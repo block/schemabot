@@ -212,6 +212,9 @@ func previewCommentApplyFlowAllOutput() {
 		{"SECOND TABLE RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyProgress()) }},
 		{"SECOND TABLE ESTIMATE EXCEEDED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyEstimateExceeded()) }},
 		{"THIRD TABLE RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyThirdRunning()) }},
+		// Sharded tables: compact per-shard summary (inline for few, collapsed for many)
+		{"SHARDED: SHARD PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyShardProgress()) }},
+		{"SHARDED: MANY SHARDS (256)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyManyShardProgress()) }},
 		{"ALL COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCompleted()) }},
 		{"VITESS: VSCHEMA ONLY", func() { fmt.Print(webhooktemplates.PreviewCommentApplyVitessVSchemaOnly()) }},
 		{"VITESS: DDL + VSCHEMA", func() { fmt.Print(webhooktemplates.PreviewCommentApplyVitessDDLWithVSchema()) }},

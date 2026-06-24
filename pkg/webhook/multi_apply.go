@@ -19,11 +19,11 @@ import (
 // ops must be in resolved deployment order (as returned by
 // ApplyOperations().ListByApply); tasks are the apply's tasks across all
 // deployments, regrouped per operation for the multi-deployment layout.
-func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, vschemaByOp map[int64][]apitypes.VSchemaChange) string {
+func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, vschemaByOp map[int64][]apitypes.VSchemaChange, shardsByTable map[string][]*storage.Task) string {
 	if len(ops) <= 1 {
-		return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks, singleOpVSchema(ops, vschemaByOp)))
+		return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks, singleOpVSchema(ops, vschemaByOp), shardsByTable))
 	}
-	return templates.RenderMultiDeploymentApplyComment(buildMultiApplyData(apply, ops, tasks, vschemaByOp))
+	return templates.RenderMultiDeploymentApplyComment(buildMultiApplyData(apply, ops, tasks, vschemaByOp, shardsByTable))
 }
 
 // formatApplySummaryComment renders the terminal summary PR comment for an apply,
@@ -36,11 +36,11 @@ func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperatio
 // ops must be in resolved deployment order (as returned by
 // ApplyOperations().ListByApply); tasks are the apply's tasks across all
 // deployments, regrouped per operation for the multi-deployment layout.
-func formatApplySummaryComment(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, vschemaByOp map[int64][]apitypes.VSchemaChange) string {
+func formatApplySummaryComment(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, vschemaByOp map[int64][]apitypes.VSchemaChange, shardsByTable map[string][]*storage.Task) string {
 	if len(ops) <= 1 {
-		return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks, singleOpVSchema(ops, vschemaByOp)))
+		return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks, singleOpVSchema(ops, vschemaByOp), shardsByTable))
 	}
-	return templates.RenderMultiDeploymentApplySummaryComment(buildMultiApplyData(apply, ops, tasks, vschemaByOp))
+	return templates.RenderMultiDeploymentApplySummaryComment(buildMultiApplyData(apply, ops, tasks, vschemaByOp, shardsByTable))
 }
 
 // singleOpVSchema returns the VSchema changes for a zero/one-operation apply
@@ -56,13 +56,13 @@ func singleOpVSchema(ops []*storage.ApplyOperation, vschemaByOp map[int64][]apit
 // buildMultiApplyData assembles the multi-deployment comment input: the derived
 // rollup plus each deployment's own single-deployment comment data, so each
 // deployment's section reuses the existing per-table renderer.
-func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, vschemaByOp map[int64][]apitypes.VSchemaChange) templates.MultiDeploymentApplyData {
+func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, vschemaByOp map[int64][]apitypes.VSchemaChange, shardsByTable map[string][]*storage.Task) templates.MultiDeploymentApplyData {
 	tasksByOp := groupTasksByOperation(tasks)
 
 	model := deriveApplyPresentation(ops)
 	details := make(map[string]templates.ApplyStatusCommentData, len(ops))
 	for _, op := range ops {
-		details[op.Deployment] = buildDeploymentDetail(apply, op, tasksByOp[op.ID], vschemaByOp[op.ID])
+		details[op.Deployment] = buildDeploymentDetail(apply, op, tasksByOp[op.ID], vschemaByOp[op.ID], shardsByTable)
 	}
 
 	data := templates.MultiDeploymentApplyData{
@@ -113,7 +113,7 @@ func applyOperationToPresentation(op *storage.ApplyOperation) presentation.Opera
 // identity and timing, and the deployment's own tasks. The deployment's database
 // target is shown via the section's deployment name; the per-table rows fall back
 // to the apply database for namespace, matching the single-deployment renderer.
-func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tasks []*storage.Task, vschemaChanges []apitypes.VSchemaChange) templates.ApplyStatusCommentData {
+func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tasks []*storage.Task, vschemaChanges []apitypes.VSchemaChange, shardsByTable map[string][]*storage.Task) templates.ApplyStatusCommentData {
 	data := templates.ApplyStatusCommentData{
 		ApplyID:        apply.ApplyIdentifier,
 		Database:       apply.Database,
@@ -121,7 +121,7 @@ func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tas
 		State:          op.State,
 		Engine:         apply.Engine,
 		ErrorMessage:   op.ErrorMessage,
-		Tables:         tableProgressFromTasks(apply.Database, tasks),
+		Tables:         tableProgressFromTasks(apply.Database, tasks, shardsByTable),
 		VSchemaChanges: vschemaChanges,
 	}
 	if apply.StartedAt != nil {

@@ -30,6 +30,21 @@ type TableProgressData struct {
 	// ErrorMessage is the task's last error. Rendered for states where the
 	// per-table error explains what the user is seeing (e.g. a retrying task).
 	ErrorMessage string
+
+	// Shards is the per-shard breakdown for a sharded table. Empty for unsharded
+	// engines. Rendered as a single compact summary line
+	// while the table is in flight (see renderShardSummary); detailed per-shard
+	// row counts/ETAs stay in the CLI, not the PR comment.
+	Shards []ShardProgressData
+}
+
+// ShardProgressData is the high-level status of one shard, for the compact
+// per-shard summary in the PR comment. It intentionally carries only state +
+// percent (no row counts/ETA) to keep the comment quiet.
+type ShardProgressData struct {
+	Shard           string
+	Status          string // canonical lowercase shard/task state
+	PercentComplete int
 }
 
 // ApplyStatusCommentData contains all data needed to render an apply status PR comment.
@@ -460,7 +475,120 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData) {
 		renderRunningTable(sb, table)
 	}
 
+	renderShardSummary(sb, table)
+
 	sb.WriteString("\n")
+}
+
+// renderShardSummary appends a single compact per-shard status line for a
+// sharded table, only while it is in flight. It keeps the PR
+// comment quiet: at most one extra line per table. With few shards it lists each
+// shard's state (and percent for actively-copying shards); with many it collapses
+// to per-state counts plus the slowest copying shard, so even hundreds of shards
+// fit on one line. Detailed per-shard rows/ETAs stay in the CLI.
+func renderShardSummary(sb *strings.Builder, table TableProgressData) {
+	if len(table.Shards) <= 1 {
+		return
+	}
+	switch state.NormalizeTaskStatus(table.Status) {
+	case state.Task.Running, state.Task.Recovering, state.Task.CuttingOver, state.Task.WaitingForCutover:
+		// in flight — a breakdown adds signal
+	default:
+		return // completed/pending/cancelled/failed: no breakdown, stay quiet
+	}
+
+	const inlineLimit = 8
+	if len(table.Shards) <= inlineLimit {
+		parts := make([]string, 0, len(table.Shards))
+		for _, sh := range table.Shards {
+			if isCopyingShardStatus(sh.Status) && sh.PercentComplete > 0 {
+				parts = append(parts, fmt.Sprintf("%s %s %d%%", shardGlyph(sh.Status), sh.Shard, sh.PercentComplete))
+			} else {
+				parts = append(parts, fmt.Sprintf("%s %s", shardGlyph(sh.Status), sh.Shard))
+			}
+		}
+		fmt.Fprintf(sb, "  └ shards: %s\n", strings.Join(parts, " · "))
+		return
+	}
+
+	var complete, copying, ready, failed, queued, other int
+	slowestShard := ""
+	slowestPct := -1
+	for _, sh := range table.Shards {
+		switch state.NormalizeShardStatus(sh.Status) {
+		case state.Task.Completed:
+			complete++
+		case state.Task.WaitingForCutover:
+			ready++
+		case state.Task.Failed, state.Task.FailedRetryable:
+			failed++
+		case state.Task.Pending:
+			queued++
+		default:
+			if isCopyingShardStatus(sh.Status) {
+				copying++
+				if slowestPct < 0 || sh.PercentComplete < slowestPct {
+					slowestPct = sh.PercentComplete
+					slowestShard = sh.Shard
+				}
+			} else {
+				other++
+			}
+		}
+	}
+	var buckets []string
+	if complete > 0 {
+		buckets = append(buckets, fmt.Sprintf("%d ✓", complete))
+	}
+	if copying > 0 {
+		buckets = append(buckets, fmt.Sprintf("%d ◐ copying", copying))
+	}
+	if ready > 0 {
+		buckets = append(buckets, fmt.Sprintf("%d ● ready", ready))
+	}
+	if queued > 0 {
+		buckets = append(buckets, fmt.Sprintf("%d ⏳", queued))
+	}
+	if failed > 0 {
+		buckets = append(buckets, fmt.Sprintf("%d ✗ failed", failed))
+	}
+	if other > 0 {
+		buckets = append(buckets, fmt.Sprintf("%d …", other))
+	}
+	line := fmt.Sprintf("  └ %d shards: %s", len(table.Shards), strings.Join(buckets, " · "))
+	if slowestShard != "" && slowestPct >= 0 {
+		line += fmt.Sprintf(" · slowest %s %d%%", slowestShard, slowestPct)
+	}
+	sb.WriteString(line + "\n")
+}
+
+// shardGlyph maps a shard's status to its compact summary glyph.
+func shardGlyph(status string) string {
+	switch state.NormalizeShardStatus(status) {
+	case state.Task.Completed:
+		return "✓" // ✓
+	case state.Task.WaitingForCutover:
+		return "●" // ●
+	case state.Task.Failed, state.Task.FailedRetryable:
+		return "✗" // ✗
+	case state.Task.Pending:
+		return "⏳" // ⏳
+	default:
+		if isCopyingShardStatus(status) {
+			return "◐" // ◐
+		}
+		return "•" // •
+	}
+}
+
+// isCopyingShardStatus reports whether a shard is actively doing copy/cutover work.
+func isCopyingShardStatus(status string) bool {
+	switch state.NormalizeShardStatus(status) {
+	case state.Task.Running, state.Task.Recovering, state.Task.CuttingOver:
+		return true
+	default:
+		return false
+	}
 }
 
 // renderRunningTable renders a table that is actively copying rows.

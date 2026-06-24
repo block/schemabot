@@ -2009,6 +2009,70 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="sharded-shard-progress"></a><strong>Sharded: Shard Progress</strong></summary>
+
+
+## Schema Change In Progress
+
+**Database**: `commerce` | **Environment**: `staging` | **Apply ID**: `apply-7aa13cf03496454b`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+### Table Progress
+
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+  └ shards: ✓ -40 · ◐ 40-80 62% · ◐ 80-c0 31% · ⏳ c0-
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-7aa13cf03496454b -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="sharded-many-shards-256"></a><strong>Sharded: Many Shards (256)</strong></summary>
+
+
+## Schema Change In Progress
+
+**Database**: `commerce` | **Environment**: `staging` | **Apply ID**: `apply-7aa13cf03496454b`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+### Table Progress
+
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70%
+
+```sql
+ALTER TABLE `orders` ADD COLUMN `region` varchar(32);
+```
+Rows: 4,200,000,000 / 6,000,000,000 · ETA: 1h 30m
+  └ 256 shards: 200 ✓ · 52 ◐ copying · 4 ⏳ · slowest f7- 12%
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-7aa13cf03496454b -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="all-completed"></a><strong>All Completed</strong></summary>
 
 

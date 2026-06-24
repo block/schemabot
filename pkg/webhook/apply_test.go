@@ -35,7 +35,7 @@ func TestFormatProgressComment(t *testing.T) {
 		},
 	}
 
-	body := formatProgressComment(apply, tasks)
+	body := formatProgressComment(apply, tasks, nil)
 
 	// Template renders rich progress bars instead of a table
 	assert.Contains(t, body, "testdb")
@@ -57,7 +57,7 @@ func TestFormatProgressComment_NoTasks(t *testing.T) {
 		State:       state.Apply.Pending,
 	}
 
-	body := formatProgressComment(apply, nil)
+	body := formatProgressComment(apply, nil, nil)
 
 	assert.Contains(t, body, "testdb")
 	assert.Contains(t, body, "Starting")
@@ -72,7 +72,7 @@ func TestFormatProgressComment_WithError(t *testing.T) {
 		ErrorMessage: "connection refused",
 	}
 
-	body := formatProgressComment(apply, nil)
+	body := formatProgressComment(apply, nil, nil)
 
 	assert.Contains(t, body, "connection refused")
 	assert.Contains(t, body, "Failed")
@@ -100,7 +100,7 @@ func TestFormatProgressCommentCutoverState(t *testing.T) {
 		{TableName: "orders", State: state.Task.WaitingForCutover, ReadyToComplete: true},
 	}
 
-	body := formatProgressComment(apply, tasks)
+	body := formatProgressComment(apply, tasks, nil)
 
 	assert.Contains(t, body, "Cutover")
 	assert.Contains(t, body, "testdb")
@@ -120,7 +120,7 @@ func TestFormatSummaryComment(t *testing.T) {
 		{TableName: "orders", State: state.Task.Completed},
 	}
 
-	body := formatSummaryComment(apply, tasks)
+	body := formatSummaryComment(apply, tasks, nil)
 
 	assert.Contains(t, body, "Schema Change Applied")
 	assert.Contains(t, body, "`users`")
@@ -140,7 +140,7 @@ func TestFormatSummaryComment_Failed(t *testing.T) {
 		{TableName: "users", State: state.Task.Failed},
 	}
 
-	body := formatSummaryComment(apply, tasks)
+	body := formatSummaryComment(apply, tasks, nil)
 
 	assert.Contains(t, body, "duplicate column")
 	assert.Contains(t, body, "Failed")
@@ -176,7 +176,7 @@ func TestBuildApplyCommentData(t *testing.T) {
 		},
 	}
 
-	data := buildApplyCommentData(apply, tasks, nil)
+	data := buildApplyCommentData(apply, tasks, nil, nil)
 
 	assert.Equal(t, "apply-abc123", data.ApplyID)
 	assert.Equal(t, "testdb", data.Database)
@@ -198,7 +198,7 @@ func TestBuildApplyCommentData_DefaultNamespace(t *testing.T) {
 		{TableName: "users", State: state.Task.Running},
 	}
 
-	data := buildApplyCommentData(apply, tasks, nil)
+	data := buildApplyCommentData(apply, tasks, nil, nil)
 
 	assert.Equal(t, "testdb", data.Tables[0].Namespace, "empty namespace should default to database name")
 }

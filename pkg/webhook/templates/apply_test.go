@@ -232,6 +232,63 @@ func TestRenderApplyStatusComment_VSchema(t *testing.T) {
 	})
 }
 
+// A sharded table renders a compact per-shard summary while in flight: each
+// shard inline when few, collapsed to per-state counts + the slowest copier when
+// many, and nothing once the table completes or when there is a single shard.
+func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
+	withTemplateTimestamp(t, "2026-06-16 19:42:00 UTC")
+
+	// Inline: ≤8 shards list each shard's status; only the copying shard shows a percent.
+	inline := RenderApplyStatusComment(ApplyStatusCommentData{
+		Database: "shop", Environment: "staging", State: "running", Engine: "Vitess",
+		Tables: []TableProgressData{{
+			TableName: "users", Status: "running", PercentComplete: 50,
+			Shards: []ShardProgressData{
+				{Shard: "-80", Status: "completed", PercentComplete: 100},
+				{Shard: "80-", Status: "running", PercentComplete: 45},
+			},
+		}},
+	})
+	assert.Contains(t, inline, "shards:")
+	assert.Contains(t, inline, "✓ -80")
+	assert.Contains(t, inline, "◐ 80- 45%")
+
+	// Collapsed: >8 shards bucket by state and name the slowest copier.
+	many := make([]ShardProgressData, 0, 12)
+	for i := range 9 {
+		many = append(many, ShardProgressData{Shard: fmt.Sprintf("c%d", i), Status: "completed", PercentComplete: 100})
+	}
+	many = append(many,
+		ShardProgressData{Shard: "slow1", Status: "running", PercentComplete: 12},
+		ShardProgressData{Shard: "fast1", Status: "running", PercentComplete: 80},
+		ShardProgressData{Shard: "q1", Status: "pending"},
+	)
+	collapsed := RenderApplyStatusComment(ApplyStatusCommentData{
+		Database: "shop", Environment: "staging", State: "running", Engine: "Vitess",
+		Tables: []TableProgressData{{TableName: "orders", Status: "running", PercentComplete: 70, Shards: many}},
+	})
+	assert.Contains(t, collapsed, "12 shards:")
+	assert.Contains(t, collapsed, "9 ✓")
+	assert.Contains(t, collapsed, "2 ◐ copying")
+	assert.Contains(t, collapsed, "slowest slow1 12%")
+
+	// Suppressed once the table completes — no shard line even with shard rows.
+	done := RenderApplyStatusComment(ApplyStatusCommentData{
+		Database: "shop", Environment: "staging", State: "completed", Engine: "Vitess",
+		Tables: []TableProgressData{{TableName: "users", Status: "completed",
+			Shards: []ShardProgressData{{Shard: "-80", Status: "completed"}, {Shard: "80-", Status: "completed"}}}},
+	})
+	assert.NotContains(t, done, "shards:")
+
+	// A single shard adds no signal — no breakdown.
+	single := RenderApplyStatusComment(ApplyStatusCommentData{
+		Database: "shop", Environment: "staging", State: "running", Engine: "Vitess",
+		Tables: []TableProgressData{{TableName: "users", Status: "running", PercentComplete: 30,
+			Shards: []ShardProgressData{{Shard: "0", Status: "running", PercentComplete: 30}}}},
+	})
+	assert.NotContains(t, single, "shards:")
+}
+
 // A PlanetScale apply in a deploy-request phase renders its first-class phase
 // header (not a generic "In Progress") and still offers the operator a stop
 // action — the change is active, stoppable work before cutover.

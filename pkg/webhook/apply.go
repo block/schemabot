@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -15,7 +16,10 @@ import (
 // buildApplyCommentData maps storage types to template data. vschemaChanges
 // carries the apply's per-keyspace VSchema application state, projected from
 // engine display metadata by resolveVSchemaByOperation (nil when there is none).
-func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, vschemaChanges []apitypes.VSchemaChange) templates.ApplyStatusCommentData {
+// shardsByTable holds the per-shard detail rows grouped by table (nil for
+// unsharded engines); it is attached to each table's progress for the compact
+// per-shard summary.
+func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, vschemaChanges []apitypes.VSchemaChange, shardsByTable map[string][]*storage.Task) templates.ApplyStatusCommentData {
 	data := templates.ApplyStatusCommentData{
 		ApplyID:        apply.ApplyIdentifier,
 		Database:       apply.Database,
@@ -31,7 +35,7 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, vschemaC
 	if apply.CompletedAt != nil {
 		data.CompletedAt = apply.CompletedAt.Format(time.RFC3339)
 	}
-	data.Tables = tableProgressFromTasks(apply.Database, tasks)
+	data.Tables = tableProgressFromTasks(apply.Database, tasks, shardsByTable)
 	return data
 }
 
@@ -83,8 +87,9 @@ func resolveVSchemaByOperation(ctx context.Context, stor storage.Storage, apply 
 // tableProgressFromTasks maps storage tasks to per-table template rows. The
 // databaseFallback is used as a task's namespace when the task has none, so the
 // single-deployment and per-deployment builders render table identities the same
-// way.
-func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task) []templates.TableProgressData {
+// way. shardsByTable (keyed by shardCommentTableKey on the raw namespace) supplies
+// each table's per-shard breakdown when present.
+func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) []templates.TableProgressData {
 	if len(tasks) == 0 {
 		return nil
 	}
@@ -106,21 +111,50 @@ func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task) []te
 			IsInstant:       t.IsInstant,
 			ReadyToComplete: t.ReadyToComplete,
 			ErrorMessage:    t.ErrorMessage,
+			Shards:          shardProgressForTable(shardsByTable, t.Namespace, t.TableName),
 		})
 	}
 	return out
 }
 
+// shardProgressForTable returns the per-shard summary rows for a table, sorted by
+// shard name for stable rendering. The map is keyed on the raw task namespace
+// (the same value the shard rows carry), so it is looked up before the database
+// fallback is applied.
+func shardProgressForTable(shardsByTable map[string][]*storage.Task, namespace, table string) []templates.ShardProgressData {
+	rows := shardsByTable[shardCommentTableKey(namespace, table)]
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([]templates.ShardProgressData, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, templates.ShardProgressData{
+			Shard:           r.Shard,
+			Status:          string(r.State),
+			PercentComplete: r.ProgressPercent,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Shard < out[j].Shard })
+	return out
+}
+
+// shardCommentTableKey keys the per-table shard map for the PR comment. It uses
+// the raw namespace (before any database fallback) so table rows and shard rows —
+// which both carry the same raw namespace — line up.
+func shardCommentTableKey(namespace, table string) string {
+	return namespace + "\x00" + table
+}
+
 // formatProgressComment renders the progress comment using the template system.
 // It is the no-operations fallback (load error, or the initial rollback comment),
 // so it carries no VSchema — the observer refreshes VSchema once operations load.
-func formatProgressComment(apply *storage.Apply, tasks []*storage.Task) string {
-	return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks, nil))
+func formatProgressComment(apply *storage.Apply, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
+	return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks, nil, shardsByTable))
 }
 
 // formatSummaryComment renders the final summary comment for a terminal apply
 // state. Like formatProgressComment it is the no-operations fallback and carries
 // no VSchema.
-func formatSummaryComment(apply *storage.Apply, tasks []*storage.Task) string {
-	return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks, nil))
+func formatSummaryComment(apply *storage.Apply, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
+	return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks, nil, shardsByTable))
 }

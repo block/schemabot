@@ -45,6 +45,18 @@ type stubStorage struct {
 
 func (s *stubStorage) ApplyOperations() storage.ApplyOperationStore { return s.ops }
 
+func (s *stubStorage) Tasks() storage.TaskStore { return stubTaskStore{} }
+
+// stubTaskStore supplies the per-shard read the comment dispatch path makes; the
+// routing tests have no shard rows, so it returns none.
+type stubTaskStore struct {
+	storage.TaskStore
+}
+
+func (stubTaskStore) GetShardProgressByApplyOperationID(context.Context, int64) ([]*storage.Task, error) {
+	return nil, nil
+}
+
 func newDispatchTestObserver(opStore storage.ApplyOperationStore) *CommentObserver {
 	return &CommentObserver{
 		stor:   &stubStorage{ops: opStore},

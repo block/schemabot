@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -838,6 +839,81 @@ func PreviewCommentApplyVitessMultiKeyspaceVSchema() string {
 		{Namespace: "commerce_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
 	}
 	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyShardProgress renders a sharded apply where one table is
+// copying across a handful of shards, exercising the inline per-shard summary
+// (each shard listed, a percent only on the actively-copying shards).
+func PreviewCommentApplyShardProgress() string {
+	shards := []ShardProgressData{
+		{Shard: "-40", Status: state.Task.Completed, PercentComplete: 100},
+		{Shard: "40-80", Status: state.Task.Running, PercentComplete: 62},
+		{Shard: "80-c0", Status: state.Task.Running, PercentComplete: 31},
+		{Shard: "c0-", Status: state.Task.Pending},
+	}
+	return RenderApplyStatusComment(ApplyStatusCommentData{
+		Database:    "commerce",
+		Environment: "staging",
+		RequestedBy: "jackjackbits",
+		ApplyID:     "apply-7aa13cf03496454b",
+		State:       state.Apply.Running,
+		Engine:      "Vitess",
+		Tables: []TableProgressData{{
+			Namespace:       "commerce",
+			TableName:       "users",
+			DDL:             "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
+			Status:          state.Task.Running,
+			RowsCopied:      914707,
+			RowsTotal:       1466232,
+			PercentComplete: 62,
+			ETASeconds:      195,
+			Shards:          shards,
+		}},
+	})
+}
+
+// PreviewCommentApplyManyShardProgress renders a sharded apply where a table is
+// copying across 256 shards, exercising the collapsed per-shard summary
+// (per-state counts plus the slowest copier, so the line stays compact).
+func PreviewCommentApplyManyShardProgress() string {
+	const total = 256
+	shards := make([]ShardProgressData, 0, total)
+	for i := range total {
+		sh := ShardProgressData{Shard: fmt.Sprintf("%02x-", i)}
+		switch {
+		case i < 200:
+			sh.Status = state.Task.Completed
+			sh.PercentComplete = 100
+		case i == 247:
+			sh.Status = state.Task.Running
+			sh.PercentComplete = 12 // the laggard the collapsed line names
+		case i < 252:
+			sh.Status = state.Task.Running
+			sh.PercentComplete = 55 + i%20
+		default:
+			sh.Status = state.Task.Pending
+		}
+		shards = append(shards, sh)
+	}
+	return RenderApplyStatusComment(ApplyStatusCommentData{
+		Database:    "commerce",
+		Environment: "staging",
+		RequestedBy: "jackjackbits",
+		ApplyID:     "apply-7aa13cf03496454b",
+		State:       state.Apply.Running,
+		Engine:      "Vitess",
+		Tables: []TableProgressData{{
+			Namespace:       "commerce",
+			TableName:       "orders",
+			DDL:             "ALTER TABLE `orders` ADD COLUMN `region` varchar(32)",
+			Status:          state.Task.Running,
+			RowsCopied:      4200000000,
+			RowsTotal:       6000000000,
+			PercentComplete: 70,
+			ETASeconds:      5400,
+			Shards:          shards,
+		}},
+	})
 }
 
 // PreviewCommentApplyCompleted renders a sample apply-completed comment.
