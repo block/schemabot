@@ -146,11 +146,16 @@ func applyTimeoutDiagnostics(applyID string) string {
 				fmt.Fprintf(&b, "  operation id=%d deployment=%q state=%q lease_owner=%q updated_at=%s\n",
 					opID, deployment, opState, opLeaseOwner, opUpdatedAt)
 			}
+			if err := opRows.Err(); err != nil {
+				fmt.Fprintf(&b, "apply_operations: row iteration error: %v\n", err)
+			}
 		}()
 	}
 
-	// Operator backlog: how many other applies are in flight (non-terminal)
-	// when this one is stuck. A busy pool here points at driver starvation.
+	// Operator backlog: every apply grouped by state, so triage can see how
+	// many sit in non-terminal states (e.g. pending, running) competing for
+	// drivers when this one is stuck. A large non-terminal count points at
+	// driver-pool starvation.
 	backlogRows, err := db.QueryContext(ctx,
 		"SELECT state, COUNT(*) FROM applies GROUP BY state ORDER BY state")
 	if err != nil {
@@ -167,6 +172,9 @@ func applyTimeoutDiagnostics(applyID string) string {
 					return
 				}
 				fmt.Fprintf(&b, " %s=%d", s, n)
+			}
+			if err := backlogRows.Err(); err != nil {
+				fmt.Fprintf(&b, " row iteration error: %v", err)
 			}
 			b.WriteString("\n")
 		}()
@@ -189,6 +197,9 @@ func applyTimeoutDiagnostics(applyID string) string {
 				}
 				fmt.Fprintf(&b, "  [%s] %s %s->%s %s: %s\n",
 					createdAt, level, oldState, newState, eventType, message)
+			}
+			if err := logRows.Err(); err != nil {
+				fmt.Fprintf(&b, "  row iteration error: %v\n", err)
 			}
 		}()
 	}
