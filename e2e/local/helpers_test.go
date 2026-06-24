@@ -279,8 +279,13 @@ func ensureNoActiveChange(t *testing.T, endpoint string) {
 
 func clearSchemaBotState(t *testing.T) {
 	t.Helper()
-	clearSchemaBotStorage(t)
+	// Reset LocalScale first so any Vitess deploy still executing from a prior
+	// test is cancelled before its SchemaBot rows are deleted. Clearing storage
+	// first deletes rows out from under an in-flight operator drive, which keeps
+	// that driver busy unwinding a lost lease and can starve the next test's
+	// apply of a free driver.
 	resetLocalScaleState(t)
+	clearSchemaBotStorage(t)
 }
 
 func clearSchemaBotStorage(t *testing.T) {
