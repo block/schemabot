@@ -63,7 +63,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		c.failApplyWithTasks(ctx, apply, tasks, err.Error())
 		return
 	}
-	changes := groupedResumeChanges(tasks)
+	changes := groupedResumeChanges(tasks, plan)
 
 	// Mark the apply as started before calling the engine. The engine may run
 	// for a long time (branch creation, DDL application, deploy request) and

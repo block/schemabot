@@ -866,7 +866,7 @@ func TestGroupedResumeChangesGroupsTasksByNamespace(t *testing.T) {
 		{Namespace: "billing", TableName: "invoices", DDL: "ALTER TABLE `invoices` ADD COLUMN `due_at` datetime", DDLAction: "alter"},
 	}
 
-	changes := groupedResumeChanges(tasks)
+	changes := groupedResumeChanges(tasks, nil)
 
 	require.Len(t, changes, 2)
 	assert.Equal(t, "commerce", changes[0].Namespace)
@@ -892,7 +892,7 @@ func TestGroupedResumeChangesPreservesDDL(t *testing.T) {
 		{Namespace: "commerce", TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter"},
 	}
 
-	changes := groupedResumeChanges(tasks)
+	changes := groupedResumeChanges(tasks, nil)
 
 	require.Len(t, changes, 1)
 	assert.Equal(t, "commerce", changes[0].Namespace)
@@ -911,7 +911,7 @@ func TestGroupedResumeChangesPreservesMultiNamespaceScopedTasks(t *testing.T) {
 		{Namespace: "routing", TableName: "lookup", DDL: "ALTER TABLE `lookup` ADD COLUMN `region` varchar(32)", DDLAction: "alter"},
 	}
 
-	changes := groupedResumeChanges(tasks)
+	changes := groupedResumeChanges(tasks, nil)
 
 	require.Len(t, changes, 2)
 	byNamespace := make(map[string]engine.SchemaChange)

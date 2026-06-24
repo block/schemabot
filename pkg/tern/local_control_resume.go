@@ -629,7 +629,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	result, err := eng.Apply(ctx, &engine.ApplyRequest{
 		Database:     apply.Database,
 		PlanID:       plan.PlanIdentifier,
-		Changes:      groupedResumeChanges(tasks),
+		Changes:      groupedResumeChanges(tasks, plan),
 		TargetShards: taskTargetShards(tasks),
 		SchemaFiles:  plan.SchemaFiles,
 		Options:      options,
@@ -791,13 +791,14 @@ func (c *LocalClient) groupedResumeState(ctx context.Context, apply *storage.App
 	return stored, nil
 }
 
-// groupedResumeChanges rebuilds the engine changes for a grouped resume from
-// the stored tasks, grouped per namespace. Tasks carry the authoritative
-// remaining work after re-planning, and engines key per-table progress on
-// namespace and table, so the rebuilt changes must preserve both. VSchema is not
-// a task — it runs as a task-less group_finalizer reconstructed from the plan —
-// so every task here is table DDL.
-func groupedResumeChanges(tasks []*storage.Task) []engine.SchemaChange {
+// groupedResumeChanges rebuilds the engine changes for a grouped apply from the
+// stored tasks plus the plan. Tasks carry the table DDL (engines key per-table
+// progress on namespace and table, so both are preserved). VSchema is not a
+// task: each namespace whose plan carries a vschema.json artifact is flagged
+// with vschema_changed so the engine applies its VSchema from the schema files
+// alongside its DDL — or on its own for a VSchema-only namespace that has no DDL
+// tasks. This mirrors how the fresh apply builds changes from the plan.
+func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan) []engine.SchemaChange {
 	indexByNamespace := make(map[string]int, len(tasks))
 	var changes []engine.SchemaChange
 	ensureNamespace := func(namespace string) int {
@@ -823,6 +824,23 @@ func groupedResumeChanges(tasks []*storage.Task) []engine.SchemaChange {
 			DDL:       task.DDL,
 			Operation: ddl.OpToStatementType(task.DDLAction),
 		})
+	}
+	if plan != nil {
+		namespaces := make([]string, 0, len(plan.Namespaces))
+		for ns := range plan.Namespaces {
+			namespaces = append(namespaces, ns)
+		}
+		sort.Strings(namespaces)
+		for _, ns := range namespaces {
+			if !namespaceHasVSchemaArtifact(plan.Namespaces[ns]) {
+				continue
+			}
+			idx := ensureNamespace(ns)
+			if changes[idx].Metadata == nil {
+				changes[idx].Metadata = make(map[string]string, 1)
+			}
+			changes[idx].Metadata["vschema_changed"] = "true"
+		}
 	}
 	return changes
 }
