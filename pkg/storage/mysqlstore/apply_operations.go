@@ -557,11 +557,15 @@ const applyOperationHeartbeatStaleness = "1 MINUTE"
 // staleness window) are re-leased without changing their state. Terminal
 // rows are never claimed.
 //
-// Sibling ordering: a pending row's claimability is gated on its earlier
-// siblings of the same apply (lower created_at, id) along deployment_order —
-// the order materialized by the apply-create dual-write into row insertion
-// order. The gate is cutover_policy-aware (the policy is captured per row at
-// apply-create):
+// Sibling ordering: a pending row's claimability is gated only on its earlier
+// siblings in an EARLIER deployment (rows of the same apply with a different
+// deployment and a lower created_at, id) along deployment_order — the order
+// materialized by the apply-create dual-write into row insertion order. Work
+// rows in the SAME deployment (the per-shard, per-namespace fan-out of a
+// sharded apply) do not gate each other, so a deployment's shard work drives
+// in parallel; the group_finalizer clause below still holds each namespace's
+// finalizer until that namespace's work siblings complete. The gate is
+// cutover_policy-aware (the policy is captured per row at apply-create):
 //
 //   - rolling (the default, and any non-barrier value — which fails closed to
 //     the serial gate): a pending row is claimable only once every earlier
@@ -594,9 +598,8 @@ const applyOperationHeartbeatStaleness = "1 MINUTE"
 //
 // The gate applies only to starting a pending row; an already-active row
 // re-leasing a stale heartbeat is recovering work it already started, so it
-// is never re-gated. While the operator flag is off and the single-deployment
-// hard-block stands, an apply has exactly one operation with no earlier
-// siblings, so this gate is dormant regardless of policy.
+// is never re-gated. A single-operation apply has no earlier-deployment
+// sibling, so the gate is a no-op for it regardless of policy.
 //
 // Mirrors ApplyStore.FindNextApply: SELECT ... FOR UPDATE SKIP LOCKED to
 // avoid driver races, READ COMMITTED isolation to prevent next-key range
@@ -604,9 +607,9 @@ const applyOperationHeartbeatStaleness = "1 MINUTE"
 //
 // Caller: the operator's per-poll recovery (Service.recoverApplyOperation)
 // claims one operation per tick through this primitive when operation-level
-// claiming is enabled. The per-deployment fan-out loop — driving multiple
-// sibling operations of the same apply concurrently — is deferred to the
-// multi-deployment apply workstream.
+// claiming is enabled. Multiple drivers each claim a different claimable row
+// (FOR UPDATE SKIP LOCKED), so same-deployment shard work siblings of one
+// apply drive concurrently across the driver pool.
 func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation: %w", storage.ErrApplyLeaseLost)
@@ -718,10 +721,11 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// task-gated (state = pending AND EXISTS tasks); a start request lets a
 	// no-task pending apply be claimed. Operation-level pending claimability is
 	// instead deployment-order-gated (the clause below), so a pending operation
-	// is already claimable the moment it is legal to start — once every earlier
-	// sibling has completed. A parent start request must not relax that gate:
-	// adding an ungated pending-start clause would let a later deployment be
-	// claimed out of order while an earlier sibling is still non-completed, and
+	// is already claimable the moment it is legal to start — once every
+	// earlier-deployment sibling has completed. A parent start request must not
+	// relax that gate: adding an ungated pending-start clause would let a later
+	// deployment be claimed out of order while an earlier one is still
+	// non-completed, and
 	// a gated one would be redundant with the pending clause below. Start
 	// requests resume eligible work; they do not reorder the rollout.
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
@@ -737,6 +741,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 							SELECT 1
 							FROM apply_operations AS earlier
 							WHERE earlier.apply_id = apply_operations.apply_id
+								AND earlier.deployment <> apply_operations.deployment
 								AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
 								AND (
 									(
