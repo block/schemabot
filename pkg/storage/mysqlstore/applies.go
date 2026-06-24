@@ -692,8 +692,11 @@ func insertApplyGroupedOperations(ctx context.Context, tx *sql.Tx, apply *storag
 		if group.Operation == nil {
 			return fmt.Errorf("create apply %s deployment %s: grouped operation is missing its operation row", apply.ApplyIdentifier, deployment)
 		}
-		if len(group.Tasks) == 0 {
-			return fmt.Errorf("create apply %s deployment %s: grouped operation has no tasks", apply.ApplyIdentifier, deployment)
+		// A group_finalizer carries no tasks — it applies namespace-level work
+		// (e.g. VSchema) reconstructed from the plan at drive time. Every other
+		// (work) operation must have at least one task.
+		if len(group.Tasks) == 0 && group.Operation.OperationKind != storage.ApplyOperationKindGroupFinalizer {
+			return fmt.Errorf("create apply %s deployment %s: grouped work operation has no tasks", apply.ApplyIdentifier, deployment)
 		}
 
 		group.Operation.ApplyID = applyID

@@ -758,6 +758,19 @@ func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *stor
 		m.rec.recordParentWrite(m.stor.Applies().Update(ctx, &probe))
 	}
 
+	// A group_finalizer carries no tasks: the real drive (driveGroupFinalizer)
+	// applies the namespace VSchema and marks the operation row directly. Simulate
+	// that outcome here rather than transitioning task rows it does not have.
+	if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+		if state.IsState(m.outcome.taskState, state.Task.Failed) {
+			return m.stor.ApplyOperations().MarkFailed(ctx, op.ID, m.outcome.errMsg)
+		}
+		if state.IsState(m.outcome.taskState, state.Task.Completed) {
+			return m.stor.ApplyOperations().MarkCompleted(ctx, op.ID)
+		}
+		return nil
+	}
+
 	tasks, err := m.stor.Tasks().GetByApplyOperationID(ctx, applyOperationID)
 	if err != nil {
 		return fmt.Errorf("matrix fake: load tasks for operation %d: %w", applyOperationID, err)

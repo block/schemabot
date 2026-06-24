@@ -326,7 +326,7 @@ func TestApplyStore_CreateWithGroupedOperationsRejectsInvalidGroups(t *testing.T
 		{name: "empty groups", groups: nil, wantError: "grouped operations are empty"},
 		{name: "nil group", groups: []*storage.ApplyOperationWithTasks{nil}, wantError: "grouped operation is nil"},
 		{name: "nil operation", groups: []*storage.ApplyOperationWithTasks{{Tasks: []*storage.Task{newGroupedCreateTask(time.Now(), "payments-a", "users")}}}, wantError: "grouped operation is missing its operation row"},
-		{name: "no tasks", groups: []*storage.ApplyOperationWithTasks{{Operation: &storage.ApplyOperation{Deployment: "payments-a", Target: "payments-target"}}}, wantError: "grouped operation has no tasks"},
+		{name: "work op no tasks", groups: []*storage.ApplyOperationWithTasks{{Operation: &storage.ApplyOperation{Deployment: "payments-a", Target: "payments-target", OperationKind: storage.ApplyOperationKindWork}}}, wantError: "grouped work operation has no tasks"},
 	}
 
 	for _, tt := range tests {
@@ -346,6 +346,48 @@ func TestApplyStore_CreateWithGroupedOperationsRejectsInvalidGroups(t *testing.T
 			assert.Nil(t, gotApply)
 		})
 	}
+}
+
+// A group_finalizer operation carries no tasks: it applies namespace-level work
+// (VSchema) reconstructed from the plan at drive time. CreateWithGroupedOperations
+// must accept a task-less finalizer alongside its work siblings rather than
+// rejecting it as an empty group.
+func TestApplyStore_CreateWithGroupedOperationsAllowsTaskLessFinalizer(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+	now := time.Now()
+
+	apply := newGroupedCreateApply(now, "apply_grouped_taskless_finalizer")
+	groups := []*storage.ApplyOperationWithTasks{
+		newGroupedCreateGroup(now, "payments-a", "payments-a-target", "users"),
+		{Operation: &storage.ApplyOperation{
+			Deployment:    "payments-a",
+			OperationKey:  "commerce/group_finalizer",
+			OperationKind: storage.ApplyOperationKindGroupFinalizer,
+			Target:        "payments-a-target",
+			State:         state.ApplyOperation.Pending,
+			CutoverPolicy: storage.CutoverPolicyRolling,
+			OnFailure:     storage.OnFailureHalt,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}},
+	}
+
+	applyID, err := store.Applies().CreateWithGroupedOperations(ctx, apply, groups)
+	require.NoError(t, err)
+
+	ops, err := store.ApplyOperations().ListByApply(ctx, applyID)
+	require.NoError(t, err)
+	require.Len(t, ops, 2)
+	var finalizer *storage.ApplyOperation
+	for _, op := range ops {
+		if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+			finalizer = op
+		}
+	}
+	require.NotNil(t, finalizer, "task-less group_finalizer operation should be persisted")
+	assert.Equal(t, "commerce/group_finalizer", finalizer.OperationKey)
 }
 
 // TestApplyStore_CreateWithGroupedOperationsBlocksOverlapOnSecondaryDeployment

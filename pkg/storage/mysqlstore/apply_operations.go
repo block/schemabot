@@ -564,7 +564,10 @@ const applyOperationHeartbeatStaleness = "1 MINUTE"
 // rows in the SAME deployment (the per-shard, per-namespace fan-out of a
 // sharded apply) do not gate each other, so a deployment's shard work drives
 // in parallel; the group_finalizer clause below still holds each namespace's
-// finalizer until that namespace's work siblings complete. The gate is
+// finalizer until that namespace's work siblings complete — and a namespace
+// whose only change is its VSchema (no shard work siblings) has its finalizer
+// claimable immediately, since there is no incomplete sibling to wait on. The
+// gate is
 // cutover_policy-aware (the policy is captured per row at apply-create):
 //
 //   - rolling (the default, and any non-barrier value — which fails closed to
@@ -646,7 +649,6 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	)
 	queryArgs = append(queryArgs,
 		storage.ApplyOperationKindGroupFinalizer,
-		storage.ApplyOperationKindWork,
 		storage.ApplyOperationKindWork,
 		state.ApplyOperation.Completed,
 	)
@@ -758,14 +760,6 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 					)
 					OR (
 						apply_operations.operation_kind = ?
-						AND EXISTS (
-							SELECT 1
-							FROM apply_operations AS sibling
-							WHERE sibling.apply_id = apply_operations.apply_id
-								AND sibling.deployment = apply_operations.deployment
-								AND sibling.operation_kind = ?
-								AND SUBSTRING_INDEX(sibling.operation_key, '/', 1) = SUBSTRING_INDEX(apply_operations.operation_key, '/', 1)
-						)
 						AND NOT EXISTS (
 							SELECT 1
 							FROM apply_operations AS sibling

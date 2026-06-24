@@ -1286,6 +1286,14 @@ func (s *Service) markOperationFromApplyState(ctx context.Context, driverID int,
 // the row is left claimable for a later poll, and a non-nil error when a read or
 // write fails so the caller skips parent derivation.
 func (s *Service) markOperationFromOwnResult(ctx context.Context, driverID int, op *storage.ApplyOperation) (updated bool, err error) {
+	// A group_finalizer carries no tasks: its terminal state was written by the
+	// drive (driveGroupFinalizer marks it completed only on an accepted apply,
+	// failed otherwise). Deriving from its empty task set would overwrite that
+	// outcome, so leave the row as the drive set it and let the parent derivation
+	// read it.
+	if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+		return true, nil
+	}
 	tasks, err := s.storage.Tasks().GetByApplyOperationID(ctx, op.ID)
 	if err != nil {
 		return false, fmt.Errorf("load tasks for apply_operation %d (deployment %q): %w", op.ID, op.Deployment, err)

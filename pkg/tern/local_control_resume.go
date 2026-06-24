@@ -809,6 +809,13 @@ func groupedResumeChanges(tasks []*storage.Task) []engine.SchemaChange {
 		return idx
 	}
 	for _, task := range tasks {
+		// A task with no DDL carries no executable change. The only tasks that
+		// ever had empty DDL were the removed synthetic VSchema tasks; an apply
+		// created by an older binary mid-rolling-deploy can still carry one. Skip
+		// it rather than emit a TableChange the engine cannot apply.
+		if task.DDL == "" {
+			continue
+		}
 		idx := ensureNamespace(task.Namespace)
 		changes[idx].TableChanges = append(changes[idx].TableChanges, engine.TableChange{
 			Table:     task.TableName,
@@ -1010,7 +1017,17 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	}
 
 	var resumeState *engine.ResumeState
-	if stored, getErr := c.storage.ApplyOperations().GetEngineResumeState(ctx, op.ID); getErr == nil && stored != nil {
+	stored, getErr := c.storage.ApplyOperations().GetEngineResumeState(ctx, op.ID)
+	switch {
+	case errors.Is(getErr, storage.ErrEngineResumeStateNotFound):
+		// No persisted resume state yet — this is the finalizer's first drive, so
+		// start fresh.
+	case getErr != nil:
+		// A storage read failure must not be treated as "fresh": proceeding would
+		// risk the engine restarting or duplicating in-flight VSchema work after a
+		// transient DB error. Fail closed for the operator to retry.
+		return failClosed(fmt.Errorf("load engine resume state for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, getErr))
+	case stored != nil:
 		resumeState = &engine.ResumeState{MigrationContext: stored.MigrationContext, Metadata: stored.Metadata}
 	}
 
