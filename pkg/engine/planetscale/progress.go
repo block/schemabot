@@ -83,6 +83,19 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		}
 	}
 
+	// Track the VSchema-application phase so it can be surfaced from stored state
+	// without a synthetic task row. Persist it through the resume state so a
+	// progress read served from storage projects it via PSDisplayMetadata.
+	if vs := nextVSchemaStatus(meta.VSchemaStatus, dr.DeploymentState); vs != meta.VSchemaStatus {
+		meta.VSchemaStatus = vs
+		if encoded, encErr := encodePSMetadata(meta); encErr == nil {
+			req.ResumeState = &engine.ResumeState{
+				MigrationContext: req.ResumeState.MigrationContext,
+				Metadata:         encoded,
+			}
+		}
+	}
+
 	// Late schema-change-context recovery. A progress poll can run in a process
 	// that never captured the pre-deploy baseline — a different replica, or an
 	// apply whose deploy was created before Vitess exposed its context — so the
@@ -590,6 +603,9 @@ func psDisplayMetadata(meta *psMetadata) map[string]string {
 	}
 	if meta.DeferredDeploy {
 		set("deferred_deploy", "true")
+	}
+	if meta.VSchemaStatus != "" {
+		set("vschema_status", meta.VSchemaStatus)
 	}
 	return m
 }
