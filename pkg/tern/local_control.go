@@ -129,7 +129,7 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 			ErrorMessage: "Schema change is recovering after restart; cutover will be available once recovery completes.",
 		}, nil
 	}
-	if controlReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
+	if controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 		return nil, fmt.Errorf("check pending stop request before cutover for apply %s: %w", apply.ApplyIdentifier, err)
 	} else if controlReq != nil {
 		c.logger.Info("cutover blocked because stop request is pending",
@@ -227,7 +227,7 @@ func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Ap
 }
 
 func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, apply *storage.Apply) error {
-	controlReq, err := pendingCutoverControlRequest(ctx, c.storage, apply)
+	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCutover)
 	if err != nil {
 		return err
 	}
@@ -243,11 +243,11 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending cutover request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		return completePendingCutoverControlRequests(ctx, c.storage, apply)
+		return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover)
 	}
 	if cutoverRequestFailedByApplyState(apply.State) {
 		message := fmt.Sprintf("cutover request was not applied because apply is %s", apply.State)
-		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, message); err != nil {
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, message); err != nil {
 			return err
 		}
 		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, message)
@@ -274,7 +274,7 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 			"state", apply.State)
 		return nil
 	}
-	if stopReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
+	if stopReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 		return fmt.Errorf("check pending stop request before pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
 	} else if stopReq != nil {
 		message := "schema change has a pending stop request; cutover is blocked until stop is processed"
@@ -289,14 +289,14 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 	}, controlRequestCaller(controlReq))
 	if err != nil {
 		errorMessage := err.Error()
-		if failErr := failPendingCutoverControlRequests(ctx, c.storage, apply, errorMessage); failErr != nil {
+		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); failErr != nil {
 			return fmt.Errorf("process pending cutover for apply %s: %w; fail pending cutover request: %w", apply.ApplyIdentifier, err, failErr)
 		}
 		return fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if resp == nil {
 		errorMessage := "not accepted"
-		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, errorMessage); err != nil {
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
 			return err
 		}
 		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, errorMessage)
@@ -306,12 +306,12 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		if resp.ErrorMessage != "" {
 			errorMessage = resp.ErrorMessage
 		}
-		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, errorMessage); err != nil {
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
 			return err
 		}
 		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, errorMessage)
 	}
-	if err := completePendingCutoverControlRequests(ctx, c.storage, apply); err != nil {
+	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover); err != nil {
 		return err
 	}
 	c.logger.Info("pending cutover request accepted and completed",
@@ -547,7 +547,7 @@ func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, apply *
 }
 
 func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
-	controlReq, err := pendingStopControlRequest(ctx, c.storage, apply)
+	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
 		return false, err
 	}
@@ -572,7 +572,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending stop request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 			return true, err
 		}
 		return c.stopHandledUnlessStartPending(ctx, apply)
@@ -592,7 +592,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending stop request rejected: %s%s", message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		if err := failPendingStopControlRequests(ctx, c.storage, apply, message); err != nil {
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop, message); err != nil {
 			return true, err
 		}
 		return true, nil

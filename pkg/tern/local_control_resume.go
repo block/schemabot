@@ -213,14 +213,14 @@ func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Ap
 }
 
 func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, apply *storage.Apply, options map[string]string, releaseAtCutoverBarrier bool) (bool, error) {
-	controlReq, err := pendingStartControlRequest(ctx, c.storage, apply)
+	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStart)
 	if err != nil {
 		return false, err
 	}
 	if controlReq == nil {
 		return false, nil
 	}
-	if stopReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
+	if stopReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 		return true, fmt.Errorf("check pending stop before pending start for apply %s: %w", apply.ApplyIdentifier, err)
 	} else if stopReq != nil {
 		c.logger.Info("pending start request is waiting for pending stop request to finish",
@@ -237,7 +237,7 @@ func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, app
 	}
 	started, err := c.startDeferredDeploy(ctx, apply, controlRequestCaller(controlReq))
 	if err != nil {
-		if failErr := failPendingStartControlRequests(ctx, c.storage, apply, err.Error()); failErr != nil {
+		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, err.Error()); failErr != nil {
 			return true, fmt.Errorf("process pending start for apply %s: %w; fail pending start request: %w", apply.ApplyIdentifier, err, failErr)
 		}
 		return true, fmt.Errorf("process pending start for apply %s: %w", apply.ApplyIdentifier, err)
@@ -248,7 +248,7 @@ func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, app
 		if resp != nil && resp.ErrorMessage != "" {
 			errorMessage = resp.ErrorMessage
 		}
-		if err := failPendingStartControlRequests(ctx, c.storage, apply, errorMessage); err != nil {
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, errorMessage); err != nil {
 			return true, err
 		}
 		return true, fmt.Errorf("process pending start for apply %s: %s", apply.ApplyIdentifier, errorMessage)
@@ -261,7 +261,7 @@ func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, app
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		return true, fmt.Errorf("update started deferred deploy apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
 		return true, err
 	}
 	c.logger.Info("pending start request accepted and completed",
@@ -601,7 +601,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 			return fmt.Errorf("mark grouped resume apply %s completed after final schema check: %w", apply.ApplyIdentifier, err)
 		}
 		if startRequested {
-			if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+			if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
 				return err
 			}
 		}
@@ -696,7 +696,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 			return fmt.Errorf("mark grouped resume apply %s %s: %w", apply.ApplyIdentifier, apply.State, err)
 		}
 		if startRequested {
-			if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+			if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
 				return err
 			}
 		}
@@ -1065,7 +1065,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		c.notifyTerminalObserver(apply, tasks)
 		return nil
 	}
-	startControlReq, err := pendingStartControlRequest(ctx, c.storage, apply)
+	startControlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStart)
 	if err != nil {
 		return err
 	}
@@ -1082,7 +1082,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Completed, "error", err)
 		}
 		if startRequested {
-			if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+			if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
 				return err
 			}
 		}
@@ -1119,7 +1119,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 			return fmt.Errorf("mark sequential resume apply %s running: %w", apply.ApplyIdentifier, err)
 		}
 		if startRequested {
-			if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+			if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
 				return err
 			}
 		}
@@ -1157,7 +1157,7 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 		fmt.Sprintf("Recovery failed: %v", err), apply.State, state.Apply.Failed)
 	c.failApplyWithTasks(ctx, apply, tasks, err.Error())
 	if startRequested {
-		if failErr := failPendingStartControlRequests(ctx, c.storage, apply, err.Error()); failErr != nil {
+		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, err.Error()); failErr != nil {
 			return failErr
 		}
 	}

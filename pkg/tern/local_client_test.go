@@ -1617,7 +1617,7 @@ func TestPrepareStoppedTasksForResumeQueuesOnlyStoppedTasks(t *testing.T) {
 			}
 			apply := &storage.Apply{ID: 123, State: applyState}
 
-			controlReq, err := pendingStartControlRequest(t.Context(), client.storage, apply)
+			controlReq, err := pendingControlRequest(t.Context(), client.storage, apply, storage.ControlOperationStart)
 			require.NoError(t, err)
 			client.prepareStoppedTasksForResume(t.Context(), apply, []*storage.Task{stoppedTask, completedTask}, controlReq != nil)
 

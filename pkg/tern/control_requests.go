@@ -9,7 +9,9 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-func pendingStartControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) (*storage.ApplyControlRequest, error) {
+// pendingControlRequest loads the pending control request of the given operation
+// for an apply, returning nil when none is pending.
+func pendingControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
 	if store == nil {
 		return nil, fmt.Errorf("storage is not available")
 	}
@@ -17,92 +19,49 @@ func pendingStartControlRequest(ctx context.Context, store storage.Storage, appl
 	if controlStore == nil {
 		return nil, fmt.Errorf("control request store is not available")
 	}
-	controlReq, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationStart)
+	controlReq, err := controlStore.GetPending(ctx, apply.ID, operation)
 	if err != nil {
-		return nil, fmt.Errorf("load pending start control request for apply %s: %w", apply.ApplyIdentifier, err)
+		return nil, fmt.Errorf("load pending %s control request for apply %s: %w", operation, apply.ApplyIdentifier, err)
 	}
 	return controlReq, nil
 }
 
-func completePendingStartControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply) error {
+// completePendingControlRequests marks the pending control request of the given
+// operation completed, after verifying the apply lease still holds.
+func completePendingControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) error {
 	if store == nil {
 		return fmt.Errorf("storage is not available")
 	}
-	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, storage.ControlOperationStart); err != nil {
+	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, operation); err != nil {
 		return err
 	}
 	controlStore := store.ControlRequests()
 	if controlStore == nil {
 		return fmt.Errorf("control request store is not available")
 	}
-	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStart); err != nil {
-		return fmt.Errorf("complete pending start control request for apply %s: %w", apply.ApplyIdentifier, err)
+	if err := controlStore.CompletePending(ctx, apply.ID, operation); err != nil {
+		return fmt.Errorf("complete pending %s control request for apply %s: %w", operation, apply.ApplyIdentifier, err)
 	}
 	return nil
 }
 
-func failPendingStartControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, errorMessage string) error {
+// failPendingControlRequests marks the pending control request of the given
+// operation terminally failed. A failed request is no longer pending, so the
+// operator-owned retry loop stops re-running the operation instead of spinning
+// on a permanent rejection.
+func failPendingControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation, errorMessage string) error {
 	if store == nil {
 		return fmt.Errorf("storage is not available")
 	}
-	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, storage.ControlOperationStart); err != nil {
+	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, operation); err != nil {
 		return err
 	}
 	controlStore := store.ControlRequests()
 	if controlStore == nil {
 		return fmt.Errorf("control request store is not available")
 	}
-	if err := controlStore.FailPending(ctx, apply.ID, storage.ControlOperationStart, errorMessage); err != nil {
-		return fmt.Errorf("fail pending start control request for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-	return nil
-}
-
-func pendingCutoverControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) (*storage.ApplyControlRequest, error) {
-	if store == nil {
-		return nil, fmt.Errorf("storage is not available")
-	}
-	controlStore := store.ControlRequests()
-	if controlStore == nil {
-		return nil, fmt.Errorf("control request store is not available")
-	}
-	controlReq, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationCutover)
-	if err != nil {
-		return nil, fmt.Errorf("load pending cutover control request for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-	return controlReq, nil
-}
-
-func completePendingCutoverControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply) error {
-	if store == nil {
-		return fmt.Errorf("storage is not available")
-	}
-	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, storage.ControlOperationCutover); err != nil {
-		return err
-	}
-	controlStore := store.ControlRequests()
-	if controlStore == nil {
-		return fmt.Errorf("control request store is not available")
-	}
-	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationCutover); err != nil {
-		return fmt.Errorf("complete pending cutover control request for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-	return nil
-}
-
-func failPendingCutoverControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, errorMessage string) error {
-	if store == nil {
-		return fmt.Errorf("storage is not available")
-	}
-	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, storage.ControlOperationCutover); err != nil {
-		return err
-	}
-	controlStore := store.ControlRequests()
-	if controlStore == nil {
-		return fmt.Errorf("control request store is not available")
-	}
-	if err := controlStore.FailPending(ctx, apply.ID, storage.ControlOperationCutover, errorMessage); err != nil {
-		return fmt.Errorf("fail pending cutover control request for apply %s: %w", apply.ApplyIdentifier, err)
+	if err := controlStore.FailPending(ctx, apply.ID, operation, errorMessage); err != nil {
+		return fmt.Errorf("fail pending %s control request for apply %s: %w", operation, apply.ApplyIdentifier, err)
 	}
 	return nil
 }
@@ -163,58 +122,6 @@ func cutoverRequestFailedByApplyState(applyState string) bool {
 	return state.IsTerminalApplyState(applyState) && !cutoverRequestResolvedByApplyState(applyState)
 }
 
-func pendingStopControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) (*storage.ApplyControlRequest, error) {
-	if store == nil {
-		return nil, fmt.Errorf("storage is not available")
-	}
-	controlStore := store.ControlRequests()
-	if controlStore == nil {
-		return nil, fmt.Errorf("control request store is not available")
-	}
-	controlReq, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationStop)
-	if err != nil {
-		return nil, fmt.Errorf("load pending stop control request for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-	return controlReq, nil
-}
-
-func completePendingStopControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply) error {
-	if store == nil {
-		return fmt.Errorf("storage is not available")
-	}
-	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, storage.ControlOperationStop); err != nil {
-		return err
-	}
-	controlStore := store.ControlRequests()
-	if controlStore == nil {
-		return fmt.Errorf("control request store is not available")
-	}
-	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
-		return fmt.Errorf("complete pending stop control request for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-	return nil
-}
-
-// failPendingStopControlRequests marks the pending stop request terminally
-// failed. A failed request is no longer pending, so the operator-owned retry
-// loop stops re-running stop instead of spinning on a permanent rejection.
-func failPendingStopControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, errorMessage string) error {
-	if store == nil {
-		return fmt.Errorf("storage is not available")
-	}
-	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, storage.ControlOperationStop); err != nil {
-		return err
-	}
-	controlStore := store.ControlRequests()
-	if controlStore == nil {
-		return fmt.Errorf("control request store is not available")
-	}
-	if err := controlStore.FailPending(ctx, apply.ID, storage.ControlOperationStop, errorMessage); err != nil {
-		return fmt.Errorf("fail pending stop control request for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-	return nil
-}
-
 func ensureApplyLeaseForControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) error {
 	lease, ok := storage.ApplyLeaseFromContext(ctx)
 	if !ok {
@@ -249,7 +156,7 @@ func completePendingStopIfStoredApplyResolved(ctx context.Context, store storage
 	if !state.IsTerminalApplyState(storedApply.State) {
 		return false, nil
 	}
-	if err := completePendingStopControlRequests(ctx, store, storedApply); err != nil {
+	if err := completePendingControlRequests(ctx, store, storedApply, storage.ControlOperationStop); err != nil {
 		return false, err
 	}
 	*apply = *storedApply
