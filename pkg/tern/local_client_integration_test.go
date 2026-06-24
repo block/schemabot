@@ -837,8 +837,7 @@ func TestLocalClient_Apply_IdempotentDispatch(t *testing.T) {
 		t.Skip("skipping integration test in short mode")
 	}
 
-	container, dsn := setupMySQLContainer(t)
-	_ = container
+	_, dsn := setupMySQLContainer(t)
 	setupStorageSchema(t, dsn)
 	cleanupTestTables(t, dsn)
 

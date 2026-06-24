@@ -1691,7 +1691,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		// races as "already in progress". Re-resolve by idempotency key so the
 		// winning apply is returned instead of a spurious rejection.
 		if existing, lookupErr := c.existingIdempotentApply(ctx, req); lookupErr != nil {
-			return nil, lookupErr
+			return nil, errors.Join(err, lookupErr)
 		} else if existing != nil {
 			c.logger.Info("Apply: idempotency key resolved an active-conflict race",
 				"apply_id", existing.ApplyIdentifier,
