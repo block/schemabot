@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -792,10 +793,9 @@ func (c *LocalClient) groupedResumeState(ctx context.Context, apply *storage.App
 // groupedResumeChanges rebuilds the engine changes for a grouped resume from
 // the stored tasks, grouped per namespace. Tasks carry the authoritative
 // remaining work after re-planning, and engines key per-table progress on
-// namespace and table, so the rebuilt changes must preserve both. VSchema tasks
-// carry no DDL — they are excluded from TableChanges and instead flag their
-// namespace with the vschema_changed metadata so the engine applies vschema.json
-// from the schema files, mirroring how the fresh apply builds changes.
+// namespace and table, so the rebuilt changes must preserve both. VSchema is not
+// a task — it runs as a task-less group_finalizer reconstructed from the plan —
+// so every task here is table DDL.
 func groupedResumeChanges(tasks []*storage.Task) []engine.SchemaChange {
 	indexByNamespace := make(map[string]int, len(tasks))
 	var changes []engine.SchemaChange
@@ -810,13 +810,6 @@ func groupedResumeChanges(tasks []*storage.Task) []engine.SchemaChange {
 	}
 	for _, task := range tasks {
 		idx := ensureNamespace(task.Namespace)
-		if isVSchemaTask(task) {
-			if changes[idx].Metadata == nil {
-				changes[idx].Metadata = make(map[string]string)
-			}
-			changes[idx].Metadata["vschema_changed"] = "true"
-			continue
-		}
 		changes[idx].TableChanges = append(changes[idx].TableChanges, engine.TableChange{
 			Table:     task.TableName,
 			DDL:       task.DDL,
@@ -824,13 +817,6 @@ func groupedResumeChanges(tasks []*storage.Task) []engine.SchemaChange {
 		})
 	}
 	return changes
-}
-
-// isVSchemaTask reports whether a task represents a VSchema update rather than a
-// table DDL change. VSchema tasks have no DDL; their work is applying the
-// namespace's vschema.json.
-func isVSchemaTask(task *storage.Task) bool {
-	return task.DDLAction == "vschema_update"
 }
 
 func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*storage.Task) {
@@ -859,17 +845,6 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 // are loaded scoped to the operation rather than the whole apply, so a driver
 // can advance one deployment independently of its siblings.
 func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
-	tasks, err := c.storage.Tasks().GetByApplyOperationID(ctx, applyOperationID)
-	if err != nil {
-		return fmt.Errorf("get tasks for apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
-	}
-	// An empty result is the fail-closed signal for an invalid or mismatched
-	// applyOperationID. Unlike ResumeApply, we must not forward this to
-	// resumeApplyWithTasks: that path marks the whole parent apply as failed,
-	// which is incorrect when only one operation lookup came back empty.
-	if len(tasks) == 0 {
-		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
-	}
 	op, err := c.storage.ApplyOperations().Get(ctx, applyOperationID)
 	if err != nil {
 		return fmt.Errorf("get apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
@@ -882,6 +857,21 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 	// this apply's state. The routing and gRPC paths enforce the same invariant.
 	if op.ApplyID != apply.ID {
 		return fmt.Errorf("apply_operation %d belongs to apply %d, not %s (%d)", applyOperationID, op.ApplyID, apply.ApplyIdentifier, apply.ID)
+	}
+	tasks, err := c.storage.Tasks().GetByApplyOperationID(ctx, applyOperationID)
+	if err != nil {
+		return fmt.Errorf("get tasks for apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
+	}
+	if len(tasks) == 0 {
+		// A group_finalizer carries no tasks: it applies the namespace's VSchema
+		// from the plan once its sibling shard work has completed. Any other
+		// (work) operation with no tasks is the fail-closed signal for an invalid
+		// or mismatched applyOperationID — unlike ResumeApply, we must not forward
+		// it to resumeApplyWithTasks, which would fail the whole parent apply.
+		if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+			return c.driveGroupFinalizer(ctx, apply, op)
+		}
+		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
 	}
 	siblings, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
@@ -908,13 +898,6 @@ func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *st
 	if apply == nil {
 		return fmt.Errorf("stored apply is required to drive apply_operation %d cutover", applyOperationID)
 	}
-	tasks, err := c.storage.Tasks().GetByApplyOperationID(ctx, applyOperationID)
-	if err != nil {
-		return fmt.Errorf("get tasks for apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
-	}
-	if len(tasks) == 0 {
-		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
-	}
 	op, err := c.storage.ApplyOperations().Get(ctx, applyOperationID)
 	if err != nil {
 		return fmt.Errorf("get apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
@@ -927,6 +910,19 @@ func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *st
 	// under this apply's state. The routing and gRPC paths enforce the same.
 	if op.ApplyID != apply.ID {
 		return fmt.Errorf("apply_operation %d belongs to apply %d, not %s (%d)", applyOperationID, op.ApplyID, apply.ApplyIdentifier, apply.ID)
+	}
+	tasks, err := c.storage.Tasks().GetByApplyOperationID(ctx, applyOperationID)
+	if err != nil {
+		return fmt.Errorf("get tasks for apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
+	}
+	if len(tasks) == 0 {
+		// A task-less group_finalizer applies its namespace's VSchema (including
+		// any cutover) from the plan; drive it directly. A work operation with no
+		// tasks fails closed rather than failing the whole parent apply.
+		if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+			return c.driveGroupFinalizer(ctx, apply, op)
+		}
+		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
 	}
 	// Fail closed unless the operation is actually in a cutover phase. A
 	// copy-phase or terminal operation must never be forced into a cutover drive.
@@ -942,6 +938,116 @@ func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *st
 	opts := apply.GetOptions()
 	opts.DeferCutover = false
 	return c.resumeApplyWithTasks(ctx, apply, tasks, opts.Map(), false, true)
+}
+
+// finalizerOperationKeySuffix is the trailing segment of a group_finalizer
+// operation key (namespace + "/" + segment), assigned at apply creation. The
+// drive parses the namespace back out to reconstruct the VSchema change.
+const finalizerOperationKeySuffix = "/group_finalizer"
+
+// namespaceFromFinalizerKey recovers the namespace a group_finalizer operation
+// targets from its operation key. Returns empty when the key is not a finalizer
+// key, which the caller treats as a fail-closed condition.
+func namespaceFromFinalizerKey(operationKey string) string {
+	if !strings.HasSuffix(operationKey, finalizerOperationKeySuffix) {
+		return ""
+	}
+	return strings.TrimSuffix(operationKey, finalizerOperationKeySuffix)
+}
+
+// driveGroupFinalizer drives a task-less group_finalizer operation: it applies
+// the namespace's VSchema once its sibling shard work has completed. The change
+// is reconstructed from the plan (the finalizer carries no task), and engine
+// resume state is persisted on the operation row so a restart reattaches to the
+// in-flight VSchema application instead of starting over.
+//
+// It fails closed: the operation is marked completed only on a successful,
+// accepted engine apply. Any error (missing namespace/plan/engine, a rejected
+// apply, or an apply error) marks the operation failed and returns, so the
+// operator never advances the parent's aggregate as if the VSchema applied.
+func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Apply, op *storage.ApplyOperation) error {
+	namespace := namespaceFromFinalizerKey(op.OperationKey)
+	if namespace == "" {
+		return fmt.Errorf("group_finalizer apply_operation %d (apply %s) has no namespace in operation key %q", op.ID, apply.ApplyIdentifier, op.OperationKey)
+	}
+	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	if err != nil {
+		return fmt.Errorf("load plan for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
+	}
+	if plan == nil {
+		return fmt.Errorf("plan %d not found for group_finalizer apply_operation %d (apply %s)", apply.PlanID, op.ID, apply.ApplyIdentifier)
+	}
+	nsData := plan.Namespaces[namespace]
+	if nsData == nil || !namespaceHasVSchemaArtifact(nsData) {
+		return fmt.Errorf("plan %d has no VSchema artifact for group_finalizer namespace %q (apply %s)", apply.PlanID, namespace, apply.ApplyIdentifier)
+	}
+	eng := c.getEngine()
+	if eng == nil {
+		return fmt.Errorf("no engine available to drive group_finalizer apply_operation %d (apply %s)", op.ID, apply.ApplyIdentifier)
+	}
+	creds, err := c.credentialsForGroupedApply(plan)
+	if err != nil {
+		return fmt.Errorf("resolve credentials for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
+	}
+
+	c.logger.Info("driving group_finalizer VSchema apply",
+		"apply_id", apply.ApplyIdentifier,
+		"apply_operation_id", op.ID,
+		"deployment", op.Deployment,
+		"namespace", namespace,
+		"database", apply.Database,
+	)
+	if err := c.storage.ApplyOperations().MarkStarted(ctx, op.ID); err != nil {
+		return fmt.Errorf("mark group_finalizer apply_operation %d started (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
+	}
+
+	failClosed := func(cause error) error {
+		if markErr := c.storage.ApplyOperations().MarkFailed(ctx, op.ID, cause.Error()); markErr != nil {
+			c.logger.Error("group_finalizer: failed to mark operation failed",
+				"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", markErr)
+		}
+		return cause
+	}
+
+	var resumeState *engine.ResumeState
+	if stored, getErr := c.storage.ApplyOperations().GetEngineResumeState(ctx, op.ID); getErr == nil && stored != nil {
+		resumeState = &engine.ResumeState{MigrationContext: stored.MigrationContext, Metadata: stored.Metadata}
+	}
+
+	result, err := eng.Apply(ctx, &engine.ApplyRequest{
+		Database:    apply.Database,
+		PlanID:      plan.PlanIdentifier,
+		Changes:     []engine.SchemaChange{{Namespace: namespace, Metadata: map[string]string{"vschema_changed": "true"}}},
+		SchemaFiles: plan.SchemaFiles,
+		Options:     apply.GetOptions().Map(),
+		ResumeState: resumeState,
+		Credentials: creds,
+		OnStateChange: func(rs *engine.ResumeState) {
+			if rs == nil {
+				return
+			}
+			if saveErr := c.storage.ApplyOperations().SaveEngineResumeState(ctx, op.ID, &storage.EngineResumeState{
+				ApplyOperationID: op.ID,
+				MigrationContext: rs.MigrationContext,
+				Metadata:         rs.Metadata,
+			}); saveErr != nil {
+				c.logger.Warn("group_finalizer: failed to persist engine resume state",
+					"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", saveErr)
+			}
+		},
+	})
+	if err != nil {
+		return failClosed(fmt.Errorf("apply VSchema for group_finalizer namespace %q (apply %s): %w", namespace, apply.ApplyIdentifier, err))
+	}
+	if result == nil || !result.Accepted {
+		return failClosed(fmt.Errorf("group_finalizer VSchema apply for namespace %q (apply %s) was not accepted", namespace, apply.ApplyIdentifier))
+	}
+	if err := c.storage.ApplyOperations().MarkCompleted(ctx, op.ID); err != nil {
+		return fmt.Errorf("mark group_finalizer apply_operation %d completed (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
+	}
+	c.logger.Info("group_finalizer VSchema apply completed",
+		"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "namespace", namespace)
+	return nil
 }
 
 // resumeApplyWithTasks drives an apply (or one of its operations) from the set

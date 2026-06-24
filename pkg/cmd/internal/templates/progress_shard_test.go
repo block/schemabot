@@ -130,14 +130,6 @@ func TestFormatShardLineDisplaysOnePercentAfterCopyStarts(t *testing.T) {
 	assert.NotContains(t, line, "0%")
 }
 
-func TestIsVSchemaTask(t *testing.T) {
-	assert.True(t, isVSchemaTask(TableProgress{TableName: "VSchema"}))
-	assert.True(t, isVSchemaTask(TableProgress{TableName: "vschema:myapp_sharded"}))
-	assert.True(t, isVSchemaTask(TableProgress{TableName: "VSchema: myapp_sharded"}))
-	assert.False(t, isVSchemaTask(TableProgress{TableName: "users"}))
-	assert.False(t, isVSchemaTask(TableProgress{TableName: "orders"}))
-}
-
 func TestIsPlanetScaleEngine(t *testing.T) {
 	assert.True(t, state.IsPlanetScaleEngine("planetscale"))
 	assert.True(t, state.IsPlanetScaleEngine("PlanetScale"))

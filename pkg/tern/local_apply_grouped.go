@@ -954,18 +954,6 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 		if retryableFailure && state.IsTerminalTaskState(task.State) {
 			continue
 		}
-		// VSchema tasks follow deploy-request-level state, not per-migration state.
-		// They have no SHOW VITESS_MIGRATIONS rows. Their state transitions are:
-		// pending → running (during in_progress_vschema) → completed/failed.
-		if isVSchemaTask(task) {
-			vsState := c.deriveVSchemaTaskState(task, result, newState, now)
-			if vsState != task.State {
-				msg := fmt.Sprintf("VSchema %s → %s", task.State, vsState)
-				c.transitionTaskState(ctx, task, task.ApplyID, vsState, msg)
-			}
-			continue
-		}
-
 		if tp, ok := engineProgressForTask(tableProgress, task); ok {
 			task.RowsCopied = tp.RowsCopied
 			task.RowsTotal = tp.RowsTotal
@@ -1068,45 +1056,5 @@ func (c *LocalClient) writeShardProgress(ctx context.Context, table *storage.Tas
 			"database", table.Database, "environment", table.Environment,
 			"namespace", table.Namespace, "table", table.TableName, "shard", sh.Shard,
 			"error", err)
-	}
-}
-
-// deriveVSchemaTaskState determines the state for a VSchema task based on
-// the engine progress result. VSchema tasks have no per-migration rows in
-// SHOW VITESS_MIGRATIONS — their state tracks the deploy request's VSchema
-// application phase (in_progress_vschema).
-func (c *LocalClient) deriveVSchemaTaskState(task *storage.Task, result *engine.ProgressResult, taskState string, now time.Time) string {
-	if state.IsTerminalTaskState(task.State) {
-		return task.State
-	}
-
-	switch {
-	case state.IsState(taskState, state.Task.FailedRetryable):
-		if task.ErrorMessage == "" {
-			task.ErrorMessage = progressFailureMessage(result)
-		}
-		return state.Task.FailedRetryable
-	case result.Message == engine.MessageApplyingVSchema:
-		if task.StartedAt == nil {
-			task.StartedAt = &now
-		}
-		return state.Task.Running
-	case result.State == engine.StateFailed:
-		if task.CompletedAt == nil {
-			task.CompletedAt = &now
-		}
-		return state.Task.Failed
-	case state.IsState(taskState, state.Task.RevertWindow):
-		if task.CompletedAt == nil {
-			task.CompletedAt = &now
-		}
-		return state.Task.RevertWindow
-	case result.State.IsTerminal(), state.IsState(taskState, state.Task.Completed):
-		if task.CompletedAt == nil {
-			task.CompletedAt = &now
-		}
-		return state.Task.Completed
-	default:
-		return task.State
 	}
 }

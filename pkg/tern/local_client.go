@@ -1677,19 +1677,9 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	}
 	optionsJSON := storage.MarshalApplyOptions(applyOpts)
 
-	// Create VSchema tasks for namespaces with VSchema changes so the
-	// progress API and TUI can track VSchema application alongside DDL.
-	// For VSchema-only deploys (0 DDL changes), this gives the progress API
-	// something to track.
-	for ns, nsData := range plan.Namespaces {
-		if namespaceHasVSchemaArtifact(nsData) {
-			ddlChanges = append(ddlChanges, storage.TableChange{
-				Table:     "VSchema: " + ns,
-				Namespace: ns,
-				Operation: "vschema_update",
-			})
-		}
-	}
+	// VSchema application is not modeled as a synthetic task. PlanetScale
+	// surfaces its VSchema status/diff from engine resume metadata, and a sharded
+	// apply runs VSchema as a task-less group_finalizer derived from the plan.
 
 	// Build the Apply record (1 Apply -> N Tasks).
 	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
