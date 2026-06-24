@@ -445,6 +445,14 @@ type psMetadata struct {
 	// same path branch/deploy-URL/instant use.
 	VSchemaStatus string `json:"vschema_status,omitempty"`
 
+	// VSchemaDiff is the VSchema change rendered as a unified diff, captured at
+	// deploy creation from the plan annotation. It is surfaced through the
+	// display-metadata projection so the progress view can show the VSchema
+	// change alongside its status without a synthetic task row. Empty when the
+	// deploy carries no VSchema change. For a deploy spanning multiple keyspaces
+	// the per-keyspace diffs are concatenated under keyspace headers.
+	VSchemaDiff string `json:"vschema_diff,omitempty"`
+
 	// ExistingMigrationCtxs is the set of SHOW VITESS_MIGRATIONS contexts that
 	// already existed just before this deploy started, keyed by context. It is
 	// the durable baseline that lets a later process — a resume on another pod,

@@ -612,6 +612,9 @@ func psDisplayMetadata(meta *psMetadata) map[string]string {
 	if meta.VSchemaStatus != "" {
 		set("vschema_status", meta.VSchemaStatus)
 	}
+	if meta.VSchemaDiff != "" {
+		set("vschema_diff", meta.VSchemaDiff)
+	}
 	return m
 }
 

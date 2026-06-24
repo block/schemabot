@@ -32,6 +32,39 @@ func noChangesApplyResult(message string) *engine.ApplyResult {
 	return &engine.ApplyResult{Accepted: true, Message: message}
 }
 
+// combinedVSchemaDiff joins the per-keyspace VSchema diffs carried on the plan
+// annotations (SchemaChange.Metadata["vschema"]) into a single display blob.
+// Returns empty when no namespace changes its VSchema. A deploy that touches a
+// single keyspace returns that keyspace's diff verbatim; a multi-keyspace deploy
+// prefixes each diff with its keyspace so the rendered output stays unambiguous.
+func combinedVSchemaDiff(changes []engine.SchemaChange) string {
+	type nsDiff struct {
+		namespace string
+		diff      string
+	}
+	var diffs []nsDiff
+	for _, sc := range changes {
+		if d := sc.Metadata["vschema"]; d != "" {
+			diffs = append(diffs, nsDiff{namespace: sc.Namespace, diff: d})
+		}
+	}
+	switch len(diffs) {
+	case 0:
+		return ""
+	case 1:
+		return diffs[0].diff
+	default:
+		var b strings.Builder
+		for i, d := range diffs {
+			if i > 0 {
+				b.WriteString("\n")
+			}
+			fmt.Fprintf(&b, "keyspace %s:\n%s", d.namespace, d.diff)
+		}
+		return b.String()
+	}
+}
+
 // Apply starts executing a schema change plan.
 // Creates a PlanetScale branch, applies DDL via MySQL connection to the branch,
 // then creates and starts a deploy request.
@@ -90,6 +123,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			Metadata:         encoded,
 		})
 	}
+
+	// Capture the VSchema diff carried on the plan annotations so it can be
+	// surfaced from stored state alongside the deploy's VSchema status, without a
+	// synthetic task row. Empty when no namespace changes its VSchema.
+	vschemaDiff := combinedVSchemaDiff(req.Changes)
 
 	// Create or reuse a branch
 	existingBranch := req.Options["branch"]
@@ -261,6 +299,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		BranchName:            branchName,
 		DeployRequestID:       dr.Number,
 		DeployRequestURL:      dr.HtmlURL,
+		VSchemaDiff:           vschemaDiff,
 		ExistingMigrationCtxs: existingContexts,
 	})
 	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr)
@@ -356,6 +395,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			DeployRequestURL:      dr.HtmlURL,
 			IsInstant:             useInstant,
 			DeferredDeploy:        true,
+			VSchemaDiff:           vschemaDiff,
 			ExistingMigrationCtxs: existingContexts,
 		})
 		if encErr != nil {
@@ -428,6 +468,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		DeployRequestID:       dr.Number,
 		DeployRequestURL:      dr.HtmlURL,
 		IsInstant:             useInstant,
+		VSchemaDiff:           vschemaDiff,
 		ExistingMigrationCtxs: existingContexts,
 	})
 	if err != nil {
