@@ -963,29 +963,36 @@ func stopRequestCounts(tasks []*storage.Task) (int64, int64) {
 	return stoppedCount, skippedCount
 }
 
-func (s *Service) createStopControlRequest(ctx context.Context, apply *storage.Apply, caller string, stoppedCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
+// createControlRequest marshals metadata and records a pending control request
+// for the given operation, keeping the per-operation create helpers to a single
+// descriptor call instead of duplicating the store/marshal/record boilerplate.
+func (s *Service) createControlRequest(ctx context.Context, apply *storage.Apply, op storage.ControlOperation, caller string, metadata any) (*storage.ApplyControlRequest, bool, error) {
 	controlStore := s.storage.ControlRequests()
 	if controlStore == nil {
 		return nil, false, fmt.Errorf("control request store is not available")
 	}
-	metadata, err := json.Marshal(stopControlRequestMetadata{
-		StoppedCount: stoppedCount,
-		SkippedCount: skippedCount,
-	})
+	metadataJSON, err := json.Marshal(metadata)
 	if err != nil {
-		return nil, false, fmt.Errorf("marshal stop control request metadata for apply %s: %w", apply.ApplyIdentifier, err)
+		return nil, false, fmt.Errorf("marshal %s control request metadata for apply %s: %w", op, apply.ApplyIdentifier, err)
 	}
 	controlReq, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
-		Operation:   storage.ControlOperationStop,
+		Operation:   op,
 		Status:      storage.ControlRequestPending,
 		RequestedBy: caller,
-		Metadata:    metadata,
+		Metadata:    metadataJSON,
 	})
 	if err != nil {
-		return nil, false, fmt.Errorf("record stop control request for apply %s: %w", apply.ApplyIdentifier, err)
+		return nil, false, fmt.Errorf("record %s control request for apply %s: %w", op, apply.ApplyIdentifier, err)
 	}
 	return controlReq, alreadyPending, nil
+}
+
+func (s *Service) createStopControlRequest(ctx context.Context, apply *storage.Apply, caller string, stoppedCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
+	return s.createControlRequest(ctx, apply, storage.ControlOperationStop, caller, stopControlRequestMetadata{
+		StoppedCount: stoppedCount,
+		SkippedCount: skippedCount,
+	})
 }
 
 func (s *Service) pendingStopResponseIfPresent(ctx context.Context, apply *storage.Apply) (*ternv1.StopResponse, string, bool, error) {
@@ -1395,28 +1402,10 @@ func (s *Service) persistStartRequestForOperator(ctx context.Context, apply *sto
 }
 
 func (s *Service) createStartControlRequest(ctx context.Context, apply *storage.Apply, caller string, startedCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
-	controlStore := s.storage.ControlRequests()
-	if controlStore == nil {
-		return nil, false, fmt.Errorf("control request store is not available")
-	}
-	metadata, err := json.Marshal(startControlRequestMetadata{
+	return s.createControlRequest(ctx, apply, storage.ControlOperationStart, caller, startControlRequestMetadata{
 		StartedCount: startedCount,
 		SkippedCount: skippedCount,
 	})
-	if err != nil {
-		return nil, false, fmt.Errorf("marshal start control request metadata for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-	controlReq, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
-		ApplyID:     apply.ID,
-		Operation:   storage.ControlOperationStart,
-		Status:      storage.ControlRequestPending,
-		RequestedBy: caller,
-		Metadata:    metadata,
-	})
-	if err != nil {
-		return nil, false, fmt.Errorf("record start control request for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-	return controlReq, alreadyPending, nil
 }
 
 func (s *Service) startResponseForPendingStartRequest(ctx context.Context, apply *storage.Apply) (*ternv1.StartResponse, string, error) {
