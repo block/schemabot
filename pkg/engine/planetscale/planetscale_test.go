@@ -422,3 +422,26 @@ func TestFormatDeployRequestError(t *testing.T) {
 		assert.Equal(t, "deploy request #99 failed during preparation (state: error)", msg)
 	})
 }
+
+func TestNextVSchemaStatus(t *testing.T) {
+	tests := []struct {
+		name     string
+		current  string
+		drState  string
+		expected string
+	}{
+		{"enters vschema phase", "", deployState.InProgressVSchema, vschemaStatusApplying},
+		{"stays applying mid-phase", vschemaStatusApplying, deployState.InProgressVSchema, vschemaStatusApplying},
+		{"applied on complete after phase", vschemaStatusApplying, deployState.Complete, vschemaStatusApplied},
+		{"applied on complete_pending_revert after phase", vschemaStatusApplying, deployState.CompletePendingRevert, vschemaStatusApplied},
+		{"complete without prior phase stays empty", "", deployState.Complete, ""},
+		{"unrelated state leaves applying untouched", vschemaStatusApplying, deployState.InProgress, vschemaStatusApplying},
+		{"unrelated state leaves empty untouched", "", deployState.Queued, ""},
+		{"already applied is stable on complete", vschemaStatusApplied, deployState.Complete, vschemaStatusApplied},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, nextVSchemaStatus(tc.current, tc.drState))
+		})
+	}
+}
