@@ -456,6 +456,35 @@ func (c *LocalClient) planNamespace(ns string) string {
 	return ns
 }
 
+// engineShardPlansToStorage converts an engine's per-shard plan metadata into
+// stored shard plan rows, mirroring the gRPC path's protoShardPlansToStorage:
+// shard names are trimmed and must be non-empty (an empty shard would produce an
+// invalid sharded operation key like "namespace//table"). An empty namespace
+// defaults to the resolved plan namespace so apply-create groups the shard under
+// the same namespace as its table changes.
+func engineShardPlansToStorage(shards []engine.ShardPlan, planNamespace string) ([]storage.ShardPlan, error) {
+	if len(shards) == 0 {
+		return nil, nil
+	}
+	out := make([]storage.ShardPlan, 0, len(shards))
+	for i, sp := range shards {
+		shardName := strings.TrimSpace(sp.Shard)
+		if shardName == "" {
+			return nil, fmt.Errorf("shard plan %d has empty shard", i)
+		}
+		namespace := strings.TrimSpace(sp.Namespace)
+		if namespace == "" {
+			namespace = planNamespace
+		}
+		out = append(out, storage.ShardPlan{
+			Shard:       shardName,
+			Namespace:   namespace,
+			NeedsChange: sp.NeedsChange,
+		})
+	}
+	return out, nil
+}
+
 // Health checks the service health.
 func (c *LocalClient) Health(ctx context.Context) error {
 	return c.storage.Ping(ctx)
@@ -1010,6 +1039,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	// Build per-namespace plan data from the engine's changes.
 	// For Vitess, each namespace is a keyspace. For Spirit, there's one namespace.
 	namespaces := make(map[string]*storage.NamespacePlanData)
+	var allShardPlans []storage.ShardPlan
 	for _, sc := range result.Changes {
 		ns := c.planNamespace(sc.Namespace)
 		nsData := namespaces[ns]
@@ -1027,17 +1057,12 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		// Carry per-shard fanout metadata from the engine into stored plan data,
 		// mirroring the gRPC path's protoShardPlansToStorage. Apply-create reads
 		// NamespacePlanData.Shards to rebuild per-shard operation groups.
-		for _, sp := range sc.Shards {
-			namespace := sp.Namespace
-			if namespace == "" {
-				namespace = ns
-			}
-			nsData.Shards = append(nsData.Shards, storage.ShardPlan{
-				Shard:       sp.Shard,
-				Namespace:   namespace,
-				NeedsChange: sp.NeedsChange,
-			})
+		shardPlans, err := engineShardPlansToStorage(sc.Shards, ns)
+		if err != nil {
+			return nil, fmt.Errorf("namespace %q: %w", ns, err)
 		}
+		nsData.Shards = append(nsData.Shards, shardPlans...)
+		allShardPlans = append(allShardPlans, shardPlans...)
 		if len(sc.OriginalFiles) > 0 {
 			nsData.OriginalFiles = sc.OriginalFiles
 		}
@@ -1150,11 +1175,23 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		}
 	}
 
+	// Surface per-shard plan metadata on the response too, for parity with the
+	// gRPC path: callers of Plan can display per-shard drift/membership.
+	var protoShards []*ternv1.ShardPlan
+	for _, sp := range allShardPlans {
+		protoShards = append(protoShards, &ternv1.ShardPlan{
+			Shard:       sp.Shard,
+			Namespace:   sp.Namespace,
+			NeedsChange: sp.NeedsChange,
+		})
+	}
+
 	return &ternv1.PlanResponse{
 		PlanId:         result.PlanID,
 		Engine:         c.protoEngine(),
 		Changes:        changes,
 		LintViolations: violations,
+		Shards:         protoShards,
 	}, nil
 }
 
