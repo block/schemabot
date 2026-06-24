@@ -640,7 +640,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 				c.logger.Debug("OnStateChange: nil resume state", "apply_id", apply.ApplyIdentifier)
 				return
 			}
-			if saveErr := c.saveEngineResumeState(ctx, tasks, rs); saveErr != nil {
+			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, rs); saveErr != nil {
 				c.logger.Warn("OnStateChange: failed to persist opaque resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 			}
 		},
@@ -658,7 +658,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 			// running on the provider. A failure to persist the resume state must
 			// not become terminal apply state — the owner exits and the operator
 			// retries against the in-flight work rather than abandoning it.
-			if saveErr := c.saveEngineResumeState(ctx, tasks, resumeState); saveErr != nil {
+			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, resumeState); saveErr != nil {
 				return fmt.Errorf("%w: save engine resume state after grouped resume of apply %s (database %s): %w", errGroupedResumeStateUnavailable, apply.ApplyIdentifier, apply.Database, saveErr)
 			}
 		}
@@ -758,7 +758,7 @@ var errGroupedResumeStateUnavailable = errors.New("grouped resume state unavaila
 func (c *LocalClient) groupedResumeState(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) (*engine.ResumeState, error) {
 	contextOnly := &engine.ResumeState{MigrationContext: apply.ApplyIdentifier}
 
-	operationID, err := applyOperationIDForTasks(tasks)
+	operationID, err := c.applyOperationIDForApplyTasks(ctx, apply, tasks)
 	if err != nil {
 		// Persisted engine resume state is scoped to an apply operation, so a
 		// Vitess apply whose tasks cannot be resolved to one leaves SchemaBot
@@ -890,14 +890,21 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 	}
 	if len(tasks) == 0 {
 		// A group_finalizer carries no tasks: it applies the namespace's VSchema
-		// from the plan once its sibling shard work has completed. Any other
-		// (work) operation with no tasks is the fail-closed signal for an invalid
-		// or mismatched applyOperationID — unlike ResumeApply, we must not forward
-		// it to resumeApplyWithTasks, which would fail the whole parent apply.
+		// from the plan once its sibling shard work has completed. A work operation
+		// with no tasks is valid only when the plan itself carries VSchema work;
+		// otherwise it is the fail-closed signal for an invalid or mismatched
+		// applyOperationID.
 		if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
 			return c.driveGroupFinalizer(ctx, apply, op)
 		}
-		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
+		plan, planErr := c.storage.Plans().GetByID(ctx, apply.PlanID)
+		if planErr != nil {
+			return fmt.Errorf("get plan for task-less apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, planErr)
+		}
+		if !isTasklessVSchemaOnlyPlan(tasks, plan) || op.OperationKind != storage.ApplyOperationKindWork || op.OperationKey != "" {
+			return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
+		}
+		return c.resumeApplyWithTasks(ctx, apply, tasks, apply.GetOptions().Map(), false, false)
 	}
 	siblings, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
@@ -1193,7 +1200,21 @@ func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.E
 // of tasks the caller has loaded. Callers choose whether tasks are scoped to the
 // whole apply or to a single operation.
 func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, options map[string]string, releaseAtCutoverBarrier bool, forceCutoverResume bool) error {
-	if len(tasks) == 0 {
+	// Get the plan to retrieve original DDLs
+	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	if err != nil || plan == nil {
+		c.logger.Warn("plan not found for apply, marking as failed",
+			"apply_id", apply.ApplyIdentifier,
+			"plan_id", apply.PlanID)
+		apply.State = state.Apply.Failed
+		apply.ErrorMessage = "plan not found during recovery"
+		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Failed, "error", err)
+		}
+		c.notifyTerminalObserver(apply, tasks)
+		return nil
+	}
+	if len(tasks) == 0 && !isTasklessVSchemaOnlyPlan(tasks, plan) {
 		c.logger.Warn("no tasks found for apply, marking as failed",
 			"apply_id", apply.ApplyIdentifier)
 		apply.State = state.Apply.Failed
@@ -1210,21 +1231,6 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 	if handled, err := c.processPendingStartControlRequest(ctx, apply, options, releaseAtCutoverBarrier); handled || err != nil {
 		return err
-	}
-
-	// Get the plan to retrieve original DDLs
-	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
-	if err != nil || plan == nil {
-		c.logger.Warn("plan not found for apply, marking as failed",
-			"apply_id", apply.ApplyIdentifier,
-			"plan_id", apply.PlanID)
-		apply.State = state.Apply.Failed
-		apply.ErrorMessage = "plan not found during recovery"
-		if err := c.storage.Applies().Update(ctx, apply); err != nil {
-			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Failed, "error", err)
-		}
-		c.notifyTerminalObserver(apply, tasks)
-		return nil
 	}
 
 	if state.IsState(apply.State, state.Apply.Pending) && apply.StartedAt == nil {

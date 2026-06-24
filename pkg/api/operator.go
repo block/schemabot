@@ -1298,6 +1298,29 @@ func (s *Service) markOperationFromOwnResult(ctx context.Context, driverID int, 
 	if err != nil {
 		return false, fmt.Errorf("load tasks for apply_operation %d (deployment %q): %w", op.ID, op.Deployment, err)
 	}
+	if len(tasks) == 0 {
+		apply, err := s.storage.Applies().Get(ctx, op.ApplyID)
+		if err != nil {
+			return false, fmt.Errorf("load parent apply for task-less apply_operation %d (deployment %q): %w", op.ID, op.Deployment, err)
+		}
+		if apply == nil {
+			return false, fmt.Errorf("parent apply %d not found for task-less apply_operation %d (deployment %q)", op.ApplyID, op.ID, op.Deployment)
+		}
+		plan, err := s.storage.Plans().GetByID(ctx, apply.PlanID)
+		if err != nil {
+			return false, fmt.Errorf("load plan %d for task-less apply_operation %d (deployment %q): %w", apply.PlanID, op.ID, op.Deployment, err)
+		}
+		if plan != nil && op.OperationKind == storage.ApplyOperationKindWork && op.OperationKey == "" && len(plan.FlatDDLChanges()) == 0 && len(vschemaFinalizerNamespaces(plan)) > 0 {
+			currentOp, getOpErr := s.storage.ApplyOperations().Get(ctx, op.ID)
+			if getOpErr != nil {
+				return false, fmt.Errorf("reload task-less apply_operation %d (deployment %q): %w", op.ID, op.Deployment, getOpErr)
+			}
+			if currentOp != nil && state.IsState(currentOp.State, state.ApplyOperation.Completed) {
+				return true, nil
+			}
+			return s.persistOperationState(ctx, driverID, op, apply.State, apply.ErrorMessage)
+		}
+	}
 	taskStates := make([]string, len(tasks))
 	for i, t := range tasks {
 		taskStates[i] = t.State
