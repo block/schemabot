@@ -262,7 +262,12 @@ message PullSchemaRequest {
 }
 
 enum PullCatalogDetail {
+  // BASIC returns only canonical DDL and engine artifacts (the bare pull): no
+  // namespace_catalog or table_catalog.
   PULL_CATALOG_DETAIL_BASIC = 0;
+  // DETAILED additionally returns the full structured catalog
+  // (namespace_catalog and table_catalog with columns, indexes, foreign keys,
+  // and engine estimates).
   PULL_CATALOG_DETAIL_DETAILED = 1;
 }
 
@@ -274,6 +279,8 @@ message PulledNamespace {
   map<string, string> tables = 1;
   // Optional engine-specific namespace content, such as Vitess VSchema JSON.
   map<string, string> artifacts = 2;
+  // namespace_catalog and table_catalog are populated only at DETAILED catalog
+  // detail; at BASIC detail they are absent.
   NamespaceCatalog namespace_catalog = 3;
   map<string, TableCatalog> table_catalog = 4;
 }
@@ -290,6 +297,17 @@ message TableCatalog {
   string comment = 3;
   repeated ColumnCatalog columns = 4;
   repeated IndexCatalog indexes = 5;
+  // Engine-maintained estimate of the number of rows. This is an approximation
+  // the engine keeps in its catalog (information_schema for MySQL); it can be
+  // stale or zero until statistics are refreshed (for example by ANALYZE TABLE)
+  // and must not be treated as an exact count.
+  int64 estimated_row_count = 6;
+  // Engine-maintained estimate of total on-disk size in bytes, including
+  // indexes. Like estimated_row_count, this is approximate and may be stale
+  // until statistics are refreshed.
+  int64 data_size_bytes = 7;
+  // Foreign keys declared on this table.
+  repeated ForeignKeyCatalog foreign_keys = 8;
 }
 
 message ColumnCatalog {
@@ -298,6 +316,11 @@ message ColumnCatalog {
   bool nullable = 3;
   string default_value = 4;
   string comment = 5;
+  // Whether the column auto-increments (MySQL AUTO_INCREMENT).
+  bool auto_increment = 6;
+  // Whether the column is generated/computed rather than stored directly
+  // (MySQL STORED/VIRTUAL GENERATED).
+  bool generated = 7;
 }
 
 message IndexCatalog {
@@ -307,6 +330,24 @@ message IndexCatalog {
   // Ordered index key parts. Each part may be a column name or an expression,
   // depending on the database engine.
   repeated string parts = 4;
+}
+
+// ForeignKeyCatalog describes a foreign-key relationship from one table to
+// another. Field names are engine-agnostic so the same shape maps to MySQL,
+// Vitess, and Postgres.
+message ForeignKeyCatalog {
+  // Constraint name.
+  string name = 1;
+  // Local columns that make up the foreign key, in key order.
+  repeated string columns = 2;
+  // Referenced table name.
+  string referenced_table = 3;
+  // Referenced columns, aligned with columns.
+  repeated string referenced_columns = 4;
+  // Referential action on update (for example CASCADE, RESTRICT, SET NULL).
+  string on_update = 5;
+  // Referential action on delete.
+  string on_delete = 6;
 }
 
 // PullSchemaResponse contains live schema content grouped by namespace.

@@ -78,15 +78,23 @@ type TableCatalog struct {
 	Comment string           `json:"comment,omitempty"`
 	Columns []*ColumnCatalog `json:"columns,omitempty"`
 	Indexes []*IndexCatalog  `json:"indexes,omitempty"`
+	// EstimatedRowCount and DataSizeBytes are engine-maintained estimates
+	// (from information_schema for MySQL) and may be stale until statistics
+	// are refreshed; they are not exact counts.
+	EstimatedRowCount int64                `json:"estimated_row_count,omitempty"`
+	DataSizeBytes     int64                `json:"data_size_bytes,omitempty"`
+	ForeignKeys       []*ForeignKeyCatalog `json:"foreign_keys,omitempty"`
 }
 
 // ColumnCatalog contains structured metadata for a pulled table column.
 type ColumnCatalog struct {
-	Name         string `json:"name"`
-	Type         string `json:"type"`
-	Nullable     bool   `json:"nullable"`
-	DefaultValue string `json:"default_value,omitempty"`
-	Comment      string `json:"comment,omitempty"`
+	Name          string `json:"name"`
+	Type          string `json:"type"`
+	Nullable      bool   `json:"nullable"`
+	DefaultValue  string `json:"default_value,omitempty"`
+	Comment       string `json:"comment,omitempty"`
+	AutoIncrement bool   `json:"auto_increment,omitempty"`
+	Generated     bool   `json:"generated,omitempty"`
 }
 
 // IndexCatalog contains structured metadata for a pulled table index.
@@ -95,6 +103,16 @@ type IndexCatalog struct {
 	Primary bool     `json:"primary,omitempty"`
 	Unique  bool     `json:"unique,omitempty"`
 	Parts   []string `json:"parts,omitempty"`
+}
+
+// ForeignKeyCatalog contains structured metadata for a foreign-key constraint.
+type ForeignKeyCatalog struct {
+	Name              string   `json:"name"`
+	Columns           []string `json:"columns,omitempty"`
+	ReferencedTable   string   `json:"referenced_table"`
+	ReferencedColumns []string `json:"referenced_columns,omitempty"`
+	OnUpdate          string   `json:"on_update,omitempty"`
+	OnDelete          string   `json:"on_delete,omitempty"`
 }
 
 // PullSchemaRequest is the HTTP request body for POST /api/pull.
