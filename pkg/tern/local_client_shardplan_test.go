@@ -30,37 +30,41 @@ func (e namedPlanEngine) Plan(ctx context.Context, req *engine.PlanRequest) (*en
 	return e.planFn(ctx, req)
 }
 
-// An instance-local sharded engine emits per-shard fanout metadata in
-// engine.SchemaChange.Shards. LocalClient.Plan must carry that into the stored
-// plan's NamespacePlanData.Shards, mirroring the gRPC plan path's
-// protoShardPlansToStorage, so apply-create can rebuild per-shard operation
-// groups after the plan request has returned.
-func TestPlanCarriesEngineShardPlanIntoStorage(t *testing.T) {
+func shardPlanTestClient(t *testing.T, store *fakePlanStore, result *engine.PlanResult) *LocalClient {
+	t.Helper()
+	return &LocalClient{
+		config:            LocalConfig{Database: "commerce", Type: storage.DatabaseTypeVitess},
+		storage:           &fakePlanStorage{plans: store},
+		planetscaleEngine: namedPlanEngine{name: "planetscale", planFn: func(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) { return result, nil }},
+		logger:            slog.Default(),
+	}
+}
+
+func alterUsersEmail() []engine.TableChange {
+	return []engine.TableChange{{
+		Table:     "users",
+		Operation: statement.StatementAlterTable,
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+	}}
+}
+
+// A sharded engine emits one SchemaChange per (namespace, shard). LocalClient.Plan
+// records each shard's membership in NamespacePlanData.Shards (so apply-create can
+// rebuild per-shard operation groups) while deduping the repeated table into the
+// namespace-level stored tables.
+func TestPlanRecordsPerShardSchemaChanges(t *testing.T) {
 	store := &fakePlanStore{
 		getFn:    func(string) (*storage.Plan, error) { return nil, nil },
 		createID: 7,
 	}
 	result := &engine.PlanResult{
 		PlanID: "plan_sharded",
-		Changes: []engine.SchemaChange{{
-			Namespace: "resolute",
-			TableChanges: []engine.TableChange{{
-				Table:     "users",
-				Operation: statement.StatementAlterTable,
-				DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
-			}},
-			Shards: []engine.ShardPlan{
-				{Shard: "-80", Namespace: "resolute", NeedsChange: true},
-				{Shard: "80-", Namespace: "resolute", NeedsChange: false},
-			},
-		}},
+		Changes: []engine.SchemaChange{
+			{Namespace: "resolute", Shard: engine.Shard{Name: "-80"}, TableChanges: alterUsersEmail()},
+			{Namespace: "resolute", Shard: engine.Shard{Name: "80-"}, TableChanges: alterUsersEmail()},
+		},
 	}
-	c := &LocalClient{
-		config:            LocalConfig{Database: "commerce", Type: storage.DatabaseTypeVitess},
-		storage:           &fakePlanStorage{plans: store},
-		planetscaleEngine: namedPlanEngine{name: "planetscale", planFn: func(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) { return result, nil }},
-		logger:            slog.Default(),
-	}
+	c := shardPlanTestClient(t, store, result)
 
 	_, err := c.Plan(t.Context(), &ternv1.PlanRequest{Database: "commerce"})
 	require.NoError(t, err)
@@ -70,36 +74,23 @@ func TestPlanCarriesEngineShardPlanIntoStorage(t *testing.T) {
 	require.NotNil(t, ns, "namespace plan data must exist for the changed keyspace")
 	require.Len(t, ns.Shards, 2)
 	assert.Equal(t, storage.ShardPlan{Shard: "-80", Namespace: "resolute", NeedsChange: true}, ns.Shards[0])
-	assert.Equal(t, storage.ShardPlan{Shard: "80-", Namespace: "resolute", NeedsChange: false}, ns.Shards[1])
+	assert.Equal(t, storage.ShardPlan{Shard: "80-", Namespace: "resolute", NeedsChange: true}, ns.Shards[1])
+	require.Len(t, ns.Tables, 1, "the table repeated across shards is deduped at the namespace level")
+	assert.Equal(t, "users", ns.Tables[0].Table)
 }
 
-// A change with an empty shard namespace inherits the resolved plan namespace so
-// apply-create groups the shard under the same namespace as its table changes.
-// (The gRPC path defaults an empty namespace to "default"; the in-process path
-// uses the plan namespace because that is what the fanout matches against.)
-func TestPlanShardPlanDefaultsNamespaceToPlanNamespace(t *testing.T) {
+// A non-sharded engine emits a SchemaChange with a zero Shard targeting the whole
+// namespace; it contributes no shard rows.
+func TestPlanNonShardedChangeHasNoShardRows(t *testing.T) {
 	store := &fakePlanStore{
 		getFn:    func(string) (*storage.Plan, error) { return nil, nil },
 		createID: 8,
 	}
 	result := &engine.PlanResult{
-		PlanID: "plan_default_ns",
-		Changes: []engine.SchemaChange{{
-			Namespace: "resolute",
-			TableChanges: []engine.TableChange{{
-				Table:     "users",
-				Operation: statement.StatementAlterTable,
-				DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
-			}},
-			Shards: []engine.ShardPlan{{Shard: "-80", NeedsChange: true}},
-		}},
+		PlanID:  "plan_unsharded",
+		Changes: []engine.SchemaChange{{Namespace: "resolute", TableChanges: alterUsersEmail()}},
 	}
-	c := &LocalClient{
-		config:            LocalConfig{Database: "commerce", Type: storage.DatabaseTypeVitess},
-		storage:           &fakePlanStorage{plans: store},
-		planetscaleEngine: namedPlanEngine{name: "planetscale", planFn: func(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) { return result, nil }},
-		logger:            slog.Default(),
-	}
+	c := shardPlanTestClient(t, store, result)
 
 	_, err := c.Plan(t.Context(), &ternv1.PlanRequest{Database: "commerce"})
 	require.NoError(t, err)
@@ -107,45 +98,12 @@ func TestPlanShardPlanDefaultsNamespaceToPlanNamespace(t *testing.T) {
 	require.NotNil(t, store.created)
 	ns := store.created.Namespaces["resolute"]
 	require.NotNil(t, ns)
-	require.Len(t, ns.Shards, 1)
-	assert.Equal(t, "resolute", ns.Shards[0].Namespace)
-}
-
-// An empty (or whitespace) shard name would produce an invalid sharded operation
-// key, so Plan fails closed rather than persisting it — matching the gRPC path's
-// protoShardPlansToStorage validation.
-func TestPlanRejectsEmptyShardName(t *testing.T) {
-	store := &fakePlanStore{
-		getFn:    func(string) (*storage.Plan, error) { return nil, nil },
-		createID: 9,
-	}
-	result := &engine.PlanResult{
-		PlanID: "plan_bad_shard",
-		Changes: []engine.SchemaChange{{
-			Namespace: "resolute",
-			TableChanges: []engine.TableChange{{
-				Table:     "users",
-				Operation: statement.StatementAlterTable,
-				DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
-			}},
-			Shards: []engine.ShardPlan{{Shard: "  ", Namespace: "resolute", NeedsChange: true}},
-		}},
-	}
-	c := &LocalClient{
-		config:            LocalConfig{Database: "commerce", Type: storage.DatabaseTypeVitess},
-		storage:           &fakePlanStorage{plans: store},
-		planetscaleEngine: namedPlanEngine{name: "planetscale", planFn: func(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) { return result, nil }},
-		logger:            slog.Default(),
-	}
-
-	_, err := c.Plan(t.Context(), &ternv1.PlanRequest{Database: "commerce"})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "empty shard")
-	assert.Nil(t, store.created, "must not persist a plan with an invalid shard")
+	assert.Empty(t, ns.Shards)
+	require.Len(t, ns.Tables, 1)
 }
 
 // Plan surfaces per-shard membership on the response (not just in stored plan
-// data) so callers can display per-shard drift, matching the gRPC path.
+// data) so callers can display per-shard drift.
 func TestPlanSurfacesShardPlanOnResponse(t *testing.T) {
 	store := &fakePlanStore{
 		getFn:    func(string) (*storage.Plan, error) { return nil, nil },
@@ -153,25 +111,12 @@ func TestPlanSurfacesShardPlanOnResponse(t *testing.T) {
 	}
 	result := &engine.PlanResult{
 		PlanID: "plan_sharded",
-		Changes: []engine.SchemaChange{{
-			Namespace: "resolute",
-			TableChanges: []engine.TableChange{{
-				Table:     "users",
-				Operation: statement.StatementAlterTable,
-				DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
-			}},
-			Shards: []engine.ShardPlan{
-				{Shard: "-80", Namespace: "resolute", NeedsChange: true},
-				{Shard: "80-", Namespace: "resolute", NeedsChange: false},
-			},
-		}},
+		Changes: []engine.SchemaChange{
+			{Namespace: "resolute", Shard: engine.Shard{Name: "-80"}, TableChanges: alterUsersEmail()},
+			{Namespace: "resolute", Shard: engine.Shard{Name: "80-"}, TableChanges: alterUsersEmail()},
+		},
 	}
-	c := &LocalClient{
-		config:            LocalConfig{Database: "commerce", Type: storage.DatabaseTypeVitess},
-		storage:           &fakePlanStorage{plans: store},
-		planetscaleEngine: namedPlanEngine{name: "planetscale", planFn: func(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) { return result, nil }},
-		logger:            slog.Default(),
-	}
+	c := shardPlanTestClient(t, store, result)
 
 	resp, err := c.Plan(t.Context(), &ternv1.PlanRequest{Database: "commerce"})
 	require.NoError(t, err)
@@ -180,5 +125,7 @@ func TestPlanSurfacesShardPlanOnResponse(t *testing.T) {
 	assert.Equal(t, "resolute", resp.Shards[0].Namespace)
 	assert.True(t, resp.Shards[0].NeedsChange)
 	assert.Equal(t, "80-", resp.Shards[1].Shard)
-	assert.False(t, resp.Shards[1].NeedsChange)
+	// The repeated table collapses to a single namespace-level proto change.
+	require.Len(t, resp.Changes, 1)
+	require.Len(t, resp.Changes[0].TableChanges, 1)
 }

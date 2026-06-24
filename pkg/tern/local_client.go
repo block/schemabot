@@ -456,35 +456,6 @@ func (c *LocalClient) planNamespace(ns string) string {
 	return ns
 }
 
-// engineShardPlansToStorage converts an engine's per-shard plan metadata into
-// stored shard plan rows, mirroring the gRPC path's protoShardPlansToStorage:
-// shard names are trimmed and must be non-empty (an empty shard would produce an
-// invalid sharded operation key like "namespace//table"). An empty namespace
-// defaults to the resolved plan namespace so apply-create groups the shard under
-// the same namespace as its table changes.
-func engineShardPlansToStorage(shards []engine.ShardPlan, planNamespace string) ([]storage.ShardPlan, error) {
-	if len(shards) == 0 {
-		return nil, nil
-	}
-	out := make([]storage.ShardPlan, 0, len(shards))
-	for i, sp := range shards {
-		shardName := strings.TrimSpace(sp.Shard)
-		if shardName == "" {
-			return nil, fmt.Errorf("shard plan %d has empty shard", i)
-		}
-		namespace := strings.TrimSpace(sp.Namespace)
-		if namespace == "" {
-			namespace = planNamespace
-		}
-		out = append(out, storage.ShardPlan{
-			Shard:       shardName,
-			Namespace:   namespace,
-			NeedsChange: sp.NeedsChange,
-		})
-	}
-	return out, nil
-}
-
 // Health checks the service health.
 func (c *LocalClient) Health(ctx context.Context) error {
 	return c.storage.Ping(ctx)
@@ -1039,6 +1010,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	// Build per-namespace plan data from the engine's changes.
 	// For Vitess, each namespace is a keyspace. For Spirit, there's one namespace.
 	namespaces := make(map[string]*storage.NamespacePlanData)
+	seenTable := make(map[string]map[string]bool)
 	var allShardPlans []storage.ShardPlan
 	for _, sc := range result.Changes {
 		ns := c.planNamespace(sc.Namespace)
@@ -1046,23 +1018,30 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		if nsData == nil {
 			nsData = &storage.NamespacePlanData{}
 			namespaces[ns] = nsData
+			seenTable[ns] = make(map[string]bool)
 		}
+		// A plan is keyed by (namespace, shard), so a sharded engine emits one
+		// SchemaChange per shard and the same table repeats across a keyspace's
+		// shards. The stored plan keeps namespace-level tables, so dedupe by table.
 		for _, tc := range sc.TableChanges {
+			if seenTable[ns][tc.Table] {
+				continue
+			}
+			seenTable[ns][tc.Table] = true
 			nsData.Tables = append(nsData.Tables, storage.TableChange{
 				Table:     tc.Table,
 				DDL:       tc.DDL,
 				Operation: ddl.StatementTypeToOp(tc.Operation),
 			})
 		}
-		// Carry per-shard fanout metadata from the engine into stored plan data,
-		// mirroring the gRPC path's protoShardPlansToStorage. Apply-create reads
-		// NamespacePlanData.Shards to rebuild per-shard operation groups.
-		shardPlans, err := engineShardPlansToStorage(sc.Shards, ns)
-		if err != nil {
-			return nil, fmt.Errorf("namespace %q: %w", ns, err)
+		// Record per-shard membership so apply-create can rebuild per-shard
+		// operation groups. A SchemaChange with an empty shard targets the whole
+		// namespace (non-sharded engines) and contributes no shard rows.
+		if shardName := strings.TrimSpace(sc.Shard.Name); shardName != "" {
+			sp := storage.ShardPlan{Shard: shardName, Namespace: ns, NeedsChange: true}
+			nsData.Shards = append(nsData.Shards, sp)
+			allShardPlans = append(allShardPlans, sp)
 		}
-		nsData.Shards = append(nsData.Shards, shardPlans...)
-		allShardPlans = append(allShardPlans, shardPlans...)
 		if len(sc.OriginalFiles) > 0 {
 			nsData.OriginalFiles = sc.OriginalFiles
 		}
@@ -1140,17 +1119,32 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	}
 	plan.ID = planID
 
-	// Convert engine SchemaChanges to proto SchemaChanges.
+	// Convert engine SchemaChanges to proto SchemaChanges. A sharded engine emits
+	// one SchemaChange per (namespace, shard); collapse them back to one proto
+	// SchemaChange per namespace (deduping repeated tables). Per-shard membership
+	// travels separately on PlanResponse.Shards below.
 	var changes []*ternv1.SchemaChange
+	protoByNS := make(map[string]*ternv1.SchemaChange)
+	protoTableSeen := make(map[string]map[string]bool)
 	for _, sc := range result.Changes {
 		ns := c.planNamespace(sc.Namespace)
-		protoSC := &ternv1.SchemaChange{
-			Namespace:             ns,
-			Metadata:              sc.Metadata,
-			OriginalFiles:         sc.OriginalFiles,
-			OriginalFilesCaptured: sc.OriginalFilesCaptured,
+		protoSC := protoByNS[ns]
+		if protoSC == nil {
+			protoSC = &ternv1.SchemaChange{
+				Namespace:             ns,
+				Metadata:              sc.Metadata,
+				OriginalFiles:         sc.OriginalFiles,
+				OriginalFilesCaptured: sc.OriginalFilesCaptured,
+			}
+			protoByNS[ns] = protoSC
+			protoTableSeen[ns] = make(map[string]bool)
+			changes = append(changes, protoSC)
 		}
 		for _, t := range sc.TableChanges {
+			if protoTableSeen[ns][t.Table] {
+				continue
+			}
+			protoTableSeen[ns][t.Table] = true
 			protoSC.TableChanges = append(protoSC.TableChanges, &ternv1.TableChange{
 				TableName:    t.Table,
 				ChangeType:   changeTypeToProto(t.Operation),
@@ -1160,7 +1154,6 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 				Namespace:    ns,
 			})
 		}
-		changes = append(changes, protoSC)
 	}
 
 	// Convert lint violations to proto

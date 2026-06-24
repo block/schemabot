@@ -205,14 +205,16 @@ func (r *PlanResult) FlatTableChanges() []TableChange {
 // SchemaChange per namespace; OriginalFiles is captured once for that namespace
 // and applies to every table/artifact change in the bundle.
 type SchemaChange struct {
-	Namespace    string        // MySQL schema, Vitess keyspace, Postgres schema
-	TableChanges []TableChange // Per-table DDL changes
-	// Shards reports per-shard membership and drift for a sharded namespace. It
-	// is captured at plan time so apply-create can deterministically rebuild
-	// per-shard operation groups after the plan request has returned. Engines
-	// that are not sharded (Spirit) leave this empty; the gRPC plan path carries
-	// the equivalent data on the proto PlanResponse.
-	Shards []ShardPlan
+	Namespace string // MySQL schema, Vitess keyspace, Postgres schema
+	// Shard identifies the shard this change targets within Namespace. A plan is
+	// a slice of SchemaChange keyed by (Namespace, Shard): a sharded engine emits
+	// one SchemaChange per changed shard, each carrying that shard's own
+	// TableChanges, so shards that have drifted — e.g. one was offline during a
+	// prior apply, or a change was canaried to a subset — can carry different
+	// DDL. Non-sharded engines (Spirit) leave it zero, targeting the whole
+	// namespace.
+	Shard        Shard
+	TableChanges []TableChange // Per-table DDL changes for this (Namespace, Shard)
 	// Metadata contains engine-specific plan annotations, such as display diffs
 	// or apply flags. It is not rollback input; rollback uses OriginalFiles.
 	Metadata              map[string]string
@@ -220,13 +222,11 @@ type SchemaChange struct {
 	OriginalFilesCaptured bool              // True when OriginalFiles was captured, including an empty namespace
 }
 
-// ShardPlan records per-shard membership and drift for a sharded namespace,
-// captured at plan time. It mirrors storage.ShardPlan so an in-process engine
-// can emit shard fanout metadata without the engine package importing storage.
-type ShardPlan struct {
-	Shard       string // Shard name (e.g., "-80", "80-")
-	Namespace   string // Namespace/keyspace this shard belongs to
-	NeedsChange bool   // True if this shard requires a schema change
+// Shard identifies a shard within a namespace for a sharded schema change. It is
+// the zero value for non-sharded engines, where a SchemaChange targets the whole
+// namespace.
+type Shard struct {
+	Name string // Shard name (e.g., "-80", "80-")
 }
 
 // LintViolation represents a lint finding from schema analysis.
