@@ -1200,6 +1200,10 @@ func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.E
 // of tasks the caller has loaded. Callers choose whether tasks are scoped to the
 // whole apply or to a single operation.
 func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, options map[string]string, releaseAtCutoverBarrier bool, forceCutoverResume bool) error {
+	if handled, err := c.processPendingStopControlRequest(ctx, apply); handled || err != nil {
+		return err
+	}
+
 	// Get the plan to retrieve original DDLs
 	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil || plan == nil {
@@ -1224,10 +1228,6 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		}
 		c.notifyTerminalObserver(apply, tasks)
 		return nil
-	}
-
-	if handled, err := c.processPendingStopControlRequest(ctx, apply); handled || err != nil {
-		return err
 	}
 	if handled, err := c.processPendingStartControlRequest(ctx, apply, options, releaseAtCutoverBarrier); handled || err != nil {
 		return err

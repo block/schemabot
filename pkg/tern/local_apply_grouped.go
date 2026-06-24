@@ -143,6 +143,13 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		return
 	}
 
+	if isTasklessVSchemaOnlyPlan(tasks, plan) {
+		if completeErr := c.completeTasklessGroupedApply(ctx, apply, result.Message); completeErr != nil {
+			c.logger.Error("failed to complete task-less grouped apply", "apply_id", apply.ApplyIdentifier, "error", completeErr)
+		}
+		return
+	}
+
 	// Persist the engine resume state and set IsInstant on tasks before marking
 	// running. The progress handler reads task.is_instant and the engine resume
 	// state to render the instant label and deploy display fields, so both must
@@ -159,12 +166,6 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		}
 	}
 	if c.config.Type == storage.DatabaseTypeVitess && resumeState == nil {
-		if isTasklessVSchemaOnlyPlan(tasks, plan) {
-			if completeErr := c.completeTasklessGroupedApply(ctx, apply, result.Message); completeErr != nil {
-				c.logger.Error("failed to complete task-less grouped apply", "apply_id", apply.ApplyIdentifier, "error", completeErr)
-			}
-			return
-		}
 		c.failApplyWithTasks(ctx, apply, tasks, "engine accepted Vitess apply without resume state")
 		return
 	}
