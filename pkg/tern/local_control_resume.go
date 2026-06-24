@@ -1064,23 +1064,27 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	if result == nil || !result.Accepted {
 		return failClosed(fmt.Errorf("group_finalizer VSchema apply for apply %s was not accepted", apply.ApplyIdentifier))
 	}
+
+	// A nil resume state means the engine has no in-flight work to track: the
+	// VSchema apply finished synchronously, or the deploy was a no-op (no DDL
+	// diff — a VSchema applied at the branch level produces a no-changes deploy).
+	// The accepted result is terminal, so complete without polling. Only an
+	// in-flight deploy (a returned resume state) is polled to completion.
 	if result.ResumeState != nil {
 		persistResume(result.ResumeState)
-		resumeState = result.ResumeState
-	}
-
-	finalState, err := c.driveFinalizerToTerminal(ctx, eng, apply, creds, resumeState, persistResume)
-	if err != nil {
-		return failClosed(fmt.Errorf("await group_finalizer VSchema apply (apply %s): %w", apply.ApplyIdentifier, err))
-	}
-	if !finalizerVSchemaApplied(finalState) {
-		return failClosed(fmt.Errorf("group_finalizer VSchema apply for apply %s ended in non-success state %q", apply.ApplyIdentifier, finalState))
+		finalState, err := c.driveFinalizerToTerminal(ctx, eng, apply, creds, result.ResumeState, persistResume)
+		if err != nil {
+			return failClosed(fmt.Errorf("await group_finalizer VSchema apply (apply %s): %w", apply.ApplyIdentifier, err))
+		}
+		if !finalizerVSchemaApplied(finalState) {
+			return failClosed(fmt.Errorf("group_finalizer VSchema apply for apply %s ended in non-success state %q", apply.ApplyIdentifier, finalState))
+		}
 	}
 	if err := c.storage.ApplyOperations().MarkCompleted(ctx, op.ID); err != nil {
 		return fmt.Errorf("mark group_finalizer apply_operation %d completed (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
 	c.logger.Info("group_finalizer VSchema apply completed",
-		"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "namespace", namespace, "final_state", finalState)
+		"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "namespace", namespace)
 	return nil
 }
 
