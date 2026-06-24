@@ -298,8 +298,33 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 		s.recoverMultiApplyOperation(ctx, driverID, op, opLease)
 		return
 	}
+	hasTasks, err := s.claimedOperationHasTasks(ctx, op)
+	if err != nil {
+		s.logger.Error("operator: failed to inspect claimed operation tasks; operation will not be driven",
+			"driver", driverID, "lease_owner", owner, "apply_operation_id", op.ID,
+			"apply_db_id", op.ApplyID, "deployment", op.Deployment, "error", err)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_task_inspect_error")
+		return
+	}
+	if !hasTasks {
+		// Apply-level claiming is task-gated, so a valid task-less operation (for
+		// example plan-level VSchema work) cannot be driven through the legacy
+		// parent-lease path. Drive it under the operation lease and project the
+		// parent from the operation row, the same fail-closed path multi-operation
+		// applies use.
+		s.driveClaimedMultiOperation(ctx, driverID, op, opLease, false)
+		return
+	}
 
 	s.recoverSingleApplyOperation(ctx, driverID, owner, op, opLease)
+}
+
+func (s *Service) claimedOperationHasTasks(ctx context.Context, op *storage.ApplyOperation) (bool, error) {
+	tasks, err := s.storage.Tasks().GetByApplyOperationID(ctx, op.ID)
+	if err != nil {
+		return false, fmt.Errorf("load tasks for apply_operation %d (deployment %q): %w", op.ID, op.Deployment, err)
+	}
+	return len(tasks) > 0, nil
 }
 
 // operationSetContainsID reports whether id is one of the apply's operation
