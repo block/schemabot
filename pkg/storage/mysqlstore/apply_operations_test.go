@@ -1705,6 +1705,142 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsSameDeploymentShardWor
 	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, claimed.OperationKind)
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_ConcurrentDriversClaimDistinctShardWork
+// verifies the multi-driver safety of parallel shard claiming: many drivers
+// poll the same deployment's pending shard work operations at once, mirroring
+// the operator's claim loop. Every shard is claimed exactly once under its own
+// freshly rotated operation lease — no shard is double-claimed (FOR UPDATE SKIP
+// LOCKED hands each pending row to a single driver), every claim rotates a
+// distinct lease token, and the group_finalizer stays unclaimed while its work
+// siblings run. A sibling's lease token cannot authorize a write to another
+// shard, so the concurrently claimed siblings hold independent leases.
+func TestApplyOperationStore_FindNextApplyOperation_ConcurrentDriversClaimDistinctShardWork(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_parallel_distinct", 1)
+
+	const shards = 4
+	shardIDs := make(map[int64]struct{}, shards)
+	for i := range shards {
+		id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a",
+			OperationKey:  fmt.Sprintf("commerce/shard-%d/users", i),
+			OperationKind: storage.ApplyOperationKindWork,
+		})
+		require.NoError(t, err)
+		shardIDs[id] = struct{}{}
+	}
+	finalizerID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer,
+	})
+	require.NoError(t, err)
+
+	const drivers = 16
+	stores := make([]*Storage, drivers)
+	for i := range drivers {
+		db, openErr := sql.Open("mysql", testDSNChangedRows)
+		require.NoError(t, openErr)
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+		t.Cleanup(func() {
+			require.NoError(t, db.Close())
+		})
+		stores[i] = New(db)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var claimed []*storage.ApplyOperation
+	var claimErrors []error
+
+	for i := range drivers {
+		driverStore := stores[i]
+		driverOwner := fmt.Sprintf("operator-%d", i)
+		wg.Go(func() {
+			<-start
+			// Poll like the operator loop: a single claim leaves its row running
+			// (the driver never completes it here), and a driver that sees only
+			// locked rows gets nil and stops. The claimed rows stay running so a
+			// later poll skips them, so this drains every pending shard exactly
+			// once across the driver pool. Cap the loop defensively — a correct
+			// claim path can never return more than `shards` distinct rows.
+			for range shards + 1 {
+				got, claimErr := driverStore.ApplyOperations().FindNextApplyOperation(ctx, driverOwner)
+				if claimErr != nil {
+					mu.Lock()
+					claimErrors = append(claimErrors, claimErr)
+					mu.Unlock()
+					return
+				}
+				if got == nil {
+					return
+				}
+				mu.Lock()
+				claimed = append(claimed, got)
+				mu.Unlock()
+			}
+		})
+	}
+
+	close(start)
+	wg.Wait()
+
+	require.Empty(t, claimErrors)
+	require.Len(t, claimed, shards, "every pending shard work op is claimed exactly once; the finalizer stays blocked")
+
+	seenIDs := make(map[int64]struct{}, shards)
+	seenTokens := make(map[string]struct{}, shards)
+	for _, op := range claimed {
+		_, isShard := shardIDs[op.ID]
+		assert.True(t, isShard, "claimed op %d must be a shard work op", op.ID)
+		assert.NotEqual(t, finalizerID, op.ID, "group_finalizer must not be claimed while shard work siblings run")
+
+		_, dupID := seenIDs[op.ID]
+		assert.False(t, dupID, "shard op %d was claimed by more than one driver", op.ID)
+		seenIDs[op.ID] = struct{}{}
+
+		assert.NotEmpty(t, op.LeaseToken, "claimed shard op %d must carry a rotated operation lease token", op.ID)
+		_, dupTok := seenTokens[op.LeaseToken]
+		assert.False(t, dupTok, "the same lease token was rotated onto two distinct shards")
+		seenTokens[op.LeaseToken] = struct{}{}
+
+		assert.NotEmpty(t, op.LeaseOwner)
+	}
+	assert.Len(t, seenIDs, shards, "every shard was claimed")
+
+	// Every shard row is now running under its lease; the finalizer is untouched.
+	for id := range shardIDs {
+		persisted, err := store.ApplyOperations().Get(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.ApplyOperation.Running, persisted.State, "shard op %d should be running after claim", id)
+	}
+	finalizer, err := store.ApplyOperations().Get(ctx, finalizerID)
+	require.NoError(t, err)
+	require.NotNil(t, finalizer)
+	assert.Equal(t, state.ApplyOperation.Pending, finalizer.State)
+
+	// Per-operation lease isolation: a sibling shard's freshly rotated token
+	// cannot authorize a write to another shard, but the shard's own token can.
+	// One driver cannot drive another driver's shard.
+	require.GreaterOrEqual(t, len(claimed), 2)
+	opA, opB := claimed[0], claimed[1]
+	opCtx := func(op *storage.ApplyOperation, token string) context.Context {
+		return storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID:     op.ApplyID,
+			OperationID: op.ID,
+			Owner:       op.LeaseOwner,
+			Token:       token,
+		})
+	}
+	require.ErrorIs(t, store.ApplyOperations().Heartbeat(opCtx(opA, opB.LeaseToken), opA.ID), storage.ErrApplyLeaseLost)
+	require.NoError(t, store.ApplyOperations().Heartbeat(opCtx(opA, opA.LeaseToken), opA.ID))
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_OrdersDeploymentsWithShards
 // verifies that sharded fan-out keeps cross-deployment ordering intact: a later
 // deployment's shard work stays unclaimable until every operation of the
