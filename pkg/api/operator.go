@@ -1570,6 +1570,24 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		"driver", driverID, "apply_id", apply.ApplyIdentifier,
 		"database", apply.Database, "environment", apply.Environment,
 		"previous_state", apply.State, "derived_state", derived, "operation_count", len(ops))
+
+	// Own the active-apply gauge for multi-operation applies. The enqueue-time
+	// increment is keyed to the parent's primary deployment, and operation-scoped
+	// drives suppress the parent-level metric, so the projection that wins the
+	// parent transition is the single point that must release it: -1 when the
+	// rollout first reaches a terminal state, and +1 if a continuable failure
+	// reopens the parent to keep it running, so the gauge tracks whether the
+	// apply is still in flight. Single-operation applies keep decrementing in
+	// their direct drive and are left untouched here.
+	if len(ops) > 1 {
+		switch {
+		case !state.IsTerminalApplyState(apply.State) && state.IsTerminalApplyState(derived):
+			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
+		case state.IsTerminalApplyState(apply.State) && !state.IsTerminalApplyState(derived):
+			metrics.AdjustActiveApplies(ctx, 1, apply.Database, apply.Deployment, apply.Environment)
+		}
+	}
+
 	return applyProjectionResult{
 		Swapped:        true,
 		PreviousState:  apply.State,
