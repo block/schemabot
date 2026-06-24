@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -963,20 +964,21 @@ func namespaceFromFinalizerKey(operationKey string) string {
 }
 
 // driveGroupFinalizer drives a task-less group_finalizer operation: it applies
-// the namespace's VSchema once its sibling shard work has completed. The change
-// is reconstructed from the plan (the finalizer carries no task), and engine
-// resume state is persisted on the operation row so a restart reattaches to the
-// in-flight VSchema application instead of starting over.
+// the VSchema once its sibling shard work has completed. The change is
+// reconstructed from the plan (the finalizer carries no task) and engine resume
+// state is persisted on the operation row so a reclaim reattaches to in-flight
+// work instead of starting over.
 //
-// It fails closed: the operation is marked completed only on a successful,
-// accepted engine apply. Any error (missing namespace/plan/engine, a rejected
-// apply, or an apply error) marks the operation failed and returns, so the
-// operator never advances the parent's aggregate as if the VSchema applied.
+// The drive is engine-agnostic: it applies, then polls Progress to a terminal
+// state. For an instance-local engine the VSchema apply is synchronous, so
+// Progress reports terminal on the first poll; for an externally-authoritative
+// engine (whose Apply starts an asynchronous deploy) Progress tracks the deploy
+// to completion. Either way the operation is marked completed only once the
+// engine reports the VSchema applied, and fails closed on any error (missing
+// plan/engine, a rejected apply, a permanent progress error, or a failed
+// terminal state), so the operator never advances the parent's aggregate as if
+// the VSchema applied when it did not.
 func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Apply, op *storage.ApplyOperation) error {
-	namespace := namespaceFromFinalizerKey(op.OperationKey)
-	if namespace == "" {
-		return fmt.Errorf("group_finalizer apply_operation %d (apply %s) has no namespace in operation key %q", op.ID, apply.ApplyIdentifier, op.OperationKey)
-	}
 	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil {
 		return fmt.Errorf("load plan for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
@@ -984,9 +986,10 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	if plan == nil {
 		return fmt.Errorf("plan %d not found for group_finalizer apply_operation %d (apply %s)", apply.PlanID, op.ID, apply.ApplyIdentifier)
 	}
-	nsData := plan.Namespaces[namespace]
-	if nsData == nil || !namespaceHasVSchemaArtifact(nsData) {
-		return fmt.Errorf("plan %d has no VSchema artifact for group_finalizer namespace %q (apply %s)", apply.PlanID, namespace, apply.ApplyIdentifier)
+	namespace := namespaceFromFinalizerKey(op.OperationKey)
+	changes, err := finalizerVSchemaChanges(plan, namespace)
+	if err != nil {
+		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
 	eng := c.getEngine()
 	if eng == nil {
@@ -1002,6 +1005,7 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		"apply_operation_id", op.ID,
 		"deployment", op.Deployment,
 		"namespace", namespace,
+		"namespace_count", len(changes),
 		"database", apply.Database,
 	)
 	if err := c.storage.ApplyOperations().MarkStarted(ctx, op.ID); err != nil {
@@ -1014,6 +1018,19 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 				"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", markErr)
 		}
 		return cause
+	}
+	persistResume := func(rs *engine.ResumeState) {
+		if rs == nil {
+			return
+		}
+		if saveErr := c.storage.ApplyOperations().SaveEngineResumeState(ctx, op.ID, &storage.EngineResumeState{
+			ApplyOperationID: op.ID,
+			MigrationContext: rs.MigrationContext,
+			Metadata:         rs.Metadata,
+		}); saveErr != nil {
+			c.logger.Warn("group_finalizer: failed to persist engine resume state",
+				"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", saveErr)
+		}
 	}
 
 	var resumeState *engine.ResumeState
@@ -1032,39 +1049,122 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	}
 
 	result, err := eng.Apply(ctx, &engine.ApplyRequest{
-		Database:    apply.Database,
-		PlanID:      plan.PlanIdentifier,
-		Changes:     []engine.SchemaChange{{Namespace: namespace, Metadata: map[string]string{"vschema_changed": "true"}}},
-		SchemaFiles: plan.SchemaFiles,
-		Options:     apply.GetOptions().Map(),
-		ResumeState: resumeState,
-		Credentials: creds,
-		OnStateChange: func(rs *engine.ResumeState) {
-			if rs == nil {
-				return
-			}
-			if saveErr := c.storage.ApplyOperations().SaveEngineResumeState(ctx, op.ID, &storage.EngineResumeState{
-				ApplyOperationID: op.ID,
-				MigrationContext: rs.MigrationContext,
-				Metadata:         rs.Metadata,
-			}); saveErr != nil {
-				c.logger.Warn("group_finalizer: failed to persist engine resume state",
-					"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", saveErr)
-			}
-		},
+		Database:      apply.Database,
+		PlanID:        plan.PlanIdentifier,
+		Changes:       changes,
+		SchemaFiles:   plan.SchemaFiles,
+		Options:       apply.GetOptions().Map(),
+		ResumeState:   resumeState,
+		Credentials:   creds,
+		OnStateChange: persistResume,
 	})
 	if err != nil {
-		return failClosed(fmt.Errorf("apply VSchema for group_finalizer namespace %q (apply %s): %w", namespace, apply.ApplyIdentifier, err))
+		return failClosed(fmt.Errorf("apply VSchema for group_finalizer (apply %s): %w", apply.ApplyIdentifier, err))
 	}
 	if result == nil || !result.Accepted {
-		return failClosed(fmt.Errorf("group_finalizer VSchema apply for namespace %q (apply %s) was not accepted", namespace, apply.ApplyIdentifier))
+		return failClosed(fmt.Errorf("group_finalizer VSchema apply for apply %s was not accepted", apply.ApplyIdentifier))
+	}
+	if result.ResumeState != nil {
+		persistResume(result.ResumeState)
+		resumeState = result.ResumeState
+	}
+
+	finalState, err := c.driveFinalizerToTerminal(ctx, eng, apply, creds, resumeState, persistResume)
+	if err != nil {
+		return failClosed(fmt.Errorf("await group_finalizer VSchema apply (apply %s): %w", apply.ApplyIdentifier, err))
+	}
+	if !finalizerVSchemaApplied(finalState) {
+		return failClosed(fmt.Errorf("group_finalizer VSchema apply for apply %s ended in non-success state %q", apply.ApplyIdentifier, finalState))
 	}
 	if err := c.storage.ApplyOperations().MarkCompleted(ctx, op.ID); err != nil {
 		return fmt.Errorf("mark group_finalizer apply_operation %d completed (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
 	c.logger.Info("group_finalizer VSchema apply completed",
-		"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "namespace", namespace)
+		"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "namespace", namespace, "final_state", finalState)
 	return nil
+}
+
+// finalizerVSchemaChanges reconstructs the VSchema change(s) a group_finalizer
+// applies, from the plan. A namespace-scoped finalizer (operation key
+// "<ns>/group_finalizer", from a sharded fan-out) applies that one namespace's
+// VSchema. A finalizer with no namespace in its key (a non-sharded VSchema-only
+// apply on an externally-authoritative engine) applies every VSchema-changed
+// namespace in the plan, because that engine deploys the whole branch in one
+// operation.
+func finalizerVSchemaChanges(plan *storage.Plan, namespace string) ([]engine.SchemaChange, error) {
+	vschemaChange := func(ns string) engine.SchemaChange {
+		return engine.SchemaChange{Namespace: ns, Metadata: map[string]string{"vschema_changed": "true"}}
+	}
+	if namespace != "" {
+		nsData := plan.Namespaces[namespace]
+		if nsData == nil || !namespaceHasVSchemaArtifact(nsData) {
+			return nil, fmt.Errorf("plan %d has no VSchema artifact for namespace %q", plan.ID, namespace)
+		}
+		return []engine.SchemaChange{vschemaChange(namespace)}, nil
+	}
+	namespaces := make([]string, 0, len(plan.Namespaces))
+	for ns, nsData := range plan.Namespaces {
+		if namespaceHasVSchemaArtifact(nsData) {
+			namespaces = append(namespaces, ns)
+		}
+	}
+	if len(namespaces) == 0 {
+		return nil, fmt.Errorf("plan %d has no VSchema artifact for a deployment-scoped finalizer", plan.ID)
+	}
+	sort.Strings(namespaces)
+	changes := make([]engine.SchemaChange, 0, len(namespaces))
+	for _, ns := range namespaces {
+		changes = append(changes, vschemaChange(ns))
+	}
+	return changes, nil
+}
+
+// finalizerVSchemaApplied reports whether an engine progress state means the
+// VSchema is applied. Completed is the terminal success; revert_window means the
+// deploy succeeded and is holding open its revert window (the VSchema is live),
+// which is success for the finalizer — the apply-level revert window is managed
+// separately.
+func finalizerVSchemaApplied(s engine.State) bool {
+	return s == engine.StateCompleted || s == engine.StateRevertWindow
+}
+
+// driveFinalizerToTerminal polls the engine until the finalizer's work reaches a
+// terminal (or revert-window) state, persisting resume state on each poll so a
+// reclaim reattaches. An instance-local engine reports terminal on the first
+// poll; an externally-authoritative engine is tracked to deploy completion. A
+// permanent progress error fails the drive; transient errors are retried while
+// the operation lease is heartbeated by the operator.
+func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.Engine, apply *storage.Apply, creds *engine.Credentials, resumeState *engine.ResumeState, persistResume func(*engine.ResumeState)) (engine.State, error) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		res, err := eng.Progress(ctx, &engine.ProgressRequest{
+			Database:    apply.Database,
+			Credentials: creds,
+			ResumeState: resumeState,
+		})
+		if err != nil {
+			var permanent *engine.PermanentError
+			if errors.As(err, &permanent) {
+				return "", fmt.Errorf("group_finalizer progress poll failed permanently: %w", err)
+			}
+			c.logger.Warn("group_finalizer: transient progress error; will retry",
+				"apply_id", apply.ApplyIdentifier, "error", err)
+		} else {
+			if res.ResumeState != nil {
+				persistResume(res.ResumeState)
+				resumeState = res.ResumeState
+			}
+			if res.State.IsTerminal() || res.State == engine.StateRevertWindow {
+				return res.State, nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // resumeApplyWithTasks drives an apply (or one of its operations) from the set

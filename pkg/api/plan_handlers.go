@@ -1032,9 +1032,20 @@ func buildApplyOperationGroups(
 
 	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets))
 	for _, target := range targets {
+		tasks := buildApplyTasks(plan, taskChanges, environment, applyOpts, "", now)
+		if len(tasks) == 0 && len(vschemaFinalizerNamespaces(plan)) > 0 {
+			// A VSchema-only apply on a non-sharded engine: no table DDL, so the
+			// engine deploys the VSchema in one operation. Drive it as a task-less
+			// group_finalizer reconstructed from the plan rather than an empty work
+			// operation (which would fail closed as having no tasks).
+			op := newPendingApplyOperation(target, finalizerOperationKeySegment, cutoverPolicy, onFailure, now)
+			op.OperationKind = storage.ApplyOperationKindGroupFinalizer
+			groups = append(groups, &storage.ApplyOperationWithTasks{Operation: op})
+			continue
+		}
 		groups = append(groups, &storage.ApplyOperationWithTasks{
 			Operation: newPendingApplyOperation(target, "", cutoverPolicy, onFailure, now),
-			Tasks:     buildApplyTasks(plan, taskChanges, environment, applyOpts, "", now),
+			Tasks:     tasks,
 		})
 	}
 	return groups, false, nil
