@@ -107,9 +107,29 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
+	if result.TenantError {
+		h.logger.Info("ignoring command with invalid tenant flag",
+			"repo", repo, "pr", pr, "action", result.Action)
+		h.writeJSON(w, http.StatusOK, map[string]string{
+			"message": "invalid tenant flag",
+		})
+		return
+	}
+
+	// When a command names a tenant, only the matching isolated deployment should
+	// react or post comments. This mirrors allowed_environments routing for -e.
+	if result.Tenant != "" && h.service != nil && !h.service.Config().ShouldRespondToTenant(result.Tenant) {
+		h.logger.Info("ignoring command for non-owned tenant",
+			"repo", repo, "pr", pr, "tenant", result.Tenant, "action", result.Action)
+		h.writeJSON(w, http.StatusOK, map[string]string{
+			"message": "tenant handled by another instance",
+		})
+		return
+	}
+
 	// Handle help command
 	if result.IsHelp {
-		if h.service != nil && !h.service.Config().ShouldRespondToUnscoped() {
+		if result.Tenant == "" && h.service != nil && !h.service.Config().ShouldRespondToUnscoped() {
 			h.logger.Debug("skipping help command (respond_to_unscoped is false)", "repo", repo, "pr", pr)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
 			return
@@ -126,7 +146,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			// Plan without -e: run for all configured environments
 			h.logger.Info("plan without -e flag", "repo", repo, "pr", pr)
 			h.goSafe(repo, pr, installationID, func() {
-				h.handleMultiEnvPlan(repo, pr, result.Database, installationID, requestedBy, false)
+				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false)
 			})
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "multi-env plan started"})
 			return
@@ -171,7 +191,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 
 	// Handle invalid command (schemabot mentioned but command not recognized)
 	if !result.Found {
-		if h.service != nil && !h.service.Config().ShouldRespondToUnscoped() {
+		if result.Tenant == "" && h.service != nil && !h.service.Config().ShouldRespondToUnscoped() {
 			h.logger.Debug("skipping invalid command response (respond_to_unscoped is false)", "repo", repo, "pr", pr)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
 			return
@@ -232,7 +252,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 
 	switch result.Action {
 	case action.Plan:
-		h.handlePlanCommand(w, repo, pr, result.Environment, result.Database, installationID, requestedBy)
+		h.handlePlanCommand(w, repo, pr, result.Environment, result.Database, result.Tenant, installationID, requestedBy)
 	case action.Help:
 		h.postComment(repo, pr, installationID, templates.RenderHelpComment())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "help posted"})

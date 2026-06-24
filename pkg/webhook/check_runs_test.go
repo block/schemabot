@@ -280,6 +280,168 @@ func TestRespondToUnscoped(t *testing.T) {
 		assert.Contains(t, rr.Body.String(), "unscoped command skipped")
 	})
 
+	t.Run("targeted command skipped by non-matching tenant", func(t *testing.T) {
+		service := api.New(nil, &api.ServerConfig{
+			Tenant:            "alpha",
+			RespondToUnscoped: &trueVal,
+			Repos:             map[string]api.RepoConfig{},
+		}, nil, testLogger())
+
+		h := &Handler{
+			service: service,
+			logger:  testLogger(),
+		}
+
+		req := buildWebhookRequest(t, webhookPayloadOpts{
+			comment: "schemabot help --tenant beta",
+			isPR:    true,
+		}, nil)
+
+		rr := httpResponseRecorder()
+		h.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "tenant handled by another instance")
+	})
+
+	t.Run("invalid tenant flag is ignored before reactions or comments", func(t *testing.T) {
+		service := api.New(nil, &api.ServerConfig{
+			Tenant:            "alpha",
+			RespondToUnscoped: &trueVal,
+			Repos:             map[string]api.RepoConfig{},
+		}, nil, testLogger())
+
+		h := &Handler{
+			service: service,
+			logger:  testLogger(),
+		}
+
+		req := buildWebhookRequest(t, webhookPayloadOpts{
+			comment: "schemabot help --tenant alpha@example",
+			isPR:    true,
+		}, nil)
+
+		rr := httpResponseRecorder()
+		h.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "invalid tenant flag")
+	})
+
+	t.Run("targeted help bypasses respond_to_unscoped", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+		})
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+		})
+
+		installClient := ghclient.NewInstallationClient(client, testLogger())
+		factory := &fakeClientFactory{client: installClient}
+
+		service := api.New(nil, &api.ServerConfig{
+			Tenant:            "alpha",
+			RespondToUnscoped: &falseVal,
+			Repos:             map[string]api.RepoConfig{},
+		}, nil, testLogger())
+
+		h := &Handler{
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
+		}
+
+		req := buildWebhookRequest(t, webhookPayloadOpts{
+			comment: "schemabot help -t alpha",
+			isPR:    true,
+		}, nil)
+
+		rr := httpResponseRecorder()
+		h.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "help posted")
+	})
+
+	t.Run("targeted invalid command bypasses respond_to_unscoped", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+		})
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+		})
+
+		installClient := ghclient.NewInstallationClient(client, testLogger())
+		factory := &fakeClientFactory{client: installClient}
+
+		service := api.New(nil, &api.ServerConfig{
+			Tenant:            "alpha",
+			RespondToUnscoped: &falseVal,
+			Repos:             map[string]api.RepoConfig{},
+		}, nil, testLogger())
+
+		h := &Handler{
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
+		}
+
+		req := buildWebhookRequest(t, webhookPayloadOpts{
+			comment: "schemabot wat -t alpha",
+			isPR:    true,
+		}, nil)
+
+		rr := httpResponseRecorder()
+		h.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "invalid command")
+	})
+
+	t.Run("short tenant flag routes to matching deployment", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+		})
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+		})
+
+		installClient := ghclient.NewInstallationClient(client, testLogger())
+		factory := &fakeClientFactory{client: installClient}
+
+		service := api.New(nil, &api.ServerConfig{
+			Tenant:            "alpha",
+			RespondToUnscoped: &trueVal,
+			Repos:             map[string]api.RepoConfig{},
+		}, nil, testLogger())
+
+		h := &Handler{
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
+		}
+
+		req := buildWebhookRequest(t, webhookPayloadOpts{
+			comment: "schemabot help -t alpha",
+			isPR:    true,
+		}, nil)
+
+		rr := httpResponseRecorder()
+		h.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "help posted")
+	})
+
 	t.Run("help responds when respond_to_unscoped is true", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {

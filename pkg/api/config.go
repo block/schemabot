@@ -92,6 +92,13 @@ type ServerConfig struct {
 	// When empty or nil, all environments are allowed.
 	AllowedEnvironments []string `yaml:"allowed_environments"`
 
+	// Tenant optionally names this isolated SchemaBot instance for PR command
+	// routing. When a PR comment includes `--tenant <name>`, only the instance
+	// with the same configured tenant responds. The value is not persisted on
+	// plans or applies; it only decides whether this webhook delivery is owned by
+	// the current process.
+	Tenant string `yaml:"tenant,omitempty"`
+
 	// EnvironmentOrder defines the server-owned promotion order. Defaults to
 	// staging before production.
 	EnvironmentOrder []string `yaml:"environment_order"`
@@ -916,6 +923,9 @@ func (c *ServerConfig) Validate() error {
 	if err := c.Storage.validateLocalDSNConfig("storage"); err != nil {
 		return err
 	}
+	if c.Tenant != "" && !isValidTenantName(c.Tenant) {
+		return fmt.Errorf("tenant must start with a letter or number and contain only letters, numbers, underscores, or hyphens")
+	}
 
 	if err := c.Auth.Validate(); err != nil {
 		return fmt.Errorf("auth config: %w", err)
@@ -1514,6 +1524,31 @@ func (c *ServerConfig) IsEnvironmentAllowed(env string) bool {
 		return true
 	}
 	return slices.Contains(c.AllowedEnvironments, env)
+}
+
+// ShouldRespondToTenant returns whether this instance should handle a PR
+// command scoped with `--tenant`. Untargeted commands remain eligible for the
+// normal environment and unscoped-command routing. Targeted commands are handled
+// only by the instance whose configured tenant matches exactly.
+func (c *ServerConfig) ShouldRespondToTenant(tenant string) bool {
+	if tenant == "" {
+		return true
+	}
+	return c != nil && c.Tenant == tenant
+}
+
+func isValidTenantName(tenant string) bool {
+	for i, r := range tenant {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case i > 0 && (r == '_' || r == '-'):
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // PromotionEnvironmentOrder returns the server-owned environment promotion

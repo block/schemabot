@@ -41,7 +41,7 @@ func TestBuildPlanCommentData_UnsafeChangesPopulated(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
 
 	assert.True(t, data.HasUnsafeChanges, "expected HasUnsafeChanges=true when plan contains unsafe table changes")
 	require.Len(t, data.UnsafeChanges, 1)
@@ -69,7 +69,7 @@ func TestBuildPlanCommentData_NoUnsafeChanges(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
 
 	assert.False(t, data.HasUnsafeChanges)
 	assert.Empty(t, data.UnsafeChanges)
@@ -104,7 +104,7 @@ func TestBuildPlanCommentData_MixedSafeAndUnsafe(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
 
 	assert.True(t, data.HasUnsafeChanges)
 	require.Len(t, data.UnsafeChanges, 1)
@@ -159,6 +159,45 @@ func TestRenderPlanComment_UnsafeWithAllowUnsafe(t *testing.T) {
 	assert.Contains(t, rendered, "--allow-unsafe` enabled")
 	assert.Contains(t, rendered, "`users`")
 	assert.Contains(t, rendered, "apply-confirm -e staging --allow-unsafe")
+}
+
+func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
+	t.Run("plan hint preserves tenant", func(t *testing.T) {
+		data := templates.PlanCommentData{
+			Database:    "testdb",
+			Environment: "staging",
+			Tenant:      "alpha",
+			IsMySQL:     true,
+			Changes: []templates.KeyspaceChangeData{{
+				Keyspace:   "testdb",
+				Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
+			}},
+		}
+
+		rendered := templates.RenderPlanComment(data)
+
+		assert.Contains(t, rendered, "**Tenant**: `alpha`")
+		assert.Contains(t, rendered, "schemabot apply -e staging --tenant alpha")
+	})
+
+	t.Run("apply-confirm hint preserves tenant", func(t *testing.T) {
+		data := templates.PlanCommentData{
+			Database:    "testdb",
+			Environment: "staging",
+			Tenant:      "alpha",
+			IsMySQL:     true,
+			IsLocked:    true,
+			Changes: []templates.KeyspaceChangeData{{
+				Keyspace:   "testdb",
+				Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
+			}},
+		}
+
+		rendered := templates.RenderPlanComment(data)
+
+		assert.Contains(t, rendered, "**Tenant**: `alpha`")
+		assert.Contains(t, rendered, "schemabot apply-confirm -e staging --tenant alpha")
+	})
 }
 
 func TestRenderPlanComment_NoUnsafe_NoWarning(t *testing.T) {
@@ -302,4 +341,26 @@ func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {
 	assert.Contains(t, rendered, "DROP TABLE removes all data")
 	assert.Contains(t, rendered, "--allow-unsafe")
 	assert.Contains(t, rendered, "schemabot apply -e staging --allow-unsafe")
+}
+
+func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		Tenant:      "alpha",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"DROP TABLE `orders`"},
+		}},
+		UnsafeChanges: []templates.UnsafeChangeData{{
+			Table:  "orders",
+			Reason: "DROP TABLE removes all data",
+		}},
+	}
+
+	rendered := templates.RenderUnsafeChangesBlocked(data)
+
+	assert.Contains(t, rendered, "**Tenant**: `alpha`")
+	assert.Contains(t, rendered, "schemabot apply -e staging --tenant alpha --allow-unsafe")
 }

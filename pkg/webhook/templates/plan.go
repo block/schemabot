@@ -29,6 +29,7 @@ type PlanCommentData struct {
 	Database    string
 	SchemaName  string // Schema directory name (e.g. filepath.Base of schema dir)
 	Environment string
+	Tenant      string
 	HeadSHA     string
 	Repository  string
 	RequestedBy string // Empty means auto-generated
@@ -133,6 +134,9 @@ func RenderPlanComment(data PlanCommentData) string {
 
 	if data.IsLocked {
 		applyConfirmCmd := fmt.Sprintf("schemabot apply-confirm -e %s", data.Environment)
+		if data.Tenant != "" {
+			applyConfirmCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
+		}
 		if data.AllowUnsafe {
 			applyConfirmCmd += " --allow-unsafe"
 		}
@@ -163,7 +167,11 @@ func RenderPlanComment(data PlanCommentData) string {
 			sb.WriteString("```\nschemabot unlock\n```\n")
 		}
 	} else {
-		writeApplyHint(&sb, fmt.Sprintf("schemabot apply -e %s", data.Environment))
+		applyCmd := fmt.Sprintf("schemabot apply -e %s", data.Environment)
+		if data.Tenant != "" {
+			applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
+		}
+		writeApplyHint(&sb, applyCmd)
 	}
 
 	return sb.String()
@@ -184,6 +192,9 @@ func writePlanMetadata(sb *strings.Builder, data PlanCommentData) {
 	}
 	if data.Environment != "" {
 		parts = append(parts, fmt.Sprintf("**Environment**: `%s`", data.Environment))
+	}
+	if data.Tenant != "" {
+		parts = append(parts, fmt.Sprintf("**Tenant**: `%s`", data.Tenant))
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
 }

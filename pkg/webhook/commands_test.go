@@ -95,6 +95,149 @@ func TestHasDatabaseFlag(t *testing.T) {
 	assert.False(t, p.HasDatabaseFlag("schemabot rollback apply_abc123 -e staging"))
 }
 
+func TestParseTenantFlag(t *testing.T) {
+	parser := NewCommandParser()
+
+	tests := []struct {
+		name   string
+		body   string
+		result CommandResult
+	}{
+		{
+			name: "plan command",
+			body: "schemabot plan -e staging --tenant alpha",
+			result: CommandResult{
+				Action:      action.Plan,
+				Environment: "staging",
+				Tenant:      "alpha",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "apply command",
+			body: "schemabot apply -e production --tenant tenant-1 --allow-unsafe",
+			result: CommandResult{
+				Action:      action.Apply,
+				Environment: "production",
+				Tenant:      "tenant-1",
+				AllowUnsafe: true,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "short flag",
+			body: "schemabot plan -e staging -t alpha_1",
+			result: CommandResult{
+				Action:      action.Plan,
+				Environment: "staging",
+				Tenant:      "alpha_1",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "help command",
+			body: "schemabot help --tenant alpha",
+			result: CommandResult{
+				Action:    action.Help,
+				Tenant:    "alpha",
+				IsHelp:    true,
+				IsMention: true,
+			},
+		},
+		{
+			name: "invalid command",
+			body: "schemabot wat --tenant alpha",
+			result: CommandResult{
+				Tenant:    "alpha",
+				IsMention: true,
+			},
+		},
+		{
+			name: "missing value",
+			body: "schemabot plan -e staging --tenant",
+			result: CommandResult{
+				Action:      action.Plan,
+				Environment: "staging",
+				TenantError: true,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "short flag missing value",
+			body: "schemabot plan -e staging -t",
+			result: CommandResult{
+				Action:      action.Plan,
+				Environment: "staging",
+				TenantError: true,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "invalid value",
+			body: "schemabot plan -e staging --tenant alpha@example",
+			result: CommandResult{
+				Action:      action.Plan,
+				Environment: "staging",
+				TenantError: true,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "tenant value cannot look like another flag",
+			body: "schemabot apply -e staging --tenant --allow-unsafe",
+			result: CommandResult{
+				Action:      action.Apply,
+				Environment: "staging",
+				TenantError: true,
+				AllowUnsafe: true,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "tenant prose after directive is ignored",
+			body: "schemabot plan -e staging\n\nDo not use --tenant here.",
+			result: CommandResult{
+				Action:      action.Plan,
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "tenant prose before directive is ignored",
+			body: "Do not use --tenant here.\n\nschemabot plan -e staging",
+			result: CommandResult{
+				Action:      action.Plan,
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "environment prose after directive is ignored",
+			body: "schemabot plan\n\nUse -e staging later.",
+			result: CommandResult{
+				Action:     action.Plan,
+				MissingEnv: true,
+				IsMention:  true,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.result, parser.ParseCommand(tc.body))
+		})
+	}
+}
+
 func TestCommandSupportsDatabaseFlag(t *testing.T) {
 	assert.True(t, commandSupportsDatabaseFlag(action.Plan))
 	assert.True(t, commandSupportsDatabaseFlag(action.Apply))

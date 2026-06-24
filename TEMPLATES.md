@@ -656,7 +656,7 @@ schemabot apply -e staging --allow-unsafe
 | `schemabot rollback <apply-id> -e <env>` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env>` | Execute a rollback |
 
-**Options**: `-e <env>` environment, `-d <db>` database, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
+**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
 
 **Quick start**: `plan` → `apply` → `apply-confirm`
 
@@ -684,7 +684,7 @@ That command wasn't recognized. Available commands:
 | `schemabot rollback <apply-id> -e <env>` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env>` | Execute a rollback |
 
-**Options**: `-e <env>` environment, `-d <db>` database, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
+**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
 
 **Quick start**: `plan` → `apply` → `apply-confirm`
 
@@ -874,7 +874,7 @@ That command wasn't recognized. Available commands:
 | `schemabot rollback <apply-id> -e <env>` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env>` | Execute a rollback |
 
-**Options**: `-e <env>` environment, `-d <db>` database, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
+**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
 
 **Quick start**: `plan` → `apply` → `apply-confirm`
 </details>

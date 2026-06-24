@@ -2374,6 +2374,78 @@ allowed_environments:
 	})
 }
 
+func TestServerConfig_ShouldRespondToTenant(t *testing.T) {
+	t.Run("untargeted commands are allowed", func(t *testing.T) {
+		cfg := ServerConfig{Tenant: "alpha"}
+		assert.True(t, cfg.ShouldRespondToTenant(""))
+	})
+
+	t.Run("matching tenant is allowed", func(t *testing.T) {
+		cfg := ServerConfig{Tenant: "alpha"}
+		assert.True(t, cfg.ShouldRespondToTenant("alpha"))
+	})
+
+	t.Run("different tenant is rejected", func(t *testing.T) {
+		cfg := ServerConfig{Tenant: "alpha"}
+		assert.False(t, cfg.ShouldRespondToTenant("beta"))
+	})
+
+	t.Run("unset tenant rejects targeted commands", func(t *testing.T) {
+		cfg := ServerConfig{}
+		assert.False(t, cfg.ShouldRespondToTenant("alpha"))
+	})
+
+	t.Run("nil receiver rejects targeted commands", func(t *testing.T) {
+		var cfg *ServerConfig
+		assert.False(t, cfg.ShouldRespondToTenant("alpha"))
+	})
+}
+
+func TestServerConfig_ValidateTenantName(t *testing.T) {
+	baseConfig := func() *ServerConfig {
+		return &ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"testapp": {
+					Type: "mysql",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root@tcp(localhost:3306)/testapp"},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("valid tenant name", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Tenant = "alpha_1-prod"
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("tenant with whitespace is rejected", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Tenant = "alpha beta"
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "tenant must start with a letter or number")
+	})
+
+	t.Run("tenant with command-unsafe punctuation is rejected", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Tenant = "alpha@example"
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "tenant must start with a letter or number")
+	})
+
+	t.Run("tenant that looks like a flag is rejected", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Tenant = "--alpha"
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "tenant must start with a letter or number")
+	})
+}
+
 func TestServerConfig_ShouldRequirePassingChecks(t *testing.T) {
 	t.Run("nil receiver defaults to true", func(t *testing.T) {
 		var cfg *ServerConfig

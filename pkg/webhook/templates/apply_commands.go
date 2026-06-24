@@ -130,7 +130,12 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	writeUnsafeDropGuidance(&sb, data.UnsafeChanges)
 
 	sb.WriteString("**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**\n")
-	fmt.Fprintf(&sb, "```\nschemabot apply -e %s --allow-unsafe\n```\n", data.Environment)
+	applyCmd := fmt.Sprintf("schemabot apply -e %s", data.Environment)
+	if data.Tenant != "" {
+		applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
+	}
+	applyCmd += " --allow-unsafe"
+	fmt.Fprintf(&sb, "```\n%s\n```\n", applyCmd)
 
 	return sb.String()
 }
