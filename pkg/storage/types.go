@@ -411,6 +411,13 @@ type Apply struct {
 	// Empty for local mode (SchemaBot IS the engine).
 	ExternalID string
 
+	// IdempotencyKey deduplicates remote apply dispatch. The control plane stamps
+	// a deterministic key per dispatch generation onto the data-plane apply it
+	// creates, so a re-dispatch after a lost response returns the same apply
+	// instead of starting a duplicate. Empty (stored as NULL) for applies that
+	// are not created through an idempotent remote dispatch (CLI, local mode).
+	IdempotencyKey string
+
 	// Engine is the schema change engine: "spirit", "planetscale", etc.
 	Engine string
 

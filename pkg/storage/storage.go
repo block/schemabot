@@ -215,6 +215,11 @@ type ApplyStore interface {
 	// apply_identifier is the external identifier (e.g., "apply_abc123").
 	GetByApplyIdentifier(ctx context.Context, applyIdentifier string) (*Apply, error)
 
+	// GetByIdempotencyKey returns the apply stamped with the given idempotency
+	// key, or nil if none exists. An empty key always returns nil (NULL keys are
+	// not deduplicated), so callers must guard against the empty case.
+	GetByIdempotencyKey(ctx context.Context, idempotencyKey string) (*Apply, error)
+
 	// GetByPlan returns the apply for a plan_id, or nil if not found.
 	GetByPlan(ctx context.Context, planID int64) (*Apply, error)
 

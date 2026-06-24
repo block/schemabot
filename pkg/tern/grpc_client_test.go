@@ -4497,3 +4497,49 @@ func TestNewGRPCClient(t *testing.T) {
 		require.NoError(t, err)
 	})
 }
+
+func TestRemoteApplyIdempotencyKey(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-abc123", Attempt: 0}
+
+	whole := remoteApplyIdempotencyKey(apply, wholeApplyTaskScope())
+	require.NotEmpty(t, whole)
+	assert.True(t, strings.HasPrefix(whole, "schemabot:v1:"), "key carries a version prefix")
+	assert.LessOrEqual(t, len(whole), 255, "key fits the storage column")
+
+	// Stable across a re-dispatch of the same generation.
+	assert.Equal(t, whole, remoteApplyIdempotencyKey(apply, wholeApplyTaskScope()),
+		"same apply + attempt + scope must produce the same key")
+
+	// Rotates when the apply is deliberately retried (attempt advances).
+	retried := &storage.Apply{ApplyIdentifier: "apply-abc123", Attempt: 1}
+	assert.NotEqual(t, whole, remoteApplyIdempotencyKey(retried, wholeApplyTaskScope()),
+		"an incremented attempt must rotate the key so a retry dispatches fresh")
+
+	// A single-operation drive (multiOperation == false) stores its remote id on
+	// the parent external_id, so it shares the whole-apply key even when an
+	// operation row is present.
+	singleOp := applyTaskScope{
+		applyOperationID: 7,
+		operation:        &storage.ApplyOperation{Deployment: "region-a", OperationKey: "commerce/users"},
+		multiOperation:   false,
+	}
+	assert.Equal(t, whole, remoteApplyIdempotencyKey(apply, singleOp),
+		"single-operation drives share the whole-apply key")
+
+	// Multi-operation sibling operations dispatch independently, so their keys differ.
+	opA := applyTaskScope{
+		applyOperationID: 1,
+		operation:        &storage.ApplyOperation{Deployment: "region-a", OperationKey: "commerce/-80/users"},
+		multiOperation:   true,
+	}
+	opB := applyTaskScope{
+		applyOperationID: 2,
+		operation:        &storage.ApplyOperation{Deployment: "region-a", OperationKey: "commerce/80-/users"},
+		multiOperation:   true,
+	}
+	keyA := remoteApplyIdempotencyKey(apply, opA)
+	keyB := remoteApplyIdempotencyKey(apply, opB)
+	assert.NotEqual(t, keyA, keyB, "distinct operations must produce distinct keys")
+	assert.NotEqual(t, whole, keyA, "an operation-scoped key differs from the whole-apply key")
+	assert.Equal(t, keyA, remoteApplyIdempotencyKey(apply, opA), "operation key is stable across re-dispatch")
+}

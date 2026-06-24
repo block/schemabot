@@ -826,6 +826,111 @@ func TestLocalClient_Apply(t *testing.T) {
 	assert.Equal(t, 1, columnCount, "expected email column to exist, got count %d", columnCount)
 }
 
+// A dispatch carrying an idempotency key is deduplicated by the data plane: a
+// re-dispatch of the same key — whether the original apply is still in flight or
+// already terminal — returns the original apply id instead of creating a
+// duplicate that would re-run the schema change. This closes the window where a
+// dispatch is accepted but its response is lost before the control plane records
+// the remote apply id.
+func TestLocalClient_Apply_IdempotentDispatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	container, dsn := setupMySQLContainer(t)
+	_ = container
+	setupStorageSchema(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err, "failed to open database")
+	defer utils.CloseAndLog(db)
+
+	_, err = db.ExecContext(ctx, "CREATE TABLE users (id INT PRIMARY KEY)")
+	require.NoError(t, err, "failed to create table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      "mysql",
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err, "failed to create client")
+	defer utils.CloseAndLog(client)
+
+	schemaFiles := buildSchemaWithAllTables(t, dsn, map[string]string{
+		"users": "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
+	})
+
+	planResp, err := client.Plan(ctx, &ternv1.PlanRequest{
+		Type:     "mysql",
+		Database: "testdb",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"testdb": {Files: schemaFiles},
+		},
+	})
+	require.NoError(t, err, "Plan() returned error")
+	require.NotEmpty(t, planResp.PlanId)
+
+	const key = "schemabot:v1:dispatch-test"
+	req := &ternv1.ApplyRequest{
+		PlanId:         planResp.PlanId,
+		Environment:    localClientTestEnvironment,
+		Database:       "testdb",
+		Type:           "mysql",
+		IdempotencyKey: key,
+	}
+
+	first, err := client.Apply(ctx, req)
+	require.NoError(t, err)
+	require.True(t, first.Accepted, "first dispatch must be accepted: %s", first.ErrorMessage)
+	require.NotEmpty(t, first.ApplyId)
+
+	// Immediate re-dispatch (the original is in flight) returns the same apply
+	// instead of being rejected as "already in progress".
+	second, err := client.Apply(ctx, req)
+	require.NoError(t, err)
+	require.True(t, second.Accepted, "re-dispatch must be accepted: %s", second.ErrorMessage)
+	assert.Equal(t, first.ApplyId, second.ApplyId, "re-dispatch of the same key must return the original apply")
+
+	waitForApplyComplete(t, client, ctx, first.ApplyId)
+
+	// Re-dispatch after the apply terminalizes still returns the original id; the
+	// key encodes the dispatch generation, so only a deliberate retry (which
+	// rotates the key) would start a fresh remote apply.
+	third, err := client.Apply(ctx, req)
+	require.NoError(t, err)
+	require.True(t, third.Accepted, "terminal re-dispatch must be accepted: %s", third.ErrorMessage)
+	assert.Equal(t, first.ApplyId, third.ApplyId, "terminal apply is still returned for the same key")
+
+	// Exactly one applies row carries the key — no duplicate was created across
+	// the three dispatches.
+	var count int
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM applies WHERE idempotency_key = ?", key).Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "exactly one apply must carry the idempotency key")
+
+	resolved, err := stor.Applies().GetByIdempotencyKey(ctx, key)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, first.ApplyId, resolved.ApplyIdentifier)
+
+	// A request whose key collides with a different environment is refused rather
+	// than silently aliased to the existing apply.
+	_, err = client.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId:         planResp.PlanId,
+		Environment:    "production",
+		Database:       "testdb",
+		Type:           "mysql",
+		IdempotencyKey: key,
+	})
+	require.Error(t, err, "a key reused across environments must be rejected")
+}
+
 // An apply created via the Tern client must carry exactly one apply_operations
 // row, and every task must link to it via ApplyOperationID. The operator claim
 // loop selects work exclusively from apply_operations, and the engine

@@ -88,6 +88,7 @@ package tern
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -1603,6 +1604,36 @@ func compareVSchemaParity(recomputed, dispatched map[string]bool) error {
 	return fmt.Errorf("reviewed vschema changes this deployment would not plan: %v; vschema changes this deployment would plan that were not reviewed: %v", missing, unexpected)
 }
 
+// existingIdempotentApply returns the apply previously created for
+// req.IdempotencyKey, or nil when the key is empty or unseen. The match is
+// returned regardless of the existing apply's state: the key encodes the
+// dispatch generation (apply id + attempt + operation), so "same key" means
+// "same generation", and a deliberate retry rotates the key via apply.Attempt.
+// A stored apply whose environment, database, or type disagrees with the request
+// signals an accidental key reuse or a control-plane bug, which is surfaced as
+// an error rather than silently aliased.
+func (c *LocalClient) existingIdempotentApply(ctx context.Context, req *ternv1.ApplyRequest) (*storage.Apply, error) {
+	if req.IdempotencyKey == "" {
+		return nil, nil
+	}
+	existing, err := c.storage.Applies().GetByIdempotencyKey(ctx, req.IdempotencyKey)
+	if err != nil {
+		return nil, fmt.Errorf("look up apply by idempotency key %q: %w", req.IdempotencyKey, err)
+	}
+	if existing == nil {
+		return nil, nil
+	}
+	if existing.Environment != req.Environment || existing.Database != req.Database || existing.DatabaseType != req.Type {
+		return nil, fmt.Errorf(
+			"idempotency key %q already maps to apply %s (env=%s database=%s type=%s); refusing to alias request (env=%s database=%s type=%s)",
+			req.IdempotencyKey, existing.ApplyIdentifier,
+			existing.Environment, existing.Database, existing.DatabaseType,
+			req.Environment, req.Database, req.Type,
+		)
+	}
+	return existing, nil
+}
+
 // Apply executes a previously generated plan.
 // In local mode, Apply has additional conflict checking and polls for completion.
 //
@@ -1615,6 +1646,22 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	}
 	if req.Environment == "" {
 		return nil, fmt.Errorf("environment is required")
+	}
+
+	// Idempotent re-dispatch: if this request's generation already created an
+	// apply, return that apply's id instead of starting a duplicate. This runs
+	// before plan resolution and the active-task conflict check so a re-dispatch
+	// of our own in-flight apply is recovered rather than rejected as "already
+	// in progress".
+	if existing, err := c.existingIdempotentApply(ctx, req); err != nil {
+		return nil, err
+	} else if existing != nil {
+		c.logger.Info("Apply: returning existing apply for idempotency key",
+			"apply_id", existing.ApplyIdentifier,
+			"idempotency_key", req.IdempotencyKey,
+			"state", existing.State,
+		)
+		return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier}, nil
 	}
 
 	// Look up the plan, materializing it from the dispatch request when this
@@ -1640,6 +1687,18 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 
 	// Local mode: check for active tasks with engine verification
 	if err := c.checkActiveTaskConflict(ctx, plan); err != nil {
+		// A same-key request that committed while we were in the conflict check
+		// races as "already in progress". Re-resolve by idempotency key so the
+		// winning apply is returned instead of a spurious rejection.
+		if existing, lookupErr := c.existingIdempotentApply(ctx, req); lookupErr != nil {
+			return nil, lookupErr
+		} else if existing != nil {
+			c.logger.Info("Apply: idempotency key resolved an active-conflict race",
+				"apply_id", existing.ApplyIdentifier,
+				"idempotency_key", req.IdempotencyKey,
+			)
+			return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier}, nil
+		}
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
 			ErrorMessage: err.Error(),
@@ -1696,6 +1755,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		Engine:          eng.Name(),
 		State:           state.Apply.Pending,
 		Options:         optionsJSON,
+		IdempotencyKey:  req.IdempotencyKey,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
@@ -1755,6 +1815,18 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 
 	applyID, err := c.storage.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, operations)
 	if err != nil {
+		// Two same-key dispatches racing to create: the loser sees a duplicate
+		// idempotency key (or the active-apply guard the create runs). Resolve by
+		// key so the winner's apply is returned instead of a create error.
+		if existing, lookupErr := c.existingIdempotentApply(ctx, req); lookupErr != nil {
+			return nil, fmt.Errorf("create apply %s with tasks and operations (idempotency re-lookup also failed): %w", applyIdentifier, errors.Join(err, lookupErr))
+		} else if existing != nil {
+			c.logger.Info("Apply: idempotency key resolved a create race",
+				"apply_id", existing.ApplyIdentifier,
+				"idempotency_key", req.IdempotencyKey,
+			)
+			return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier}, nil
+		}
 		return nil, fmt.Errorf("create apply %s with tasks and operations: %w", applyIdentifier, err)
 	}
 	apply.ID = applyID

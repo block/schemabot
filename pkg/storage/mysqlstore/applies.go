@@ -23,13 +23,13 @@ import (
 
 // applyColumns lists all columns for SELECT queries.
 const applyColumns = `id, apply_identifier, lock_id, plan_id, database_name, database_type,
-	repository, pull_request, environment, deployment, caller, installation_id, external_id, engine,
+	repository, pull_request, environment, deployment, caller, installation_id, external_id, idempotency_key, engine,
 	state, error_message, options, attempt,
 	lease_owner, lease_token, lease_acquired_at,
 	created_at, started_at, completed_at, updated_at, revert_skipped_at`
 
 const applyColumnsForApplyAlias = `a.id, a.apply_identifier, a.lock_id, a.plan_id, a.database_name, a.database_type,
-	a.repository, a.pull_request, a.environment, a.deployment, a.caller, a.installation_id, a.external_id, a.engine,
+	a.repository, a.pull_request, a.environment, a.deployment, a.caller, a.installation_id, a.external_id, a.idempotency_key, a.engine,
 	a.state, a.error_message, a.options, a.attempt,
 	a.lease_owner, a.lease_token, a.lease_acquired_at,
 	a.created_at, a.started_at, a.completed_at, a.updated_at, a.revert_skipped_at`
@@ -474,12 +474,12 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	result, err := writeTx.tx.ExecContext(ctx, `
 		INSERT INTO applies (
 			apply_identifier, lock_id, plan_id, database_name, database_type,
-			repository, pull_request, environment, deployment, caller, installation_id, external_id, engine,
+			repository, pull_request, environment, deployment, caller, installation_id, external_id, idempotency_key, engine,
 			state, error_message, options, attempt
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		apply.ApplyIdentifier, apply.LockID, apply.PlanID, apply.Database, apply.DatabaseType,
-		apply.Repository, apply.PullRequest, apply.Environment, apply.Deployment, apply.Caller, apply.InstallationID, apply.ExternalID, apply.Engine,
+		apply.Repository, apply.PullRequest, apply.Environment, apply.Deployment, apply.Caller, apply.InstallationID, apply.ExternalID, nullString(apply.IdempotencyKey), apply.Engine,
 		apply.State, apply.ErrorMessage, string(options), apply.Attempt,
 	)
 	if err != nil {
@@ -570,12 +570,12 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 	result, err := writeTx.tx.ExecContext(ctx, `
 		INSERT INTO applies (
 			apply_identifier, lock_id, plan_id, database_name, database_type,
-			repository, pull_request, environment, deployment, caller, installation_id, external_id, engine,
+			repository, pull_request, environment, deployment, caller, installation_id, external_id, idempotency_key, engine,
 			state, error_message, options, attempt
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		apply.ApplyIdentifier, apply.LockID, apply.PlanID, apply.Database, apply.DatabaseType,
-		apply.Repository, apply.PullRequest, apply.Environment, apply.Deployment, apply.Caller, apply.InstallationID, apply.ExternalID, apply.Engine,
+		apply.Repository, apply.PullRequest, apply.Environment, apply.Deployment, apply.Caller, apply.InstallationID, apply.ExternalID, nullString(apply.IdempotencyKey), apply.Engine,
 		apply.State, apply.ErrorMessage, string(options), apply.Attempt,
 	)
 	if err != nil {
@@ -739,6 +739,22 @@ func (s *applyStore) GetByApplyIdentifier(ctx context.Context, applyIdentifier s
 		FROM applies
 		WHERE apply_identifier = ?
 	`, applyIdentifier)
+
+	return scanApply(row)
+}
+
+// GetByIdempotencyKey returns the apply stamped with the given idempotency key,
+// or nil if none exists. An empty key returns nil without querying: NULL keys
+// are not deduplicated, so an empty lookup would never match a real dispatch.
+func (s *applyStore) GetByIdempotencyKey(ctx context.Context, idempotencyKey string) (*storage.Apply, error) {
+	if idempotencyKey == "" {
+		return nil, nil
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+applyColumns+`
+		FROM applies
+		WHERE idempotency_key = ?
+	`, idempotencyKey)
 
 	return scanApply(row)
 }
@@ -1906,13 +1922,14 @@ func scanApplies(rows *sql.Rows) ([]*storage.Apply, error) {
 func scanApplyInto(s scanner) (*storage.Apply, error) {
 	var apply storage.Apply
 	var leaseAcquiredAt, startedAt, completedAt, revertSkippedAt sql.NullTime
+	var idempotencyKey sql.NullString
 	var options []byte
 
 	err := s.Scan(
 		&apply.ID, &apply.ApplyIdentifier, &apply.LockID, &apply.PlanID,
 		&apply.Database, &apply.DatabaseType,
 		&apply.Repository, &apply.PullRequest, &apply.Environment, &apply.Deployment,
-		&apply.Caller, &apply.InstallationID, &apply.ExternalID, &apply.Engine,
+		&apply.Caller, &apply.InstallationID, &apply.ExternalID, &idempotencyKey, &apply.Engine,
 		&apply.State, &apply.ErrorMessage, &options, &apply.Attempt,
 		&apply.LeaseOwner, &apply.LeaseToken, &leaseAcquiredAt,
 		&apply.CreatedAt, &startedAt, &completedAt, &apply.UpdatedAt, &revertSkippedAt,
@@ -1921,6 +1938,7 @@ func scanApplyInto(s scanner) (*storage.Apply, error) {
 		return nil, err
 	}
 
+	apply.IdempotencyKey = idempotencyKey.String
 	apply.Options = options
 
 	if leaseAcquiredAt.Valid {

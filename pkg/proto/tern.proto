@@ -429,6 +429,11 @@ message ApplyRequest {
   // Optional phased-apply selector for sharded engines. When empty, the apply
   // covers every shard. When set, only the named shards run in this apply.
   repeated string target_shards = 10;
+  // Optional idempotency key for deduplicating dispatch. When set, the data
+  // plane returns the existing apply for this key instead of creating a
+  // duplicate, so a re-dispatch after a lost response does not re-run the
+  // schema change. Empty preserves the non-deduplicated behavior.
+  string idempotency_key = 11;
 }
 
 // ApplyResponse indicates whether the apply was accepted.

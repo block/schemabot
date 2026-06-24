@@ -1071,6 +1071,87 @@ func TestApplyStore_GetByApplyIdentifier(t *testing.T) {
 	require.Equal(t, int64(42), apply.PlanID)
 }
 
+// TestApplyStore_IdempotencyKey verifies the dedupe anchor for remote apply
+// dispatch: applies with no key store NULL and never collide, a non-empty key is
+// unique, and GetByIdempotencyKey resolves a stamped apply while treating the
+// empty key as no lookup.
+func TestApplyStore_IdempotencyKey(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+
+	// Empty key is never deduplicated: many applies store NULL and coexist.
+	// Terminal state keeps the active-apply target guard from rejecting the
+	// repeated inserts so the test isolates the NULL-key uniqueness behavior.
+	for i := range 3 {
+		_, err := store.Applies().Create(ctx, &storage.Apply{
+			ApplyIdentifier: "apply_nokey_" + strconv.Itoa(i),
+			LockID:          lock.ID,
+			PlanID:          int64(i + 1),
+			Database:        lock.DatabaseName,
+			DatabaseType:    lock.DatabaseType,
+			Repository:      lock.Repository,
+			PullRequest:     lock.PullRequest,
+			Environment:     "staging",
+			Engine:          storage.EngineForType(lock.DatabaseType),
+			State:           state.Apply.Completed,
+		})
+		require.NoError(t, err, "applies without an idempotency key must not collide on NULL")
+	}
+
+	// Empty key lookup short-circuits to nil without matching the NULL rows.
+	got, err := store.Applies().GetByIdempotencyKey(ctx, "")
+	require.NoError(t, err)
+	assert.Nil(t, got, "empty key must not resolve any NULL-keyed apply")
+
+	// A stamped key is resolvable.
+	keyed := &storage.Apply{
+		ApplyIdentifier: "apply_keyed",
+		LockID:          lock.ID,
+		PlanID:          100,
+		Database:        lock.DatabaseName,
+		DatabaseType:    lock.DatabaseType,
+		Repository:      lock.Repository,
+		PullRequest:     lock.PullRequest,
+		Environment:     "staging",
+		Engine:          storage.EngineForType(lock.DatabaseType),
+		State:           state.Apply.Completed,
+		IdempotencyKey:  "schemabot:v1:abc",
+	}
+	keyedID, err := store.Applies().Create(ctx, keyed)
+	require.NoError(t, err)
+
+	got, err = store.Applies().GetByIdempotencyKey(ctx, "schemabot:v1:abc")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, keyedID, got.ID)
+	assert.Equal(t, "apply_keyed", got.ApplyIdentifier)
+	assert.Equal(t, "schemabot:v1:abc", got.IdempotencyKey)
+
+	// An unseen key resolves to nil.
+	got, err = store.Applies().GetByIdempotencyKey(ctx, "schemabot:v1:unseen")
+	require.NoError(t, err)
+	assert.Nil(t, got)
+
+	// The same non-empty key cannot be inserted twice.
+	_, err = store.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply_keyed_dup",
+		LockID:          lock.ID,
+		PlanID:          101,
+		Database:        lock.DatabaseName,
+		DatabaseType:    lock.DatabaseType,
+		Repository:      lock.Repository,
+		PullRequest:     lock.PullRequest,
+		Environment:     "staging",
+		Engine:          storage.EngineForType(lock.DatabaseType),
+		State:           state.Apply.Completed,
+		IdempotencyKey:  "schemabot:v1:abc",
+	})
+	require.Error(t, err, "a duplicate non-empty idempotency key must be rejected")
+}
+
 func TestApplyStore_GetByPlan(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
