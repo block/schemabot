@@ -798,36 +798,31 @@ func gitHubMetricAttributes(operation, resource, repository, githubApp string, i
 	return attrs
 }
 
-func normalizeGitHubOperation(operation string) string {
-	if isKnownGitHubOperation(operation) {
-		return operation
+// normalizeGitHubLabel returns value when known passes, otherwise logs the
+// unknown label once and returns the shared unknown sentinel, keeping each
+// per-label normalizer to a single descriptor call.
+func normalizeGitHubLabel(label, value string, known func(string) bool) string {
+	if known(value) {
+		return value
 	}
-	logUnknownGitHubMetricLabel("operation", operation)
+	logUnknownGitHubMetricLabel(label, value)
 	return gitHubMetricValueUnknown
+}
+
+func normalizeGitHubOperation(operation string) string {
+	return normalizeGitHubLabel("operation", operation, isKnownGitHubOperation)
 }
 
 func normalizeGitHubRequestCategory(category string) string {
-	if isKnownGitHubRequestCategory(category) {
-		return category
-	}
-	logUnknownGitHubMetricLabel("category", category)
-	return GitHubRequestCategoryUnknown
+	return normalizeGitHubLabel("category", category, isKnownGitHubRequestCategory)
 }
 
 func normalizeGitHubRequestStatus(status string) string {
-	if isKnownGitHubRequestStatus(status) {
-		return status
-	}
-	logUnknownGitHubMetricLabel("status", status)
-	return GitHubRequestStatusUnknown
+	return normalizeGitHubLabel("status", status, isKnownGitHubRequestStatus)
 }
 
 func normalizeGitHubRateLimitResource(resource string) string {
-	if isKnownGitHubRateLimitResource(resource) {
-		return resource
-	}
-	logUnknownGitHubMetricLabel("resource", resource)
-	return gitHubMetricValueUnknown
+	return normalizeGitHubLabel("resource", resource, isKnownGitHubRateLimitResource)
 }
 
 func logUnknownGitHubMetricLabel(label, value string) {
