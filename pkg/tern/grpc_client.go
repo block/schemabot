@@ -101,6 +101,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -1788,15 +1789,16 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	}
 
 	resp, err := c.client.Apply(ctx, &ternv1.ApplyRequest{
-		PlanId:      plan.PlanIdentifier,
-		Options:     options,
-		Database:    apply.Database,
-		Type:        apply.DatabaseType,
-		DdlChanges:  tasksToProtoTableChanges(tasks),
-		SchemaFiles: schemaFilesToProto(plan.SchemaFiles),
-		Environment: apply.Environment,
-		Target:      target,
-		Caller:      apply.Caller,
+		PlanId:       plan.PlanIdentifier,
+		Options:      options,
+		Database:     apply.Database,
+		Type:         apply.DatabaseType,
+		DdlChanges:   tasksToProtoTableChanges(tasks),
+		SchemaFiles:  schemaFilesToProto(plan.SchemaFiles),
+		Environment:  apply.Environment,
+		Target:       target,
+		Caller:       apply.Caller,
+		TargetShards: taskTargetShards(tasks),
 	})
 	if err != nil {
 		if isAmbiguousRemoteApplyDispatchError(err) {
@@ -1978,6 +1980,23 @@ func tasksToProtoTableChanges(tasks []*storage.Task) []*ternv1.TableChange {
 		})
 	}
 	return changes
+}
+
+func taskTargetShards(tasks []*storage.Task) []string {
+	seen := make(map[string]struct{})
+	var shards []string
+	for _, task := range tasks {
+		if task.Shard == "" {
+			continue
+		}
+		if _, ok := seen[task.Shard]; ok {
+			continue
+		}
+		seen[task.Shard] = struct{}{}
+		shards = append(shards, task.Shard)
+	}
+	sort.Strings(shards)
+	return shards
 }
 
 // storedApplyTransitionStatus describes whether a driver may copy a remote
@@ -2736,11 +2755,9 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 
 			// Park-and-release at the cutover barrier, mirroring the LocalClient
 			// copy drive. The tasks were just synced to waiting_for_cutover above,
-			// so exit the drive here: the operator persists the operation row at
-			// waiting_for_cutover and frees it for the deployment-ordered cutover
-			// claim. Without this an operation-scoped barrier copy drive would
-			// hold its lease and poll the parked remote forever, so the cutover
-			// claim never sees a parked operation and the rollout stalls.
+			// so exit the drive here and release the lease: the operator persists
+			// the operation row at waiting_for_cutover and frees it for the
+			// deployment-ordered cutover claim to pick up.
 			if releaseAtCutoverBarrier && state.IsState(apply.State, state.Apply.WaitingForCutover) {
 				slog.Info("operation parked at cutover barrier; exiting remote copy drive",
 					"apply_id", apply.ApplyIdentifier,

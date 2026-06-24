@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
@@ -24,7 +25,7 @@ type planStore struct {
 
 // Create stores a new plan and returns its ID.
 func (s *planStore) Create(ctx context.Context, plan *storage.Plan) (int64, error) {
-	planDataJSON, err := json.Marshal(plan.Namespaces)
+	planDataJSON, err := json.Marshal(namespacesWithShardPlans(plan))
 	if err != nil {
 		return 0, fmt.Errorf("marshal plan data: %w", err)
 	}
@@ -179,7 +180,78 @@ func scanPlanInto(s scanner) (*storage.Plan, error) {
 		if err := json.Unmarshal(planDataJSON, &plan.Namespaces); err != nil {
 			return nil, fmt.Errorf("unmarshal plan data: %w", err)
 		}
+		plan.Shards = shardPlansFromNamespaces(plan.Namespaces)
 	}
 
 	return &plan, nil
+}
+
+func namespacesWithShardPlans(plan *storage.Plan) map[string]*storage.NamespacePlanData {
+	if len(plan.Namespaces) == 0 && len(plan.Shards) == 0 {
+		return plan.Namespaces
+	}
+	namespaces := make(map[string]*storage.NamespacePlanData, len(plan.Namespaces))
+	for namespace, nsData := range plan.Namespaces {
+		if nsData == nil {
+			namespaces[namespace] = nil
+			continue
+		}
+		// Plan.Shards is the authoritative flattened write path. Existing
+		// namespace-embedded shards are preserved only when the caller did not
+		// supply flattened shards, such as when re-storing an older decoded shape.
+		shards := append([]storage.ShardPlan(nil), nsData.Shards...)
+		if len(plan.Shards) > 0 {
+			shards = nil
+		}
+		namespaces[namespace] = &storage.NamespacePlanData{
+			Tables:                append([]storage.TableChange(nil), nsData.Tables...),
+			Shards:                shards,
+			OriginalFiles:         nsData.OriginalFiles,
+			OriginalFilesCaptured: nsData.OriginalFilesCaptured,
+			Artifacts:             nsData.Artifacts,
+		}
+	}
+	for _, shard := range sortedShardPlans(plan.Shards) {
+		namespace := planShardNamespace(shard.Namespace)
+		shard.Namespace = namespace
+		if namespaces[namespace] == nil {
+			namespaces[namespace] = &storage.NamespacePlanData{}
+		}
+		namespaces[namespace].Shards = append(namespaces[namespace].Shards, shard)
+	}
+	return namespaces
+}
+
+func shardPlansFromNamespaces(namespaces map[string]*storage.NamespacePlanData) []storage.ShardPlan {
+	var shards []storage.ShardPlan
+	for namespace, nsData := range namespaces {
+		if nsData == nil {
+			continue
+		}
+		for _, shard := range nsData.Shards {
+			if shard.Namespace == "" {
+				shard.Namespace = planShardNamespace(namespace)
+			}
+			shards = append(shards, shard)
+		}
+	}
+	return sortedShardPlans(shards)
+}
+
+func sortedShardPlans(shards []storage.ShardPlan) []storage.ShardPlan {
+	out := append([]storage.ShardPlan(nil), shards...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Namespace != out[j].Namespace {
+			return out[i].Namespace < out[j].Namespace
+		}
+		return out[i].Shard < out[j].Shard
+	})
+	return out
+}
+
+func planShardNamespace(namespace string) string {
+	if namespace == "" {
+		return "default"
+	}
+	return namespace
 }

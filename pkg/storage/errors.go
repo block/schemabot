@@ -50,7 +50,7 @@ var (
 	ErrApplyOperationNotFound = errors.New("apply operation not found")
 
 	// ErrApplyOperationExists is returned when an apply_operations row for
-	// (apply_id, deployment) is being inserted but already exists.
+	// (apply_id, deployment, operation_key) is being inserted but already exists.
 	ErrApplyOperationExists = errors.New("apply operation already exists")
 
 	// ErrVitessApplyDataNotFound is returned when no vitess apply data exists for an apply.

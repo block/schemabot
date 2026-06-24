@@ -44,6 +44,7 @@ func TestApplyOperationStore_InsertAndGet(t *testing.T) {
 	assert.Equal(t, "region-a", got.Deployment)
 	assert.Equal(t, "payments", got.Target)
 	assert.Equal(t, state.ApplyOperation.Pending, got.State)
+	assert.Equal(t, storage.ApplyOperationKindWork, got.OperationKind)
 	assert.Equal(t, storage.CutoverPolicyRolling, got.CutoverPolicy, "an unset cutover_policy defaults to rolling")
 	assert.Empty(t, got.ErrorMessage)
 	assert.Nil(t, got.StartedAt)
@@ -52,6 +53,39 @@ func TestApplyOperationStore_InsertAndGet(t *testing.T) {
 	assert.Empty(t, got.EngineResumeMetadata)
 	assert.NotZero(t, got.CreatedAt)
 	assert.NotZero(t, got.UpdatedAt)
+}
+
+func TestApplyOperationStore_OperationKindRoundTrip(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_kind_roundtrip", 1)
+
+	defaulted := &storage.ApplyOperation{ApplyID: apply.ID, Deployment: "region-a", Target: "payments"}
+	defaultedID, err := store.ApplyOperations().Insert(ctx, defaulted)
+	require.NoError(t, err)
+	assert.Equal(t, storage.ApplyOperationKindWork, defaulted.OperationKind)
+
+	finalizerID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:       apply.ID,
+		Deployment:    "region-a",
+		OperationKey:  "commerce/group_finalizer",
+		OperationKind: storage.ApplyOperationKindGroupFinalizer,
+		Target:        "payments",
+	})
+	require.NoError(t, err)
+
+	gotDefaulted, err := store.ApplyOperations().Get(ctx, defaultedID)
+	require.NoError(t, err)
+	require.NotNil(t, gotDefaulted)
+	assert.Equal(t, storage.ApplyOperationKindWork, gotDefaulted.OperationKind)
+
+	gotFinalizer, err := store.ApplyOperations().Get(ctx, finalizerID)
+	require.NoError(t, err)
+	require.NotNil(t, gotFinalizer)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, gotFinalizer.OperationKind)
 }
 
 // TestApplyOperationStore_CutoverPolicyRoundTrip verifies that an explicit
@@ -194,6 +228,27 @@ func TestApplyOperationStore_GetByApplyAndDeployment(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "region-a", got.Deployment)
+	assert.Empty(t, got.OperationKey)
+
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "shard/-80", Target: "payments",
+	})
+	require.NoError(t, err)
+
+	got, err = store.ApplyOperations().GetByApplyAndDeployment(ctx, apply.ID, "region-a")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Empty(t, got.OperationKey, "legacy lookup must return the unkeyed operation")
+
+	got, err = store.ApplyOperations().GetByApplyDeploymentAndOperationKey(ctx, apply.ID, "region-a", "shard/-80")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "region-a", got.Deployment)
+	assert.Equal(t, "shard/-80", got.OperationKey)
+
+	got, err = store.ApplyOperations().GetByApplyDeploymentAndOperationKey(ctx, apply.ID, "region-a", "shard/80-")
+	require.NoError(t, err)
+	require.Nil(t, got)
 
 	// Unknown deployment for this apply → nil, no error.
 	got, err = store.ApplyOperations().GetByApplyAndDeployment(ctx, apply.ID, "region-zzz")
@@ -214,9 +269,21 @@ func TestApplyOperationStore_UniqueConstraint(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Duplicate (apply_id, deployment) → typed error.
+	// Duplicate (apply_id, deployment, operation_key) → typed error.
 	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a",
+	})
+	require.ErrorIs(t, err, storage.ErrApplyOperationExists)
+
+	// Same deployment with a distinct operation key for the same apply → ok.
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "shard/-80",
+	})
+	require.NoError(t, err)
+
+	// Duplicate keyed operation → typed error.
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "shard/-80",
 	})
 	require.ErrorIs(t, err, storage.ErrApplyOperationExists)
 
@@ -250,7 +317,7 @@ func TestApplyOperationStore_ListByApply(t *testing.T) {
 	// Insert three children in deployment order.
 	for _, dep := range []string{"region-a", "region-b", "region-c"} {
 		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-			ApplyID: apply.ID, Deployment: dep, Target: "payments",
+			ApplyID: apply.ID, Deployment: dep, OperationKey: "schema", Target: "payments",
 		})
 		require.NoError(t, err)
 	}
@@ -262,10 +329,43 @@ func TestApplyOperationStore_ListByApply(t *testing.T) {
 	// ListByApply is ordered by (created_at, id); rows inserted in the same
 	// second tie-break on id, preserving insertion (deployment) order.
 	deps := make([]string, len(got))
+	operationKeys := make([]string, len(got))
 	for i, ad := range got {
 		deps[i] = ad.Deployment
+		operationKeys[i] = ad.OperationKey
 	}
 	assert.Equal(t, []string{"region-a", "region-b", "region-c"}, deps)
+	assert.Equal(t, []string{"schema", "schema", "schema"}, operationKeys)
+}
+
+func TestApplyOperationStore_ListByApply_AllowsMultipleOperationKeysPerDeployment(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_md_same_deployment_keys", 1)
+
+	for _, operationKey := range []string{"shard/-80", "shard/80-"} {
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID:      apply.ID,
+			Deployment:   "region-a",
+			OperationKey: operationKey,
+			Target:       "payments",
+		})
+		require.NoError(t, err)
+	}
+
+	got, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+
+	operationKeys := make([]string, len(got))
+	for i, ad := range got {
+		assert.Equal(t, "region-a", ad.Deployment)
+		operationKeys[i] = ad.OperationKey
+	}
+	assert.Equal(t, []string{"shard/-80", "shard/80-"}, operationKeys)
 }
 
 // TestApplyOperationStore_ListByApply_OrderedByCreatedAt proves ListByApply
@@ -1132,6 +1232,79 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableWithinB
 	assert.WithinDuration(t, time.Now(), persisted.UpdatedAt, 5*time.Second, "heartbeat must be refreshed on re-claim")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_MultiOpRedispatchConsumesParentBudget
+// verifies OC-5 Part B2: an operation-only redispatch of a failed_retryable
+// operation in a multi-deployment apply consumes one unit of the parent apply's
+// retry budget (applies.attempt += 1). Without this the operation-only retry
+// path never advances applies.attempt, so ExpireRetryable's budget gate never
+// fires and a permanently failing deployment retries forever — stranding a
+// healthy sibling parked at the cutover barrier under on_failure "continue".
+func TestApplyOperationStore_FindNextApplyOperation_MultiOpRedispatchConsumesParentBudget(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_multiop_budget", 1, state.Apply.FailedRetryable, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ?, updated_at = NOW() WHERE id = ?
+	`, maxRecoveryAttempts-1, apply.ID)
+	require.NoError(t, err)
+
+	redispatchID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+	// A sibling operation makes this a genuine multi-deployment apply.
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.WaitingForCutover,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "the failed_retryable operation within budget must be reclaimable")
+	assert.Equal(t, redispatchID, claimed.ID)
+
+	persistedApply, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persistedApply)
+	assert.Equal(t, maxRecoveryAttempts, persistedApply.Attempt, "a multi-op redispatch must consume one unit of the parent retry budget")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_SingleOpRedispatchDoesNotConsumeParentBudget
+// verifies OC-5 Part B2's guard: a single-operation apply's parent attempt is
+// incremented by the ClaimApplyByID its drive performs, so the operation claim
+// must NOT also bump it — doing so would double-count the budget. The
+// EXISTS-sibling guard keeps the redispatch charge to multi-op applies only.
+func TestApplyOperationStore_FindNextApplyOperation_SingleOpRedispatchDoesNotConsumeParentBudget(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_singleop_budget", 1, state.Apply.FailedRetryable, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ?, updated_at = NOW() WHERE id = ?
+	`, maxRecoveryAttempts-1, apply.ID)
+	require.NoError(t, err)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, id, claimed.ID)
+
+	persistedApply, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persistedApply)
+	assert.Equal(t, maxRecoveryAttempts-1, persistedApply.Attempt, "a single-op apply's retry budget is charged by ClaimApplyByID, not by the operation claim")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableBudgetExhausted
 // verifies the recovery budget is enforced: once the parent apply's attempt
 // count reaches the limit, the failed_retryable operation is no longer
@@ -1431,6 +1604,78 @@ func TestApplyOperationStore_FindNextApplyOperation_OrdersSiblings(t *testing.T)
 	done, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	assert.Nil(t, done)
+}
+
+func TestApplyOperationStore_FindNextApplyOperation_ClaimsFinalizerAfterWorkSiblingsComplete(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_finalizer_claim", 1)
+
+	workA, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/users", OperationKind: storage.ApplyOperationKindWork,
+	})
+	require.NoError(t, err)
+	workB, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/80-/users", OperationKind: storage.ApplyOperationKindWork,
+	})
+	require.NoError(t, err)
+	finalizer, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, workA, claimed.ID)
+	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, workA))
+
+	claimed, err = store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, workB, claimed.ID)
+
+	blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, blocked)
+
+	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, workB))
+	claimed, err = store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, finalizer, claimed.ID)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, claimed.OperationKind)
+}
+
+func TestApplyOperationStore_FindNextApplyOperation_BlocksFinalizerAfterFailedWorkSibling(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_finalizer_failed_work", 1)
+
+	workA, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/users", OperationKind: storage.ApplyOperationKindWork,
+	})
+	require.NoError(t, err)
+	workB, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/80-/users", OperationKind: storage.ApplyOperationKindWork,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, workA))
+	require.NoError(t, store.ApplyOperations().MarkFailed(ctx, workB, "copy failed"))
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed)
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_HaltsOnFailedSibling verifies

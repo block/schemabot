@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -57,4 +58,16 @@ func TestEngineProgressIsExternallyAuthoritative(t *testing.T) {
 			assert.Equal(t, tc.want, engineProgressIsExternallyAuthoritative(tc.eng))
 		})
 	}
+}
+
+func TestLocalClientSupportsShardedApplyFanoutOnlyForInstanceLocalEngines(t *testing.T) {
+	assert.False(t, (&LocalClient{
+		config:       LocalConfig{Type: storage.DatabaseTypeMySQL},
+		spiritEngine: &authoritativeEngine{authoritative: true},
+	}).SupportsShardedApplyFanout())
+
+	assert.True(t, (&LocalClient{
+		config:       LocalConfig{Type: storage.DatabaseTypeMySQL},
+		spiritEngine: &instanceLocalEngine{},
+	}).SupportsShardedApplyFanout())
 }

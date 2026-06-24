@@ -2,6 +2,7 @@ package planetscale
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -231,7 +232,7 @@ func TestSelectSchemaChangeContext(t *testing.T) {
 			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "80-", Status: state.Vitess.Queued},
 		}
 
-		got, candidates := selectSchemaChangeContext(rows, map[string]bool{})
+		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, time.Time{})
 
 		assert.Equal(t, "singularity:new-change", got)
 		assert.Equal(t, []string{"singularity:new-change"}, candidates)
@@ -244,7 +245,7 @@ func TestSelectSchemaChangeContext(t *testing.T) {
 			{MigrationContext: "singularity:old-drop-index", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Failed},
 		}
 
-		got, candidates := selectSchemaChangeContext(rows, map[string]bool{})
+		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, time.Time{})
 
 		assert.Empty(t, got)
 		assert.Empty(t, candidates)
@@ -256,7 +257,7 @@ func TestSelectSchemaChangeContext(t *testing.T) {
 			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "80-", Status: state.Vitess.Running},
 		}
 
-		got, candidates := selectSchemaChangeContext(rows, map[string]bool{})
+		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, time.Time{})
 
 		assert.Equal(t, "singularity:new-change", got)
 		assert.Equal(t, []string{"singularity:new-change"}, candidates)
@@ -268,7 +269,7 @@ func TestSelectSchemaChangeContext(t *testing.T) {
 			{MigrationContext: "singularity:change-b", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Queued},
 		}
 
-		got, candidates := selectSchemaChangeContext(rows, map[string]bool{})
+		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, time.Time{})
 
 		assert.Empty(t, got)
 		assert.Equal(t, []string{"singularity:change-a", "singularity:change-b"}, candidates)
@@ -279,12 +280,47 @@ func TestSelectSchemaChangeContext(t *testing.T) {
 			{MigrationContext: "singularity:pre-existing", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running},
 			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running},
 		}
-		baseline := map[string]bool{"singularity:pre-existing": true}
+		baseline := map[string]MigrationContextTimestamps{"singularity:pre-existing": {}}
 
-		got, candidates := selectSchemaChangeContext(rows, baseline)
+		got, candidates := selectSchemaChangeContext(rows, baseline, time.Time{})
 
 		assert.Equal(t, "singularity:new-change", got)
 		assert.Equal(t, []string{"singularity:new-change"}, candidates)
+	})
+
+	t.Run("multiple in-flight candidates disambiguate by earliest requested at/after deploy", func(t *testing.T) {
+		deployCreatedAt := time.Date(2026, 6, 23, 10, 0, 5, 0, time.UTC)
+		beforeDeploy := time.Date(2026, 6, 23, 9, 58, 0, 0, time.UTC)
+		atDeploy := time.Date(2026, 6, 23, 10, 0, 6, 0, time.UTC)
+		laterDeploy := time.Date(2026, 6, 23, 10, 0, 9, 0, time.UTC)
+		rows := []vitessMigrationRow{
+			// A concurrent change requested before this deploy — must be excluded.
+			{MigrationContext: "singularity:other-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running, RequestedAt: &beforeDeploy},
+			// This deploy's context — earliest requested at/after the deploy.
+			{MigrationContext: "singularity:this-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Queued, RequestedAt: &atDeploy},
+			// Another change started just after — later requested timestamp.
+			{MigrationContext: "singularity:newer-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Queued, RequestedAt: &laterDeploy},
+		}
+
+		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, deployCreatedAt)
+
+		assert.Equal(t, "singularity:this-change", got, "the earliest context requested at/after the deploy is this apply's")
+		assert.Len(t, candidates, 3, "all three in-flight contexts are candidates before the tie-break")
+	})
+
+	t.Run("multiple in-flight candidates stay ambiguous when none is requested at/after deploy", func(t *testing.T) {
+		deployCreatedAt := time.Date(2026, 6, 23, 10, 0, 5, 0, time.UTC)
+		beforeA := time.Date(2026, 6, 23, 9, 0, 0, 0, time.UTC)
+		beforeB := time.Date(2026, 6, 23, 9, 30, 0, 0, time.UTC)
+		rows := []vitessMigrationRow{
+			{MigrationContext: "singularity:change-a", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running, RequestedAt: &beforeA},
+			{MigrationContext: "singularity:change-b", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Queued, RequestedAt: &beforeB},
+		}
+
+		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, deployCreatedAt)
+
+		assert.Empty(t, got, "no candidate requested at/after the deploy means none can be claimed as this apply's")
+		assert.Len(t, candidates, 2)
 	})
 }
 

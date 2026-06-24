@@ -258,9 +258,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		NewState: state.Apply.ValidatingDeployRequest,
 	})
 	persistState(&psMetadata{
-		BranchName:       branchName,
-		DeployRequestID:  dr.Number,
-		DeployRequestURL: dr.HtmlURL,
+		BranchName:            branchName,
+		DeployRequestID:       dr.Number,
+		DeployRequestURL:      dr.HtmlURL,
+		ExistingMigrationCtxs: existingContexts,
 	})
 	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr)
 	if err != nil {
@@ -350,11 +351,12 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			"instant_eligible", useInstant,
 		)
 		meta, encErr := encodePSMetadata(&psMetadata{
-			BranchName:       branchName,
-			DeployRequestID:  dr.Number,
-			DeployRequestURL: dr.HtmlURL,
-			IsInstant:        useInstant,
-			DeferredDeploy:   true,
+			BranchName:            branchName,
+			DeployRequestID:       dr.Number,
+			DeployRequestURL:      dr.HtmlURL,
+			IsInstant:             useInstant,
+			DeferredDeploy:        true,
+			ExistingMigrationCtxs: existingContexts,
 		})
 		if encErr != nil {
 			return nil, fmt.Errorf("encode metadata for deferred deploy request #%d: %w", dr.Number, encErr)
@@ -419,13 +421,14 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// Discover migration_context by diffing current SHOW VITESS_MIGRATIONS against
 	// the pre-deploy baseline. Retries because Vitess may not have created migrations
 	// immediately after the deploy request is submitted.
-	migrationContext := e.discoverSchemaChangeContextWithRetry(ctx, client, req.Database, req.Credentials, existingContexts)
+	migrationContext := e.discoverSchemaChangeContextWithRetry(ctx, client, req.Database, req.Credentials, existingContexts, dr.CreatedAt)
 
 	meta, err := encodePSMetadata(&psMetadata{
-		BranchName:       branchName,
-		DeployRequestID:  dr.Number,
-		DeployRequestURL: dr.HtmlURL,
-		IsInstant:        useInstant,
+		BranchName:            branchName,
+		DeployRequestID:       dr.Number,
+		DeployRequestURL:      dr.HtmlURL,
+		IsInstant:             useInstant,
+		ExistingMigrationCtxs: existingContexts,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("encode metadata for deploy request #%d: %w", dr.Number, err)
@@ -826,7 +829,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("deploy on resume: %w", err)
 	}
 
-	migrationContext := e.resolveResumeSchemaChangeContext(ctx, client, req, existingContexts)
+	migrationContext := e.resolveResumeSchemaChangeContext(ctx, client, req, existingContexts, dr.CreatedAt)
 
 	// Persist the rediscovered context now so a crash before this function
 	// returns does not lose it — the returned ResumeState alone is not durable.
@@ -909,7 +912,7 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 		}
 		dr = deployed
 
-		migrationContext = e.resolveResumeSchemaChangeContext(ctx, client, req, existingContexts)
+		migrationContext = e.resolveResumeSchemaChangeContext(ctx, client, req, existingContexts, dr.CreatedAt)
 
 		// Persist the rediscovered context now so a crash before this function
 		// returns does not lose it — the returned ResumeState alone is not durable.
@@ -937,12 +940,15 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 		e.logger.Info("rediscovering Vitess context on reattach; stored value is not a real context",
 			"database", req.Database, "deploy_request", dr.Number, "stored_context", migrationContext)
 		// The deploy ran in a prior process, so its context is already in SHOW
-		// VITESS_MIGRATIONS. Discover against an empty baseline, which makes every
-		// context a candidate; selection keeps only non-terminal candidates so a
-		// completed historical context from an unrelated change is never matched.
-		// A genuinely finished change yields no non-terminal candidate, so the
-		// stored identifier is preserved rather than attached to stale progress.
-		rediscovered := e.discoverSchemaChangeContextWithRetry(ctx, client, req.Database, req.Credentials, map[string]bool{})
+		// VITESS_MIGRATIONS. Discover against the pre-deploy baseline persisted in
+		// engine resume metadata so contexts that predate this deploy are excluded,
+		// anchored to the deploy's creation time to disambiguate concurrent changes.
+		// Selection keeps only non-terminal candidates, so a completed historical
+		// change is never matched and a genuinely finished change yields no
+		// candidate — preserving the stored identifier rather than attaching stale
+		// progress. The baseline may be empty for applies created before this
+		// persistence existed; discovery then falls back to baseline-free selection.
+		rediscovered := e.discoverSchemaChangeContextWithRetry(ctx, client, req.Database, req.Credentials, meta.ExistingMigrationCtxs, dr.CreatedAt)
 		if rediscovered != "" {
 			migrationContext = rediscovered
 			e.persistResumeSchemaChangeContext(req, migrationContext, updatedMeta)
@@ -984,15 +990,15 @@ func deployRequestNeedsResumeDeploy(dr *ps.DeployRequest, meta *psMetadata) bool
 // baseline; otherwise it is the tern-assigned apply identifier, which never
 // matches SHOW VITESS_MIGRATIONS, so per-shard progress stays empty until a real
 // context is found.
-func (e *Engine) resolveResumeSchemaChangeContext(ctx context.Context, client psclient.PSClient, req *engine.ApplyRequest, existingContexts map[string]bool) string {
+func (e *Engine) resolveResumeSchemaChangeContext(ctx context.Context, client psclient.PSClient, req *engine.ApplyRequest, existingContexts map[string]MigrationContextTimestamps, deployCreatedAt time.Time) string {
 	stored := req.ResumeState.MigrationContext
 
-	discovered := e.discoverSchemaChangeContextWithRetry(ctx, client, req.Database, req.Credentials, existingContexts)
+	discovered := e.discoverSchemaChangeContextWithRetry(ctx, client, req.Database, req.Credentials, existingContexts, deployCreatedAt)
 	if discovered != "" {
 		return discovered
 	}
 
-	if stored != "" && existingContexts[stored] {
+	if _, inBaseline := existingContexts[stored]; stored != "" && inBaseline {
 		e.logger.Debug("keeping stored Vitess context on resume", "database", req.Database, "context", stored)
 		return stored
 	}

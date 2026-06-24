@@ -1684,6 +1684,26 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 		return nil, fmt.Errorf("expire retryable tasks: %w", err)
 	}
 
+	// Terminalize the apply's retryable operation rows alongside the apply: once
+	// the apply is being expired — whether its retry budget is spent or its
+	// recovery freshness window has elapsed — the rollout's verdict is final, so
+	// a per-deployment operation that was still retryable is permanently failed,
+	// not retryable. The deployment-order claim gates read earlier.state from
+	// apply_operations, so a row left failed_retryable would keep blocking a
+	// healthy later deployment under on_failure "continue" even though the
+	// rollout has already failed. Only failed_retryable rows are flipped — a
+	// successor parked at waiting_for_cutover is a healthy deployment that must
+	// still be allowed to cut over, so it is left untouched.
+	opArgs := append([]any{state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable}, applyIDs...)
+	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE apply_operations
+		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+		WHERE state = ? AND apply_id IN (%s)
+	`, placeholders(len(applyIDs))), opArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("expire retryable apply_operations: %w", err)
+	}
+
 	applyArgs := append([]any{state.Apply.Failed}, applyIDs...)
 	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE applies

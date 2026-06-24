@@ -9,9 +9,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/spirit/pkg/statement"
 )
 
 // fakePlanStore lets a test script the plan Get/Create behavior the plan
@@ -48,6 +50,45 @@ func newPlanMaterializeClient(plans storage.PlanStore) *LocalClient {
 	}
 }
 
+// fakePlanEngine implements only engine.Plan so the drift guard can recompute a
+// local plan in tests without a live database. All other engine methods are
+// inherited from the embedded nil interface and must not be called.
+type fakePlanEngine struct {
+	engine.Engine
+	planFn func(context.Context, *engine.PlanRequest) (*engine.PlanResult, error)
+}
+
+func (e fakePlanEngine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.PlanResult, error) {
+	return e.planFn(ctx, req)
+}
+
+// newPlanMaterializeClientWithPlan returns a materialize client whose drift
+// guard recomputes the given plan result against "live" schema. The DB-bearing
+// TargetDSN keeps planWithEngine on the single-namespace path.
+func newPlanMaterializeClientWithPlan(plans storage.PlanStore, result *engine.PlanResult) *LocalClient {
+	c := newPlanMaterializeClient(plans)
+	c.config.TargetDSN = "user:pass@tcp(127.0.0.1:3306)/testapp"
+	c.spiritEngine = fakePlanEngine{
+		planFn: func(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) { return result, nil },
+	}
+	return c
+}
+
+// alterUsersEmailPlan is the recomputed plan that exactly matches the reviewed
+// ALTER used across the materialize-path tests.
+func alterUsersEmailPlan() *engine.PlanResult {
+	return &engine.PlanResult{
+		Changes: []engine.SchemaChange{{
+			Namespace: "testapp",
+			TableChanges: []engine.TableChange{{
+				Table:     "users",
+				Operation: statement.StatementAlterTable,
+				DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			}},
+		}},
+	}
+}
+
 // A deployment that planned locally resolves its own stored plan and never
 // materializes a new one from the dispatch request.
 func TestPlanForApplyRequest_LocalPlanWins(t *testing.T) {
@@ -72,7 +113,7 @@ func TestPlanForApplyRequest_MaterializesFromRequest(t *testing.T) {
 		getFn:    func(string) (*storage.Plan, error) { return nil, nil },
 		createID: 42,
 	}
-	c := newPlanMaterializeClient(store)
+	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
 
 	got, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId:      "plan_remote",
@@ -132,7 +173,7 @@ func TestPlanForApplyRequest_DuplicateCreateReloads(t *testing.T) {
 		},
 		createErr: errors.New("duplicate plan_identifier"),
 	}
-	c := newPlanMaterializeClient(store)
+	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
 
 	got, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId:     "plan_race",

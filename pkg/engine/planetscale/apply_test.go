@@ -449,7 +449,7 @@ func TestResolveResumeSchemaChangeContext_PreservesStoredWithoutDSN(t *testing.T
 		ResumeState: &engine.ResumeState{MigrationContext: "apply-1a2b3c4d5e6f7890"},
 	}
 
-	got := e.resolveResumeSchemaChangeContext(t.Context(), client, req, map[string]bool{})
+	got := e.resolveResumeSchemaChangeContext(t.Context(), client, req, map[string]MigrationContextTimestamps{}, time.Time{})
 
 	assert.Equal(t, "apply-1a2b3c4d5e6f7890", got)
 }

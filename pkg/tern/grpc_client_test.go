@@ -918,6 +918,7 @@ func TestGRPCClient_ResumeApplyOperationDispatchesScopedTasks(t *testing.T) {
 		ApplyID:          apply.ID,
 		ApplyOperationID: &operationID,
 		TableName:        "users",
+		Shard:            "-80",
 		DDL:              "ALTER TABLE users ADD COLUMN email varchar(255)",
 		DDLAction:        "alter",
 		Namespace:        "default",
@@ -954,6 +955,7 @@ func TestGRPCClient_ResumeApplyOperationDispatchesScopedTasks(t *testing.T) {
 	require.NotNil(t, req, "expected operation-scoped apply to be dispatched to remote Tern")
 	require.Len(t, req.DdlChanges, 1)
 	assert.Equal(t, "users", req.DdlChanges[0].TableName)
+	assert.Equal(t, []string{"-80"}, req.TargetShards)
 }
 
 func TestGRPCClient_ResumeApplyOperationDispatchParksBarrierCutoverRemotely(t *testing.T) {
@@ -2324,10 +2326,8 @@ func TestGRPCClient_ProgressPollAdoptsTerminalTablesAfterStart(t *testing.T) {
 
 // An operation-scoped barrier copy drive must stop driving the moment the remote
 // parks at the cutover barrier: it persists the operation's tasks at
-// waiting_for_cutover and returns so the operator can mark the operation row
-// parked and free it for the deployment-ordered cutover claim. Without releasing
-// here the drive would hold its lease and poll the parked remote forever, so the
-// cutover claim never sees a parked operation and the rollout stalls.
+// waiting_for_cutover and returns, releasing its lease so the operator can mark
+// the operation row parked and free it for the deployment-ordered cutover claim.
 func TestGRPCClient_PollForCompletionReleasesAtCutoverBarrier(t *testing.T) {
 	server := &capturingTernServer{
 		progressState:    ternv1.State_STATE_WAITING_FOR_CUTOVER,

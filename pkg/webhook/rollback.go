@@ -330,9 +330,13 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 		return
 	}
 
-	// Build apply options — rollback always allows unsafe changes
+	// Build apply options — rollback always allows unsafe changes, and is marked
+	// as a rollback so the terminal check update lands action_required (the PR's
+	// change is reverted) even when an operator driver, not this command's
+	// observer, publishes the terminal result.
 	options := map[string]string{
 		"allow_unsafe": "true",
+		"rollback":     "true",
 	}
 	if result.DeferCutover {
 		options["defer_cutover"] = "true"

@@ -22,6 +22,14 @@ const taskColumns = `id, task_identifier, apply_id, apply_operation_id, plan_id,
 	is_instant, ready_to_complete, engine_migration_id,
 	started_at, completed_at, created_at, updated_at`
 
+func prefixedTaskColumns(alias string) string {
+	parts := strings.Split(taskColumns, ",")
+	for i, part := range parts {
+		parts[i] = alias + "." + strings.TrimSpace(part)
+	}
+	return strings.Join(parts, ", ")
+}
+
 // terminalTaskStatesSQL is formatted for SQL IN clause.
 var terminalTaskStatesSQL = func() string {
 	parts := make([]string, 0, len(state.TerminalTaskStates))
@@ -288,19 +296,27 @@ func (s *taskStore) GetByApplyID(ctx context.Context, applyID int64) ([]*storage
 	return scanTasks(rows)
 }
 
-// GetByApplyOperationID returns the per-table tasks for a single apply_operation
-// (one deployment of a multi-deployment apply). It lets a driver drive and
-// reconcile one deployment independently once an apply fans out across several.
-// Per-shard detail rows (shard != "") are excluded for the same reason as
-// GetByApplyID: they must stay write-only relative to the per-table pipeline and
-// are read via GetShardProgressByApplyOperationID.
+// GetByApplyOperationID returns the drive tasks for a single apply_operation.
+// Unsharded operations load their per-table rows (shard = ""). Sharded work
+// operations load the row whose namespace/shard/table matches the operation key,
+// so TargetShards can be rebuilt from storage while reflected per-shard progress
+// rows for unsharded operations stay out of the drive pipeline.
 func (s *taskStore) GetByApplyOperationID(ctx context.Context, applyOperationID int64) ([]*storage.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT `+taskColumns+`
-		FROM tasks
-		WHERE apply_operation_id = ? AND shard = ''
-		ORDER BY created_at DESC, id DESC
-	`, applyOperationID)
+		SELECT `+prefixedTaskColumns("t")+`
+		FROM tasks t
+		JOIN apply_operations ao ON ao.id = t.apply_operation_id
+		WHERE t.apply_operation_id = ?
+			AND (
+				t.shard = ''
+				OR (
+					ao.operation_kind = ?
+					-- Keep this in sync with shardOperationKey's namespace/shard/table format.
+					AND ao.operation_key = CONCAT(t.namespace, '/', t.shard, '/', t.table_name)
+				)
+			)
+		ORDER BY t.created_at DESC, t.id DESC
+	`, applyOperationID, storage.ApplyOperationKindWork)
 	if err != nil {
 		return nil, fmt.Errorf("query tasks for apply_operation %d: %w", applyOperationID, err)
 	}

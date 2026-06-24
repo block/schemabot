@@ -1031,6 +1031,62 @@ func TestExecutePlanUnavailableRemoteErrorIncludesDeployment(t *testing.T) {
 	assert.Equal(t, codes.Unavailable, status.Code(err))
 }
 
+func TestExecutePlanPersistsShardPlans(t *testing.T) {
+	plans := &capturingPlanStore{}
+	mockClient := &mockTernClient{
+		planResp: &ternv1.PlanResponse{
+			PlanId: "plan-shards",
+			Changes: []*ternv1.SchemaChange{{
+				Namespace: "commerce",
+				TableChanges: []*ternv1.TableChange{{
+					TableName:  "users",
+					Ddl:        "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+					ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+				}},
+			}},
+			Shards: []*ternv1.ShardPlan{
+				{Namespace: "commerce", Shard: "-80", NeedsChange: true},
+				{Namespace: "commerce", Shard: "80-", NeedsChange: false},
+			},
+		},
+	}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"commerce": {
+				Type: storage.DatabaseTypeVitess,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {Target: "commerce-target", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"staging": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
+		"primary/staging": mockClient,
+	}, logger)
+
+	resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
+		Database:    "commerce",
+		Environment: "staging",
+		Type:        storage.DatabaseTypeVitess,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"commerce": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL)"}},
+		},
+		Repository: "example/app",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.NotNil(t, plans.created)
+	assert.Equal(t, []storage.ShardPlan{
+		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
+		{Namespace: "commerce", Shard: "80-", NeedsChange: false},
+	}, plans.created.Shards)
+}
+
 func TestExecutePullSchemaRoutesConfiguredMySQLTarget(t *testing.T) {
 	mockClient := &mockTernClient{
 		pullSchemaResp: &ternv1.PullSchemaResponse{
@@ -1867,7 +1923,7 @@ func TestCreateStoredApplyFansOutOperationsForResolvedTargets(t *testing.T) {
 		controls:  &memoryControlRequestStore{},
 	}, cfg, map[string]tern.Client{}, logger)
 
-	apply, storedApplyID, err := svc.createStoredApply(t.Context(), executeApplyTestPlan(), ApplyRequest{Environment: "staging"}, nil, "apply-fanout", "")
+	apply, storedApplyID, err := svc.createStoredApply(t.Context(), executeApplyTestPlan(), ApplyRequest{Environment: "staging"}, nil, "apply-fanout", false)
 
 	require.NoError(t, err)
 	assert.Equal(t, int64(123), storedApplyID)
@@ -1890,6 +1946,233 @@ func TestCreateStoredApplyFansOutOperationsForResolvedTargets(t *testing.T) {
 	require.NotNil(t, tasks.tasks[1].ApplyOperationID)
 	assert.Equal(t, applies.operations[0].ID, *tasks.tasks[0].ApplyOperationID)
 	assert.Equal(t, applies.operations[1].ID, *tasks.tasks[1].ApplyOperationID)
+}
+
+func TestCreateStoredApplyFansOutShardedPlanOperations(t *testing.T) {
+	// A sharded plan queues one operation per changed shard/table so each shard
+	// can be claimed and driven independently while unchanged shards stay out of
+	// the apply operation set.
+	applies := &capturingApplyStore{}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	plan := executeApplyTestPlan()
+	plan.DatabaseType = storage.DatabaseTypeStrata
+	plan.Target = "commerce-target"
+	plan.Namespaces = map[string]*storage.NamespacePlanData{
+		"commerce": {
+			Tables: []storage.TableChange{
+				{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"},
+			},
+		},
+	}
+	plan.Shards = []storage.ShardPlan{
+		{Namespace: "commerce", Shard: "80-", NeedsChange: true},
+		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
+		{Namespace: "commerce", Shard: "-", NeedsChange: false},
+	}
+	cfg := testServerConfig()
+	cfg.Databases = map[string]DatabaseConfig{}
+	cfg.Databases["testdb"] = DatabaseConfig{
+		Type: storage.DatabaseTypeStrata,
+		Environments: map[string]EnvironmentConfig{
+			"staging": {Target: "commerce-target", Deployment: DefaultDeployment},
+		},
+	}
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+		controls:  &memoryControlRequestStore{},
+	}, cfg, map[string]tern.Client{}, logger)
+
+	apply, storedApplyID, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-sharded-fanout", true)
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(123), storedApplyID)
+	require.NotNil(t, apply)
+	assert.Equal(t, storage.EngineStrata, apply.Engine)
+	require.Len(t, applies.operations, 2)
+	assert.Equal(t, DefaultDeployment, applies.operations[0].Deployment)
+	assert.Equal(t, "commerce-target", applies.operations[0].Target)
+	assert.Equal(t, "commerce/-80/users", applies.operations[0].OperationKey)
+	assert.Equal(t, storage.ApplyOperationKindWork, applies.operations[0].OperationKind)
+	assert.Equal(t, DefaultDeployment, applies.operations[1].Deployment)
+	assert.Equal(t, "commerce-target", applies.operations[1].Target)
+	assert.Equal(t, "commerce/80-/users", applies.operations[1].OperationKey)
+	assert.Equal(t, storage.ApplyOperationKindWork, applies.operations[1].OperationKind)
+	require.Len(t, tasks.tasks, 2)
+	assert.Equal(t, "-80", tasks.tasks[0].Shard)
+	assert.Equal(t, "users", tasks.tasks[0].TableName)
+	require.NotNil(t, tasks.tasks[0].ApplyOperationID)
+	assert.Equal(t, applies.operations[0].ID, *tasks.tasks[0].ApplyOperationID)
+	assert.Equal(t, "80-", tasks.tasks[1].Shard)
+	assert.Equal(t, "users", tasks.tasks[1].TableName)
+	require.NotNil(t, tasks.tasks[1].ApplyOperationID)
+	assert.Equal(t, applies.operations[1].ID, *tasks.tasks[1].ApplyOperationID)
+}
+
+func TestCreateStoredApplyFansOutShardedPlanWithFinalizerOperation(t *testing.T) {
+	// A sharded plan with a namespace-level routing metadata change keeps the
+	// work operations shard-scoped and queues the metadata change as a finalizer
+	// operation that is driven through the same operation-scoped path.
+	applies := &capturingApplyStore{}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	plan := executeApplyTestPlan()
+	plan.DatabaseType = storage.DatabaseTypeStrata
+	plan.Target = "commerce-target"
+	plan.Namespaces = map[string]*storage.NamespacePlanData{
+		"commerce": {
+			Artifacts: map[string]string{vSchemaArtifactName: "{\"sharded\":true}"},
+			Tables: []storage.TableChange{
+				{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"},
+			},
+		},
+	}
+	plan.Shards = []storage.ShardPlan{
+		{Namespace: "commerce", Shard: "80-", NeedsChange: true},
+		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
+	}
+	cfg := testServerConfig()
+	cfg.Databases = map[string]DatabaseConfig{}
+	cfg.Databases["testdb"] = DatabaseConfig{
+		Type: storage.DatabaseTypeStrata,
+		Environments: map[string]EnvironmentConfig{
+			"staging": {Target: "commerce-target", Deployment: DefaultDeployment},
+		},
+	}
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+		controls:  &memoryControlRequestStore{},
+	}, cfg, map[string]tern.Client{}, logger)
+
+	_, _, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-sharded-finalizer", true)
+
+	require.NoError(t, err)
+	require.Len(t, applies.operations, 3)
+	assert.Equal(t, "commerce/-80/users", applies.operations[0].OperationKey)
+	assert.Equal(t, storage.ApplyOperationKindWork, applies.operations[0].OperationKind)
+	assert.Equal(t, "commerce/80-/users", applies.operations[1].OperationKey)
+	assert.Equal(t, storage.ApplyOperationKindWork, applies.operations[1].OperationKind)
+	assert.Equal(t, "commerce/group_finalizer", applies.operations[2].OperationKey)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, applies.operations[2].OperationKind)
+
+	require.Len(t, tasks.tasks, 3)
+	assert.Equal(t, "-80", tasks.tasks[0].Shard)
+	assert.Equal(t, "users", tasks.tasks[0].TableName)
+	assert.Equal(t, "80-", tasks.tasks[1].Shard)
+	assert.Equal(t, "users", tasks.tasks[1].TableName)
+	assert.Empty(t, tasks.tasks[2].Shard)
+	assert.Equal(t, "VSchema: commerce", tasks.tasks[2].TableName)
+	assert.Equal(t, "vschema_update", tasks.tasks[2].DDLAction)
+	require.NotNil(t, tasks.tasks[2].ApplyOperationID)
+	assert.Equal(t, applies.operations[2].ID, *tasks.tasks[2].ApplyOperationID)
+}
+
+func TestCreateStoredApplyDoesNotDropFinalizerOnlyNamespace(t *testing.T) {
+	// A routing-only namespace with no shard work keeps the apply on the
+	// single-operation path so the routing change is preserved.
+	applies := &capturingApplyStore{}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	plan := executeApplyTestPlan()
+	plan.DatabaseType = storage.DatabaseTypeStrata
+	plan.Namespaces = map[string]*storage.NamespacePlanData{
+		"commerce": {
+			Tables: []storage.TableChange{
+				{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"},
+			},
+		},
+		"routing": {
+			Artifacts: map[string]string{vSchemaArtifactName: "{\"routing\":true}"},
+		},
+	}
+	plan.Shards = []storage.ShardPlan{{Namespace: "commerce", Shard: "-", NeedsChange: true}}
+	cfg := testServerConfig()
+	cfg.Databases = map[string]DatabaseConfig{}
+	cfg.Databases["testdb"] = DatabaseConfig{
+		Type: storage.DatabaseTypeStrata,
+		Environments: map[string]EnvironmentConfig{
+			"staging": {Target: "commerce-target", Deployment: DefaultDeployment},
+		},
+	}
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+		controls:  &memoryControlRequestStore{},
+	}, cfg, map[string]tern.Client{}, logger)
+
+	_, _, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-finalizer-only-namespace", true)
+
+	require.NoError(t, err)
+	require.Len(t, applies.operations, 1)
+	assert.Empty(t, applies.operations[0].OperationKey)
+	assert.Equal(t, storage.ApplyOperationKindWork, applies.operations[0].OperationKind)
+	require.Len(t, tasks.tasks, 2)
+	assert.Equal(t, "users", tasks.tasks[0].TableName)
+	assert.Equal(t, "VSchema: routing", tasks.tasks[1].TableName)
+	assert.Equal(t, "vschema_update", tasks.tasks[1].DDLAction)
+}
+
+func TestCreateStoredApplyDoesNotShardWithoutClientOptIn(t *testing.T) {
+	applies := &capturingApplyStore{}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	plan := executeApplyTestPlan()
+	plan.Namespaces = map[string]*storage.NamespacePlanData{
+		"commerce": {
+			Tables: []storage.TableChange{
+				{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"},
+			},
+		},
+	}
+	plan.Shards = []storage.ShardPlan{
+		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
+		{Namespace: "commerce", Shard: "80-", NeedsChange: true},
+	}
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+		controls:  &memoryControlRequestStore{},
+	}, testServerConfig(), map[string]tern.Client{}, logger)
+
+	_, _, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-no-sharded-fanout", false)
+
+	require.NoError(t, err)
+	require.Len(t, applies.operations, 1)
+	assert.Empty(t, applies.operations[0].OperationKey)
+	require.Len(t, tasks.tasks, 1)
+	assert.Empty(t, tasks.tasks[0].Shard)
+}
+
+func TestValidateShardOperationKeyPartsRejectsDelimiter(t *testing.T) {
+	err := validateShardOperationKeyParts("commerce", "-80/80-", "users")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reserved delimiter")
+}
+
+func TestValidateOperationKeyPartRejectsFinalizerNamespaceDelimiter(t *testing.T) {
+	err := validateOperationKeyPart("namespace", "commerce/eu")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reserved delimiter")
 }
 
 func TestProgressByApplyIDServesQueuedRemoteApplyFromStorage(t *testing.T) {
@@ -2358,8 +2641,8 @@ func TestProgressFromLocalStorageIncludesOperationProgressAndTableDeployment(t *
 			},
 		}},
 		operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{
-			{ID: opAID, ApplyID: apply.ID, Deployment: "deploy-a", Target: "target-a", State: state.ApplyOperation.Running, StartedAt: &startedAt},
-			{ID: opBID, ApplyID: apply.ID, Deployment: "deploy-b", Target: "target-b", State: state.ApplyOperation.Failed, ErrorMessage: "engine failed", StartedAt: &startedAt, CompletedAt: &completedAt},
+			{ID: opAID, ApplyID: apply.ID, Deployment: "deploy-a", OperationKind: storage.ApplyOperationKindWork, Target: "target-a", State: state.ApplyOperation.Running, StartedAt: &startedAt},
+			{ID: opBID, ApplyID: apply.ID, Deployment: "deploy-b", OperationKind: storage.ApplyOperationKindGroupFinalizer, Target: "target-b", State: state.ApplyOperation.Failed, ErrorMessage: "engine failed", StartedAt: &startedAt, CompletedAt: &completedAt},
 		}},
 	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
 
@@ -2368,10 +2651,12 @@ func TestProgressFromLocalStorageIncludesOperationProgressAndTableDeployment(t *
 	require.NoError(t, err)
 	require.Len(t, resp.Operations, 2)
 	assert.Equal(t, "deploy-a", resp.Operations[0].Deployment)
+	assert.Equal(t, storage.ApplyOperationKindWork, resp.Operations[0].OperationKind)
 	assert.Equal(t, "target-a", resp.Operations[0].Target)
 	assert.Equal(t, state.ApplyOperation.Running, resp.Operations[0].State)
 	assert.Equal(t, startedAt.Format(time.RFC3339), resp.Operations[0].StartedAt)
 	assert.Equal(t, "deploy-b", resp.Operations[1].Deployment)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, resp.Operations[1].OperationKind)
 	assert.Equal(t, apitypes.ErrCodeEngineError, resp.Operations[1].ErrorCode)
 	assert.Equal(t, "engine failed", resp.Operations[1].ErrorMessage)
 	assert.Equal(t, completedAt.Format(time.RFC3339), resp.Operations[1].CompletedAt)

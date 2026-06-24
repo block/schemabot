@@ -93,6 +93,44 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		assert.Zero(t, svc.matrixSummary.recoveredCount(), "a multi-op drive must not fire the per-driver recovered observer")
 	})
 
+	t.Run("ShardedWorkCompletesBeforeGroupFinalizer", func(t *testing.T) {
+		// A sharded apply with namespace-level finalization drives shard work
+		// operations first, keeps the aggregate non-terminal while the finalizer is
+		// pending, then completes only after the finalizer operation succeeds.
+		resetMatrixTables(t, ctx, db)
+		seed := seedShardedFinalizerApply(t, ctx, stor)
+
+		rec := &driveRecorder{}
+		svc := newMatrixService(t, stor, matrixClients(stor, rec, map[string]matrixOutcome{
+			"region-a": {taskState: state.Task.Completed},
+		}))
+
+		driveNextOperation(t, ctx, svc, 1)
+		driveNextOperation(t, ctx, svc, 2)
+
+		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.workAID))
+		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.workBID))
+		assert.Equal(t, state.ApplyOperation.Pending, opState(t, ctx, stor, seed.finalizerID))
+		assert.Equal(t, state.Apply.Pending, getApply(t, ctx, stor, seed.applyID).State,
+			"completed shard work plus a pending finalizer must remain non-terminal")
+
+		driveNextOperation(t, ctx, svc, 3)
+
+		assert.Equal(t, []string{
+			"commerce/-80/users",
+			"commerce/80-/users",
+			"commerce/group_finalizer",
+		}, rec.resumeOperationKeys())
+		assert.Equal(t, []string{
+			storage.ApplyOperationKindWork,
+			storage.ApplyOperationKindWork,
+			storage.ApplyOperationKindGroupFinalizer,
+		}, rec.resumeOperationKinds())
+		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.finalizerID))
+		assert.Equal(t, state.Apply.Completed, getApply(t, ctx, stor, seed.applyID).State)
+		assert.Equal(t, 1, svc.matrixSummary.count(), "terminal summary publishes after the finalizer completes")
+	})
+
 	t.Run("RollingHaltFailureStopsAtFirstDeployment", func(t *testing.T) {
 		resetMatrixTables(t, ctx, db)
 		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
@@ -365,6 +403,13 @@ type seededMultiOpApply struct {
 
 func (s seededMultiOpApply) opID(deployment string) int64 { return s.ops[deployment] }
 
+type seededShardedFinalizerApply struct {
+	applyID     int64
+	workAID     int64
+	workBID     int64
+	finalizerID int64
+}
+
 func seedGroupedApply(t *testing.T, ctx context.Context, stor storage.Storage, spec multiOpSeed) seededMultiOpApply {
 	t.Helper()
 	require.NotEmpty(t, spec.deployments, "seedGroupedApply requires at least one deployment")
@@ -433,6 +478,75 @@ func seedGroupedApply(t *testing.T, ctx context.Context, stor storage.Storage, s
 		ops[group.Operation.Deployment] = group.Operation.ID
 	}
 	return seededMultiOpApply{applyID: applyID, deployments: spec.deployments, ops: ops}
+}
+
+func seedShardedFinalizerApply(t *testing.T, ctx context.Context, stor storage.Storage) seededShardedFinalizerApply {
+	t.Helper()
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: "matrix-sharded-finalizer",
+		Database:        "payments",
+		DatabaseType:    storage.DatabaseTypeStrata,
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		Environment:     "staging",
+		Deployment:      "region-a",
+		Caller:          "matrix-test",
+		Engine:          storage.EngineForType(storage.DatabaseTypeStrata),
+		State:           state.Apply.Pending,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{}),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+
+	groups := []*storage.ApplyOperationWithTasks{
+		newShardedFinalizerGroup(now, "commerce/-80/users", storage.ApplyOperationKindWork, "users", "alter", "-80", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+		newShardedFinalizerGroup(now, "commerce/80-/users", storage.ApplyOperationKindWork, "users", "alter", "80-", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+		newShardedFinalizerGroup(now, "commerce/group_finalizer", storage.ApplyOperationKindGroupFinalizer, "VSchema: commerce", "vschema_update", "", ""),
+	}
+
+	applyID, err := stor.Applies().CreateWithGroupedOperations(ctx, apply, groups)
+	require.NoError(t, err, "seed sharded finalizer apply")
+	return seededShardedFinalizerApply{
+		applyID:     applyID,
+		workAID:     groups[0].Operation.ID,
+		workBID:     groups[1].Operation.ID,
+		finalizerID: groups[2].Operation.ID,
+	}
+}
+
+func newShardedFinalizerGroup(now time.Time, operationKey, operationKind, table, action, shard, ddl string) *storage.ApplyOperationWithTasks {
+	return &storage.ApplyOperationWithTasks{
+		Operation: &storage.ApplyOperation{
+			Deployment:    "region-a",
+			OperationKey:  operationKey,
+			OperationKind: operationKind,
+			Target:        "payments-region-a",
+			State:         state.ApplyOperation.Pending,
+			CutoverPolicy: storage.CutoverPolicyRolling,
+			OnFailure:     storage.OnFailureHalt,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+		Tasks: []*storage.Task{{
+			TaskIdentifier: "task-" + operationKey,
+			Database:       "payments",
+			DatabaseType:   storage.DatabaseTypeStrata,
+			Engine:         storage.EngineForType(storage.DatabaseTypeStrata),
+			Repository:     "octocat/hello-world",
+			PullRequest:    1,
+			Environment:    "staging",
+			State:          state.Task.Pending,
+			Options:        storage.MarshalApplyOptions(storage.ApplyOptions{}),
+			Namespace:      "commerce",
+			TableName:      table,
+			Shard:          shard,
+			DDL:            ddl,
+			DDLAction:      action,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}},
+	}
 }
 
 func requestPendingStop(t *testing.T, ctx context.Context, stor storage.Storage, applyID int64) {
@@ -535,7 +649,14 @@ type matrixTernClient struct {
 }
 
 func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
-	m.rec.recordResume(m.deployment)
+	op, err := m.stor.ApplyOperations().Get(ctx, applyOperationID)
+	if err != nil {
+		return fmt.Errorf("matrix fake: load operation %d: %w", applyOperationID, err)
+	}
+	if op == nil {
+		return fmt.Errorf("matrix fake: operation %d not found", applyOperationID)
+	}
+	m.rec.recordResume(m.deployment, op)
 
 	if m.outcome.gate != nil {
 		m.outcome.gate.arriveAndWait()
@@ -574,13 +695,17 @@ func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *stor
 type driveRecorder struct {
 	mu          sync.Mutex
 	order       []string
+	opKeys      []string
+	opKinds     []string
 	parentWrite []error
 }
 
-func (r *driveRecorder) recordResume(deployment string) {
+func (r *driveRecorder) recordResume(deployment string, op *storage.ApplyOperation) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.order = append(r.order, deployment)
+	r.opKeys = append(r.opKeys, op.OperationKey)
+	r.opKinds = append(r.opKinds, op.OperationKind)
 }
 
 func (r *driveRecorder) recordParentWrite(err error) {
@@ -599,6 +724,18 @@ func (r *driveRecorder) resumeCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.order)
+}
+
+func (r *driveRecorder) resumeOperationKeys() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.opKeys...)
+}
+
+func (r *driveRecorder) resumeOperationKinds() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.opKinds...)
 }
 
 func (r *driveRecorder) parentWriteErrors() []error {

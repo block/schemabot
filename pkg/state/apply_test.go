@@ -185,6 +185,7 @@ func TestIsTerminalApplyState(t *testing.T) {
 		Apply.Pending,
 		Apply.Running,
 		Apply.RunningDegraded,
+		Apply.Paused,
 		Apply.FailedRetryable,
 		Apply.WaitingForCutover,
 		Apply.CuttingOver,
@@ -211,6 +212,7 @@ func TestIsRunningApplyState(t *testing.T) {
 	}
 	for _, s := range []string{
 		Apply.Pending,
+		Apply.Paused,
 		Apply.WaitingForDeploy,
 		Apply.WaitingForCutover,
 		Apply.Recovering,
@@ -235,6 +237,8 @@ func TestNormalizeState(t *testing.T) {
 		{"running", Apply.Running},
 		{"RUNNING_DEGRADED", Apply.RunningDegraded},
 		{"running_degraded", Apply.RunningDegraded},
+		{"PAUSED", Apply.Paused},
+		{"paused", Apply.Paused},
 		{"WAITING_FOR_DEPLOY", Apply.WaitingForDeploy},
 		{"waiting_for_deploy", Apply.WaitingForDeploy},
 		{"WAITING_FOR_CUTOVER", Apply.WaitingForCutover},
@@ -352,6 +356,12 @@ func rc(state string, continueOnFailure bool) RolloutChild {
 	return RolloutChild{State: state, ContinueOnFailure: continueOnFailure}
 }
 
+// rcPause builds a RolloutChild under an unreleased on_failure=pause policy.
+// A released pause behaves like continue, so those cases use rc(state, true).
+func rcPause(state string) RolloutChild {
+	return RolloutChild{State: state, PauseOnFailure: true}
+}
+
 func TestDeriveRolloutApplyState_Empty(t *testing.T) {
 	assert.Equal(t, Apply.Pending, DeriveRolloutApplyState(nil))
 	assert.Equal(t, Apply.Pending, DeriveRolloutApplyState([]RolloutChild{}))
@@ -400,8 +410,9 @@ func TestDeriveRolloutApplyState_NoFailureMatchesBase(t *testing.T) {
 }
 
 // TestDeriveRolloutApplyState_FailurePolicy is the truth table for the failed
-// base case: continue holds the apply active until siblings settle, while halt,
-// pause, and unrecognized policies fail closed to the failed verdict.
+// base case: continue holds the apply active until siblings settle, while halt
+// and unrecognized policies fail closed to the failed verdict. The pause policy
+// has its own truth table in TestDeriveRolloutApplyState_PausePolicy.
 func TestDeriveRolloutApplyState_FailurePolicy(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -442,6 +453,77 @@ func TestDeriveRolloutApplyState_FailurePolicy(t *testing.T) {
 			name:     "continue failure with completed and pending holds running_degraded",
 			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Completed, true), rc(Apply.Pending, true)},
 			want:     Apply.RunningDegraded,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, DeriveRolloutApplyState(tc.children))
+		})
+	}
+}
+
+// TestDeriveRolloutApplyState_PausePolicy is the truth table for on_failure=pause.
+// An unreleased pause failure holds the apply paused while later siblings still
+// have work to do, settles failed once nothing is left to hold, and — once
+// released — behaves exactly like continue. Children are in deployment order.
+func TestDeriveRolloutApplyState_PausePolicy(t *testing.T) {
+	cases := []struct {
+		name     string
+		children []RolloutChild
+		want     string
+	}{
+		{
+			name:     "pause failure with later pending sibling holds paused",
+			children: []RolloutChild{rcPause(Apply.Failed), rcPause(Apply.Pending)},
+			want:     Apply.Paused,
+		},
+		{
+			name:     "pause failure with later running sibling holds paused",
+			children: []RolloutChild{rcPause(Apply.Failed), rcPause(Apply.Running)},
+			want:     Apply.Paused,
+		},
+		{
+			name:     "pause failure with all later siblings terminal settles failed",
+			children: []RolloutChild{rcPause(Apply.Failed), rcPause(Apply.Completed)},
+			want:     Apply.Failed,
+		},
+		{
+			name:     "single pause failure with nothing to hold settles failed",
+			children: []RolloutChild{rcPause(Apply.Failed)},
+			want:     Apply.Failed,
+		},
+		{
+			name:     "pause failure last in order with earlier sibling still running settles running_degraded",
+			children: []RolloutChild{rcPause(Apply.Running), rcPause(Apply.Failed)},
+			want:     Apply.RunningDegraded,
+		},
+		{
+			name:     "earlier pause-held failure holds paused even when a later pause failure has nothing to hold",
+			children: []RolloutChild{rcPause(Apply.Failed), rcPause(Apply.Pending), rcPause(Apply.Failed)},
+			want:     Apply.Paused,
+		},
+		{
+			name:     "released pause (continue) failure with pending sibling holds running_degraded",
+			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Pending, true)},
+			want:     Apply.RunningDegraded,
+		},
+		{
+			name:     "released pause (continue) failure with all siblings terminal settles failed",
+			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Completed, true)},
+			want:     Apply.Failed,
+		},
+		{
+			name:     "halt failure dominates a pause-held sibling and fails closed",
+			children: []RolloutChild{rcPause(Apply.Failed), rc(Apply.Failed, false), rcPause(Apply.Pending)},
+			want:     Apply.Failed,
+		},
+		{
+			name: "invalid both-flags failure fails closed rather than continuing",
+			children: []RolloutChild{
+				{State: Apply.Failed, ContinueOnFailure: true, PauseOnFailure: true},
+				rc(Apply.Pending, true),
+			},
+			want: Apply.Failed,
 		},
 	}
 	for _, tc := range cases {

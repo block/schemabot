@@ -1,25 +1,30 @@
 # SchemaBot Configuration (gRPC Mode - multi-deployment fan-out)
 #
-# A single (database, environment) — testapp/production — fans out to TWO
-# deployments (eu, us), each backed by its own remote Tern service and MySQL.
-# This is the shape exercised by the multi-deployment ordered-cutover
-# acceptance test.
+# A single (database, environment) fans out to TWO deployments (eu, us), each
+# backed by its own remote Tern service and MySQL. This is the shape exercised
+# by the multi-deployment ordered-cutover acceptance tests.
 #
 # Contrast with grpc-schemabot.yaml, which wires two Terns as two *environments*
 # (staging/production) of a single "default" deployment.
 #
-# NOTE: This config sets a deployments map with >1 entry. SchemaBot's config
-# validation currently rejects that with:
-#   "multi-deployment (>1 entries) is not yet supported by this server"
-# so a stack booted from this file will NOT come up until the server supports
-# deployments maps with more than one entry. The fixture is committed now so the
-# harness is ready the moment that support lands.
+# Two environments share the same pair of remote Terns, differing only in
+# rollout-failure policy:
+#   - production           -> on_failure: halt (default): a failed deployment
+#                             halts the rollout; healthy siblings do not cut over.
+#   - production-continue  -> on_failure: continue: a failed deployment should
+#                             be treated as settled so healthy siblings still cut
+#                             over and complete while the apply settles to failed.
+#                             This env encodes that intended behavior; until the
+#                             barrier-release semantics for a continue-failed
+#                             predecessor land (OC-5), the healthy sibling parks
+#                             at waiting_for_cutover and the scenario is expected
+#                             to fail.
+# Both use cutover_policy: barrier and deployment_order [eu, us].
 
 # SchemaBot's own storage database
 storage:
   dsn: "env:MYSQL_DSN"
 
-# gRPC mode: one environment (production) fanning out to two deployments.
 databases:
   testapp:
     type: mysql
@@ -34,10 +39,23 @@ databases:
             target: testapp
           us:
             target: testapp
+      production-continue:
+        cutover_policy: barrier
+        on_failure: continue
+        deployment_order:
+          - eu
+          - us
+        deployments:
+          eu:
+            target: testapp
+          us:
+            target: testapp
 
-# Per-deployment Tern gRPC endpoints.
+# Per-deployment Tern gRPC endpoints. Both environments reuse the same Terns.
 tern_deployments:
   eu:
     production: "tern-eu:9090"
+    production-continue: "tern-eu:9090"
   us:
     production: "tern-us:9090"
+    production-continue: "tern-us:9090"

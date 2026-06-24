@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -155,6 +156,33 @@ func TestProtoChangesToNamespacesRejectsDuplicateDefaultNamespaces(t *testing.T)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `duplicate schema change namespace "default"`)
+}
+
+func TestProtoShardPlansToStorage(t *testing.T) {
+	got, err := protoShardPlansToStorage([]*ternv1.ShardPlan{
+		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
+		{Shard: "80-", NeedsChange: false},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, []storage.ShardPlan{
+		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
+		{Namespace: "default", Shard: "80-", NeedsChange: false},
+	}, got)
+}
+
+func TestProtoShardPlansToStorageRejectsNilShardPlan(t *testing.T) {
+	_, err := protoShardPlansToStorage([]*ternv1.ShardPlan{nil})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "shard plan 0 is null")
+}
+
+func TestProtoShardPlansToStorageRejectsEmptyShard(t *testing.T) {
+	_, err := protoShardPlansToStorage([]*ternv1.ShardPlan{{Namespace: "commerce", Shard: "  "}})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "shard plan 0 has empty shard")
 }
 
 // schema_files with a null namespace value is rejected as a hard validation

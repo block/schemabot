@@ -288,6 +288,28 @@ func TestUpdateApplyStateFromOperations_ContinuePolicy(t *testing.T) {
 	}
 }
 
+func TestUpdateApplyStateFromOperations_FinalizerPendingIsNonTerminal(t *testing.T) {
+	applyStore := &recordingApplyStore{swapped: true}
+	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: []*storage.ApplyOperation{
+		{ID: 1, State: state.ApplyOperation.Completed, OperationKind: storage.ApplyOperationKindWork},
+		{ID: 2, State: state.ApplyOperation.Completed, OperationKind: storage.ApplyOperationKindWork},
+		{ID: 3, State: state.ApplyOperation.Pending, OperationKind: storage.ApplyOperationKindGroupFinalizer},
+	}}, applyStore)
+
+	apply := &storage.Apply{
+		ID:              3,
+		ApplyIdentifier: "apply-finalizer-pending",
+		State:           state.Apply.Running,
+		Environment:     "staging",
+	}
+
+	_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+	require.NoError(t, err)
+	require.NotNil(t, applyStore.updated, "the pending finalizer must keep the aggregate non-terminal")
+	assert.Equal(t, state.Apply.Pending, applyStore.updated.State)
+	assert.Nil(t, applyStore.updated.CompletedAt)
+}
+
 // TestUpdateApplyStateFromOperations_ReopenFailedGuard verifies the terminal
 // guard's reopen exception. Under on_failure "continue" a sibling failure can
 // terminalize the parent apply to failed before the rollout settles; once a

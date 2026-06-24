@@ -1,6 +1,6 @@
 // apply_operations.go implements ApplyOperationStore for per-(apply,
-// deployment) child rows under a multi-deployment apply — the unit of work
-// the operator claims.
+// deployment, operation_key) child rows under a multi-operation apply — the
+// unit of work the driver claims.
 package mysqlstore
 
 import (
@@ -19,7 +19,7 @@ import (
 )
 
 // applyOperationColumns lists all columns for SELECT queries.
-const applyOperationColumns = `id, apply_id, deployment, target, state, error_message,
+const applyOperationColumns = `id, apply_id, deployment, operation_key, operation_kind, target, state, error_message,
 	cutover_policy, on_failure, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
 	engine_resume_context, engine_resume_metadata, created_at, updated_at`
 
@@ -33,7 +33,7 @@ type applyOperationStore struct {
 }
 
 // Insert stores a new apply_operations row and returns its ID.
-// Translates a unique-key conflict on (apply_id, deployment) into
+// Translates a unique-key conflict on (apply_id, deployment, operation_key) into
 // storage.ErrApplyOperationExists so callers can branch cleanly.
 func (s *applyOperationStore) Insert(ctx context.Context, ad *storage.ApplyOperation) (int64, error) {
 	return insertApplyOperation(ctx, s.db, ad)
@@ -48,8 +48,8 @@ type sqlExecer interface {
 
 // insertApplyOperation inserts one apply_operations row using the supplied
 // executer (pool or transaction). On success the row's ID and State fields
-// are set. A duplicate-key violation on (apply_id, deployment) is translated
-// to storage.ErrApplyOperationExists for callers to branch on.
+// are set. A duplicate-key violation on (apply_id, deployment, operation_key)
+// is translated to storage.ErrApplyOperationExists for callers to branch on.
 func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.ApplyOperation) (int64, error) {
 	stateVal := ad.State
 	if stateVal == "" {
@@ -73,13 +73,18 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 		onFailure = storage.OnFailureHalt
 	}
 
+	operationKind := ad.OperationKind
+	if operationKind == "" {
+		operationKind = storage.ApplyOperationKindWork
+	}
+
 	result, err := exec.ExecContext(ctx, `
 		INSERT INTO apply_operations (
-			apply_id, deployment, target, state, error_message, cutover_policy, on_failure,
+			apply_id, deployment, operation_key, operation_kind, target, state, error_message, cutover_policy, on_failure,
 			started_at, completed_at, engine_resume_context, engine_resume_metadata
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		ad.ApplyID, ad.Deployment, ad.Target, stateVal, nullString(ad.ErrorMessage), cutoverPolicy, onFailure,
+		ad.ApplyID, ad.Deployment, ad.OperationKey, operationKind, ad.Target, stateVal, nullString(ad.ErrorMessage), cutoverPolicy, onFailure,
 		ad.StartedAt, ad.CompletedAt, nullString(ad.EngineResumeContext), nullString(ad.EngineResumeMetadata),
 	)
 	if err != nil {
@@ -87,7 +92,7 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 		if errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlErrDupEntry {
 			return 0, storage.ErrApplyOperationExists
 		}
-		return 0, fmt.Errorf("insert apply_operations (apply=%d, deployment=%s): %w", ad.ApplyID, ad.Deployment, err)
+		return 0, fmt.Errorf("insert apply_operations (apply=%d, deployment=%s, operation_key=%s): %w", ad.ApplyID, ad.Deployment, ad.OperationKey, err)
 	}
 
 	id, err := result.LastInsertId()
@@ -96,6 +101,7 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 	}
 	ad.ID = id
 	ad.State = stateVal
+	ad.OperationKind = operationKind
 	ad.CutoverPolicy = cutoverPolicy
 	ad.OnFailure = onFailure
 	return id, nil
@@ -111,13 +117,20 @@ func (s *applyOperationStore) Get(ctx context.Context, id int64) (*storage.Apply
 	return scanApplyOperation(row)
 }
 
-// GetByApplyAndDeployment returns the child row for (apply_id, deployment), or nil if not found.
+// GetByApplyAndDeployment returns the legacy unkeyed child row for
+// (apply_id, deployment), or nil if not found.
 func (s *applyOperationStore) GetByApplyAndDeployment(ctx context.Context, applyID int64, deployment string) (*storage.ApplyOperation, error) {
+	return s.GetByApplyDeploymentAndOperationKey(ctx, applyID, deployment, "")
+}
+
+// GetByApplyDeploymentAndOperationKey returns the child row for
+// (apply_id, deployment, operation_key), or nil if not found.
+func (s *applyOperationStore) GetByApplyDeploymentAndOperationKey(ctx context.Context, applyID int64, deployment, operationKey string) (*storage.ApplyOperation, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT `+applyOperationColumns+`
 		FROM apply_operations
-		WHERE apply_id = ? AND deployment = ?
-	`, applyID, deployment)
+		WHERE apply_id = ? AND deployment = ? AND operation_key = ?
+	`, applyID, deployment, operationKey)
 	return scanApplyOperation(row)
 }
 
@@ -608,6 +621,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	activeStatePlaceholders := placeholders(len(activeStates))
 
 	queryArgs := []any{state.ApplyOperation.Pending}
+	queryArgs = append(queryArgs, storage.ApplyOperationKindGroupFinalizer)
 	// Sibling-gate args for the pending claim, cutover_policy-aware (see the
 	// gate SQL below). Under barrier, an earlier sibling stops blocking once it
 	// reaches the cutover barrier or succeeds (waiting_for_cutover, cutting_over,
@@ -626,6 +640,12 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		state.ApplyOperation.Completed,
 		storage.OnFailureContinue,
 		state.ApplyOperation.Failed,
+	)
+	queryArgs = append(queryArgs,
+		storage.ApplyOperationKindGroupFinalizer,
+		storage.ApplyOperationKindWork,
+		storage.ApplyOperationKindWork,
+		state.ApplyOperation.Completed,
 	)
 	// Pending stop gate: a pending operation is not claimable for start while
 	// its apply has a pending stop control request. This is what makes `stop`
@@ -710,22 +730,47 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		WHERE (
 			(
 				state = ?
-				AND NOT EXISTS (
-					SELECT 1
-					FROM apply_operations AS earlier
-					WHERE earlier.apply_id = apply_operations.apply_id
-						AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
-						AND (
-							(
-								apply_operations.cutover_policy = ?
-								AND earlier.state NOT IN (?, ?, ?, ?)
-							)
-							OR (
-								apply_operations.cutover_policy <> ?
-								AND earlier.state <> ?
+				AND (
+					(
+						apply_operations.operation_kind <> ?
+						AND NOT EXISTS (
+							SELECT 1
+							FROM apply_operations AS earlier
+							WHERE earlier.apply_id = apply_operations.apply_id
+								AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
+								AND (
+									(
+										apply_operations.cutover_policy = ?
+										AND earlier.state NOT IN (?, ?, ?, ?)
+									)
+									OR (
+										apply_operations.cutover_policy <> ?
+										AND earlier.state <> ?
+									)
+								)
+								AND NOT (apply_operations.on_failure = ? AND earlier.state = ?)
+						)
+					)
+					OR (
+						apply_operations.operation_kind = ?
+						AND EXISTS (
+							SELECT 1
+							FROM apply_operations AS sibling
+							WHERE sibling.apply_id = apply_operations.apply_id
+								AND sibling.deployment = apply_operations.deployment
+								AND sibling.operation_kind = ?
+								AND SUBSTRING_INDEX(sibling.operation_key, '/', 1) = SUBSTRING_INDEX(apply_operations.operation_key, '/', 1)
+						)
+						AND NOT EXISTS (
+							SELECT 1
+							FROM apply_operations AS sibling
+							WHERE sibling.apply_id = apply_operations.apply_id
+								AND sibling.deployment = apply_operations.deployment
+								AND sibling.operation_kind = ?
+								AND SUBSTRING_INDEX(sibling.operation_key, '/', 1) = SUBSTRING_INDEX(apply_operations.operation_key, '/', 1)
+								AND sibling.state <> ?
 							)
 						)
-						AND NOT (apply_operations.on_failure = ? AND earlier.state = ?)
 				)
 				AND NOT EXISTS (
 					SELECT 1
@@ -890,6 +935,37 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		`, owner, leaseToken, ad.ID)
 		if err != nil {
 			return nil, fmt.Errorf("refresh heartbeat for claimed apply_operation %d: %w", ad.ID, err)
+		}
+
+		// Re-claiming a failed_retryable operation is a redispatch, so consume one
+		// unit of the parent apply's retry budget. Only multi-operation applies are
+		// charged here: a single-operation apply's parent attempt is incremented by
+		// the ClaimApplyByID its drive performs, so bumping here too would
+		// double-count. Without this, an operation-only multi-deployment retry never
+		// advances applies.attempt, so ExpireRetryable's budget path never fires and
+		// a permanently failing deployment retries forever — stranding a healthy
+		// sibling parked at the cutover barrier under on_failure "continue". The
+		// EXISTS-sibling guard selects multi-op, and the failed_retryable parent
+		// guard keeps this to genuine redispatches (a terminal-failed parent never
+		// re-leases its operations). The attempt < budget guard makes the
+		// increment idempotent once the budget is spent: two operators can claim
+		// different failed_retryable operations of the same apply concurrently, and
+		// the row lock this UPDATE takes serializes them, so the second sees the
+		// already-incremented attempt and does not overshoot maxRecoveryAttempts.
+		if ad.State == state.ApplyOperation.FailedRetryable {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE applies a
+				SET a.attempt = a.attempt + 1, a.updated_at = NOW()
+				WHERE a.id = ?
+					AND a.state = ?
+					AND a.attempt < ?
+					AND EXISTS (
+						SELECT 1 FROM apply_operations o
+						WHERE o.apply_id = a.id AND o.id <> ?
+					)
+			`, ad.ApplyID, state.Apply.FailedRetryable, maxRecoveryAttempts, ad.ID); err != nil {
+				return nil, fmt.Errorf("consume retry budget for apply_operation %d redispatch: %w", ad.ID, err)
+			}
 		}
 	}
 
@@ -1281,7 +1357,7 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	var startedAt, completedAt, leaseAcquiredAt sql.NullTime
 
 	if err := s.Scan(
-		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.Target, &ad.State, &errMsg,
+		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.OperationKey, &ad.OperationKind, &ad.Target, &ad.State, &errMsg,
 		&ad.CutoverPolicy, &ad.OnFailure, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
 		&engineResumeContext, &engineResumeMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {

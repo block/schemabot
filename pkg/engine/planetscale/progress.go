@@ -83,6 +83,28 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		}
 	}
 
+	// Late schema-change-context recovery. A progress poll can run in a process
+	// that never captured the pre-deploy baseline — a different replica, or an
+	// apply whose deploy was created before Vitess exposed its context — so the
+	// stored context is empty even though the deploy is live and producing
+	// per-shard migrations. Rediscover it, diffing against whatever baseline is
+	// persisted in engine resume metadata (possibly empty on a fresh database, in
+	// which case every in-flight context is a candidate) and anchored to the
+	// deploy's creation time; selection stays ambiguous and keeps the empty value
+	// when it can't safely choose. Keep the rest of the resume state intact so the
+	// per-shard query below can attach progress.
+	if req.ResumeState.MigrationContext == "" {
+		recovered := e.discoverMigrationContext(ctx, client, req.Database, req.Credentials, meta.ExistingMigrationCtxs, dr.CreatedAt)
+		if recovered != "" {
+			e.logger.Info("recovered migration context on progress poll",
+				"database", req.Database, "deploy_request", meta.DeployRequestID, "context", recovered)
+			req.ResumeState = &engine.ResumeState{
+				MigrationContext: recovered,
+				Metadata:         req.ResumeState.Metadata,
+			}
+		}
+	}
+
 	e.logger.Debug("progress poll",
 		"database", req.Database,
 		"deploy_request", meta.DeployRequestID,
@@ -145,8 +167,8 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 // captureExistingContexts returns the set of migration_context values currently
 // in SHOW VITESS_MIGRATIONS. Used as a baseline before deploying so that new
 // contexts can be identified after deploy.
-func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials) map[string]bool {
-	existing := make(map[string]bool)
+func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials) map[string]MigrationContextTimestamps {
+	existing := make(map[string]MigrationContextTimestamps)
 	if creds.DSN == "" {
 		return existing
 	}
@@ -170,7 +192,7 @@ func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PS
 		}
 		for _, r := range rows {
 			if r.MigrationContext != "" {
-				existing[r.MigrationContext] = true
+				existing[r.MigrationContext] = migrationRowTimestamps(r)
 			}
 		}
 	}
@@ -179,19 +201,37 @@ func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PS
 	return existing
 }
 
+// migrationRowTimestamps snapshots a baseline row's Vitess timestamp fields for
+// durable storage. The values are diagnostic; baseline membership is keyed by
+// migration_context.
+func migrationRowTimestamps(row vitessMigrationRow) MigrationContextTimestamps {
+	return MigrationContextTimestamps{
+		RequestedTimestamp: formatMigrationTimestamp(row.RequestedAt),
+		StartedTimestamp:   formatMigrationTimestamp(row.StartedAt),
+		CompletedTimestamp: formatMigrationTimestamp(row.CompletedAt),
+	}
+}
+
+func formatMigrationTimestamp(ts *time.Time) string {
+	if ts == nil {
+		return ""
+	}
+	return ts.UTC().Format(time.RFC3339)
+}
+
 // discoverMigrationContext finds the schema change context that this apply's
 // deploy created. It collects current SHOW VITESS_MIGRATIONS rows across all
 // keyspaces and selects the single non-baseline, non-terminal context via
 // selectSchemaChangeContext. Returns "" when no unambiguous candidate exists
 // (zero or multiple), so the caller keeps the stored identifier rather than
 // attaching progress to the wrong context.
-func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, existingContexts map[string]bool) string {
+func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, existingContexts map[string]MigrationContextTimestamps, deployCreatedAt time.Time) string {
 	if creds.DSN == "" {
 		e.logger.Debug("skipping schema change context discovery, no DSN configured")
 		return ""
 	}
 
-	e.logger.Info("discovering schema change context", "database", database, "baseline_count", len(existingContexts))
+	e.logger.Info("discovering schema change context", "database", database, "baseline_count", len(existingContexts), "deploy_created_at", deployCreatedAt)
 
 	branch := mainBranch(creds)
 	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
@@ -214,14 +254,16 @@ func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.P
 		rows = append(rows, ksRows...)
 	}
 
-	discovered, candidates := selectSchemaChangeContext(rows, existingContexts)
+	discovered, candidates := selectSchemaChangeContext(rows, existingContexts, deployCreatedAt)
 	switch {
 	case discovered != "":
 		e.logger.Info("discovered schema change context", "database", database, "context", discovered)
 		return discovered
 	case len(candidates) > 1:
-		// Multiple in-flight contexts not in the baseline — attaching to any one
-		// could render the wrong change's progress. Keep the stored identifier.
+		// Multiple in-flight contexts not in the baseline, and the
+		// requested-at/after-deploy tie-break could not isolate one. Attaching to
+		// any one could render the wrong change's progress, so keep the stored
+		// identifier.
 		e.logger.Warn("multiple in-flight schema change contexts; keeping stored identifier to avoid attaching to the wrong change",
 			"database", database, "candidate_count", len(candidates), "candidates", candidates)
 		return ""
@@ -240,18 +282,26 @@ func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.P
 // change. It returns the single context when exactly one candidate remains and
 // the full candidate list so the caller can distinguish the zero and multiple
 // cases (both ambiguous, both must keep the stored identifier).
-func selectSchemaChangeContext(rows []vitessMigrationRow, existingContexts map[string]bool) (string, []string) {
-	// A context is a candidate if any of its shards is still non-terminal: the
-	// change is in flight even when some shards have already finished.
+func selectSchemaChangeContext(rows []vitessMigrationRow, existingContexts map[string]MigrationContextTimestamps, deployCreatedAt time.Time) (string, []string) {
+	// A context is a candidate if it is absent from the pre-deploy baseline and
+	// any of its shards is still non-terminal: the change is in flight even when
+	// some shards have already finished. earliestRequested tracks each candidate's
+	// earliest requested_timestamp for the multi-candidate tie-break below.
 	nonTerminal := make(map[string]bool)
+	earliestRequested := make(map[string]*time.Time)
 	for _, r := range rows {
-		if r.MigrationContext == "" || existingContexts[r.MigrationContext] {
+		if r.MigrationContext == "" {
 			continue
 		}
-		if state.IsTerminalVitessState(r.Status) {
+		if _, inBaseline := existingContexts[r.MigrationContext]; inBaseline {
 			continue
 		}
-		nonTerminal[r.MigrationContext] = true
+		if !state.IsTerminalVitessState(r.Status) {
+			nonTerminal[r.MigrationContext] = true
+		}
+		if earlierTime(r.RequestedAt, earliestRequested[r.MigrationContext]) {
+			earliestRequested[r.MigrationContext] = r.RequestedAt
+		}
 	}
 
 	candidates := make([]string, 0, len(nonTerminal))
@@ -260,10 +310,49 @@ func selectSchemaChangeContext(rows []vitessMigrationRow, existingContexts map[s
 	}
 	sort.Strings(candidates)
 
-	if len(candidates) == 1 {
-		return candidates[0], candidates
+	if len(candidates) <= 1 {
+		if len(candidates) == 1 {
+			return candidates[0], candidates
+		}
+		return "", candidates
+	}
+
+	// More than one in-flight, non-baseline candidate. This deploy's context was
+	// requested at or after the deploy was created, so prefer the earliest such
+	// candidate; ties break deterministically on the context string. If no
+	// candidate has a requested timestamp at/after the deploy — including when
+	// timestamps are unavailable — stay ambiguous so the caller keeps the stored
+	// identifier rather than attaching to the wrong change.
+	best := ""
+	var bestRequested *time.Time
+	for _, c := range candidates {
+		requested := earliestRequested[c]
+		if requested == nil || requested.Before(deployCreatedAt) {
+			continue
+		}
+		if best == "" || requested.Before(*bestRequested) || (requested.Equal(*bestRequested) && c < best) {
+			best = c
+			bestRequested = requested
+		}
+	}
+	if best != "" {
+		return best, candidates
 	}
 	return "", candidates
+}
+
+// earlierTime reports whether candidate is strictly earlier than current,
+// treating a nil current as "unset" (any real candidate is earlier) and a nil
+// candidate as never earlier. Used to track the earliest requested_timestamp
+// seen for a context.
+func earlierTime(candidate, current *time.Time) bool {
+	if candidate == nil {
+		return false
+	}
+	if current == nil {
+		return true
+	}
+	return candidate.Before(*current)
 }
 
 // migrationContextDiscoveryAttempts and migrationContextDiscoveryInterval bound
@@ -280,7 +369,7 @@ const (
 // have created migrations immediately after the deploy request is submitted, so
 // a single poll can miss the context. Returns "" if no new context was found
 // within the window; respects ctx cancellation between attempts.
-func (e *Engine) discoverSchemaChangeContextWithRetry(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, existingContexts map[string]bool) string {
+func (e *Engine) discoverSchemaChangeContextWithRetry(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, existingContexts map[string]MigrationContextTimestamps, deployCreatedAt time.Time) string {
 	// Without a vtgate DSN there is nothing to poll; retrying would only burn the
 	// discovery window on a query that can never succeed.
 	if creds.DSN == "" {
@@ -289,7 +378,7 @@ func (e *Engine) discoverSchemaChangeContextWithRetry(ctx context.Context, clien
 	}
 
 	for attempt := range migrationContextDiscoveryAttempts {
-		migrationContext := e.discoverMigrationContext(ctx, client, database, creds, existingContexts)
+		migrationContext := e.discoverMigrationContext(ctx, client, database, creds, existingContexts, deployCreatedAt)
 		if migrationContext != "" {
 			return migrationContext
 		}
@@ -321,6 +410,7 @@ type vitessMigrationRow struct {
 	TableRows        int64
 	IsImmediate      bool
 	CutoverAttempts  int
+	RequestedAt      *time.Time
 	StartedAt        *time.Time
 	CompletedAt      *time.Time
 }
@@ -449,6 +539,9 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 			row.CutoverAttempts = int(v)
 		}
 
+		if ts, parseErr := time.Parse("2006-01-02 15:04:05", colMap["requested_timestamp"]); parseErr == nil {
+			row.RequestedAt = &ts
+		}
 		if ts, parseErr := time.Parse("2006-01-02 15:04:05", colMap["started_timestamp"]); parseErr == nil {
 			row.StartedAt = &ts
 		}

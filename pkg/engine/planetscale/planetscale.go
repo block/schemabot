@@ -438,18 +438,39 @@ type psMetadata struct {
 	DeployedAt       *time.Time `json:"deployed_at,omitempty"`
 	IsInstant        bool       `json:"is_instant,omitempty"`
 	DeferredDeploy   bool       `json:"deferred_deploy,omitempty"`
+
+	// ExistingMigrationCtxs is the set of SHOW VITESS_MIGRATIONS contexts that
+	// already existed just before this deploy started, keyed by context. It is
+	// the durable baseline that lets a later process — a resume on another pod,
+	// or an API progress poll — discover this deploy's own context by diffing
+	// against it; the process that captured the baseline would otherwise be the
+	// only one that knows it. Map membership drives the baseline diff; the stored
+	// timestamp values are diagnostic only — the earliest-requested tie-break in
+	// discovery reads requested_timestamp from the current rows, not from these.
+	ExistingMigrationCtxs map[string]MigrationContextTimestamps `json:"existing_migration_contexts,omitempty"`
+}
+
+// MigrationContextTimestamps records the Vitess timestamp fields seen on a
+// migration_context in SHOW VITESS_MIGRATIONS before this deploy started. The
+// keys of the enclosing map provide baseline membership; these values are
+// diagnostic for operators inspecting recovery decisions.
+type MigrationContextTimestamps struct {
+	RequestedTimestamp string `json:"requested_timestamp,omitempty"`
+	StartedTimestamp   string `json:"started_timestamp,omitempty"`
+	CompletedTimestamp string `json:"completed_timestamp,omitempty"`
 }
 
 // ResumeData is PlanetScale deploy metadata persisted by the tern layer and
 // encoded into engine.ResumeState.Metadata for engine control and progress calls.
 type ResumeData struct {
-	BranchName       string
-	DeployRequestID  uint64
-	DeployRequestURL string
-	MigrationContext string
-	DeployedAt       *time.Time
-	IsInstant        bool
-	DeferredDeploy   bool
+	BranchName            string
+	DeployRequestID       uint64
+	DeployRequestURL      string
+	MigrationContext      string
+	ExistingMigrationCtxs map[string]MigrationContextTimestamps
+	DeployedAt            *time.Time
+	IsInstant             bool
+	DeferredDeploy        bool
 }
 
 // BuildResumeState encodes PlanetScale resume metadata into the opaque
@@ -457,12 +478,13 @@ type ResumeData struct {
 // can persist branch information before the deploy request exists.
 func BuildResumeState(data ResumeData) (*engine.ResumeState, error) {
 	metadata, err := encodePSMetadata(&psMetadata{
-		BranchName:       data.BranchName,
-		DeployRequestID:  data.DeployRequestID,
-		DeployRequestURL: data.DeployRequestURL,
-		DeployedAt:       data.DeployedAt,
-		IsInstant:        data.IsInstant,
-		DeferredDeploy:   data.DeferredDeploy,
+		BranchName:            data.BranchName,
+		DeployRequestID:       data.DeployRequestID,
+		DeployRequestURL:      data.DeployRequestURL,
+		DeployedAt:            data.DeployedAt,
+		IsInstant:             data.IsInstant,
+		DeferredDeploy:        data.DeferredDeploy,
+		ExistingMigrationCtxs: data.ExistingMigrationCtxs,
 	})
 	if err != nil {
 		return nil, err

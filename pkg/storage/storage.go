@@ -394,10 +394,11 @@ type TaskStore interface {
 	// Used for aggregating task states to derive Apply state.
 	GetByApplyID(ctx context.Context, applyID int64) ([]*Task, error)
 
-	// GetByApplyOperationID returns the per-table tasks for a single
-	// apply_operation (one deployment of a multi-deployment apply). Used to drive
-	// and reconcile one operation independently of its sibling deployments.
-	// Per-shard detail rows are excluded — read them via
+	// GetByApplyOperationID returns the drive tasks for a single apply_operation.
+	// Unsharded operations return their per-table tasks. Sharded work operations
+	// return the task whose namespace/shard/table matches the operation key so the
+	// drive can rebuild its shard selector. Reflected per-shard progress rows that
+	// do not match a sharded work operation key are excluded — read them via
 	// GetShardProgressByApplyOperationID.
 	GetByApplyOperationID(ctx context.Context, applyOperationID int64) ([]*Task, error)
 
@@ -448,26 +449,26 @@ type ApplyCommentStore interface {
 	Supersede(ctx context.Context, applyID int64, commentState string) error
 }
 
-// ApplyOperationStore manages per-(apply, deployment) child rows for
-// multi-deployment applies. One apply owns 1..N apply_operations rows.
-//
-// Pure storage primitive: no orchestration code reads or writes these rows
-// yet — the apply-create dual-write and the operator's per-row claim + lock
-// relocation arrive in subsequent PRs in the multi-deployment apply
-// workstream.
+// ApplyOperationStore manages per-(apply, deployment, operation_key) child rows
+// for multi-operation applies. One apply owns 1..N apply_operations rows.
 type ApplyOperationStore interface {
 	// Insert stores a new apply_operations row and returns its ID.
-	// Fails with a uniqueness error if (apply_id, deployment) already exists.
+	// Fails with a uniqueness error if (apply_id, deployment, operation_key)
+	// already exists.
 	Insert(ctx context.Context, ad *ApplyOperation) (int64, error)
 
 	// Get returns a child row by ID, or nil if not found.
 	Get(ctx context.Context, id int64) (*ApplyOperation, error)
 
-	// GetByApplyAndDeployment returns the child row for (apply_id, deployment),
-	// or nil if not found.
+	// GetByApplyAndDeployment returns the legacy unkeyed child row for
+	// (apply_id, deployment), or nil if not found.
 	GetByApplyAndDeployment(ctx context.Context, applyID int64, deployment string) (*ApplyOperation, error)
 
-	// ListByApply returns all child rows for an apply, ordered by id ascending.
+	// GetByApplyDeploymentAndOperationKey returns the child row for
+	// (apply_id, deployment, operation_key), or nil if not found.
+	GetByApplyDeploymentAndOperationKey(ctx context.Context, applyID int64, deployment, operationKey string) (*ApplyOperation, error)
+
+	// ListByApply returns all child rows for an apply in (created_at, id) order.
 	ListByApply(ctx context.Context, applyID int64) ([]*ApplyOperation, error)
 
 	// UpdateState transitions a child row to a new state. Updates the state
