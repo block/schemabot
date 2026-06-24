@@ -162,14 +162,21 @@ func CallApplyAPI(endpoint, planID, environment, caller string, options map[stri
 	return &result, nil
 }
 
-// CallCutoverAPI calls the cutover API and returns the typed result.
-func CallCutoverAPI(endpoint, environment, applyID string) (*apitypes.ControlResponse, error) {
+// callControlAPI posts an apply-scoped control request to path and decodes the
+// typed response. Control operations share the same ControlRequest body and
+// differ only by endpoint path and response type.
+func callControlAPI[Resp any](endpoint, path, environment, applyID string) (*Resp, error) {
 	req := apitypes.ControlRequest{Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()}
-	var result apitypes.ControlResponse
-	if err := doPostInto(endpoint, "/api/cutover", req, &result); err != nil {
+	var result Resp
+	if err := doPostInto(endpoint, path, req, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
+}
+
+// CallCutoverAPI calls the cutover API and returns the typed result.
+func CallCutoverAPI(endpoint, environment, applyID string) (*apitypes.ControlResponse, error) {
+	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/cutover", environment, applyID)
 }
 
 // GetProgress fetches progress for a schema change by apply ID.
@@ -308,22 +315,12 @@ func isSchemaFile(name string) bool {
 
 // CallStopAPI calls the stop API and returns the typed result.
 func CallStopAPI(endpoint, environment, applyID string) (*apitypes.StopResponse, error) {
-	req := apitypes.ControlRequest{Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()}
-	var result apitypes.StopResponse
-	if err := doPostInto(endpoint, "/api/stop", req, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
+	return callControlAPI[apitypes.StopResponse](endpoint, "/api/stop", environment, applyID)
 }
 
 // CallStartAPI calls the start API and returns the typed result.
 func CallStartAPI(endpoint, environment, applyID string) (*apitypes.StartResponse, error) {
-	req := apitypes.ControlRequest{Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()}
-	var result apitypes.StartResponse
-	if err := doPostInto(endpoint, "/api/start", req, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
+	return callControlAPI[apitypes.StartResponse](endpoint, "/api/start", environment, applyID)
 }
 
 // CallVolumeAPI calls the volume API and returns the typed result.
@@ -338,22 +335,12 @@ func CallVolumeAPI(endpoint, environment, applyID string, volume int) (*apitypes
 
 // CallRevertAPI calls the revert API and returns the typed result.
 func CallRevertAPI(endpoint, environment, applyID string) (*apitypes.ControlResponse, error) {
-	req := apitypes.ControlRequest{Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()}
-	var result apitypes.ControlResponse
-	if err := doPostInto(endpoint, "/api/revert", req, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
+	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/revert", environment, applyID)
 }
 
 // CallSkipRevertAPI calls the skip-revert API and returns the typed result.
 func CallSkipRevertAPI(endpoint, environment, applyID string) (*apitypes.ControlResponse, error) {
-	req := apitypes.ControlRequest{Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()}
-	var result apitypes.ControlResponse
-	if err := doPostInto(endpoint, "/api/skip-revert", req, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
+	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/skip-revert", environment, applyID)
 }
 
 // ExitWithJSON outputs a JSON error response and exits with code 1.
