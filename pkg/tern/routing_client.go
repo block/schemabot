@@ -178,109 +178,77 @@ func (c *RoutingClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*t
 	return resp, err
 }
 
-// Progress returns detailed progress for an active schema change.
-func (c *RoutingClient) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
+// routeApply resolves the deployment client for an apply-scoped request, then
+// dispatches a clone whose apply id is rewritten to the deployment-local tern
+// apply id and whose environment is normalized to the stored apply. The
+// operation name is used for routing context and the missing-request error.
+func routeApply[T any, PT applyScopedRequest[T], Resp any](
+	ctx context.Context,
+	c *RoutingClient,
+	req PT,
+	operation string,
+	setIdentity func(req PT, ternApplyID, environment string),
+	dispatch func(client Client, ctx context.Context, req PT) (*Resp, error),
+) (*Resp, error) {
 	if req == nil {
-		return nil, fmt.Errorf("progress request is required")
+		return nil, fmt.Errorf("%s request is required", operation)
 	}
-	client, apply, ternApplyID, err := c.clientForApply(ctx, req.ApplyId, req.Environment, "progress")
+	client, apply, ternApplyID, err := c.clientForApply(ctx, req.GetApplyId(), req.GetEnvironment(), operation)
 	if err != nil {
 		return nil, err
 	}
-	routedReq := proto.Clone(req).(*ternv1.ProgressRequest)
-	routedReq.ApplyId = ternApplyID
-	routedReq.Environment = apply.Environment
-	return client.Progress(ctx, routedReq)
+	routedReq := proto.Clone(req).(PT)
+	setIdentity(routedReq, ternApplyID, apply.Environment)
+	return dispatch(client, ctx, routedReq)
+}
+
+// Progress returns detailed progress for an active schema change.
+func (c *RoutingClient) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
+	return routeApply(ctx, c, req, "progress", func(r *ternv1.ProgressRequest, applyID, environment string) {
+		r.ApplyId, r.Environment = applyID, environment
+	}, Client.Progress)
 }
 
 // Cutover triggers the cutover phase when defer_cutover was used.
 func (c *RoutingClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
-	if req == nil {
-		return nil, fmt.Errorf("cutover request is required")
-	}
-	client, apply, ternApplyID, err := c.clientForApply(ctx, req.ApplyId, req.Environment, "cutover")
-	if err != nil {
-		return nil, err
-	}
-	routedReq := proto.Clone(req).(*ternv1.CutoverRequest)
-	routedReq.ApplyId = ternApplyID
-	routedReq.Environment = apply.Environment
-	return client.Cutover(ctx, routedReq)
+	return routeApply(ctx, c, req, "cutover", func(r *ternv1.CutoverRequest, applyID, environment string) {
+		r.ApplyId, r.Environment = applyID, environment
+	}, Client.Cutover)
 }
 
 // Stop pauses an in-progress schema change.
 func (c *RoutingClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1.StopResponse, error) {
-	if req == nil {
-		return nil, fmt.Errorf("stop request is required")
-	}
-	client, apply, ternApplyID, err := c.clientForApply(ctx, req.ApplyId, req.Environment, "stop")
-	if err != nil {
-		return nil, err
-	}
-	routedReq := proto.Clone(req).(*ternv1.StopRequest)
-	routedReq.ApplyId = ternApplyID
-	routedReq.Environment = apply.Environment
-	return client.Stop(ctx, routedReq)
+	return routeApply(ctx, c, req, "stop", func(r *ternv1.StopRequest, applyID, environment string) {
+		r.ApplyId, r.Environment = applyID, environment
+	}, Client.Stop)
 }
 
 // Start resumes a stopped schema change.
 func (c *RoutingClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
-	if req == nil {
-		return nil, fmt.Errorf("start request is required")
-	}
-	client, apply, ternApplyID, err := c.clientForApply(ctx, req.ApplyId, req.Environment, "start")
-	if err != nil {
-		return nil, err
-	}
-	routedReq := proto.Clone(req).(*ternv1.StartRequest)
-	routedReq.ApplyId = ternApplyID
-	routedReq.Environment = apply.Environment
-	return client.Start(ctx, routedReq)
+	return routeApply(ctx, c, req, "start", func(r *ternv1.StartRequest, applyID, environment string) {
+		r.ApplyId, r.Environment = applyID, environment
+	}, Client.Start)
 }
 
 // Volume modifies the schema change speed/concurrency in-flight.
 func (c *RoutingClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	if req == nil {
-		return nil, fmt.Errorf("volume request is required")
-	}
-	client, apply, ternApplyID, err := c.clientForApply(ctx, req.ApplyId, req.Environment, "volume")
-	if err != nil {
-		return nil, err
-	}
-	routedReq := proto.Clone(req).(*ternv1.VolumeRequest)
-	routedReq.ApplyId = ternApplyID
-	routedReq.Environment = apply.Environment
-	return client.Volume(ctx, routedReq)
+	return routeApply(ctx, c, req, "volume", func(r *ternv1.VolumeRequest, applyID, environment string) {
+		r.ApplyId, r.Environment = applyID, environment
+	}, Client.Volume)
 }
 
 // Revert reverts a completed schema change during the revert window.
 func (c *RoutingClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
-	if req == nil {
-		return nil, fmt.Errorf("revert request is required")
-	}
-	client, apply, ternApplyID, err := c.clientForApply(ctx, req.ApplyId, req.Environment, "revert")
-	if err != nil {
-		return nil, err
-	}
-	routedReq := proto.Clone(req).(*ternv1.RevertRequest)
-	routedReq.ApplyId = ternApplyID
-	routedReq.Environment = apply.Environment
-	return client.Revert(ctx, routedReq)
+	return routeApply(ctx, c, req, "revert", func(r *ternv1.RevertRequest, applyID, environment string) {
+		r.ApplyId, r.Environment = applyID, environment
+	}, Client.Revert)
 }
 
 // SkipRevert skips the revert window and finalizes the schema change.
 func (c *RoutingClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequest) (*ternv1.SkipRevertResponse, error) {
-	if req == nil {
-		return nil, fmt.Errorf("skip revert request is required")
-	}
-	client, apply, ternApplyID, err := c.clientForApply(ctx, req.ApplyId, req.Environment, "skip revert")
-	if err != nil {
-		return nil, err
-	}
-	routedReq := proto.Clone(req).(*ternv1.SkipRevertRequest)
-	routedReq.ApplyId = ternApplyID
-	routedReq.Environment = apply.Environment
-	return client.SkipRevert(ctx, routedReq)
+	return routeApply(ctx, c, req, "skip revert", func(r *ternv1.SkipRevertRequest, applyID, environment string) {
+		r.ApplyId, r.Environment = applyID, environment
+	}, Client.SkipRevert)
 }
 
 // Health is not routable without a specific deployment and environment.
