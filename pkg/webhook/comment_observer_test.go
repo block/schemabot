@@ -84,7 +84,7 @@ func TestCommentObserverRendersVSchemaFromEngineResumeState(t *testing.T) {
 
 	t.Run("terminal summary of a VSchema-only apply reports the VSchema outcome", func(t *testing.T) {
 		body := observer(`{"vschema_status":"applied","vschema_diffs":[{"namespace":"commerce_sharded","diff":"+ \"xxhash\": {}"}]}`).
-			formatTerminalSummaryComment(psApply(state.Apply.Completed), nil)
+			formatTerminalSummaryComment(psApply(state.Apply.Completed))
 		assert.Contains(t, body, "VSchema applied successfully")
 		assert.Contains(t, body, "**`commerce_sharded`**: Applied")
 		assert.NotContains(t, body, "0 tables")
@@ -157,7 +157,7 @@ func TestFormatTerminalSummaryCommentRoutesMultiDeployment(t *testing.T) {
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Completed},
 	}})
 
-	body := o.formatTerminalSummaryComment(completedApply(), nil)
+	body := o.formatTerminalSummaryComment(completedApply())
 
 	assert.Contains(t, body, "## ✅ Schema Change Applied")
 	assert.Contains(t, body, "**Deployments**: 2 completed")
@@ -172,7 +172,7 @@ func TestFormatTerminalSummaryCommentRoutesSingleDeployment(t *testing.T) {
 		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
 	}})
 
-	body := o.formatTerminalSummaryComment(completedApply(), nil)
+	body := o.formatTerminalSummaryComment(completedApply())
 
 	assert.Contains(t, body, "## ✅ Schema Change Applied")
 	assert.NotContains(t, body, "**Deployments**:")
@@ -183,7 +183,7 @@ func TestFormatTerminalSummaryCommentRoutesSingleDeployment(t *testing.T) {
 func TestFormatTerminalSummaryCommentFallsBackOnLoadError(t *testing.T) {
 	o := newDispatchTestObserver(&stubApplyOperationStore{err: errors.New("db unavailable")})
 
-	body := o.formatTerminalSummaryComment(completedApply(), nil)
+	body := o.formatTerminalSummaryComment(completedApply())
 
 	assert.Contains(t, body, "## ✅ Schema Change Applied")
 	assert.NotContains(t, body, "**Deployments**:")

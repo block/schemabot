@@ -398,11 +398,11 @@ func (o *CommentObserver) resolveVSchema(apply *storage.Apply, ops []*storage.Ap
 // single-deployment summary byte-for-byte. A load failure falls back to the
 // single-deployment summary so a transient storage error never blocks the
 // terminal comment.
-func (o *CommentObserver) formatTerminalSummaryComment(apply *storage.Apply, tasks []*storage.Task) string {
+func (o *CommentObserver) formatTerminalSummaryComment(apply *storage.Apply) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	ops, err := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
-	return o.summaryCommentFromOps(apply, ops, err, tasks)
+	return o.summaryCommentFromOps(apply, ops, err, nil)
 }
 
 // summaryCommentFromOps renders the terminal summary from already-loaded
