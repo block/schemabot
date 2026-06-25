@@ -247,11 +247,12 @@ func protoShardPlansToStorage(shards []*ternv1.ShardPlan) ([]storage.ShardPlan, 
 			Namespace: namespace,
 		}
 		// Carry the shard's own changes so the apply-create fan-out can build
-		// per-shard tasks from per-shard DDL. Empty leaves the shard on the
-		// namespace-level changes (uniform case / pre-per-shard plans).
-		for _, ch := range shard.Changes {
+		// per-shard tasks from per-shard DDL. This comes from the data plane over
+		// gRPC, so a nil entry is malformed input — fail closed rather than
+		// silently dropping a change and generating an incomplete plan.
+		for j, ch := range shard.Changes {
 			if ch == nil {
-				continue
+				return nil, fmt.Errorf("shard plan %d (namespace %q shard %q) change %d is null", i, namespace, shardName, j)
 			}
 			chNamespace := ch.Namespace
 			if chNamespace == "" {

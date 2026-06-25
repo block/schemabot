@@ -1277,31 +1277,37 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 	return result, nil
 }
 
-// applyRequestDDLChanges returns the table changes this apply should execute.
-// A dispatched apply (from the control-plane operator) carries the
-// authoritative, already-scoped DDL changes for one apply_operation in
-// req.DdlChanges — for a sharded engine that is one table's change for one
-// shard, the per-shard fan-out the control plane owns — so they are honored
-// verbatim. A local apply carries none, so the whole stored plan is used. The
-// proto change type round-trips back to the same DDL action the stored plan
-// would carry (create/alter/drop).
-func (c *LocalClient) applyRequestDDLChanges(req *ternv1.ApplyRequest, plan *storage.Plan) []storage.TableChange {
-	if len(req.DdlChanges) == 0 {
-		return plan.FlatDDLChanges()
+// scopedDispatchDDLChanges converts a shard-scoped dispatch's DDL changes to
+// storage table changes, failing closed on a missing or malformed set. A
+// shard-scoped dispatch is already scoped by the control-plane operator (one
+// table's change for one shard, the per-shard fan-out the control plane owns),
+// so it must carry valid, non-empty changes; falling back to the whole stored
+// plan would apply unrelated tables on the targeted shard. The proto change type
+// round-trips to the DDL action the stored plan would carry (create/alter/drop).
+func scopedDispatchDDLChanges(changes []*ternv1.TableChange) ([]storage.TableChange, error) {
+	if len(changes) == 0 {
+		return nil, fmt.Errorf("shard-scoped dispatch carried no ddl_changes")
 	}
-	changes := make([]storage.TableChange, 0, len(req.DdlChanges))
-	for _, ch := range req.DdlChanges {
+	out := make([]storage.TableChange, 0, len(changes))
+	for i, ch := range changes {
 		if ch == nil {
-			continue
+			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d is nil", i)
 		}
-		changes = append(changes, storage.TableChange{
+		if strings.TrimSpace(ch.TableName) == "" || strings.TrimSpace(ch.Ddl) == "" {
+			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d has empty table or DDL", i)
+		}
+		op := protoChangeTypeToDDLAction(ch.ChangeType)
+		if op == "unknown" {
+			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d (table %q) has unsupported change type %v", i, ch.TableName, ch.ChangeType)
+		}
+		out = append(out, storage.TableChange{
 			Namespace: ch.Namespace,
 			Table:     ch.TableName,
 			DDL:       ch.Ddl,
-			Operation: protoChangeTypeToDDLAction(ch.ChangeType),
+			Operation: op,
 		})
 	}
-	return changes
+	return out, nil
 }
 
 // planForApplyRequest resolves the plan for an apply. It prefers a plan row in
@@ -1554,8 +1560,12 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		if len(req.TargetShards) != 1 {
 			return nil, fmt.Errorf("apply for plan %s: a sharded dispatch must target exactly one shard, got %d (%v)", req.PlanId, len(req.TargetShards), req.TargetShards)
 		}
+		scoped, err := scopedDispatchDDLChanges(req.DdlChanges)
+		if err != nil {
+			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
+		}
 		dispatchShard = req.TargetShards[0]
-		ddlChanges = c.applyRequestDDLChanges(req, plan)
+		ddlChanges = scoped
 	}
 	c.logger.Info("Apply: retrieved plan",
 		"plan_id", req.PlanId,
