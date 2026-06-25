@@ -260,6 +260,27 @@ func TestFormatTableProgress_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing
 	assert.NotContains(t, output, " 0%")
 }
 
+// A Spirit row-copy reports its detail string and a structured ETA. The CLI
+// renders the ETA from the structured field (the same source and FormatETA the
+// PR comment uses), so the two surfaces show an identical "Rows … · ETA …" line
+// even though the detail string itself no longer carries the ETA.
+func TestFormatTableProgress_RowCopyShowsStructuredETA(t *testing.T) {
+	tp := TableProgress{
+		TableName:       "users",
+		ChangeType:      "alter",
+		Status:          state.Apply.Running,
+		RowsCopied:      45_000,
+		RowsTotal:       100_000,
+		PercentComplete: 45,
+		ETASeconds:      340,
+		ProgressDetail:  "45000/100000 45% copyRows",
+	}
+
+	output := FormatTableProgress(tp)
+
+	assert.Contains(t, output, "Rows: 45,000 / 100,000 · ETA: 5m 40s")
+}
+
 func TestFormatTableProgress_FailedRetryableKeepsProgress(t *testing.T) {
 	t.Run("with progress", func(t *testing.T) {
 		tp := TableProgress{

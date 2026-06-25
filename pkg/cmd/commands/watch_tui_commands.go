@@ -248,6 +248,7 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 			RowsCopied:     tbl.RowsCopied,
 			RowsTotal:      tbl.RowsTotal,
 			Percent:        int(tbl.PercentComplete),
+			ETASeconds:     tbl.ETASeconds,
 			ProgressDetail: tbl.ProgressDetail,
 			IsInstant:      tbl.IsInstant,
 		}
@@ -256,7 +257,6 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 				tp.Percent = info.Percent
 				tp.RowsCopied = info.RowsCopied
 				tp.RowsTotal = info.RowsTotal
-				tp.ETA = info.ETA
 			}
 		}
 		for _, sh := range tbl.Shards {

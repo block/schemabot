@@ -847,12 +847,7 @@ func (e *logEmitter) emitProgressHeartbeat(tbl *apitypes.TableProgressResponse, 
 		)
 	}
 
-	// Try to extract ETA from Spirit progress detail
-	if tbl.ProgressDetail != "" {
-		if info := templates.ParseSpiritProgress(tbl.ProgressDetail); info != nil && info.ETA != "" && info.ETA != "TBD" {
-			kvs = append(kvs, "eta", info.ETA)
-		}
-	} else if tbl.ETASeconds > 0 {
+	if tbl.ETASeconds > 0 {
 		kvs = append(kvs, "eta", ui.FormatETA(tbl.ETASeconds))
 	}
 

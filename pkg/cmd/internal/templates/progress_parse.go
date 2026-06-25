@@ -4,15 +4,15 @@ import (
 	"math"
 	"regexp"
 	"strconv"
-	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
 )
 
-// spiritProgressPattern matches Spirit progress strings like "71436/221193 32.30% copyRows ETA TBD"
-// or "71436/221193 32.30% copyRows ETA 5m 30s (-1m from 3m ago)".
-var spiritProgressPattern = regexp.MustCompile(`(\d+)/(\d+)\s+([\d.]+)%\s+(\w+)(?:\s+ETA\s+([^\(]+))?`)
+// spiritProgressPattern matches the row-copy prefix of a Spirit progress
+// string, e.g. "71436/221193 32.30% copyRows". The ETA is carried separately as
+// a structured field, so it is not parsed out of this string.
+var spiritProgressPattern = regexp.MustCompile(`(\d+)/(\d+)\s+([\d.]+)%\s+(\w+)`)
 
 // ProgressData contains data for rendering schema change progress.
 type ProgressData struct {
@@ -90,7 +90,6 @@ type SpiritProgressInfo struct {
 	RowsCopied int64
 	RowsTotal  int64
 	Percent    int
-	ETA        string // "TBD", "5m 30s", etc.
 	State      string // "copyRows", "checksum", etc.
 }
 
@@ -110,17 +109,12 @@ func ParseSpiritProgress(progress string) *SpiritProgressInfo {
 	rowsTotal, _ := strconv.ParseInt(matches[2], 10, 64)
 	percentFloat, _ := strconv.ParseFloat(matches[3], 64)
 	state := matches[4]
-	eta := ""
-	if len(matches) > 5 {
-		eta = strings.TrimSpace(matches[5])
-	}
 
 	return &SpiritProgressInfo{
 		RowsCopied: rowsCopied,
 		RowsTotal:  rowsTotal,
 		Percent:    int(math.Round(percentFloat)),
 		State:      state,
-		ETA:        eta,
 	}
 }
 

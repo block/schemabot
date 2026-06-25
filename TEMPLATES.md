@@ -6058,7 +6058,7 @@ Environment: production
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
-       • Rows: 42,500 / 120,000
+       • Rows: 42,500 / 120,000 · ETA: 4m 0s
 
 
 ⏳ ap-south — waiting for eu-west (orders-ap-south)

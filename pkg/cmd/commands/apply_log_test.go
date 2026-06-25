@@ -215,7 +215,7 @@ func TestLogEmitter_EmitTableStateChange(t *testing.T) {
 }
 
 func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
-	t.Run("with ETA from progress detail", func(t *testing.T) {
+	t.Run("structured ETA renders alongside a Spirit progress detail", func(t *testing.T) {
 		e := &logEmitter{applyID: "apply-test"}
 		ts := &tableLogState{taskID: "task-orders-1"}
 		tbl := &apitypes.TableProgressResponse{
@@ -223,7 +223,8 @@ func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
 			PercentComplete: 45,
 			RowsCopied:      99450,
 			RowsTotal:       221000,
-			ProgressDetail:  "99450/221000 45.00% copyRows ETA 5m 30s",
+			ETASeconds:      330,
+			ProgressDetail:  "99450/221000 45.00% copyRows",
 		}
 
 		output := captureOutput(t, func() {
@@ -235,7 +236,7 @@ func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
 		assert.Contains(t, plain, "table=orders")
 		assert.Contains(t, plain, "progress=45%")
 		assert.Contains(t, plain, "rows=99,450/221,000")
-		assert.Contains(t, plain, "eta=")
+		assert.Contains(t, plain, "5m 30s")
 	})
 
 	t.Run("with ETA from ETASeconds", func(t *testing.T) {

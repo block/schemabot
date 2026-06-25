@@ -588,12 +588,9 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			if t.DDL != "" {
 				b.WriteString(formatProgressDDL(t.DDL))
 			}
-			// Rows and ETA on same line
-			if info.ETA != "" && info.ETA != "TBD" {
-				fmt.Fprintf(&b, indentDetail+"Rows: %s / %s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(info.RowsCopied, info.RowsTotal)), ui.FormatNumber(info.RowsTotal), info.ETA)
-			} else {
-				fmt.Fprintf(&b, indentDetail+"Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(info.RowsCopied, info.RowsTotal)), ui.FormatNumber(info.RowsTotal))
-			}
+			// Rows and ETA on the same line, rendered from the structured ETA
+			// so the CLI and PR comment show the same value via FormatETA.
+			writeStructuredRowsAndETA(&b, t)
 			if info.State != "" && info.State != "copyRows" {
 				fmt.Fprintf(&b, indentDetail+"Status: %s\n", info.State)
 			}
