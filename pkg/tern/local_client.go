@@ -108,6 +108,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
 	"github.com/block/schemabot/pkg/engine/spirit"
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
@@ -1624,6 +1625,7 @@ func (c *LocalClient) existingIdempotentApply(ctx context.Context, req *ternv1.A
 		return nil, nil
 	}
 	if existing.Environment != req.Environment || existing.Database != req.Database || existing.DatabaseType != req.Type {
+		metrics.RecordRemoteApplyDedup(ctx, req.Database, req.Environment, "key_collision_refused")
 		return nil, fmt.Errorf(
 			"idempotency key %q already maps to apply %s (env=%s database=%s type=%s); refusing to alias request (env=%s database=%s type=%s)",
 			req.IdempotencyKey, existing.ApplyIdentifier,
@@ -1661,6 +1663,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			"idempotency_key", req.IdempotencyKey,
 			"state", existing.State,
 		)
+		metrics.RecordRemoteApplyDedup(ctx, req.Database, req.Environment, "hit")
 		return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier}, nil
 	}
 
@@ -1696,7 +1699,9 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			c.logger.Info("Apply: idempotency key resolved an active-conflict race",
 				"apply_id", existing.ApplyIdentifier,
 				"idempotency_key", req.IdempotencyKey,
+				"state", existing.State,
 			)
+			metrics.RecordRemoteApplyDedup(ctx, req.Database, req.Environment, "conflict_race")
 			return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier}, nil
 		}
 		return &ternv1.ApplyResponse{
@@ -1824,7 +1829,9 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			c.logger.Info("Apply: idempotency key resolved a create race",
 				"apply_id", existing.ApplyIdentifier,
 				"idempotency_key", req.IdempotencyKey,
+				"state", existing.State,
 			)
+			metrics.RecordRemoteApplyDedup(ctx, req.Database, req.Environment, "create_race")
 			return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier}, nil
 		}
 		return nil, fmt.Errorf("create apply %s with tasks and operations: %w", applyIdentifier, err)

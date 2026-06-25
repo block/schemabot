@@ -493,6 +493,37 @@ func RecordLockOperation(ctx context.Context, operation, database, status string
 	)
 }
 
+// knownRemoteApplyDedupOutcomes limits metric cardinality to the expected
+// idempotency-keyed dispatch dedup outcomes.
+var knownRemoteApplyDedupOutcomes = map[string]bool{
+	"hit":                   true,
+	"conflict_race":         true,
+	"create_race":           true,
+	"key_collision_refused": true,
+}
+
+// RecordRemoteApplyDedup increments the counter for idempotency-keyed remote
+// apply dispatch dedup outcomes. Outcome should be one of:
+//   - "hit": a re-dispatch of the same generation returned the existing apply
+//     instead of starting a duplicate (the ambiguous-reclaim event an operator
+//     wants to see spike during an incident).
+//   - "conflict_race" / "create_race": a concurrent same-key dispatch was
+//     resolved to the winning apply instead of a spurious rejection or error.
+//   - "key_collision_refused": a stored apply's environment/database/type
+//     disagreed with the request, so the dispatch was refused fail-closed
+//     (a safety event worth investigating).
+func RecordRemoteApplyDedup(ctx context.Context, database, environment, outcome string) {
+	if !knownRemoteApplyDedupOutcomes[outcome] {
+		outcome = "unknown"
+	}
+	addCounter(ctx, "schemabot.remote_apply_dedup_total",
+		"Total idempotency-keyed remote apply dispatch dedup outcomes", "{dispatch}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
 // operatorMetricNames returns the canonical operator metric name alongside its
 // deprecated schemabot.scheduler.* alias. Both are emitted for one release so
 // dashboards and alerts can migrate before the legacy series is removed.
