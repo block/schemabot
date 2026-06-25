@@ -1207,7 +1207,7 @@ func (s *applyOperationStore) DeleteByApply(ctx context.Context, applyID int64) 
 	if err != nil {
 		return fmt.Errorf("delete apply_operations for apply %d: %w", applyID, err)
 	}
-	if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, fmt.Sprintf("delete apply_operations for apply %d", applyID)); err != nil {
+	if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "deleted apply_operations", fmt.Sprintf("apply %d", applyID)); err != nil {
 		return err
 	}
 	return nil
@@ -1296,7 +1296,7 @@ func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, app
 	if err != nil {
 		return 0, fmt.Errorf("stop pending apply_operations for apply %d: %w", applyID, err)
 	}
-	rows, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, fmt.Sprintf("stop pending apply_operations for apply %d", applyID))
+	rows, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "stopped pending apply_operations", fmt.Sprintf("apply %d", applyID))
 	if err != nil {
 		return 0, err
 	}

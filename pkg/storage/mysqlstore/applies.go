@@ -420,12 +420,13 @@ func ensureApplyLeaseStillOwned(ctx context.Context, db queryRower, lease storag
 // still valid) or the lease token no longer matches because ownership was lost.
 // It reloads the lease to distinguish the two so a displaced driver returns
 // ErrApplyLeaseLost instead of silently treating a lost lease as a no-op. desc
-// identifies the operation in the rows-affected error. The affected row count is
-// returned for callers that need it.
-func confirmLeaseOnZeroRows(ctx context.Context, db queryRower, result sql.Result, lease storage.ApplyLease, desc string) (int64, error) {
+// names the write and target identifies the row(s) in the rows-affected error
+// ("read <desc> rows affected for <target>"). The affected row count is returned
+// for callers that need it.
+func confirmLeaseOnZeroRows(ctx context.Context, db queryRower, result sql.Result, lease storage.ApplyLease, desc, target string) (int64, error) {
 	rows, err := result.RowsAffected()
 	if err != nil {
-		return 0, fmt.Errorf("read %s rows affected: %w", desc, err)
+		return 0, fmt.Errorf("read %s rows affected for %s: %w", desc, target, err)
 	}
 	if rows == 0 {
 		if err := ensureApplyLeaseStillOwned(ctx, db, lease); err != nil {
@@ -1649,7 +1650,7 @@ func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {
 		return fmt.Errorf("heartbeat apply %d: %w", applyID, err)
 	}
 	if hasLease {
-		if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, fmt.Sprintf("heartbeat apply %d", applyID)); err != nil {
+		if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "heartbeat", fmt.Sprintf("apply %d", applyID)); err != nil {
 			return err
 		}
 	}

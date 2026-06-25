@@ -146,7 +146,7 @@ func (s *controlRequestStore) CompletePending(ctx context.Context, applyID int64
 		return fmt.Errorf("complete pending control requests for apply %d operation %s: %w", applyID, operation, err)
 	}
 	if hasLease {
-		if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, fmt.Sprintf("complete pending control requests for apply %d operation %s", applyID, operation)); err != nil {
+		if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "completed control request", fmt.Sprintf("apply %d operation %s", applyID, operation)); err != nil {
 			return err
 		}
 	}
@@ -176,7 +176,7 @@ func (s *controlRequestStore) FailPending(ctx context.Context, applyID int64, op
 		return fmt.Errorf("fail pending control requests for apply %d operation %s: %w", applyID, operation, err)
 	}
 	if hasLease {
-		if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, fmt.Sprintf("fail pending control requests for apply %d operation %s", applyID, operation)); err != nil {
+		if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "failed control request", fmt.Sprintf("apply %d operation %s", applyID, operation)); err != nil {
 			return err
 		}
 	}
