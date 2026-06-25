@@ -154,6 +154,32 @@ func (s *applyOperationStore) ListByApply(ctx context.Context, applyID int64) ([
 	return scanApplyOperations(rows)
 }
 
+// execStateUpdate runs a guarded UPDATE against a single apply_operations row,
+// applying setClause with its placeholder args and the write guard's join /
+// predicate. It centralizes the guard load, argument ordering, error wrapping,
+// and idempotent row-existence check shared by the state-transition helpers, so
+// each one supplies only its SET clause, args, and error context.
+func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, errContext, setClause string, setArgs ...any) error {
+	guard, err := operationWriteGuardFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	args := make([]any, 0, len(setArgs)+1+len(guard.args()))
+	args = append(args, setArgs...)
+	args = append(args, id)
+	args = append(args, guard.args()...)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_operations ao
+		`+guard.join()+`
+		SET `+setClause+`
+		WHERE ao.id = ?`+guard.predicate()+`
+	`, args...)
+	if err != nil {
+		return fmt.Errorf("%s (id=%d): %w", errContext, id, err)
+	}
+	return s.checkUpdatedOrExists(ctx, result, id, guard, false)
+}
+
 // UpdateState transitions a child row to the given state.
 // Returns storage.ErrApplyOperationNotFound if no row matches the ID.
 //
@@ -161,21 +187,8 @@ func (s *applyOperationStore) ListByApply(ctx context.Context, applyID int64) ([
 // MySQL's RowsAffected reports rows *changed* (not matched) by default, so a
 // repeat call would report 0; we disambiguate with an existence check.
 func (s *applyOperationStore) UpdateState(ctx context.Context, id int64, newState string) error {
-	guard, err := operationWriteGuardFromContext(ctx)
-	if err != nil {
-		return err
-	}
-	args := append([]any{newState, id}, guard.args()...)
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE apply_operations ao
-		`+guard.join()+`
-		SET ao.state = ?
-		WHERE ao.id = ?`+guard.predicate()+`
-	`, args...)
-	if err != nil {
-		return fmt.Errorf("update apply_operations state (id=%d): %w", id, err)
-	}
-	return s.checkUpdatedOrExists(ctx, result, id, guard, false)
+	return s.execStateUpdate(ctx, id, "update apply_operations state",
+		"ao.state = ?", newState)
 }
 
 // MarkStarted sets state=running and stamps started_at=NOW().
@@ -184,21 +197,8 @@ func (s *applyOperationStore) UpdateState(ctx context.Context, id int64, newStat
 // Idempotent: COALESCE preserves started_at on repeat calls, so a re-issue
 // against an already-started row is a no-op and returns nil.
 func (s *applyOperationStore) MarkStarted(ctx context.Context, id int64) error {
-	guard, err := operationWriteGuardFromContext(ctx)
-	if err != nil {
-		return err
-	}
-	args := append([]any{state.ApplyOperation.Running, id}, guard.args()...)
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE apply_operations ao
-		`+guard.join()+`
-		SET ao.state = ?, ao.started_at = COALESCE(ao.started_at, NOW())
-		WHERE ao.id = ?`+guard.predicate()+`
-	`, args...)
-	if err != nil {
-		return fmt.Errorf("mark apply_operation started (id=%d): %w", id, err)
-	}
-	return s.checkUpdatedOrExists(ctx, result, id, guard, false)
+	return s.execStateUpdate(ctx, id, "mark apply_operation started",
+		"ao.state = ?, ao.started_at = COALESCE(ao.started_at, NOW())", state.ApplyOperation.Running)
 }
 
 // checkUpdatedOrExists returns nil if the UPDATE affected at least one row,
@@ -418,21 +418,8 @@ func operationWriteGuardFromContext(ctx context.Context) (operationWriteGuard, e
 // checkUpdatedOrExists disambiguates that no-op from a missing row so we
 // don't spuriously return ErrApplyOperationNotFound.
 func (s *applyOperationStore) MarkCompleted(ctx context.Context, id int64) error {
-	guard, err := operationWriteGuardFromContext(ctx)
-	if err != nil {
-		return err
-	}
-	args := append([]any{state.ApplyOperation.Completed, id}, guard.args()...)
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE apply_operations ao
-		`+guard.join()+`
-		SET ao.state = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())
-		WHERE ao.id = ?`+guard.predicate()+`
-	`, args...)
-	if err != nil {
-		return fmt.Errorf("mark apply_operation completed (id=%d): %w", id, err)
-	}
-	return s.checkUpdatedOrExists(ctx, result, id, guard, false)
+	return s.execStateUpdate(ctx, id, "mark apply_operation completed",
+		"ao.state = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())", state.ApplyOperation.Completed)
 }
 
 // MarkFailed sets state=failed, error_message, and stamps completed_at=NOW().
@@ -443,21 +430,9 @@ func (s *applyOperationStore) MarkCompleted(ctx context.Context, id int64) error
 // produce RowsAffected=0, which checkUpdatedOrExists disambiguates from
 // a missing row.
 func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg string) error {
-	guard, err := operationWriteGuardFromContext(ctx)
-	if err != nil {
-		return err
-	}
-	args := append([]any{state.ApplyOperation.Failed, nullString(errMsg), id}, guard.args()...)
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE apply_operations ao
-		`+guard.join()+`
-		SET ao.state = ?, ao.error_message = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())
-		WHERE ao.id = ?`+guard.predicate()+`
-	`, args...)
-	if err != nil {
-		return fmt.Errorf("mark apply_operation failed (id=%d): %w", id, err)
-	}
-	return s.checkUpdatedOrExists(ctx, result, id, guard, false)
+	return s.execStateUpdate(ctx, id, "mark apply_operation failed",
+		"ao.state = ?, ao.error_message = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())",
+		state.ApplyOperation.Failed, nullString(errMsg))
 }
 
 // MarkTerminal sets the given terminal state and stamps completed_at=NOW().
@@ -469,21 +444,8 @@ func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg s
 // Idempotent: COALESCE preserves completed_at, and re-applying the same state
 // is a no-op, so a re-issue against an already-terminal row returns nil.
 func (s *applyOperationStore) MarkTerminal(ctx context.Context, id int64, newState string) error {
-	guard, err := operationWriteGuardFromContext(ctx)
-	if err != nil {
-		return err
-	}
-	args := append([]any{newState, id}, guard.args()...)
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE apply_operations ao
-		`+guard.join()+`
-		SET ao.state = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())
-		WHERE ao.id = ?`+guard.predicate()+`
-	`, args...)
-	if err != nil {
-		return fmt.Errorf("mark apply_operation terminal (id=%d, state=%s): %w", id, newState, err)
-	}
-	return s.checkUpdatedOrExists(ctx, result, id, guard, false)
+	return s.execStateUpdate(ctx, id, fmt.Sprintf("mark apply_operation terminal (state=%s)", newState),
+		"ao.state = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())", newState)
 }
 
 // SaveEngineResumeState stores opaque engine state on the operation that owns
