@@ -11,10 +11,7 @@ func RenderRollbackPlanComment(data PlanCommentData) string {
 	var sb strings.Builder
 
 	// Header
-	dbTypeLabel := "Vitess"
-	if data.IsMySQL {
-		dbTypeLabel = "MySQL"
-	}
+	dbTypeLabel := schemaChangePlanDatabaseTypeLabel(data.DatabaseType, data.IsMySQL)
 	fmt.Fprintf(&sb, "## %s Schema Rollback Plan\n\n", dbTypeLabel)
 
 	writePlanMetadata(&sb, data)

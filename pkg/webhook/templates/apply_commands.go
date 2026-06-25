@@ -95,10 +95,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 
 	// Render the full plan first (DDL, lint warnings, etc.) so the user can see
 	// what would change — but without a lock or confirm footer.
-	dbTypeLabel := "Vitess"
-	if data.IsMySQL {
-		dbTypeLabel = "MySQL"
-	}
+	dbTypeLabel := schemaChangePlanDatabaseTypeLabel(data.DatabaseType, data.IsMySQL)
 	fmt.Fprintf(&sb, "## %s Schema Change Plan\n\n", dbTypeLabel)
 
 	writePlanMetadata(&sb, data)

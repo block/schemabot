@@ -74,6 +74,26 @@ func TestRenderRollbackPlanComment_Vitess(t *testing.T) {
 	assert.NotContains(t, rendered, "schemabot rollback-confirm -e staging -d")
 }
 
+func TestRenderRollbackPlanComment_CustomDatabaseTypeHeader(t *testing.T) {
+	data := PlanCommentData{
+		Database:     "myks",
+		Environment:  "staging",
+		RequestedBy:  "admin",
+		DatabaseType: "custom-engine",
+		ApplyID:      "apply_abc123",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace:   "myks",
+				Statements: []string{"ALTER TABLE `t1` DROP INDEX `idx_foo`"},
+			},
+		},
+	}
+
+	rendered := RenderRollbackPlanComment(data)
+	assert.Contains(t, rendered, "## Custom Engine Schema Rollback Plan")
+	assert.Contains(t, rendered, "schemabot rollback-confirm -e staging")
+}
+
 func TestRenderRollbackPlanComment_WithLintViolations(t *testing.T) {
 	data := PlanCommentData{
 		Database:    "testapp",

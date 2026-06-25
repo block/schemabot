@@ -198,11 +198,12 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	// auditability, but rollback-confirm loads the lock-pinned rollback plan so
 	// the user does not need to repeat the apply ID.
 	commentData := templates.PlanCommentData{
-		Database:    database,
-		Environment: environment,
-		RequestedBy: requestedBy,
-		IsMySQL:     dbType == "mysql",
-		ApplyID:     apply.ApplyIdentifier,
+		Database:     database,
+		Environment:  environment,
+		RequestedBy:  requestedBy,
+		DatabaseType: dbType,
+		IsMySQL:      dbType == "mysql",
+		ApplyID:      apply.ApplyIdentifier,
 	}
 
 	for _, sc := range planResp.Changes {

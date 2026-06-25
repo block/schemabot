@@ -7,6 +7,7 @@ import (
 	"github.com/block/spirit/pkg/statement"
 
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -26,15 +27,16 @@ type UnsafeChangeData struct {
 
 // PlanCommentData contains all data needed to render a plan comment.
 type PlanCommentData struct {
-	Database    string
-	SchemaName  string // Schema directory name (e.g. filepath.Base of schema dir)
-	Environment string
-	Tenant      string
-	HeadSHA     string
-	Repository  string
-	RequestedBy string // Empty means auto-generated
-	IsMySQL     bool
-	ApplyID     string
+	Database     string
+	SchemaName   string // Schema directory name (e.g. filepath.Base of schema dir)
+	Environment  string
+	Tenant       string
+	HeadSHA      string
+	Repository   string
+	RequestedBy  string // Empty means auto-generated
+	DatabaseType string
+	IsMySQL      bool
+	ApplyID      string
 
 	Changes        []KeyspaceChangeData
 	LintViolations []LintViolationData
@@ -74,10 +76,7 @@ func RenderPlanComment(data PlanCommentData) string {
 	var sb strings.Builder
 
 	// Header
-	dbTypeLabel := "Vitess"
-	if data.IsMySQL {
-		dbTypeLabel = "MySQL"
-	}
+	dbTypeLabel := schemaChangePlanDatabaseTypeLabel(data.DatabaseType, data.IsMySQL)
 	if data.IsLocked {
 		sb.WriteString("## Schema Change Apply\n\n")
 	} else {
@@ -452,12 +451,13 @@ func pluralize(singular string, count int) string {
 // MultiEnvPlanCommentData contains data for rendering a multi-environment plan
 // in a single comment. Used when `schemabot plan` is run without `-e`.
 type MultiEnvPlanCommentData struct {
-	Database    string
-	SchemaName  string
-	HeadSHA     string
-	Repository  string
-	IsMySQL     bool
-	RequestedBy string
+	Database     string
+	SchemaName   string
+	HeadSHA      string
+	Repository   string
+	DatabaseType string
+	IsMySQL      bool
+	RequestedBy  string
 
 	// Environments in display order (staging first, production second, etc.)
 	Environments []string
@@ -475,10 +475,7 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	var sb strings.Builder
 
 	// Header
-	dbTypeLabel := "Vitess"
-	if data.IsMySQL {
-		dbTypeLabel = "MySQL"
-	}
+	dbTypeLabel := schemaChangePlanDatabaseTypeLabel(data.DatabaseType, data.IsMySQL)
 	fmt.Fprintf(&sb, "## %s Schema Change Plan\n\n", dbTypeLabel)
 
 	writePlanMetadata(&sb, PlanCommentData{Database: data.Database, SchemaName: data.SchemaName})
@@ -535,6 +532,42 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	writeMultiEnvFooter(&sb, data)
 
 	return sb.String()
+}
+
+func schemaChangePlanDatabaseTypeLabel(databaseType string, isMySQL bool) string {
+	databaseType = strings.TrimSpace(databaseType)
+	switch databaseType {
+	case storage.DatabaseTypeMySQL:
+		return "MySQL"
+	case storage.DatabaseTypeStrata:
+		return "Strata"
+	case storage.DatabaseTypeVitess:
+		return "Vitess"
+	case "postgres", "postgresql":
+		return "PostgreSQL"
+	}
+	if databaseType != "" {
+		if label := titleDatabaseType(databaseType); label != "" {
+			return label
+		}
+	}
+	if isMySQL {
+		return "MySQL"
+	}
+	return "Vitess"
+}
+
+func titleDatabaseType(databaseType string) string {
+	parts := strings.FieldsFunc(databaseType, func(r rune) bool {
+		return r == '-' || r == '_' || r == ' '
+	})
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		parts[i] = strings.ToUpper(part[:1]) + strings.ToLower(part[1:])
+	}
+	return strings.Join(parts, " ")
 }
 
 // writeEnvironmentPlanSection writes the plan body for a single environment within a multi-env comment.

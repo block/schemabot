@@ -248,6 +248,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			multiEnvData.Database = schemaResult.Database
 			multiEnvData.HeadSHA = schemaResult.HeadSHA
 			multiEnvData.Repository = schemaResult.Repository
+			multiEnvData.DatabaseType = schemaResult.Type
 			multiEnvData.IsMySQL = schemaResult.Type == "mysql"
 
 			// Stale-schema gate for user-triggered `schemabot plan` only.
@@ -429,13 +430,14 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 // buildPlanCommentData converts plan results into template data.
 func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
-		Database:    schema.Database,
-		Environment: environment,
-		Tenant:      tenant,
-		HeadSHA:     schema.HeadSHA,
-		Repository:  schema.Repository,
-		RequestedBy: requestedBy,
-		IsMySQL:     schema.Type == "mysql",
+		Database:     schema.Database,
+		Environment:  environment,
+		Tenant:       tenant,
+		HeadSHA:      schema.HeadSHA,
+		Repository:   schema.Repository,
+		RequestedBy:  requestedBy,
+		DatabaseType: schema.Type,
+		IsMySQL:      schema.Type == "mysql",
 	}
 
 	// Build keyspace changes from namespace-grouped plan response
