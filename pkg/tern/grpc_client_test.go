@@ -4543,3 +4543,37 @@ func TestRemoteApplyIdempotencyKey(t *testing.T) {
 	assert.NotEqual(t, whole, keyA, "an operation-scoped key differs from the whole-apply key")
 	assert.Equal(t, keyA, remoteApplyIdempotencyKey(apply, opA), "operation key is stable across re-dispatch")
 }
+
+// TestRemoteApplyIdempotencyKey_OperationAttemptRotation verifies that an
+// operation-scoped key rotates on the operation's OWN attempt, not the shared
+// parent apply.Attempt. A sibling operation's retry advances the parent attempt
+// but not this operation's; if the key embedded the parent attempt, that sibling
+// retry would rotate this operation's key and re-dispatch it (re-running DDL)
+// while it sits in its dispatch-then-crash window. The operation-local attempt
+// keeps the key stable across a sibling's retry and rotates it only on this
+// operation's own redispatch.
+func TestRemoteApplyIdempotencyKey_OperationAttemptRotation(t *testing.T) {
+	opScope := func(parentAttempt, opAttempt int) (*storage.Apply, applyTaskScope) {
+		return &storage.Apply{ApplyIdentifier: "apply-abc123", Attempt: parentAttempt},
+			applyTaskScope{
+				applyOperationID: 1,
+				operation:        &storage.ApplyOperation{Deployment: "region-a", OperationKey: "commerce/users", Attempt: opAttempt},
+				multiOperation:   true,
+			}
+	}
+
+	apply0, scope0 := opScope(0, 0)
+	base := remoteApplyIdempotencyKey(apply0, scope0)
+
+	// A sibling's retry advances the parent attempt but not this operation's:
+	// the key must NOT rotate, so a lost-response self-redispatch is reused.
+	applySib, scopeSib := opScope(1, 0)
+	assert.Equal(t, base, remoteApplyIdempotencyKey(applySib, scopeSib),
+		"a sibling's retry (parent attempt bump) must not rotate this operation's key")
+
+	// This operation's own retry advances its attempt: the key must rotate so the
+	// redispatch starts a fresh generation.
+	applyOwn, scopeOwn := opScope(1, 1)
+	assert.NotEqual(t, base, remoteApplyIdempotencyKey(applyOwn, scopeOwn),
+		"this operation's own attempt advancing must rotate its key")
+}
