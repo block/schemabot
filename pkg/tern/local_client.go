@@ -709,7 +709,11 @@ func (c *LocalClient) pullVitessSchemaNamespace(ctx context.Context, req *ternv1
 		Artifacts: artifacts,
 	}
 	// BASIC pulls only DDL and artifacts; the namespace catalog is DETAILED-only,
-	// consistent with the MySQL path.
+	// consistent with the MySQL path. Per-table catalog (table_catalog with
+	// columns, indexes, and foreign keys) is not yet populated for Vitess — that
+	// metadata comes from information_schema on the MySQL path and has no
+	// PlanetScale equivalent wired up here; DETAILED currently returns only the
+	// namespace-level catalog for Vitess.
 	if req.GetCatalogDetail() == ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED {
 		pulledNamespace.NamespaceCatalog = &ternv1.NamespaceCatalog{
 			Name:       namespace,
@@ -871,6 +875,10 @@ func (c *LocalClient) loadColumnCatalog(ctx context.Context, db *sql.DB, namespa
 		}
 		if _, ok := pulledTables[tableName]; ok {
 			tableCatalog := ensurePulledTableCatalog(catalog, tableName)
+			// EXTRA marks generated columns as "STORED GENERATED" or "VIRTUAL
+			// GENERATED". Match those specifically: a bare "GENERATED" substring
+			// would also match "DEFAULT_GENERATED" (an expression default such as
+			// DEFAULT CURRENT_TIMESTAMP), which is not a generated column.
 			upperExtra := strings.ToUpper(extra)
 			column := &ternv1.ColumnCatalog{
 				Name:          columnName,
@@ -878,7 +886,7 @@ func (c *LocalClient) loadColumnCatalog(ctx context.Context, db *sql.DB, namespa
 				Nullable:      nullable == "YES",
 				Comment:       comment,
 				AutoIncrement: strings.Contains(upperExtra, "AUTO_INCREMENT"),
-				Generated:     strings.Contains(upperExtra, "GENERATED"),
+				Generated:     strings.Contains(upperExtra, "STORED GENERATED") || strings.Contains(upperExtra, "VIRTUAL GENERATED"),
 			}
 			if defaultValue.Valid {
 				column.DefaultValue = defaultValue.String

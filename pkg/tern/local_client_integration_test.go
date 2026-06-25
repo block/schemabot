@@ -540,6 +540,9 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	assert.Equal(t, "timestamp", tableCatalog.Columns[2].Type)
 	assert.True(t, tableCatalog.Columns[2].Nullable)
 	assert.Equal(t, "CURRENT_TIMESTAMP", tableCatalog.Columns[2].DefaultValue)
+	// An expression default (DEFAULT CURRENT_TIMESTAMP) reports EXTRA
+	// "DEFAULT_GENERATED" but is not a generated column.
+	assert.False(t, tableCatalog.Columns[2].Generated, "expression default is not a generated column")
 	require.Len(t, tableCatalog.Indexes, 2)
 	indexesByName := make(map[string]*ternv1.IndexCatalog, len(tableCatalog.Indexes))
 	for _, index := range tableCatalog.Indexes {
