@@ -109,11 +109,6 @@ func writeRequesterOrTimestamp(sb *strings.Builder, requestedBy string) {
 	writeAttributionLine(sb, "Requested", requestedBy)
 }
 
-// writeAppliedByOrTimestamp writes "Applied by" attribution for apply/progress comments.
-func writeAppliedByOrTimestamp(sb *strings.Builder, appliedBy string) {
-	writeAttributionLine(sb, "Applied", appliedBy)
-}
-
 func writeAppliedByOrTimestampAt(sb *strings.Builder, appliedBy, timestamp string) {
 	writeAttributionLineAt(sb, "Applied", appliedBy, timestamp, "")
 }

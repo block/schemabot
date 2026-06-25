@@ -833,6 +833,41 @@ func TestRenderApplyStatusComment_NoRequestedBy(t *testing.T) {
 	assert.NotContains(t, result, "@")
 }
 
+// A status comment rendered after the apply starts keeps the timeline anchored
+// to the apply's actual start time.
+func TestRenderApplyStatusComment_StartedAtUsesApplyStart(t *testing.T) {
+	withTemplateTimestamp(t, "2026-06-16 20:00:00 UTC") // render time, ~18m after start
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Running,
+		StartedAt:   "2026-06-16T19:42:00Z",
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "*Started at 2026-06-16 19:42:00 UTC*")
+	assert.NotContains(t, result, "*Started at 2026-06-16 20:00:00 UTC*")
+}
+
+// A terminal summary comment keeps the same start time as the in-place status
+// comment, even when the final summary is rendered after completion.
+func TestRenderApplySummaryComment_StartedAtUsesApplyStart(t *testing.T) {
+	withTemplateTimestamp(t, "2026-06-16 20:00:00 UTC")
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Failed,
+		StartedAt:   "2026-06-16T19:42:00Z",
+		CompletedAt: "2026-06-16T19:59:00Z",
+	}
+
+	result := RenderApplySummaryComment(data)
+
+	assert.Contains(t, result, "*Started at 2026-06-16 19:42:00 UTC*")
+	assert.NotContains(t, result, "*Started at 2026-06-16 20:00:00 UTC*")
+}
+
 func TestRenderPRCommandNotAuthorized(t *testing.T) {
 	result := RenderPRCommandNotAuthorized(ActorAuthorizationCommentData{
 		RequestedBy: "mona",

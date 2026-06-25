@@ -175,7 +175,22 @@ func writeApplyMetadata(sb *strings.Builder, data ApplyStatusCommentData, render
 		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
-	writeAppliedByOrTimestampAt(sb, data.RequestedBy, renderedAt)
+	attributionAt := renderedAt
+	if data.RequestedBy == "" {
+		attributionAt = startedAtDisplay(data.StartedAt, renderedAt)
+	}
+	writeAppliedByOrTimestampAt(sb, data.RequestedBy, attributionAt)
+}
+
+func startedAtDisplay(startedAt, fallback string) string {
+	if startedAt == "" {
+		return fallback
+	}
+	t, err := time.Parse(time.RFC3339, startedAt)
+	if err != nil {
+		return fallback
+	}
+	return t.UTC().Format("2006-01-02 15:04:05 UTC")
 }
 
 func writeApplyStatusDetail(sb *strings.Builder, applyState string) {
@@ -916,7 +931,7 @@ func writeSummaryMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
 		}
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
-	writeAppliedByOrTimestamp(sb, data.RequestedBy)
+	writeAppliedByOrTimestampAt(sb, data.RequestedBy, startedAtDisplay(data.StartedAt, currentTimestamp()))
 }
 
 // formatDuration formats a time.Duration as a human-readable string.

@@ -2014,9 +2014,9 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="second-table-checksumming"></a><strong>Second Table Checksumming</strong></summary>
 
 
-## Schema Change In Progress
+## Schema Change In Progress — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -2686,7 +2686,7 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 > ⚠️ **Error:** table users failed: schema change failed: unsafe warning: Field 'name' doesn't have a default value
 
@@ -2733,7 +2733,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 45m
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 13:45:00 UTC*
 
 1 of 2 tables completed before stop.
 
@@ -2765,7 +2765,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 45m
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 13:45:00 UTC*
 
 1 of 2 tables completed before cancellation.
 
@@ -2849,7 +2849,7 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 3h 30m
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 11:00:00 UTC*
 
 > ⚠️ **Error:** Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'
 
@@ -2913,7 +2913,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 > ⚠️ **Error:** table customers.addresses failed: Error 1205: Lock wait timeout exceeded
 
@@ -5522,7 +5522,7 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 
 **Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @aparajon at 2026-03-15 14:22:00 UTC*
 
 > ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
 
