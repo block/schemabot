@@ -1728,13 +1728,23 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			ErrorMessage: "plan not found",
 		}, nil
 	}
-	// Build the task set from the dispatch's authoritative scope. The
-	// control-plane operator dispatches one apply_operation at a time, carrying
-	// that operation's own DDL changes — and, for a sharded engine, its single
-	// target shard — so a per-shard operation drives exactly its shard's table
-	// change rather than the whole keyspace. A local apply carries no dispatched
-	// changes and falls back to the whole stored plan.
-	ddlChanges := c.applyRequestDDLChanges(req, plan)
+	// Determine the dispatch's shard scope. A sharded engine's work is dispatched
+	// one apply_operation per shard, so a request that carries target shards is
+	// scoped to that single shard: it drives the operation's own DDL changes
+	// (req.DdlChanges) and tags its tasks with the shard, so the engine receives
+	// exactly one target shard. A whole-deployment or non-sharded apply carries no
+	// target shard and uses the stored plan unchanged — keeping that path
+	// byte-for-byte as before. More than one target shard is a malformed dispatch
+	// (the per-shard fan-out emits one shard per operation) and fails closed.
+	ddlChanges := plan.FlatDDLChanges()
+	dispatchShard := ""
+	if len(req.TargetShards) > 0 {
+		if len(req.TargetShards) != 1 {
+			return nil, fmt.Errorf("apply for plan %s: a sharded dispatch must target exactly one shard, got %d (%v)", req.PlanId, len(req.TargetShards), req.TargetShards)
+		}
+		dispatchShard = req.TargetShards[0]
+		ddlChanges = c.applyRequestDDLChanges(req, plan)
+	}
 	c.logger.Info("Apply: retrieved plan",
 		"plan_id", req.PlanId,
 		"plan_identifier", plan.PlanIdentifier,
@@ -1830,15 +1840,6 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			"table", ddlChange.Table,
 			"ddl", ddlChange.DDL,
 		)
-	}
-
-	// A sharded engine's work is dispatched one shard per operation, so tag every
-	// task with that shard and the engine receives exactly one target shard (it
-	// reads the shard back via taskTargetShards). A whole-deployment or
-	// non-sharded dispatch carries no target shard and tasks stay unscoped.
-	dispatchShard := ""
-	if len(req.TargetShards) == 1 {
-		dispatchShard = req.TargetShards[0]
 	}
 
 	tasks := make([]*storage.Task, len(ddlChanges))
