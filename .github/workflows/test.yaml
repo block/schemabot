@@ -264,6 +264,34 @@ jobs:
         run: |
           docker compose -f deploy/e2e/docker-compose.yml logs --tail=300 schemabot localscale 2>/dev/null || true
 
+  e2e-grpc-multideploy:
+    name: "E2E gRPC Multi-Deployment Tests"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      - name: "Test"
+        run: make test-e2e-grpc-multideploy
+      - name: "Container logs on failure"
+        if: failure()
+        run: |
+          docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs --tail=300 2>/dev/null || true
+
   e2e-vitess-matrix:
     name: "E2E Vitess Matrix"
     needs: changes
@@ -511,7 +539,7 @@ jobs:
   # skipped or failed upstream is treated as failure.
   e2e-rollup:
     name: "E2E Tests"
-    needs: [changes, e2e-vitess-matrix, e2e-mysql, e2e-vitess]
+    needs: [changes, e2e-vitess-matrix, e2e-mysql, e2e-grpc-multideploy, e2e-vitess]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -524,6 +552,7 @@ jobs:
           VITESS_MODE: ${{ needs.e2e-vitess-matrix.outputs.mode }}
           VITESS_SHARD_COUNT: ${{ needs.e2e-vitess-matrix.outputs.shard_count }}
           E2E_MYSQL_RESULT: ${{ needs.e2e-mysql.result }}
+          E2E_MULTIDEPLOY_RESULT: ${{ needs.e2e-grpc-multideploy.result }}
           E2E_VITESS_RESULT: ${{ needs.e2e-vitess.result }}
         run: |
           set -euo pipefail
@@ -552,6 +581,10 @@ jobs:
           fi
           if [ "$E2E_MYSQL_RESULT" != "success" ]; then
             echo "::error::e2e-mysql result=$E2E_MYSQL_RESULT"
+            exit 1
+          fi
+          if [ "$E2E_MULTIDEPLOY_RESULT" != "success" ]; then
+            echo "::error::e2e-grpc-multideploy result=$E2E_MULTIDEPLOY_RESULT"
             exit 1
           fi
           if [ "$E2E_VITESS_RESULT" != "success" ]; then
