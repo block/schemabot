@@ -233,6 +233,16 @@ func (c *GRPCClient) IsRemote() bool { return true }
 // Endpoint returns the gRPC dial address for this client.
 func (c *GRPCClient) Endpoint() string { return c.address }
 
+// SupportsShardedApplyFanout reports that a sharded plan dispatched over this
+// client may be fanned out into one claimable apply_operation per shard. The
+// control plane owns that fan-out (and its rollout sequencing); the data plane
+// behind this client executes one shard per dispatch, scoped by the per-shard
+// ApplyRequest's TargetShards and DdlChanges. Reporting true is safe regardless
+// of the remote engine: apply-create only fans out when the stored plan carries
+// changing shards (canBuildShardedOperationGroups), which non-sharded engines
+// never produce, so a non-sharded plan is dispatched whole exactly as before.
+func (c *GRPCClient) SupportsShardedApplyFanout() bool { return true }
+
 // SetPendingObserver sets an observer consumed by the next Apply() call.
 func (c *GRPCClient) SetPendingObserver(observer ProgressObserver) {
 	c.observerMu.Lock()

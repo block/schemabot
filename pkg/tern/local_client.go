@@ -1257,6 +1257,33 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 	return result, nil
 }
 
+// applyRequestDDLChanges returns the table changes this apply should execute.
+// A dispatched apply (from the control-plane operator) carries the
+// authoritative, already-scoped DDL changes for one apply_operation in
+// req.DdlChanges — for a sharded engine that is one table's change for one
+// shard, the per-shard fan-out the control plane owns — so they are honored
+// verbatim. A local apply carries none, so the whole stored plan is used. The
+// proto change type round-trips back to the same DDL action the stored plan
+// would carry (create/alter/drop).
+func (c *LocalClient) applyRequestDDLChanges(req *ternv1.ApplyRequest, plan *storage.Plan) []storage.TableChange {
+	if len(req.DdlChanges) == 0 {
+		return plan.FlatDDLChanges()
+	}
+	changes := make([]storage.TableChange, 0, len(req.DdlChanges))
+	for _, ch := range req.DdlChanges {
+		if ch == nil {
+			continue
+		}
+		changes = append(changes, storage.TableChange{
+			Namespace: ch.Namespace,
+			Table:     ch.TableName,
+			DDL:       ch.Ddl,
+			Operation: protoChangeTypeToDDLAction(ch.ChangeType),
+		})
+	}
+	return changes
+}
+
 // planForApplyRequest resolves the plan for an apply. It prefers a plan row in
 // this deployment's own storage (the single-deployment path, and the primary
 // deployment of a multi-deployment apply). When no local plan exists, a
@@ -1680,11 +1707,18 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			ErrorMessage: "plan not found",
 		}, nil
 	}
-	ddlChanges := plan.FlatDDLChanges()
+	// Build the task set from the dispatch's authoritative scope. The
+	// control-plane operator dispatches one apply_operation at a time, carrying
+	// that operation's own DDL changes — and, for a sharded engine, its single
+	// target shard — so a per-shard operation drives exactly its shard's table
+	// change rather than the whole keyspace. A local apply carries no dispatched
+	// changes and falls back to the whole stored plan.
+	ddlChanges := c.applyRequestDDLChanges(req, plan)
 	c.logger.Info("Apply: retrieved plan",
 		"plan_id", req.PlanId,
 		"plan_identifier", plan.PlanIdentifier,
 		"ddl_change_count", len(ddlChanges),
+		"target_shards", req.TargetShards,
 		"database", plan.Database,
 	)
 
@@ -1777,6 +1811,15 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		)
 	}
 
+	// A sharded engine's work is dispatched one shard per operation, so tag every
+	// task with that shard and the engine receives exactly one target shard (it
+	// reads the shard back via taskTargetShards). A whole-deployment or
+	// non-sharded dispatch carries no target shard and tasks stay unscoped.
+	dispatchShard := ""
+	if len(req.TargetShards) == 1 {
+		dispatchShard = req.TargetShards[0]
+	}
+
 	tasks := make([]*storage.Task, len(ddlChanges))
 	for i, ddlChange := range ddlChanges {
 		taskIdentifier := "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
@@ -1793,6 +1836,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			Options:        optionsJSON,
 			TableName:      ddlChange.Table,
 			Namespace:      ddlChange.Namespace,
+			Shard:          dispatchShard,
 			DDL:            ddlChange.DDL,
 			DDLAction:      ddlChange.Operation,
 			CreatedAt:      now,
