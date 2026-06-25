@@ -61,7 +61,12 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	owner := client.GenerateCLIOwner()
 
 	// Check for existing active schema change
-	active, err := client.CheckActiveSchemaChange(ep, cfg.Database, cmd.Environment)
+	var active *client.ActiveSchemaChange
+	err = withLoading("Checking active schema changes...", cmd.Output != OutputFormatJSON, func() error {
+		var checkErr error
+		active, checkErr = client.CheckActiveSchemaChange(ep, cfg.Database, cmd.Environment)
+		return checkErr
+	})
 	if err != nil {
 		// Ignore status preflight errors; apply is still guarded server-side.
 	} else if active != nil && active.State != "" {
@@ -95,7 +100,12 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	}
 
 	// Step 1: Generate plan
-	planResult, err := client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest)
+	var planResult *apitypes.PlanResponse
+	err = withLoading("Generating schema change plan...", cmd.Output != OutputFormatJSON, func() error {
+		var planErr error
+		planResult, planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest)
+		return planErr
+	})
 	if err != nil {
 		return err
 	}
@@ -145,7 +155,12 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Check lock availability before showing plan (unless --force will break it anyway or --no-lock skips locking)
 	if !cmd.NoLock && !cmd.Force {
-		existingLock, err := client.GetLock(ep, cfg.Database, cfg.Type)
+		var existingLock *client.LockInfo
+		err := withLoading("Checking database lock...", cmd.Output != OutputFormatJSON, func() error {
+			var lockErr error
+			existingLock, lockErr = client.GetLock(ep, cfg.Database, cfg.Type)
+			return lockErr
+		})
 		if err != nil {
 			return fmt.Errorf("check lock: %w", err)
 		}
@@ -192,12 +207,19 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	if !cmd.NoLock {
 		// If --force, break any existing lock first
 		if cmd.Force {
-			existingLock, err := client.GetLock(ep, cfg.Database, cfg.Type)
+			var existingLock *client.LockInfo
+			err := withLoading("Checking database lock...", cmd.Output != OutputFormatJSON, func() error {
+				var lockErr error
+				existingLock, lockErr = client.GetLock(ep, cfg.Database, cfg.Type)
+				return lockErr
+			})
 			if err != nil {
 				return fmt.Errorf("check existing lock: %w", err)
 			}
 			if existingLock != nil && existingLock.Owner != owner {
-				if err := client.ForceReleaseLock(ep, cfg.Database, cfg.Type); err != nil {
+				if err := withLoading("Releasing database lock...", cmd.Output != OutputFormatJSON, func() error {
+					return client.ForceReleaseLock(ep, cfg.Database, cfg.Type)
+				}); err != nil {
 					return fmt.Errorf("force release lock: %w", err)
 				}
 				templates.WriteLockForceReleased(cfg.Database, cfg.Type, existingLock.Owner)
@@ -205,10 +227,18 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		}
 
 		// Acquire the lock
-		_, err = client.AcquireLock(ep, cfg.Database, cfg.Type, owner, cmd.Repository, cmd.PullRequest)
+		err = withLoading("Acquiring database lock...", cmd.Output != OutputFormatJSON, func() error {
+			_, lockErr := client.AcquireLock(ep, cfg.Database, cfg.Type, owner, cmd.Repository, cmd.PullRequest)
+			return lockErr
+		})
 		if errors.Is(err, client.ErrLockHeld) {
 			// Lock is held by someone else - show conflict message
-			existingLock, getErr := client.GetLock(ep, cfg.Database, cfg.Type)
+			var existingLock *client.LockInfo
+			getErr := withLoading("Checking database lock...", cmd.Output != OutputFormatJSON, func() error {
+				var lockErr error
+				existingLock, lockErr = client.GetLock(ep, cfg.Database, cfg.Type)
+				return lockErr
+			})
 			if getErr != nil || existingLock == nil {
 				return fmt.Errorf("database is locked by another user")
 			}

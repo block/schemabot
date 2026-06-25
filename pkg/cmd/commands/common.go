@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -164,6 +165,61 @@ func writeJSON(v any) error {
 	return enc.Encode(v)
 }
 
+var (
+	loadingSpinnerDelay              = 400 * time.Millisecond
+	loadingSpinnerInterval           = 100 * time.Millisecond
+	loadingSpinnerFrames             = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	loadingSpinnerWriter   io.Writer = os.Stderr
+	loadingSpinnerTerminal           = func() bool {
+		info, err := os.Stderr.Stat()
+		return err == nil && info.Mode()&os.ModeCharDevice != 0
+	}
+)
+
+func withLoading(message string, show bool, fn func() error) error {
+	if !show || !loadingSpinnerTerminal() {
+		return fn()
+	}
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		timer := time.NewTimer(loadingSpinnerDelay)
+		defer timer.Stop()
+
+		select {
+		case <-timer.C:
+		case <-done:
+			return
+		}
+
+		frame := 0
+		ticker := time.NewTicker(loadingSpinnerInterval)
+		defer ticker.Stop()
+
+		for {
+			if _, err := fmt.Fprintf(loadingSpinnerWriter, "\r%s %s", loadingSpinnerFrames[frame%len(loadingSpinnerFrames)], message); err != nil {
+				return
+			}
+			frame++
+
+			select {
+			case <-done:
+				if _, err := fmt.Fprint(loadingSpinnerWriter, "\r\033[2K"); err != nil {
+					return
+				}
+				return
+			case <-ticker.C:
+			}
+		}
+	})
+
+	err := fn()
+	close(done)
+	wg.Wait()
+	return err
+}
+
 // requireControlScope validates the explicit fields that scope a control operation.
 func requireControlScope(applyID, environment string) error {
 	if applyID == "" {
@@ -260,7 +316,12 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 
 	options := buildApplyOptions(planResult, deferCutover, deferDeploy, skipRevert, branch, watch, format)
 
-	applyResult, err := client.CallApplyAPI(ep, planResult.PlanID, environment, caller, options)
+	var applyResult *apitypes.ApplyResponse
+	err := withLoading("Submitting schema change...", format != OutputFormatJSON, func() error {
+		var applyErr error
+		applyResult, applyErr = client.CallApplyAPI(ep, planResult.PlanID, environment, caller, options)
+		return applyErr
+	})
 	if err != nil {
 		return err
 	}

@@ -3,6 +3,7 @@ package commands
 import (
 	"fmt"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
@@ -24,7 +25,12 @@ func (cmd *StopCmd) Run(g *Globals) error {
 	}
 
 	// Check current state first
-	result, err := client.GetProgress(ep, cmd.ApplyID)
+	var result *apitypes.ProgressResponse
+	err = withLoading("Loading schema change progress...", true, func() error {
+		var loadErr error
+		result, loadErr = client.GetProgress(ep, cmd.ApplyID)
+		return loadErr
+	})
 	if err != nil {
 		return fmt.Errorf("get progress for apply %s: %w", cmd.ApplyID, err)
 	}
@@ -48,7 +54,12 @@ func (cmd *StopCmd) Run(g *Globals) error {
 	}
 
 	// Call stop API
-	stopResult, err := client.CallStopAPI(ep, cmd.Environment, cmd.ApplyID)
+	var stopResult *apitypes.StopResponse
+	err = withLoading("Stopping schema change...", true, func() error {
+		var stopErr error
+		stopResult, stopErr = client.CallStopAPI(ep, cmd.Environment, cmd.ApplyID)
+		return stopErr
+	})
 	if err != nil {
 		return err
 	}

@@ -3,6 +3,7 @@ package commands
 import (
 	"fmt"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 )
@@ -29,7 +30,12 @@ func (cmd *ProgressCmd) Run(g *Globals) error {
 		return watchApplyProgressByApplyIDWithEnvironment(ep, cmd.ApplyID, cmd.Environment, true)
 	}
 
-	result, err := client.GetProgress(ep, cmd.ApplyID)
+	var result *apitypes.ProgressResponse
+	err = withLoading("Loading schema change progress...", true, func() error {
+		var loadErr error
+		result, loadErr = client.GetProgress(ep, cmd.ApplyID)
+		return loadErr
+	})
 	if err != nil {
 		return err
 	}
