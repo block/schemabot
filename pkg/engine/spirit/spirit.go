@@ -525,9 +525,10 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 
 // buildSpiritTableProgress maps Spirit's per-table progress into engine
 // TableProgress. Spirit reports a single remaining row-copy estimate for the
-// whole runner, so the ETA is surfaced on the tables still copying; completed
-// tables keep 0, as do estimates that aren't ready yet (still measuring the
-// copy rate, or essentially done).
+// whole runner, so the ETA is surfaced on the tables still copying that have an
+// established row total; completed tables keep 0, as do tables without a total
+// yet and estimates that aren't ready (still measuring the copy rate, or
+// essentially done).
 func buildSpiritTableProgress(prog status.Progress, stateStr string, ddlByTable, tableNamespace map[string]string) []engine.TableProgress {
 	var etaSeconds int64
 	if prog.ETA.State == status.ETAReady {
@@ -552,7 +553,7 @@ func buildSpiritTableProgress(prog status.Progress, stateStr string, ddlByTable,
 		if st.IsComplete {
 			tp.State = "completed"
 			tp.Progress = 100
-		} else {
+		} else if st.RowsTotal > 0 {
 			tp.ETASeconds = etaSeconds
 		}
 		tableProgress = append(tableProgress, tp)

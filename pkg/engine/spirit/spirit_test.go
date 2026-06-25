@@ -148,6 +148,18 @@ func TestBuildSpiritTableProgress(t *testing.T) {
 		assert.Equal(t, int64(0), orders.ETASeconds, "completed table carries no ETA")
 	})
 
+	t.Run("ready ETA is withheld from a table without an established total", func(t *testing.T) {
+		prog := status.Progress{
+			ETA:    status.ETA{State: status.ETAReady, Duration: 90 * time.Second},
+			Tables: []status.TableProgress{{TableName: "users", RowsCopied: 0, RowsTotal: 0}},
+		}
+		got := buildSpiritTableProgress(prog, "copyRows", ddlByTable, tableNamespace)
+		require.Len(t, got, 1)
+		assert.Equal(t, int64(0), got[0].ETASeconds, "no row total means no ETA")
+		assert.Equal(t, 0, got[0].Progress)
+		assert.Empty(t, got[0].ProgressDetail)
+	})
+
 	notReady := []struct {
 		name string
 		eta  status.ETA
