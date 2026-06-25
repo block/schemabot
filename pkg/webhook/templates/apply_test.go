@@ -599,7 +599,8 @@ func TestRenderApplyStatusComment_Completed(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## ✅ Schema Change Applied")
+	assert.Contains(t, result, "## Schema Change Status — Staging")
+	assert.Contains(t, result, "**Status**: Applied")
 	assert.Contains(t, result, "### Table Progress")
 	// Progress summary line
 	assert.Contains(t, result, "📊 2/2 complete")
@@ -660,7 +661,8 @@ func TestRenderApplyStatusComment_Failed(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## ❌ Schema Change Failed")
+	assert.Contains(t, result, "## Schema Change Status — Staging")
+	assert.Contains(t, result, "**Status**: Failed")
 	assert.Contains(t, result, "⚠️ **Error:**")
 	assert.Contains(t, result, "lock wait timeout exceeded")
 	assert.Contains(t, result, "🟥") // red bar for failed table
@@ -672,6 +674,24 @@ func TestRenderApplyStatusComment_Failed(t *testing.T) {
 	assert.Contains(t, result, "1 cancelled")
 	assert.Contains(t, result, "To retry:")
 	assert.Contains(t, result, "schemabot apply -e staging")
+}
+
+func TestTerminalStatusAndSummaryCommentTitlesAreDistinct(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:     "testapp",
+		Environment:  "staging",
+		State:        state.Apply.Failed,
+		ErrorMessage: "lock wait timeout exceeded",
+		Tables: []TableProgressData{
+			{TableName: "users", Status: state.Task.Failed},
+		},
+	}
+
+	statusTitle := strings.SplitN(RenderApplyStatusComment(data), "\n", 2)[0]
+	summaryTitle := strings.SplitN(RenderApplySummaryComment(data), "\n", 2)[0]
+
+	assert.Equal(t, "## Schema Change Status — Staging", statusTitle)
+	assert.Equal(t, "## ❌ Schema Change Failed — Staging", summaryTitle)
 }
 
 // A retryable failure is operator-recovery state, not a user-facing outcome:
@@ -792,7 +812,8 @@ func TestRenderApplyStatusComment_Stopped(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## ⏹️ Schema Change Stopped")
+	assert.Contains(t, result, "## Schema Change Status — Staging")
+	assert.Contains(t, result, "**Status**: Stopped")
 	assert.Contains(t, result, "🟧") // orange bar for stopped
 	assert.Contains(t, result, "⏹️ Stopped at 72%")
 	assert.Contains(t, result, "72,000 / 100,000")
@@ -848,7 +869,8 @@ func TestRenderApplyStatusComment_Cancelled(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## 🚫 Schema Change Cancelled")
+	assert.Contains(t, result, "## Schema Change Status — Staging")
+	assert.Contains(t, result, "**Status**: Cancelled")
 	assert.Contains(t, result, "cannot be resumed")
 	assert.Contains(t, result, "Open a new schema change")
 	assert.NotContains(t, result, "schemabot start", "a cancelled change is permanent — no resume affordance")
@@ -1096,14 +1118,16 @@ func TestPreviewCommentApplyEstimateExceeded(t *testing.T) {
 func TestPreviewCommentApplyCompleted(t *testing.T) {
 	result := PreviewCommentApplyCompleted()
 
-	assert.Contains(t, result, "Schema Change Applied")
+	assert.Contains(t, result, "Schema Change Status")
+	assert.Contains(t, result, "**Status**: Applied")
 	assert.Contains(t, result, "### Table Progress")
 }
 
 func TestPreviewCommentApplyFailed(t *testing.T) {
 	result := PreviewCommentApplyFailed()
 
-	assert.Contains(t, result, "Schema Change Failed")
+	assert.Contains(t, result, "Schema Change Status")
+	assert.Contains(t, result, "**Status**: Failed")
 	assert.Contains(t, result, "lock wait timeout")
 	assert.Contains(t, result, "Cancelled (not started)")
 }
@@ -1111,7 +1135,8 @@ func TestPreviewCommentApplyFailed(t *testing.T) {
 func TestPreviewCommentApplyStopped(t *testing.T) {
 	result := PreviewCommentApplyStopped()
 
-	assert.Contains(t, result, "Schema Change Stopped")
+	assert.Contains(t, result, "Schema Change Status")
+	assert.Contains(t, result, "**Status**: Stopped")
 	assert.Contains(t, result, "Stopped at 72%")
 	assert.Contains(t, result, "schemabot start")
 }
@@ -1128,7 +1153,8 @@ func TestPreviewCommentApplyResuming(t *testing.T) {
 func TestPreviewCommentApplyCancelled(t *testing.T) {
 	result := PreviewCommentApplyCancelled()
 
-	assert.Contains(t, result, "🚫 Schema Change Cancelled")
+	assert.Contains(t, result, "Schema Change Status")
+	assert.Contains(t, result, "**Status**: Cancelled")
 	assert.Contains(t, result, "cannot be resumed")
 	assert.NotContains(t, result, "schemabot start", "a cancelled change is permanent — no resume affordance")
 }

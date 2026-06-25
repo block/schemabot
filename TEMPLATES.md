@@ -771,11 +771,13 @@ That command wasn't recognized. Available commands:
 
 ### Apply failure
 
-## ❌ Schema Change Failed — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Failed
 
 📊 1/3 complete · 1 failed · 1 cancelled
 
@@ -1786,11 +1788,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="single-table-completed"></a><strong>Single Table: Completed</strong></summary>
 
 
-## ✅ Schema Change Applied — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Applied
 
 ### Table Progress
 
@@ -1807,11 +1811,13 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 <summary><a name="single-table-failed"></a><strong>Single Table: Failed</strong></summary>
 
 
-## ❌ Schema Change Failed — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Failed
 
 ### Table Progress
 
@@ -1837,11 +1843,13 @@ schemabot apply -e staging
 <summary><a name="single-table-stopped"></a><strong>Single Table: Stopped</strong></summary>
 
 
-## ⏹️ Schema Change Stopped — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Stopped
 
 ### Table Progress
 
@@ -2200,11 +2208,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="all-completed"></a><strong>All Completed</strong></summary>
 
 
-## ✅ Schema Change Applied — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Applied
 
 📊 3/3 complete
 
@@ -2342,11 +2352,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="first-table-failed"></a><strong>First Table Failed</strong></summary>
 
 
-## ❌ Schema Change Failed — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Failed
 
 📊 1 failed · 2 cancelled
 
@@ -2386,11 +2398,13 @@ schemabot apply -e staging
 <summary><a name="middle-table-failed"></a><strong>Middle Table Failed</strong></summary>
 
 
-## ❌ Schema Change Failed — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Failed
 
 📊 1/3 complete · 1 failed · 1 cancelled
 
@@ -2430,11 +2444,13 @@ schemabot apply -e staging
 <summary><a name="stopped"></a><strong>Stopped</strong></summary>
 
 
-## ⏹️ Schema Change Stopped — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Stopped
 
 📊 1/2 complete · 1 stopped
 
@@ -2498,11 +2514,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="cancelled"></a><strong>Cancelled</strong></summary>
 
 
-## 🚫 Schema Change Cancelled — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Cancelled
 
 📊 1/2 complete · 1 cancelled
 
@@ -5257,11 +5275,13 @@ schemabot apply -e production
 <details>
 <summary>✅ eu — completed</summary>
 
-## ✅ Schema Change Applied — Production
+## Schema Change Status — Production
 
 **Database**: `payments_eu` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Status**: Applied
 
 📊 3/3 complete
 
@@ -5291,11 +5311,13 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <details open>
 <summary>❌ us — failed</summary>
 
-## ❌ Schema Change Failed — Production
+## Schema Change Status — Production
 
 **Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Status**: Failed
 
 📊 1/3 complete · 1 failed · 1 cancelled
 
@@ -5366,11 +5388,13 @@ _No details available yet._
 <details>
 <summary>✅ eu — completed</summary>
 
-## ✅ Schema Change Applied — Production
+## Schema Change Status — Production
 
 **Database**: `payments_eu` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Status**: Applied
 
 📊 3/3 complete
 
@@ -5400,11 +5424,13 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <details>
 <summary>✅ us — completed</summary>
 
-## ✅ Schema Change Applied — Production
+## Schema Change Status — Production
 
 **Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Status**: Applied
 
 📊 3/3 complete
 
@@ -5434,11 +5460,13 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <details>
 <summary>✅ au — completed</summary>
 
-## ✅ Schema Change Applied — Production
+## Schema Change Status — Production
 
 **Database**: `payments_au` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Status**: Applied
 
 📊 3/3 complete
 

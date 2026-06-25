@@ -87,7 +87,7 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	var sb strings.Builder
 
 	// Header varies by state
-	writeApplyHeader(&sb, data)
+	writeApplyStatusHeader(&sb, data)
 
 	// Metadata line
 	writeApplyMetadata(&sb, data, renderedAt)
@@ -123,6 +123,14 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	}
 
 	return sb.String()
+}
+
+func writeApplyStatusHeader(sb *strings.Builder, data ApplyStatusCommentData) {
+	if state.IsTerminalApplyState(data.State) {
+		writeEnvironmentTitle(sb, "Schema Change Status", data.Environment)
+		return
+	}
+	writeApplyHeader(sb, data)
 }
 
 // writeApplyHeader writes the comment header with a state-specific title.
@@ -202,7 +210,18 @@ func writeApplyStatusDetail(sb *strings.Builder, applyState string) {
 }
 
 func applyStatusDetail(applyState string) string {
+	applyState = state.NormalizeState(applyState)
 	switch applyState {
+	case state.Apply.Completed:
+		return "Applied"
+	case state.Apply.Failed:
+		return "Failed"
+	case state.Apply.Stopped:
+		return "Stopped"
+	case state.Apply.Reverted:
+		return "Reverted"
+	case state.Apply.Cancelled:
+		return "Cancelled"
 	case state.Apply.Pending:
 		return "Starting"
 	case state.Apply.WaitingForDeploy:
