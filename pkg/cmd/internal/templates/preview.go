@@ -109,6 +109,7 @@ const (
 
 	// Comment template previews (GitHub PR comments)
 	PreviewCommentPlan                  PreviewType = "comment_plan"                    // Plan comment with DDL changes + lint violations
+	PreviewCommentPlanTenant            PreviewType = "comment_plan_tenant"             // Tenant-targeted plan comment
 	PreviewCommentPlanEmpty             PreviewType = "comment_plan_empty"              // Plan comment with no changes
 	PreviewCommentNoManagedSchema       PreviewType = "comment_no_managed_schema"       // No managed schema changes in current PR
 	PreviewCommentReconcileInProgress   PreviewType = "comment_reconcile_in_progress"   // Empty diff with in-progress apply-owned state
@@ -124,6 +125,7 @@ const (
 	PreviewCommentErrors                PreviewType = "comment_errors"                  // All error comment templates
 	PreviewCommentUnsafeBlocked         PreviewType = "comment_unsafe_blocked"          // Unsafe changes blocked (no --allow-unsafe)
 	PreviewCommentDropColumnBlocked     PreviewType = "comment_drop_column_blocked"     // Drop column blocked with destructive-drop guidance
+	PreviewCommentDropIndexBlocked      PreviewType = "comment_drop_index_blocked"      // Drop index blocked with destructive-drop guidance
 	PreviewCommentApplyPlan             PreviewType = "comment_apply_plan"              // Locked apply-plan comment
 	PreviewCommentApplyPlanOptions      PreviewType = "comment_apply_plan_options"      // Locked apply-plan with options
 	PreviewCommentApplyPlanUnsafe       PreviewType = "comment_apply_plan_unsafe"       // Locked apply-plan with unsafe warning

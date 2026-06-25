@@ -7,6 +7,7 @@ import (
 	"github.com/block/spirit/pkg/statement"
 
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -26,15 +27,16 @@ type UnsafeChangeData struct {
 
 // PlanCommentData contains all data needed to render a plan comment.
 type PlanCommentData struct {
-	Database    string
-	SchemaName  string // Schema directory name (e.g. filepath.Base of schema dir)
-	Environment string
-	Tenant      string
-	HeadSHA     string
-	Repository  string
-	RequestedBy string // Empty means auto-generated
-	IsMySQL     bool
-	ApplyID     string
+	Database     string
+	SchemaName   string // Schema directory name (e.g. filepath.Base of schema dir)
+	Environment  string
+	Tenant       string
+	HeadSHA      string
+	Repository   string
+	RequestedBy  string // Empty means auto-generated
+	DatabaseType string
+	IsMySQL      bool
+	ApplyID      string
 
 	Changes        []KeyspaceChangeData
 	LintViolations []LintViolationData
@@ -74,14 +76,10 @@ func RenderPlanComment(data PlanCommentData) string {
 	var sb strings.Builder
 
 	// Header
-	dbTypeLabel := "Vitess"
-	if data.IsMySQL {
-		dbTypeLabel = "MySQL"
-	}
 	if data.IsLocked {
-		sb.WriteString("## Schema Change Apply\n\n")
+		writeEnvironmentTitle(&sb, "Schema Change Apply", data.Environment)
 	} else {
-		fmt.Fprintf(&sb, "## %s Schema Change Plan\n\n", dbTypeLabel)
+		writeEnvironmentTitle(&sb, "Schema Change Plan", data.Environment)
 	}
 
 	writePlanMetadata(&sb, data)
@@ -112,7 +110,7 @@ func RenderPlanComment(data PlanCommentData) string {
 
 	// Unsafe changes warning
 	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 {
-		writeUnsafeWarning(&sb, data.UnsafeChanges, data.AllowUnsafe)
+		writeUnsafeWarning(&sb, data.UnsafeChanges, data.AllowUnsafe, data.IsMySQL)
 	}
 
 	// Lint violations
@@ -187,11 +185,9 @@ func writeApplyHint(sb *strings.Builder, command string) {
 // Schema name (the schema directory) is shown for MySQL. Vitess uses keyspace headers instead.
 func writePlanMetadata(sb *strings.Builder, data PlanCommentData) {
 	parts := []string{fmt.Sprintf("**Database**: `%s`", data.Database)}
+	parts = append(parts, fmt.Sprintf("**Type**: `%s`", schemaChangePlanDatabaseTypeLabel(data.DatabaseType, data.IsMySQL)))
 	if data.IsMySQL && data.SchemaName != "" {
 		parts = append(parts, fmt.Sprintf("**Schema Name**: `%s`", data.SchemaName))
-	}
-	if data.Environment != "" {
-		parts = append(parts, fmt.Sprintf("**Environment**: `%s`", data.Environment))
 	}
 	if data.Tenant != "" {
 		parts = append(parts, fmt.Sprintf("**Tenant**: `%s`", data.Tenant))
@@ -358,7 +354,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 	}
 }
 
-func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, allowUnsafe bool) {
+func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, allowUnsafe bool, isMySQL bool) {
 	if allowUnsafe {
 		sb.WriteString("**🚨 Unsafe Changes** (`--allow-unsafe` enabled):\n")
 	} else {
@@ -373,20 +369,30 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, allowUn
 		}
 	}
 	sb.WriteString("\n")
-	writeUnsafeDropGuidance(sb, changes)
+	writeUnsafeDropGuidance(sb, changes, isMySQL)
 }
 
-func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData) {
-	usageTarget, ok := unsafeDropUsageTarget(changes)
-	if !ok {
+func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
+	applicationUsageTarget, hasApplicationUsageTarget := unsafeDropApplicationUsageTarget(changes)
+	indexActionTarget, indexInvisibleTarget, indexQueryTarget, hasIndexUsageTarget := unsafeDropIndexUsageTargets(changes)
+	if !hasApplicationUsageTarget && !hasIndexUsageTarget {
 		return
 	}
 
 	sb.WriteString("**Destructive drop guidance:**\n\n")
-	fmt.Fprintf(sb, "Before allowing a destructive drop, first deploy application code that no longer reads from or writes to %s.\n\n", usageTarget)
+	if hasApplicationUsageTarget {
+		fmt.Fprintf(sb, "Before allowing a destructive drop, first deploy application code that no longer reads from or writes to %s.\n\n", applicationUsageTarget)
+	}
+	if hasIndexUsageTarget {
+		if isMySQL {
+			fmt.Fprintf(sb, "Before dropping %s in MySQL, first make %s invisible and verify application queries no longer rely on %s for safe performance.\n\n", indexActionTarget, indexInvisibleTarget, indexQueryTarget)
+		} else {
+			fmt.Fprintf(sb, "Before allowing a destructive drop, verify application queries no longer rely on %s for safe performance.\n\n", indexInvisibleTarget)
+		}
+	}
 }
 
-func unsafeDropUsageTarget(changes []UnsafeChangeData) (string, bool) {
+func unsafeDropApplicationUsageTarget(changes []UnsafeChangeData) (string, bool) {
 	dropColumns := 0
 	dropTables := 0
 	for _, change := range changes {
@@ -422,6 +428,21 @@ func unsafeDropUsageTarget(changes []UnsafeChangeData) (string, bool) {
 	return "", false
 }
 
+func unsafeDropIndexUsageTargets(changes []UnsafeChangeData) (actionTarget, invisibleTarget, queryTarget string, ok bool) {
+	dropIndexes := 0
+	for _, change := range changes {
+		dropIndexes += strings.Count(strings.ToUpper(change.Reason), "DROP INDEX")
+	}
+
+	if dropIndexes == 1 {
+		return "an index", "the dropped index", "it", true
+	}
+	if dropIndexes > 1 {
+		return "indexes", "any dropped indexes", "them", true
+	}
+	return "", "", "", false
+}
+
 func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 	sb.WriteString("\u26a0\ufe0f **Lint Warnings**:\n")
 	for _, w := range warnings {
@@ -452,12 +473,13 @@ func pluralize(singular string, count int) string {
 // MultiEnvPlanCommentData contains data for rendering a multi-environment plan
 // in a single comment. Used when `schemabot plan` is run without `-e`.
 type MultiEnvPlanCommentData struct {
-	Database    string
-	SchemaName  string
-	HeadSHA     string
-	Repository  string
-	IsMySQL     bool
-	RequestedBy string
+	Database     string
+	SchemaName   string
+	HeadSHA      string
+	Repository   string
+	DatabaseType string
+	IsMySQL      bool
+	RequestedBy  string
 
 	// Environments in display order (staging first, production second, etc.)
 	Environments []string
@@ -475,13 +497,9 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	var sb strings.Builder
 
 	// Header
-	dbTypeLabel := "Vitess"
-	if data.IsMySQL {
-		dbTypeLabel = "MySQL"
-	}
-	fmt.Fprintf(&sb, "## %s Schema Change Plan\n\n", dbTypeLabel)
+	sb.WriteString("## Schema Change Plan\n\n")
 
-	writePlanMetadata(&sb, PlanCommentData{Database: data.Database, SchemaName: data.SchemaName})
+	writePlanMetadata(&sb, PlanCommentData{Database: data.Database, SchemaName: data.SchemaName, DatabaseType: data.DatabaseType, IsMySQL: data.IsMySQL})
 	writePlanAttribution(&sb, PlanCommentData{
 		HeadSHA:     data.HeadSHA,
 		Repository:  data.Repository,
@@ -537,6 +555,33 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	return sb.String()
 }
 
+func schemaChangePlanDatabaseTypeLabel(databaseType string, isMySQL bool) string {
+	databaseType = strings.TrimSpace(databaseType)
+	switch databaseType {
+	case storage.DatabaseTypeMySQL:
+		return "MySQL"
+	case storage.DatabaseTypeStrata:
+		return "Strata"
+	case storage.DatabaseTypeVitess:
+		return "Vitess"
+	case "postgres", "postgresql":
+		return "PostgreSQL"
+	}
+	if databaseType != "" {
+		if label := titleDatabaseType(databaseType); label != "" {
+			return label
+		}
+	}
+	if isMySQL {
+		return "MySQL"
+	}
+	return "Vitess"
+}
+
+func titleDatabaseType(databaseType string) string {
+	return titleLabel(databaseType)
+}
+
 // writeEnvironmentPlanSection writes the plan body for a single environment within a multi-env comment.
 func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 	totalStatements, keyspacesWithVSchema := countChanges(plan.Changes)
@@ -552,7 +597,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 
 	// Unsafe changes warning
 	if plan.HasUnsafeChanges && len(plan.UnsafeChanges) > 0 {
-		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.AllowUnsafe)
+		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.AllowUnsafe, plan.IsMySQL)
 	}
 
 	// Lint violations

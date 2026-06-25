@@ -70,7 +70,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewUnsafeAllowed, templates.PreviewLintAll:
 		templates.PreviewCLIOutput(previewType)
 	// Comment template types
-	case templates.PreviewCommentPlan, templates.PreviewCommentPlanEmpty,
+	case templates.PreviewCommentPlan, templates.PreviewCommentPlanTenant,
+		templates.PreviewCommentPlanEmpty,
 		templates.PreviewCommentNoManagedSchema,
 		templates.PreviewCommentReconcileInProgress,
 		templates.PreviewCommentReconcileCompleted,
@@ -80,7 +81,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentMySQLMultiSchema,
 		templates.PreviewCommentHelp, templates.PreviewCommentSupportChannel,
 		templates.PreviewCommentErrors, templates.PreviewCommentUnsafeBlocked,
-		templates.PreviewCommentDropColumnBlocked,
+		templates.PreviewCommentDropColumnBlocked, templates.PreviewCommentDropIndexBlocked,
 		templates.PreviewCommentApplyPlan, templates.PreviewCommentApplyPlanOptions,
 		templates.PreviewCommentApplyPlanUnsafe,
 		templates.PreviewCommentApplyProgress, templates.PreviewCommentApplyCompleted,
@@ -232,6 +233,7 @@ Interactive TUI:
 
 Comment Templates (GitHub PR comments):
   comment_plan                  Plan comment with DDL changes + lint violations
+  comment_plan_tenant           Tenant-targeted plan comment
   comment_plan_empty            Plan comment with no changes
   comment_no_managed_schema     No managed schema changes in current PR
   comment_reconcile_in_progress Empty diff with an in-progress apply
@@ -244,6 +246,7 @@ Comment Templates (GitHub PR comments):
   comment_errors                All error comment templates
   comment_unsafe_blocked        Unsafe changes blocked (no --allow-unsafe)
   comment_drop_column_blocked   Drop column blocked with destructive-drop guidance
+  comment_drop_index_blocked    Drop index blocked with destructive-drop guidance
   comment_single_progress       Single table: running (most common case)
   comment_single_complete       Single table: completed
   comment_single_failed         Single table: failed

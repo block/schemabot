@@ -322,16 +322,15 @@
 // rows copied (~94%), task 2 (8bbc0560, items) completed instantly with no
 // row copy.
 //
-// # VSchema Tasks
+// # VSchema Application
 //
-// VSchema updates are tracked as VSchema tasks in the regular tasks table, not a
-// separate table. They are marked by a synthetic table_name (e.g.
-// "VSchema: <keyspace>") rather than a real table and never appear in
-// SHOW VITESS_MIGRATIONS. Their state follows the deploy request: they transition
-// to running when the deploy reaches in_progress_vschema and complete when it
-// passes, and the overall apply state aggregates them alongside the DDL tasks.
-// This lets a VSchema-only deploy (zero DDLs) still have a task to aggregate and
-// surfaces the in_progress_vschema phase in the progress view.
+// VSchema application is not modeled as a task. Its status and diff ride in the
+// apply's engine resume metadata and are projected onto the progress response's
+// display metadata (vschema_status / vschema_diff), which the CLI and PR comment
+// render as their own VSchema section. The status follows the deploy request:
+// it becomes "applying" when the deploy reaches in_progress_vschema and
+// "applied" when it passes. A VSchema-only deploy (zero DDLs) carries no task
+// rows and is driven to completion by a task-less group finalizer.
 //
 // # Storage
 //
@@ -428,6 +427,12 @@ func formatDeployRequestError(dr *ps.DeployRequest) string {
 	return b.String()
 }
 
+// vschemaKeyspaceDiff is one keyspace's VSchema diff captured at deploy creation.
+type vschemaKeyspaceDiff struct {
+	Namespace string `json:"namespace"`
+	Diff      string `json:"diff"`
+}
+
 // psMetadata holds PlanetScale-specific state stored as JSON in ResumeState.Metadata.
 type psMetadata struct {
 	BranchName       string     `json:"branch_name"`
@@ -445,13 +450,12 @@ type psMetadata struct {
 	// same path branch/deploy-URL/instant use.
 	VSchemaStatus string `json:"vschema_status,omitempty"`
 
-	// VSchemaDiff is the VSchema change rendered as a unified diff, captured at
-	// deploy creation from the plan annotation. It is surfaced through the
-	// display-metadata projection so the progress view can show the VSchema
-	// change alongside its status without a synthetic task row. Empty when the
-	// deploy carries no VSchema change. For a deploy spanning multiple keyspaces
-	// the per-keyspace diffs are concatenated under keyspace headers.
-	VSchemaDiff string `json:"vschema_diff,omitempty"`
+	// VSchemaDiffs holds the per-keyspace VSchema diffs, captured at deploy
+	// creation from the plan annotations and kept separate so each keyspace
+	// renders and tracks independently. Surfaced through the display-metadata
+	// projection alongside the deploy's VSchema status, without a synthetic task
+	// row. Empty when the deploy carries no VSchema change.
+	VSchemaDiffs []vschemaKeyspaceDiff `json:"vschema_diffs,omitempty"`
 
 	// ExistingMigrationCtxs is the set of SHOW VITESS_MIGRATIONS contexts that
 	// already existed just before this deploy started, keyed by context. It is
@@ -833,9 +837,12 @@ func nextVSchemaStatus(current, drState string) string {
 	case deployState.InProgressVSchema:
 		return vschemaStatusApplying
 	case deployState.Complete, deployState.CompletePendingRevert:
-		if current == vschemaStatusApplying {
-			return vschemaStatusApplied
-		}
+		// A completed deploy has applied its VSchema. Mark it applied even when no
+		// poll observed the in-progress VSchema phase (a fast deploy can pass
+		// between polls), so a completed VSchema change never renders as still
+		// "Pending". Harmless when the deploy carries no VSchema change — the
+		// status is only surfaced for keyspaces that have a diff.
+		return vschemaStatusApplied
 	}
 	return current
 }

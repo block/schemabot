@@ -200,9 +200,40 @@ func TestBuildEtreResolverVitess(t *testing.T) {
 	assert.Contains(t, err.Error(), "password_ref")
 }
 
+// Strata is Aurora-backed and reached over the MySQL protocol, so it assembles
+// its connection from the MySQL block exactly as the MySQL engine does. The same
+// host_field validation applies, failing closed at startup when it is missing.
+func TestBuildEtreResolverStrata(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	cfg := EtreConfig{
+		Addr: "https://etre.example", DatabaseType: storage.DatabaseTypeStrata,
+		EntityType: "aurora_cluster", TargetLabel: "dsid", EnvLabel: "env",
+		MySQL:       EtreMySQLConfig{HostField: "writer_endpoint"},
+		Credentials: EtreCredentialsConfig{Username: "ddl", PasswordRef: "env:DDL_PASSWORD"},
+	}
+
+	resolver, err := buildEtreResolver(t.Context(), cfg, logger)
+	require.NoError(t, err)
+	require.NotNil(t, resolver)
+
+	// The assembler must report the Strata engine type — not plain MySQL — or the
+	// resolver's request-type guard would reject "strata" requests and stamp the
+	// resolved target as MySQL, routing it to the wrong data-plane engine.
+	assembler, _, err := etreAssembler(cfg)
+	require.NoError(t, err)
+	assert.Equal(t, storage.DatabaseTypeStrata, assembler.DatabaseType())
+
+	noHost := cfg
+	noHost.MySQL.HostField = ""
+	_, err = buildEtreResolver(t.Context(), noHost, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "host_field")
+	assert.Contains(t, err.Error(), storage.DatabaseTypeStrata)
+}
+
 // An unsupported database_type fails closed at startup rather than silently
-// resolving as MySQL, so adding an engine (postgres, strata) is a deliberate
-// change at the assembler-selection site.
+// resolving as MySQL, so adding an engine (postgres) is a deliberate change at
+// the assembler-selection site.
 func TestBuildEtreResolverRejectsUnsupportedEngine(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	cfg := EtreConfig{

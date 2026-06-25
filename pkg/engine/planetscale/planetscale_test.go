@@ -434,7 +434,7 @@ func TestNextVSchemaStatus(t *testing.T) {
 		{"stays applying mid-phase", vschemaStatusApplying, deployState.InProgressVSchema, vschemaStatusApplying},
 		{"applied on complete after phase", vschemaStatusApplying, deployState.Complete, vschemaStatusApplied},
 		{"applied on complete_pending_revert after phase", vschemaStatusApplying, deployState.CompletePendingRevert, vschemaStatusApplied},
-		{"complete without prior phase stays empty", "", deployState.Complete, ""},
+		{"applied on complete without observed phase", "", deployState.Complete, vschemaStatusApplied},
 		{"unrelated state leaves applying untouched", vschemaStatusApplying, deployState.InProgress, vschemaStatusApplying},
 		{"unrelated state leaves empty untouched", "", deployState.Queued, ""},
 		{"already applied is stable on complete", vschemaStatusApplied, deployState.Complete, vschemaStatusApplied},

@@ -42,7 +42,7 @@ func TestRenderMultiDeploymentApplyComment_BarrierInProgress(t *testing.T) {
 	})
 
 	assert.Contains(t, out, "## Schema Change In Progress")
-	assert.Contains(t, out, "**Environment**: `production`")
+	assert.Contains(t, out, "— Production")
 	assert.Contains(t, out, "**Apply ID**: `apply-123`")
 	assert.Contains(t, out, "_Last updated: <relative-time datetime=\"2026-06-16T19:43:00Z\">2026-06-16 19:43:00 UTC</relative-time> (2026-06-16 19:43:00 UTC)_")
 	assert.NotContains(t, out, "**Last updated**")
@@ -130,6 +130,28 @@ func TestRenderMultiDeploymentApplyComment_UsesOneRenderTimestamp(t *testing.T) 
 	assert.Contains(t, out, "*Applied by @aparajon at 2026-06-16 19:43:00 UTC*")
 	assert.Contains(t, out, "<relative-time datetime=\"2026-06-16T19:43:00Z\">2026-06-16 19:43:00 UTC</relative-time>")
 	assert.NotContains(t, out, "2026-06-16 19:43:01 UTC")
+}
+
+// The aggregate comment uses the apply start time for no-requester attribution
+// while keeping its own last-updated footer anchored to the render timestamp.
+func TestRenderMultiDeploymentApplyComment_StartedAtUsesApplyStart(t *testing.T) {
+	original := TimestampFunc
+	TimestampFunc = func() string { return "2026-06-16 20:00:00 UTC" }
+	t.Cleanup(func() { TimestampFunc = original })
+
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("us", so.Running),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		StartedAt:   "2026-06-16T19:42:00Z",
+	})
+
+	assert.Contains(t, out, "*Started at 2026-06-16 19:42:00 UTC*")
+	assert.Contains(t, out, "<relative-time datetime=\"2026-06-16T20:00:00Z\">2026-06-16 20:00:00 UTC</relative-time>")
+	assert.NotContains(t, out, "*Started at 2026-06-16 20:00:00 UTC*")
 }
 
 // firstFailingOp builds a rolling, continue-policy operation carrying an error,

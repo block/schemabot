@@ -849,7 +849,11 @@ type Task struct {
 	RowsTotal       int64 // Total rows to copy
 	ProgressPercent int   // 0-100
 	ETASeconds      int   // Estimated seconds remaining
-	CutoverAttempts int   // Number of cutover attempts for this shard
+	// Checksum phase progress: rows verified so far and total to verify.
+	// Non-zero only while the task is checksumming (verifying copied data).
+	ChecksumRowsChecked int64
+	ChecksumRowsTotal   int64
+	CutoverAttempts     int // Number of cutover attempts for this shard
 
 	// Execution flags
 	IsInstant         bool   // True if INSTANT DDL (no copy needed)

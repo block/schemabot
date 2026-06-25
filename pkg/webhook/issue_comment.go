@@ -126,6 +126,14 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		})
 		return
 	}
+	if result.Tenant == "" && commandRequiresTenantTarget(result) && h.service != nil && h.service.Config().Tenant != "" {
+		h.logger.Info("ignoring work command without tenant target",
+			"repo", repo, "pr", pr, "tenant", h.service.Config().Tenant, "action", result.Action)
+		h.writeJSON(w, http.StatusOK, map[string]string{
+			"message": "tenant target required",
+		})
+		return
+	}
 
 	// Handle help command
 	if result.IsHelp {
@@ -307,6 +315,10 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		h.postComment(repo, pr, installationID, templates.RenderInvalidCommand())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "invalid command"})
 	}
+}
+
+func commandRequiresTenantTarget(result CommandResult) bool {
+	return !result.IsHelp && (result.Found || result.MissingEnv)
 }
 
 // postComment posts a comment on a PR.

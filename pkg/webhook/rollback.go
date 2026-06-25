@@ -198,11 +198,12 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	// auditability, but rollback-confirm loads the lock-pinned rollback plan so
 	// the user does not need to repeat the apply ID.
 	commentData := templates.PlanCommentData{
-		Database:    database,
-		Environment: environment,
-		RequestedBy: requestedBy,
-		IsMySQL:     dbType == "mysql",
-		ApplyID:     apply.ApplyIdentifier,
+		Database:     database,
+		Environment:  environment,
+		RequestedBy:  requestedBy,
+		DatabaseType: dbType,
+		IsMySQL:      dbType == "mysql",
+		ApplyID:      apply.ApplyIdentifier,
 	}
 
 	for _, sc := range planResp.Changes {
@@ -471,8 +472,10 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 		return
 	}
 
-	// Post initial progress comment for the observer to edit.
-	progressBody := formatProgressComment(apply, nil)
+	// Post initial progress comment for the observer to edit. VSchema status is
+	// omitted on this first comment — the observer refreshes it from engine
+	// display metadata on the next progress tick.
+	progressBody := formatProgressComment(apply, nil, nil)
 	h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, progressBody)
 }
 

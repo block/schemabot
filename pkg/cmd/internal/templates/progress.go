@@ -2,12 +2,14 @@ package templates
 
 import (
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/block/spirit/pkg/statement"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -112,9 +114,6 @@ func WriteProgress(data ProgressData) {
 		}
 	}
 	if data.Metadata != nil {
-		if branch := data.Metadata["branch_name"]; branch != "" {
-			rows = append(rows, BoxRow{"Branch", branch})
-		}
 		if url := data.Metadata["deploy_request_url"]; url != "" {
 			rows = append(rows, BoxRow{"Deploy Request", url})
 		}
@@ -195,12 +194,12 @@ func WriteProgress(data ProgressData) {
 		}
 	}
 
-	// Surface VSchema application status (and diff) from the engine's display
-	// metadata, rather than from a synthetic task in the table list.
-	if data.Metadata != nil {
-		if vs := FormatVSchemaStatus(data.Metadata["vschema_status"], data.Metadata["vschema_diff"]); vs != "" {
-			fmt.Print(vs)
-		}
+	// Surface per-keyspace VSchema application status (and diff) from the engine's
+	// display metadata, rather than from a synthetic task in the table list.
+	if changes, err := apitypes.ParseVSchemaChanges(data.Metadata); err != nil {
+		slog.Warn("failed to parse VSchema changes from progress metadata", "error", err)
+	} else if vs := FormatVSchemaStatus(changes); vs != "" {
+		fmt.Print(vs)
 	}
 
 	// Show deploy request info for deferred deploys
@@ -251,14 +250,6 @@ func FormatNamespacedTablesWithActivity(tables []TableProgress, activityBar, act
 		ns := t.Namespace
 		if ns == "" {
 			ns = "(default)"
-		}
-		// Strip namespace prefix from VSchema task names (e.g., "VSchema: myapp_sharded" -> "VSchema")
-		// since the keyspace header already provides context.
-		if strings.HasPrefix(t.TableName, "vschema:") || strings.HasPrefix(t.TableName, "VSchema:") {
-			parts := strings.SplitN(t.TableName, ": ", 2)
-			if len(parts) == 2 {
-				t.TableName = "VSchema"
-			}
 		}
 		if idx, ok := nsIndex[ns]; ok {
 			ordered[idx].tables = append(ordered[idx].tables, t)
@@ -321,36 +312,23 @@ func FormatNamespacedTablesWithActivity(tables []TableProgress, activityBar, act
 	return b.String()
 }
 
-// FormatVSchemaStatus renders the VSchema-application status and diff surfaced
-// on a progress response's display metadata (vschema_status / vschema_diff).
-// Returns empty when the deploy carries no VSchema change. The diff field is a
-// VSchema diff (not SQL), rendered with diff coloring via colorizeDiffLine.
-func FormatVSchemaStatus(status, diff string) string {
-	if status == "" && diff == "" {
+// FormatVSchemaStatus renders each keyspace's VSchema-application status and
+// diff surfaced on a progress response's display metadata. Returns empty when
+// the apply carries no VSchema change. A keyspace's diff is a VSchema diff (not
+// SQL), rendered with diff coloring via colorizeDiffLine.
+func FormatVSchemaStatus(changes []apitypes.VSchemaChange) string {
+	if len(changes) == 0 {
 		return ""
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "    ~ VSchema: %s\n", vschemaMetadataStatusLabel(status))
-	if diff != "" {
-		b.WriteString(FormatVSchemaDiff(diff, indentContent))
+	for _, c := range changes {
+		fmt.Fprintf(&b, "    ~ VSchema (%s): %s\n", c.Namespace, ui.VSchemaStatusLabel(c.Status))
+		if c.Diff != "" {
+			b.WriteString(FormatVSchemaDiff(c.Diff, indentContent))
+		}
 	}
 	b.WriteString("\n")
 	return b.String()
-}
-
-// vschemaMetadataStatusLabel maps the engine's vschema_status display value to a
-// human label.
-func vschemaMetadataStatusLabel(status string) string {
-	switch status {
-	case "applying":
-		return "Applying..."
-	case "applied":
-		return "Applied"
-	case "":
-		return "Pending"
-	default:
-		return status
-	}
 }
 
 // FormatVSchemaDiff returns a VSchema diff with colorized +/- lines as a string,
@@ -473,6 +451,27 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s\n", t.TableName, bar, label)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		b.WriteString("\n")
+		b.WriteString(FormatShardProgress(t.Shards))
+		return b.String()
+	case state.Task.Checksumming:
+		// Row copy is done; the engine is verifying the copied data against the
+		// source. On a large table this can run for hours, so show how far the
+		// verify has progressed once Spirit has reported a total.
+		if t.ChecksumRowsTotal > 0 {
+			pct := ui.ClampPercent(int(t.ChecksumRowsChecked * 100 / t.ChecksumRowsTotal))
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data (%d%%)\n", t.TableName, ui.ProgressBarRowCopy(pct), pct)
+			if t.DDL != "" {
+				b.WriteString(formatProgressDDL(t.DDL))
+			}
+			fmt.Fprintf(&b, indentDetail+"Rows verified: %s / %s\n",
+				ui.FormatNumber(ui.ClampRows(t.ChecksumRowsChecked, t.ChecksumRowsTotal)), ui.FormatNumber(t.ChecksumRowsTotal))
+		} else {
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data...\n", t.TableName, ui.ProgressBarRowCopy(100))
+			if t.DDL != "" {
+				b.WriteString(formatProgressDDL(t.DDL))
+			}
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -607,12 +606,9 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			if t.DDL != "" {
 				b.WriteString(formatProgressDDL(t.DDL))
 			}
-			// Rows and ETA on same line
-			if info.ETA != "" && info.ETA != "TBD" {
-				fmt.Fprintf(&b, indentDetail+"Rows: %s / %s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(info.RowsCopied, info.RowsTotal)), ui.FormatNumber(info.RowsTotal), info.ETA)
-			} else {
-				fmt.Fprintf(&b, indentDetail+"Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(info.RowsCopied, info.RowsTotal)), ui.FormatNumber(info.RowsTotal))
-			}
+			// Rows and ETA on the same line, rendered from the structured ETA
+			// so the CLI and PR comment show the same value via FormatETA.
+			writeStructuredRowsAndETA(&b, t)
 			if info.State != "" && info.State != "copyRows" {
 				fmt.Fprintf(&b, indentDetail+"Status: %s\n", info.State)
 			}

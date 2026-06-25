@@ -33,11 +33,43 @@ func TestTableStatePriority(t *testing.T) {
 	}
 }
 
+func TestVSchemaStatusLabel(t *testing.T) {
+	assert.Equal(t, "Applying...", VSchemaStatusLabel("applying"))
+	assert.Equal(t, "Applied", VSchemaStatusLabel("applied"))
+	assert.Equal(t, "Pending", VSchemaStatusLabel(""))
+	assert.Equal(t, "rolling_back", VSchemaStatusLabel("rolling_back"), "unknown status passes through")
+}
+
 func TestProgressBarActivity(t *testing.T) {
 	bar := ProgressBarActivity()
 
 	assert.Equal(t, 20, strings.Count(bar, ColorBlue))
 	assert.Zero(t, strings.Count(bar, ColorEmpty))
+}
+
+func TestFormatETA(t *testing.T) {
+	tests := []struct {
+		name    string
+		seconds int64
+		want    string
+	}{
+		{"zero", 0, "0s"},
+		{"sub-minute", 45, "45s"},
+		{"exactly a minute", 60, "1m 0s"},
+		{"minutes and seconds", 195, "3m 15s"},
+		{"exactly an hour", 3600, "1h 0m"},
+		{"hours and minutes", 3700, "1h 1m"},
+		{"just under a day", 86399, "23h 59m"},
+		{"exactly a day", 86400, "1d 0h"},
+		{"days and hours", 180000, "2d 2h"},
+		{"multi-week copy", 1814400, "21d 0h"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, FormatETA(tt.seconds))
+		})
+	}
 }
 
 func TestRowCopyDisplayPercent(t *testing.T) {

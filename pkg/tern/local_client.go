@@ -2066,6 +2066,8 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		tp.PercentComplete = int32(t.ProgressPercent)
 		tp.RowsCopied = t.RowsCopied
 		tp.RowsTotal = t.RowsTotal
+		tp.ChecksumRowsChecked = t.ChecksumRowsChecked
+		tp.ChecksumRowsTotal = t.ChecksumRowsTotal
 		// Clamp to 100% only for successfully completed tasks — Vitess row
 		// counts can lag slightly due to concurrent inserts during copy.
 		if state.IsState(t.State, state.Task.Completed) && t.RowsTotal > 0 {
@@ -2380,12 +2382,17 @@ func activeTaskProgressRank(taskState string) (int, bool) {
 		return 1, true
 	case state.Task.Running:
 		return 2, true
-	case state.Task.WaitingForCutover:
+	case state.Task.Checksumming:
+		// Row copy is done; the engine is verifying the copied data. Ranks after
+		// Running and before WaitingForCutover — the phase the table moves through
+		// next — so a later poll never regresses a checksumming table to Running.
 		return 3, true
-	case state.Task.CuttingOver:
+	case state.Task.WaitingForCutover:
 		return 4, true
-	case state.Task.RevertWindow:
+	case state.Task.CuttingOver:
 		return 5, true
+	case state.Task.RevertWindow:
+		return 6, true
 	default:
 		return 0, false
 	}

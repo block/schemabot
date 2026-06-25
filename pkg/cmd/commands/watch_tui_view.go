@@ -284,8 +284,9 @@ func recoveringCopyPercent(tables []tableProgress) (int, bool) {
 func toTemplateTables(tables []tableProgress) []templates.TableProgress {
 	result := make([]templates.TableProgress, len(tables))
 	for i, t := range tables {
-		// Derive table-level ETA from max shard ETA for Vitess tables
-		var etaSeconds int64
+		// Table-level ETA: the table's own estimate (MySQL/Spirit), or the
+		// slowest shard's for a sharded (Vitess) table.
+		etaSeconds := t.ETASeconds
 		for _, sh := range t.Shards {
 			if sh.ETASeconds > etaSeconds {
 				etaSeconds = sh.ETASeconds

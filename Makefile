@@ -20,6 +20,7 @@ else
 endif
 E2E_TEST_TIMEOUT ?= 10m
 E2E_TEST_FLAGS ?=
+E2E_GRPC_MD_RUN ?= TestGRPCMultiDeploy
 
 .PHONY: help lint lint-fix setup test test-unit test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
 
@@ -446,7 +447,7 @@ test-e2e-grpc-multideploy: build ## Run multi-deployment fan-out gRPC e2e fixtur
 	E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:15371)/schemabot" \
 	E2E_TERN_EU_MYSQL_DSN="root:testpassword@tcp(localhost:15372)/testapp" \
 	E2E_TERN_US_MYSQL_DSN="root:testpassword@tcp(localhost:15373)/testapp" \
-	$(GOTEST) -count=1 -v -tags=e2e -timeout=10m -run TestGRPCMultiDeploy ./e2e/grpc/... ; \
+	$(GOTEST) -count=1 -v -tags=e2e -timeout=10m -run '$(E2E_GRPC_MD_RUN)' ./e2e/grpc/... ; \
 	TEST_EXIT_CODE=$$?; \
 	echo "Tearing down multi-deployment gRPC e2e environment..."; \
 	$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml down -v; \

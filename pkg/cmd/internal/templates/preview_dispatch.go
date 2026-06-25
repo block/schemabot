@@ -111,6 +111,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 	// Comment template previews
 	case PreviewCommentPlan:
 		fmt.Print(webhooktemplates.PreviewCommentPlan())
+	case PreviewCommentPlanTenant:
+		fmt.Print(webhooktemplates.PreviewCommentPlanTenant())
 	case PreviewCommentPlanEmpty:
 		fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges())
 	case PreviewCommentNoManagedSchema:
@@ -141,6 +143,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentUnsafeBlocked())
 	case PreviewCommentDropColumnBlocked:
 		fmt.Print(webhooktemplates.PreviewCommentDropColumnBlocked())
+	case PreviewCommentDropIndexBlocked:
+		fmt.Print(webhooktemplates.PreviewCommentDropIndexBlocked())
 	case PreviewCommentApplyPlan:
 		fmt.Print(webhooktemplates.PreviewCommentApplyPlan())
 	case PreviewCommentApplyPlanOptions:

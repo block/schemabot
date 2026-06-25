@@ -280,6 +280,7 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 	// both comment renders below, so the terminal path reads apply_operations a
 	// single time per callback.
 	ops, opsErr := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
+	shardsByTable := o.shardsByTable(ctx, apply, ops)
 
 	if activeCommentState == state.Comment.Cutover {
 		// The cutover comment IS the completion comment, so editing it to the
@@ -289,7 +290,7 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		// aggregate CAS-winner observer re-edits it with the full task set. The
 		// summary marker is always upserted so FindMissingSummaryComment (outbox
 		// query) doesn't false-positive on restart for cutover applies.
-		finalBody := o.summaryCommentFromOps(apply, ops, opsErr, tasks)
+		finalBody := o.summaryCommentFromOps(apply, ops, opsErr, tasks, shardsByTable)
 		o.editTrackedComment(apply, activeCommentState, finalBody)
 		o.markSummaryPosted(apply, activeCommentState)
 	} else {
@@ -297,7 +298,7 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		// This is the per-operation status freeze, not the apply-level summary, so
 		// it always runs; the aggregate publisher re-edits it with the full task
 		// set for multi-operation applies.
-		finalBody := o.statusCommentFromOps(apply, ops, opsErr, tasks)
+		finalBody := o.statusCommentFromOps(apply, ops, opsErr, tasks, shardsByTable)
 		o.editTrackedComment(apply, activeCommentState, finalBody)
 
 		// Post a separate summary comment. A new comment is more reliable than
@@ -309,7 +310,7 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		// so a per-driver observer holding one operation's task slice must defer
 		// to it rather than post a duplicate, partial summary.
 		if o.shouldPublishSeparateSummary(apply, ops, opsErr) {
-			summaryBody := o.summaryCommentFromOps(apply, ops, opsErr, tasks)
+			summaryBody := o.summaryCommentFromOps(apply, ops, opsErr, tasks, shardsByTable)
 			o.postAndTrackComment(apply, state.Comment.Summary, summaryBody)
 		}
 	}
@@ -364,20 +365,60 @@ func (o *CommentObserver) formatStatusComment(apply *storage.Apply, tasks []*sto
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	ops, err := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
-	return o.statusCommentFromOps(apply, ops, err, tasks)
+	return o.statusCommentFromOps(apply, ops, err, tasks, o.shardsByTable(ctx, apply, ops))
+}
+
+// shardsByTable loads an apply's per-shard detail rows and groups them by table
+// for the compact per-shard summary in the PR comment. Only sharded engines
+// write these rows; MySQL never does, so it is skipped and any other engine is
+// queried, returning an empty map (and so no shard summary) when an apply has no
+// shard rows. Best-effort: a failed load for one operation just omits its shards
+// from this render rather than failing the comment.
+func (o *CommentObserver) shardsByTable(ctx context.Context, apply *storage.Apply, ops []*storage.ApplyOperation) map[string][]*storage.Task {
+	if apply == nil || apply.DatabaseType == storage.DatabaseTypeMySQL {
+		return nil
+	}
+	byTable := map[string][]*storage.Task{}
+	for _, op := range ops {
+		if err := ctx.Err(); err != nil {
+			o.logError(apply, "comment per-shard summary will omit remaining operations' shards: context done", "error", err)
+			break
+		}
+		opID := op.ID
+		shardTasks, err := o.stor.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
+		if err != nil {
+			o.logError(apply, "comment per-shard summary will omit an operation's shards: failed to load shard rows", "apply_operation_id", opID, "error", err)
+			continue
+		}
+		for _, st := range shardTasks {
+			key := shardCommentTableKey(&opID, st.Namespace, st.TableName)
+			byTable[key] = append(byTable[key], st)
+		}
+	}
+	return byTable
 }
 
 // statusCommentFromOps renders the status comment from already-loaded operation
 // rows, applying the same single-deployment fallback as formatStatusComment when
 // the load failed. Callers that already hold the operation set (e.g. OnTerminal)
 // use this to avoid re-reading apply_operations.
-func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task) string {
+func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
 	if opsErr != nil {
 		o.logger.Error("observer: failed to load apply operations for comment dispatch; rendering single-deployment layout",
 			"apply_id", o.applyID, "error", opsErr)
-		return formatProgressComment(apply, tasks)
+		return formatProgressComment(apply, tasks, shardsByTable)
 	}
-	return formatApplyStatusComment(apply, ops, tasks)
+	return formatApplyStatusComment(apply, ops, tasks, o.resolveDisplay(apply, ops), shardsByTable)
+}
+
+// resolveDisplay projects the apply's per-operation engine display state (VSchema
+// status + deploy-request URL) for comment rendering. It uses a short, independent
+// deadline so a slow storage read degrades to a comment without these fields
+// rather than blocking the update.
+func (o *CommentObserver) resolveDisplay(apply *storage.Apply, ops []*storage.ApplyOperation) map[int64]operationDisplay {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return resolveDisplayByOperation(ctx, o.stor, apply, ops)
 }
 
 // formatTerminalSummaryComment renders the apply's terminal summary comment,
@@ -388,11 +429,11 @@ func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*stor
 // single-deployment summary byte-for-byte. A load failure falls back to the
 // single-deployment summary so a transient storage error never blocks the
 // terminal comment.
-func (o *CommentObserver) formatTerminalSummaryComment(apply *storage.Apply, tasks []*storage.Task) string {
+func (o *CommentObserver) formatTerminalSummaryComment(apply *storage.Apply) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	ops, err := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
-	return o.summaryCommentFromOps(apply, ops, err, tasks)
+	return o.summaryCommentFromOps(apply, ops, err, nil, o.shardsByTable(ctx, apply, ops))
 }
 
 // summaryCommentFromOps renders the terminal summary from already-loaded
@@ -400,13 +441,13 @@ func (o *CommentObserver) formatTerminalSummaryComment(apply *storage.Apply, tas
 // formatTerminalSummaryComment when the load failed. Callers that already hold
 // the operation set (e.g. OnTerminal) use this to avoid re-reading
 // apply_operations.
-func (o *CommentObserver) summaryCommentFromOps(apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task) string {
+func (o *CommentObserver) summaryCommentFromOps(apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
 	if opsErr != nil {
 		o.logger.Error("observer: failed to load apply operations for summary comment dispatch; rendering single-deployment layout",
 			"apply_id", o.applyID, "error", opsErr)
-		return formatSummaryComment(apply, tasks)
+		return formatSummaryComment(apply, tasks, shardsByTable)
 	}
-	return formatApplySummaryComment(apply, ops, tasks)
+	return formatApplySummaryComment(apply, ops, tasks, o.resolveDisplay(apply, ops), shardsByTable)
 }
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {

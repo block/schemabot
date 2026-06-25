@@ -333,6 +333,8 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				task.RowsTotal = tp.RowsTotal
 				task.ProgressPercent = tp.Progress
 				task.ETASeconds = int(tp.ETASeconds)
+				task.ChecksumRowsChecked = tp.ChecksumRowsChecked
+				task.ChecksumRowsTotal = tp.ChecksumRowsTotal
 				task.IsInstant = tp.IsInstant
 			}
 

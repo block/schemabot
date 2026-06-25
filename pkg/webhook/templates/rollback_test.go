@@ -26,10 +26,11 @@ func TestRenderRollbackPlanComment_WithChanges(t *testing.T) {
 	}
 
 	rendered := RenderRollbackPlanComment(data)
-	assert.Contains(t, rendered, "## MySQL Schema Rollback Plan")
+	assert.Contains(t, rendered, "## Schema Rollback Plan — Staging")
+	assert.Contains(t, rendered, "**Type**: `MySQL`")
 	assert.Contains(t, rendered, "@testuser")
 	assert.Contains(t, rendered, "`testapp`")
-	assert.Contains(t, rendered, "`staging`")
+	assert.Contains(t, rendered, "— Staging")
 	assert.Contains(t, rendered, "DROP INDEX")
 	assert.Contains(t, rendered, "DROP COLUMN")
 	assert.Contains(t, rendered, "destructive changes")
@@ -48,7 +49,7 @@ func TestRenderRollbackPlanComment_NoChanges(t *testing.T) {
 	}
 
 	rendered := RenderRollbackPlanComment(data)
-	assert.Contains(t, rendered, "## MySQL Schema Rollback Plan")
+	assert.Contains(t, rendered, "## Schema Rollback Plan")
 	assert.Contains(t, rendered, "already matches the original schema")
 	assert.NotContains(t, rendered, "schemabot rollback-confirm")
 }
@@ -69,9 +70,31 @@ func TestRenderRollbackPlanComment_Vitess(t *testing.T) {
 	}
 
 	rendered := RenderRollbackPlanComment(data)
-	assert.Contains(t, rendered, "## Vitess Schema Rollback Plan")
+	assert.Contains(t, rendered, "## Schema Rollback Plan")
+	assert.Contains(t, rendered, "**Type**: `Vitess`")
 	assert.Contains(t, rendered, "schemabot rollback-confirm -e staging")
 	assert.NotContains(t, rendered, "schemabot rollback-confirm -e staging -d")
+}
+
+func TestRenderRollbackPlanComment_CustomDatabaseTypeHeader(t *testing.T) {
+	data := PlanCommentData{
+		Database:     "myks",
+		Environment:  "staging",
+		RequestedBy:  "admin",
+		DatabaseType: "custom-engine",
+		ApplyID:      "apply_abc123",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace:   "myks",
+				Statements: []string{"ALTER TABLE `t1` DROP INDEX `idx_foo`"},
+			},
+		},
+	}
+
+	rendered := RenderRollbackPlanComment(data)
+	assert.Contains(t, rendered, "## Schema Rollback Plan")
+	assert.Contains(t, rendered, "**Type**: `Custom Engine`")
+	assert.Contains(t, rendered, "schemabot rollback-confirm -e staging")
 }
 
 func TestRenderRollbackPlanComment_WithLintViolations(t *testing.T) {

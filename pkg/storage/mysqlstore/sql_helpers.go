@@ -1,7 +1,21 @@
 // sql_helpers.go provides shared utilities for MySQL store implementations.
 package mysqlstore
 
-import "database/sql"
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"log/slog"
+)
+
+// rollbackTx rolls back tx, logging a warning if the rollback fails for a
+// reason other than the transaction already being finished. operation is
+// included in the log to identify the originating call site.
+func rollbackTx(ctx context.Context, tx *sql.Tx, operation string) {
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		slog.WarnContext(ctx, "failed to roll back transaction", "operation", operation, "error", err)
+	}
+}
 
 // scanner is implemented by both *sql.Row and *sql.Rows.
 // Used by scan helpers to work with both single-row and multi-row queries.

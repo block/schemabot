@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 
 	"github.com/block/schemabot/pkg/state"
@@ -22,10 +21,6 @@ import (
 const applyOperationColumns = `id, apply_id, deployment, operation_key, operation_kind, target, state, error_message,
 	cutover_policy, on_failure, attempt, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
 	engine_resume_context, engine_resume_metadata, created_at, updated_at`
-
-// mysqlErrDupEntry is MySQL's error number for a duplicate-key violation.
-// Used to translate unique-index conflicts into typed storage errors.
-const mysqlErrDupEntry = 1062
 
 // applyOperationStore implements storage.ApplyOperationStore using MySQL.
 type applyOperationStore struct {
@@ -88,8 +83,7 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 		ad.StartedAt, ad.CompletedAt, nullString(ad.EngineResumeContext), nullString(ad.EngineResumeMetadata),
 	)
 	if err != nil {
-		var mysqlErr *mysql.MySQLError
-		if errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlErrDupEntry {
+		if isDuplicateKeyError(err) {
 			return 0, storage.ErrApplyOperationExists
 		}
 		return 0, fmt.Errorf("insert apply_operations (apply=%d, deployment=%s, operation_key=%s): %w", ad.ApplyID, ad.Deployment, ad.OperationKey, err)
@@ -584,7 +578,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	if err != nil {
 		return nil, fmt.Errorf("begin claim apply_operation transaction: %w", err)
 	}
-	defer rollbackApplyTx(ctx, tx, "claim apply_operation")
+	defer rollbackTx(ctx, tx, "claim apply_operation")
 
 	activeStates := claimableApplyStates()
 	activeStatePlaceholders := placeholders(len(activeStates))
@@ -1011,7 +1005,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	if err != nil {
 		return nil, fmt.Errorf("begin claim apply_operation cutover transaction: %w", err)
 	}
-	defer rollbackApplyTx(ctx, tx, "claim apply_operation cutover")
+	defer rollbackTx(ctx, tx, "claim apply_operation cutover")
 
 	// Eligibility gate (the three leading conditions in the SQL below). The
 	// cutover worker may only claim operations it is actually responsible for
@@ -1207,14 +1201,8 @@ func (s *applyOperationStore) DeleteByApply(ctx context.Context, applyID int64) 
 	if err != nil {
 		return fmt.Errorf("delete apply_operations for apply %d: %w", applyID, err)
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("read deleted apply_operations rows affected for apply %d: %w", applyID, err)
-	}
-	if rows == 0 {
-		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
-			return err
-		}
+	if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "deleted apply_operations", fmt.Sprintf("apply %d", applyID)); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1302,17 +1290,9 @@ func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, app
 	if err != nil {
 		return 0, fmt.Errorf("stop pending apply_operations for apply %d: %w", applyID, err)
 	}
-	rows, err := result.RowsAffected()
+	rows, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "stopped pending apply_operations", fmt.Sprintf("apply %d", applyID))
 	if err != nil {
-		return 0, fmt.Errorf("read stopped pending apply_operations rows affected for apply %d: %w", applyID, err)
-	}
-	if rows == 0 {
-		// No pending rows changed: either there were none (lease still valid, a
-		// legitimate no-op) or the lease token no longer matches (ownership lost).
-		// Distinguish the two so a displaced driver fails closed.
-		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
-			return 0, err
-		}
+		return 0, err
 	}
 	return rows, nil
 }

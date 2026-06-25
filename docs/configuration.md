@@ -600,6 +600,13 @@ the webhook delivery and skip it without adding reactions or comments, the same
 way an environment-scoped deployment skips commands for environments outside
 `allowed_environments`.
 
+When `tenant` is set, work commands must include a matching `--tenant` or `-t`
+target. Untargeted commands such as `schemabot plan -e production` and
+`schemabot apply -e production` are accepted without a PR response by the
+tenant-scoped deployment. This keeps multiple isolated deployments from acting
+on the same PR command. Deployments without `tenant` configured keep the
+existing behavior and do not require the flag.
+
 This routing identity is deliberately local to the server process. It is not
 stored on plans or applies and it does not change database target resolution.
 The isolated deployment's own storage, chart values, GitHub App configuration,
@@ -616,10 +623,10 @@ others. Operators can still direct help to a specific deployment with
 
 - **Environment scoping:** When `allowed_environments` is set, the instance only processes commands targeting those environments. Commands for other environments (e.g., `schemabot apply -e production` sent to the staging instance) are accepted without a PR response by this deployment. A deployment that allows the requested environment must process its own webhook delivery.
 
-- **Tenant scoping:** When `tenant` is set and a command includes `--tenant`,
-  only the matching deployment processes the command. Tenant scoping is a
-  webhook ownership filter, not a schema-change state field; untargeted commands
-  continue through the existing environment and unscoped-command routing.
+- **Tenant scoping:** When `tenant` is set, work commands must include a matching
+  `--tenant` or `-t` target. Tenant scoping is a webhook ownership filter, not a
+  schema-change state field; untargeted help and invalid-command responses
+  continue through the unscoped-command routing.
 
 - **Per-environment aggregate checks:** Each instance creates its own aggregate check run scoped to its environments (e.g., `SchemaBot (staging)`, `SchemaBot (production)`) instead of the default `SchemaBot` aggregate. Configure branch protection to require both aggregates. Set `github.check-name` when independent SchemaBot gates need distinct visible names; every instance in the same promotion chain should use the same base name.
 
@@ -629,7 +636,7 @@ others. Operators can still direct help to a specific deployment with
 
 - **Separate GitHub Apps:** Each instance needs its own GitHub App installation. Both Apps must be installed on the same repositories and configured to receive the same webhook events. GitHub delivers webhooks to all installed Apps independently.
 
-- **Unscoped command routing:** With two Apps on the same repo, commands not scoped to an environment (`help`, invalid commands) would get duplicate responses. Set `respond_to_unscoped: false` on the staging instance so only the production instance responds to these. Environment-scoped commands (`plan -e`, `apply -e`) are unaffected — they're already routed by `allowed_environments`.
+- **Unscoped command routing:** With two Apps on the same repo, commands not scoped to an environment or tenant (`help`, invalid commands) would get duplicate responses. Set `respond_to_unscoped: false` on one instance so only the designated instance responds to these. Work commands (`plan -e`, `apply -e`) must include `--tenant` or `-t` when the deployment has `tenant` configured.
 
 - **Backwards compatible:** When `allowed_environments` is not set or empty, the instance handles all environments and creates a single `SchemaBot` aggregate check — the same behavior as a single-instance deployment.
 

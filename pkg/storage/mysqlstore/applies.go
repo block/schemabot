@@ -142,12 +142,6 @@ func nonTerminalApplyStatePredicate(column string) (string, []any) {
 	return fmt.Sprintf("%s NOT IN (%s)", column, placeholders(len(terminalStates))), stringArgs(terminalStates)
 }
 
-func rollbackApplyTx(ctx context.Context, tx *sql.Tx, operation string) {
-	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-		slog.WarnContext(ctx, "failed to roll back apply transaction", "operation", operation, "error", err)
-	}
-}
-
 func beginApplyWriteTx(ctx context.Context, beginner txBeginner, operation string) (*applyWriteTx, error) {
 	tx, err := beginner.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if err != nil {
@@ -178,7 +172,7 @@ func (w *applyWriteTx) close(ctx context.Context, operation string) {
 		return
 	}
 	if w.tx != nil {
-		rollbackApplyTx(ctx, w.tx, operation)
+		rollbackTx(ctx, w.tx, operation)
 	}
 	if w.targetLockConn != nil {
 		releaseApplyTargetLockConn(ctx, w.targetLockConn, w.targetLockName, operation)
@@ -413,6 +407,27 @@ func ensureApplyLeaseStillOwned(ctx context.Context, db queryRower, lease storag
 		return fmt.Errorf("apply lease for apply %d is no longer current: %w", lease.ApplyID, storage.ErrApplyLeaseLost)
 	}
 	return nil
+}
+
+// confirmLeaseOnZeroRows fails closed when a lease-scoped write changed no rows.
+// Zero rows is ambiguous: either a legitimate idempotent no-op (the lease is
+// still valid) or the lease token no longer matches because ownership was lost.
+// It reloads the lease to distinguish the two so a displaced driver returns
+// ErrApplyLeaseLost instead of silently treating a lost lease as a no-op. desc
+// names the write and target identifies the row(s) in the rows-affected error
+// ("read <desc> rows affected for <target>"). The affected row count is returned
+// for callers that need it.
+func confirmLeaseOnZeroRows(ctx context.Context, db queryRower, result sql.Result, lease storage.ApplyLease, desc, target string) (int64, error) {
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read %s rows affected for %s: %w", desc, target, err)
+	}
+	if rows == 0 {
+		if err := ensureApplyLeaseStillOwned(ctx, db, lease); err != nil {
+			return rows, err
+		}
+	}
+	return rows, nil
 }
 
 // applyTargetForUpdate resolves the (database, type, environment, deployment)
@@ -1088,7 +1103,7 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 	if err != nil {
 		return nil, fmt.Errorf("begin claim apply transaction: %w", err)
 	}
-	defer rollbackApplyTx(ctx, tx, "claim apply")
+	defer rollbackTx(ctx, tx, "claim apply")
 
 	activeStates := claimableApplyStates()
 	activeStatePlaceholders := placeholders(len(activeStates))
@@ -1193,7 +1208,7 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 	if err != nil {
 		return nil, fmt.Errorf("begin claim apply %d transaction: %w", applyID, err)
 	}
-	defer rollbackApplyTx(ctx, tx, "claim apply by id")
+	defer rollbackTx(ctx, tx, "claim apply by id")
 
 	activeStates := claimableApplyStates()
 	activeStatePlaceholders := placeholders(len(activeStates))
@@ -1293,7 +1308,7 @@ func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, own
 	if err != nil {
 		return nil, fmt.Errorf("begin claim apply for stop reconciliation transaction: %w", err)
 	}
-	defer rollbackApplyTx(ctx, tx, "claim apply for stop reconciliation")
+	defer rollbackTx(ctx, tx, "claim apply for stop reconciliation")
 
 	// Parent eligibility: pending plus the active recovery-claimable states
 	// (claimableApplyStates); the resumable failed_retryable and stopped states
@@ -1629,14 +1644,8 @@ func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {
 		return fmt.Errorf("heartbeat apply %d: %w", applyID, err)
 	}
 	if hasLease {
-		rows, err := result.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("read heartbeat rows affected for apply %d: %w", applyID, err)
-		}
-		if rows == 0 {
-			if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
-				return err
-			}
+		if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "heartbeat", fmt.Sprintf("apply %d", applyID)); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -1657,7 +1666,7 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 	if err != nil {
 		return nil, fmt.Errorf("begin expire retryable applies transaction: %w", err)
 	}
-	defer rollbackApplyTx(ctx, tx, "expire retryable applies")
+	defer rollbackTx(ctx, tx, "expire retryable applies")
 
 	rows, err := tx.QueryContext(ctx, `
 		SELECT `+applyColumns+`

@@ -29,19 +29,24 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 
 	// Mode 1: Show details for specific apply by ID
 	if cmd.ApplyIDArg != "" {
-		return showApplyByID(ep, cmd.ApplyIDArg, cmd.JSON)
+		return showApplyByID(ep, cmd.ApplyIDArg, cmd.JSON, !cmd.JSON)
 	}
 
 	// Mode 2: Show history for a database
 	if cmd.Database != "" {
-		return showDatabaseHistory(ep, cmd.Database, cmd.Environment, cmd.JSON)
+		return showDatabaseHistory(ep, cmd.Database, cmd.Environment, cmd.JSON, !cmd.JSON)
 	}
 
 	// Mode 3: List recent applies
-	result, err := client.GetStatus(ep, client.StatusOptions{
-		Limit:       cmd.Limit,
-		Environment: cmd.Environment,
-		Failed:      cmd.Failed,
+	var result *apitypes.StatusResponse
+	err = withLoading("Loading schema change status...", !cmd.JSON, func() error {
+		var loadErr error
+		result, loadErr = client.GetStatus(ep, client.StatusOptions{
+			Limit:       cmd.Limit,
+			Environment: cmd.Environment,
+			Failed:      cmd.Failed,
+		})
+		return loadErr
 	})
 	if err != nil {
 		return err
@@ -88,8 +93,13 @@ func activeApplyDataFromResponse(a *apitypes.ActiveApplyResponse) templates.Acti
 }
 
 // showApplyByID shows details for a specific apply by its ID.
-func showApplyByID(endpoint, applyID string, outputJSON bool) error {
-	result, err := client.GetProgress(endpoint, applyID)
+func showApplyByID(endpoint, applyID string, outputJSON, showLoader bool) error {
+	var result *apitypes.ProgressResponse
+	err := withLoading("Loading schema change details...", showLoader, func() error {
+		var loadErr error
+		result, loadErr = client.GetProgress(endpoint, applyID)
+		return loadErr
+	})
 	if err != nil {
 		if client.IsNotFound(err) {
 			fmt.Printf("No schema change found for apply '%s'\n", applyID)
@@ -116,8 +126,13 @@ func showApplyByID(endpoint, applyID string, outputJSON bool) error {
 }
 
 // showDatabaseHistory shows all applies for a database.
-func showDatabaseHistory(endpoint, database, environment string, outputJSON bool) error {
-	result, err := client.GetDatabaseHistory(endpoint, database, environment)
+func showDatabaseHistory(endpoint, database, environment string, outputJSON, showLoader bool) error {
+	var result *apitypes.DatabaseHistoryResponse
+	err := withLoading("Loading schema change history...", showLoader, func() error {
+		var loadErr error
+		result, loadErr = client.GetDatabaseHistory(endpoint, database, environment)
+		return loadErr
+	})
 	if err != nil {
 		return err
 	}

@@ -1,8 +1,10 @@
 package templates
 
 import (
+	"fmt"
 	"time"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -49,6 +51,21 @@ func PreviewCommentPlan() string {
 			{Message: "New column uses floating-point data type", Table: "orders", LinterName: "has_float"},
 			{Message: "Column added without DEFAULT value", Table: "users", LinterName: "no_default"},
 		},
+	})
+}
+
+// PreviewCommentPlanTenant renders a tenant-targeted plan comment.
+func PreviewCommentPlanTenant() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		Tenant:      "alpha",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes:     samplePlanChanges(),
 	})
 }
 
@@ -391,6 +408,35 @@ func PreviewCommentDropColumnBlocked() string {
 			{
 				Table:  "customers",
 				Reason: "Unsafe operation detected: DROP COLUMN `nickname`",
+			},
+		},
+	})
+}
+
+// PreviewCommentDropIndexBlocked renders a sample plan where a destructive
+// index drop is blocked until query performance has been reviewed.
+func PreviewCommentDropIndexBlocked() string {
+	return RenderUnsafeChangesBlocked(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `customers` DROP INDEX `idx_customers_email`;",
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{
+				Table:  "customers",
+				Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`",
 			},
 		},
 	})
@@ -769,6 +815,18 @@ func PreviewCommentApplyProgress() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
 }
 
+// PreviewCommentApplyChecksumming renders an apply comment where a table has
+// finished copying and entered the checksum phase to verify the copied data.
+func PreviewCommentApplyChecksumming() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Checksumming
+	tables[1].ChecksumRowsChecked = 321450
+	tables[1].ChecksumRowsTotal = 1466232
+	tables[2].Status = state.Task.Pending
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+}
+
 // PreviewCommentApplyEstimateExceeded renders an apply comment where the active row copy has exceeded MySQL's initial estimate.
 func PreviewCommentApplyEstimateExceeded() string {
 	tables := sampleApplyTables()
@@ -792,6 +850,127 @@ func PreviewCommentApplyThirdRunning() string {
 	tables[2].PercentComplete = 17
 	tables[2].ETASeconds = 420
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+}
+
+// PreviewCommentApplyVitessVSchemaOnly renders a VSchema-only Vitess apply,
+// which has no per-table tasks — only the VSchema status section.
+func PreviewCommentApplyVitessVSchemaOnly() string {
+	data := sampleApplyData(state.Apply.Running, nil)
+	data.Engine = "PlanetScale"
+	data.VSchemaChanges = []apitypes.VSchemaChange{
+		{Namespace: "myapp_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
+	}
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyVitessDDLWithVSchema renders a Vitess apply where a DDL
+// table has completed while the VSchema change is still applying.
+func PreviewCommentApplyVitessDDLWithVSchema() string {
+	tables := []TableProgressData{
+		{
+			TableName:       "users",
+			DDL:             "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
+			Status:          state.Task.Completed,
+			RowsCopied:      50000,
+			RowsTotal:       50000,
+			PercentComplete: 100,
+		},
+	}
+	data := sampleApplyData(state.Apply.Running, tables)
+	data.Engine = "PlanetScale"
+	data.DeployRequestURL = "https://app.planetscale.com/acme/myapp/deploy-requests/42"
+	data.VSchemaChanges = []apitypes.VSchemaChange{
+		{Namespace: "myapp_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
+	}
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyVitessMultiKeyspaceVSchema renders a Vitess apply that
+// changes VSchema in multiple keyspaces, each tracked independently — one
+// already applied, one still applying.
+func PreviewCommentApplyVitessMultiKeyspaceVSchema() string {
+	data := sampleApplyData(state.Apply.Running, nil)
+	data.Engine = "PlanetScale"
+	data.VSchemaChanges = []apitypes.VSchemaChange{
+		{Namespace: "commerce", Status: "applied", Diff: `+ "lookup_orders": {"type": "lookup_hash"}`},
+		{Namespace: "commerce_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
+	}
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyShardProgress renders a sharded apply where one table is
+// copying across a handful of shards, exercising the inline per-shard summary
+// (each shard listed, a percent only on the actively-copying shards).
+func PreviewCommentApplyShardProgress() string {
+	shards := []ShardProgressData{
+		{Shard: "-40", Status: state.Task.Completed, PercentComplete: 100},
+		{Shard: "40-80", Status: state.Task.Running, PercentComplete: 62},
+		{Shard: "80-c0", Status: state.Task.Running, PercentComplete: 31},
+		{Shard: "c0-", Status: state.Task.Pending},
+	}
+	return RenderApplyStatusComment(ApplyStatusCommentData{
+		Database:    "commerce",
+		Environment: "staging",
+		RequestedBy: "jackjackbits",
+		ApplyID:     "apply-7aa13cf03496454b",
+		State:       state.Apply.Running,
+		Engine:      "Vitess",
+		Tables: []TableProgressData{{
+			Namespace:       "commerce",
+			TableName:       "users",
+			DDL:             "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
+			Status:          state.Task.Running,
+			RowsCopied:      914707,
+			RowsTotal:       1466232,
+			PercentComplete: 62,
+			ETASeconds:      195,
+			Shards:          shards,
+		}},
+	})
+}
+
+// PreviewCommentApplyManyShardProgress renders a sharded apply where a table is
+// copying across 256 shards, exercising the collapsed per-shard summary
+// (per-state counts plus the slowest copier, so the line stays compact).
+func PreviewCommentApplyManyShardProgress() string {
+	const total = 256
+	shards := make([]ShardProgressData, 0, total)
+	for i := range total {
+		sh := ShardProgressData{Shard: fmt.Sprintf("%02x-", i)}
+		switch {
+		case i < 200:
+			sh.Status = state.Task.Completed
+			sh.PercentComplete = 100
+		case i == 247:
+			sh.Status = state.Task.Running
+			sh.PercentComplete = 12 // the laggard the collapsed line names
+		case i < 252:
+			sh.Status = state.Task.Running
+			sh.PercentComplete = 55 + i%20
+		default:
+			sh.Status = state.Task.Pending
+		}
+		shards = append(shards, sh)
+	}
+	return RenderApplyStatusComment(ApplyStatusCommentData{
+		Database:    "commerce",
+		Environment: "staging",
+		RequestedBy: "jackjackbits",
+		ApplyID:     "apply-7aa13cf03496454b",
+		State:       state.Apply.Running,
+		Engine:      "Vitess",
+		Tables: []TableProgressData{{
+			Namespace:       "commerce",
+			TableName:       "orders",
+			DDL:             "ALTER TABLE `orders` ADD COLUMN `region` varchar(32)",
+			Status:          state.Task.Running,
+			RowsCopied:      4200000000,
+			RowsTotal:       6000000000,
+			PercentComplete: 70,
+			ETASeconds:      5400,
+			Shards:          shards,
+		}},
+	})
 }
 
 // PreviewCommentApplyCompleted renders a sample apply-completed comment.

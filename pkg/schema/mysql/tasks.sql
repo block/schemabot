@@ -23,6 +23,8 @@ CREATE TABLE `tasks` (
   `rows_total` bigint DEFAULT '0',
   `progress_percent` int DEFAULT '0',
   `eta_seconds` int DEFAULT NULL,
+  `checksum_rows_checked` bigint DEFAULT '0',
+  `checksum_rows_total` bigint DEFAULT '0',
   `cutover_attempts` int NOT NULL DEFAULT '0',
   `is_instant` tinyint(1) DEFAULT '0',
   `ready_to_complete` tinyint(1) DEFAULT '0',

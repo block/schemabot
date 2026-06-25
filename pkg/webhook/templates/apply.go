@@ -2,6 +2,7 @@ package templates
 
 import (
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -23,12 +24,31 @@ type TableProgressData struct {
 	RowsTotal       int64
 	PercentComplete int
 	ETASeconds      int64
-	IsInstant       bool
-	ReadyToComplete bool
+	// Checksum phase progress: rows verified so far and total to verify.
+	// Non-zero only while the table is checksumming (verifying copied data).
+	ChecksumRowsChecked int64
+	ChecksumRowsTotal   int64
+	IsInstant           bool
+	ReadyToComplete     bool
 
 	// ErrorMessage is the task's last error. Rendered for states where the
 	// per-table error explains what the user is seeing (e.g. a retrying task).
 	ErrorMessage string
+
+	// Shards is the per-shard breakdown for a sharded table. Empty for unsharded
+	// engines. Rendered as a single compact summary line
+	// while the table is in flight (see renderShardSummary); detailed per-shard
+	// row counts/ETAs stay in the CLI, not the PR comment.
+	Shards []ShardProgressData
+}
+
+// ShardProgressData is the high-level status of one shard, for the compact
+// per-shard summary in the PR comment. It intentionally carries only state +
+// percent (no row counts/ETA) to keep the comment quiet.
+type ShardProgressData struct {
+	Shard           string
+	Status          string // canonical lowercase shard/task state
+	PercentComplete int
 }
 
 // ApplyStatusCommentData contains all data needed to render an apply status PR comment.
@@ -43,6 +63,17 @@ type ApplyStatusCommentData struct {
 	StartedAt    string // RFC3339 format
 	CompletedAt  string // RFC3339 format
 	Tables       []TableProgressData
+
+	// VSchemaChanges holds per-keyspace VSchema application state, surfaced from
+	// the engine's display metadata rather than as a per-table task. Empty when
+	// the apply carries no VSchema change.
+	VSchemaChanges []apitypes.VSchemaChange
+
+	// DeployRequestURL links the PlanetScale deploy request driving this apply
+	// (Vitess/PlanetScale only). It is the operator's entry point into the deploy
+	// request's own progress, which the comment does not otherwise surface. Empty
+	// for engines without a deploy request or before one is created.
+	DeployRequestURL string
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -60,6 +91,11 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 
 	// Metadata line
 	writeApplyMetadata(&sb, data, renderedAt)
+	writeApplyStatusDetail(&sb, data.State)
+
+	// Deploy-request link (PlanetScale) — the operator's entry point into the
+	// deploy request's own progress, which the comment does not otherwise surface.
+	writeDeployRequestLink(&sb, data)
 
 	// Cutover readiness summary
 	if data.State == state.Apply.WaitingForCutover || data.State == state.Apply.CuttingOver {
@@ -70,6 +106,10 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	if len(data.Tables) > 0 {
 		writeTableProgressSection(&sb, data)
 	}
+
+	// VSchema application status, surfaced from engine metadata rather than as a
+	// per-table task (a VSchema-only apply has no tables at all).
+	writeVSchemaStatus(&sb, data)
 
 	// Error message for apply states that need operator triage.
 	if state.IsState(data.State, state.Apply.Failed, state.Apply.Stopped) && data.ErrorMessage != "" {
@@ -88,70 +128,120 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 // writeApplyHeader writes the comment header with a state-specific title.
 func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	switch data.State {
-	case state.Apply.Pending:
-		sb.WriteString("## Schema Change Starting\n\n")
-	case state.Apply.Running, state.Apply.RunningDegraded:
+	case state.Apply.Pending,
+		state.Apply.Running,
+		state.Apply.RunningDegraded,
+		state.Apply.FailedRetryable,
+		state.Apply.WaitingForDeploy,
+		state.Apply.WaitingForCutover,
+		state.Apply.Recovering,
+		state.Apply.Resuming,
+		state.Apply.CuttingOver,
+		state.Apply.PreparingBranch,
+		state.Apply.ApplyingBranchChanges,
+		state.Apply.ValidatingBranch,
+		state.Apply.CreatingDeployRequest,
+		state.Apply.ValidatingDeployRequest:
 		// running_degraded is a continue rollout still in flight past a failed
 		// sibling: the change is still in progress, and the failed deployment is
 		// surfaced in the per-deployment breakdown, not the headline.
-		sb.WriteString("## Schema Change In Progress\n\n")
-	case state.Apply.FailedRetryable:
-		// Operator recovery retries the apply automatically, so it is still
-		// in progress from the user's perspective. The retry detail is
-		// surfaced per table in the progress section, not in the headline.
-		sb.WriteString("## Schema Change In Progress\n\n")
-	case state.Apply.WaitingForDeploy:
-		sb.WriteString("## Schema Change — Waiting for Deploy\n\n")
-	case state.Apply.WaitingForCutover:
-		sb.WriteString("## Schema Change — Waiting for Cutover\n\n")
-	case state.Apply.Recovering:
-		sb.WriteString("## Schema Change — Recovering\n\n")
-	case state.Apply.Resuming:
-		sb.WriteString("## Schema Change — Resuming\n\n")
-	case state.Apply.CuttingOver:
-		sb.WriteString("## Schema Change — Cutting Over\n\n")
+		writeEnvironmentTitle(sb, "Schema Change In Progress", data.Environment)
 	case state.Apply.RevertWindow:
-		sb.WriteString("## Schema Change Applied (Pending Revert)\n\n")
+		writeEnvironmentTitle(sb, "Schema Change Applied (Pending Revert)", data.Environment)
 	case state.Apply.Completed:
-		sb.WriteString("## ✅ Schema Change Applied\n\n")
+		writeEnvironmentTitle(sb, "✅ Schema Change Applied", data.Environment)
 	case state.Apply.Failed:
-		sb.WriteString("## ❌ Schema Change Failed\n\n")
+		writeEnvironmentTitle(sb, "❌ Schema Change Failed", data.Environment)
 	case state.Apply.Stopped:
-		sb.WriteString("## ⏹️ Schema Change Stopped\n\n")
+		writeEnvironmentTitle(sb, "⏹️ Schema Change Stopped", data.Environment)
 	case state.Apply.Reverted:
-		sb.WriteString("## ↩️ Schema Change Reverted\n\n")
+		writeEnvironmentTitle(sb, "↩️ Schema Change Reverted", data.Environment)
 	case state.Apply.Cancelled:
-		sb.WriteString("## 🚫 Schema Change Cancelled\n\n")
-	case state.Apply.PreparingBranch:
-		sb.WriteString("## Schema Change — Preparing Branch\n\n")
-	case state.Apply.ApplyingBranchChanges:
-		sb.WriteString("## Schema Change — Applying Branch Changes\n\n")
-	case state.Apply.ValidatingBranch:
-		sb.WriteString("## Schema Change — Validating Branch\n\n")
-	case state.Apply.CreatingDeployRequest:
-		sb.WriteString("## Schema Change — Creating Deploy Request\n\n")
-	case state.Apply.ValidatingDeployRequest:
-		sb.WriteString("## Schema Change — Validating Deploy Request\n\n")
+		writeEnvironmentTitle(sb, "🚫 Schema Change Cancelled", data.Environment)
 	default:
-		fmt.Fprintf(sb, "## Schema Change — %s\n\n", humanizeState(data.State))
+		if state.IsTerminalApplyState(data.State) {
+			writeEnvironmentTitle(sb, fmt.Sprintf("Schema Change: %s", humanizeState(data.State)), data.Environment)
+		} else {
+			writeEnvironmentTitle(sb, "Schema Change In Progress", data.Environment)
+		}
 	}
 }
 
-// writeApplyMetadata writes the database, environment, apply ID, elapsed time, and requester info.
+// writeApplyMetadata writes the database, apply ID, and requester info.
 func writeApplyMetadata(sb *strings.Builder, data ApplyStatusCommentData, renderedAt string) {
 	var parts []string
 	parts = append(parts, fmt.Sprintf("**Database**: `%s`", data.Database))
-	if data.Environment != "" {
-		parts = append(parts, fmt.Sprintf("**Environment**: `%s`", data.Environment))
-	}
 	if data.ApplyID != "" {
 		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
 	}
-	if elapsed := applyElapsed(data); elapsed != "" {
-		parts = append(parts, fmt.Sprintf("**Elapsed**: %s", elapsed))
-	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
-	writeAppliedByOrTimestampAt(sb, data.RequestedBy, renderedAt)
+	attributionAt := renderedAt
+	if data.RequestedBy == "" {
+		attributionAt = startedAtDisplay(data.StartedAt, renderedAt)
+	}
+	writeAppliedByOrTimestampAt(sb, data.RequestedBy, attributionAt)
+}
+
+func startedAtDisplay(startedAt, fallback string) string {
+	if startedAt == "" {
+		return fallback
+	}
+	t, err := time.Parse(time.RFC3339, startedAt)
+	if err != nil {
+		return fallback
+	}
+	return t.UTC().Format("2006-01-02 15:04:05 UTC")
+}
+
+func writeApplyStatusDetail(sb *strings.Builder, applyState string) {
+	detail := applyStatusDetail(applyState)
+	if detail == "" {
+		return
+	}
+	fmt.Fprintf(sb, "\n**Status**: %s\n", detail)
+}
+
+func applyStatusDetail(applyState string) string {
+	switch applyState {
+	case state.Apply.Pending:
+		return "Starting"
+	case state.Apply.WaitingForDeploy:
+		return "Waiting for Deploy"
+	case state.Apply.WaitingForCutover:
+		return "Waiting for Cutover"
+	case state.Apply.Recovering:
+		return "Recovering"
+	case state.Apply.Resuming:
+		return "Resuming"
+	case state.Apply.CuttingOver:
+		return "Cutting Over"
+	case state.Apply.PreparingBranch:
+		return "Preparing Branch"
+	case state.Apply.ApplyingBranchChanges:
+		return "Applying Branch Changes"
+	case state.Apply.ValidatingBranch:
+		return "Validating Branch"
+	case state.Apply.CreatingDeployRequest:
+		return "Creating Deploy Request"
+	case state.Apply.ValidatingDeployRequest:
+		return "Validating Deploy Request"
+	default:
+		if applyState == "" || state.IsTerminalApplyState(applyState) || state.IsState(applyState, state.Apply.Running, state.Apply.RunningDegraded, state.Apply.FailedRetryable) {
+			return ""
+		}
+		return humanizeState(applyState)
+	}
+}
+
+// writeDeployRequestLink writes a link to the PlanetScale deploy request driving
+// the apply, when one is known. For a Vitess/PlanetScale apply the meaningful
+// in-flight work happens in the deploy request, so this gives the operator a way
+// to follow it directly rather than hunting for it in the PlanetScale UI.
+func writeDeployRequestLink(sb *strings.Builder, data ApplyStatusCommentData) {
+	if data.DeployRequestURL == "" {
+		return
+	}
+	fmt.Fprintf(sb, "\n🔗 **Deploy request**: %s\n", data.DeployRequestURL)
 }
 
 // writeCutoverSummary writes a readiness summary for cutover states,
@@ -174,29 +264,6 @@ func writeCutoverSummary(sb *strings.Builder, tables []TableProgressData) {
 	}
 }
 
-// applyElapsed returns a human-readable elapsed duration.
-// For terminal states (completed/failed/stopped), it uses CompletedAt - StartedAt.
-// For in-progress states, it uses NowFunc() - StartedAt.
-func applyElapsed(data ApplyStatusCommentData) string {
-	if data.StartedAt == "" {
-		return ""
-	}
-	startTime, err := time.Parse(time.RFC3339, data.StartedAt)
-	if err != nil {
-		return ""
-	}
-	var end time.Time
-	if data.CompletedAt != "" {
-		end, err = time.Parse(time.RFC3339, data.CompletedAt)
-		if err != nil {
-			return ""
-		}
-	} else {
-		end = NowFunc()
-	}
-	return formatDuration(end.Sub(startTime))
-}
-
 // writeProgressSummary writes a one-line progress summary before the per-table breakdown.
 // For multi-table applies, shows "X/N complete · Y running (Z%) · ..." at a glance.
 // For single-table applies, the summary is skipped — the header and progress bar
@@ -207,7 +274,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		return
 	}
 
-	var completed, running, queued, failed, retrying, stopped, waiting, recovering, cutting, cancelled int
+	var completed, running, checksumming, queued, failed, retrying, stopped, waiting, recovering, cutting, cancelled int
 	var runningPct int
 	var runningEstimateExceeded bool
 
@@ -222,6 +289,8 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			} else {
 				runningPct = ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			}
+		case state.Task.Checksumming:
+			checksumming++
 		case state.Task.Pending:
 			queued++
 		case state.Task.WaitingForCutover:
@@ -260,6 +329,13 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			label += fmt.Sprintf(" (%d%%)", runningPct)
 		}
 		parts = append(parts, label)
+	}
+	if checksumming > 0 {
+		if multi {
+			parts = append(parts, fmt.Sprintf("%d checksumming", checksumming))
+		} else {
+			parts = append(parts, "checksumming")
+		}
 	}
 	if queued > 0 && multi {
 		parts = append(parts, fmt.Sprintf("%d queued", queued))
@@ -312,6 +388,23 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 
 	if len(parts) > 0 {
 		fmt.Fprintf(sb, "\n📊 %s\n", strings.Join(parts, " · "))
+	}
+}
+
+// writeVSchemaStatus renders the VSchema application status and diff surfaced
+// from the engine's display metadata. It is shown as its own section because
+// VSchema application is not a per-table task. Renders nothing when the apply
+// carries no VSchema change.
+func writeVSchemaStatus(sb *strings.Builder, data ApplyStatusCommentData) {
+	if len(data.VSchemaChanges) == 0 {
+		return
+	}
+	sb.WriteString("\n### VSchema\n\n")
+	for _, c := range data.VSchemaChanges {
+		fmt.Fprintf(sb, "**`%s`**: %s\n\n", c.Namespace, ui.VSchemaStatusLabel(c.Status))
+		if c.Diff != "" {
+			fmt.Fprintf(sb, "```diff\n%s\n```\n\n", c.Diff)
+		}
 	}
 }
 
@@ -376,6 +469,21 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData) {
 		fmt.Fprintf(sb, "**`%s`**: %s \u2713 Complete\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
+	case state.Task.Checksumming:
+		// Row copy is complete; the engine is verifying the copied data against
+		// the source before cutover. On a large table this can run for hours, so
+		// show how far the verify has progressed once Spirit reports a total.
+		if table.ChecksumRowsTotal > 0 {
+			pct := ui.ClampPercent(int(table.ChecksumRowsChecked * 100 / table.ChecksumRowsTotal))
+			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data (%d%%)\n", table.TableName, ui.ProgressBarRowCopy(pct), pct)
+			writeDDLLine(sb, table.DDL)
+			fmt.Fprintf(sb, "Rows verified: %s / %s\n",
+				ui.FormatNumber(ui.ClampRows(table.ChecksumRowsChecked, table.ChecksumRowsTotal)), ui.FormatNumber(table.ChecksumRowsTotal))
+		} else {
+			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data...\n", table.TableName, ui.ProgressBarRowCopy(100))
+			writeDDLLine(sb, table.DDL)
+		}
+
 	case state.Task.WaitingForCutover:
 		bar := ui.ProgressBarWaitingCutover()
 		if table.ReadyToComplete {
@@ -433,7 +541,120 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData) {
 		renderRunningTable(sb, table)
 	}
 
+	renderShardSummary(sb, table)
+
 	sb.WriteString("\n")
+}
+
+// renderShardSummary appends a single compact per-shard status line for a
+// sharded table, only while it is in flight. It keeps the PR
+// comment quiet: at most one extra line per table. With few shards it lists each
+// shard's state (and percent for actively-copying shards); with many it collapses
+// to per-state counts plus the slowest copying shard, so even hundreds of shards
+// fit on one line. Detailed per-shard rows/ETAs stay in the CLI.
+func renderShardSummary(sb *strings.Builder, table TableProgressData) {
+	if len(table.Shards) <= 1 {
+		return
+	}
+	switch state.NormalizeTaskStatus(table.Status) {
+	case state.Task.Running, state.Task.Checksumming, state.Task.Recovering, state.Task.CuttingOver, state.Task.WaitingForCutover:
+		// in flight — a breakdown adds signal
+	default:
+		return // completed/pending/cancelled/failed: no breakdown, stay quiet
+	}
+
+	const inlineLimit = 8
+	if len(table.Shards) <= inlineLimit {
+		parts := make([]string, 0, len(table.Shards))
+		for _, sh := range table.Shards {
+			if isCopyingShardStatus(sh.Status) && sh.PercentComplete > 0 {
+				parts = append(parts, fmt.Sprintf("%s %s %d%%", shardGlyph(sh.Status), sh.Shard, sh.PercentComplete))
+			} else {
+				parts = append(parts, fmt.Sprintf("%s %s", shardGlyph(sh.Status), sh.Shard))
+			}
+		}
+		fmt.Fprintf(sb, "  └ shards: %s\n", strings.Join(parts, " · "))
+		return
+	}
+
+	var complete, copying, ready, failed, queued, other int
+	slowestShard := ""
+	slowestPct := -1
+	for _, sh := range table.Shards {
+		switch state.NormalizeShardStatus(sh.Status) {
+		case state.Task.Completed:
+			complete++
+		case state.Task.WaitingForCutover:
+			ready++
+		case state.Task.Failed, state.Task.FailedRetryable:
+			failed++
+		case state.Task.Pending:
+			queued++
+		default:
+			if isCopyingShardStatus(sh.Status) {
+				copying++
+				if slowestPct < 0 || sh.PercentComplete < slowestPct {
+					slowestPct = sh.PercentComplete
+					slowestShard = sh.Shard
+				}
+			} else {
+				other++
+			}
+		}
+	}
+	var buckets []string
+	if complete > 0 {
+		buckets = append(buckets, fmt.Sprintf("%d ✓", complete))
+	}
+	if copying > 0 {
+		buckets = append(buckets, fmt.Sprintf("%d ◐ copying", copying))
+	}
+	if ready > 0 {
+		buckets = append(buckets, fmt.Sprintf("%d ● ready", ready))
+	}
+	if queued > 0 {
+		buckets = append(buckets, fmt.Sprintf("%d ⏳", queued))
+	}
+	if failed > 0 {
+		buckets = append(buckets, fmt.Sprintf("%d ✗ failed", failed))
+	}
+	if other > 0 {
+		buckets = append(buckets, fmt.Sprintf("%d …", other))
+	}
+	line := fmt.Sprintf("  └ %d shards: %s", len(table.Shards), strings.Join(buckets, " · "))
+	if slowestShard != "" && slowestPct >= 0 {
+		line += fmt.Sprintf(" · slowest %s %d%%", slowestShard, slowestPct)
+	}
+	sb.WriteString(line + "\n")
+}
+
+// shardGlyph maps a shard's status to its compact summary glyph.
+func shardGlyph(status string) string {
+	switch state.NormalizeShardStatus(status) {
+	case state.Task.Completed:
+		return "✓" // ✓
+	case state.Task.WaitingForCutover:
+		return "●" // ●
+	case state.Task.Failed, state.Task.FailedRetryable:
+		return "✗" // ✗
+	case state.Task.Pending:
+		return "⏳" // ⏳
+	default:
+		if isCopyingShardStatus(status) {
+			return "◐" // ◐
+		}
+		return "•" // •
+	}
+}
+
+// isCopyingShardStatus reports whether a shard is actively doing copy/cutover work.
+func isCopyingShardStatus(status string) bool {
+	switch state.NormalizeShardStatus(status) {
+	case state.Task.Running, state.Task.Recovering, state.Task.CuttingOver:
+		return true
+	default:
+		return false
+	}
 }
 
 // renderRunningTable renders a table that is actively copying rows.
@@ -596,7 +817,7 @@ func RenderApplySummaryComment(data ApplyStatusCommentData) string {
 	case state.Apply.Cancelled:
 		writeSummaryCancelled(&sb, data, completedCount, totalTables)
 	default:
-		fmt.Fprintf(&sb, "## Schema Change \u2014 %s\n\n", humanizeState(data.State))
+		writeEnvironmentTitle(&sb, fmt.Sprintf("Schema Change: %s", humanizeState(data.State)), data.Environment)
 		writeSummaryMetadata(&sb, data)
 	}
 
@@ -620,13 +841,20 @@ func writeSummaryCompleted(sb *strings.Builder, data ApplyStatusCommentData, tot
 	writeApplyHeader(sb, data)
 	writeSummaryCompletedMetadata(sb, data)
 	var msg string
-	if totalTables == 1 {
+	switch {
+	case totalTables == 0 && len(data.VSchemaChanges) > 0:
+		// VSchema-only apply: no per-table tasks, so report the VSchema outcome.
+		msg = "VSchema applied successfully — your changes are live!"
+	case totalTables == 0:
 		msg = "Schema change applied successfully — your changes are live!"
-	} else {
+	case totalTables == 1:
+		msg = "Schema change applied successfully — your changes are live!"
+	default:
 		msg = fmt.Sprintf("All %d tables applied successfully — your schema changes are live!", totalTables)
 	}
 	writeSuccessBlock(sb, msg)
 	writeSummaryTableList(sb, data)
+	writeVSchemaStatus(sb, data)
 	if data.ApplyID != "" {
 		if !strings.HasSuffix(sb.String(), "\n\n") {
 			sb.WriteString("\n")
@@ -636,14 +864,10 @@ func writeSummaryCompleted(sb *strings.Builder, data ApplyStatusCommentData, tot
 }
 
 // writeSummaryCompletedMetadata writes a clean metadata line for completed applies.
-// Only shows database and environment — apply ID and duration are operational details
-// that add clutter without value for most users.
+// Only shows database — environment is already in the title, and apply ID plus
+// duration are operational details that add clutter without value for most users.
 func writeSummaryCompletedMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
-	if data.Environment != "" {
-		fmt.Fprintf(sb, "**Database**: `%s` | **Environment**: `%s`\n", data.Database, data.Environment)
-	} else {
-		fmt.Fprintf(sb, "**Database**: `%s`\n", data.Database)
-	}
+	writeDBLine(sb, data.Database)
 	sb.WriteString("\n")
 }
 
@@ -693,13 +917,9 @@ func writeSummaryCancelled(sb *strings.Builder, data ApplyStatusCommentData, com
 }
 
 func writeSummaryMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
-	// Combine database, environment, apply ID, and duration on one metadata line
+	// Combine database, apply ID, and duration on one metadata line.
 	var parts []string
-	if data.Environment != "" {
-		parts = append(parts, fmt.Sprintf("**Database**: `%s` | **Environment**: `%s`", data.Database, data.Environment))
-	} else {
-		parts = append(parts, fmt.Sprintf("**Database**: `%s`", data.Database))
-	}
+	parts = append(parts, fmt.Sprintf("**Database**: `%s`", data.Database))
 	if data.ApplyID != "" {
 		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
 	}
@@ -711,7 +931,7 @@ func writeSummaryMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
 		}
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
-	writeAppliedByOrTimestamp(sb, data.RequestedBy)
+	writeAppliedByOrTimestampAt(sb, data.RequestedBy, startedAtDisplay(data.StartedAt, currentTimestamp()))
 }
 
 // formatDuration formats a time.Duration as a human-readable string.
@@ -926,6 +1146,12 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 		ErrorMessage: resp.ErrorMessage,
 		StartedAt:    resp.StartedAt,
 		CompletedAt:  resp.CompletedAt,
+	}
+
+	if changes, err := apitypes.ParseVSchemaChanges(resp.Metadata); err != nil {
+		slog.Warn("failed to parse VSchema changes from progress metadata", "apply_id", resp.ApplyID, "error", err)
+	} else {
+		data.VSchemaChanges = changes
 	}
 
 	for _, t := range resp.Tables {

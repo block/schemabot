@@ -17,7 +17,7 @@ func TestNormalizeTaskStatus_SpiritStates(t *testing.T) {
 		{spiritstatus.ApplyChangeset.String(), Task.Running},
 		{spiritstatus.RestoreSecondaryIndexes.String(), Task.Running},
 		{spiritstatus.AnalyzeTable.String(), Task.Running},
-		{spiritstatus.Checksum.String(), Task.Running},
+		{spiritstatus.Checksum.String(), Task.Checksumming},
 		{spiritstatus.PostChecksum.String(), Task.Running},
 		{spiritstatus.ErrCleanup.String(), Task.Running},
 		{spiritstatus.WaitingOnSentinelTable.String(), Task.WaitingForCutover},

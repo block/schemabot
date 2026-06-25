@@ -26,7 +26,12 @@ func (cmd *UnlockCmd) Run(g *Globals) error {
 
 	if cmd.Force {
 		// Force release - get lock info first to show previous owner
-		existingLock, err := client.GetLock(ep, cmd.Database, cmd.Type)
+		var existingLock *client.LockInfo
+		err := withLoading("Checking database lock...", true, func() error {
+			var lockErr error
+			existingLock, lockErr = client.GetLock(ep, cmd.Database, cmd.Type)
+			return lockErr
+		})
 		if err != nil {
 			return fmt.Errorf("check lock: %w", err)
 		}
@@ -35,7 +40,9 @@ func (cmd *UnlockCmd) Run(g *Globals) error {
 			return nil
 		}
 
-		if err := client.ForceReleaseLock(ep, cmd.Database, cmd.Type); err != nil {
+		if err := withLoading("Releasing database lock...", true, func() error {
+			return client.ForceReleaseLock(ep, cmd.Database, cmd.Type)
+		}); err != nil {
 			return fmt.Errorf("force release lock: %w", err)
 		}
 		templates.WriteLockForceReleased(cmd.Database, cmd.Type, existingLock.Owner)
@@ -43,14 +50,21 @@ func (cmd *UnlockCmd) Run(g *Globals) error {
 	}
 
 	// Normal release - ownership required
-	err = client.ReleaseLock(ep, cmd.Database, cmd.Type, owner)
+	err = withLoading("Releasing database lock...", true, func() error {
+		return client.ReleaseLock(ep, cmd.Database, cmd.Type, owner)
+	})
 	if errors.Is(err, client.ErrLockNotFound) {
 		templates.WriteNoLockFound(cmd.Database, cmd.Type)
 		return nil
 	}
 	if errors.Is(err, client.ErrLockNotOwned) {
 		// Show current owner
-		existingLock, getErr := client.GetLock(ep, cmd.Database, cmd.Type)
+		var existingLock *client.LockInfo
+		getErr := withLoading("Checking database lock...", true, func() error {
+			var lockErr error
+			existingLock, lockErr = client.GetLock(ep, cmd.Database, cmd.Type)
+			return lockErr
+		})
 		if getErr != nil || existingLock == nil {
 			return fmt.Errorf("lock is not owned by you")
 		}

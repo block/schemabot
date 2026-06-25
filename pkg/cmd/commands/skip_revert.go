@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -24,7 +25,12 @@ func (cmd *SkipRevertCmd) Run(g *Globals) error {
 	}
 
 	// Check current state
-	result, err := client.GetProgress(ep, cmd.ApplyID)
+	var result *apitypes.ProgressResponse
+	err = withLoading("Loading schema change progress...", true, func() error {
+		var loadErr error
+		result, loadErr = client.GetProgress(ep, cmd.ApplyID)
+		return loadErr
+	})
 	if err == nil {
 		populateControlDisplayFields(&cmd.Database, result)
 		if !state.IsState(result.State, state.Apply.RevertWindow) {
@@ -35,7 +41,12 @@ func (cmd *SkipRevertCmd) Run(g *Globals) error {
 			"apply_id", cmd.ApplyID, "environment", cmd.Environment, "error", err)
 	}
 
-	resp, err := client.CallSkipRevertAPI(ep, cmd.Environment, cmd.ApplyID)
+	var resp *apitypes.ControlResponse
+	err = withLoading("Skipping revert window...", true, func() error {
+		var skipErr error
+		resp, skipErr = client.CallSkipRevertAPI(ep, cmd.Environment, cmd.ApplyID)
+		return skipErr
+	})
 	if err != nil {
 		return fmt.Errorf("skip-revert failed: %w", err)
 	}

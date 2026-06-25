@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"sort"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/block/spirit/pkg/utils"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/state"
@@ -609,13 +611,35 @@ func psDisplayMetadata(meta *psMetadata) map[string]string {
 	if meta.DeferredDeploy {
 		set("deferred_deploy", "true")
 	}
-	if meta.VSchemaStatus != "" {
-		set("vschema_status", meta.VSchemaStatus)
-	}
-	if meta.VSchemaDiff != "" {
-		set("vschema_diff", meta.VSchemaDiff)
+	// Project per-keyspace VSchema state. A PlanetScale deploy has a single
+	// VSchema phase, so every changed keyspace carries the same deploy-level
+	// status; the per-keyspace shape lets engines that apply VSchema per keyspace
+	// (and the renderers) track them independently.
+	if changes := vschemaChangesForDisplay(meta); len(changes) > 0 {
+		if encoded, err := apitypes.EncodeVSchemaChanges(changes); err != nil {
+			slog.Warn("failed to encode VSchema changes for display metadata", "error", err)
+		} else if encoded != "" {
+			set(apitypes.VSchemaChangesMetadataKey, encoded)
+		}
 	}
 	return m
+}
+
+// vschemaChangesForDisplay builds the per-keyspace VSchema display entries from
+// stored metadata, stamping each keyspace with the deploy-level VSchema status.
+func vschemaChangesForDisplay(meta *psMetadata) []apitypes.VSchemaChange {
+	if len(meta.VSchemaDiffs) == 0 {
+		return nil
+	}
+	changes := make([]apitypes.VSchemaChange, 0, len(meta.VSchemaDiffs))
+	for _, d := range meta.VSchemaDiffs {
+		changes = append(changes, apitypes.VSchemaChange{
+			Namespace: d.Namespace,
+			Status:    meta.VSchemaStatus,
+			Diff:      d.Diff,
+		})
+	}
+	return changes
 }
 
 // parseProgressPercent parses the Vitess schema_migrations.progress column,

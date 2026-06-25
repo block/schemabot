@@ -1742,8 +1742,12 @@ type TableProgress struct {
 	Shards          []*ShardProgress       `protobuf:"bytes,11,rep,name=shards,proto3" json:"shards,omitempty"`
 	ProgressDetail  string                 `protobuf:"bytes,12,opt,name=progress_detail,json=progressDetail,proto3" json:"progress_detail,omitempty"`
 	ChangeType      ChangeType             `protobuf:"varint,13,opt,name=change_type,json=changeType,proto3,enum=tern.v1.ChangeType" json:"change_type,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Checksum phase progress: rows verified so far and the total to verify.
+	// Populated while the table is checksumming (verifying copied data), 0 otherwise.
+	ChecksumRowsChecked int64 `protobuf:"varint,14,opt,name=checksum_rows_checked,json=checksumRowsChecked,proto3" json:"checksum_rows_checked,omitempty"`
+	ChecksumRowsTotal   int64 `protobuf:"varint,15,opt,name=checksum_rows_total,json=checksumRowsTotal,proto3" json:"checksum_rows_total,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *TableProgress) Reset() {
@@ -1865,6 +1869,20 @@ func (x *TableProgress) GetChangeType() ChangeType {
 		return x.ChangeType
 	}
 	return ChangeType_CHANGE_TYPE_OTHER
+}
+
+func (x *TableProgress) GetChecksumRowsChecked() int64 {
+	if x != nil {
+		return x.ChecksumRowsChecked
+	}
+	return 0
+}
+
+func (x *TableProgress) GetChecksumRowsTotal() int64 {
+	if x != nil {
+		return x.ChecksumRowsTotal
+	}
+	return 0
 }
 
 // ProgressResponse contains detailed progress information.
@@ -2947,7 +2965,7 @@ const file_tern_proto_rawDesc = "" +
 	"etaSeconds\x12)\n" +
 	"\x10cutover_attempts\x18\x06 \x01(\x05R\x0fcutoverAttempts\x120\n" +
 	"\x14last_cutover_attempt\x18\a \x01(\tR\x12lastCutoverAttempt\x12*\n" +
-	"\x11ready_to_complete\x18\b \x01(\bR\x0freadyToComplete\"\xc9\x03\n" +
+	"\x11ready_to_complete\x18\b \x01(\bR\x0freadyToComplete\"\xad\x04\n" +
 	"\rTableProgress\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12\x1d\n" +
@@ -2968,7 +2986,9 @@ const file_tern_proto_rawDesc = "" +
 	"\x06shards\x18\v \x03(\v2\x16.tern.v1.ShardProgressR\x06shards\x12'\n" +
 	"\x0fprogress_detail\x18\f \x01(\tR\x0eprogressDetail\x124\n" +
 	"\vchange_type\x18\r \x01(\x0e2\x13.tern.v1.ChangeTypeR\n" +
-	"changeType\"\xc7\x03\n" +
+	"changeType\x122\n" +
+	"\x15checksum_rows_checked\x18\x0e \x01(\x03R\x13checksumRowsChecked\x12.\n" +
+	"\x13checksum_rows_total\x18\x0f \x01(\x03R\x11checksumRowsTotal\"\xc7\x03\n" +
 	"\x10ProgressResponse\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12$\n" +
 	"\x05state\x18\x02 \x01(\x0e2\x0e.tern.v1.StateR\x05state\x12'\n" +

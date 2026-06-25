@@ -62,7 +62,12 @@ func validateSettingKey(key string) error {
 }
 
 func listSettings(endpoint string) error {
-	settings, err := client.ListSettings(endpoint)
+	var settings []*client.Setting
+	err := withLoading("Loading settings...", true, func() error {
+		var loadErr error
+		settings, loadErr = client.ListSettings(endpoint)
+		return loadErr
+	})
 	if err != nil {
 		return err
 	}
@@ -89,7 +94,12 @@ func listSettings(endpoint string) error {
 }
 
 func getSetting(endpoint, key string) error {
-	value, err := client.GetSetting(endpoint, key)
+	var value string
+	err := withLoading("Loading setting...", true, func() error {
+		var loadErr error
+		value, loadErr = client.GetSetting(endpoint, key)
+		return loadErr
+	})
 	if err != nil {
 		return err
 	}
@@ -107,7 +117,9 @@ func setSetting(endpoint, key, value string) error {
 		return err
 	}
 
-	if err := client.SetSetting(endpoint, key, value); err != nil {
+	if err := withLoading("Updating setting...", true, func() error {
+		return client.SetSetting(endpoint, key, value)
+	}); err != nil {
 		return err
 	}
 

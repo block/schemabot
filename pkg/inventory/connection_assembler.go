@@ -29,6 +29,12 @@ type ConnectionAssembler interface {
 // MySQLConnectionAssembler assembles a namespace-free MySQL DSN. The schema is
 // injected per operation by the data plane, so the DSN carries no database name.
 type MySQLConnectionAssembler struct {
+	// Type is the engine type reported for assembled targets, defaulting to
+	// "mysql". An engine that connects over the MySQL protocol but routes to a
+	// distinct data-plane engine (for example "strata") sets this so the
+	// resolver's request-type guard and the resolved target's DatabaseType reflect
+	// the real engine rather than plain MySQL.
+	Type string
 	// DefaultPort is appended to the host when it has no port.
 	DefaultPort string
 	// Params are extra MySQL DSN parameters (for example TLS settings).
@@ -40,8 +46,13 @@ type MySQLConnectionAssembler struct {
 
 var _ ConnectionAssembler = MySQLConnectionAssembler{}
 
-// DatabaseType returns the MySQL engine type.
-func (MySQLConnectionAssembler) DatabaseType() string { return "mysql" }
+// DatabaseType returns the configured engine type, defaulting to "mysql".
+func (a MySQLConnectionAssembler) DatabaseType() string {
+	if a.Type == "" {
+		return "mysql"
+	}
+	return a.Type
+}
 
 // Assemble builds a namespace-free MySQL DSN from the host and credentials. The
 // endpoint attributes are unused for MySQL.

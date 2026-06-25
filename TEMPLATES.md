@@ -11,9 +11,9 @@ All templates rendered with sample data.
 <summary><a name="mysql-plan"></a><strong>MySQL Plan</strong></summary>
 
 
-## MySQL Schema Change Plan
+## Schema Change Plan — Staging
 
-**Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
@@ -59,12 +59,59 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-tenant-target"></a><strong>MySQL Plan (Tenant Target)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp` | **Tenant**: `alpha`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+💡 **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging --tenant alpha
+```
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-no-changes"></a><strong>MySQL Plan (No Changes)</strong></summary>
 
 
-## MySQL Schema Change Plan
+## Schema Change Plan — Staging
 
-**Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
@@ -162,9 +209,9 @@ Choose one:
 <summary><a name="vitess-plan"></a><strong>Vitess Plan</strong></summary>
 
 
-## Vitess Schema Change Plan
+## Schema Change Plan — Staging
 
-**Database**: `commerce` | **Environment**: `staging`
+**Database**: `commerce` | **Type**: `Vitess`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
@@ -250,9 +297,9 @@ schemabot apply -e staging
 <summary><a name="schema-change-apply-locked--options"></a><strong>Schema Change Apply (Locked + Options)</strong></summary>
 
 
-## Schema Change Apply
+## Schema Change Apply — Staging
 
-**Database**: `commerce` | **Environment**: `staging`
+**Database**: `commerce` | **Type**: `Vitess`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
@@ -347,9 +394,9 @@ schemabot unlock
 <summary><a name="mysql-multischema-plan"></a><strong>MySQL Multi-schema Plan</strong></summary>
 
 
-## MySQL Schema Change Plan
+## Schema Change Plan — Staging
 
-**Database**: `myapp` | **Environment**: `staging`
+**Database**: `myapp` | **Type**: `MySQL`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
@@ -390,9 +437,9 @@ schemabot apply -e staging
 <summary><a name="multienv-plan-identical"></a><strong>Multi-env Plan (Identical)</strong></summary>
 
 
-## MySQL Schema Change Plan
+## Schema Change Plan
 
-**Database**: `testapp`
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
@@ -443,9 +490,9 @@ schemabot apply -e production
 <summary><a name="multienv-plan-different"></a><strong>Multi-env Plan (Different)</strong></summary>
 
 
-## MySQL Schema Change Plan
+## Schema Change Plan
 
-**Database**: `testapp`
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
@@ -495,9 +542,9 @@ schemabot apply -e production
 <summary><a name="multienv-plan-error"></a><strong>Multi-env Plan (Error)</strong></summary>
 
 
-## MySQL Schema Change Plan
+## Schema Change Plan
 
-**Database**: `testapp`
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
@@ -553,9 +600,9 @@ schemabot plan -e production
 <summary><a name="multienv-plan-lint-warnings"></a><strong>Multi-env Plan (Lint Warnings)</strong></summary>
 
 
-## MySQL Schema Change Plan
+## Schema Change Plan
 
-**Database**: `testapp`
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
 *Started at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
@@ -610,9 +657,9 @@ schemabot apply -e production
 <summary><a name="drop-column-blocked"></a><strong>Drop Column Blocked</strong></summary>
 
 
-## MySQL Schema Change Plan
+## Schema Change Plan — Staging
 
-**Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
@@ -630,6 +677,38 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 **Destructive drop guidance:**
 
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
+
+**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
+```
+schemabot apply -e staging --allow-unsafe
+```
+
+</details>
+
+<details>
+<summary><a name="drop-index-blocked"></a><strong>Drop Index Blocked</strong></summary>
+
+
+## MySQL Schema Change Plan
+
+**Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
+```
+
+📋 **Plan**: **1** table to alter
+
+---
+
+**⛔ Unsafe Changes Detected:**
+- `customers`: Unsafe operation detected: DROP INDEX `idx_customers_email`
+
+**Destructive drop guidance:**
+
+Before dropping an index in MySQL, first make the dropped index invisible and verify application queries no longer rely on it for safe performance.
 
 **🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
 ```
@@ -692,9 +771,9 @@ That command wasn't recognized. Available commands:
 
 ### Apply failure
 
-## ❌ Schema Change Failed
+## ❌ Schema Change Failed — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -1134,9 +1213,9 @@ Production
 <summary><a name="apply-blocked-by-other-pr"></a><strong>Apply Blocked By Other PR</strong></summary>
 
 
-## 🔒 Apply Blocked
+## 🔒 Apply Blocked — Staging
 
-**Database**: `testapp` | **Environment**: `staging`
+**Database**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -1153,9 +1232,9 @@ Wait for the other PR to complete or ask the lock holder to run `schemabot unloc
 <summary><a name="apply-blocked-by-cli"></a><strong>Apply Blocked By CLI</strong></summary>
 
 
-## 🔒 Apply Blocked
+## 🔒 Apply Blocked — Staging
 
-**Database**: `testapp` | **Environment**: `staging`
+**Database**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -1175,9 +1254,9 @@ schemabot unlock -d testapp --force
 <summary><a name="unlock-success"></a><strong>Unlock Success</strong></summary>
 
 
-## 🔓 Lock Released
+## 🔓 Lock Released — Staging
 
-**Database**: `testapp` | **Environment**: `staging`
+**Database**: `testapp`
 
 *Released by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -1189,9 +1268,9 @@ The database is now available for schema changes.
 <summary><a name="apply-already-in-progress"></a><strong>Apply Already In Progress</strong></summary>
 
 
-## ⚠️ Apply Already In Progress
+## ⚠️ Apply Already In Progress — Staging
 
-**Database**: `testapp` | **Environment**: `staging`
+**Database**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -1205,9 +1284,9 @@ Wait for it to complete or stop it first.
 <summary><a name="no-lock-found"></a><strong>No Lock Found</strong></summary>
 
 
-## 🔒 No Lock Found
+## 🔒 No Lock Found — Staging
 
-**Database**: `testapp` | **Environment**: `staging`
+**Database**: `testapp`
 
 No apply lock is held for this database. Run `apply` first to generate a plan and acquire the lock.
 
@@ -1221,9 +1300,9 @@ schemabot apply -e staging
 <summary><a name="blocked-by-prior-env-pending"></a><strong>Blocked By Prior Env (Pending)</strong></summary>
 
 
-## ❌ Apply Blocked
+## ❌ Apply Blocked — Production
 
-**Database**: `testapp` | **Environment**: `production`
+**Database**: `testapp`
 
 Staging has pending changes. Apply staging first before applying to production.
 
@@ -1237,9 +1316,9 @@ schemabot apply -e staging
 <summary><a name="blocked-by-prior-env-failed"></a><strong>Blocked By Prior Env (Failed)</strong></summary>
 
 
-## ❌ Apply Blocked
+## ❌ Apply Blocked — Production
 
-**Database**: `testapp` | **Environment**: `production`
+**Database**: `testapp`
 
 Staging failed. Fix the issue and re-apply staging before applying to production.
 
@@ -1253,9 +1332,9 @@ schemabot apply -e staging
 <summary><a name="blocked-by-prior-env-in-progress"></a><strong>Blocked By Prior Env (In Progress)</strong></summary>
 
 
-## ⏳ Apply Blocked
+## ⏳ Apply Blocked — Production
 
-**Database**: `testapp` | **Environment**: `production`
+**Database**: `testapp`
 
 Staging is currently in progress. Wait for it to complete before applying to production.
 
@@ -1455,9 +1534,9 @@ No active locks.
 <summary><a name="schema-change-apply-lock--confirm"></a><strong>Schema Change Apply (Lock + Confirm)</strong></summary>
 
 
-## Schema Change Apply
+## Schema Change Apply — Staging
 
-**Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
@@ -1509,9 +1588,9 @@ schemabot unlock
 <summary><a name="schema-change-apply-with-options"></a><strong>Schema Change Apply (With Options)</strong></summary>
 
 
-## Schema Change Apply
+## Schema Change Apply — Staging
 
-**Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
@@ -1565,9 +1644,9 @@ schemabot unlock
 <summary><a name="schema-change-apply-vitess--options"></a><strong>Schema Change Apply (Vitess + Options)</strong></summary>
 
 
-## Schema Change Apply
+## Schema Change Apply — Staging
 
-**Database**: `commerce` | **Environment**: `staging`
+**Database**: `commerce` | **Type**: `Vitess`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
@@ -1662,9 +1741,9 @@ schemabot unlock
 <summary><a name="apply-started"></a><strong>Apply Started</strong></summary>
 
 
-## Schema Change In Progress
+## Schema Change In Progress — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6`
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -1676,9 +1755,9 @@ Schema changes are being applied. Progress updates will be posted as new comment
 <summary><a name="single-table-running"></a><strong>Single Table: Running</strong></summary>
 
 
-## Schema Change In Progress
+## Schema Change In Progress — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -1707,9 +1786,9 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="single-table-completed"></a><strong>Single Table: Completed</strong></summary>
 
 
-## ✅ Schema Change Applied
+## ✅ Schema Change Applied — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -1728,9 +1807,9 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 <summary><a name="single-table-failed"></a><strong>Single Table: Failed</strong></summary>
 
 
-## ❌ Schema Change Failed
+## ❌ Schema Change Failed — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -1758,9 +1837,9 @@ schemabot apply -e staging
 <summary><a name="single-table-stopped"></a><strong>Single Table: Stopped</strong></summary>
 
 
-## ⏹️ Schema Change Stopped
+## ⏹️ Schema Change Stopped — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -1787,9 +1866,9 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 <summary><a name="all-pending"></a><strong>All Pending</strong></summary>
 
 
-## Schema Change In Progress
+## Schema Change In Progress — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -1831,9 +1910,9 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="first-table-running"></a><strong>First Table Running</strong></summary>
 
 
-## Schema Change In Progress
+## Schema Change In Progress — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -1876,9 +1955,9 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="second-table-running"></a><strong>Second Table Running</strong></summary>
 
 
-## Schema Change In Progress
+## Schema Change In Progress — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -1921,9 +2000,9 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="second-table-estimate-exceeded"></a><strong>Second Table Estimate Exceeded</strong></summary>
 
 
-## Schema Change In Progress
+## Schema Change In Progress — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -1964,12 +2043,57 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="second-table-checksumming"></a><strong>Second Table Checksumming</strong></summary>
+
+
+## Schema Change In Progress — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+📊 1/3 complete · 1 checksumming · 1 queued
+
+### Table Progress
+
+**`users`**: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔍 Checksumming to verify data (21%)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+Rows verified: 321,450 / 1,466,232
+
+**`products`**: ⏳ Queued
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="third-table-running"></a><strong>Third Table Running</strong></summary>
 
 
-## Schema Change In Progress
+## Schema Change In Progress — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -2009,12 +2133,76 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="sharded-shard-progress"></a><strong>Sharded: Shard Progress</strong></summary>
+
+
+## Schema Change In Progress — Staging
+
+**Database**: `commerce` | **Apply ID**: `apply-7aa13cf03496454b`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+### Table Progress
+
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+  └ shards: ✓ -40 · ◐ 40-80 62% · ◐ 80-c0 31% · ⏳ c0-
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-7aa13cf03496454b -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="sharded-many-shards-256"></a><strong>Sharded: Many Shards (256)</strong></summary>
+
+
+## Schema Change In Progress — Staging
+
+**Database**: `commerce` | **Apply ID**: `apply-7aa13cf03496454b`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+### Table Progress
+
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70%
+
+```sql
+ALTER TABLE `orders` ADD COLUMN `region` varchar(32);
+```
+Rows: 4,200,000,000 / 6,000,000,000 · ETA: 1h 30m
+  └ 256 shards: 200 ✓ · 52 ◐ copying · 4 ⏳ · slowest f7- 12%
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-7aa13cf03496454b -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="all-completed"></a><strong>All Completed</strong></summary>
 
 
-## ✅ Schema Change Applied
+## ✅ Schema Change Applied — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -2044,12 +2232,119 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 </details>
 
 <details>
+<summary><a name="vitess-vschema-only"></a><strong>Vitess: VSchema Only</strong></summary>
+
+
+## Schema Change In Progress — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+### VSchema
+
+**`myapp_sharded`**: Applying...
+
+```diff
++ "xxhash": {"type": "xxhash"}
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="vitess-ddl--vschema"></a><strong>Vitess: DDL + VSchema</strong></summary>
+
+
+## Schema Change In Progress — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+🔗 **Deploy request**: https://app.planetscale.com/acme/myapp/deploy-requests/42
+
+### Table Progress
+
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+```
+
+
+### VSchema
+
+**`myapp_sharded`**: Applying...
+
+```diff
++ "xxhash": {"type": "xxhash"}
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="vitess-multikeyspace-vschema"></a><strong>Vitess: Multi-keyspace VSchema</strong></summary>
+
+
+## Schema Change In Progress — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+### VSchema
+
+**`commerce`**: Applied
+
+```diff
++ "lookup_orders": {"type": "lookup_hash"}
+```
+
+**`commerce_sharded`**: Applying...
+
+```diff
++ "xxhash": {"type": "xxhash"}
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="first-table-failed"></a><strong>First Table Failed</strong></summary>
 
 
-## ❌ Schema Change Failed
+## ❌ Schema Change Failed — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -2091,9 +2386,9 @@ schemabot apply -e staging
 <summary><a name="middle-table-failed"></a><strong>Middle Table Failed</strong></summary>
 
 
-## ❌ Schema Change Failed
+## ❌ Schema Change Failed — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -2135,9 +2430,9 @@ schemabot apply -e staging
 <summary><a name="stopped"></a><strong>Stopped</strong></summary>
 
 
-## ⏹️ Schema Change Stopped
+## ⏹️ Schema Change Stopped — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -2172,11 +2467,13 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 <summary><a name="resuming"></a><strong>Resuming</strong></summary>
 
 
-## Schema Change — Resuming
+## Schema Change In Progress — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Resuming
 
 ### Table Progress
 
@@ -2201,9 +2498,9 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="cancelled"></a><strong>Cancelled</strong></summary>
 
 
-## 🚫 Schema Change Cancelled
+## 🚫 Schema Change Cancelled — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -2234,11 +2531,13 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 <summary><a name="waiting-for-cutover"></a><strong>Waiting For Cutover</strong></summary>
 
 
-## Schema Change — Waiting for Cutover
+## Schema Change In Progress — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Waiting for Cutover
 
 **0/3** table(s) ready for cutover — waiting on 3
 
@@ -2280,11 +2579,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="cutting-over"></a><strong>Cutting Over</strong></summary>
 
 
-## Schema Change — Cutting Over
+## Schema Change In Progress — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Cutting Over
 
 **0/3** table(s) ready for cutover — waiting on 3
 
@@ -2383,9 +2684,9 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 <summary><a name="summary-completed"></a><strong>Summary: Completed</strong></summary>
 
 
-## ✅ Schema Change Applied
+## ✅ Schema Change Applied — Staging
 
-**Database**: `testapp` | **Environment**: `staging`
+**Database**: `testapp`
 
 
 > All 3 tables applied successfully — your schema changes are live!
@@ -2413,11 +2714,11 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 <summary><a name="summary-failed"></a><strong>Summary: Failed</strong></summary>
 
 
-## ❌ Schema Change Failed
+## ❌ Schema Change Failed — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 > ⚠️ **Error:** table users failed: schema change failed: unsafe warning: Field 'name' doesn't have a default value
 
@@ -2460,11 +2761,11 @@ schemabot apply -e staging
 <summary><a name="summary-stopped"></a><strong>Summary: Stopped</strong></summary>
 
 
-## ⏹️ Schema Change Stopped
+## ⏹️ Schema Change Stopped — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 45m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 45m
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 13:45:00 UTC*
 
 1 of 2 tables completed before stop.
 
@@ -2492,11 +2793,11 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 <summary><a name="summary-cancelled"></a><strong>Summary: Cancelled</strong></summary>
 
 
-## 🚫 Schema Change Cancelled
+## 🚫 Schema Change Cancelled — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 45m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 45m
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 13:45:00 UTC*
 
 1 of 2 tables completed before cancellation.
 
@@ -2521,9 +2822,9 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 <summary><a name="summary-completed-large"></a><strong>Summary: Completed (Large)</strong></summary>
 
 
-## ✅ Schema Change Applied
+## ✅ Schema Change Applied — Staging
 
-**Database**: `testapp` | **Environment**: `staging`
+**Database**: `testapp`
 
 
 > All 8 tables applied successfully — your schema changes are live!
@@ -2576,11 +2877,11 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 <summary><a name="summary-failed-large"></a><strong>Summary: Failed (Large)</strong></summary>
 
 
-## ❌ Schema Change Failed
+## ❌ Schema Change Failed — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 3h 30m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 3h 30m
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 11:00:00 UTC*
 
 > ⚠️ **Error:** Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'
 
@@ -2640,11 +2941,11 @@ schemabot apply -e staging
 <summary><a name="summary-multinamespace-failed"></a><strong>Summary: Multi-namespace Failed</strong></summary>
 
 
-## ❌ Schema Change Failed
+## ❌ Schema Change Failed — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
 
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
 > ⚠️ **Error:** table customers.addresses failed: Error 1205: Lock wait timeout exceeded
 
@@ -2697,9 +2998,9 @@ schemabot apply -e staging
 <summary><a name="summary-multinamespace-completed"></a><strong>Summary: Multi-namespace Completed</strong></summary>
 
 
-## ✅ Schema Change Applied
+## ✅ Schema Change Applied — Staging
 
-**Database**: `testapp` | **Environment**: `staging`
+**Database**: `testapp`
 
 
 > All 5 tables applied successfully — your schema changes are live!
@@ -2993,6 +3294,35 @@ Sequential mode: First complete, second running
 </details>
 
 <details>
+<summary><a name="mysql-multitable-second-table-checksumming"></a><strong>MySQL: Multi-table Second Table Checksumming</strong></summary>
+
+```
+
+Sequential mode: First complete, second checksumming
+
+┌──────────────────────────────────┐
+│  Apply ID:  apply-a1b2c3d4e5f6   │
+│  State:     Running              │
+│  Started:   Jan 15 14:05:00 UTC  │
+│  Duration:  25m                  │
+└──────────────────────────────────┘
+
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 🔍 Checksumming to verify data (60%)
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+       • Rows verified: 3,000,000 / 5,000,000
+
+     ~ products: ⏳ Queued
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+
+
+```
+</details>
+
+<details>
 <summary><a name="mysql-multitable-third-table-running"></a><strong>MySQL: Multi-table Third Table Running</strong></summary>
 
 ```
@@ -3172,7 +3502,6 @@ Use 'schemabot start' to resume from checkpoint.
 │  Database:     myapp                     │
 │  Environment:  staging                   │
 │  State:        Refreshing branch schema  │
-│  Branch:       my-reusable-branch        │
 └──────────────────────────────────────────┘
 
 
@@ -3189,7 +3518,6 @@ Use 'schemabot start' to resume from checkpoint.
 │  Database:     myapp                                      │
 │  Environment:  staging                                    │
 │  State:        Applied keyspace myapp_sharded_003 (8/12)  │
-│  Branch:       schemabot-myapp-28471035                   │
 └───────────────────────────────────────────────────────────┘
 
 
@@ -3201,13 +3529,12 @@ Use 'schemabot start' to resume from checkpoint.
 
 ```
 
-┌──────────────────────────────────────────┐
-│  Apply ID:     apply-a1b2c3d4e5f6        │
-│  Database:     myapp                     │
-│  Environment:  staging                   │
-│  State:        Validating branch         │
-│  Branch:       schemabot-myapp-28471035  │
-└──────────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Apply ID:     apply-a1b2c3d4e5f6  │
+│  Database:     myapp               │
+│  Environment:  staging             │
+│  State:        Validating branch   │
+└────────────────────────────────────┘
 
 
 ```
@@ -3218,13 +3545,12 @@ Use 'schemabot start' to resume from checkpoint.
 
 ```
 
-┌──────────────────────────────────────────┐
-│  Apply ID:     apply-a1b2c3d4e5f6        │
-│  Database:     myapp                     │
-│  Environment:  staging                   │
-│  State:        Creating deploy request   │
-│  Branch:       schemabot-myapp-28471035  │
-└──────────────────────────────────────────┘
+┌─────────────────────────────────────────┐
+│  Apply ID:     apply-a1b2c3d4e5f6       │
+│  Database:     myapp                    │
+│  Environment:  staging                  │
+│  State:        Creating deploy request  │
+└─────────────────────────────────────────┘
 
 
 ```
@@ -3240,7 +3566,6 @@ Use 'schemabot start' to resume from checkpoint.
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Validating deploy request                                    │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/42  │
 └────────────────────────────────────────────────────────────────────────────────┘
 
@@ -3284,7 +3609,6 @@ Use 'schemabot start' to resume from checkpoint.
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Running                                                      │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/42  │
 │  Started:         Jan 15 14:29:30 UTC                                          │
 │  Duration:        30s                                                          │
@@ -3310,7 +3634,6 @@ Use 'schemabot start' to resume from checkpoint.
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Completed                                                    │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/42  │
 │  Started:         Jan 15 14:28:30 UTC                                          │
 │  Duration:        1m 30s                                                       │
@@ -3336,7 +3659,6 @@ Use 'schemabot start' to resume from checkpoint.
 │  Database:        commerce                                                        │
 │  Environment:     production                                                      │
 │  State:           Completed                                                       │
-│  Branch:          schemabot-commerce-72511904                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/commerce/deploy-requests/86  │
 │  Started:         Jan 15 14:28:00 UTC                                             │
 │  Duration:        2m                                                              │
@@ -3369,7 +3691,6 @@ Use 'schemabot start' to resume from checkpoint.
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Failed                                                       │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/42  │
 │  Started:         Jan 15 14:29:00 UTC                                          │
 │  Duration:        1m                                                           │
@@ -3402,7 +3723,6 @@ The new apply will only process tables that haven't completed.
 │  Environment:     production                                                   │
 │  State:           Waiting for deploy                                           │
 │  Options:         ⏸️ Defer Deploy                                              │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/50  │
 │  Started:         Jan 15 14:29:30 UTC                                          │
 │  Duration:        30s                                                          │
@@ -3428,7 +3748,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Environment:     production                                                   │
 │  State:           Waiting for cutover                                          │
 │  Options:         ⏸️ Defer Cutover                                             │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/49  │
 │  Started:         Jan 15 14:27:00 UTC                                          │
 │  Duration:        3m                                                           │
@@ -3458,7 +3777,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Environment:     production                                                   │
 │  State:           Cutting over                                                 │
 │  Options:         ⏸️ Defer Cutover                                             │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/49  │
 │  Started:         Jan 15 14:26:00 UTC                                          │
 │  Duration:        4m                                                           │
@@ -3487,7 +3805,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Cancelled                                                    │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/50  │
 │  Started:         Jan 15 14:28:00 UTC                                          │
 │  Duration:        2m                                                           │
@@ -3516,7 +3833,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        commerce                                                        │
 │  Environment:     production                                                      │
 │  State:           Running                                                         │
-│  Branch:          schemabot-commerce-99182746                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/commerce/deploy-requests/28  │
 │  Started:         Jan 15 14:18:00 UTC                                             │
 │  Duration:        12m                                                             │
@@ -3553,7 +3869,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        commerce                                                        │
 │  Environment:     production                                                      │
 │  State:           Running                                                         │
-│  Branch:          schemabot-commerce-99182746                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/commerce/deploy-requests/29  │
 │  Started:         Jan 15 14:22:00 UTC                                             │
 │  Duration:        8m                                                              │
@@ -3613,7 +3928,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 </details>
 
 <details>
-<summary><a name="vitess-vschemaonly-update"></a><strong>Vitess: Vschema-only Update</strong></summary>
+<summary><a name="vitess-vschema-only-update"></a><strong>Vitess: VSchema Only Update</strong></summary>
 
 ```
 
@@ -3622,16 +3937,36 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Running                                                      │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/43  │
 │  Started:         Jan 15 14:29:50 UTC                                          │
 │  Duration:        10s                                                          │
 └────────────────────────────────────────────────────────────────────────────────┘
 
+    ~ VSchema (myapp_sharded): Applying...
+       + "xxhash": {"type": "xxhash"}
 
-  ── myapp_sharded ──
 
-    ~ VSchema: Applying...
+```
+</details>
+
+<details>
+<summary><a name="vitess-multikeyspace-vschema"></a><strong>Vitess: Multi-keyspace VSchema</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     staging                                                      │
+│  State:           Running                                                      │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/46  │
+│  Started:         Jan 15 14:29:50 UTC                                          │
+│  Duration:        10s                                                          │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+    ~ VSchema (commerce): Applied
+       + "lookup_orders": {"type": "lookup_hash"}
+    ~ VSchema (commerce_sharded): Applying...
        + "xxhash": {"type": "xxhash"}
 
 
@@ -3648,7 +3983,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Running                                                      │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/44  │
 │  Started:         Jan 15 14:29:40 UTC                                          │
 │  Duration:        20s                                                          │
@@ -3685,7 +4019,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Running                                                      │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/45  │
 │  Started:         Jan 15 14:29:30 UTC                                          │
 │  Duration:        30s                                                          │
@@ -3694,16 +4027,11 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 
   ── myapp_sharded ──
 
-    ~ VSchema: Applying...
-       + "xxhash": {"type": "xxhash"}
-
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
-
-  ── myapp ──
-
-    ~ VSchema: Applied
+    ~ VSchema (myapp_sharded): Applying...
+       + "xxhash": {"type": "xxhash"}
 
 
 ```
@@ -3719,7 +4047,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Running                                                      │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/46  │
 │  Started:         Jan 15 14:29:15 UTC                                          │
 │  Duration:        45s                                                          │
@@ -3748,7 +4075,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        myapp                                                        │
 │  Environment:     production                                                   │
 │  State:           Running                                                      │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/51  │
 │  Started:         Jan 15 14:25:00 UTC                                          │
 │  Duration:        5m                                                           │
@@ -3821,7 +4147,7 @@ Vitess plan: DDL + VSchema changes in a sharded keyspace
 </details>
 
 <details>
-<summary><a name="vitess-plan-vschemaonly"></a><strong>Vitess: Plan (Vschema-only)</strong></summary>
+<summary><a name="vitess-plan-vschema-only"></a><strong>Vitess: Plan (VSchema Only)</strong></summary>
 
 ```
 
@@ -3927,7 +4253,6 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Completed                                                    │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/47  │
 │  Started:         Jan 15 14:29:57 UTC                                          │
 │  Duration:        3s                                                           │
@@ -3953,7 +4278,6 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
 │  Database:           myapp                                                        │
 │  Environment:        production                                                   │
 │  State:              Revert window                                                │
-│  Branch:             schemabot-myapp-28471035                                     │
 │  Deploy Request:     https://app.planetscale.com/my-org/myapp/deploy-requests/48  │
 │  Started:            Jan 15 14:28:00 UTC                                          │
 │  Duration:           30s                                                          │
@@ -4224,9 +4548,9 @@ No schema changes found for database 'new-db'
 <summary><a name="apply-gate-schema-change-apply-lock--confirm"></a><strong>Apply Gate: Schema Change Apply (Lock + Confirm)</strong></summary>
 
 
-## Schema Change Apply
+## Schema Change Apply — Staging
 
-**Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
@@ -4279,9 +4603,9 @@ schemabot unlock
 <summary><a name="apply-gate-schema-change-apply-with-options"></a><strong>Apply Gate: Schema Change Apply (With Options)</strong></summary>
 
 
-## Schema Change Apply
+## Schema Change Apply — Staging
 
-**Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
@@ -4336,9 +4660,9 @@ schemabot unlock
 <summary><a name="apply-started"></a><strong>Apply Started</strong></summary>
 
 
-## Schema Change In Progress
+## Schema Change In Progress — Staging
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6`
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -4351,9 +4675,9 @@ Schema changes are being applied. Progress updates will be posted as new comment
 <summary><a name="unlock-success"></a><strong>Unlock Success</strong></summary>
 
 
-## 🔓 Lock Released
+## 🔓 Lock Released — Staging
 
-**Database**: `testapp` | **Environment**: `staging`
+**Database**: `testapp`
 
 *Released by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -4366,9 +4690,9 @@ The database is now available for schema changes.
 <summary><a name="apply-blocked-by-other-pr"></a><strong>Apply Blocked By Other PR</strong></summary>
 
 
-## 🔒 Apply Blocked
+## 🔒 Apply Blocked — Staging
 
-**Database**: `testapp` | **Environment**: `staging`
+**Database**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -4386,9 +4710,9 @@ Wait for the other PR to complete or ask the lock holder to run `schemabot unloc
 <summary><a name="apply-blocked-by-cli"></a><strong>Apply Blocked By CLI</strong></summary>
 
 
-## 🔒 Apply Blocked
+## 🔒 Apply Blocked — Staging
 
-**Database**: `testapp` | **Environment**: `staging`
+**Database**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -4409,9 +4733,9 @@ schemabot unlock -d testapp --force
 <summary><a name="apply-already-in-progress"></a><strong>Apply Already In Progress</strong></summary>
 
 
-## ⚠️ Apply Already In Progress
+## ⚠️ Apply Already In Progress — Staging
 
-**Database**: `testapp` | **Environment**: `staging`
+**Database**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
@@ -4426,9 +4750,9 @@ Wait for it to complete or stop it first.
 <summary><a name="no-lock-found"></a><strong>No Lock Found</strong></summary>
 
 
-## 🔒 No Lock Found
+## 🔒 No Lock Found — Staging
 
-**Database**: `testapp` | **Environment**: `staging`
+**Database**: `testapp`
 
 No apply lock is held for this database. Run `apply` first to generate a plan and acquire the lock.
 
@@ -4443,9 +4767,9 @@ schemabot apply -e staging
 <summary><a name="blocked-by-prior-env-pending"></a><strong>Blocked By Prior Env (Pending)</strong></summary>
 
 
-## ❌ Apply Blocked
+## ❌ Apply Blocked — Production
 
-**Database**: `testapp` | **Environment**: `production`
+**Database**: `testapp`
 
 Staging has pending changes. Apply staging first before applying to production.
 
@@ -4460,9 +4784,9 @@ schemabot apply -e staging
 <summary><a name="blocked-by-prior-env-failed"></a><strong>Blocked By Prior Env (Failed)</strong></summary>
 
 
-## ❌ Apply Blocked
+## ❌ Apply Blocked — Production
 
-**Database**: `testapp` | **Environment**: `production`
+**Database**: `testapp`
 
 Staging failed. Fix the issue and re-apply staging before applying to production.
 
@@ -4477,9 +4801,9 @@ schemabot apply -e staging
 <summary><a name="blocked-by-prior-env-in-progress"></a><strong>Blocked By Prior Env (In Progress)</strong></summary>
 
 
-## ⏳ Apply Blocked
+## ⏳ Apply Blocked — Production
 
-**Database**: `testapp` | **Environment**: `production`
+**Database**: `testapp`
 
 Staging is currently in progress. Wait for it to complete before applying to production.
 
@@ -4646,9 +4970,7 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 <summary><a name="checks-gate-not-passing"></a><strong>Checks Gate: Not Passing</strong></summary>
 
 
-## ❌ Apply Blocked
-
-**Environment**: `staging`
+## ❌ Apply Blocked — Staging
 
 Cannot apply while PR checks are not passing:
 
@@ -4669,9 +4991,7 @@ schemabot apply -e staging
 <summary><a name="checks-gate-in-progress"></a><strong>Checks Gate: In Progress</strong></summary>
 
 
-## ⏳ Apply Blocked
-
-**Environment**: `staging`
+## ⏳ Apply Blocked — Staging
 
 Cannot apply while PR checks are still running:
 
@@ -4695,9 +5015,9 @@ schemabot apply -e staging
 <summary><a name="barrier-rollout-in-progress"></a><strong>Barrier Rollout In Progress</strong></summary>
 
 
-## Schema Change In Progress
+## Schema Change In Progress — Production
 
-**Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 12m
+**Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
@@ -4718,11 +5038,13 @@ schemabot cutover apply-a1b2c3d4e5f6 -e production
 <details open>
 <summary>🟢 eu — ready for cutover — next in order</summary>
 
-## Schema Change — Waiting for Cutover
+## Schema Change In Progress — Production
 
-**Database**: `payments_eu` | **Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `payments_eu` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Status**: Waiting for Cutover
 
 **0/3** table(s) ready for cutover — waiting on 3
 
@@ -4761,9 +5083,9 @@ schemabot cutover apply-a1b2c3d4e5f6 -e production
 <details open>
 <summary>🔄 us — running table copy</summary>
 
-## Schema Change In Progress
+## Schema Change In Progress — Production
 
-**Database**: `payments_us` | **Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
@@ -4822,9 +5144,9 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="halt-on-failure-one-deployment-failed"></a><strong>Halt On Failure (One Deployment Failed)</strong></summary>
 
 
-## ❌ Schema Change Failed
+## ❌ Schema Change Failed — Production
 
-**Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 20m
+**Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
@@ -4847,9 +5169,9 @@ schemabot apply -e production
 <details>
 <summary>✅ eu — completed</summary>
 
-## ✅ Schema Change Applied
+## ✅ Schema Change Applied — Production
 
-**Database**: `payments_eu` | **Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `payments_eu` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
@@ -4881,9 +5203,9 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <details open>
 <summary>❌ us — failed</summary>
 
-## ❌ Schema Change Failed
+## ❌ Schema Change Failed — Production
 
-**Database**: `payments_us` | **Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
@@ -4941,9 +5263,9 @@ _No details available yet._
 <summary><a name="all-deployments-completed"></a><strong>All Deployments Completed</strong></summary>
 
 
-## ✅ Schema Change Applied
+## ✅ Schema Change Applied — Production
 
-**Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 28m
+**Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
@@ -4956,9 +5278,9 @@ _No details available yet._
 <details>
 <summary>✅ eu — completed</summary>
 
-## ✅ Schema Change Applied
+## ✅ Schema Change Applied — Production
 
-**Database**: `payments_eu` | **Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `payments_eu` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
@@ -4990,9 +5312,9 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <details>
 <summary>✅ us — completed</summary>
 
-## ✅ Schema Change Applied
+## ✅ Schema Change Applied — Production
 
-**Database**: `payments_us` | **Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
@@ -5024,9 +5346,9 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <details>
 <summary>✅ au — completed</summary>
 
-## ✅ Schema Change Applied
+## ✅ Schema Change Applied — Production
 
-**Database**: `payments_au` | **Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+**Database**: `payments_au` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
@@ -5061,9 +5383,9 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <summary><a name="summary-all-deployments-completed"></a><strong>Summary: All Deployments Completed</strong></summary>
 
 
-## ✅ Schema Change Applied
+## ✅ Schema Change Applied — Production
 
-**Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 28m
+**Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
@@ -5076,9 +5398,9 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <details>
 <summary>✅ eu — completed</summary>
 
-## ✅ Schema Change Applied
+## ✅ Schema Change Applied — Production
 
-**Database**: `payments_eu` | **Environment**: `production`
+**Database**: `payments_eu`
 
 
 > All 3 tables applied successfully — your schema changes are live!
@@ -5107,9 +5429,9 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 <details>
 <summary>✅ us — completed</summary>
 
-## ✅ Schema Change Applied
+## ✅ Schema Change Applied — Production
 
-**Database**: `payments_us` | **Environment**: `production`
+**Database**: `payments_us`
 
 
 > All 3 tables applied successfully — your schema changes are live!
@@ -5138,9 +5460,9 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 <details>
 <summary>✅ au — completed</summary>
 
-## ✅ Schema Change Applied
+## ✅ Schema Change Applied — Production
 
-**Database**: `payments_au` | **Environment**: `production`
+**Database**: `payments_au`
 
 
 > All 3 tables applied successfully — your schema changes are live!
@@ -5172,9 +5494,9 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 <summary><a name="summary-halt-on-failure-one-deployment-failed"></a><strong>Summary: Halt On Failure (One Deployment Failed)</strong></summary>
 
 
-## ❌ Schema Change Failed
+## ❌ Schema Change Failed — Production
 
-**Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 19m
+**Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
@@ -5197,9 +5519,9 @@ schemabot apply -e production
 <details>
 <summary>✅ eu — completed</summary>
 
-## ✅ Schema Change Applied
+## ✅ Schema Change Applied — Production
 
-**Database**: `payments_eu` | **Environment**: `production`
+**Database**: `payments_eu`
 
 
 > All 3 tables applied successfully — your schema changes are live!
@@ -5228,11 +5550,11 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 <details open>
 <summary>❌ us — failed</summary>
 
-## ❌ Schema Change Failed
+## ❌ Schema Change Failed — Production
 
-**Database**: `payments_us` | **Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6`
+**Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @aparajon at 2026-03-15 14:22:00 UTC*
 
 > ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
 
@@ -5936,7 +6258,7 @@ Environment: production
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
-       • Rows: 42,500 / 120,000
+       • Rows: 42,500 / 120,000 · ETA: 4m 0s
 
 
 ⏳ ap-south — waiting for eu-west (orders-ap-south)

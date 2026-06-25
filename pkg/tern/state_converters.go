@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/spirit/pkg/statement"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -278,14 +279,21 @@ func schemaFilesToProto(sf schema.SchemaFiles) map[string]*ternv1.SchemaFiles {
 // psMetadataForStorage is a subset of the PlanetScale engine's metadata
 // used for storing deploy request tracking data.
 type psMetadataForStorage struct {
-	BranchName       string     `json:"branch_name"`
-	DeployRequestID  uint64     `json:"deploy_request_id"`
-	DeployRequestURL string     `json:"deploy_request_url,omitempty"`
-	DeployedAt       *time.Time `json:"deployed_at,omitempty"`
-	IsInstant        bool       `json:"is_instant,omitempty"`
-	DeferredDeploy   bool       `json:"deferred_deploy,omitempty"`
-	VSchemaStatus    string     `json:"vschema_status,omitempty"`
-	VSchemaDiff      string     `json:"vschema_diff,omitempty"`
+	BranchName       string                `json:"branch_name"`
+	DeployRequestID  uint64                `json:"deploy_request_id"`
+	DeployRequestURL string                `json:"deploy_request_url,omitempty"`
+	DeployedAt       *time.Time            `json:"deployed_at,omitempty"`
+	IsInstant        bool                  `json:"is_instant,omitempty"`
+	DeferredDeploy   bool                  `json:"deferred_deploy,omitempty"`
+	VSchemaStatus    string                `json:"vschema_status,omitempty"`
+	VSchemaDiffs     []vschemaKeyspaceDiff `json:"vschema_diffs,omitempty"`
+}
+
+// vschemaKeyspaceDiff mirrors the PlanetScale engine's per-keyspace VSchema diff
+// shape so the stored-state projection can decode it.
+type vschemaKeyspaceDiff struct {
+	Namespace string `json:"namespace"`
+	Diff      string `json:"diff"`
 }
 
 func decodePSMetadataForStorage(s string) (*psMetadataForStorage, error) {
@@ -333,11 +341,25 @@ func PSDisplayMetadata(resumeStateMetadata string) (map[string]string, error) {
 	if meta.DeferredDeploy {
 		set("deferred_deploy", "true")
 	}
-	if meta.VSchemaStatus != "" {
-		set("vschema_status", meta.VSchemaStatus)
-	}
-	if meta.VSchemaDiff != "" {
-		set("vschema_diff", meta.VSchemaDiff)
+	// Per-keyspace VSchema state. Mirrors the engine's live projection: every
+	// changed keyspace carries the deploy-level status, encoded as JSON so the
+	// CLI and PR comment decode it via apitypes.ParseVSchemaChanges.
+	if len(meta.VSchemaDiffs) > 0 {
+		changes := make([]apitypes.VSchemaChange, 0, len(meta.VSchemaDiffs))
+		for _, d := range meta.VSchemaDiffs {
+			changes = append(changes, apitypes.VSchemaChange{
+				Namespace: d.Namespace,
+				Status:    meta.VSchemaStatus,
+				Diff:      d.Diff,
+			})
+		}
+		encoded, err := apitypes.EncodeVSchemaChanges(changes)
+		if err != nil {
+			return nil, fmt.Errorf("encode planetscale vschema changes for display: %w", err)
+		}
+		if encoded != "" {
+			set(apitypes.VSchemaChangesMetadataKey, encoded)
+		}
 	}
 	return m, nil
 }

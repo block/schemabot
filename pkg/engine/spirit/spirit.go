@@ -483,33 +483,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 
 	// If Spirit provides per-table progress, use it
 	if len(spiritProgress.Tables) > 0 {
-		for _, st := range spiritProgress.Tables {
-			rowsCopied := int64(st.RowsCopied)
-			rowsTotal := int64(st.RowsTotal)
-			tp := engine.TableProgress{
-				Namespace:  rm.tableNamespace[st.TableName],
-				Table:      st.TableName,
-				DDL:        ddlByTable[st.TableName],
-				State:      stateStr,
-				RowsCopied: rowsCopied,
-				RowsTotal:  rowsTotal,
-			}
-			// Calculate percent (clamp to 100 — concurrent inserts can cause RowsCopied > RowsTotal)
-			if st.RowsTotal > 0 {
-				tp.Progress = min(int(float64(st.RowsCopied)/float64(st.RowsTotal)*100), 100)
-			}
-
-			// Build progress detail string (ETA is shown at status line level, not per-table)
-			if st.RowsTotal > 0 {
-				tp.ProgressDetail = fmt.Sprintf("%d/%d %d%% copyRows",
-					st.RowsCopied, st.RowsTotal, tp.Progress)
-			}
-			if st.IsComplete {
-				tp.State = "completed"
-				tp.Progress = 100
-			}
-			tableProgress = append(tableProgress, tp)
-		}
+		tableProgress = buildSpiritTableProgress(spiritProgress, stateStr, ddlByTable, rm.tableNamespace)
 	} else {
 		// Fallback: no per-table progress available
 		for i, tableName := range rm.tables {
@@ -547,6 +521,52 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		Tables:       tableProgress,
 		ResumeState:  req.ResumeState,
 	}, nil
+}
+
+// buildSpiritTableProgress maps Spirit's per-table progress into engine
+// TableProgress. Spirit reports a single remaining row-copy estimate for the
+// whole runner, so the ETA is surfaced on the tables still copying that have an
+// established row total; completed tables keep 0, as do tables without a total
+// yet and estimates that aren't ready (still measuring the copy rate, or
+// essentially done).
+func buildSpiritTableProgress(prog status.Progress, stateStr string, ddlByTable, tableNamespace map[string]string) []engine.TableProgress {
+	var etaSeconds int64
+	if prog.ETA.State == status.ETAReady {
+		etaSeconds = int64(prog.ETA.Duration.Seconds())
+	}
+	tableProgress := make([]engine.TableProgress, 0, len(prog.Tables))
+	for _, st := range prog.Tables {
+		tp := engine.TableProgress{
+			Namespace:  tableNamespace[st.TableName],
+			Table:      st.TableName,
+			DDL:        ddlByTable[st.TableName],
+			State:      stateStr,
+			RowsCopied: int64(st.RowsCopied),
+			RowsTotal:  int64(st.RowsTotal),
+		}
+		// Calculate percent (clamp to 100 — concurrent inserts can cause RowsCopied > RowsTotal)
+		if st.RowsTotal > 0 {
+			tp.Progress = min(int(float64(st.RowsCopied)/float64(st.RowsTotal)*100), 100)
+			tp.ProgressDetail = fmt.Sprintf("%d/%d %d%% copyRows",
+				st.RowsCopied, st.RowsTotal, tp.Progress)
+		}
+		if st.IsComplete {
+			tp.State = "completed"
+			tp.Progress = 100
+		} else if st.RowsTotal > 0 {
+			tp.ETASeconds = etaSeconds
+		}
+		// Spirit reports a single runner-wide checksum estimate (rows verified so
+		// far / total to verify), populated only during the verify phase and zero
+		// otherwise. Surface it on the tables still in flight so consumers can
+		// render verify progress; completed tables keep zero.
+		if !st.IsComplete {
+			tp.ChecksumRowsChecked = int64(prog.Checksum.RowsChecked)
+			tp.ChecksumRowsTotal = int64(prog.Checksum.RowsTotal)
+		}
+		tableProgress = append(tableProgress, tp)
+	}
+	return tableProgress
 }
 
 // progressState resolves the state reported for a progress poll. The tracked

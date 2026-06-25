@@ -88,6 +88,22 @@ func TestDeriveApplyState_AnyRunning(t *testing.T) {
 	}
 }
 
+// Checksumming is a table-level state, not an apply state: while tables verify
+// their copied data the apply as a whole is still running, so it derives to
+// RUNNING rather than a distinct apply state.
+func TestDeriveApplyState_ChecksummingDerivesRunning(t *testing.T) {
+	testCases := [][]string{
+		{"checksumming"},
+		{"CHECKSUMMING"},
+		{"RUNNING", "checksumming"},
+		{"COMPLETED", "checksumming", "PENDING"},
+	}
+
+	for _, states := range testCases {
+		assert.Equal(t, Apply.Running, DeriveApplyState(states), "input: %v", states)
+	}
+}
+
 func TestDeriveApplyState_AllWaitingForDeploy(t *testing.T) {
 	states := []string{"WAITING_FOR_DEPLOY", "WAITING_FOR_DEPLOY"}
 	assert.Equal(t, Apply.WaitingForDeploy, DeriveApplyState(states))

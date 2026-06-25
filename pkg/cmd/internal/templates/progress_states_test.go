@@ -5,6 +5,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
@@ -192,6 +193,26 @@ func TestFormatTableProgress_ChangeTypeSymbol(t *testing.T) {
 	}
 }
 
+// A checksumming table renders its verify progress rather than a row-copy
+// percent — its copy is done and the engine is now verifying the data, which
+// can run for hours on a large table.
+func TestFormatTableProgress_Checksumming(t *testing.T) {
+	// Before Spirit reports a total, the verify shows an indeterminate label.
+	measuring := FormatTableProgress(TableProgress{
+		TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
+	})
+	assert.Contains(t, measuring, "orders: ")
+	assert.Contains(t, measuring, "🔍 Checksumming to verify data...")
+
+	// Once a total is known, it shows how far the verify has progressed.
+	withProgress := FormatTableProgress(TableProgress{
+		TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
+		ChecksumRowsChecked: 321450, ChecksumRowsTotal: 1466232,
+	})
+	assert.Contains(t, withProgress, "🔍 Checksumming to verify data (21%)")
+	assert.Contains(t, withProgress, "Rows verified: 321,450 / 1,466,232")
+}
+
 func TestFormatTableProgress_InstantDDL(t *testing.T) {
 	tp := TableProgress{
 		TableName:  "users",
@@ -259,6 +280,27 @@ func TestFormatTableProgress_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing
 	assert.NotContains(t, output, " 0%")
 }
 
+// A Spirit row-copy reports its detail string and a structured ETA. The CLI
+// renders the ETA from the structured field (the same source and FormatETA the
+// PR comment uses), so the two surfaces show an identical "Rows … · ETA …" line
+// even though the detail string itself no longer carries the ETA.
+func TestFormatTableProgress_RowCopyShowsStructuredETA(t *testing.T) {
+	tp := TableProgress{
+		TableName:       "users",
+		ChangeType:      "alter",
+		Status:          state.Apply.Running,
+		RowsCopied:      45_000,
+		RowsTotal:       100_000,
+		PercentComplete: 45,
+		ETASeconds:      340,
+		ProgressDetail:  "45000/100000 45% copyRows",
+	}
+
+	output := FormatTableProgress(tp)
+
+	assert.Contains(t, output, "Rows: 45,000 / 100,000 · ETA: 5m 40s")
+}
+
 func TestFormatTableProgress_FailedRetryableKeepsProgress(t *testing.T) {
 	t.Run("with progress", func(t *testing.T) {
 		tp := TableProgress{
@@ -322,20 +364,23 @@ func TestFormatTableProgress_EstimateExceeded(t *testing.T) {
 
 func TestFormatVSchemaStatus(t *testing.T) {
 	// No VSchema change → nothing rendered.
-	assert.Empty(t, FormatVSchemaStatus("", ""))
+	assert.Empty(t, FormatVSchemaStatus(nil))
 
-	// Status only.
-	applying := FormatVSchemaStatus("applying", "")
-	assert.Contains(t, applying, "VSchema")
-	assert.Contains(t, applying, "Applying")
+	// A single keyspace renders its name, status, and diff.
+	single := FormatVSchemaStatus([]apitypes.VSchemaChange{
+		{Namespace: "commerce", Status: "applied", Diff: "--- a/commerce.json\n+++ b/commerce.json\n+  \"new_table\": {}"},
+	})
+	assert.Contains(t, single, "VSchema (commerce)")
+	assert.Contains(t, single, "Applied")
+	assert.Contains(t, single, "new_table")
 
-	applied := FormatVSchemaStatus("applied", "")
-	assert.Contains(t, applied, "Applied")
-
-	// Status + diff: the diff is rendered with the VSchema status.
-	withDiff := FormatVSchemaStatus("applied", "--- a/commerce.json\n+++ b/commerce.json\n+  \"new_table\": {}")
-	assert.Contains(t, withDiff, "Applied")
-	assert.Contains(t, withDiff, "new_table")
+	// Multiple keyspaces each render independently, with their own status.
+	multi := FormatVSchemaStatus([]apitypes.VSchemaChange{
+		{Namespace: "commerce", Status: "applied", Diff: `+ "lookup": {}`},
+		{Namespace: "commerce_sharded", Status: "applying", Diff: `+ "xxhash": {}`},
+	})
+	assert.Contains(t, multi, "VSchema (commerce): Applied")
+	assert.Contains(t, multi, "VSchema (commerce_sharded): Applying...")
 }
 
 func TestStateColorFunc_PlanetScalePhases(t *testing.T) {

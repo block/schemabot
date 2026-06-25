@@ -50,7 +50,12 @@ func (cmd *LogsCmd) Run(g *Globals) error {
 
 // showLogs displays logs once and exits.
 func showLogs(endpoint, database, environment, applyID string, limit int) error {
-	logs, err := client.GetLogs(endpoint, database, environment, applyID, limit)
+	var logs []*client.LogEntry
+	err := withLoading("Loading logs...", true, func() error {
+		var loadErr error
+		logs, loadErr = client.GetLogs(endpoint, database, environment, applyID, limit)
+		return loadErr
+	})
 	if err != nil {
 		return err
 	}

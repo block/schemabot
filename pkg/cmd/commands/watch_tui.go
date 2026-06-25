@@ -68,7 +68,7 @@ type tableProgress struct {
 	RowsCopied     int64
 	RowsTotal      int64
 	Percent        int
-	ETA            string
+	ETASeconds     int64
 	ProgressDetail string
 	IsInstant      bool
 	Shards         []shardProgress

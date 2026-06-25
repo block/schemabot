@@ -430,15 +430,17 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	})
 
 	// First progress tick after resume rotates the progress comment. While the
-	// apply is in the Resuming window the comment renders state-only: the row-copy
-	// percent is indeterminate (continuation vs fresh copy), so no bar is shown.
+	// apply is in the Resuming window the comment keeps the stable in-progress
+	// title and renders state-only: the row-copy percent is indeterminate
+	// (continuation vs fresh copy), so no bar is shown.
 	obs.OnProgress(apply, []*storage.Task{task})
 
 	var newProgressID int64
 	select {
 	case created := <-capture.creates:
 		newProgressID = created.ID
-		assert.Contains(t, created.Body, "Schema Change — Resuming")
+		assert.Contains(t, created.Body, "Schema Change In Progress — Staging")
+		assert.Contains(t, created.Body, "**Status**: Resuming")
 		assert.Contains(t, created.Body, "Resuming…")
 		assert.NotContains(t, created.Body, "Stopped")
 		assert.NotContains(t, created.Body, "50%", "the indeterminate resume window must not show a stale percent")

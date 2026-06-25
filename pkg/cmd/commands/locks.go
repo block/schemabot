@@ -17,7 +17,12 @@ func (cmd *LocksCmd) Run(g *Globals) error {
 		return err
 	}
 
-	locks, err := client.ListLocks(ep)
+	var locks []*client.LockInfo
+	err = withLoading("Loading locks...", true, func() error {
+		var loadErr error
+		locks, loadErr = client.ListLocks(ep)
+		return loadErr
+	})
 	if err != nil {
 		return fmt.Errorf("list locks: %w", err)
 	}

@@ -3,6 +3,7 @@ package commands
 import (
 	"fmt"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -29,7 +30,12 @@ func (cmd *VolumeCmd) Run(g *Globals) error {
 	}
 
 	// Check current state first
-	result, err := client.GetProgress(ep, cmd.ApplyID)
+	var result *apitypes.ProgressResponse
+	err = withLoading("Loading schema change progress...", true, func() error {
+		var loadErr error
+		result, loadErr = client.GetProgress(ep, cmd.ApplyID)
+		return loadErr
+	})
 	if err != nil {
 		return fmt.Errorf("get progress: %w", err)
 	}
@@ -48,7 +54,12 @@ func (cmd *VolumeCmd) Run(g *Globals) error {
 	}
 
 	// Call volume API
-	volumeResult, err := client.CallVolumeAPI(ep, cmd.Environment, cmd.ApplyID, cmd.Volume)
+	var volumeResult *apitypes.VolumeResponse
+	err = withLoading("Updating schema change volume...", true, func() error {
+		var volumeErr error
+		volumeResult, volumeErr = client.CallVolumeAPI(ep, cmd.Environment, cmd.ApplyID, cmd.Volume)
+		return volumeErr
+	})
 	if err != nil {
 		return err
 	}

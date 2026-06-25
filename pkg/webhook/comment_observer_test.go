@@ -19,12 +19,20 @@ import (
 // without a database.
 type stubApplyOperationStore struct {
 	storage.ApplyOperationStore
-	ops []*storage.ApplyOperation
-	err error
+	ops        []*storage.ApplyOperation
+	err        error
+	resumeByOp map[int64]*storage.EngineResumeState
 }
 
 func (s *stubApplyOperationStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
 	return s.ops, s.err
+}
+
+func (s *stubApplyOperationStore) GetEngineResumeState(_ context.Context, opID int64) (*storage.EngineResumeState, error) {
+	if rs, ok := s.resumeByOp[opID]; ok {
+		return rs, nil
+	}
+	return nil, storage.ErrEngineResumeStateNotFound
 }
 
 // stubStorage exposes only the ApplyOperations accessor the comment dispatch
@@ -37,11 +45,80 @@ type stubStorage struct {
 
 func (s *stubStorage) ApplyOperations() storage.ApplyOperationStore { return s.ops }
 
+func (s *stubStorage) Tasks() storage.TaskStore { return stubTaskStore{} }
+
+// stubTaskStore supplies the per-shard read the comment dispatch path makes; the
+// routing tests have no shard rows, so it returns none.
+type stubTaskStore struct {
+	storage.TaskStore
+}
+
+func (stubTaskStore) GetShardProgressByApplyOperationID(context.Context, int64) ([]*storage.Task, error) {
+	return nil, nil
+}
+
 func newDispatchTestObserver(opStore storage.ApplyOperationStore) *CommentObserver {
 	return &CommentObserver{
 		stor:   &stubStorage{ops: opStore},
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
+}
+
+// VSchema status must reach real PR comments through the production observer
+// path: comments are built from storage (buildApplyCommentData), and VSchema is
+// projected from each operation's engine resume metadata — the comment path
+// never reads a progress response. These cases drive that path end to end from a
+// stubbed resume state, covering the progress comment, the terminal summary, a
+// multi-keyspace deploy, and the fail-soft cases that must render no section.
+func TestCommentObserverRendersVSchemaFromEngineResumeState(t *testing.T) {
+	const opID = 7
+	psApply := func(s string) *storage.Apply {
+		return &storage.Apply{
+			ApplyIdentifier: "apply-1", Database: "commerce", Environment: "production",
+			State: s, Engine: storage.EnginePlanetScale,
+		}
+	}
+	observer := func(blob string) *CommentObserver {
+		stub := &stubApplyOperationStore{ops: []*storage.ApplyOperation{{ID: opID, Deployment: "eu", State: state.ApplyOperation.Running}}}
+		if blob != "" {
+			stub.resumeByOp = map[int64]*storage.EngineResumeState{opID: {Metadata: blob}}
+		}
+		return newDispatchTestObserver(stub)
+	}
+
+	t.Run("progress comment shows the applying keyspace and diff", func(t *testing.T) {
+		body := observer(`{"vschema_status":"applying","vschema_diffs":[{"namespace":"commerce_sharded","diff":"+ \"xxhash\": {\"type\": \"xxhash\"}"}]}`).
+			formatStatusComment(psApply(state.Apply.Running), nil)
+		assert.Contains(t, body, "### VSchema")
+		assert.Contains(t, body, "**`commerce_sharded`**: Applying...")
+		assert.Contains(t, body, `+ "xxhash": {"type": "xxhash"}`)
+	})
+
+	t.Run("terminal summary of a VSchema-only apply reports the VSchema outcome", func(t *testing.T) {
+		body := observer(`{"vschema_status":"applied","vschema_diffs":[{"namespace":"commerce_sharded","diff":"+ \"xxhash\": {}"}]}`).
+			formatTerminalSummaryComment(psApply(state.Apply.Completed))
+		assert.Contains(t, body, "VSchema applied successfully")
+		assert.Contains(t, body, "**`commerce_sharded`**: Applied")
+		assert.NotContains(t, body, "0 tables")
+	})
+
+	t.Run("multi-keyspace renders each keyspace independently", func(t *testing.T) {
+		body := observer(`{"vschema_status":"applying","vschema_diffs":[{"namespace":"commerce","diff":"+ \"lookup\": {}"},{"namespace":"commerce_sharded","diff":"+ \"xxhash\": {}"}]}`).
+			formatStatusComment(psApply(state.Apply.Running), nil)
+		assert.Contains(t, body, "**`commerce`**: Applying...")
+		assert.Contains(t, body, "**`commerce_sharded`**: Applying...")
+	})
+
+	t.Run("no engine resume state renders no VSchema section", func(t *testing.T) {
+		body := observer("").formatStatusComment(psApply(state.Apply.Running), nil)
+		assert.NotContains(t, body, "### VSchema")
+	})
+
+	t.Run("non-PlanetScale apply skips VSchema projection", func(t *testing.T) {
+		body := observer(`{"vschema_status":"applying","vschema_diffs":[{"namespace":"x","diff":"+ y"}]}`).
+			formatStatusComment(runningApply(), nil)
+		assert.NotContains(t, body, "### VSchema")
+	})
 }
 
 // A multi-deployment apply renders the aggregated comment: the observer loads
@@ -92,7 +169,7 @@ func TestFormatTerminalSummaryCommentRoutesMultiDeployment(t *testing.T) {
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Completed},
 	}})
 
-	body := o.formatTerminalSummaryComment(completedApply(), nil)
+	body := o.formatTerminalSummaryComment(completedApply())
 
 	assert.Contains(t, body, "## ✅ Schema Change Applied")
 	assert.Contains(t, body, "**Deployments**: 2 completed")
@@ -107,7 +184,7 @@ func TestFormatTerminalSummaryCommentRoutesSingleDeployment(t *testing.T) {
 		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
 	}})
 
-	body := o.formatTerminalSummaryComment(completedApply(), nil)
+	body := o.formatTerminalSummaryComment(completedApply())
 
 	assert.Contains(t, body, "## ✅ Schema Change Applied")
 	assert.NotContains(t, body, "**Deployments**:")
@@ -118,7 +195,7 @@ func TestFormatTerminalSummaryCommentRoutesSingleDeployment(t *testing.T) {
 func TestFormatTerminalSummaryCommentFallsBackOnLoadError(t *testing.T) {
 	o := newDispatchTestObserver(&stubApplyOperationStore{err: errors.New("db unavailable")})
 
-	body := o.formatTerminalSummaryComment(completedApply(), nil)
+	body := o.formatTerminalSummaryComment(completedApply())
 
 	assert.Contains(t, body, "## ✅ Schema Change Applied")
 	assert.NotContains(t, body, "**Deployments**:")
