@@ -486,6 +486,13 @@ type EtreVitessConfig struct {
 	// APIURL is the PlanetScale-compatible API base URL; a per-target override in
 	// the credential secret takes precedence.
 	APIURL string `yaml:"api_url,omitempty"`
+	// HostField is the entity field holding the vtgate host used for SHOW
+	// VITESS_MIGRATIONS progress. Optional: when unset (or the credentials carry
+	// no MySQL username) the target is API-only and progress falls back to the
+	// deploy-request state.
+	HostField string `yaml:"host_field,omitempty"`
+	// DefaultPort is appended to the vtgate host when it carries no port.
+	DefaultPort string `yaml:"default_port,omitempty"`
 }
 
 // EtreCredentialsConfig configures credentials for an Etre-resolved target.

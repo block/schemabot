@@ -413,6 +413,35 @@ func PreviewCommentDropColumnBlocked() string {
 	})
 }
 
+// PreviewCommentDropIndexBlocked renders a sample plan where a destructive
+// index drop is blocked until query performance has been reviewed.
+func PreviewCommentDropIndexBlocked() string {
+	return RenderUnsafeChangesBlocked(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `customers` DROP INDEX `idx_customers_email`;",
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{
+				Table:  "customers",
+				Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`",
+			},
+		},
+	})
+}
+
 // PreviewCommentApplyPlan renders a sample locked apply-plan comment.
 func PreviewCommentApplyPlan() string {
 	return RenderPlanComment(PlanCommentData{

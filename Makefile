@@ -575,7 +575,11 @@ test-unit: ## Run unit tests with race detection
 # Note: -race is omitted because Spirit (upstream) has known data races in
 # Runner.initChunkers/Progress. Our unit tests cover race detection for our code.
 test-integration: ## Run integration tests
-	$(GOTEST) -tags=integration -timeout=10m ./...
+	# -p=2 caps package-level parallelism: the integration suite runs many heavy
+	# MySQL/Spirit package binaries that otherwise thrash CPU and the shared
+	# MySQL, starving operator claim loops and causing spurious pending-apply
+	# timeouts.
+	$(GOTEST) -tags=integration -timeout=10m -p=2 ./...
 
 # Run tests with coverage (unit + integration, merged per-package breakdown)
 #   make test-coverage              # Unit + integration (requires Docker for testcontainers)

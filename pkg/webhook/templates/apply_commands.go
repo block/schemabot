@@ -123,7 +123,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 		}
 	}
 	sb.WriteString("\n")
-	writeUnsafeDropGuidance(&sb, data.UnsafeChanges)
+	writeUnsafeDropGuidance(&sb, data.UnsafeChanges, data.IsMySQL)
 
 	sb.WriteString("**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**\n")
 	applyCmd := fmt.Sprintf("schemabot apply -e %s", data.Environment)

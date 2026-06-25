@@ -145,9 +145,9 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	// Enrich with per-shard progress from SHOW VITESS_MIGRATIONS.
 	// Requires a vtgate DSN (Credentials.DSN) and a migration context
 	// (from the engine resume state) to query per-shard state.
-	hasMigrationContext := req.Credentials.DSN != "" &&
-		req.ResumeState != nil && req.ResumeState.MigrationContext != ""
-	if hasMigrationContext {
+	hasVtgateDSN := req.Credentials.DSN != ""
+	hasMigrationContext := req.ResumeState != nil && req.ResumeState.MigrationContext != ""
+	if hasVtgateDSN && hasMigrationContext {
 		tables, overallProgress := e.queryVitessMigrations(ctx, client, req.Database, req.Credentials, req.ResumeState.MigrationContext)
 		e.logger.Debug("vitess migrations queried",
 			"database", req.Database,
@@ -161,10 +161,14 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 			}
 		}
 	} else {
+		// No per-shard/row-copy progress this poll. A missing vtgate DSN is a target
+		// resolution gap that persists for the whole apply (warned once at apply
+		// start); an unset MigrationContext is transient during setup/recovery.
+		// Either way the comment and CLI fall back to deploy-request state.
 		e.logger.Debug("skipping per-shard progress",
 			"database", req.Database,
-			"has_vtgate_dsn", req.Credentials.DSN != "",
-			"has_migration_context", req.ResumeState != nil && req.ResumeState.MigrationContext != "",
+			"has_vtgate_dsn", hasVtgateDSN,
+			"has_migration_context", hasMigrationContext,
 		)
 	}
 

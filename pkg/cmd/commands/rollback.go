@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
@@ -26,8 +27,12 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 	}
 
 	// Step 1: Generate rollback plan from the specified apply
-	fmt.Println("Generating rollback plan...")
-	planResult, err := client.CallRollbackPlanAPI(ep, cmd.ApplyID, cmd.Environment)
+	var planResult *apitypes.PlanResponse
+	err = withLoading("Generating rollback plan...", true, func() error {
+		var planErr error
+		planResult, planErr = client.CallRollbackPlanAPI(ep, cmd.ApplyID, cmd.Environment)
+		return planErr
+	})
 	if err != nil {
 		return err
 	}
@@ -37,7 +42,12 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 	dbType := planResult.DatabaseType
 
 	// Check for existing active schema change
-	active, err := client.CheckActiveSchemaChange(ep, database, environment)
+	var active *client.ActiveSchemaChange
+	err = withLoading("Checking active schema changes...", true, func() error {
+		var checkErr error
+		active, checkErr = client.CheckActiveSchemaChange(ep, database, environment)
+		return checkErr
+	})
 	if err != nil {
 		// Ignore status preflight errors; apply is still guarded server-side.
 	} else if active != nil && active.State != "" {
@@ -109,7 +119,12 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 	// Step 4: Acquire lock and apply the rollback
 	owner := client.GenerateCLIOwner()
 
-	existingLock, err := client.GetLock(ep, database, dbType)
+	var existingLock *client.LockInfo
+	err = withLoading("Checking database lock...", true, func() error {
+		var lockErr error
+		existingLock, lockErr = client.GetLock(ep, database, dbType)
+		return lockErr
+	})
 	if err != nil {
 		return fmt.Errorf("check lock: %w", err)
 	}
@@ -125,7 +140,10 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 		return fmt.Errorf("database is locked")
 	}
 
-	_, err = client.AcquireLock(ep, database, dbType, owner, "", 0)
+	err = withLoading("Acquiring database lock...", true, func() error {
+		_, lockErr := client.AcquireLock(ep, database, dbType, owner, "", 0)
+		return lockErr
+	})
 	if errors.Is(err, client.ErrLockHeld) {
 		return fmt.Errorf("database is locked by another user")
 	}

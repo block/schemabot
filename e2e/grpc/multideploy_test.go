@@ -656,3 +656,132 @@ func TestGRPCMultiDeploy_OnFailureContinue(t *testing.T) {
 
 	multiDeployEnsureNoActiveChange(t, database, env, first, second)
 }
+
+// barrierReleaseDeadline bounds how long a deployment parked at the cutover
+// barrier may remain parked once its ordered predecessor has completed. Unlike
+// orderedCutoverDeadline, which spans the variable copy phases of the whole
+// rollout, this is a short post-barrier deadline: by the time it starts the
+// predecessor is already completed, so the only remaining work is the ordered
+// cutover claim picking up and driving the parked successor.
+const barrierReleaseDeadline = testutil.PollDeadline
+
+// TestGRPCMultiDeploy_BarrierReleaseBounded guards the remote-drive ordered
+// cutover wiring: a deployment parked at the cutover barrier must be released
+// and driven to completion promptly once its predecessor completes — it must
+// never be stranded at the barrier waiting for a cutover claim that never comes.
+//
+// Scenario: testapp/production fans out to deployments [eu, us] with
+// deployment_order [eu, us] and cutover_policy: barrier, each backed by its own
+// remote Tern over gRPC. Both deployments run a full copy-swap and park at the
+// cutover barrier (waiting_for_cutover); no operator cutover is triggered, so
+// the deployment-ordered cutover claim alone must drive both swaps in order. The
+// later deployment (us) parks behind the earlier one (eu); once eu completes, us
+// must be released from the barrier and reach completed within a short bounded
+// deadline. If the remote-drive cutover wiring regresses such that the barrier
+// release is never propagated to the parked operation, us stays parked and this
+// test fails fast at barrierReleaseDeadline with a message naming the stranded
+// deployment — rather than hanging until the broad rollout deadline.
+func TestGRPCMultiDeploy_BarrierReleaseBounded(t *testing.T) {
+	requireMultiDeploy(t)
+
+	const (
+		database = "testapp"
+		env      = "production"
+	)
+	// Matches deployment_order in grpc-schemabot-multideploy.yaml.
+	first, second := "eu", "us"
+
+	tableName := uniqueGRPCTableName("md_barrier_release")
+	createDDL := fmt.Sprintf(
+		"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT)", tableName)
+
+	// Seed both deployments so each runs a full copy-swap (not instant DDL),
+	// giving the barrier a real window in which the later deployment parks.
+	for _, d := range []string{first, second} {
+		multiDeployCreateTestTable(t, d, tableName, createDDL)
+		multiDeploySeedRows(t, d, tableName, "name, data",
+			"CONCAT('user_', seq), REPEAT('x', 200)", 10000)
+	}
+
+	multiDeployEnsureNoActiveChange(t, database, env, first, second)
+
+	// Widen the primary key from INT to BIGINT to force a full table copy on
+	// every deployment.
+	plan := grpcPlan(t, database, env, map[string]string{
+		tableName + ".sql": fmt.Sprintf(
+			"CREATE TABLE %s (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT);", tableName),
+	})
+	require.Empty(t, plan.Errors, "plan errors: %v", plan.Errors)
+	require.NotEmpty(t, plan.PlanID, "plan_id")
+
+	// No defer_cutover: the operations auto-defer under barrier policy and
+	// release their claim for the deployment-ordered cutover drive. Passing
+	// defer_cutover here would switch to the manual cutover contract, in which
+	// the operator holds the claim — a different code path from the remote-drive
+	// wiring this test guards.
+	apply := grpcApply(t, plan.PlanID, env, nil)
+	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
+
+	// Phase 1: wait until the later deployment parks at the cutover barrier. The
+	// ordering invariant holds throughout — the later deployment must never
+	// complete before the earlier one.
+	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
+		func() bool {
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
+			require.Falsef(t, failedApplyState(ops[first].State), "%s operation failed: %s", first, ops[first].ErrorMessage)
+			require.Falsef(t, failedApplyState(ops[second].State), "%s operation failed: %s", second, ops[second].ErrorMessage)
+			if state.IsState(ops[second].State, state.Apply.Completed) {
+				require.Truef(t, state.IsState(ops[first].State, state.Apply.Completed),
+					"barrier violated: %s completed while %s was %q", second, first, ops[first].State)
+			}
+			return state.IsState(ops[second].State, state.Apply.WaitingForCutover)
+		},
+		func() string {
+			ops := multiDeployOperationStates(t, apply.ApplyID)
+			return fmt.Sprintf("waiting for %s to park at the cutover barrier; %s=%q %s=%q",
+				second, first, ops[first].State, second, ops[second].State)
+		},
+	)
+
+	// Phase 2: wait for the earlier deployment to complete its ordered cutover,
+	// still holding the ordering invariant.
+	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
+		func() bool {
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
+			require.Falsef(t, failedApplyState(ops[first].State), "%s operation failed: %s", first, ops[first].ErrorMessage)
+			require.Falsef(t, failedApplyState(ops[second].State), "%s operation failed: %s", second, ops[second].ErrorMessage)
+			if state.IsState(ops[second].State, state.Apply.Completed) {
+				require.Truef(t, state.IsState(ops[first].State, state.Apply.Completed),
+					"barrier violated: %s completed while %s was %q", second, first, ops[first].State)
+			}
+			return state.IsState(ops[first].State, state.Apply.Completed)
+		},
+		func() string {
+			ops := multiDeployOperationStates(t, apply.ApplyID)
+			return fmt.Sprintf("waiting for %s to complete its ordered cutover; %s=%q %s=%q",
+				first, first, ops[first].State, second, ops[second].State)
+		},
+	)
+
+	// Phase 3 — the guard: the earlier deployment is completed and the later one
+	// was observed parked at the barrier, so the only remaining work is the
+	// ordered cutover claim releasing and driving the parked successor. It must
+	// reach completed within the short post-barrier deadline; a stranded barrier
+	// fails here fast rather than hanging until the broad rollout deadline.
+	testutil.Poll(t, barrierReleaseDeadline, testutil.PollInterval,
+		func() bool {
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
+			require.Truef(t, state.IsState(ops[first].State, state.Apply.Completed),
+				"%s regressed from completed to %q", first, ops[first].State)
+			require.Falsef(t, failedApplyState(ops[second].State), "%s operation failed: %s", second, ops[second].ErrorMessage)
+			return state.IsState(ops[second].State, state.Apply.Completed)
+		},
+		func() string {
+			ops := multiDeployOperationStates(t, apply.ApplyID)
+			return fmt.Sprintf("barrier did not release %s within %s after %s completed; %s=%q %s=%q",
+				second, barrierReleaseDeadline, first, first, ops[first].State, second, ops[second].State)
+		},
+	)
+
+	multiDeployEnsureNoActiveChange(t, database, env, first, second)
+}

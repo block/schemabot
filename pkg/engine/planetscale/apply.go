@@ -55,6 +55,18 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		"database", req.Database,
 	)
 
+	// Per-shard and row-copy progress come from SHOW VITESS_MIGRATIONS, which the
+	// engine reads over a vtgate MySQL connection. With API credentials but no
+	// vtgate DSN the apply still runs (DDL goes through the PlanetScale API), but
+	// progress degrades to the deploy-request state only — no rows, no per-shard
+	// breakdown. Surface it once per apply so a blank progress bar is explained
+	// rather than a silent skip. (A nil Credentials fails hard in getClient below,
+	// so it is not the degraded-progress case and is not warned here.)
+	if req.Credentials != nil && req.Credentials.DSN == "" {
+		e.logger.Warn("vitess apply has no vtgate DSN: per-shard and row-copy progress will be unavailable (deploy-request state only); check the target resolver's vtgate endpoint and credentials",
+			"database", req.Database, "plan_id", req.PlanID)
+	}
+
 	client, err := e.getClient(req.Credentials)
 	if err != nil {
 		return nil, fmt.Errorf("get planetscale client: %w", err)

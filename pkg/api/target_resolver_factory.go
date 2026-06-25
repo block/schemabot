@@ -129,7 +129,7 @@ func buildEtreResolver(ctx context.Context, cfg EtreConfig, logger *slog.Logger)
 		TargetLabel:     cfg.TargetLabel,
 		Labels:          cfg.Labels,
 		EnvLabel:        cfg.EnvLabel,
-		HostField:       cfg.MySQL.HostField,
+		HostField:       etreHostField(cfg),
 		AttributeFields: resolverAttributeFields(cfg),
 		Credentials:     creds,
 		Assembler:       assembler,
@@ -144,6 +144,17 @@ func buildEtreResolver(ctx context.Context, cfg EtreConfig, logger *slog.Logger)
 // Vitess assembles PlanetScale API metadata and decodes a token secret rather
 // than a username/password. A new engine (postgres) is a new case here; an
 // unsupported type fails closed.
+// etreHostField returns the entity field holding the connection host for the
+// configured engine. MySQL/Strata resolve a MySQL host; Vitess resolves the
+// optional vtgate host used for SHOW VITESS_MIGRATIONS progress (its own block,
+// since it is independent of the PlanetScale API connection).
+func etreHostField(cfg EtreConfig) string {
+	if cfg.DatabaseType == storage.DatabaseTypeVitess {
+		return cfg.Vitess.HostField
+	}
+	return cfg.MySQL.HostField
+}
+
 func etreAssembler(cfg EtreConfig) (inventory.ConnectionAssembler, inventory.SecretDecoder, error) {
 	switch cfg.DatabaseType {
 	case "":
@@ -160,6 +171,7 @@ func etreAssembler(cfg EtreConfig) (inventory.ConnectionAssembler, inventory.Sec
 		return inventory.VitessConnectionAssembler{
 			OrganizationAttribute: cfg.Vitess.OrganizationAttribute,
 			APIURL:                cfg.Vitess.APIURL,
+			DefaultPort:           cfg.Vitess.DefaultPort,
 		}, inventory.DecodePlanetScaleSecret, nil
 	default:
 		return nil, nil, fmt.Errorf("target_resolver.etre.database_type %q is not supported", cfg.DatabaseType)

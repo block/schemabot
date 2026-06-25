@@ -29,7 +29,12 @@ func (cmd *DatabasesCmd) Run(g *Globals) error {
 		return err
 	}
 
-	resp, err := client.ListDatabases(ep, client.ListDatabasesOptions{Type: cmd.Type})
+	var resp *apitypes.DatabaseListResponse
+	err = withLoading("Loading databases...", !cmd.JSON, func() error {
+		var loadErr error
+		resp, loadErr = client.ListDatabases(ep, client.ListDatabasesOptions{Type: cmd.Type})
+		return loadErr
+	})
 	if err != nil {
 		return fmt.Errorf("list databases: %w", err)
 	}

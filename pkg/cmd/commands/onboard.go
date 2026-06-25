@@ -38,7 +38,12 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 	if err != nil {
 		return err
 	}
-	resp, err := client.CallPullSchemaAPI(ep, cmd.Database, cmd.Type, cmd.Environment, pullNamespaces...)
+	var resp *apitypes.PullSchemaResponse
+	err = withLoading("Pulling live schema...", true, func() error {
+		var pullErr error
+		resp, pullErr = client.CallPullSchemaAPI(ep, cmd.Database, cmd.Type, cmd.Environment, pullNamespaces...)
+		return pullErr
+	})
 	if err != nil {
 		if outputSchemaPullRequestError("Onboard", cmd.Database, cmd.Environment, err) {
 			return ErrSilent
@@ -289,7 +294,12 @@ func formatOnboardWriteError(operation, path string, written []string, err error
 }
 
 func verifyOnboardPlan(endpoint string, resp *apitypes.PullSchemaResponse, schemaDir string) error {
-	planResult, err := client.CallPlanAPI(endpoint, resp.Database, resp.Type, resp.Environment, schemaDir, "", 0)
+	var planResult *apitypes.PlanResponse
+	err := withLoading("Verifying pulled schema...", true, func() error {
+		var planErr error
+		planResult, planErr = client.CallPlanAPI(endpoint, resp.Database, resp.Type, resp.Environment, schemaDir, "", 0)
+		return planErr
+	})
 	if err != nil {
 		if outputPlanRequestError(resp.Database, resp.Environment, err) {
 			return ErrSilent

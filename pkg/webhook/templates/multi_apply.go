@@ -113,7 +113,11 @@ func writeAggregateMetadata(sb *strings.Builder, data MultiDeploymentApplyData, 
 		fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID),
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
-	writeAppliedByOrTimestampAt(sb, data.RequestedBy, renderedAt)
+	attributionAt := renderedAt
+	if data.RequestedBy == "" {
+		attributionAt = startedAtDisplay(data.StartedAt, renderedAt)
+	}
+	writeAppliedByOrTimestampAt(sb, data.RequestedBy, attributionAt)
 }
 
 // writeDeploymentCounts writes the per-status histogram so an operator sees

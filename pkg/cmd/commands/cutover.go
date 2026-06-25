@@ -26,7 +26,12 @@ func (cmd *CutoverCmd) Run(g *Globals) error {
 	}
 
 	// Check current state first
-	result, err := client.GetProgress(ep, cmd.ApplyID)
+	var result *apitypes.ProgressResponse
+	err = withLoading("Loading schema change progress...", true, func() error {
+		var loadErr error
+		result, loadErr = client.GetProgress(ep, cmd.ApplyID)
+		return loadErr
+	})
 	if err == nil {
 		populateControlDisplayFields(&cmd.Database, result)
 		if state.IsState(result.State, state.Apply.Completed) {
@@ -45,7 +50,12 @@ func (cmd *CutoverCmd) Run(g *Globals) error {
 	}
 
 	// Trigger cutover
-	cutoverResult, err := client.CallCutoverAPI(ep, cmd.Environment, cmd.ApplyID)
+	var cutoverResult *apitypes.ControlResponse
+	err = withLoading("Requesting cutover...", true, func() error {
+		var cutoverErr error
+		cutoverResult, cutoverErr = client.CallCutoverAPI(ep, cmd.Environment, cmd.ApplyID)
+		return cutoverErr
+	})
 	if err != nil {
 		return err
 	}

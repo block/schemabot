@@ -154,7 +154,11 @@ jobs:
           key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Test"
-        run: go test -tags=integration -timeout=10m -count=1 $(go list -tags=integration ./... | grep -v /localscale)
+        # Cap package-level parallelism: the integration suite runs many heavy
+        # MySQL/Spirit package binaries that otherwise thrash CPU and the shared
+        # MySQL, starving operator claim loops and causing spurious pending-apply
+        # timeouts. Two lanes keeps wall time within the job budget.
+        run: go test -tags=integration -timeout=10m -count=1 -p=2 $(go list -tags=integration ./... | grep -v /localscale)
 
   localscale-matrix:
     name: "LocalScale Matrix"
