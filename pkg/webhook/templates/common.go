@@ -23,6 +23,31 @@ func humanizeState(s string) string {
 	return capitalizeFirst(strings.ReplaceAll(s, "_", " "))
 }
 
+func environmentTitleSuffix(environment string) string {
+	environment = strings.TrimSpace(environment)
+	if environment == "" {
+		return ""
+	}
+	return " — " + capitalizeFirst(environment)
+}
+
+func titleLabel(value string) string {
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == '-' || r == '_' || r == ' '
+	})
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		parts[i] = strings.ToUpper(part[:1]) + strings.ToLower(part[1:])
+	}
+	return strings.Join(parts, " ")
+}
+
+func writeEnvironmentTitle(sb *strings.Builder, title, environment string) {
+	fmt.Fprintf(sb, "## %s%s\n\n", title, environmentTitleSuffix(environment))
+}
+
 // TimestampFunc is the function used to generate timestamps in templates.
 // Override in previews/tests to produce deterministic output.
 var TimestampFunc = func() string {
@@ -136,4 +161,11 @@ func writeDBEnvLine(sb *strings.Builder, database, environment string) {
 	} else {
 		fmt.Fprintf(sb, "**Database**: `%s`\n", database)
 	}
+}
+
+func writeDBLine(sb *strings.Builder, database string) {
+	if database == "" {
+		return
+	}
+	fmt.Fprintf(sb, "**Database**: `%s`\n", database)
 }

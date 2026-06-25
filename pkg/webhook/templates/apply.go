@@ -81,6 +81,7 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 
 	// Metadata line
 	writeApplyMetadata(&sb, data, renderedAt)
+	writeApplyStatusDetail(&sb, data.State)
 
 	// Cutover readiness summary
 	if data.State == state.Apply.WaitingForCutover || data.State == state.Apply.CuttingOver {
@@ -113,70 +114,94 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 // writeApplyHeader writes the comment header with a state-specific title.
 func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	switch data.State {
-	case state.Apply.Pending:
-		sb.WriteString("## Schema Change Starting\n\n")
-	case state.Apply.Running, state.Apply.RunningDegraded:
+	case state.Apply.Pending,
+		state.Apply.Running,
+		state.Apply.RunningDegraded,
+		state.Apply.FailedRetryable,
+		state.Apply.WaitingForDeploy,
+		state.Apply.WaitingForCutover,
+		state.Apply.Recovering,
+		state.Apply.Resuming,
+		state.Apply.CuttingOver,
+		state.Apply.PreparingBranch,
+		state.Apply.ApplyingBranchChanges,
+		state.Apply.ValidatingBranch,
+		state.Apply.CreatingDeployRequest,
+		state.Apply.ValidatingDeployRequest:
 		// running_degraded is a continue rollout still in flight past a failed
 		// sibling: the change is still in progress, and the failed deployment is
 		// surfaced in the per-deployment breakdown, not the headline.
-		sb.WriteString("## Schema Change In Progress\n\n")
-	case state.Apply.FailedRetryable:
-		// Operator recovery retries the apply automatically, so it is still
-		// in progress from the user's perspective. The retry detail is
-		// surfaced per table in the progress section, not in the headline.
-		sb.WriteString("## Schema Change In Progress\n\n")
-	case state.Apply.WaitingForDeploy:
-		sb.WriteString("## Schema Change — Waiting for Deploy\n\n")
-	case state.Apply.WaitingForCutover:
-		sb.WriteString("## Schema Change — Waiting for Cutover\n\n")
-	case state.Apply.Recovering:
-		sb.WriteString("## Schema Change — Recovering\n\n")
-	case state.Apply.Resuming:
-		sb.WriteString("## Schema Change — Resuming\n\n")
-	case state.Apply.CuttingOver:
-		sb.WriteString("## Schema Change — Cutting Over\n\n")
+		writeEnvironmentTitle(sb, "Schema Change In Progress", data.Environment)
 	case state.Apply.RevertWindow:
-		sb.WriteString("## Schema Change Applied (Pending Revert)\n\n")
+		writeEnvironmentTitle(sb, "Schema Change Applied (Pending Revert)", data.Environment)
 	case state.Apply.Completed:
-		sb.WriteString("## ✅ Schema Change Applied\n\n")
+		writeEnvironmentTitle(sb, "✅ Schema Change Applied", data.Environment)
 	case state.Apply.Failed:
-		sb.WriteString("## ❌ Schema Change Failed\n\n")
+		writeEnvironmentTitle(sb, "❌ Schema Change Failed", data.Environment)
 	case state.Apply.Stopped:
-		sb.WriteString("## ⏹️ Schema Change Stopped\n\n")
+		writeEnvironmentTitle(sb, "⏹️ Schema Change Stopped", data.Environment)
 	case state.Apply.Reverted:
-		sb.WriteString("## ↩️ Schema Change Reverted\n\n")
+		writeEnvironmentTitle(sb, "↩️ Schema Change Reverted", data.Environment)
 	case state.Apply.Cancelled:
-		sb.WriteString("## 🚫 Schema Change Cancelled\n\n")
-	case state.Apply.PreparingBranch:
-		sb.WriteString("## Schema Change — Preparing Branch\n\n")
-	case state.Apply.ApplyingBranchChanges:
-		sb.WriteString("## Schema Change — Applying Branch Changes\n\n")
-	case state.Apply.ValidatingBranch:
-		sb.WriteString("## Schema Change — Validating Branch\n\n")
-	case state.Apply.CreatingDeployRequest:
-		sb.WriteString("## Schema Change — Creating Deploy Request\n\n")
-	case state.Apply.ValidatingDeployRequest:
-		sb.WriteString("## Schema Change — Validating Deploy Request\n\n")
+		writeEnvironmentTitle(sb, "🚫 Schema Change Cancelled", data.Environment)
 	default:
-		fmt.Fprintf(sb, "## Schema Change — %s\n\n", humanizeState(data.State))
+		if state.IsTerminalApplyState(data.State) {
+			writeEnvironmentTitle(sb, fmt.Sprintf("Schema Change: %s", humanizeState(data.State)), data.Environment)
+		} else {
+			writeEnvironmentTitle(sb, "Schema Change In Progress", data.Environment)
+		}
 	}
 }
 
-// writeApplyMetadata writes the database, environment, apply ID, elapsed time, and requester info.
+// writeApplyMetadata writes the database, apply ID, and requester info.
 func writeApplyMetadata(sb *strings.Builder, data ApplyStatusCommentData, renderedAt string) {
 	var parts []string
 	parts = append(parts, fmt.Sprintf("**Database**: `%s`", data.Database))
-	if data.Environment != "" {
-		parts = append(parts, fmt.Sprintf("**Environment**: `%s`", data.Environment))
-	}
 	if data.ApplyID != "" {
 		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
 	}
-	if elapsed := applyElapsed(data); elapsed != "" {
-		parts = append(parts, fmt.Sprintf("**Elapsed**: %s", elapsed))
-	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
 	writeAppliedByOrTimestampAt(sb, data.RequestedBy, renderedAt)
+}
+
+func writeApplyStatusDetail(sb *strings.Builder, applyState string) {
+	detail := applyStatusDetail(applyState)
+	if detail == "" {
+		return
+	}
+	fmt.Fprintf(sb, "\n**Status**: %s\n", detail)
+}
+
+func applyStatusDetail(applyState string) string {
+	switch applyState {
+	case state.Apply.Pending:
+		return "Starting"
+	case state.Apply.WaitingForDeploy:
+		return "Waiting for Deploy"
+	case state.Apply.WaitingForCutover:
+		return "Waiting for Cutover"
+	case state.Apply.Recovering:
+		return "Recovering"
+	case state.Apply.Resuming:
+		return "Resuming"
+	case state.Apply.CuttingOver:
+		return "Cutting Over"
+	case state.Apply.PreparingBranch:
+		return "Preparing Branch"
+	case state.Apply.ApplyingBranchChanges:
+		return "Applying Branch Changes"
+	case state.Apply.ValidatingBranch:
+		return "Validating Branch"
+	case state.Apply.CreatingDeployRequest:
+		return "Creating Deploy Request"
+	case state.Apply.ValidatingDeployRequest:
+		return "Validating Deploy Request"
+	default:
+		if applyState == "" || state.IsTerminalApplyState(applyState) || state.IsState(applyState, state.Apply.Running, state.Apply.RunningDegraded, state.Apply.FailedRetryable) {
+			return ""
+		}
+		return humanizeState(applyState)
+	}
 }
 
 // writeCutoverSummary writes a readiness summary for cutover states,
@@ -197,29 +222,6 @@ func writeCutoverSummary(sb *strings.Builder, tables []TableProgressData) {
 	} else {
 		fmt.Fprintf(sb, "\n**%d/%d** table(s) ready for cutover — waiting on %d\n", ready, total, total-ready)
 	}
-}
-
-// applyElapsed returns a human-readable elapsed duration.
-// For terminal states (completed/failed/stopped), it uses CompletedAt - StartedAt.
-// For in-progress states, it uses NowFunc() - StartedAt.
-func applyElapsed(data ApplyStatusCommentData) string {
-	if data.StartedAt == "" {
-		return ""
-	}
-	startTime, err := time.Parse(time.RFC3339, data.StartedAt)
-	if err != nil {
-		return ""
-	}
-	var end time.Time
-	if data.CompletedAt != "" {
-		end, err = time.Parse(time.RFC3339, data.CompletedAt)
-		if err != nil {
-			return ""
-		}
-	} else {
-		end = NowFunc()
-	}
-	return formatDuration(end.Sub(startTime))
 }
 
 // writeProgressSummary writes a one-line progress summary before the per-table breakdown.
@@ -751,7 +753,7 @@ func RenderApplySummaryComment(data ApplyStatusCommentData) string {
 	case state.Apply.Cancelled:
 		writeSummaryCancelled(&sb, data, completedCount, totalTables)
 	default:
-		fmt.Fprintf(&sb, "## Schema Change \u2014 %s\n\n", humanizeState(data.State))
+		writeEnvironmentTitle(&sb, fmt.Sprintf("Schema Change: %s", humanizeState(data.State)), data.Environment)
 		writeSummaryMetadata(&sb, data)
 	}
 
@@ -798,14 +800,10 @@ func writeSummaryCompleted(sb *strings.Builder, data ApplyStatusCommentData, tot
 }
 
 // writeSummaryCompletedMetadata writes a clean metadata line for completed applies.
-// Only shows database and environment — apply ID and duration are operational details
-// that add clutter without value for most users.
+// Only shows database — environment is already in the title, and apply ID plus
+// duration are operational details that add clutter without value for most users.
 func writeSummaryCompletedMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
-	if data.Environment != "" {
-		fmt.Fprintf(sb, "**Database**: `%s` | **Environment**: `%s`\n", data.Database, data.Environment)
-	} else {
-		fmt.Fprintf(sb, "**Database**: `%s`\n", data.Database)
-	}
+	writeDBLine(sb, data.Database)
 	sb.WriteString("\n")
 }
 
@@ -855,13 +853,9 @@ func writeSummaryCancelled(sb *strings.Builder, data ApplyStatusCommentData, com
 }
 
 func writeSummaryMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
-	// Combine database, environment, apply ID, and duration on one metadata line
+	// Combine database, apply ID, and duration on one metadata line.
 	var parts []string
-	if data.Environment != "" {
-		parts = append(parts, fmt.Sprintf("**Database**: `%s` | **Environment**: `%s`", data.Database, data.Environment))
-	} else {
-		parts = append(parts, fmt.Sprintf("**Database**: `%s`", data.Database))
-	}
+	parts = append(parts, fmt.Sprintf("**Database**: `%s`", data.Database))
 	if data.ApplyID != "" {
 		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
 	}

@@ -34,6 +34,27 @@ func TestRenderApplyBlockedByCLILockUsesValidUnlockCommand(t *testing.T) {
 	assert.NotContains(t, rendered, "schemabot unlock -d example-db -e staging --force")
 }
 
+func TestRenderApplyCommentsIncludeEnvironmentInTitle(t *testing.T) {
+	t.Run("status title", func(t *testing.T) {
+		rendered := RenderApplyStatusComment(ApplyStatusCommentData{
+			Database:    "testapp",
+			Environment: "production",
+			State:       state.Apply.Running,
+		})
+		firstLine, _, _ := strings.Cut(rendered, "\n")
+
+		assert.Equal(t, "## Schema Change In Progress — Production", firstLine)
+		assert.NotContains(t, rendered, "**Elapsed**")
+	})
+
+	t.Run("blocked title", func(t *testing.T) {
+		rendered := RenderApplyBlockedByPriorEnv("testapp", "production", "staging", "has pending changes", "Apply staging first")
+		firstLine, _, _ := strings.Cut(rendered, "\n")
+
+		assert.Equal(t, "## ❌ Apply Blocked — Production", firstLine)
+	})
+}
+
 func TestUnsafeDropUsageTarget(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -151,7 +172,8 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 	assert.Contains(t, result, "## Schema Change In Progress")
 	assert.Contains(t, result, "@aparajon")
 	assert.Contains(t, result, "`testapp`")
-	assert.Contains(t, result, "`staging`")
+	assert.Contains(t, result, "— Staging")
+	assert.NotContains(t, result, "**Environment**")
 	assert.Contains(t, result, "_Last updated: <relative-time datetime=\"2026-06-16T19:42:00Z\">2026-06-16 19:42:00 UTC</relative-time> (2026-06-16 19:42:00 UTC)_")
 	assert.NotContains(t, result, "**Last updated**")
 	// Progress summary
@@ -310,8 +332,8 @@ func TestRenderApplyStatusComment_ValidatingDeployRequest(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## Schema Change — Validating Deploy Request")
-	assert.NotContains(t, result, "## Schema Change In Progress")
+	assert.Contains(t, result, "## Schema Change In Progress")
+	assert.Contains(t, result, "**Status**: Validating Deploy Request")
 	assert.Contains(t, result, "To stop this schema change:")
 	assert.Contains(t, result, "schemabot stop apply-7aa13cf03496454b -e staging")
 }
@@ -624,7 +646,7 @@ func TestRenderApplyStatusComment_Resuming(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## Schema Change — Resuming")
+	assert.Contains(t, result, "## Schema Change In Progress")
 	assert.Contains(t, result, "🔄 Resuming…")
 	assert.NotContains(t, result, "21%", "the indeterminate resume window must not show the stale pre-stop percent")
 	assert.NotContains(t, result, "21,000 / 100,000", "the indeterminate resume window must not show stale row counts")
@@ -885,7 +907,7 @@ func TestPreviewCommentApplyStopped(t *testing.T) {
 func TestPreviewCommentApplyResuming(t *testing.T) {
 	result := PreviewCommentApplyResuming()
 
-	assert.Contains(t, result, "Schema Change — Resuming")
+	assert.Contains(t, result, "Schema Change In Progress")
 	assert.Contains(t, result, "🔄 Resuming…")
 	// The indeterminate resume window hides the stale pre-stop percent.
 	assert.NotContains(t, result, "72%")
@@ -1050,7 +1072,7 @@ func TestRenderApplyBlockedByNonPassingChecks(t *testing.T) {
 	result := RenderApplyBlockedByNonPassingChecks("staging", notPassing)
 
 	assert.Contains(t, result, "## ❌ Apply Blocked")
-	assert.Contains(t, result, "`staging`")
+	assert.Contains(t, result, "— Staging")
 	assert.Contains(t, result, "Cannot apply while PR checks are not passing")
 	assert.Contains(t, result, "| Check | Status |")
 	assert.Contains(t, result, "| `CI / unit-tests` | failure |")
@@ -1065,7 +1087,7 @@ func TestRenderApplyBlockedByNonPassingChecks_SingleCheck(t *testing.T) {
 
 	result := RenderApplyBlockedByNonPassingChecks("production", notPassing)
 
-	assert.Contains(t, result, "`production`")
+	assert.Contains(t, result, "— Production")
 	assert.Contains(t, result, "| `security-scan` | error |")
 	assert.Contains(t, result, "schemabot apply -e production")
 }
@@ -1073,13 +1095,13 @@ func TestRenderApplyBlockedByNonPassingChecks_SingleCheck(t *testing.T) {
 func TestRenderApplyBlockedByNonPassingChecks_EmptyList(t *testing.T) {
 	// Defensive guard: rendering with an empty slice must not emit an empty
 	// Markdown table (header row with zero data rows). It should fall back
-	// to a generic message that still preserves the header, environment,
+	// to a generic message that still preserves the environment-scoped header
 	// and retry block.
 	for _, notPassing := range [][]BlockingCheck{nil, {}} {
 		result := RenderApplyBlockedByNonPassingChecks("staging", notPassing)
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
-		assert.Contains(t, result, "**Environment**: `staging`")
+		assert.Contains(t, result, "— Staging")
 		assert.Contains(t, result, "Cannot apply while PR checks are not passing.")
 		assert.Contains(t, result, "Get the checks passing — fix failures and re-run cancelled or stale checks — then retry:\n```\nschemabot apply -e staging\n```",
 			"retry command must be inside a fenced code block immediately after the retry copy")
@@ -1097,7 +1119,7 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 		result := RenderApplyBlockedByCheckStatusError("staging", err, nil)
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
-		assert.Contains(t, result, "**Environment**: `staging`")
+		assert.Contains(t, result, "— Staging")
 		assert.Contains(t, result, "Unable to verify PR check statuses")
 		assert.Contains(t, result, "get combined commit status: 500 Internal Server Error")
 		assert.Contains(t, result, "Resolve the issue and retry:\n```\nschemabot apply -e staging\n```",
@@ -1113,7 +1135,7 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 		})
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
-		assert.Contains(t, result, "**Environment**: `production`")
+		assert.Contains(t, result, "— Production")
 		assert.Contains(t, result, "SchemaBot GitHub App `schemabot-prod`")
 		assert.Contains(t, result, "cannot read PR check statuses")
 		assert.Contains(t, result, "**Checks: Read**")
@@ -1145,7 +1167,7 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 		result := RenderApplyBlockedByCheckStatusError("staging", nil, nil)
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
-		assert.Contains(t, result, "**Environment**: `staging`")
+		assert.Contains(t, result, "— Staging")
 		assert.Contains(t, result, "Unable to verify PR check statuses.")
 		assert.Contains(t, result, "Retry:\n```\nschemabot apply -e staging\n```",
 			"retry command must be inside a fenced code block immediately after the retry copy")
@@ -1225,7 +1247,7 @@ func TestRenderApplyBlockedByInProgressChecks(t *testing.T) {
 	result := RenderApplyBlockedByInProgressChecks("staging", inProgress, nil)
 
 	assert.Contains(t, result, "⏳ Apply Blocked")
-	assert.Contains(t, result, "`staging`")
+	assert.Contains(t, result, "— Staging")
 	assert.Contains(t, result, "still running")
 	assert.Contains(t, result, "| `CI / unit-tests` | in_progress |")
 	assert.Contains(t, result, "| `CI / integration` | queued |")
@@ -1247,7 +1269,7 @@ func TestRenderApplyBlockedByInProgressChecks_NotReported(t *testing.T) {
 	result := RenderApplyBlockedByInProgressChecks("production", nil, notReported)
 
 	assert.Contains(t, result, "⏳ Apply Blocked")
-	assert.Contains(t, result, "`production`")
+	assert.Contains(t, result, "— Production")
 	assert.Contains(t, result, "have not reported on this commit")
 	assert.Contains(t, result, "| `Security scan` | not reported |")
 	assert.Contains(t, result, "If a check never reports, waiting will not unblock the apply.")
@@ -1283,13 +1305,13 @@ func TestRenderApplyBlockedByInProgressChecks_InProgressAndNotReported(t *testin
 func TestRenderApplyBlockedByInProgressChecks_EmptyList(t *testing.T) {
 	// Defensive guard: rendering with empty slices must not emit an empty
 	// Markdown table (header row with zero data rows). It should fall back
-	// to a generic message that still preserves the header, environment,
+	// to a generic message that still preserves the environment-scoped header
 	// and retry block.
 	for _, inProgress := range [][]BlockingCheck{nil, {}} {
 		result := RenderApplyBlockedByInProgressChecks("staging", inProgress, nil)
 
 		assert.Contains(t, result, "## ⏳ Apply Blocked")
-		assert.Contains(t, result, "**Environment**: `staging`")
+		assert.Contains(t, result, "— Staging")
 		assert.Contains(t, result, "Cannot apply until PR checks finish verifying this commit.")
 		assert.Contains(t, result, "Wait for checks to complete and retry:\n```\nschemabot apply -e staging\n```",
 			"retry command must be inside a fenced code block immediately after the retry copy")

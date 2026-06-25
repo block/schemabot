@@ -42,7 +42,7 @@ func TestRenderMultiDeploymentApplyComment_BarrierInProgress(t *testing.T) {
 	})
 
 	assert.Contains(t, out, "## Schema Change In Progress")
-	assert.Contains(t, out, "**Environment**: `production`")
+	assert.Contains(t, out, "— Production")
 	assert.Contains(t, out, "**Apply ID**: `apply-123`")
 	assert.Contains(t, out, "_Last updated: <relative-time datetime=\"2026-06-16T19:43:00Z\">2026-06-16 19:43:00 UTC</relative-time> (2026-06-16 19:43:00 UTC)_")
 	assert.NotContains(t, out, "**Last updated**")

@@ -109,6 +109,7 @@ const (
 
 	// Comment template previews (GitHub PR comments)
 	PreviewCommentPlan                  PreviewType = "comment_plan"                    // Plan comment with DDL changes + lint violations
+	PreviewCommentPlanTenant            PreviewType = "comment_plan_tenant"             // Tenant-targeted plan comment
 	PreviewCommentPlanEmpty             PreviewType = "comment_plan_empty"              // Plan comment with no changes
 	PreviewCommentNoManagedSchema       PreviewType = "comment_no_managed_schema"       // No managed schema changes in current PR
 	PreviewCommentReconcileInProgress   PreviewType = "comment_reconcile_in_progress"   // Empty diff with in-progress apply-owned state

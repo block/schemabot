@@ -573,7 +573,7 @@ func TestE2EPlanWithChanges(t *testing.T) {
 	// Verify plan comment was posted
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "## MySQL Schema Change Plan")
+		assert.Contains(t, body, "## Schema Change Plan")
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
 		assert.Contains(t, body, "staging")
@@ -873,7 +873,7 @@ func TestE2EMultiEnvPlan(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		// Should be a combined comment (not separate per env)
-		assert.Contains(t, body, "## MySQL Schema Change Plan")
+		assert.Contains(t, body, "## Schema Change Plan")
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
 
@@ -948,7 +948,7 @@ func TestE2EMultiEnvPlanDifferentChanges(t *testing.T) {
 	// Wait for the combined comment
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "## MySQL Schema Change Plan")
+		assert.Contains(t, body, "## Schema Change Plan")
 
 		// Plans differ: staging has no changes, production has changes
 		// Should NOT be deduplicated — should show separate sections
@@ -2390,7 +2390,7 @@ func TestE2EPlanUsesServerSideTarget(t *testing.T) {
 	// Verify plan comment was posted with the expected DDL
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "## MySQL Schema Change Plan")
+		assert.Contains(t, body, "## Schema Change Plan")
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
 	case <-time.After(10 * time.Second):
@@ -2654,7 +2654,7 @@ func TestE2ERollbackPlanViaWebhook(t *testing.T) {
 	// Step 5: Verify rollback plan comment was posted
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "## MySQL Schema Rollback Plan")
+		assert.Contains(t, body, "## Schema Rollback Plan")
 		assert.Contains(t, body, "DROP INDEX", "rollback should drop the index we added")
 		assert.Contains(t, body, "schemabot rollback-confirm -e staging")
 		assert.Contains(t, body, "schemabot unlock")

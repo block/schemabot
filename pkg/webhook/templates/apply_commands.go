@@ -95,8 +95,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 
 	// Render the full plan first (DDL, lint warnings, etc.) so the user can see
 	// what would change — but without a lock or confirm footer.
-	dbTypeLabel := schemaChangePlanDatabaseTypeLabel(data.DatabaseType, data.IsMySQL)
-	fmt.Fprintf(&sb, "## %s Schema Change Plan\n\n", dbTypeLabel)
+	writeEnvironmentTitle(&sb, "Schema Change Plan", data.Environment)
 
 	writePlanMetadata(&sb, data)
 	writePlanAttribution(&sb, data)
@@ -141,7 +140,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 func RenderApplyStarted(data ApplyStatusCommentData) string {
 	var sb strings.Builder
 
-	sb.WriteString("## Schema Change In Progress\n\n")
+	writeEnvironmentTitle(&sb, "Schema Change In Progress", data.Environment)
 	writeApplyMetadata(&sb, data, currentTimestamp())
 	sb.WriteString("\nSchema changes are being applied. Progress updates will be posted as new comments.\n")
 
@@ -176,8 +175,8 @@ func RenderApplyStopped(data ApplyStatusCommentData) string {
 func RenderUnlockSuccess(database, environment, releasedBy string) string {
 	var sb strings.Builder
 
-	sb.WriteString("## 🔓 Lock Released\n\n")
-	writeDBEnvLine(&sb, database, environment)
+	writeEnvironmentTitle(&sb, "🔓 Lock Released", environment)
+	writeDBLine(&sb, database)
 	fmt.Fprintf(&sb, "\n*Released by @%s at %s*\n", releasedBy, currentTimestamp())
 	sb.WriteString("\nThe database is now available for schema changes.\n")
 
@@ -188,8 +187,8 @@ func RenderUnlockSuccess(database, environment, releasedBy string) string {
 func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 	var sb strings.Builder
 
-	sb.WriteString("## 🔒 Apply Blocked\n\n")
-	writeDBEnvLine(&sb, data.Database, data.Environment)
+	writeEnvironmentTitle(&sb, "🔒 Apply Blocked", data.Environment)
+	writeDBLine(&sb, data.Database)
 	writeRequesterOrTimestamp(&sb, data.RequestedBy)
 	sb.WriteString("\n")
 
@@ -222,8 +221,8 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 func RenderApplyInProgress(data ApplyLockConflictData) string {
 	var sb strings.Builder
 
-	sb.WriteString("## ⚠️ Apply Already In Progress\n\n")
-	writeDBEnvLine(&sb, data.Database, data.Environment)
+	writeEnvironmentTitle(&sb, "⚠️ Apply Already In Progress", data.Environment)
+	writeDBLine(&sb, data.Database)
 	writeRequesterOrTimestamp(&sb, data.RequestedBy)
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "An apply is already running for this PR (apply ID: `%s`, state: `%s`).\n\n",
@@ -247,8 +246,8 @@ func RenderNoLocksFound() string {
 func RenderCannotUnlock(database, environment, applyID, applyState string) string {
 	var sb strings.Builder
 
-	sb.WriteString("## ⚠️ Cannot Unlock\n\n")
-	writeDBEnvLine(&sb, database, environment)
+	writeEnvironmentTitle(&sb, "⚠️ Cannot Unlock", environment)
+	writeDBLine(&sb, database)
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "An apply is currently active (apply ID: `%s`, state: `%s`).\n\n",
 		applyID, applyState)
@@ -261,8 +260,8 @@ func RenderCannotUnlock(database, environment, applyID, applyState string) strin
 func RenderApplyConfirmNoChanges(database, environment string) string {
 	var sb strings.Builder
 
-	sb.WriteString("## No Changes Detected\n\n")
-	writeDBEnvLine(&sb, database, environment)
+	writeEnvironmentTitle(&sb, "No Changes Detected", environment)
+	writeDBLine(&sb, database)
 	sb.WriteString("\nThe database is already up to date — no schema changes needed. Lock released.\n")
 
 	return sb.String()
@@ -286,8 +285,8 @@ type StaleSchemaRejectionData struct {
 func RenderStaleSchemaRejection(data StaleSchemaRejectionData) string {
 	var sb strings.Builder
 
-	sb.WriteString("## ⚠️ Rejected — new commits since discovery\n\n")
-	writeDBEnvLine(&sb, data.Database, data.Environment)
+	writeEnvironmentTitle(&sb, "⚠️ Rejected — new commits since discovery", data.Environment)
+	writeDBLine(&sb, data.Database)
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "Schema files were loaded at `%s`, but the current PR HEAD is `%s`. ", data.DiscoverySHA, data.CurrentSHA)
 	sb.WriteString("These files no longer match what is on the branch.\n\n")
@@ -320,8 +319,8 @@ type StalePlanRejectionData struct {
 func RenderStalePlanRejection(data StalePlanRejectionData) string {
 	var sb strings.Builder
 
-	sb.WriteString("## ⚠️ Rejected — the plan you confirmed is stale\n\n")
-	writeDBEnvLine(&sb, data.Database, data.Environment)
+	writeEnvironmentTitle(&sb, "⚠️ Rejected — the plan you confirmed is stale", data.Environment)
+	writeDBLine(&sb, data.Database)
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "The confirmation plan was rendered at `%s`, but the current PR HEAD is `%s`. ", data.PlanSHA, data.CurrentSHA)
 	sb.WriteString("New commits have landed since the plan was posted, so the DDL you reviewed no longer matches what is on the branch.\n\n")
@@ -339,8 +338,8 @@ func RenderStalePlanRejection(data StalePlanRejectionData) string {
 func RenderApplyConfirmNoLock(database, environment string) string {
 	var sb strings.Builder
 
-	sb.WriteString("## 🔒 No Lock Found\n\n")
-	writeDBEnvLine(&sb, database, environment)
+	writeEnvironmentTitle(&sb, "🔒 No Lock Found", environment)
+	writeDBLine(&sb, database)
 	sb.WriteString("\n")
 	sb.WriteString("No apply lock is held for this database. Run `apply` first to generate a plan and acquire the lock.\n\n")
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
@@ -353,8 +352,8 @@ func RenderApplyConfirmNoLock(database, environment string) string {
 func RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, action string) string {
 	var sb strings.Builder
 
-	sb.WriteString("## ❌ Apply Blocked\n\n")
-	writeDBEnvLine(&sb, database, environment)
+	writeEnvironmentTitle(&sb, "❌ Apply Blocked", environment)
+	writeDBLine(&sb, database)
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "%s %s. %s before applying to %s.\n\n", capitalizeFirst(priorEnv), status, action, environment)
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", priorEnv)
@@ -377,8 +376,7 @@ type BlockingCheck struct {
 func RenderApplyBlockedByNonPassingChecks(environment string, notPassing []BlockingCheck) string {
 	var sb strings.Builder
 
-	sb.WriteString("## ❌ Apply Blocked\n\n")
-	fmt.Fprintf(&sb, "**Environment**: `%s`\n\n", environment)
+	writeEnvironmentTitle(&sb, "❌ Apply Blocked", environment)
 	if len(notPassing) == 0 {
 		// Defensive: callers should only invoke this template when at least
 		// one non-passing check has been identified. Render a generic message
@@ -415,8 +413,7 @@ type CheckStatusAccessDetails struct {
 func RenderApplyBlockedByCheckStatusError(environment string, err error, details *CheckStatusAccessDetails) string {
 	var sb strings.Builder
 
-	sb.WriteString("## ❌ Apply Blocked\n\n")
-	fmt.Fprintf(&sb, "**Environment**: `%s`\n\n", environment)
+	writeEnvironmentTitle(&sb, "❌ Apply Blocked", environment)
 
 	if err != nil && strings.Contains(err.Error(), "Resource not accessible") {
 		app := "SchemaBot GitHub App"
@@ -474,8 +471,7 @@ func RenderApplyBlockedByCheckStatusError(environment string, err error, details
 func RenderApplyBlockedByInProgressChecks(environment string, inProgress, notReported []BlockingCheck) string {
 	var sb strings.Builder
 
-	sb.WriteString("## ⏳ Apply Blocked\n\n")
-	fmt.Fprintf(&sb, "**Environment**: `%s`\n\n", environment)
+	writeEnvironmentTitle(&sb, "⏳ Apply Blocked", environment)
 	if len(inProgress) == 0 && len(notReported) == 0 {
 		// Defensive: callers should only invoke this template when at least
 		// one in-progress or not-reported check has been identified. Render a
@@ -575,8 +571,8 @@ func RenderApplyBlockedByUntrustedPriorEnvCheck(priorEnv, checkName string, untr
 func RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv string) string {
 	var sb strings.Builder
 
-	sb.WriteString("## ⏳ Apply Blocked\n\n")
-	writeDBEnvLine(&sb, database, environment)
+	writeEnvironmentTitle(&sb, "⏳ Apply Blocked", environment)
+	writeDBLine(&sb, database)
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "%s is currently in progress. Wait for it to complete before applying to %s.\n\n", capitalizeFirst(priorEnv), environment)
 	fmt.Fprintf(&sb, "Once %s completes, retry:\n", priorEnv)
@@ -593,8 +589,7 @@ func RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv stri
 func RenderApplyBlockedByUnlistedEnvironment(environment string, promotionOrder []string) string {
 	var sb strings.Builder
 
-	sb.WriteString("## ❌ Apply Blocked\n\n")
-	fmt.Fprintf(&sb, "**Environment**: `%s`\n\n", environment)
+	writeEnvironmentTitle(&sb, "❌ Apply Blocked", environment)
 	fmt.Fprintf(&sb, "`%s` is not in the configured promotion order, so SchemaBot cannot determine which environments must be applied before it and cannot enforce staging-first ordering.\n\n", environment)
 	if len(promotionOrder) > 0 {
 		fmt.Fprintf(&sb, "Configured promotion order: `%s`\n\n", strings.Join(promotionOrder, "` → `"))

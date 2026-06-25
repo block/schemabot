@@ -70,7 +70,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewUnsafeAllowed, templates.PreviewLintAll:
 		templates.PreviewCLIOutput(previewType)
 	// Comment template types
-	case templates.PreviewCommentPlan, templates.PreviewCommentPlanEmpty,
+	case templates.PreviewCommentPlan, templates.PreviewCommentPlanTenant,
+		templates.PreviewCommentPlanEmpty,
 		templates.PreviewCommentNoManagedSchema,
 		templates.PreviewCommentReconcileInProgress,
 		templates.PreviewCommentReconcileCompleted,
@@ -232,6 +233,7 @@ Interactive TUI:
 
 Comment Templates (GitHub PR comments):
   comment_plan                  Plan comment with DDL changes + lint violations
+  comment_plan_tenant           Tenant-targeted plan comment
   comment_plan_empty            Plan comment with no changes
   comment_no_managed_schema     No managed schema changes in current PR
   comment_reconcile_in_progress Empty diff with an in-progress apply

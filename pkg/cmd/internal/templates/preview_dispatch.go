@@ -111,6 +111,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 	// Comment template previews
 	case PreviewCommentPlan:
 		fmt.Print(webhooktemplates.PreviewCommentPlan())
+	case PreviewCommentPlanTenant:
+		fmt.Print(webhooktemplates.PreviewCommentPlanTenant())
 	case PreviewCommentPlanEmpty:
 		fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges())
 	case PreviewCommentNoManagedSchema:

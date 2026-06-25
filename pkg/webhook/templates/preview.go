@@ -54,6 +54,21 @@ func PreviewCommentPlan() string {
 	})
 }
 
+// PreviewCommentPlanTenant renders a tenant-targeted plan comment.
+func PreviewCommentPlanTenant() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		Tenant:      "alpha",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes:     samplePlanChanges(),
+	})
+}
+
 // PreviewCommentPlanNoChanges renders a sample plan comment with no changes detected.
 func PreviewCommentPlanNoChanges() string {
 	return RenderPlanComment(PlanCommentData{

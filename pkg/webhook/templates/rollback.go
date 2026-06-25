@@ -11,8 +11,7 @@ func RenderRollbackPlanComment(data PlanCommentData) string {
 	var sb strings.Builder
 
 	// Header
-	dbTypeLabel := schemaChangePlanDatabaseTypeLabel(data.DatabaseType, data.IsMySQL)
-	fmt.Fprintf(&sb, "## %s Schema Rollback Plan\n\n", dbTypeLabel)
+	writeEnvironmentTitle(&sb, "Schema Rollback Plan", data.Environment)
 
 	writePlanMetadata(&sb, data)
 	writeRequesterOrTimestamp(&sb, data.RequestedBy)

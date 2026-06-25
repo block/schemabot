@@ -76,11 +76,10 @@ func RenderPlanComment(data PlanCommentData) string {
 	var sb strings.Builder
 
 	// Header
-	dbTypeLabel := schemaChangePlanDatabaseTypeLabel(data.DatabaseType, data.IsMySQL)
 	if data.IsLocked {
-		sb.WriteString("## Schema Change Apply\n\n")
+		writeEnvironmentTitle(&sb, "Schema Change Apply", data.Environment)
 	} else {
-		fmt.Fprintf(&sb, "## %s Schema Change Plan\n\n", dbTypeLabel)
+		writeEnvironmentTitle(&sb, "Schema Change Plan", data.Environment)
 	}
 
 	writePlanMetadata(&sb, data)
@@ -186,11 +185,9 @@ func writeApplyHint(sb *strings.Builder, command string) {
 // Schema name (the schema directory) is shown for MySQL. Vitess uses keyspace headers instead.
 func writePlanMetadata(sb *strings.Builder, data PlanCommentData) {
 	parts := []string{fmt.Sprintf("**Database**: `%s`", data.Database)}
+	parts = append(parts, fmt.Sprintf("**Type**: `%s`", schemaChangePlanDatabaseTypeLabel(data.DatabaseType, data.IsMySQL)))
 	if data.IsMySQL && data.SchemaName != "" {
 		parts = append(parts, fmt.Sprintf("**Schema Name**: `%s`", data.SchemaName))
-	}
-	if data.Environment != "" {
-		parts = append(parts, fmt.Sprintf("**Environment**: `%s`", data.Environment))
 	}
 	if data.Tenant != "" {
 		parts = append(parts, fmt.Sprintf("**Tenant**: `%s`", data.Tenant))
@@ -475,10 +472,9 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	var sb strings.Builder
 
 	// Header
-	dbTypeLabel := schemaChangePlanDatabaseTypeLabel(data.DatabaseType, data.IsMySQL)
-	fmt.Fprintf(&sb, "## %s Schema Change Plan\n\n", dbTypeLabel)
+	sb.WriteString("## Schema Change Plan\n\n")
 
-	writePlanMetadata(&sb, PlanCommentData{Database: data.Database, SchemaName: data.SchemaName})
+	writePlanMetadata(&sb, PlanCommentData{Database: data.Database, SchemaName: data.SchemaName, DatabaseType: data.DatabaseType, IsMySQL: data.IsMySQL})
 	writePlanAttribution(&sb, PlanCommentData{
 		HeadSHA:     data.HeadSHA,
 		Repository:  data.Repository,
@@ -558,16 +554,7 @@ func schemaChangePlanDatabaseTypeLabel(databaseType string, isMySQL bool) string
 }
 
 func titleDatabaseType(databaseType string) string {
-	parts := strings.FieldsFunc(databaseType, func(r rune) bool {
-		return r == '-' || r == '_' || r == ' '
-	})
-	for i, part := range parts {
-		if part == "" {
-			continue
-		}
-		parts[i] = strings.ToUpper(part[:1]) + strings.ToLower(part[1:])
-	}
-	return strings.Join(parts, " ")
+	return titleLabel(databaseType)
 }
 
 // writeEnvironmentPlanSection writes the plan body for a single environment within a multi-env comment.

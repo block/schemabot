@@ -51,14 +51,14 @@ type MultiDeploymentApplyData struct {
 // per deployment carrying today's per-table UX scoped to that deployment.
 //
 // The single-deployment case is intentionally not handled here: callers render
-// it with RenderApplyStatusComment so that UX stays byte-for-byte unchanged.
+// it with RenderApplyStatusComment so the title and detail vocabulary stay shared.
 func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 	var sb strings.Builder
 	renderedAt := currentTimestamp()
 
 	// Aggregate header: reuse the single-deployment title map keyed on the
 	// derived aggregate state so the headline vocabulary is identical.
-	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State})
+	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment})
 	writeAggregateMetadata(&sb, data, renderedAt)
 	writeDeploymentCounts(&sb, data.Model.Counts)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
@@ -85,11 +85,11 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 // summary (RenderApplySummaryComment) rather than its in-progress status.
 //
 // The single-deployment case is intentionally not handled here: callers render
-// it with RenderApplySummaryComment so that UX stays byte-for-byte unchanged.
+// it with RenderApplySummaryComment so the title and detail vocabulary stay shared.
 func RenderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData) string {
 	var sb strings.Builder
 
-	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State})
+	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment})
 	writeAggregateMetadata(&sb, data, currentTimestamp())
 	writeDeploymentCounts(&sb, data.Model.Counts)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
@@ -105,17 +105,12 @@ func RenderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData) str
 
 // writeAggregateMetadata writes the apply-level metadata line. The database is
 // intentionally omitted — it is per-deployment and shown in each deployment's
-// section — so the aggregate carries only the environment, apply ID, elapsed
-// time, and requester.
+// section — so the aggregate carries only the apply ID and requester.
 func writeAggregateMetadata(sb *strings.Builder, data MultiDeploymentApplyData, renderedAt string) {
-	// Environment and ApplyID are always populated from the persisted apply, so
-	// they are rendered unconditionally; only the optional elapsed time is guarded.
+	// ApplyID is always populated from the persisted apply, so it is rendered
+	// unconditionally. Environment is already in the title.
 	parts := []string{
-		fmt.Sprintf("**Environment**: `%s`", data.Environment),
 		fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID),
-	}
-	if elapsed := applyElapsed(ApplyStatusCommentData{StartedAt: data.StartedAt, CompletedAt: data.CompletedAt}); elapsed != "" {
-		parts = append(parts, fmt.Sprintf("**Elapsed**: %s", elapsed))
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
 	writeAppliedByOrTimestampAt(sb, data.RequestedBy, renderedAt)

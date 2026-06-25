@@ -200,6 +200,93 @@ func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
 		assert.Contains(t, rendered, "**Tenant**: `alpha`")
 		assert.Contains(t, rendered, "schemabot apply-confirm -e staging --tenant alpha")
 	})
+
+	t.Run("preview shows tenant metadata without putting tenant in title", func(t *testing.T) {
+		rendered := templates.PreviewCommentPlanTenant()
+		firstLine, _, _ := strings.Cut(rendered, "\n")
+
+		assert.Equal(t, "## Schema Change Plan — Staging", firstLine)
+		assert.Contains(t, rendered, "**Tenant**: `alpha`")
+		assert.Contains(t, rendered, "schemabot apply -e staging --tenant alpha")
+		assert.NotContains(t, firstLine, "alpha")
+	})
+}
+
+func TestRenderPlanComment_EnvironmentScopedTitle(t *testing.T) {
+	t.Run("plan title includes environment without tenant", func(t *testing.T) {
+		data := templates.PlanCommentData{
+			Database:     "testdb",
+			Environment:  "production",
+			Tenant:       "alpha",
+			DatabaseType: storage.DatabaseTypeStrata,
+			Changes: []templates.KeyspaceChangeData{{
+				Keyspace:   "testdb",
+				Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
+			}},
+		}
+
+		rendered := templates.RenderPlanComment(data)
+		firstLine, _, _ := strings.Cut(rendered, "\n")
+
+		assert.Equal(t, "## Schema Change Plan — Production", firstLine)
+		assert.Contains(t, rendered, "**Type**: `Strata`")
+		assert.NotContains(t, firstLine, "alpha")
+	})
+
+	t.Run("locked apply title includes environment", func(t *testing.T) {
+		data := templates.PlanCommentData{
+			Database:    "testdb",
+			Environment: "staging",
+			IsMySQL:     true,
+			IsLocked:    true,
+			Changes: []templates.KeyspaceChangeData{{
+				Keyspace:   "testdb",
+				Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
+			}},
+		}
+
+		rendered := templates.RenderPlanComment(data)
+		firstLine, _, _ := strings.Cut(rendered, "\n")
+
+		assert.Equal(t, "## Schema Change Apply — Staging", firstLine)
+		assert.Contains(t, rendered, "**Type**: `MySQL`")
+	})
+
+	t.Run("environment suffix preserves identifier separators", func(t *testing.T) {
+		data := templates.PlanCommentData{
+			Database:    "testdb",
+			Environment: "prod_us-east",
+			IsMySQL:     true,
+			Changes: []templates.KeyspaceChangeData{{
+				Keyspace:   "testdb",
+				Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
+			}},
+		}
+
+		rendered := templates.RenderPlanComment(data)
+		firstLine, _, _ := strings.Cut(rendered, "\n")
+
+		assert.Equal(t, "## Schema Change Plan — Prod_us-east", firstLine)
+	})
+
+	t.Run("multi environment plan title stays generic", func(t *testing.T) {
+		data := templates.MultiEnvPlanCommentData{
+			Database:     "testdb",
+			IsMySQL:      true,
+			Environments: []string{"staging", "production"},
+			Plans: map[string]*templates.PlanCommentData{
+				"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true},
+				"production": {Database: "testdb", Environment: "production", IsMySQL: true},
+			},
+			Errors: map[string]string{},
+		}
+
+		rendered := templates.RenderMultiEnvPlanComment(data)
+		firstLine, _, _ := strings.Cut(rendered, "\n")
+
+		assert.Equal(t, "## Schema Change Plan", firstLine)
+		assert.Contains(t, rendered, "**Type**: `MySQL`")
+	})
 }
 
 func TestRenderPlanComment_NoUnsafe_NoWarning(t *testing.T) {
@@ -231,7 +318,8 @@ func TestRenderPlanComment_StrataHeader(t *testing.T) {
 
 	rendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, rendered, "## Strata Schema Change Plan")
+	assert.Contains(t, rendered, "## Schema Change Plan")
+	assert.Contains(t, rendered, "**Type**: `Strata`")
 }
 
 func TestRenderPlanComment_CustomDatabaseTypeHeader(t *testing.T) {
@@ -247,7 +335,8 @@ func TestRenderPlanComment_CustomDatabaseTypeHeader(t *testing.T) {
 
 	rendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, rendered, "## Custom Engine Schema Change Plan")
+	assert.Contains(t, rendered, "## Schema Change Plan")
+	assert.Contains(t, rendered, "**Type**: `Custom Engine`")
 }
 
 func TestRenderPlanComment_PostgresHeader(t *testing.T) {
@@ -263,7 +352,8 @@ func TestRenderPlanComment_PostgresHeader(t *testing.T) {
 
 	rendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, rendered, "## PostgreSQL Schema Change Plan")
+	assert.Contains(t, rendered, "## Schema Change Plan")
+	assert.Contains(t, rendered, "**Type**: `PostgreSQL`")
 }
 
 func TestRenderPlanComment_ShowsPRHeadSHA(t *testing.T) {
@@ -331,7 +421,7 @@ func TestRenderMultiEnvPlanComment_StrataHeaderWithErrors(t *testing.T) {
 
 	rendered := templates.RenderMultiEnvPlanComment(data)
 
-	assert.Contains(t, rendered, "## Strata Schema Change Plan")
+	assert.Contains(t, rendered, "## Schema Change Plan")
 }
 
 func TestUserFacingErrorExplainsNoHealthyUpstream(t *testing.T) {
@@ -425,7 +515,7 @@ func TestRenderUnsafeChangesBlocked_CustomDatabaseTypeHeader(t *testing.T) {
 
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
-	assert.Contains(t, rendered, "## Custom Engine Schema Change Plan")
+	assert.Contains(t, rendered, "## Schema Change Plan")
 	assert.Contains(t, rendered, "schemabot apply -e staging --allow-unsafe")
 }
 
