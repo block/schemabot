@@ -1207,14 +1207,8 @@ func (s *applyOperationStore) DeleteByApply(ctx context.Context, applyID int64) 
 	if err != nil {
 		return fmt.Errorf("delete apply_operations for apply %d: %w", applyID, err)
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("read deleted apply_operations rows affected for apply %d: %w", applyID, err)
-	}
-	if rows == 0 {
-		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
-			return err
-		}
+	if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, fmt.Sprintf("delete apply_operations for apply %d", applyID)); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1302,17 +1296,9 @@ func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, app
 	if err != nil {
 		return 0, fmt.Errorf("stop pending apply_operations for apply %d: %w", applyID, err)
 	}
-	rows, err := result.RowsAffected()
+	rows, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, fmt.Sprintf("stop pending apply_operations for apply %d", applyID))
 	if err != nil {
-		return 0, fmt.Errorf("read stopped pending apply_operations rows affected for apply %d: %w", applyID, err)
-	}
-	if rows == 0 {
-		// No pending rows changed: either there were none (lease still valid, a
-		// legitimate no-op) or the lease token no longer matches (ownership lost).
-		// Distinguish the two so a displaced driver fails closed.
-		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
-			return 0, err
-		}
+		return 0, err
 	}
 	return rows, nil
 }

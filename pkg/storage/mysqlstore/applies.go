@@ -415,6 +415,26 @@ func ensureApplyLeaseStillOwned(ctx context.Context, db queryRower, lease storag
 	return nil
 }
 
+// confirmLeaseOnZeroRows fails closed when a lease-scoped write changed no rows.
+// Zero rows is ambiguous: either a legitimate idempotent no-op (the lease is
+// still valid) or the lease token no longer matches because ownership was lost.
+// It reloads the lease to distinguish the two so a displaced driver returns
+// ErrApplyLeaseLost instead of silently treating a lost lease as a no-op. desc
+// identifies the operation in the rows-affected error. The affected row count is
+// returned for callers that need it.
+func confirmLeaseOnZeroRows(ctx context.Context, db queryRower, result sql.Result, lease storage.ApplyLease, desc string) (int64, error) {
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read %s rows affected: %w", desc, err)
+	}
+	if rows == 0 {
+		if err := ensureApplyLeaseStillOwned(ctx, db, lease); err != nil {
+			return rows, err
+		}
+	}
+	return rows, nil
+}
+
 // applyTargetForUpdate resolves the (database, type, environment, deployment)
 // target an update should lock and check against. The stored row is
 // authoritative, so it is reloaded whenever the in-memory apply is missing the
@@ -1629,14 +1649,8 @@ func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {
 		return fmt.Errorf("heartbeat apply %d: %w", applyID, err)
 	}
 	if hasLease {
-		rows, err := result.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("read heartbeat rows affected for apply %d: %w", applyID, err)
-		}
-		if rows == 0 {
-			if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
-				return err
-			}
+		if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, fmt.Sprintf("heartbeat apply %d", applyID)); err != nil {
+			return err
 		}
 	}
 	return nil
