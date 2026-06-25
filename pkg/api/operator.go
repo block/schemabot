@@ -298,8 +298,33 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 		s.recoverMultiApplyOperation(ctx, driverID, op, opLease)
 		return
 	}
+	hasTasks, err := s.claimedOperationHasTasks(ctx, op)
+	if err != nil {
+		s.logger.Error("operator: failed to inspect claimed operation tasks; operation will not be driven",
+			"driver", driverID, "lease_owner", owner, "apply_operation_id", op.ID,
+			"apply_db_id", op.ApplyID, "deployment", op.Deployment, "error", err)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_task_inspect_error")
+		return
+	}
+	if !hasTasks {
+		// Apply-level claiming is task-gated, so a valid task-less operation (for
+		// example plan-level VSchema work) cannot be driven through the legacy
+		// parent-lease path. Drive it under the operation lease and project the
+		// parent from the operation row, the same fail-closed path multi-operation
+		// applies use.
+		s.driveClaimedMultiOperation(ctx, driverID, op, opLease, false)
+		return
+	}
 
 	s.recoverSingleApplyOperation(ctx, driverID, owner, op, opLease)
+}
+
+func (s *Service) claimedOperationHasTasks(ctx context.Context, op *storage.ApplyOperation) (bool, error) {
+	tasks, err := s.storage.Tasks().GetByApplyOperationID(ctx, op.ID)
+	if err != nil {
+		return false, fmt.Errorf("load tasks for apply_operation %d (deployment %q): %w", op.ID, op.Deployment, err)
+	}
+	return len(tasks) > 0, nil
 }
 
 // operationSetContainsID reports whether id is one of the apply's operation
@@ -530,6 +555,10 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 			"driver", driverID, "apply_operation_id", op.ID, "apply_db_id", op.ApplyID,
 			"deployment", op.Deployment)
 		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_missing")
+		return
+	}
+	if state.IsTerminalApplyState(apply.State) {
+		s.reconcileClaimedOperationFromTerminalParent(operationLeaseCtx, driverID, op, apply)
 		return
 	}
 
@@ -926,29 +955,7 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, 
 		return
 	}
 	if state.IsTerminalApplyState(parent.State) {
-		s.logger.Info("operator: parent apply already terminal; reconciling operation to terminal state",
-			"driver", driverID,
-			"apply_operation_id", op.ID,
-			"apply_id", parent.ApplyIdentifier,
-			"deployment", op.Deployment,
-			"environment", parent.Environment,
-			"state", parent.State)
-		marked, err := s.markOperationFromApplyState(ctx, driverID, op, parent)
-		if err != nil {
-			s.logger.Error("operator: failed to reconcile apply_operation from terminal parent; derived apply state not updated",
-				"driver", driverID, "apply_operation_id", op.ID, "apply_id", parent.ApplyIdentifier,
-				"deployment", op.Deployment, "environment", parent.Environment, "state", parent.State, "error", err)
-			return
-		}
-		if !marked {
-			return
-		}
-		if _, err := s.updateApplyStateFromOperations(ctx, driverID, parent, rejectFailedApplyReopen); err != nil {
-			s.logger.Error("operator: failed to update derived apply state for terminal parent",
-				"driver", driverID, "apply_operation_id", op.ID, "apply_id", parent.ApplyIdentifier,
-				"deployment", op.Deployment, "environment", parent.Environment, "error", err)
-			return
-		}
+		s.reconcileClaimedOperationFromTerminalParent(ctx, driverID, op, parent)
 		return
 	}
 	s.logger.Warn("operator: parent apply not claimable for operation; operation will be retried",
@@ -959,6 +966,32 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, 
 		"environment", parent.Environment,
 		"state", parent.State)
 	metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
+}
+
+func (s *Service) reconcileClaimedOperationFromTerminalParent(ctx context.Context, driverID int, op *storage.ApplyOperation, parent *storage.Apply) {
+	s.logger.Info("operator: parent apply already terminal; reconciling operation to terminal state",
+		"driver", driverID,
+		"apply_operation_id", op.ID,
+		"apply_id", parent.ApplyIdentifier,
+		"deployment", op.Deployment,
+		"environment", parent.Environment,
+		"state", parent.State)
+	marked, err := s.markOperationFromApplyState(ctx, driverID, op, parent)
+	if err != nil {
+		s.logger.Error("operator: failed to reconcile apply_operation from terminal parent; derived apply state not updated",
+			"driver", driverID, "apply_operation_id", op.ID, "apply_id", parent.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", parent.Environment, "state", parent.State, "error", err)
+		return
+	}
+	if !marked {
+		return
+	}
+	if _, err := s.updateApplyStateFromOperations(ctx, driverID, parent, rejectFailedApplyReopen); err != nil {
+		s.logger.Error("operator: failed to update derived apply state for terminal parent",
+			"driver", driverID, "apply_operation_id", op.ID, "apply_id", parent.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", parent.Environment, "error", err)
+		return
+	}
 }
 
 // failOperationWithoutTasks terminalizes an operation whose drive failed closed
@@ -1286,9 +1319,40 @@ func (s *Service) markOperationFromApplyState(ctx context.Context, driverID int,
 // the row is left claimable for a later poll, and a non-nil error when a read or
 // write fails so the caller skips parent derivation.
 func (s *Service) markOperationFromOwnResult(ctx context.Context, driverID int, op *storage.ApplyOperation) (updated bool, err error) {
+	// A group_finalizer carries no tasks: its terminal state was written by the
+	// drive (driveGroupFinalizer marks it completed only on an accepted apply,
+	// failed otherwise). Deriving from its empty task set would overwrite that
+	// outcome, so leave the row as the drive set it and let the parent derivation
+	// read it.
+	if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+		return true, nil
+	}
 	tasks, err := s.storage.Tasks().GetByApplyOperationID(ctx, op.ID)
 	if err != nil {
 		return false, fmt.Errorf("load tasks for apply_operation %d (deployment %q): %w", op.ID, op.Deployment, err)
+	}
+	if len(tasks) == 0 {
+		apply, err := s.storage.Applies().Get(ctx, op.ApplyID)
+		if err != nil {
+			return false, fmt.Errorf("load parent apply for task-less apply_operation %d (deployment %q): %w", op.ID, op.Deployment, err)
+		}
+		if apply == nil {
+			return false, fmt.Errorf("parent apply %d not found for task-less apply_operation %d (deployment %q)", op.ApplyID, op.ID, op.Deployment)
+		}
+		plan, err := s.storage.Plans().GetByID(ctx, apply.PlanID)
+		if err != nil {
+			return false, fmt.Errorf("load plan %d for task-less apply_operation %d (deployment %q): %w", apply.PlanID, op.ID, op.Deployment, err)
+		}
+		if plan != nil && op.OperationKind == storage.ApplyOperationKindWork && op.OperationKey == "" && len(plan.FlatDDLChanges()) == 0 && len(vschemaFinalizerNamespaces(plan)) > 0 {
+			currentOp, getOpErr := s.storage.ApplyOperations().Get(ctx, op.ID)
+			if getOpErr != nil {
+				return false, fmt.Errorf("reload task-less apply_operation %d (deployment %q): %w", op.ID, op.Deployment, getOpErr)
+			}
+			if currentOp != nil && state.IsState(currentOp.State, state.ApplyOperation.Completed) {
+				return true, nil
+			}
+			return s.persistOperationState(ctx, driverID, op, apply.State, apply.ErrorMessage)
+		}
 	}
 	taskStates := make([]string, len(tasks))
 	for i, t := range tasks {

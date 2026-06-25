@@ -205,13 +205,28 @@ func (r *PlanResult) FlatTableChanges() []TableChange {
 // SchemaChange per namespace; OriginalFiles is captured once for that namespace
 // and applies to every table/artifact change in the bundle.
 type SchemaChange struct {
-	Namespace    string        // MySQL schema, Vitess keyspace, Postgres schema
-	TableChanges []TableChange // Per-table DDL changes
+	Namespace string // MySQL schema, Vitess keyspace, Postgres schema
+	// Shard identifies the shard this change targets within Namespace. A plan is
+	// a slice of SchemaChange keyed by (Namespace, Shard): a sharded engine emits
+	// one SchemaChange per changed shard, each carrying that shard's own
+	// TableChanges, so shards that have drifted — e.g. one was offline during a
+	// prior apply, or a change was canaried to a subset — can carry different
+	// DDL. Non-sharded engines (Spirit) leave it zero, targeting the whole
+	// namespace.
+	Shard        Shard
+	TableChanges []TableChange // Per-table DDL changes for this (Namespace, Shard)
 	// Metadata contains engine-specific plan annotations, such as display diffs
 	// or apply flags. It is not rollback input; rollback uses OriginalFiles.
 	Metadata              map[string]string
 	OriginalFiles         map[string]string // Declarative schema files and artifacts for this namespace before applying
 	OriginalFilesCaptured bool              // True when OriginalFiles was captured, including an empty namespace
+}
+
+// Shard identifies a shard within a namespace for a sharded schema change. It is
+// the zero value for non-sharded engines, where a SchemaChange targets the whole
+// namespace.
+type Shard struct {
+	Name string // Shard name (e.g., "-80", "80-")
 }
 
 // LintViolation represents a lint finding from schema analysis.

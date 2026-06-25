@@ -162,14 +162,14 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 
 	// No changes — post a regular plan comment (no lock, no confirm footer)
 	if len(planResp.FlatTables()) == 0 {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, requestedBy)
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 		return
 	}
 
 	// Block unsafe changes unless --allow-unsafe was specified
 	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, requestedBy)
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
 		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
 		return
@@ -193,7 +193,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	}
 
 	// Build plan comment data with lock info
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, requestedBy)
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
 	commentData.IsLocked = true
 	commentData.LockOwner = lockOwner
 	commentData.LockAcquired = time.Now().UTC().Format("2006-01-02 15:04:05 UTC")

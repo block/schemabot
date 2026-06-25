@@ -3,7 +3,6 @@ package templates
 import (
 	"io"
 	"os"
-	"strings"
 	"testing"
 
 	"github.com/block/schemabot/pkg/state"
@@ -321,36 +320,22 @@ func TestFormatTableProgress_EstimateExceeded(t *testing.T) {
 	})
 }
 
-func TestVSchemaStatusLabel(t *testing.T) {
-	assert.Equal(t, "Pending", vschemaStatusLabel(state.Apply.Pending))
-	assert.Equal(t, "Pending", vschemaStatusLabel(state.Apply.WaitingForDeploy))
-	assert.Contains(t, vschemaStatusLabel(state.Apply.Running), "Applying")
-	assert.Contains(t, vschemaStatusLabel(state.Apply.WaitingForCutover), "Applying")
-	assert.Contains(t, vschemaStatusLabel(state.Apply.Recovering), "Applying")
-	assert.Contains(t, vschemaStatusLabel(state.Apply.CuttingOver), "Applying")
-	assert.Contains(t, vschemaStatusLabel(state.Apply.Completed), "Applied")
-	assert.Contains(t, vschemaStatusLabel(state.Apply.Failed), "Failed")
-	assert.Contains(t, vschemaStatusLabel(state.Apply.RevertWindow), "pending revert")
-}
+func TestFormatVSchemaStatus(t *testing.T) {
+	// No VSchema change → nothing rendered.
+	assert.Empty(t, FormatVSchemaStatus("", ""))
 
-func TestVSchemaTaskRenderedWithDDLTasks(t *testing.T) {
-	tables := []TableProgress{
-		{TableName: "users", Namespace: "myapp_sharded", Status: state.Apply.Completed, DDL: "ALTER TABLE `users` ADD COLUMN `phone` varchar(20)"},
-		{TableName: "VSchema: myapp_sharded", Namespace: "myapp_sharded", Status: state.Apply.Running},
-	}
-	result := FormatNamespacedTables(tables)
-	assert.Contains(t, result, "VSchema")
-	assert.Contains(t, result, "users")
-	vsIdx := strings.Index(result, "VSchema")
-	usersIdx := strings.Index(result, "users:")
-	assert.Less(t, vsIdx, usersIdx, "VSchema should render before DDL tables")
-}
+	// Status only.
+	applying := FormatVSchemaStatus("applying", "")
+	assert.Contains(t, applying, "VSchema")
+	assert.Contains(t, applying, "Applying")
 
-func TestIsVSchemaTask_Variants(t *testing.T) {
-	assert.True(t, isVSchemaTask(TableProgress{TableName: "VSchema"}))
-	assert.True(t, isVSchemaTask(TableProgress{TableName: "VSchema: myapp_sharded"}))
-	assert.True(t, isVSchemaTask(TableProgress{TableName: "vschema:myapp"}))
-	assert.False(t, isVSchemaTask(TableProgress{TableName: "users"}))
+	applied := FormatVSchemaStatus("applied", "")
+	assert.Contains(t, applied, "Applied")
+
+	// Status + diff: the diff is rendered with the VSchema status.
+	withDiff := FormatVSchemaStatus("applied", "--- a/commerce.json\n+++ b/commerce.json\n+  \"new_table\": {}")
+	assert.Contains(t, withDiff, "Applied")
+	assert.Contains(t, withDiff, "new_table")
 }
 
 func TestStateColorFunc_PlanetScalePhases(t *testing.T) {

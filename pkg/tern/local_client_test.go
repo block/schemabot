@@ -445,9 +445,17 @@ func (s *exactProgressStorage) ApplyOperations() storage.ApplyOperationStore {
 type exactProgressApplyOperationStore struct {
 	storage.ApplyOperationStore
 	data    *storage.EngineResumeState
+	ops     []*storage.ApplyOperation
 	err     error
 	saveErr error
 	saved   *storage.EngineResumeState
+}
+
+func (s *exactProgressApplyOperationStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.ops, nil
 }
 
 func (s *exactProgressApplyOperationStore) SaveEngineResumeState(_ context.Context, operationID int64, resumeState *storage.EngineResumeState) error {
@@ -610,8 +618,9 @@ func TestLocalClient_ProgressByApplyIDReturnsNotFoundForMissingApplyData(t *test
 		t.Run(tc.name, func(t *testing.T) {
 			client := &LocalClient{
 				storage: &exactProgressStorage{
-					applies: &exactProgressApplyStore{apply: tc.apply},
-					tasks:   &exactProgressTaskStore{tasks: tc.tasks},
+					applies:         &exactProgressApplyStore{apply: tc.apply},
+					tasks:           &exactProgressTaskStore{tasks: tc.tasks},
+					applyOperations: &exactProgressApplyOperationStore{},
 				},
 				logger: slog.Default(),
 			}
@@ -623,6 +632,32 @@ func TestLocalClient_ProgressByApplyIDReturnsNotFoundForMissingApplyData(t *test
 			require.ErrorIs(t, err, tc.wantError)
 		})
 	}
+}
+
+// A VSchema-only apply carries no task rows — it is driven by a task-less
+// group_finalizer. Progress must serve such an apply from its operation rows
+// (the operator maintains apply.State by deriving it from them) rather than
+// failing it as "no tasks".
+func TestLocalClient_ProgressServesTaskLessApplyFromOperations(t *testing.T) {
+	client := &LocalClient{
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: &storage.Apply{
+				ID: 7, ApplyIdentifier: "apply-vschema-only", State: state.Apply.Completed,
+			}},
+			tasks: &exactProgressTaskStore{},
+			applyOperations: &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{
+				{ID: 1, OperationKind: storage.ApplyOperationKindGroupFinalizer, State: state.ApplyOperation.Completed},
+			}},
+		},
+		logger: slog.Default(),
+	}
+
+	resp, err := client.Progress(t.Context(), &ternv1.ProgressRequest{
+		ApplyId:     "apply-vschema-only",
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	assert.True(t, isTerminalProtoState(resp.State), "task-less completed apply should report a terminal state, got %v", resp.State)
 }
 
 func groupedResumeStateClient(databaseType string, applyOperations storage.ApplyOperationStore) *LocalClient {
@@ -831,7 +866,7 @@ func TestGroupedResumeChangesGroupsTasksByNamespace(t *testing.T) {
 		{Namespace: "billing", TableName: "invoices", DDL: "ALTER TABLE `invoices` ADD COLUMN `due_at` datetime", DDLAction: "alter"},
 	}
 
-	changes := groupedResumeChanges(tasks)
+	changes := groupedResumeChanges(tasks, nil)
 
 	require.Len(t, changes, 2)
 	assert.Equal(t, "commerce", changes[0].Namespace)
@@ -849,17 +884,15 @@ func TestGroupedResumeChangesGroupsTasksByNamespace(t *testing.T) {
 	assert.Equal(t, statement.StatementAlterTable, changes[1].TableChanges[0].Operation)
 }
 
-// A VSchema task carries no DDL, so a resumed apply with mixed VSchema and DDL
-// work must keep the VSchema out of TableChanges and instead flag its namespace
-// with the vschema_changed metadata. This is how the engine knows to re-apply
-// vschema.json from the schema files on resume.
-func TestGroupedResumeChangesCarriesVSchemaMetadata(t *testing.T) {
+// A resumed grouped apply rebuilds the engine changes from the stored DDL
+// tasks, grouped per namespace, preserving each table's DDL and operation so the
+// engine keys per-table progress on the same namespace/table pairs.
+func TestGroupedResumeChangesPreservesDDL(t *testing.T) {
 	tasks := []*storage.Task{
 		{Namespace: "commerce", TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter"},
-		{Namespace: "commerce", TableName: "VSchema: commerce", DDLAction: "vschema_update"},
 	}
 
-	changes := groupedResumeChanges(tasks)
+	changes := groupedResumeChanges(tasks, nil)
 
 	require.Len(t, changes, 1)
 	assert.Equal(t, "commerce", changes[0].Namespace)
@@ -867,35 +900,18 @@ func TestGroupedResumeChangesCarriesVSchemaMetadata(t *testing.T) {
 	assert.Equal(t, "users", changes[0].TableChanges[0].Table)
 	assert.Equal(t, tasks[0].DDL, changes[0].TableChanges[0].DDL)
 	assert.Equal(t, statement.StatementAlterTable, changes[0].TableChanges[0].Operation)
-	assert.Equal(t, "true", changes[0].Metadata["vschema_changed"])
 	for _, tc := range changes[0].TableChanges {
 		assert.NotEmpty(t, tc.DDL, "resume changes must not contain an empty-DDL table change")
 	}
 }
 
-// A VSchema-only apply has no DDL tasks. Its resumed change must still carry a
-// namespace flagged with vschema_changed and no table changes, so the engine
-// applies vschema.json without attempting to execute an empty statement.
-func TestGroupedResumeChangesVSchemaOnly(t *testing.T) {
-	tasks := []*storage.Task{
-		{Namespace: "commerce", TableName: "VSchema: commerce", DDLAction: "vschema_update"},
-	}
-
-	changes := groupedResumeChanges(tasks)
-
-	require.Len(t, changes, 1)
-	assert.Equal(t, "commerce", changes[0].Namespace)
-	assert.Empty(t, changes[0].TableChanges)
-	assert.Equal(t, "true", changes[0].Metadata["vschema_changed"])
-}
-
 func TestGroupedResumeChangesPreservesMultiNamespaceScopedTasks(t *testing.T) {
 	tasks := []*storage.Task{
 		{Namespace: "commerce", TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter"},
-		{Namespace: "routing", TableName: "VSchema: routing", DDLAction: "vschema_update"},
+		{Namespace: "routing", TableName: "lookup", DDL: "ALTER TABLE `lookup` ADD COLUMN `region` varchar(32)", DDLAction: "alter"},
 	}
 
-	changes := groupedResumeChanges(tasks)
+	changes := groupedResumeChanges(tasks, nil)
 
 	require.Len(t, changes, 2)
 	byNamespace := make(map[string]engine.SchemaChange)
@@ -907,10 +923,10 @@ func TestGroupedResumeChangesPreservesMultiNamespaceScopedTasks(t *testing.T) {
 	assert.Equal(t, "users", commerce.TableChanges[0].Table)
 	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", commerce.TableChanges[0].DDL)
 	assert.Equal(t, statement.StatementAlterTable, commerce.TableChanges[0].Operation)
-	assert.Empty(t, commerce.Metadata["vschema_changed"])
 	routing := byNamespace["routing"]
-	assert.Empty(t, routing.TableChanges)
-	assert.Equal(t, "true", routing.Metadata["vschema_changed"])
+	require.Len(t, routing.TableChanges, 1)
+	assert.Equal(t, "lookup", routing.TableChanges[0].Table)
+	assert.Equal(t, statement.StatementAlterTable, routing.TableChanges[0].Operation)
 }
 
 func TestTaskTargetShardsReturnsSortedUniqueShardSelector(t *testing.T) {
@@ -1617,7 +1633,7 @@ func TestPrepareStoppedTasksForResumeQueuesOnlyStoppedTasks(t *testing.T) {
 			}
 			apply := &storage.Apply{ID: 123, State: applyState}
 
-			controlReq, err := pendingStartControlRequest(t.Context(), client.storage, apply)
+			controlReq, err := pendingControlRequest(t.Context(), client.storage, apply, storage.ControlOperationStart)
 			require.NoError(t, err)
 			client.prepareStoppedTasksForResume(t.Context(), apply, []*storage.Task{stoppedTask, completedTask}, controlReq != nil)
 

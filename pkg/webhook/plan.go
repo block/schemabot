@@ -15,7 +15,7 @@ import (
 )
 
 // handlePlanCommand handles the "schemabot plan -e <env>" command.
-func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, environment, databaseName string, installationID int64, requestedBy string) {
+func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, environment, databaseName, tenant string, installationID int64, requestedBy string) {
 	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
 		h.logger.Error("plan: failed to bootstrap command", "error", err)
@@ -112,7 +112,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	}
 
 	// Build plan comment data
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, requestedBy)
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy)
 
 	metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "success")
 
@@ -138,7 +138,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 // handleMultiEnvPlan runs plan for all configured environments and posts a single combined comment.
 // When isAutoPlan is true and no environments have changes or errors, the comment is skipped to reduce PR noise.
-func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, installationID int64, requestedBy string, isAutoPlan bool) {
+func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool) {
 	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
 		h.logger.Error("multi-env plan: failed to bootstrap command", "error", err)
@@ -306,7 +306,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 			headSHA = sha
 		}
 
-		commentData := buildPlanCommentData(schemaResult, planResp, env, requestedBy)
+		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy)
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 		multiEnvData.Plans[env] = &commentData
 	}
@@ -427,10 +427,11 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 }
 
 // buildPlanCommentData converts plan results into template data.
-func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, requestedBy string) templates.PlanCommentData {
+func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
 		Database:    schema.Database,
 		Environment: environment,
+		Tenant:      tenant,
 		HeadSHA:     schema.HeadSHA,
 		Repository:  schema.Repository,
 		RequestedBy: requestedBy,

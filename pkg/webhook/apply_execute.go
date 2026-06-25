@@ -69,7 +69,7 @@ func (h *Handler) executeApply(
 	if storedPlan != nil && !ddlMatchesStoredPlan(planResp, storedPlan) {
 		h.logger.Info("auto-confirm downgraded: DDL drift detected",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, requestedBy)
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
 		commentData.IsLocked = true
 		commentData.AutoConfirmDowngradeReason = "Schema changes differ from auto-plan — review and confirm manually"
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
@@ -78,7 +78,7 @@ func (h *Handler) executeApply(
 
 	// Block unsafe changes on confirm (re-plan may have detected new unsafe changes)
 	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, requestedBy)
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
 		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
 		return

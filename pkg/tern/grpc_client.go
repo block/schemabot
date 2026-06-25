@@ -445,7 +445,7 @@ func (c *GRPCClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*
 }
 
 func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
-	controlReq, err := pendingCutoverControlRequest(ctx, c.storage, apply)
+	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCutover)
 	if err != nil {
 		return err
 	}
@@ -462,11 +462,11 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered,
 			fmt.Sprintf("Pending remote cutover request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		return completePendingCutoverControlRequests(ctx, c.storage, apply)
+		return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover)
 	}
 	if cutoverRequestFailedByApplyState(apply.State) {
 		message := fmt.Sprintf("cutover request was not applied because apply is %s", apply.State)
-		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, message); err != nil {
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, message); err != nil {
 			return err
 		}
 		return fmt.Errorf("process pending gRPC cutover for apply %s: %s", apply.ApplyIdentifier, message)
@@ -498,12 +498,12 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
 		message := "remote apply id is not available"
-		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, message); err != nil {
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, message); err != nil {
 			return err
 		}
 		return fmt.Errorf("process pending gRPC cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
-	if stopReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
+	if stopReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 		return fmt.Errorf("check pending stop request before pending gRPC cutover for apply %s: %w", apply.ApplyIdentifier, err)
 	} else if stopReq != nil {
 		message := "schema change has a pending stop request; cutover is blocked until stop is processed"
@@ -518,7 +518,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 	})
 	if err != nil {
 		errorMessage := fmt.Sprintf("remote cutover failed: %v", err)
-		if failErr := failPendingCutoverControlRequests(ctx, c.storage, apply, errorMessage); failErr != nil {
+		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); failErr != nil {
 			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %w; fail pending cutover request: %w", apply.ApplyIdentifier, remoteID, err, failErr)
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,
@@ -527,7 +527,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 	}
 	if resp == nil {
 		errorMessage := "not accepted"
-		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, errorMessage); err != nil {
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
 			return err
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,
@@ -539,7 +539,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		if resp.ErrorMessage != "" {
 			errorMessage = resp.ErrorMessage
 		}
-		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, errorMessage); err != nil {
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
 			return err
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,
@@ -548,7 +548,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered,
 		fmt.Sprintf("Remote cutover accepted for apply %s (remote %s)%s", apply.ApplyIdentifier, remoteID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-	if err := completePendingCutoverControlRequests(ctx, c.storage, apply); err != nil {
+	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover); err != nil {
 		return err
 	}
 	slog.Info("pending gRPC cutover request accepted and completed",
@@ -582,7 +582,7 @@ func logOperationDriveLeavesParentStop(apply *storage.Apply, scope applyTaskScop
 }
 
 func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
-	controlReq, err := pendingStopControlRequest(ctx, c.storage, apply)
+	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
 		return false, err
 	}
@@ -642,7 +642,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
 			fmt.Sprintf("Pending remote stop request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 			return true, err
 		}
 		return true, nil
@@ -665,7 +665,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		if err := c.stopUndispatchedApply(ctx, apply, controlRequestCaller(controlReq), scope); err != nil {
 			return true, err
 		}
-		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 			return true, err
 		}
 		return true, nil
@@ -729,7 +729,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 			logOperationDriveLeavesParentStop(apply, scope)
 			return true, nil
 		}
-		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 			return true, err
 		}
 		if hasPendingStart, startErr := hasPendingStartControlRequest(ctx, c.storage, apply); startErr != nil {
@@ -811,7 +811,7 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 		logOperationDriveLeavesParentStop(apply, scope)
 		return true, nil
 	}
-	if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 		return false, err
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
@@ -1347,7 +1347,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		return errors.New(errMsg)
 	}
 
-	startControlReq, err := pendingStartControlRequest(ctx, c.storage, apply)
+	startControlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStart)
 	if err != nil {
 		return err
 	}
@@ -1482,7 +1482,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 					return fmt.Errorf("persist stopped gRPC apply %s after start failure: %w", apply.ApplyIdentifier, reconcileErr)
 				}
 				if startRequested {
-					if failErr := failPendingStartControlRequests(ctx, c.storage, apply, message); failErr != nil {
+					if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message); failErr != nil {
 						return failErr
 					}
 				}
@@ -1531,7 +1531,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 // parent stop (the operator projection owns it), so it must not start remote
 // work and leaves both the stop and start pending for the operator.
 func (c *GRPCClient) completePendingStopBeforeRemoteStart(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
-	controlReq, err := pendingStopControlRequest(ctx, c.storage, apply)
+	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
 		return false, fmt.Errorf("check pending stop before starting stopped gRPC apply %s: %w", apply.ApplyIdentifier, err)
 	}
@@ -1550,7 +1550,7 @@ func (c *GRPCClient) completePendingStopBeforeRemoteStart(ctx context.Context, a
 			"state", apply.State)
 		return true, nil
 	}
-	if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 		return false, fmt.Errorf("complete pending stop before starting stopped gRPC apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	slog.Info("completed pending gRPC stop request before starting stopped remote apply",
@@ -1566,7 +1566,7 @@ func (c *GRPCClient) completePendingStopBeforeRemoteStart(ctx context.Context, a
 }
 
 func hasPendingStartControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) (bool, error) {
-	controlReq, err := pendingStartControlRequest(ctx, store, apply)
+	controlReq, err := pendingControlRequest(ctx, store, apply, storage.ControlOperationStart)
 	if err != nil {
 		return false, err
 	}
@@ -1581,7 +1581,7 @@ func hasPendingStartControlRequest(ctx context.Context, store storage.Storage, a
 func (c *GRPCClient) waitForPendingStopBeforeStart(ctx context.Context, apply *storage.Apply, scope applyTaskScope, startControlReq *storage.ApplyControlRequest) (bool, error) {
 	loggedWait := false
 	for {
-		stopReq, err := pendingStopControlRequest(ctx, c.storage, apply)
+		stopReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
 		if err != nil {
 			return false, fmt.Errorf("check pending stop before pending gRPC start for apply %s: %w", apply.ApplyIdentifier, err)
 		}
@@ -1596,7 +1596,7 @@ func (c *GRPCClient) waitForPendingStopBeforeStart(ctx context.Context, apply *s
 			if err != nil {
 				return false, err
 			}
-			stillPending, err := pendingStopControlRequest(ctx, c.storage, apply)
+			stillPending, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
 			if err != nil {
 				return false, fmt.Errorf("recheck pending stop before deferring pending gRPC start for apply %s: %w", apply.ApplyIdentifier, err)
 			}
@@ -1640,14 +1640,14 @@ func (c *GRPCClient) waitForPendingStopBeforeStart(ctx context.Context, apply *s
 }
 
 func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
-	controlReq, err := pendingStartControlRequest(ctx, c.storage, apply)
+	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStart)
 	if err != nil {
 		return err
 	}
 	if controlReq == nil {
 		return nil
 	}
-	if stopReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
+	if stopReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 		return fmt.Errorf("check pending stop before pending gRPC start for apply %s: %w", apply.ApplyIdentifier, err)
 	} else if stopReq != nil {
 		slog.Info("pending gRPC start request is waiting for pending stop request to finish",
@@ -1666,7 +1666,7 @@ func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, appl
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
 		message := fmt.Sprintf("gRPC apply %s is waiting for deploy without a remote apply id; start dispatch state is ambiguous", apply.ApplyIdentifier)
-		if err := failPendingStartControlRequests(ctx, c.storage, apply, message); err != nil {
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message); err != nil {
 			return err
 		}
 		return errors.New(message)
@@ -1683,7 +1683,7 @@ func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, appl
 			"database", apply.Database,
 			"environment", apply.Environment,
 			"error", err)
-		if failErr := failPendingStartControlRequests(ctx, c.storage, apply, message); failErr != nil {
+		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message); failErr != nil {
 			return failErr
 		}
 		return fmt.Errorf("start gRPC deferred deploy %s: %w", apply.ApplyIdentifier, err)
@@ -2081,7 +2081,7 @@ func (c *GRPCClient) completeApplyStartRequestForScope(ctx context.Context, appl
 			"environment", apply.Environment)
 		return nil
 	}
-	return completePendingStartControlRequests(ctx, c.storage, apply)
+	return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart)
 }
 
 // persistParentApply writes the parent applies row unless the drive is a
@@ -2247,7 +2247,7 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 		}
 		if storedApply != nil && state.IsTerminalApplyState(storedApply.State) {
 			if scope.suppressesDirectParentApplyWrites() {
-				controlReq, err := pendingStopControlRequest(ctx, c.storage, storedApply)
+				controlReq, err := pendingControlRequest(ctx, c.storage, storedApply, storage.ControlOperationStop)
 				if err != nil {
 					return fmt.Errorf("check pending stop after terminal remote progress for apply %s: %w", storedApply.ApplyIdentifier, err)
 				}
@@ -2256,7 +2256,7 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 				}
 				return nil
 			}
-			if err := completePendingStopControlRequests(ctx, c.storage, storedApply); err != nil {
+			if err := completePendingControlRequests(ctx, c.storage, storedApply, storage.ControlOperationStop); err != nil {
 				return err
 			}
 		}
@@ -2310,7 +2310,7 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 	if err := c.storage.Applies().Update(ctx, storedApply); err != nil {
 		return fmt.Errorf("update terminal remote gRPC apply %s: %w", storedApply.ApplyIdentifier, err)
 	}
-	if err := completePendingStopControlRequests(ctx, c.storage, storedApply); err != nil {
+	if err := completePendingControlRequests(ctx, c.storage, storedApply, storage.ControlOperationStop); err != nil {
 		return err
 	}
 	// Stopped is a terminal apply state, but it is not completion of a pending
@@ -2318,7 +2318,7 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 	// recording the stop; leave that request pending so the operator can claim
 	// the stopped row and perform the resume.
 	if !state.IsState(storedApply.State, state.Apply.Stopped) {
-		if err := completePendingStartControlRequests(ctx, c.storage, storedApply); err != nil {
+		if err := completePendingControlRequests(ctx, c.storage, storedApply, storage.ControlOperationStart); err != nil {
 			return err
 		}
 	}
@@ -2713,7 +2713,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 					if err := c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now, scope); err != nil {
 						return fmt.Errorf("persist stopped gRPC apply %s after start grace period: %w", apply.ApplyIdentifier, err)
 					}
-					if err := failPendingStartControlRequests(ctx, c.storage, apply, message); err != nil {
+					if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message); err != nil {
 						return err
 					}
 					return fmt.Errorf("start accepted for gRPC apply %s but %s", apply.ApplyIdentifier, message)

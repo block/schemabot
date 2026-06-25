@@ -164,7 +164,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	for _, cfg := range configs {
 		database := cfg.Config.Database
 		h.goSafe(repo, pr, installationID, func() {
-			h.handleMultiEnvPlan(repo, pr, database, installationID, "", true)
+			h.handleMultiEnvPlan(repo, pr, database, "", installationID, "", true)
 		})
 	}
 

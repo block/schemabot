@@ -284,6 +284,8 @@ type psMetadataForStorage struct {
 	DeployedAt       *time.Time `json:"deployed_at,omitempty"`
 	IsInstant        bool       `json:"is_instant,omitempty"`
 	DeferredDeploy   bool       `json:"deferred_deploy,omitempty"`
+	VSchemaStatus    string     `json:"vschema_status,omitempty"`
+	VSchemaDiff      string     `json:"vschema_diff,omitempty"`
 }
 
 func decodePSMetadataForStorage(s string) (*psMetadataForStorage, error) {
@@ -330,6 +332,12 @@ func PSDisplayMetadata(resumeStateMetadata string) (map[string]string, error) {
 	}
 	if meta.DeferredDeploy {
 		set("deferred_deploy", "true")
+	}
+	if meta.VSchemaStatus != "" {
+		set("vschema_status", meta.VSchemaStatus)
+	}
+	if meta.VSchemaDiff != "" {
+		set("vschema_diff", meta.VSchemaDiff)
 	}
 	return m, nil
 }

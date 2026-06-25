@@ -8,28 +8,23 @@ import (
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/psclient"
 )
 
 var _ engine.ControlResumeValidator = (*Engine)(nil)
 
 // Stop cancels the deploy request. This is permanent.
 func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	meta, err := controlMeta(engine.ControlStop, req)
+	meta, client, err := e.controlClient(engine.ControlStop, req)
 	if err != nil {
-		return nil, fmt.Errorf("decode control metadata: %w", err)
+		return nil, err
 	}
 
-	client, err := e.getClient(req.Credentials)
-	if err != nil {
-		return nil, fmt.Errorf("get planetscale client: %w", err)
-	}
-
-	_, err = client.CancelDeployRequest(ctx, &ps.CancelDeployRequestRequest{
+	if _, err := client.CancelDeployRequest(ctx, &ps.CancelDeployRequestRequest{
 		Organization: credOrg(req.Credentials),
 		Database:     req.Database,
 		Number:       meta.DeployRequestID,
-	})
-	if err != nil {
+	}); err != nil {
 		return nil, fmt.Errorf("cancel deploy request #%d (may have been deleted): %w", meta.DeployRequestID, err)
 	}
 
@@ -78,84 +73,79 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 
 // Cutover triggers the final schema swap via ApplyDeployRequest.
 func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	meta, err := controlMeta(engine.ControlCutover, req)
-	if err != nil {
-		return nil, fmt.Errorf("decode control metadata: %w", err)
-	}
-
-	client, err := e.getClient(req.Credentials)
-	if err != nil {
-		return nil, fmt.Errorf("get planetscale client: %w", err)
-	}
-
-	dr, err := client.ApplyDeployRequest(ctx, &ps.ApplyDeployRequestRequest{
-		Organization: credOrg(req.Credentials),
-		Database:     req.Database,
-		Number:       meta.DeployRequestID,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("cutover deploy request #%d (may have been deleted): %w", meta.DeployRequestID, err)
-	}
-
-	return &engine.ControlResult{
-		Accepted:    true,
-		Message:     fmt.Sprintf("Cutover initiated for deploy request #%d", dr.Number),
-		ResumeState: req.ResumeState,
-	}, nil
+	return e.controlDeployRequest(ctx, engine.ControlCutover, req, "cutover", "Cutover initiated for",
+		func(ctx context.Context, client psclient.PSClient, number uint64) (*ps.DeployRequest, error) {
+			return client.ApplyDeployRequest(ctx, &ps.ApplyDeployRequestRequest{
+				Organization: credOrg(req.Credentials),
+				Database:     req.Database,
+				Number:       number,
+			})
+		})
 }
 
 // Revert rolls back a completed schema change during the revert window.
 func (e *Engine) Revert(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	meta, err := controlMeta(engine.ControlRevert, req)
-	if err != nil {
-		return nil, fmt.Errorf("decode control metadata: %w", err)
-	}
-
-	client, err := e.getClient(req.Credentials)
-	if err != nil {
-		return nil, fmt.Errorf("get planetscale client: %w", err)
-	}
-
-	dr, err := client.RevertDeployRequest(ctx, &ps.RevertDeployRequestRequest{
-		Organization: credOrg(req.Credentials),
-		Database:     req.Database,
-		Number:       meta.DeployRequestID,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("revert deploy request #%d (may have been deleted): %w", meta.DeployRequestID, err)
-	}
-
-	return &engine.ControlResult{
-		Accepted:    true,
-		Message:     fmt.Sprintf("Revert initiated for deploy request #%d", dr.Number),
-		ResumeState: req.ResumeState,
-	}, nil
+	return e.controlDeployRequest(ctx, engine.ControlRevert, req, "revert", "Revert initiated for",
+		func(ctx context.Context, client psclient.PSClient, number uint64) (*ps.DeployRequest, error) {
+			return client.RevertDeployRequest(ctx, &ps.RevertDeployRequestRequest{
+				Organization: credOrg(req.Credentials),
+				Database:     req.Database,
+				Number:       number,
+			})
+		})
 }
 
 // SkipRevert closes the revert window, making the schema change permanent.
 func (e *Engine) SkipRevert(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	meta, err := controlMeta(engine.ControlSkipRevert, req)
-	if err != nil {
-		return nil, fmt.Errorf("decode control metadata: %w", err)
-	}
+	return e.controlDeployRequest(ctx, engine.ControlSkipRevert, req, "skip revert for", "Revert window skipped for",
+		func(ctx context.Context, client psclient.PSClient, number uint64) (*ps.DeployRequest, error) {
+			return client.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
+				Organization: credOrg(req.Credentials),
+				Database:     req.Database,
+				Number:       number,
+			})
+		})
+}
 
+// controlClient validates the resume-state metadata for a control operation and
+// returns it together with a PlanetScale client for the request's credentials.
+func (e *Engine) controlClient(operation engine.ControlOperation, req *engine.ControlRequest) (*psMetadata, psclient.PSClient, error) {
+	meta, err := controlMeta(operation, req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decode control metadata: %w", err)
+	}
 	client, err := e.getClient(req.Credentials)
 	if err != nil {
-		return nil, fmt.Errorf("get planetscale client: %w", err)
+		return nil, nil, fmt.Errorf("get planetscale client: %w", err)
+	}
+	return meta, client, nil
+}
+
+// controlDeployRequest runs a deploy-request mutation that returns the updated
+// deploy request and reports a successful ControlResult. errVerb names the action
+// in the failure message; messagePrefix prefixes the success message, both
+// followed by "deploy request #<number>".
+func (e *Engine) controlDeployRequest(
+	ctx context.Context,
+	operation engine.ControlOperation,
+	req *engine.ControlRequest,
+	errVerb string,
+	messagePrefix string,
+	mutate func(ctx context.Context, client psclient.PSClient, number uint64) (*ps.DeployRequest, error),
+) (*engine.ControlResult, error) {
+	meta, client, err := e.controlClient(operation, req)
+	if err != nil {
+		return nil, err
 	}
 
-	dr, err := client.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
-		Organization: credOrg(req.Credentials),
-		Database:     req.Database,
-		Number:       meta.DeployRequestID,
-	})
+	dr, err := mutate(ctx, client, meta.DeployRequestID)
 	if err != nil {
-		return nil, fmt.Errorf("skip revert for deploy request #%d (may have been deleted): %w", meta.DeployRequestID, err)
+		return nil, fmt.Errorf("%s deploy request #%d (may have been deleted): %w", errVerb, meta.DeployRequestID, err)
 	}
 
 	return &engine.ControlResult{
 		Accepted:    true,
-		Message:     fmt.Sprintf("Revert window skipped for deploy request #%d", dr.Number),
+		Message:     fmt.Sprintf("%s deploy request #%d", messagePrefix, dr.Number),
 		ResumeState: req.ResumeState,
 	}, nil
 }

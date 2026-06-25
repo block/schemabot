@@ -194,95 +194,69 @@ func planAuthoritativeField(name, planID, requested, planValue string) (string, 
 	return planValue, nil
 }
 
-// Progress returns progress for a stored apply by routing through its target.
-func (r *TargetRouter) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
+// applyScopedRequest is implemented by the apply-scoped tern request protos,
+// which all carry an apply id and environment used to route to a deployment.
+type applyScopedRequest[T any] interface {
+	*T
+	proto.Message
+	GetApplyId() string
+	GetEnvironment() string
+}
+
+// routeStoredApply resolves the target client for an apply-scoped request and
+// dispatches the request to it, attaching any registered progress observer. The
+// operation name is used for routing context and the missing-request error.
+func routeStoredApply[T any, PT applyScopedRequest[T], Resp any](
+	ctx context.Context,
+	r *TargetRouter,
+	req PT,
+	operation string,
+	dispatch func(client Client, ctx context.Context, req PT) (*Resp, error),
+) (*Resp, error) {
 	if req == nil {
-		return nil, fmt.Errorf("progress request is required")
+		return nil, fmt.Errorf("%s request is required", operation)
 	}
-	client, apply, err := r.clientForApplyIdentifier(ctx, req.ApplyId, req.Environment, "progress")
+	client, apply, err := r.clientForApplyIdentifier(ctx, req.GetApplyId(), req.GetEnvironment(), operation)
 	if err != nil {
 		return nil, err
 	}
 	r.attachObserver(client, apply.ID)
-	return client.Progress(ctx, req)
+	return dispatch(client, ctx, req)
+}
+
+// Progress returns progress for a stored apply by routing through its target.
+func (r *TargetRouter) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
+	return routeStoredApply(ctx, r, req, "progress", Client.Progress)
 }
 
 // Cutover triggers cutover for a stored apply by routing through its target.
 func (r *TargetRouter) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
-	if req == nil {
-		return nil, fmt.Errorf("cutover request is required")
-	}
-	client, apply, err := r.clientForApplyIdentifier(ctx, req.ApplyId, req.Environment, "cutover")
-	if err != nil {
-		return nil, err
-	}
-	r.attachObserver(client, apply.ID)
-	return client.Cutover(ctx, req)
+	return routeStoredApply(ctx, r, req, "cutover", Client.Cutover)
 }
 
 // Stop pauses a stored apply by routing through its target.
 func (r *TargetRouter) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1.StopResponse, error) {
-	if req == nil {
-		return nil, fmt.Errorf("stop request is required")
-	}
-	client, apply, err := r.clientForApplyIdentifier(ctx, req.ApplyId, req.Environment, "stop")
-	if err != nil {
-		return nil, err
-	}
-	r.attachObserver(client, apply.ID)
-	return client.Stop(ctx, req)
+	return routeStoredApply(ctx, r, req, "stop", Client.Stop)
 }
 
 // Start resumes a stored apply by routing through its target.
 func (r *TargetRouter) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
-	if req == nil {
-		return nil, fmt.Errorf("start request is required")
-	}
-	client, apply, err := r.clientForApplyIdentifier(ctx, req.ApplyId, req.Environment, "start")
-	if err != nil {
-		return nil, err
-	}
-	r.attachObserver(client, apply.ID)
-	return client.Start(ctx, req)
+	return routeStoredApply(ctx, r, req, "start", Client.Start)
 }
 
 // Volume modifies a stored apply by routing through its target.
 func (r *TargetRouter) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	if req == nil {
-		return nil, fmt.Errorf("volume request is required")
-	}
-	client, apply, err := r.clientForApplyIdentifier(ctx, req.ApplyId, req.Environment, "volume")
-	if err != nil {
-		return nil, err
-	}
-	r.attachObserver(client, apply.ID)
-	return client.Volume(ctx, req)
+	return routeStoredApply(ctx, r, req, "volume", Client.Volume)
 }
 
 // Revert reverts a stored apply by routing through its target.
 func (r *TargetRouter) Revert(ctx context.Context, req *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
-	if req == nil {
-		return nil, fmt.Errorf("revert request is required")
-	}
-	client, apply, err := r.clientForApplyIdentifier(ctx, req.ApplyId, req.Environment, "revert")
-	if err != nil {
-		return nil, err
-	}
-	r.attachObserver(client, apply.ID)
-	return client.Revert(ctx, req)
+	return routeStoredApply(ctx, r, req, "revert", Client.Revert)
 }
 
 // SkipRevert skips the revert window for a stored apply by routing through its target.
 func (r *TargetRouter) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequest) (*ternv1.SkipRevertResponse, error) {
-	if req == nil {
-		return nil, fmt.Errorf("skip revert request is required")
-	}
-	client, apply, err := r.clientForApplyIdentifier(ctx, req.ApplyId, req.Environment, "skip revert")
-	if err != nil {
-		return nil, err
-	}
-	r.attachObserver(client, apply.ID)
-	return client.SkipRevert(ctx, req)
+	return routeStoredApply(ctx, r, req, "skip revert", Client.SkipRevert)
 }
 
 // Health checks storage connectivity for the data-plane router.

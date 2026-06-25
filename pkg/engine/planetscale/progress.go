@@ -73,13 +73,31 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 
 	// Update metadata with DeployedAt when available (used by tern layer for
 	// revert window timeout calculation).
+	metaChanged := false
 	if dr.DeployedAt != nil && meta.DeployedAt == nil {
 		meta.DeployedAt = dr.DeployedAt
-		if encoded, encErr := encodePSMetadata(meta); encErr == nil {
-			req.ResumeState = &engine.ResumeState{
-				MigrationContext: req.ResumeState.MigrationContext,
-				Metadata:         encoded,
-			}
+		metaChanged = true
+	}
+
+	// Track the VSchema-application phase so it can be surfaced from stored state
+	// without a synthetic task row. Persisting it through the resume state lets a
+	// progress read served from storage project it via PSDisplayMetadata.
+	if vs := nextVSchemaStatus(meta.VSchemaStatus, dr.DeploymentState); vs != meta.VSchemaStatus {
+		meta.VSchemaStatus = vs
+		metaChanged = true
+	}
+
+	// Re-encode once if anything changed. A failed encode would desync the live
+	// progress projection from what persists to storage, so surface it rather
+	// than continuing with stale resume state.
+	if metaChanged {
+		encoded, err := encodePSMetadata(meta)
+		if err != nil {
+			return nil, fmt.Errorf("encode planetscale resume metadata for deploy request #%d: %w", meta.DeployRequestID, err)
+		}
+		req.ResumeState = &engine.ResumeState{
+			MigrationContext: req.ResumeState.MigrationContext,
+			Metadata:         encoded,
 		}
 	}
 
@@ -590,6 +608,12 @@ func psDisplayMetadata(meta *psMetadata) map[string]string {
 	}
 	if meta.DeferredDeploy {
 		set("deferred_deploy", "true")
+	}
+	if meta.VSchemaStatus != "" {
+		set("vschema_status", meta.VSchemaStatus)
+	}
+	if meta.VSchemaDiff != "" {
+		set("vschema_diff", meta.VSchemaDiff)
 	}
 	return m
 }

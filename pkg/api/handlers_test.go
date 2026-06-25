@@ -1990,9 +1990,10 @@ func TestCreateStoredApplyFansOutShardedPlanOperations(t *testing.T) {
 }
 
 func TestCreateStoredApplyFansOutShardedPlanWithFinalizerOperation(t *testing.T) {
-	// A sharded plan with a namespace-level routing metadata change keeps the
-	// work operations shard-scoped and queues the metadata change as a finalizer
-	// operation that is driven through the same operation-scoped path.
+	// A sharded plan with a namespace-level VSchema change keeps the work
+	// operations shard-scoped and queues the VSchema change as a task-less
+	// group_finalizer operation, driven through the same operation-scoped path.
+	// The finalizer reconstructs the VSchema from the plan, so it carries no task.
 	applies := &capturingApplyStore{}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	tasks := &capturingTaskStore{}
@@ -2040,21 +2041,18 @@ func TestCreateStoredApplyFansOutShardedPlanWithFinalizerOperation(t *testing.T)
 	assert.Equal(t, "commerce/group_finalizer", applies.operations[2].OperationKey)
 	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, applies.operations[2].OperationKind)
 
-	require.Len(t, tasks.tasks, 3)
+	// Only the two shard-work tasks exist; the finalizer is task-less.
+	require.Len(t, tasks.tasks, 2)
 	assert.Equal(t, "-80", tasks.tasks[0].Shard)
 	assert.Equal(t, "users", tasks.tasks[0].TableName)
 	assert.Equal(t, "80-", tasks.tasks[1].Shard)
 	assert.Equal(t, "users", tasks.tasks[1].TableName)
-	assert.Empty(t, tasks.tasks[2].Shard)
-	assert.Equal(t, "VSchema: commerce", tasks.tasks[2].TableName)
-	assert.Equal(t, "vschema_update", tasks.tasks[2].DDLAction)
-	require.NotNil(t, tasks.tasks[2].ApplyOperationID)
-	assert.Equal(t, applies.operations[2].ID, *tasks.tasks[2].ApplyOperationID)
 }
 
 func TestCreateStoredApplyDoesNotDropFinalizerOnlyNamespace(t *testing.T) {
-	// A routing-only namespace with no shard work keeps the apply on the
-	// single-operation path so the routing change is preserved.
+	// When a sharded apply also carries a VSchema-only namespace (a VSchema change
+	// with no shard work of its own), that namespace still gets a task-less
+	// group_finalizer so its VSchema change is preserved rather than dropped.
 	applies := &capturingApplyStore{}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	tasks := &capturingTaskStore{}
@@ -2092,13 +2090,15 @@ func TestCreateStoredApplyDoesNotDropFinalizerOnlyNamespace(t *testing.T) {
 	_, _, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-finalizer-only-namespace", true)
 
 	require.NoError(t, err)
-	require.Len(t, applies.operations, 1)
-	assert.Empty(t, applies.operations[0].OperationKey)
+	require.Len(t, applies.operations, 2)
+	assert.Equal(t, "commerce/-/users", applies.operations[0].OperationKey)
 	assert.Equal(t, storage.ApplyOperationKindWork, applies.operations[0].OperationKind)
-	require.Len(t, tasks.tasks, 2)
+	assert.Equal(t, "routing/group_finalizer", applies.operations[1].OperationKey)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, applies.operations[1].OperationKind)
+	// The routing VSchema change is preserved as a task-less finalizer; only the
+	// commerce shard work produces a task.
+	require.Len(t, tasks.tasks, 1)
 	assert.Equal(t, "users", tasks.tasks[0].TableName)
-	assert.Equal(t, "VSchema: routing", tasks.tasks[1].TableName)
-	assert.Equal(t, "vschema_update", tasks.tasks[1].DDLAction)
 }
 
 func TestCreateStoredApplyDoesNotShardWithoutClientOptIn(t *testing.T) {

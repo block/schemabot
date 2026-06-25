@@ -107,6 +107,8 @@ type CommandParser struct {
 	applyIDRegex      *regexp.Regexp
 	environmentRegex  *regexp.Regexp
 	databaseRegex     *regexp.Regexp
+	tenantRegex       *regexp.Regexp
+	tenantFlagRegex   *regexp.Regexp
 	skipRevertRegex   *regexp.Regexp
 	deferCutoverRegex *regexp.Regexp
 	allowUnsafeRegex  *regexp.Regexp
@@ -123,6 +125,8 @@ func NewCommandParser() *CommandParser {
 		applyIDRegex:      regexp.MustCompile(`(?i)\b(apply[_-][a-f0-9]+)\b`),
 		environmentRegex:  regexp.MustCompile(`(?i)-e\s+(staging|production)`),
 		databaseRegex:     regexp.MustCompile(`(?i)-d\s+([a-zA-Z0-9_-]+)`),
+		tenantRegex:       regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`),
+		tenantFlagRegex:   regexp.MustCompile(`(?i)(?:^|\s)(?:--tenant|-t)(?:[ \t]+([^\s]+))?`),
 		skipRevertRegex:   regexp.MustCompile(`(?i)--skip-revert\b`),
 		deferCutoverRegex: regexp.MustCompile(`(?i)--defer-cutover\b`),
 		allowUnsafeRegex:  regexp.MustCompile(`(?i)--allow-unsafe\b`),
@@ -137,6 +141,8 @@ type CommandResult struct {
 	ApplyID      string // Positional apply identifier for apply-scoped commands.
 	Environment  string
 	Database     string // Optional -d flag value
+	Tenant       string // Optional --tenant/-t routing target for this command.
+	TenantError  bool   // True when --tenant/-t is present without a valid routing target.
 	SkipRevert   bool
 	DeferCutover bool
 	AllowUnsafe  bool
@@ -163,25 +169,48 @@ type CommandResult struct {
 //     "invalid command" comment under the respond_to_unscoped policy.
 func (p *CommandParser) ParseCommand(body string) CommandResult {
 	body = markdownDirectiveText(body)
+	directive, ok := p.firstDirectiveLine(body)
+	if !ok {
+		return CommandResult{}
+	}
+	tenant, tenantErr := p.extractTenant(directive)
 
-	if p.helpRegex.MatchString(body) {
-		return CommandResult{Action: action.Help, IsHelp: true, IsMention: true}
+	if p.helpRegex.MatchString(directive) {
+		return CommandResult{Action: action.Help, Tenant: tenant, TenantError: tenantErr, IsHelp: true, IsMention: true}
 	}
 
-	matches := p.commandRegex.FindStringSubmatch(body)
+	matches := p.commandRegex.FindStringSubmatch(directive)
 	if len(matches) < 2 {
-		if p.mentionRegex.MatchString(body) {
-			return CommandResult{IsMention: true}
-		}
-		return CommandResult{}
+		return CommandResult{Tenant: tenant, TenantError: tenantErr, IsMention: true}
 	}
 
 	name := strings.ToLower(matches[1])
 	spec, ok := specByName[name]
 	if !ok {
-		return CommandResult{IsMention: true}
+		return CommandResult{Tenant: tenant, TenantError: tenantErr, IsMention: true}
 	}
-	return p.applySpec(spec, body)
+	return p.applySpec(spec, directive, tenant, tenantErr)
+}
+
+func (p *CommandParser) firstDirectiveLine(body string) (string, bool) {
+	for line := range strings.Lines(body) {
+		line = strings.TrimRight(line, "\r\n")
+		if p.mentionRegex.MatchString(line) {
+			return line, true
+		}
+	}
+	return "", false
+}
+
+func (p *CommandParser) extractTenant(body string) (string, bool) {
+	match := p.tenantFlagRegex.FindStringSubmatch(body)
+	if len(match) == 0 {
+		return "", false
+	}
+	if len(match) < 2 || match[1] == "" || !p.tenantRegex.MatchString(match[1]) {
+		return "", true
+	}
+	return match[1], false
 }
 
 func markdownDirectiveText(body string) string {
@@ -208,10 +237,12 @@ func isMarkdownFence(line string) bool {
 // applySpec populates CommandResult from a body using the per-command spec.
 // Each spec field gates the corresponding regex extraction, so flags only
 // affect commands that opted in via the registry.
-func (p *CommandParser) applySpec(spec CommandSpec, body string) CommandResult {
+func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantErr bool) CommandResult {
 	result := CommandResult{
-		Action:    spec.Name,
-		IsMention: true,
+		Action:      spec.Name,
+		Tenant:      tenant,
+		TenantError: tenantErr,
+		IsMention:   true,
 	}
 
 	if spec.HasApplyID {

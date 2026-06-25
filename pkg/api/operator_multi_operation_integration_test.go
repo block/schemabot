@@ -567,9 +567,9 @@ func seedShardedFinalizerApply(t *testing.T, ctx context.Context, stor storage.S
 	}
 
 	groups := []*storage.ApplyOperationWithTasks{
-		newShardedFinalizerGroup(now, "commerce/-80/users", storage.ApplyOperationKindWork, "users", "alter", "-80", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
-		newShardedFinalizerGroup(now, "commerce/80-/users", storage.ApplyOperationKindWork, "users", "alter", "80-", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
-		newShardedFinalizerGroup(now, "commerce/group_finalizer", storage.ApplyOperationKindGroupFinalizer, "VSchema: commerce", "vschema_update", "", ""),
+		newShardedWorkGroup(now, "commerce/-80/users", "users", "alter", "-80", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+		newShardedWorkGroup(now, "commerce/80-/users", "users", "alter", "80-", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+		newTaskLessFinalizerGroup(now, "commerce/group_finalizer"),
 	}
 
 	applyID, err := stor.Applies().CreateWithGroupedOperations(ctx, apply, groups)
@@ -582,12 +582,12 @@ func seedShardedFinalizerApply(t *testing.T, ctx context.Context, stor storage.S
 	}
 }
 
-func newShardedFinalizerGroup(now time.Time, operationKey, operationKind, table, action, shard, ddl string) *storage.ApplyOperationWithTasks {
+func newShardedWorkGroup(now time.Time, operationKey, table, action, shard, ddl string) *storage.ApplyOperationWithTasks {
 	return &storage.ApplyOperationWithTasks{
 		Operation: &storage.ApplyOperation{
 			Deployment:    "region-a",
 			OperationKey:  operationKey,
-			OperationKind: operationKind,
+			OperationKind: storage.ApplyOperationKindWork,
 			Target:        "payments-region-a",
 			State:         state.ApplyOperation.Pending,
 			CutoverPolicy: storage.CutoverPolicyRolling,
@@ -613,6 +613,25 @@ func newShardedFinalizerGroup(now time.Time, operationKey, operationKind, table,
 			CreatedAt:      now,
 			UpdatedAt:      now,
 		}},
+	}
+}
+
+// newTaskLessFinalizerGroup seeds a group_finalizer operation with no task,
+// matching how apply-create builds finalizers: the VSchema change is
+// reconstructed from the plan at drive time, not carried as a task.
+func newTaskLessFinalizerGroup(now time.Time, operationKey string) *storage.ApplyOperationWithTasks {
+	return &storage.ApplyOperationWithTasks{
+		Operation: &storage.ApplyOperation{
+			Deployment:    "region-a",
+			OperationKey:  operationKey,
+			OperationKind: storage.ApplyOperationKindGroupFinalizer,
+			Target:        "payments-region-a",
+			State:         state.ApplyOperation.Pending,
+			CutoverPolicy: storage.CutoverPolicyRolling,
+			OnFailure:     storage.OnFailureHalt,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
 	}
 }
 
@@ -737,6 +756,19 @@ func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *stor
 		probe := *apply
 		probe.State = state.Apply.Completed
 		m.rec.recordParentWrite(m.stor.Applies().Update(ctx, &probe))
+	}
+
+	// A group_finalizer carries no tasks: the real drive (driveGroupFinalizer)
+	// applies the namespace VSchema and marks the operation row directly. Simulate
+	// that outcome here rather than transitioning task rows it does not have.
+	if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+		if state.IsState(m.outcome.taskState, state.Task.Failed) {
+			return m.stor.ApplyOperations().MarkFailed(ctx, op.ID, m.outcome.errMsg)
+		}
+		if state.IsState(m.outcome.taskState, state.Task.Completed) {
+			return m.stor.ApplyOperations().MarkCompleted(ctx, op.ID)
+		}
+		return nil
 	}
 
 	tasks, err := m.stor.Tasks().GetByApplyOperationID(ctx, applyOperationID)

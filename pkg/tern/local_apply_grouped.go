@@ -63,7 +63,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		c.failApplyWithTasks(ctx, apply, tasks, err.Error())
 		return
 	}
-	changes := groupedResumeChanges(tasks)
+	changes := groupedResumeChanges(tasks, plan)
 
 	// Mark the apply as started before calling the engine. The engine may run
 	// for a long time (branch creation, DDL application, deploy request) and
@@ -108,7 +108,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 				c.logger.Debug("OnStateChange: nil resume state", "apply_id", apply.ApplyIdentifier)
 				return
 			}
-			if saveErr := c.saveEngineResumeState(ctx, tasks, rs); saveErr != nil {
+			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, rs); saveErr != nil {
 				c.logger.Warn("OnStateChange: failed to persist opaque resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 			}
 		},
@@ -143,6 +143,13 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		return
 	}
 
+	if isTasklessVSchemaOnlyPlan(tasks, plan) {
+		if completeErr := c.completeTasklessGroupedApply(ctx, apply, result.Message); completeErr != nil {
+			c.logger.Error("failed to complete task-less grouped apply", "apply_id", apply.ApplyIdentifier, "error", completeErr)
+		}
+		return
+	}
+
 	// Persist the engine resume state and set IsInstant on tasks before marking
 	// running. The progress handler reads task.is_instant and the engine resume
 	// state to render the instant label and deploy display fields, so both must
@@ -151,7 +158,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	if result.ResumeState != nil {
 		resumeState = result.ResumeState
 		if c.config.Type == storage.DatabaseTypeVitess {
-			if saveErr := c.saveEngineResumeState(ctx, tasks, resumeState); saveErr != nil {
+			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, resumeState); saveErr != nil {
 				c.logger.Error("failed to save opaque engine resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 				c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state: %v", saveErr))
 				return
@@ -188,12 +195,95 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	c.pollForCompletionAtomic(ctx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
 }
 
-func (c *LocalClient) saveEngineResumeState(ctx context.Context, tasks []*storage.Task, resumeState *engine.ResumeState) error {
-	operationID, err := applyOperationIDForTasks(tasks)
+func (c *LocalClient) saveEngineResumeState(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, resumeState *engine.ResumeState) error {
+	operationID, err := c.applyOperationIDForApplyTasks(ctx, apply, tasks)
 	if err != nil {
 		return err
 	}
 	return c.saveEngineResumeStateForOperation(ctx, operationID, resumeState)
+}
+
+func (c *LocalClient) applyOperationIDForApplyTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) (int64, error) {
+	if len(tasks) > 0 {
+		return applyOperationIDForTasks(tasks)
+	}
+	if apply == nil {
+		return 0, fmt.Errorf("engine resume state has no tasks and no apply")
+	}
+	store := c.storage.ApplyOperations()
+	if store == nil {
+		return 0, fmt.Errorf("engine resume state has no tasks and no apply operation store")
+	}
+	ops, err := store.ListByApply(ctx, apply.ID)
+	if err != nil {
+		return 0, fmt.Errorf("list apply operations for task-less apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if len(ops) != 1 {
+		return 0, fmt.Errorf("engine resume state has no tasks and apply %s has %d operations", apply.ApplyIdentifier, len(ops))
+	}
+	return ops[0].ID, nil
+}
+
+func isTasklessVSchemaOnlyPlan(tasks []*storage.Task, plan *storage.Plan) bool {
+	if len(tasks) != 0 || plan == nil {
+		return false
+	}
+	if len(plan.FlatDDLChanges()) != 0 {
+		return false
+	}
+	for _, nsData := range plan.Namespaces {
+		if namespaceHasVSchemaArtifact(nsData) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *LocalClient) completeTasklessGroupedApply(ctx context.Context, apply *storage.Apply, message string) error {
+	if suppressParentApplyWrites(ctx) {
+		operationID, err := c.applyOperationIDForApplyTasks(ctx, apply, nil)
+		if err != nil {
+			return fmt.Errorf("resolve task-less apply operation for apply %s: %w", apply.ApplyIdentifier, err)
+		}
+		if err := c.storage.ApplyOperations().MarkCompleted(ctx, operationID); err != nil {
+			return fmt.Errorf("mark task-less apply_operation %d completed (apply %s): %w", operationID, apply.ApplyIdentifier, err)
+		}
+		return nil
+	}
+	now := time.Now()
+	apply.State = state.Apply.Completed
+	apply.CompletedAt = &now
+	apply.UpdatedAt = now
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		return fmt.Errorf("complete task-less grouped apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if message == "" {
+		message = "Apply completed with state: completed"
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+		message, state.Apply.Running, state.Apply.Completed)
+	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
+	c.notifyTerminalObserver(apply, nil)
+	return nil
+}
+
+func (c *LocalClient) markTasklessOperationState(ctx context.Context, apply *storage.Apply, opState, errorMessage string) error {
+	operationID, err := c.applyOperationIDForApplyTasks(ctx, apply, nil)
+	if err != nil {
+		return fmt.Errorf("resolve task-less apply operation for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	switch {
+	case state.IsState(opState, state.Apply.Completed):
+		return c.storage.ApplyOperations().MarkCompleted(ctx, operationID)
+	case state.IsState(opState, state.Apply.Failed):
+		return c.storage.ApplyOperations().MarkFailed(ctx, operationID, errorMessage)
+	case state.IsState(opState, state.Apply.FailedRetryable, state.Apply.WaitingForCutover):
+		return c.storage.ApplyOperations().UpdateState(ctx, operationID, opState)
+	case state.IsTerminalApplyState(opState):
+		return c.storage.ApplyOperations().MarkTerminal(ctx, operationID, opState)
+	default:
+		return nil
+	}
 }
 
 func (c *LocalClient) saveEngineResumeStateForOperation(ctx context.Context, operationID int64, resumeState *engine.ResumeState) error {
@@ -553,7 +643,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	if result.ResumeState != nil && resumeState != nil {
 		*resumeState = *result.ResumeState
 		if c.config.Type == storage.DatabaseTypeVitess {
-			if saveErr := c.saveEngineResumeState(ctx, tasks, resumeState); saveErr != nil {
+			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, resumeState); saveErr != nil {
 				c.logger.Error("failed to save Vitess engine resume state from progress polling",
 					"apply_id", apply.ApplyIdentifier, "error", saveErr)
 				c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state from progress polling: %v", saveErr))
@@ -697,6 +787,16 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// would suppress the operator's once-only terminal summary.
 	if suppressParentApplyWrites(ctx) {
 		opState := state.DeriveApplyState(taskStates(tasks))
+		if len(tasks) == 0 {
+			opState = state.DeriveApplyState([]string{newState})
+			if state.IsTerminalApplyState(opState) || state.IsState(opState, state.Apply.FailedRetryable, state.Apply.WaitingForCutover) {
+				if err := c.markTasklessOperationState(ctx, apply, opState, result.ErrorMessage); err != nil {
+					c.logger.Error("failed to mark task-less apply_operation from progress",
+						"apply_id", apply.ApplyIdentifier, "operation_state", opState, "error", err)
+					return true
+				}
+			}
+		}
 		if releaseAtCutoverBarrier && state.IsState(opState, state.Apply.WaitingForCutover) {
 			c.logger.Info("operation parked at cutover barrier; exiting operation drive",
 				"mode", groupedApplyMode(apply, options), "apply_id", apply.ApplyIdentifier, "operation_state", opState)
@@ -712,7 +812,9 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 	// Update apply state from persisted task state so recovery guards can keep
 	// storage ahead of stale engine progress until Spirit reaches the cutover wait again.
-	if derived, ok := c.deriveAggregateApplyState(ctx, apply, tasks); ok {
+	if len(tasks) == 0 {
+		apply.State = state.DeriveApplyState([]string{newState})
+	} else if derived, ok := c.deriveAggregateApplyState(ctx, apply, tasks); ok {
 		apply.State = derived
 	}
 	apply.UpdatedAt = now
@@ -732,7 +834,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			"stored_state", freshApply.State,
 			"progress_state", apply.State)
 		*apply = *freshApply
-		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 			c.logger.Warn("failed to complete pending stop request for terminal apply; current apply owner will exit for operator retry",
 				"apply_id", apply.ApplyIdentifier, "error", err)
 			return true
@@ -779,7 +881,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 				"apply_id", apply.ApplyIdentifier, "expected_state", expectedState, "derived_state", apply.State)
 			return true
 		}
-		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 			c.logger.Warn("failed to complete pending stop request after terminal progress reconciliation; current apply owner will exit for operator retry",
 				"apply_id", apply.ApplyIdentifier, "error", err)
 			return true
@@ -954,18 +1056,6 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 		if retryableFailure && state.IsTerminalTaskState(task.State) {
 			continue
 		}
-		// VSchema tasks follow deploy-request-level state, not per-migration state.
-		// They have no SHOW VITESS_MIGRATIONS rows. Their state transitions are:
-		// pending → running (during in_progress_vschema) → completed/failed.
-		if isVSchemaTask(task) {
-			vsState := c.deriveVSchemaTaskState(task, result, newState, now)
-			if vsState != task.State {
-				msg := fmt.Sprintf("VSchema %s → %s", task.State, vsState)
-				c.transitionTaskState(ctx, task, task.ApplyID, vsState, msg)
-			}
-			continue
-		}
-
 		if tp, ok := engineProgressForTask(tableProgress, task); ok {
 			task.RowsCopied = tp.RowsCopied
 			task.RowsTotal = tp.RowsTotal
@@ -1068,45 +1158,5 @@ func (c *LocalClient) writeShardProgress(ctx context.Context, table *storage.Tas
 			"database", table.Database, "environment", table.Environment,
 			"namespace", table.Namespace, "table", table.TableName, "shard", sh.Shard,
 			"error", err)
-	}
-}
-
-// deriveVSchemaTaskState determines the state for a VSchema task based on
-// the engine progress result. VSchema tasks have no per-migration rows in
-// SHOW VITESS_MIGRATIONS — their state tracks the deploy request's VSchema
-// application phase (in_progress_vschema).
-func (c *LocalClient) deriveVSchemaTaskState(task *storage.Task, result *engine.ProgressResult, taskState string, now time.Time) string {
-	if state.IsTerminalTaskState(task.State) {
-		return task.State
-	}
-
-	switch {
-	case state.IsState(taskState, state.Task.FailedRetryable):
-		if task.ErrorMessage == "" {
-			task.ErrorMessage = progressFailureMessage(result)
-		}
-		return state.Task.FailedRetryable
-	case result.Message == engine.MessageApplyingVSchema:
-		if task.StartedAt == nil {
-			task.StartedAt = &now
-		}
-		return state.Task.Running
-	case result.State == engine.StateFailed:
-		if task.CompletedAt == nil {
-			task.CompletedAt = &now
-		}
-		return state.Task.Failed
-	case state.IsState(taskState, state.Task.RevertWindow):
-		if task.CompletedAt == nil {
-			task.CompletedAt = &now
-		}
-		return state.Task.RevertWindow
-	case result.State.IsTerminal(), state.IsState(taskState, state.Task.Completed):
-		if task.CompletedAt == nil {
-			task.CompletedAt = &now
-		}
-		return state.Task.Completed
-	default:
-		return task.State
 	}
 }

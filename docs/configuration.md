@@ -21,6 +21,7 @@
   - [Staging Instance](#staging-instance)
   - [Production Instance](#production-instance)
   - [Environment-local gRPC targets](#environment-local-grpc-targets)
+  - [Tenant-scoped command routing](#tenant-scoped-command-routing)
   - [How it works](#how-it-works)
   - [Auto-plan behavior](#auto-plan-behavior)
 - [Multi-App Routing](#multi-app-routing)
@@ -573,9 +574,52 @@ tern_deployments:
 
 Do not require the staging ConfigMap to contain production targets, or the production ConfigMap to contain staging targets. Each instance resolves only the environments it owns.
 
+### Tenant-scoped command routing
+
+When multiple isolated SchemaBot deployments are installed on the same
+repository and handle the same environment names, use the server-side `tenant`
+setting to give each deployment a stable command-routing identity:
+
+```yaml
+tenant: alpha
+allowed_environments:
+  - production
+```
+
+A PR comment can then target exactly one deployment:
+
+```text
+schemabot plan -e production --tenant alpha
+schemabot apply -e production --tenant alpha
+schemabot help -t alpha
+```
+
+Only the deployment whose configured `tenant` exactly matches the `--tenant`
+or `-t` flag reacts to the comment or posts a response. Other deployments accept
+the webhook delivery and skip it without adding reactions or comments, the same
+way an environment-scoped deployment skips commands for environments outside
+`allowed_environments`.
+
+This routing identity is deliberately local to the server process. It is not
+stored on plans or applies and it does not change database target resolution.
+The isolated deployment's own storage, chart values, GitHub App configuration,
+and database routing remain the source of truth for the work it owns.
+
+Use `respond_to_unscoped` separately for commands that do not carry `--tenant`.
+For example, if several deployments are installed on the same repository, pick
+one deployment to answer untargeted `schemabot help` and invalid commands by
+leaving `respond_to_unscoped` enabled there and setting it to `false` on the
+others. Operators can still direct help to a specific deployment with
+`schemabot help --tenant <name>` or `schemabot help -t <name>`.
+
 ### How it works
 
 - **Environment scoping:** When `allowed_environments` is set, the instance only processes commands targeting those environments. Commands for other environments (e.g., `schemabot apply -e production` sent to the staging instance) are accepted without a PR response by this deployment. A deployment that allows the requested environment must process its own webhook delivery.
+
+- **Tenant scoping:** When `tenant` is set and a command includes `--tenant`,
+  only the matching deployment processes the command. Tenant scoping is a
+  webhook ownership filter, not a schema-change state field; untargeted commands
+  continue through the existing environment and unscoped-command routing.
 
 - **Per-environment aggregate checks:** Each instance creates its own aggregate check run scoped to its environments (e.g., `SchemaBot (staging)`, `SchemaBot (production)`) instead of the default `SchemaBot` aggregate. Configure branch protection to require both aggregates. Set `github.check-name` when independent SchemaBot gates need distinct visible names; every instance in the same promotion chain should use the same base name.
 

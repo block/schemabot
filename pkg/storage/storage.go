@@ -336,8 +336,9 @@ type ApplyStore interface {
 
 // ApplyOperationWithTasks groups one apply_operations row with the task rows it owns.
 type ApplyOperationWithTasks struct {
-	Operation *ApplyOperation
-	Tasks     []*Task
+	Operation     *ApplyOperation
+	Tasks         []*Task
+	AllowTaskless bool
 }
 
 // RecentAppliesFilter controls recent apply queries for status views.

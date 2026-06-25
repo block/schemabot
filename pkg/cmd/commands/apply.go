@@ -618,11 +618,7 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 				ts.announced = true
 				ts.taskID = tbl.TaskID
 				ts.lastEmit = time.Now()
-				msg := "Table started"
-				if isVSchemaTask(tbl) {
-					msg = "VSchema update started"
-				}
-				kvs := tableKVs(msg, tbl, ts)
+				kvs := tableKVs("Table started", tbl, ts)
 				if tbl.DDL != "" {
 					kvs = append(kvs, "ddl", collapseDDL(tbl.DDL))
 				}
@@ -736,13 +732,7 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 
 // tableKVs returns the common key-value pairs for a table log line (table name + task_id if known).
 func tableKVs(msg string, tbl *apitypes.TableProgressResponse, ts *tableLogState) []string {
-	kvs := []string{"msg", msg}
-	if isVSchemaTask(tbl) {
-		// VSchema tasks use keyspace as the identifier, not "table"
-		kvs = append(kvs, "keyspace", tbl.Keyspace)
-	} else {
-		kvs = append(kvs, "table", tbl.TableName)
-	}
+	kvs := []string{"msg", msg, "table", tbl.TableName}
 	taskID := ts.taskID
 	if taskID == "" {
 		taskID = tbl.TaskID
@@ -750,7 +740,7 @@ func tableKVs(msg string, tbl *apitypes.TableProgressResponse, ts *tableLogState
 	if taskID != "" {
 		kvs = append(kvs, "task_id", taskID)
 	}
-	if !isVSchemaTask(tbl) && tbl.Keyspace != "" {
+	if tbl.Keyspace != "" {
 		kvs = append(kvs, "keyspace", tbl.Keyspace)
 	}
 	return kvs
@@ -781,41 +771,23 @@ func appendShardSummary(kvs []string, shards []*apitypes.ShardProgressResponse) 
 	return kvs
 }
 
-// isVSchemaTask returns true if this is a synthetic VSchema update task.
-func isVSchemaTask(tbl *apitypes.TableProgressResponse) bool {
-	return strings.HasPrefix(tbl.TableName, "vschema:")
-}
-
 // emitTableStateChange emits a log line for a table state transition.
 func (e *logEmitter) emitTableStateChange(tbl *apitypes.TableProgressResponse, tblStatus string, ts *tableLogState) {
 	dur := ui.FormatHumanDuration(time.Since(ts.startedAt))
-	vs := isVSchemaTask(tbl)
 
 	switch tblStatus {
 	case state.Apply.Completed:
-		msg := "Table complete"
-		if vs {
-			msg = "VSchema update complete"
-		}
-		kvs := tableKVs(msg, tbl, ts)
+		kvs := tableKVs("Table complete", tbl, ts)
 		kvs = append(kvs, "duration", dur)
 		kvs = appendShardSummary(kvs, tbl.Shards)
 		e.emit(kvs...)
 	case state.Apply.RevertWindow:
-		msg := "Table deployed — revert window open"
-		if vs {
-			msg = "VSchema deployed — revert window open"
-		}
-		kvs := tableKVs(msg, tbl, ts)
+		kvs := tableKVs("Table deployed — revert window open", tbl, ts)
 		kvs = append(kvs, "duration", dur)
 		kvs = appendShardSummary(kvs, tbl.Shards)
 		e.emit(kvs...)
 	case state.Apply.Failed:
-		msg := "Table failed"
-		if vs {
-			msg = "VSchema update failed"
-		}
-		kvs := tableKVs(msg, tbl, ts)
+		kvs := tableKVs("Table failed", tbl, ts)
 		e.emit(append(kvs, "duration", dur)...)
 	case state.Apply.WaitingForCutover:
 		kvs := tableKVs("Waiting for cutover", tbl, ts)

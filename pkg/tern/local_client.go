@@ -1010,19 +1010,37 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	// Build per-namespace plan data from the engine's changes.
 	// For Vitess, each namespace is a keyspace. For Spirit, there's one namespace.
 	namespaces := make(map[string]*storage.NamespacePlanData)
+	seenTable := make(map[string]map[string]bool)
+	var allShardPlans []storage.ShardPlan
 	for _, sc := range result.Changes {
 		ns := c.planNamespace(sc.Namespace)
 		nsData := namespaces[ns]
 		if nsData == nil {
 			nsData = &storage.NamespacePlanData{}
 			namespaces[ns] = nsData
+			seenTable[ns] = make(map[string]bool)
 		}
+		// A plan is keyed by (namespace, shard), so a sharded engine emits one
+		// SchemaChange per shard and the same table repeats across a keyspace's
+		// shards. The stored plan keeps namespace-level tables, so dedupe by table.
 		for _, tc := range sc.TableChanges {
+			if seenTable[ns][tc.Table] {
+				continue
+			}
+			seenTable[ns][tc.Table] = true
 			nsData.Tables = append(nsData.Tables, storage.TableChange{
 				Table:     tc.Table,
 				DDL:       tc.DDL,
 				Operation: ddl.StatementTypeToOp(tc.Operation),
 			})
+		}
+		// Record per-shard membership so apply-create can rebuild per-shard
+		// operation groups. A SchemaChange with an empty shard targets the whole
+		// namespace (non-sharded engines) and contributes no shard rows.
+		if shardName := strings.TrimSpace(sc.Shard.Name); shardName != "" {
+			sp := storage.ShardPlan{Shard: shardName, Namespace: ns, NeedsChange: true}
+			nsData.Shards = append(nsData.Shards, sp)
+			allShardPlans = append(allShardPlans, sp)
 		}
 		if len(sc.OriginalFiles) > 0 {
 			nsData.OriginalFiles = sc.OriginalFiles
@@ -1101,17 +1119,32 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	}
 	plan.ID = planID
 
-	// Convert engine SchemaChanges to proto SchemaChanges.
+	// Convert engine SchemaChanges to proto SchemaChanges. A sharded engine emits
+	// one SchemaChange per (namespace, shard); collapse them back to one proto
+	// SchemaChange per namespace (deduping repeated tables). Per-shard membership
+	// travels separately on PlanResponse.Shards below.
 	var changes []*ternv1.SchemaChange
+	protoByNS := make(map[string]*ternv1.SchemaChange)
+	protoTableSeen := make(map[string]map[string]bool)
 	for _, sc := range result.Changes {
 		ns := c.planNamespace(sc.Namespace)
-		protoSC := &ternv1.SchemaChange{
-			Namespace:             ns,
-			Metadata:              sc.Metadata,
-			OriginalFiles:         sc.OriginalFiles,
-			OriginalFilesCaptured: sc.OriginalFilesCaptured,
+		protoSC := protoByNS[ns]
+		if protoSC == nil {
+			protoSC = &ternv1.SchemaChange{
+				Namespace:             ns,
+				Metadata:              sc.Metadata,
+				OriginalFiles:         sc.OriginalFiles,
+				OriginalFilesCaptured: sc.OriginalFilesCaptured,
+			}
+			protoByNS[ns] = protoSC
+			protoTableSeen[ns] = make(map[string]bool)
+			changes = append(changes, protoSC)
 		}
 		for _, t := range sc.TableChanges {
+			if protoTableSeen[ns][t.Table] {
+				continue
+			}
+			protoTableSeen[ns][t.Table] = true
 			protoSC.TableChanges = append(protoSC.TableChanges, &ternv1.TableChange{
 				TableName:    t.Table,
 				ChangeType:   changeTypeToProto(t.Operation),
@@ -1121,7 +1154,6 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 				Namespace:    ns,
 			})
 		}
-		changes = append(changes, protoSC)
 	}
 
 	// Convert lint violations to proto
@@ -1136,11 +1168,23 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		}
 	}
 
+	// Surface per-shard plan metadata on the response too, for parity with the
+	// gRPC path: callers of Plan can display per-shard drift/membership.
+	var protoShards []*ternv1.ShardPlan
+	for _, sp := range allShardPlans {
+		protoShards = append(protoShards, &ternv1.ShardPlan{
+			Shard:       sp.Shard,
+			Namespace:   sp.Namespace,
+			NeedsChange: sp.NeedsChange,
+		})
+	}
+
 	return &ternv1.PlanResponse{
 		PlanId:         result.PlanID,
 		Engine:         c.protoEngine(),
 		Changes:        changes,
 		LintViolations: violations,
+		Shards:         protoShards,
 	}, nil
 }
 
@@ -1633,19 +1677,9 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	}
 	optionsJSON := storage.MarshalApplyOptions(applyOpts)
 
-	// Create VSchema tasks for namespaces with VSchema changes so the
-	// progress API and TUI can track VSchema application alongside DDL.
-	// For VSchema-only deploys (0 DDL changes), this gives the progress API
-	// something to track.
-	for ns, nsData := range plan.Namespaces {
-		if namespaceHasVSchemaArtifact(nsData) {
-			ddlChanges = append(ddlChanges, storage.TableChange{
-				Table:     "VSchema: " + ns,
-				Namespace: ns,
-				Operation: "vschema_update",
-			})
-		}
-	}
+	// VSchema application is not modeled as a synthetic task. PlanetScale
+	// surfaces its VSchema status/diff from engine resume metadata, and a sharded
+	// apply runs VSchema as a task-less group_finalizer derived from the plan.
 
 	// Build the Apply record (1 Apply -> N Tasks).
 	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
@@ -1820,7 +1854,26 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, err)
 	}
 	if len(tasks) == 0 {
-		return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, storage.ErrTaskNotFound)
+		// A task-less apply — e.g. a VSchema-only apply driven by a
+		// group_finalizer, which carries no task rows. Serve its state from the
+		// apply row, which the operator maintains by deriving it from the
+		// operation rows; the API progress handler overlays the engine display
+		// fields (VSchema status/diff, branch) from the operations' resume
+		// metadata. An apply with neither tasks nor operations is genuinely
+		// taskless work and stays the fail-closed not-found case.
+		ops, opErr := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+		if opErr != nil {
+			return nil, fmt.Errorf("list apply_operations for apply %s: %w", req.ApplyId, opErr)
+		}
+		if len(ops) == 0 {
+			return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, storage.ErrTaskNotFound)
+		}
+		c.logger.Info("Progress: serving task-less apply from operations",
+			"apply_id", req.ApplyId, "operation_count", len(ops), "state", apply.State)
+		return &ternv1.ProgressResponse{
+			State:  storageStateToProto(apply.State),
+			Engine: c.protoEngine(),
+		}, nil
 	}
 
 	c.logger.Debug("Progress: found tasks", "count", len(tasks), "database", c.config.Database, "apply_id", req.ApplyId)

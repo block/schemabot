@@ -1003,18 +1003,12 @@ func clientSupportsShardedApplyFanout(client tern.Client) bool {
 	return ok && capability.SupportsShardedApplyFanout()
 }
 
+// applyTaskChanges returns the per-table DDL changes that become apply tasks.
+// VSchema application is no longer modeled as a synthetic task: PlanetScale
+// surfaces its VSchema status/diff from engine resume metadata, and a sharded
+// apply runs VSchema as a task-less group_finalizer derived from the plan.
 func applyTaskChanges(plan *storage.Plan) []storage.TableChange {
-	changes := append([]storage.TableChange{}, plan.FlatDDLChanges()...)
-	for namespace, nsData := range plan.Namespaces {
-		if nsData.Artifacts[vSchemaArtifactName] != "" {
-			changes = append(changes, storage.TableChange{
-				Table:     "VSchema: " + namespace,
-				Namespace: namespace,
-				Operation: "vschema_update",
-			})
-		}
-	}
-	return changes
+	return plan.FlatDDLChanges()
 }
 
 func buildApplyOperationGroups(
@@ -1037,10 +1031,13 @@ func buildApplyOperationGroups(
 	}
 
 	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets))
+	allowTasklessWork := len(targets) == 1 && len(taskChanges) == 0 && len(vschemaFinalizerNamespaces(plan)) > 0
 	for _, target := range targets {
+		tasks := buildApplyTasks(plan, taskChanges, environment, applyOpts, "", now)
 		groups = append(groups, &storage.ApplyOperationWithTasks{
-			Operation: newPendingApplyOperation(target, "", cutoverPolicy, onFailure, now),
-			Tasks:     buildApplyTasks(plan, taskChanges, environment, applyOpts, "", now),
+			Operation:     newPendingApplyOperation(target, "", cutoverPolicy, onFailure, now),
+			Tasks:         tasks,
+			AllowTaskless: allowTasklessWork,
 		})
 	}
 	return groups, false, nil
@@ -1055,26 +1052,14 @@ func canBuildShardedOperationGroups(plan *storage.Plan, taskChanges []storage.Ta
 		return false
 	}
 	hasWorkChange := false
-	workNamespaces := make(map[string]struct{})
-	finalizerNamespaces := make(map[string]struct{})
 	for _, ddlChange := range taskChanges {
-		if isGroupFinalizerChange(ddlChange) {
-			finalizerNamespaces[ddlChange.Namespace] = struct{}{}
-			continue
-		}
 		if ddlChange.DDL == "" || ddlChange.Table == "" {
 			return false
 		}
 		if len(shardsByNamespace[ddlChange.Namespace]) == 0 {
 			return false
 		}
-		workNamespaces[ddlChange.Namespace] = struct{}{}
 		hasWorkChange = true
-	}
-	for namespace := range finalizerNamespaces {
-		if _, ok := workNamespaces[namespace]; !ok {
-			return false
-		}
 	}
 	return hasWorkChange
 }
@@ -1090,13 +1075,10 @@ func buildShardedApplyOperationGroups(
 	now time.Time,
 ) ([]*storage.ApplyOperationWithTasks, error) {
 	shardsByNamespace := changingShardsByNamespace(plan.Shards)
-	workChanges, finalizerChanges := splitShardedTaskChanges(taskChanges)
-	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets)*(len(workChanges)+len(finalizerChanges)))
+	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets)*(len(taskChanges)+1))
 	groupsByTargetAndKey := make(map[string]*storage.ApplyOperationWithTasks)
 	for _, target := range targets {
-		workNamespaces := make(map[string]struct{})
-		for _, ddlChange := range workChanges {
-			workNamespaces[ddlChange.Namespace] = struct{}{}
+		for _, ddlChange := range taskChanges {
 			for _, shard := range shardsByNamespace[ddlChange.Namespace] {
 				if err := validateShardOperationKeyParts(ddlChange.Namespace, shard.Shard, ddlChange.Table); err != nil {
 					return nil, err
@@ -1117,10 +1099,13 @@ func buildShardedApplyOperationGroups(
 				group.Tasks = append(group.Tasks, buildApplyTask(plan, ddlChange, environment, applyOpts, shard.Shard, now))
 			}
 		}
-		for _, namespace := range sortedFinalizerNamespaces(finalizerChanges) {
-			if _, ok := workNamespaces[namespace]; !ok {
-				return nil, fmt.Errorf("group finalizer for namespace %q has no work operation siblings", namespace)
-			}
+		// Every namespace that changes its VSchema gets a task-less
+		// group_finalizer. The VSchema is applied once the namespace's shard work
+		// (if any) completes; the finalizer drives it from the plan (reconstructed
+		// by namespace at drive time), not from a synthetic task. A VSchema-only
+		// namespace with no shard work still gets a finalizer so its VSchema change
+		// is never dropped.
+		for _, namespace := range vschemaFinalizerNamespaces(plan) {
 			if err := validateOperationKeyPart("namespace", namespace); err != nil {
 				return nil, err
 			}
@@ -1132,38 +1117,24 @@ func buildShardedApplyOperationGroups(
 			operation.OperationKind = storage.ApplyOperationKindGroupFinalizer
 			groups = append(groups, &storage.ApplyOperationWithTasks{
 				Operation: operation,
-				Tasks:     []*storage.Task{buildApplyTask(plan, finalizerChanges[namespace], environment, applyOpts, "", now)},
 			})
 		}
 	}
 	return groups, nil
 }
 
-func splitShardedTaskChanges(taskChanges []storage.TableChange) ([]storage.TableChange, map[string]storage.TableChange) {
-	workChanges := make([]storage.TableChange, 0, len(taskChanges))
-	finalizerChanges := make(map[string]storage.TableChange)
-	for _, change := range taskChanges {
-		if isGroupFinalizerChange(change) {
-			finalizerChanges[change.Namespace] = change
-			continue
+// vschemaFinalizerNamespaces returns, in sorted order, every namespace in the
+// plan that changes its VSchema — each needs a group_finalizer to apply the
+// VSchema after its shard work (if any) completes.
+func vschemaFinalizerNamespaces(plan *storage.Plan) []string {
+	var namespaces []string
+	for namespace, nsData := range plan.Namespaces {
+		if nsData != nil && nsData.Artifacts[vSchemaArtifactName] != "" {
+			namespaces = append(namespaces, namespace)
 		}
-		workChanges = append(workChanges, change)
-	}
-	return workChanges, finalizerChanges
-}
-
-func sortedFinalizerNamespaces(finalizerChanges map[string]storage.TableChange) []string {
-	namespaces := make([]string, 0, len(finalizerChanges))
-	for namespace := range finalizerChanges {
-		namespaces = append(namespaces, namespace)
 	}
 	sort.Strings(namespaces)
 	return namespaces
-}
-
-func isGroupFinalizerChange(change storage.TableChange) bool {
-	// Routing metadata is the only creation-time group-finalizer payload today.
-	return change.Operation == "vschema_update"
 }
 
 func validateShardOperationKeyParts(namespace, shard, table string) error {

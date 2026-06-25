@@ -197,14 +197,9 @@ func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Tas
 }
 
 // markTasksRunning sets DDL tasks to running state with a start timestamp.
-// VSchema tasks are skipped — their state is driven by the deploy request
-// lifecycle (deriveVSchemaTaskState), not by apply start.
 func (c *LocalClient) markTasksRunning(ctx context.Context, tasks []*storage.Task) {
 	now := time.Now()
 	for _, task := range tasks {
-		if isVSchemaTask(task) {
-			continue
-		}
 		task.State = state.Task.Running
 		task.StartedAt = &now
 		task.UpdatedAt = now

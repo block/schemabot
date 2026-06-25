@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -125,58 +126,84 @@ func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int
 	return apply, true
 }
 
+// runControlCommand runs the shared lifecycle of a PR control command and
+// returns the typed response only when the operation was accepted. It loads and
+// authorizes the apply, executes the operation, and converts any failure
+// (error, missing response, or rejection) into a PR comment. On a non-nil
+// return the caller renders the operation-specific acceptance comment.
+func runControlCommand[R any](
+	h *Handler,
+	ctx context.Context,
+	repo string, pr int, installationID int64, requestedBy string,
+	result CommandResult,
+	actionName string,
+	execute func(ctx context.Context, req apitypes.ControlRequest) (*R, error),
+	accepted func(*R) bool,
+	errorMessage func(*R) string,
+) *R {
+	apply, ok := h.loadApplyForPRControl(ctx, repo, pr, installationID, requestedBy, result, actionName)
+	if !ok {
+		return nil
+	}
+	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, apply.Database, result.Environment, actionName)
+	if blocked {
+		return nil
+	}
+	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, apply.Database, apply.DatabaseType, result.Environment, actionName); blocked {
+		return nil
+	}
+
+	caller := fmt.Sprintf("github:%s@%s#%d", requestedBy, repo, pr)
+	resp, err := execute(ctx, apitypes.ControlRequest{
+		ApplyID:     result.ApplyID,
+		Environment: result.Environment,
+		Caller:      caller,
+	})
+	if err != nil {
+		h.logControlCommandError(actionName, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
+		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, err.Error())
+		return nil
+	}
+	if resp == nil {
+		h.logger.Error(actionName+" PR command returned no response",
+			"repo", repo,
+			"pr", pr,
+			"apply_id", result.ApplyID,
+			"environment", result.Environment,
+			"requested_by", requestedBy)
+		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy,
+			fmt.Sprintf("SchemaBot accepted the %s command but returned no response", actionName))
+		return nil
+	}
+	if !accepted(resp) {
+		detail := errorMessage(resp)
+		if detail == "" {
+			detail = strings.ToUpper(actionName[:1]) + actionName[1:] + " was not accepted"
+		}
+		h.logger.Warn(actionName+" PR command was not accepted",
+			"repo", repo,
+			"pr", pr,
+			"apply_id", result.ApplyID,
+			"environment", result.Environment,
+			"requested_by", requestedBy,
+			"error_message", errorMessage(resp))
+		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, detail)
+		return nil
+	}
+	return resp
+}
+
 // handleStopCommand handles the "schemabot stop <apply-id> -e <env>" PR
 // comment command by recording durable stop intent for the operator owner.
 func (h *Handler) handleStopCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
 	ctx, cancel := h.commandContext(commandTimeout)
 	defer cancel()
 
-	apply, ok := h.loadApplyForPRControl(ctx, repo, pr, installationID, requestedBy, result, action.Stop)
-	if !ok {
-		return
-	}
-	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, apply.Database, result.Environment, action.Stop)
-	if blocked {
-		return
-	}
-	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, apply.Database, apply.DatabaseType, result.Environment, action.Stop); blocked {
-		return
-	}
-
-	caller := fmt.Sprintf("github:%s@%s#%d", requestedBy, repo, pr)
-	resp, err := h.service.ExecuteStop(ctx, apitypes.ControlRequest{
-		ApplyID:     result.ApplyID,
-		Environment: result.Environment,
-		Caller:      caller,
-	})
-	if err != nil {
-		h.logControlCommandError(action.Stop, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
-		h.postCommandError(repo, pr, installationID, action.Stop, result.Environment, requestedBy, err.Error())
-		return
-	}
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Stop,
+		h.service.ExecuteStop,
+		func(r *apitypes.StopResponse) bool { return r.Accepted },
+		func(r *apitypes.StopResponse) string { return r.ErrorMessage })
 	if resp == nil {
-		h.logger.Error("stop PR command returned no response",
-			"repo", repo,
-			"pr", pr,
-			"apply_id", result.ApplyID,
-			"environment", result.Environment,
-			"requested_by", requestedBy)
-		h.postCommandError(repo, pr, installationID, action.Stop, result.Environment, requestedBy, "SchemaBot accepted the stop command but returned no response")
-		return
-	}
-	if !resp.Accepted {
-		detail := resp.ErrorMessage
-		if detail == "" {
-			detail = "Stop was not accepted"
-		}
-		h.logger.Warn("stop PR command was not accepted",
-			"repo", repo,
-			"pr", pr,
-			"apply_id", result.ApplyID,
-			"environment", result.Environment,
-			"requested_by", requestedBy,
-			"error_message", resp.ErrorMessage)
-		h.postCommandError(repo, pr, installationID, action.Stop, result.Environment, requestedBy, detail)
 		return
 	}
 
@@ -205,52 +232,11 @@ func (h *Handler) handleStartCommand(repo string, pr int, installationID int64, 
 	ctx, cancel := h.commandContext(commandTimeout)
 	defer cancel()
 
-	apply, ok := h.loadApplyForPRControl(ctx, repo, pr, installationID, requestedBy, result, action.Start)
-	if !ok {
-		return
-	}
-	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, apply.Database, result.Environment, action.Start)
-	if blocked {
-		return
-	}
-	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, apply.Database, apply.DatabaseType, result.Environment, action.Start); blocked {
-		return
-	}
-
-	caller := fmt.Sprintf("github:%s@%s#%d", requestedBy, repo, pr)
-	resp, err := h.service.ExecuteStart(ctx, apitypes.ControlRequest{
-		ApplyID:     result.ApplyID,
-		Environment: result.Environment,
-		Caller:      caller,
-	})
-	if err != nil {
-		h.logControlCommandError(action.Start, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
-		h.postCommandError(repo, pr, installationID, action.Start, result.Environment, requestedBy, err.Error())
-		return
-	}
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Start,
+		h.service.ExecuteStart,
+		func(r *apitypes.StartResponse) bool { return r.Accepted },
+		func(r *apitypes.StartResponse) string { return r.ErrorMessage })
 	if resp == nil {
-		h.logger.Error("start PR command returned no response",
-			"repo", repo,
-			"pr", pr,
-			"apply_id", result.ApplyID,
-			"environment", result.Environment,
-			"requested_by", requestedBy)
-		h.postCommandError(repo, pr, installationID, action.Start, result.Environment, requestedBy, "SchemaBot accepted the start command but returned no response")
-		return
-	}
-	if !resp.Accepted {
-		detail := resp.ErrorMessage
-		if detail == "" {
-			detail = "Start was not accepted"
-		}
-		h.logger.Warn("start PR command was not accepted",
-			"repo", repo,
-			"pr", pr,
-			"apply_id", result.ApplyID,
-			"environment", result.Environment,
-			"requested_by", requestedBy,
-			"error_message", resp.ErrorMessage)
-		h.postCommandError(repo, pr, installationID, action.Start, result.Environment, requestedBy, detail)
 		return
 	}
 
@@ -279,52 +265,11 @@ func (h *Handler) handleCutoverCommand(repo string, pr int, installationID int64
 	ctx, cancel := h.commandContext(commandTimeout)
 	defer cancel()
 
-	apply, ok := h.loadApplyForPRControl(ctx, repo, pr, installationID, requestedBy, result, action.Cutover)
-	if !ok {
-		return
-	}
-	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, apply.Database, result.Environment, action.Cutover)
-	if blocked {
-		return
-	}
-	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, apply.Database, apply.DatabaseType, result.Environment, action.Cutover); blocked {
-		return
-	}
-
-	caller := fmt.Sprintf("github:%s@%s#%d", requestedBy, repo, pr)
-	resp, err := h.service.ExecuteCutover(ctx, apitypes.ControlRequest{
-		ApplyID:     result.ApplyID,
-		Environment: result.Environment,
-		Caller:      caller,
-	})
-	if err != nil {
-		h.logControlCommandError(action.Cutover, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
-		h.postCommandError(repo, pr, installationID, action.Cutover, result.Environment, requestedBy, err.Error())
-		return
-	}
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Cutover,
+		h.service.ExecuteCutover,
+		func(r *apitypes.ControlResponse) bool { return r.Accepted },
+		func(r *apitypes.ControlResponse) string { return r.ErrorMessage })
 	if resp == nil {
-		h.logger.Error("cutover PR command returned no response",
-			"repo", repo,
-			"pr", pr,
-			"apply_id", result.ApplyID,
-			"environment", result.Environment,
-			"requested_by", requestedBy)
-		h.postCommandError(repo, pr, installationID, action.Cutover, result.Environment, requestedBy, "SchemaBot accepted the cutover command but returned no response")
-		return
-	}
-	if !resp.Accepted {
-		detail := resp.ErrorMessage
-		if detail == "" {
-			detail = "Cutover was not accepted"
-		}
-		h.logger.Warn("cutover PR command was not accepted",
-			"repo", repo,
-			"pr", pr,
-			"apply_id", result.ApplyID,
-			"environment", result.Environment,
-			"requested_by", requestedBy,
-			"error_message", resp.ErrorMessage)
-		h.postCommandError(repo, pr, installationID, action.Cutover, result.Environment, requestedBy, detail)
 		return
 	}
 

@@ -195,6 +195,14 @@ func WriteProgress(data ProgressData) {
 		}
 	}
 
+	// Surface VSchema application status (and diff) from the engine's display
+	// metadata, rather than from a synthetic task in the table list.
+	if data.Metadata != nil {
+		if vs := FormatVSchemaStatus(data.Metadata["vschema_status"], data.Metadata["vschema_diff"]); vs != "" {
+			fmt.Print(vs)
+		}
+	}
+
 	// Show deploy request info for deferred deploys
 	if data.State == state.Apply.WaitingForDeploy {
 		fmt.Println()
@@ -305,40 +313,44 @@ func FormatNamespacedTablesWithActivity(tables []TableProgress, activityBar, act
 			}
 		} else {
 			b.WriteString(FormatKeyspaceHeader(g.namespaces[0]))
-			// Render VSchema tasks first, then DDL tables
 			for _, t := range g.tables {
-				if isVSchemaTask(t) {
-					b.WriteString(FormatVSchemaProgress(t))
-				}
-			}
-			for _, t := range g.tables {
-				if !isVSchemaTask(t) {
-					b.WriteString(FormatTableProgressWithActivity(t, activityBar, activityLabel))
-				}
+				b.WriteString(FormatTableProgressWithActivity(t, activityBar, activityLabel))
 			}
 		}
 	}
 	return b.String()
 }
 
-// writeNamespacedTables renders tables grouped by keyspace to stdout.
-// isVSchemaTask returns true if this is a synthetic VSchema update task.
-func isVSchemaTask(t TableProgress) bool {
-	return t.TableName == "VSchema" || strings.HasPrefix(t.TableName, "vschema:") || strings.HasPrefix(t.TableName, "VSchema:")
-}
-
-// FormatVSchemaProgress returns a VSchema update rendered as a string.
-// The DDL field contains a VSchema diff (not SQL), so we render it with
-// diff coloring via colorizeDiffLine, stripping ---/+++/@@ headers.
-func FormatVSchemaProgress(t TableProgress) string {
+// FormatVSchemaStatus renders the VSchema-application status and diff surfaced
+// on a progress response's display metadata (vschema_status / vschema_diff).
+// Returns empty when the deploy carries no VSchema change. The diff field is a
+// VSchema diff (not SQL), rendered with diff coloring via colorizeDiffLine.
+func FormatVSchemaStatus(status, diff string) string {
+	if status == "" && diff == "" {
+		return ""
+	}
 	var b strings.Builder
-	label := vschemaStatusLabel(state.NormalizeState(t.Status))
-	fmt.Fprintf(&b, "    ~ VSchema: %s\n", label)
-	if t.DDL != "" {
-		b.WriteString(FormatVSchemaDiff(t.DDL, indentContent))
+	fmt.Fprintf(&b, "    ~ VSchema: %s\n", vschemaMetadataStatusLabel(status))
+	if diff != "" {
+		b.WriteString(FormatVSchemaDiff(diff, indentContent))
 	}
 	b.WriteString("\n")
 	return b.String()
+}
+
+// vschemaMetadataStatusLabel maps the engine's vschema_status display value to a
+// human label.
+func vschemaMetadataStatusLabel(status string) string {
+	switch status {
+	case "applying":
+		return "Applying..."
+	case "applied":
+		return "Applied"
+	case "":
+		return "Pending"
+	default:
+		return status
+	}
 }
 
 // FormatVSchemaDiff returns a VSchema diff with colorized +/- lines as a string,
@@ -352,29 +364,6 @@ func FormatVSchemaDiff(diff, indent string) string {
 		fmt.Fprintf(&b, "%s%s\n", indent, colorizeDiffLine(line))
 	}
 	return b.String()
-}
-
-// writeVSchemaDiff renders a VSchema diff to stdout.
-// vschemaStatusLabel maps a task status to a VSchema-specific display label.
-func vschemaStatusLabel(status string) string {
-	switch status {
-	case state.Apply.Pending:
-		return "Pending"
-	case state.Apply.Running:
-		return "Applying..."
-	case state.Apply.WaitingForDeploy:
-		return "Pending"
-	case state.Apply.WaitingForCutover, state.Apply.Recovering, state.Apply.CuttingOver:
-		return "Applying..."
-	case state.Apply.Completed:
-		return "Applied"
-	case state.Apply.Failed:
-		return ANSIRed + "Failed" + ANSIReset
-	case state.Apply.RevertWindow:
-		return "Applied (pending revert)"
-	default:
-		return status
-	}
 }
 
 // writeFailureGuidance prints remediation instructions for failed applies.

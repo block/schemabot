@@ -437,6 +437,22 @@ type psMetadata struct {
 	IsInstant        bool       `json:"is_instant,omitempty"`
 	DeferredDeploy   bool       `json:"deferred_deploy,omitempty"`
 
+	// VSchemaStatus tracks the deploy's VSchema-application phase so it can be
+	// surfaced from stored state without a synthetic task row. Empty when the
+	// deploy carries no VSchema change; "applying" once the deploy reaches the
+	// VSchema phase; "applied" once it completes after that phase. The renderer
+	// reads it through the display-metadata projection (PSDisplayMetadata), the
+	// same path branch/deploy-URL/instant use.
+	VSchemaStatus string `json:"vschema_status,omitempty"`
+
+	// VSchemaDiff is the VSchema change rendered as a unified diff, captured at
+	// deploy creation from the plan annotation. It is surfaced through the
+	// display-metadata projection so the progress view can show the VSchema
+	// change alongside its status without a synthetic task row. Empty when the
+	// deploy carries no VSchema change. For a deploy spanning multiple keyspaces
+	// the per-keyspace diffs are concatenated under keyspace headers.
+	VSchemaDiff string `json:"vschema_diff,omitempty"`
+
 	// ExistingMigrationCtxs is the set of SHOW VITESS_MIGRATIONS contexts that
 	// already existed just before this deploy started, keyed by context. It is
 	// the durable baseline that lets a later process — a resume on another pod,
@@ -798,6 +814,30 @@ func deployStateToMessage(drState string) string {
 	default:
 		return fmt.Sprintf("Processing (%s)", drState)
 	}
+}
+
+// VSchema-application status values surfaced on the progress projection. Empty
+// means the deploy carries no VSchema change (or hasn't reached the phase yet).
+const (
+	vschemaStatusApplying = "applying"
+	vschemaStatusApplied  = "applied"
+)
+
+// nextVSchemaStatus advances the stored VSchema status from the current deploy
+// state. It becomes "applying" when the deploy enters the VSchema phase, and
+// "applied" once a deploy that went through that phase completes. A deploy that
+// never reaches the VSchema phase (instant DDL, no VSchema change) keeps an
+// empty status, so no VSchema indicator is surfaced for it.
+func nextVSchemaStatus(current, drState string) string {
+	switch drState {
+	case deployState.InProgressVSchema:
+		return vschemaStatusApplying
+	case deployState.Complete, deployState.CompletePendingRevert:
+		if current == vschemaStatusApplying {
+			return vschemaStatusApplied
+		}
+	}
+	return current
 }
 
 // sortedKeyspaces returns keyspace names from SchemaFiles in sorted order.

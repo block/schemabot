@@ -21,6 +21,68 @@ const (
 	unknownEnvironment = "unknown"
 )
 
+// addCounter increments a named Int64Counter by one with the given attributes,
+// logging and skipping if the instrument cannot be created. Centralizing the
+// meter/create/error/emit boilerplate keeps each Record* function to its metric
+// descriptor and attribute set.
+func addCounter(ctx context.Context, name, description, unit string, attrs ...attribute.KeyValue) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter(name,
+		otelmetric.WithDescription(description),
+		otelmetric.WithUnit(unit),
+	)
+	if err != nil {
+		slog.Warn("failed to create counter", "metric", name, "error", err)
+		return
+	}
+	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
+}
+
+// addUpDownCounter adjusts a named Int64UpDownCounter by delta with the given
+// attributes, logging and skipping if the instrument cannot be created.
+func addUpDownCounter(ctx context.Context, name string, delta int64, description, unit string, attrs ...attribute.KeyValue) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64UpDownCounter(name,
+		otelmetric.WithDescription(description),
+		otelmetric.WithUnit(unit),
+	)
+	if err != nil {
+		slog.Warn("failed to create up/down counter", "metric", name, "error", err)
+		return
+	}
+	counter.Add(ctx, delta, otelmetric.WithAttributes(attrs...))
+}
+
+// recordHistogram records value into a named Float64Histogram with the given
+// attributes, logging and skipping if the instrument cannot be created.
+func recordHistogram(ctx context.Context, name string, value float64, description, unit string, attrs ...attribute.KeyValue) {
+	meter := otel.Meter(meterName)
+	hist, err := meter.Float64Histogram(name,
+		otelmetric.WithDescription(description),
+		otelmetric.WithUnit(unit),
+	)
+	if err != nil {
+		slog.Warn("failed to create histogram", "metric", name, "error", err)
+		return
+	}
+	hist.Record(ctx, value, otelmetric.WithAttributes(attrs...))
+}
+
+// recordGauge records value into a named Int64Gauge with the given attributes,
+// logging and skipping if the instrument cannot be created.
+func recordGauge(ctx context.Context, name string, value int64, description, unit string, attrs ...attribute.KeyValue) {
+	meter := otel.Meter(meterName)
+	gauge, err := meter.Int64Gauge(name,
+		otelmetric.WithDescription(description),
+		otelmetric.WithUnit(unit),
+	)
+	if err != nil {
+		slog.Warn("failed to create gauge", "metric", name, "error", err)
+		return
+	}
+	gauge.Record(ctx, value, otelmetric.WithAttributes(attrs...))
+}
+
 // DeploymentAttribute returns the canonical deployment metric attribute.
 // Use "unknown" when the request fails before SchemaBot resolves routing.
 func DeploymentAttribute(deployment string) attribute.KeyValue {
@@ -46,91 +108,51 @@ func EnvironmentAttribute(environment string) attribute.KeyValue {
 // The OTel SDK deduplicates instruments with the same name, so repeated calls
 // to Int64Counter are cheap after the first registration.
 func RecordPlan(ctx context.Context, repo, database, deployment, environment, status string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.plans.total",
-		otelmetric.WithDescription("Total number of plan operations"),
-		otelmetric.WithUnit("{plan}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create plans counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("repository", repo),
-			attribute.String("database", database),
-			DeploymentAttribute(deployment),
-			EnvironmentAttribute(environment),
-			attribute.String("status", status),
-		),
+	addCounter(ctx, "schemabot.plans.total",
+		"Total number of plan operations", "{plan}",
+		attribute.String("repository", repo),
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("status", status),
 	)
 }
 
 // RecordPlanDuration records the duration of a plan operation.
 func RecordPlanDuration(ctx context.Context, duration time.Duration, repo, database, deployment, environment, status string) {
-	meter := otel.Meter(meterName)
-	hist, err := meter.Float64Histogram("schemabot.plan.duration_seconds",
-		otelmetric.WithDescription("Duration of plan operations"),
-		otelmetric.WithUnit("s"),
-	)
-	if err != nil {
-		slog.Warn("failed to create plan duration histogram", "error", err)
-		return
-	}
-	hist.Record(ctx, duration.Seconds(),
-		otelmetric.WithAttributes(
-			attribute.String("repository", repo),
-			attribute.String("database", database),
-			DeploymentAttribute(deployment),
-			EnvironmentAttribute(environment),
-			attribute.String("status", status),
-		),
+	recordHistogram(ctx, "schemabot.plan.duration_seconds", duration.Seconds(),
+		"Duration of plan operations", "s",
+		attribute.String("repository", repo),
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("status", status),
 	)
 }
 
 // RecordApply increments the applies counter with database, deployment, environment, and status attributes.
 // Status should be "success", "error", "rejected", or "conflict".
 func RecordApply(ctx context.Context, repo, database, deployment, environment, status string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.applies.total",
-		otelmetric.WithDescription("Total number of apply operations"),
-		otelmetric.WithUnit("{apply}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create applies counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("repository", repo),
-			attribute.String("database", database),
-			DeploymentAttribute(deployment),
-			EnvironmentAttribute(environment),
-			attribute.String("status", status),
-		),
+	addCounter(ctx, "schemabot.applies.total",
+		"Total number of apply operations", "{apply}",
+		attribute.String("repository", repo),
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("status", status),
 	)
 }
 
 // RecordApplyDuration records the duration of an apply operation (API call time,
 // not the full Spirit run which can take hours).
 func RecordApplyDuration(ctx context.Context, duration time.Duration, repo, database, deployment, environment, status string) {
-	meter := otel.Meter(meterName)
-	hist, err := meter.Float64Histogram("schemabot.apply.duration_seconds",
-		otelmetric.WithDescription("Duration of apply operations (API call time)"),
-		otelmetric.WithUnit("s"),
-	)
-	if err != nil {
-		slog.Warn("failed to create apply duration histogram", "error", err)
-		return
-	}
-	hist.Record(ctx, duration.Seconds(),
-		otelmetric.WithAttributes(
-			attribute.String("repository", repo),
-			attribute.String("database", database),
-			DeploymentAttribute(deployment),
-			EnvironmentAttribute(environment),
-			attribute.String("status", status),
-		),
+	recordHistogram(ctx, "schemabot.apply.duration_seconds", duration.Seconds(),
+		"Duration of apply operations (API call time)", "s",
+		attribute.String("repository", repo),
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("status", status),
 	)
 }
 
@@ -144,20 +166,10 @@ func RecordRemoteDeploymentHealth(ctx context.Context, deployment, environment s
 		value = 1
 	}
 
-	meter := otel.Meter(meterName)
-	gauge, err := meter.Int64Gauge("schemabot.remote_deployment.health",
-		otelmetric.WithDescription("Latest remote deployment health check result"),
-		otelmetric.WithUnit("1"),
-	)
-	if err != nil {
-		slog.Warn("failed to create remote deployment health gauge", "error", err)
-		return
-	}
-	gauge.Record(ctx, value,
-		otelmetric.WithAttributes(
-			DeploymentAttribute(deployment),
-			EnvironmentAttribute(environment),
-		),
+	recordGauge(ctx, "schemabot.remote_deployment.health", value,
+		"Latest remote deployment health check result", "1",
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
 	)
 }
 
@@ -184,22 +196,12 @@ func RecordRemoteDeploymentHealthCheck(ctx context.Context, deployment, environm
 		reason = "unavailable"
 	}
 
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.remote_deployment.health_checks_total",
-		otelmetric.WithDescription("Total number of remote deployment health checks"),
-		otelmetric.WithUnit("{check}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create remote deployment health check counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			DeploymentAttribute(deployment),
-			EnvironmentAttribute(environment),
-			attribute.String("status", status),
-			attribute.String("reason", reason),
-		),
+	addCounter(ctx, "schemabot.remote_deployment.health_checks_total",
+		"Total number of remote deployment health checks", "{check}",
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("status", status),
+		attribute.String("reason", reason),
 	)
 }
 
@@ -221,20 +223,10 @@ func RecordSchemaFreshnessRejected(ctx context.Context, action, environment stri
 	if !knownSchemaFreshnessActions[action] {
 		action = "unknown"
 	}
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.schema_freshness.rejected.total",
-		otelmetric.WithDescription("Plan/apply/apply-confirm rejected because PR HEAD advanced after discovery loaded schema files"),
-		otelmetric.WithUnit("{rejection}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create schema freshness rejected counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("action", action),
-			EnvironmentAttribute(environment),
-		),
+	addCounter(ctx, "schemabot.schema_freshness.rejected.total",
+		"Plan/apply/apply-confirm rejected because PR HEAD advanced after discovery loaded schema files", "{rejection}",
+		attribute.String("action", action),
+		EnvironmentAttribute(environment),
 	)
 }
 
@@ -250,20 +242,10 @@ func RecordSchemaFreshnessRejected(ctx context.Context, action, environment stri
 // during PR review; sustained activity suggests reviewers need a tighter
 // "freeze the branch" workflow during apply confirmation.
 func RecordStalePlanRejected(ctx context.Context, environment string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.command.rejected_stale_plan.total",
-		otelmetric.WithDescription("apply-confirm rejected because PR HEAD advanced after the confirmation plan was posted"),
-		otelmetric.WithUnit("{rejection}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create stale plan rejected counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("action", "apply_confirm"),
-			EnvironmentAttribute(environment),
-		),
+	addCounter(ctx, "schemabot.command.rejected_stale_plan.total",
+		"apply-confirm rejected because PR HEAD advanced after the confirmation plan was posted", "{rejection}",
+		attribute.String("action", "apply_confirm"),
+		EnvironmentAttribute(environment),
 	)
 }
 
@@ -273,21 +255,11 @@ func RecordStalePlanRejected(ctx context.Context, environment string) {
 // remote deployment is down rather than flapping — investigate the
 // connectivity between this server and the deployment.
 func RecordTransientPlanRetry(ctx context.Context, database, environment, outcome string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.webhook.plan_transient_retry.total",
-		otelmetric.WithDescription("webhook plan retries after transient remote deployment unavailability"),
-		otelmetric.WithUnit("{retry}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create transient plan retry counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("database", database),
-			EnvironmentAttribute(environment),
-			attribute.String("outcome", outcome),
-		),
+	addCounter(ctx, "schemabot.webhook.plan_transient_retry.total",
+		"webhook plan retries after transient remote deployment unavailability", "{retry}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
 	)
 }
 
@@ -316,22 +288,12 @@ func RecordSourcePolicyBlock(ctx context.Context, operation, database, environme
 	if !knownSourcePolicyBlockReasons[reason] {
 		reason = "unknown"
 	}
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.source_policy.blocks_total",
-		otelmetric.WithDescription("Total trusted-source plan/apply requests blocked by source policy"),
-		otelmetric.WithUnit("{block}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create source policy block counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("operation", operation),
-			attribute.String("database", database),
-			EnvironmentAttribute(environment),
-			attribute.String("reason", reason),
-		),
+	addCounter(ctx, "schemabot.source_policy.blocks_total",
+		"Total trusted-source plan/apply requests blocked by source policy", "{block}",
+		attribute.String("operation", operation),
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("reason", reason),
 	)
 }
 
@@ -385,24 +347,14 @@ func RecordPRCommandActorAuthorization(ctx context.Context, command, database, e
 		reason = "unknown"
 	}
 
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.pr_command_actor_authorization.total",
-		otelmetric.WithDescription("Total GitHub PR command actor authorization decisions"),
-		otelmetric.WithUnit("{decision}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create PR command actor authorization counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("command", command),
-			attribute.String("database", database),
-			EnvironmentAttribute(environment),
-			attribute.String("repository", repository),
-			attribute.String("status", status),
-			attribute.String("reason", reason),
-		),
+	addCounter(ctx, "schemabot.pr_command_actor_authorization.total",
+		"Total GitHub PR command actor authorization decisions", "{decision}",
+		attribute.String("command", command),
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("repository", repository),
+		attribute.String("status", status),
+		attribute.String("reason", reason),
 	)
 }
 
@@ -410,21 +362,11 @@ func RecordPRCommandActorAuthorization(ctx context.Context, command, database, e
 // direct (OIDC) request path. Labels are inherently low-cardinality: tier is
 // read/plan/write, decision is allow/deny, reason is a fixed set.
 func RecordAuthDecision(ctx context.Context, tier, decision, reason string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.auth_decisions.total",
-		otelmetric.WithDescription("Total API auth decisions on the OIDC request path"),
-		otelmetric.WithUnit("{decision}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create auth decisions counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("tier", tier),
-			attribute.String("decision", decision),
-			attribute.String("reason", reason),
-		),
+	addCounter(ctx, "schemabot.auth_decisions.total",
+		"Total API auth decisions on the OIDC request path", "{decision}",
+		attribute.String("tier", tier),
+		attribute.String("decision", decision),
+		attribute.String("reason", reason),
 	)
 }
 
@@ -442,24 +384,14 @@ func RecordCheckOwnershipMiss(ctx context.Context, operation, repository, databa
 	if !knownCheckOwnershipOperations[operation] {
 		operation = "unknown"
 	}
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.check_ownership_misses_total",
-		otelmetric.WithDescription("Total stored check state ownership misses"),
-		otelmetric.WithUnit("{miss}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create check ownership miss counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("operation", operation),
-			attribute.String("repository", repository),
-			attribute.String("database", database),
-			attribute.String("database_type", databaseType),
-			DeploymentAttribute(deployment),
-			EnvironmentAttribute(environment),
-		),
+	addCounter(ctx, "schemabot.check_ownership_misses_total",
+		"Total stored check state ownership misses", "{miss}",
+		attribute.String("operation", operation),
+		attribute.String("repository", repository),
+		attribute.String("database", database),
+		attribute.String("database_type", databaseType),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
 	)
 }
 
@@ -484,22 +416,12 @@ const (
 // check surfaced: the passing-checks gate or the promotion gate (where it
 // cannot verify the prior environment).
 func RecordUntrustedAggregateNamedCheck(ctx context.Context, repository, environment, appSlug, gate string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.untrusted_aggregate_named_checks_total",
-		otelmetric.WithDescription("Total PR checks with a SchemaBot aggregate name from an untrusted GitHub App"),
-		otelmetric.WithUnit("{check}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create untrusted aggregate-named check counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("repository", repository),
-			EnvironmentAttribute(environment),
-			attribute.String("app_slug", appSlug),
-			attribute.String("gate", gate),
-		),
+	addCounter(ctx, "schemabot.untrusted_aggregate_named_checks_total",
+		"Total PR checks with a SchemaBot aggregate name from an untrusted GitHub App", "{check}",
+		attribute.String("repository", repository),
+		EnvironmentAttribute(environment),
+		attribute.String("app_slug", appSlug),
+		attribute.String("gate", gate),
 	)
 }
 
@@ -511,42 +433,22 @@ func RecordUntrustedAggregateNamedCheck(ctx context.Context, repository, environ
 // environment to environment_order; the matching warn log carries the
 // promotion_order so they can see what is configured.
 func RecordPromotionConfigErrorBlock(ctx context.Context, repository, database, environment string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.promotion.config_error_blocks_total",
-		otelmetric.WithDescription("Total applies blocked because the target environment is absent from the configured promotion order"),
-		otelmetric.WithUnit("{block}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create promotion config error block counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("repository", repository),
-			attribute.String("database", database),
-			EnvironmentAttribute(environment),
-		),
+	addCounter(ctx, "schemabot.promotion.config_error_blocks_total",
+		"Total applies blocked because the target environment is absent from the configured promotion order", "{block}",
+		attribute.String("repository", repository),
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
 	)
 }
 
 // AdjustActiveApplies increments or decrements the active applies gauge.
 // Use delta=1 when an apply is accepted and delta=-1 when it reaches a terminal state.
 func AdjustActiveApplies(ctx context.Context, delta int64, database, deployment, environment string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64UpDownCounter("schemabot.active_applies",
-		otelmetric.WithDescription("Number of currently in-progress applies"),
-		otelmetric.WithUnit("{apply}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create active applies gauge", "error", err)
-		return
-	}
-	counter.Add(ctx, delta,
-		otelmetric.WithAttributes(
-			attribute.String("database", database),
-			DeploymentAttribute(deployment),
-			EnvironmentAttribute(environment),
-		),
+	addUpDownCounter(ctx, "schemabot.active_applies", delta,
+		"Number of currently in-progress applies", "{apply}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
 	)
 }
 
@@ -568,23 +470,13 @@ func RecordControlOperation(ctx context.Context, operation, database, deployment
 	if !knownControlOperations[operation] {
 		operation = "unknown"
 	}
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.control_operations_total",
-		otelmetric.WithDescription("Total number of control operations (cutover, stop, start, etc.)"),
-		otelmetric.WithUnit("{operation}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create control operations counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("operation", operation),
-			attribute.String("database", database),
-			DeploymentAttribute(deployment),
-			EnvironmentAttribute(environment),
-			attribute.String("status", status),
-		),
+	addCounter(ctx, "schemabot.control_operations_total",
+		"Total number of control operations (cutover, stop, start, etc.)", "{operation}",
+		attribute.String("operation", operation),
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("status", status),
 	)
 }
 
@@ -592,22 +484,12 @@ func RecordControlOperation(ctx context.Context, operation, database, deployment
 // Operation should be "acquire" or "release".
 // Status should be "success", "conflict", "not_found", "not_owned", or "error".
 func RecordLockOperation(ctx context.Context, operation, database, status string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.lock_operations_total",
-		otelmetric.WithDescription("Total number of lock acquire/release operations"),
-		otelmetric.WithUnit("{operation}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create lock operations counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("operation", operation),
-			attribute.String("database", database),
-			EnvironmentAttribute(""),
-			attribute.String("status", status),
-		),
+	addCounter(ctx, "schemabot.lock_operations_total",
+		"Total number of lock acquire/release operations", "{operation}",
+		attribute.String("operation", operation),
+		attribute.String("database", database),
+		EnvironmentAttribute(""),
+		attribute.String("status", status),
 	)
 }
 
@@ -621,17 +503,8 @@ func operatorMetricNames(suffix string) [2]string {
 // addOperatorCounter increments an operator counter and its deprecated
 // scheduler-named alias by one with the same attributes.
 func addOperatorCounter(ctx context.Context, suffix, description, unit string, attrs ...attribute.KeyValue) {
-	meter := otel.Meter(meterName)
 	for _, name := range operatorMetricNames(suffix) {
-		counter, err := meter.Int64Counter(name,
-			otelmetric.WithDescription(description),
-			otelmetric.WithUnit(unit),
-		)
-		if err != nil {
-			slog.Warn("failed to create operator counter", "metric", name, "error", err)
-			continue
-		}
-		counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
+		addCounter(ctx, name, description, unit, attrs...)
 	}
 }
 
@@ -714,23 +587,14 @@ func RecordOperatorTerminalSummaryFailure(ctx context.Context, reason string) {
 
 // RecordOperatorClaimDuration records how long it took to claim and resume an apply.
 func RecordOperatorClaimDuration(ctx context.Context, duration time.Duration, database, deployment, environment, previousState string) {
-	meter := otel.Meter(meterName)
-	attrs := otelmetric.WithAttributes(
-		attribute.String("database", database),
-		DeploymentAttribute(deployment),
-		EnvironmentAttribute(environment),
-		attribute.String("previous_state", previousState),
-	)
 	for _, name := range operatorMetricNames("claim_duration_seconds") {
-		hist, err := meter.Float64Histogram(name,
-			otelmetric.WithDescription("Duration of operator claim + resume operations"),
-			otelmetric.WithUnit("s"),
+		recordHistogram(ctx, name, duration.Seconds(),
+			"Duration of operator claim + resume operations", "s",
+			attribute.String("database", database),
+			DeploymentAttribute(deployment),
+			EnvironmentAttribute(environment),
+			attribute.String("previous_state", previousState),
 		)
-		if err != nil {
-			slog.Warn("failed to create operator claim duration histogram", "metric", name, "error", err)
-			continue
-		}
-		hist.Record(ctx, duration.Seconds(), attrs)
 	}
 }
 
@@ -787,23 +651,13 @@ var knownWebhookActions = map[string]bool{
 // Reason should be a stable string: "database_not_found", "invalid_config",
 // "no_config", "multiple_configs", or "unexpected".
 func RecordSchemaRequestError(ctx context.Context, repo, command, database, environment, reason string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.schema_request.errors_total",
-		otelmetric.WithDescription("Schema request errors by reason"),
-		otelmetric.WithUnit("{error}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create schema request error counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("repository", repo),
-			attribute.String("command", command),
-			attribute.String("database", database),
-			EnvironmentAttribute(environment),
-			attribute.String("reason", reason),
-		),
+	addCounter(ctx, "schemabot.schema_request.errors_total",
+		"Schema request errors by reason", "{error}",
+		attribute.String("repository", repo),
+		attribute.String("command", command),
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("reason", reason),
 	)
 }
 
@@ -891,17 +745,9 @@ func RecordGitHubRequest(ctx context.Context, sample GitHubRequestSample) {
 		attribute.String("status", sample.Status),
 	)
 
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.github.requests_total",
-		otelmetric.WithDescription("Total GitHub API responses observed by SchemaBot"),
-		otelmetric.WithUnit("{request}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create GitHub request counter", "error", err)
-		return
-	}
-
-	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
+	addCounter(ctx, "schemabot.github.requests_total",
+		"Total GitHub API responses observed by SchemaBot", "{request}",
+		attrs...)
 }
 
 // GitHubRateLimitSample describes rate-limit headers observed after a GitHub
@@ -926,35 +772,12 @@ func RecordGitHubRateLimit(ctx context.Context, sample GitHubRateLimitSample) {
 
 	attrs := gitHubMetricAttributes(sample.Operation, sample.Resource, sample.Repository, sample.GitHubApp, sample.InstallationID)
 
-	meter := otel.Meter(meterName)
-	limitGauge, err := meter.Int64Gauge("schemabot.github.rate_limit.limit",
-		otelmetric.WithDescription("GitHub primary rate limit for the observed API resource"),
-		otelmetric.WithUnit("{request}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create GitHub rate limit gauge", "error", err)
-		return
-	}
-	remainingGauge, err := meter.Int64Gauge("schemabot.github.rate_limit.remaining",
-		otelmetric.WithDescription("GitHub primary rate limit requests remaining for the observed API resource"),
-		otelmetric.WithUnit("{request}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create GitHub rate remaining gauge", "error", err)
-		return
-	}
-	usedGauge, err := meter.Int64Gauge("schemabot.github.rate_limit.used",
-		otelmetric.WithDescription("GitHub primary rate limit requests used for the observed API resource"),
-		otelmetric.WithUnit("{request}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create GitHub rate used gauge", "error", err)
-		return
-	}
-
-	limitGauge.Record(ctx, sample.Limit, otelmetric.WithAttributes(attrs...))
-	remainingGauge.Record(ctx, sample.Remaining, otelmetric.WithAttributes(attrs...))
-	usedGauge.Record(ctx, sample.Used, otelmetric.WithAttributes(attrs...))
+	recordGauge(ctx, "schemabot.github.rate_limit.limit", sample.Limit,
+		"GitHub primary rate limit for the observed API resource", "{request}", attrs...)
+	recordGauge(ctx, "schemabot.github.rate_limit.remaining", sample.Remaining,
+		"GitHub primary rate limit requests remaining for the observed API resource", "{request}", attrs...)
+	recordGauge(ctx, "schemabot.github.rate_limit.used", sample.Used,
+		"GitHub primary rate limit requests used for the observed API resource", "{request}", attrs...)
 }
 
 func gitHubMetricAttributes(operation, resource, repository, githubApp string, installationID int64) []attribute.KeyValue {
@@ -975,36 +798,31 @@ func gitHubMetricAttributes(operation, resource, repository, githubApp string, i
 	return attrs
 }
 
-func normalizeGitHubOperation(operation string) string {
-	if isKnownGitHubOperation(operation) {
-		return operation
+// normalizeGitHubLabel returns value when known passes, otherwise logs the
+// unknown label once and returns the shared unknown sentinel, keeping each
+// per-label normalizer to a single descriptor call.
+func normalizeGitHubLabel(label, value string, known func(string) bool) string {
+	if known(value) {
+		return value
 	}
-	logUnknownGitHubMetricLabel("operation", operation)
+	logUnknownGitHubMetricLabel(label, value)
 	return gitHubMetricValueUnknown
+}
+
+func normalizeGitHubOperation(operation string) string {
+	return normalizeGitHubLabel("operation", operation, isKnownGitHubOperation)
 }
 
 func normalizeGitHubRequestCategory(category string) string {
-	if isKnownGitHubRequestCategory(category) {
-		return category
-	}
-	logUnknownGitHubMetricLabel("category", category)
-	return GitHubRequestCategoryUnknown
+	return normalizeGitHubLabel("category", category, isKnownGitHubRequestCategory)
 }
 
 func normalizeGitHubRequestStatus(status string) string {
-	if isKnownGitHubRequestStatus(status) {
-		return status
-	}
-	logUnknownGitHubMetricLabel("status", status)
-	return GitHubRequestStatusUnknown
+	return normalizeGitHubLabel("status", status, isKnownGitHubRequestStatus)
 }
 
 func normalizeGitHubRateLimitResource(resource string) string {
-	if isKnownGitHubRateLimitResource(resource) {
-		return resource
-	}
-	logUnknownGitHubMetricLabel("resource", resource)
-	return gitHubMetricValueUnknown
+	return normalizeGitHubLabel("resource", resource, isKnownGitHubRateLimitResource)
 }
 
 func logUnknownGitHubMetricLabel(label, value string) {
@@ -1105,15 +923,6 @@ func RecordWebhookEvent(ctx context.Context, appName, eventType, action, repo, s
 	if appName == "" {
 		appName = "default"
 	}
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.webhook.events_total",
-		otelmetric.WithDescription("Total number of GitHub webhook events received"),
-		otelmetric.WithUnit("{event}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create webhook events counter", "error", err)
-		return
-	}
 	attrs := []attribute.KeyValue{
 		EnvironmentAttribute(""),
 		attribute.String("app_name", appName),
@@ -1126,7 +935,9 @@ func RecordWebhookEvent(ctx context.Context, appName, eventType, action, repo, s
 	if repo != "" {
 		attrs = append(attrs, attribute.String("repository", repo))
 	}
-	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
+	addCounter(ctx, "schemabot.webhook.events_total",
+		"Total number of GitHub webhook events received", "{event}",
+		attrs...)
 }
 
 func logUnknownWebhookMetricLabel(label, value, appName, repo, status string) {
@@ -1159,15 +970,6 @@ func RecordUnregisteredRepositoryWebhook(ctx context.Context, appName, eventType
 		appName = "default"
 	}
 
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.webhook.unregistered_repository_ignored_total",
-		otelmetric.WithDescription("Total number of GitHub webhook events ignored because the repository is not configured"),
-		otelmetric.WithUnit("{event}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create unregistered repository webhook counter", "error", err)
-		return
-	}
 	attrs := []attribute.KeyValue{
 		EnvironmentAttribute(""),
 		attribute.String("app_name", appName),
@@ -1177,7 +979,9 @@ func RecordUnregisteredRepositoryWebhook(ctx context.Context, appName, eventType
 	if action != "" {
 		attrs = append(attrs, attribute.String("action", action))
 	}
-	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
+	addCounter(ctx, "schemabot.webhook.unregistered_repository_ignored_total",
+		"Total number of GitHub webhook events ignored because the repository is not configured", "{event}",
+		attrs...)
 }
 
 var knownStatusCheckOperations = map[string]bool{
@@ -1222,15 +1026,6 @@ func RecordStatusCheckOperation(ctx context.Context, op StatusCheckOperation) {
 	if !knownStatusCheckStatuses[op.Status] {
 		op.Status = "unknown"
 	}
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.status_check_operations_total",
-		otelmetric.WithDescription("Total number of status-check operations"),
-		otelmetric.WithUnit("{operation}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create status-check operations counter", "error", err)
-		return
-	}
 	attrs := []attribute.KeyValue{
 		EnvironmentAttribute(op.Environment),
 		attribute.String("operation", op.Operation),
@@ -1245,46 +1040,28 @@ func RecordStatusCheckOperation(ctx context.Context, op StatusCheckOperation) {
 	if op.Repository != "" {
 		attrs = append(attrs, attribute.String("repository", op.Repository))
 	}
-	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
+	addCounter(ctx, "schemabot.status_check_operations_total",
+		"Total number of status-check operations", "{operation}",
+		attrs...)
 }
 
 // RecordPendingDropMoved increments the counter for tables quarantined into
 // the pending drops database instead of being dropped.
 func RecordPendingDropMoved(ctx context.Context, database string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.pending_drops.tables_moved_total",
-		otelmetric.WithDescription("Total number of dropped tables quarantined into the pending drops database"),
-		otelmetric.WithUnit("{table}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create pending drops moved counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("database", database),
-			EnvironmentAttribute(""),
-		),
+	addCounter(ctx, "schemabot.pending_drops.tables_moved_total",
+		"Total number of dropped tables quarantined into the pending drops database", "{table}",
+		attribute.String("database", database),
+		EnvironmentAttribute(""),
 	)
 }
 
 // RecordPendingDropsCleanupDropped increments the counter for expired
 // quarantined tables permanently dropped by the pending drops cleaner.
 func RecordPendingDropsCleanupDropped(ctx context.Context, database, environment string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.pending_drops.cleanup_dropped_total",
-		otelmetric.WithDescription("Total number of expired quarantined tables dropped by the pending drops cleaner"),
-		otelmetric.WithUnit("{table}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create pending drops cleanup dropped counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("database", database),
-			EnvironmentAttribute(environment),
-		),
+	addCounter(ctx, "schemabot.pending_drops.cleanup_dropped_total",
+		"Total number of expired quarantined tables dropped by the pending drops cleaner", "{table}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
 	)
 }
 
@@ -1293,20 +1070,10 @@ func RecordPendingDropsCleanupDropped(ctx context.Context, database, environment
 // prefix. A sustained nonzero rate means tables are accumulating that an
 // operator must inspect and remove manually.
 func RecordPendingDropsCleanupSkipped(ctx context.Context, database, environment string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.pending_drops.cleanup_skipped_total",
-		otelmetric.WithDescription("Total number of quarantined tables skipped by the cleaner due to unparseable names"),
-		otelmetric.WithUnit("{table}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create pending drops cleanup skipped counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("database", database),
-			EnvironmentAttribute(environment),
-		),
+	addCounter(ctx, "schemabot.pending_drops.cleanup_skipped_total",
+		"Total number of quarantined tables skipped by the cleaner due to unparseable names", "{table}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
 	)
 }
 
@@ -1314,20 +1081,10 @@ func RecordPendingDropsCleanupSkipped(ctx context.Context, database, environment
 // passes skipped because another SchemaBot instance owns the per-target
 // advisory lock.
 func RecordPendingDropsCleanupLockSkipped(ctx context.Context, database, environment string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.pending_drops.cleanup_lock_skipped_total",
-		otelmetric.WithDescription("Total number of pending drops cleanup target passes skipped because another instance held the cleanup lock"),
-		otelmetric.WithUnit("{pass}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create pending drops cleanup lock skipped counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("database", database),
-			EnvironmentAttribute(environment),
-		),
+	addCounter(ctx, "schemabot.pending_drops.cleanup_lock_skipped_total",
+		"Total number of pending drops cleanup target passes skipped because another instance held the cleanup lock", "{pass}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
 	)
 }
 
@@ -1335,20 +1092,10 @@ func RecordPendingDropsCleanupLockSkipped(ctx context.Context, database, environ
 // cleanup failures. Failed targets and tables are retried on the next cleanup
 // pass.
 func RecordPendingDropsCleanupError(ctx context.Context, database, environment, reason string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.pending_drops.cleanup_errors_total",
-		otelmetric.WithDescription("Total number of pending drops cleanup failures"),
-		otelmetric.WithUnit("{error}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create pending drops cleanup errors counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("database", database),
-			EnvironmentAttribute(environment),
-			attribute.String("reason", reason),
-		),
+	addCounter(ctx, "schemabot.pending_drops.cleanup_errors_total",
+		"Total number of pending drops cleanup failures", "{error}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("reason", reason),
 	)
 }

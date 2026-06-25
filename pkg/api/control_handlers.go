@@ -963,48 +963,90 @@ func stopRequestCounts(tasks []*storage.Task) (int64, int64) {
 	return stoppedCount, skippedCount
 }
 
-func (s *Service) createStopControlRequest(ctx context.Context, apply *storage.Apply, caller string, stoppedCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
+// createControlRequest marshals metadata and records a pending control request
+// for the given operation, keeping the per-operation create helpers to a single
+// descriptor call instead of duplicating the store/marshal/record boilerplate.
+func (s *Service) createControlRequest(ctx context.Context, apply *storage.Apply, op storage.ControlOperation, caller string, metadata any) (*storage.ApplyControlRequest, bool, error) {
 	controlStore := s.storage.ControlRequests()
 	if controlStore == nil {
 		return nil, false, fmt.Errorf("control request store is not available")
 	}
-	metadata, err := json.Marshal(stopControlRequestMetadata{
-		StoppedCount: stoppedCount,
-		SkippedCount: skippedCount,
-	})
+	metadataJSON, err := json.Marshal(metadata)
 	if err != nil {
-		return nil, false, fmt.Errorf("marshal stop control request metadata for apply %s: %w", apply.ApplyIdentifier, err)
+		return nil, false, fmt.Errorf("marshal %s control request metadata for apply %s: %w", op, apply.ApplyIdentifier, err)
 	}
 	controlReq, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
-		Operation:   storage.ControlOperationStop,
+		Operation:   op,
 		Status:      storage.ControlRequestPending,
 		RequestedBy: caller,
-		Metadata:    metadata,
+		Metadata:    metadataJSON,
 	})
 	if err != nil {
-		return nil, false, fmt.Errorf("record stop control request for apply %s: %w", apply.ApplyIdentifier, err)
+		return nil, false, fmt.Errorf("record %s control request for apply %s: %w", op, apply.ApplyIdentifier, err)
 	}
 	return controlReq, alreadyPending, nil
 }
 
-func (s *Service) pendingStopResponseIfPresent(ctx context.Context, apply *storage.Apply) (*ternv1.StopResponse, string, bool, error) {
+func (s *Service) createStopControlRequest(ctx context.Context, apply *storage.Apply, caller string, stoppedCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
+	return s.createControlRequest(ctx, apply, storage.ControlOperationStop, caller, stopControlRequestMetadata{
+		StoppedCount: stoppedCount,
+		SkippedCount: skippedCount,
+	})
+}
+
+// pendingControlResponseIfPresent loads any pending control request for the
+// operation and renders it with build, so each operation's pending-response
+// lookup is a single descriptor call instead of duplicating the store/load/
+// render boilerplate.
+func pendingControlResponseIfPresent[R any](ctx context.Context, s *Service, apply *storage.Apply, op storage.ControlOperation, status string, build func(*storage.ApplyControlRequest) (R, error)) (R, string, bool, error) {
+	var zero R
 	controlStore := s.storage.ControlRequests()
 	if controlStore == nil {
-		return nil, "", false, fmt.Errorf("control request store is not available")
+		return zero, "", false, fmt.Errorf("control request store is not available")
 	}
-	controlReq, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationStop)
+	controlReq, err := controlStore.GetPending(ctx, apply.ID, op)
 	if err != nil {
-		return nil, "", false, fmt.Errorf("load pending stop control request for apply %s: %w", apply.ApplyIdentifier, err)
+		return zero, "", false, fmt.Errorf("load pending %s control request for apply %s: %w", op, apply.ApplyIdentifier, err)
 	}
 	if controlReq == nil {
-		return nil, "", false, nil
+		return zero, "", false, nil
 	}
-	resp, err := stopResponseFromControlRequest(controlReq)
+	resp, err := build(controlReq)
 	if err != nil {
-		return nil, "", false, err
+		return zero, "", false, err
 	}
-	return resp, stopResponseStatusAlreadyRequested, true, nil
+	return resp, status, true, nil
+}
+
+// decodeControlRequestMetadata unmarshals the operation's stored metadata,
+// tolerating an empty payload so a metadata-less request decodes to the zero
+// value.
+func decodeControlRequestMetadata[M any](controlReq *storage.ApplyControlRequest, op storage.ControlOperation) (M, error) {
+	var metadata M
+	if len(controlReq.Metadata) > 0 {
+		if err := json.Unmarshal(controlReq.Metadata, &metadata); err != nil {
+			return metadata, fmt.Errorf("decode %s control request metadata for request %d: %w", op, controlReq.ID, err)
+		}
+	}
+	return metadata, nil
+}
+
+// applyControlRequestStatus maps a control request status onto a response via
+// the accepted/error setters, so every operation shares one status mapping.
+func applyControlRequestStatus(controlReq *storage.ApplyControlRequest, op storage.ControlOperation, setAccepted func(), setError func(string)) {
+	switch controlReq.Status {
+	case storage.ControlRequestPending, storage.ControlRequestCompleted:
+		setAccepted()
+	case storage.ControlRequestFailed:
+		setError(controlReq.ErrorMessage)
+	default:
+		setError(fmt.Sprintf("%s control request has unknown status: %s", op, controlReq.Status))
+	}
+}
+
+func (s *Service) pendingStopResponseIfPresent(ctx context.Context, apply *storage.Apply) (*ternv1.StopResponse, string, bool, error) {
+	return pendingControlResponseIfPresent(ctx, s, apply, storage.ControlOperationStop, stopResponseStatusAlreadyRequested, stopResponseFromControlRequest)
 }
 
 func stopResponseFromControlRequest(controlReq *storage.ApplyControlRequest) (*ternv1.StopResponse, error) {
@@ -1012,22 +1054,15 @@ func stopResponseFromControlRequest(controlReq *storage.ApplyControlRequest) (*t
 	if controlReq == nil {
 		return resp, nil
 	}
-	var metadata stopControlRequestMetadata
-	if len(controlReq.Metadata) > 0 {
-		if err := json.Unmarshal(controlReq.Metadata, &metadata); err != nil {
-			return nil, fmt.Errorf("decode stop control request metadata for request %d: %w", controlReq.ID, err)
-		}
+	metadata, err := decodeControlRequestMetadata[stopControlRequestMetadata](controlReq, storage.ControlOperationStop)
+	if err != nil {
+		return nil, err
 	}
 	resp.StoppedCount = metadata.StoppedCount
 	resp.SkippedCount = metadata.SkippedCount
-	switch controlReq.Status {
-	case storage.ControlRequestPending, storage.ControlRequestCompleted:
-		resp.Accepted = true
-	case storage.ControlRequestFailed:
-		resp.ErrorMessage = controlReq.ErrorMessage
-	default:
-		resp.ErrorMessage = fmt.Sprintf("stop control request has unknown status: %s", controlReq.Status)
-	}
+	applyControlRequestStatus(controlReq, storage.ControlOperationStop,
+		func() { resp.Accepted = true },
+		func(msg string) { resp.ErrorMessage = msg })
 	return resp, nil
 }
 
@@ -1395,28 +1430,10 @@ func (s *Service) persistStartRequestForOperator(ctx context.Context, apply *sto
 }
 
 func (s *Service) createStartControlRequest(ctx context.Context, apply *storage.Apply, caller string, startedCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
-	controlStore := s.storage.ControlRequests()
-	if controlStore == nil {
-		return nil, false, fmt.Errorf("control request store is not available")
-	}
-	metadata, err := json.Marshal(startControlRequestMetadata{
+	return s.createControlRequest(ctx, apply, storage.ControlOperationStart, caller, startControlRequestMetadata{
 		StartedCount: startedCount,
 		SkippedCount: skippedCount,
 	})
-	if err != nil {
-		return nil, false, fmt.Errorf("marshal start control request metadata for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-	controlReq, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
-		ApplyID:     apply.ID,
-		Operation:   storage.ControlOperationStart,
-		Status:      storage.ControlRequestPending,
-		RequestedBy: caller,
-		Metadata:    metadata,
-	})
-	if err != nil {
-		return nil, false, fmt.Errorf("record start control request for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-	return controlReq, alreadyPending, nil
 }
 
 func (s *Service) startResponseForPendingStartRequest(ctx context.Context, apply *storage.Apply) (*ternv1.StartResponse, string, error) {
@@ -1431,22 +1448,7 @@ func (s *Service) startResponseForPendingStartRequest(ctx context.Context, apply
 }
 
 func (s *Service) pendingStartResponseIfPresent(ctx context.Context, apply *storage.Apply) (*ternv1.StartResponse, string, bool, error) {
-	controlStore := s.storage.ControlRequests()
-	if controlStore == nil {
-		return nil, "", false, fmt.Errorf("control request store is not available")
-	}
-	controlReq, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationStart)
-	if err != nil {
-		return nil, "", false, fmt.Errorf("load pending start control request for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-	if controlReq == nil {
-		return nil, "", false, nil
-	}
-	resp, err := startResponseFromControlRequest(controlReq)
-	if err != nil {
-		return nil, "", false, err
-	}
-	return resp, startResponseStatusAlreadyRequested, true, nil
+	return pendingControlResponseIfPresent(ctx, s, apply, storage.ControlOperationStart, startResponseStatusAlreadyRequested, startResponseFromControlRequest)
 }
 
 func startResponseFromControlRequest(controlReq *storage.ApplyControlRequest) (*ternv1.StartResponse, error) {
@@ -1454,22 +1456,15 @@ func startResponseFromControlRequest(controlReq *storage.ApplyControlRequest) (*
 	if controlReq == nil {
 		return resp, nil
 	}
-	var metadata startControlRequestMetadata
-	if len(controlReq.Metadata) > 0 {
-		if err := json.Unmarshal(controlReq.Metadata, &metadata); err != nil {
-			return nil, fmt.Errorf("decode start control request metadata for request %d: %w", controlReq.ID, err)
-		}
+	metadata, err := decodeControlRequestMetadata[startControlRequestMetadata](controlReq, storage.ControlOperationStart)
+	if err != nil {
+		return nil, err
 	}
 	resp.StartedCount = metadata.StartedCount
 	resp.SkippedCount = metadata.SkippedCount
-	switch controlReq.Status {
-	case storage.ControlRequestPending, storage.ControlRequestCompleted:
-		resp.Accepted = true
-	case storage.ControlRequestFailed:
-		resp.ErrorMessage = controlReq.ErrorMessage
-	default:
-		resp.ErrorMessage = fmt.Sprintf("start control request has unknown status: %s", controlReq.Status)
-	}
+	applyControlRequestStatus(controlReq, storage.ControlOperationStart,
+		func() { resp.Accepted = true },
+		func(msg string) { resp.ErrorMessage = msg })
 	return resp, nil
 }
 
