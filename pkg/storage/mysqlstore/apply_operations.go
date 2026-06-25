@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 
 	"github.com/block/schemabot/pkg/state"
@@ -22,10 +21,6 @@ import (
 const applyOperationColumns = `id, apply_id, deployment, operation_key, operation_kind, target, state, error_message,
 	cutover_policy, on_failure, attempt, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
 	engine_resume_context, engine_resume_metadata, created_at, updated_at`
-
-// mysqlErrDupEntry is MySQL's error number for a duplicate-key violation.
-// Used to translate unique-index conflicts into typed storage errors.
-const mysqlErrDupEntry = 1062
 
 // applyOperationStore implements storage.ApplyOperationStore using MySQL.
 type applyOperationStore struct {
@@ -88,8 +83,7 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 		ad.StartedAt, ad.CompletedAt, nullString(ad.EngineResumeContext), nullString(ad.EngineResumeMetadata),
 	)
 	if err != nil {
-		var mysqlErr *mysql.MySQLError
-		if errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlErrDupEntry {
+		if isDuplicateKeyError(err) {
 			return 0, storage.ErrApplyOperationExists
 		}
 		return 0, fmt.Errorf("insert apply_operations (apply=%d, deployment=%s, operation_key=%s): %w", ad.ApplyID, ad.Deployment, ad.OperationKey, err)
