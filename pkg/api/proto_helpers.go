@@ -242,11 +242,30 @@ func protoShardPlansToStorage(shards []*ternv1.ShardPlan) ([]storage.ShardPlan, 
 		if namespace == "" {
 			namespace = "default"
 		}
-		out = append(out, storage.ShardPlan{
+		sp := storage.ShardPlan{
 			Shard:       shardName,
 			Namespace:   namespace,
 			NeedsChange: shard.NeedsChange,
-		})
+		}
+		// Carry the shard's own changes so the apply-create fan-out can build
+		// per-shard tasks from per-shard DDL. Empty leaves the shard on the
+		// namespace-level changes (uniform case / pre-per-shard plans).
+		for _, ch := range shard.Changes {
+			if ch == nil {
+				continue
+			}
+			chNamespace := ch.Namespace
+			if chNamespace == "" {
+				chNamespace = namespace
+			}
+			sp.Changes = append(sp.Changes, storage.TableChange{
+				Namespace: chNamespace,
+				Table:     ch.TableName,
+				DDL:       ch.Ddl,
+				Operation: protoChangeTypeToOperation(ch.ChangeType),
+			})
+		}
+		out = append(out, sp)
 	}
 	return out, nil
 }

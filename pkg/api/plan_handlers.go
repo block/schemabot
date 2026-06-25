@@ -1075,28 +1075,50 @@ func buildShardedApplyOperationGroups(
 	now time.Time,
 ) ([]*storage.ApplyOperationWithTasks, error) {
 	shardsByNamespace := changingShardsByNamespace(plan.Shards)
+	// Namespace-level changes, keyed by namespace, used as the fallback for a
+	// shard that carries no per-shard changes — the uniform case, and plans
+	// persisted before per-shard changes were recorded.
+	taskChangesByNamespace := make(map[string][]storage.TableChange)
+	for _, ddlChange := range taskChanges {
+		taskChangesByNamespace[ddlChange.Namespace] = append(taskChangesByNamespace[ddlChange.Namespace], ddlChange)
+	}
+	namespaces := make([]string, 0, len(shardsByNamespace))
+	for namespace := range shardsByNamespace {
+		namespaces = append(namespaces, namespace)
+	}
+	sort.Strings(namespaces)
+
 	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets)*(len(taskChanges)+1))
 	groupsByTargetAndKey := make(map[string]*storage.ApplyOperationWithTasks)
 	for _, target := range targets {
-		for _, ddlChange := range taskChanges {
-			for _, shard := range shardsByNamespace[ddlChange.Namespace] {
-				if err := validateShardOperationKeyParts(ddlChange.Namespace, shard.Shard, ddlChange.Table); err != nil {
-					return nil, err
+		for _, namespace := range namespaces {
+			for _, shard := range shardsByNamespace[namespace] {
+				// Drive each shard from its own changes so a divergent keyspace
+				// applies the right DDL per shard; fall back to the namespace-level
+				// changes when a shard carries none.
+				shardChanges := shard.Changes
+				if len(shardChanges) == 0 {
+					shardChanges = taskChangesByNamespace[namespace]
 				}
-				operationKey := shardOperationKey(ddlChange.Namespace, shard.Shard, ddlChange.Table)
-				if len(operationKey) > applyOperationKeyMaxLen {
-					return nil, fmt.Errorf("operation key for namespace %q shard %q table %q exceeds %d characters", ddlChange.Namespace, shard.Shard, ddlChange.Table, applyOperationKeyMaxLen)
-				}
-				groupKey := target.Deployment + "\x00" + operationKey
-				group := groupsByTargetAndKey[groupKey]
-				if group == nil {
-					group = &storage.ApplyOperationWithTasks{
-						Operation: newPendingApplyOperation(target, operationKey, cutoverPolicy, onFailure, now),
+				for _, ddlChange := range shardChanges {
+					if err := validateShardOperationKeyParts(namespace, shard.Shard, ddlChange.Table); err != nil {
+						return nil, err
 					}
-					groupsByTargetAndKey[groupKey] = group
-					groups = append(groups, group)
+					operationKey := shardOperationKey(namespace, shard.Shard, ddlChange.Table)
+					if len(operationKey) > applyOperationKeyMaxLen {
+						return nil, fmt.Errorf("operation key for namespace %q shard %q table %q exceeds %d characters", namespace, shard.Shard, ddlChange.Table, applyOperationKeyMaxLen)
+					}
+					groupKey := target.Deployment + "\x00" + operationKey
+					group := groupsByTargetAndKey[groupKey]
+					if group == nil {
+						group = &storage.ApplyOperationWithTasks{
+							Operation: newPendingApplyOperation(target, operationKey, cutoverPolicy, onFailure, now),
+						}
+						groupsByTargetAndKey[groupKey] = group
+						groups = append(groups, group)
+					}
+					group.Tasks = append(group.Tasks, buildApplyTask(plan, ddlChange, environment, applyOpts, shard.Shard, now))
 				}
-				group.Tasks = append(group.Tasks, buildApplyTask(plan, ddlChange, environment, applyOpts, shard.Shard, now))
 			}
 		}
 		// Every namespace that changes its VSchema gets a task-less

@@ -1036,11 +1036,21 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 				Operation: ddl.StatementTypeToOp(tc.Operation),
 			})
 		}
-		// Record per-shard membership so apply-create can rebuild per-shard
-		// operation groups. A SchemaChange with an empty shard targets the whole
-		// namespace (non-sharded engines) and contributes no shard rows.
+		// Record per-shard membership and this shard's own changes so apply-create
+		// can rebuild per-shard operation groups with per-shard DDL (a keyspace
+		// whose shards diverge is persisted per shard, not collapsed). A
+		// SchemaChange with an empty shard targets the whole namespace (non-sharded
+		// engines) and contributes no shard rows.
 		if shardName := strings.TrimSpace(sc.Shard.Name); shardName != "" {
 			sp := storage.ShardPlan{Shard: shardName, Namespace: ns, NeedsChange: true}
+			for _, tc := range sc.TableChanges {
+				sp.Changes = append(sp.Changes, storage.TableChange{
+					Namespace: ns,
+					Table:     tc.Table,
+					DDL:       tc.DDL,
+					Operation: ddl.StatementTypeToOp(tc.Operation),
+				})
+			}
 			nsData.Shards = append(nsData.Shards, sp)
 			allShardPlans = append(allShardPlans, sp)
 		}
@@ -1171,14 +1181,25 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	}
 
 	// Surface per-shard plan metadata on the response too, for parity with the
-	// gRPC path: callers of Plan can display per-shard drift/membership.
+	// gRPC path: callers of Plan can display per-shard drift/membership, and the
+	// control plane rebuilds per-shard operation groups from each shard's own
+	// changes.
 	var protoShards []*ternv1.ShardPlan
 	for _, sp := range allShardPlans {
-		protoShards = append(protoShards, &ternv1.ShardPlan{
+		protoSP := &ternv1.ShardPlan{
 			Shard:       sp.Shard,
 			Namespace:   sp.Namespace,
 			NeedsChange: sp.NeedsChange,
-		})
+		}
+		for _, ch := range sp.Changes {
+			protoSP.Changes = append(protoSP.Changes, &ternv1.TableChange{
+				Namespace:  ch.Namespace,
+				TableName:  ch.Table,
+				Ddl:        ch.DDL,
+				ChangeType: ddlActionToProtoChangeType(ch.Operation),
+			})
+		}
+		protoShards = append(protoShards, protoSP)
 	}
 
 	return &ternv1.PlanResponse{

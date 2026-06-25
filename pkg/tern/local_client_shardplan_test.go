@@ -73,8 +73,16 @@ func TestPlanRecordsPerShardSchemaChanges(t *testing.T) {
 	ns := store.created.Namespaces["resolute"]
 	require.NotNil(t, ns, "namespace plan data must exist for the changed keyspace")
 	require.Len(t, ns.Shards, 2)
-	assert.Equal(t, storage.ShardPlan{Shard: "-80", Namespace: "resolute", NeedsChange: true}, ns.Shards[0])
-	assert.Equal(t, storage.ShardPlan{Shard: "80-", Namespace: "resolute", NeedsChange: true}, ns.Shards[1])
+	// Each shard records its own changes (here identical) so a later divergence is
+	// representable; the namespace-level Tables stay deduped.
+	wantChange := storage.TableChange{
+		Namespace: "resolute",
+		Table:     "users",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		Operation: "alter",
+	}
+	assert.Equal(t, storage.ShardPlan{Shard: "-80", Namespace: "resolute", NeedsChange: true, Changes: []storage.TableChange{wantChange}}, ns.Shards[0])
+	assert.Equal(t, storage.ShardPlan{Shard: "80-", Namespace: "resolute", NeedsChange: true, Changes: []storage.TableChange{wantChange}}, ns.Shards[1])
 	require.Len(t, ns.Tables, 1, "the table repeated across shards is deduped at the namespace level")
 	assert.Equal(t, "users", ns.Tables[0].Table)
 }
@@ -125,6 +133,12 @@ func TestPlanSurfacesShardPlanOnResponse(t *testing.T) {
 	assert.Equal(t, "resolute", resp.Shards[0].Namespace)
 	assert.True(t, resp.Shards[0].NeedsChange)
 	assert.Equal(t, "80-", resp.Shards[1].Shard)
+	// Each shard surfaces its own changes so the control plane can rebuild the
+	// fan-out (and present per-shard divergence) from the response.
+	require.Len(t, resp.Shards[0].Changes, 1)
+	assert.Equal(t, "users", resp.Shards[0].Changes[0].TableName)
+	require.Len(t, resp.Shards[1].Changes, 1)
+	assert.Equal(t, "users", resp.Shards[1].Changes[0].TableName)
 	// The repeated table collapses to a single namespace-level proto change.
 	require.Len(t, resp.Changes, 1)
 	require.Len(t, resp.Changes[0].TableChanges, 1)

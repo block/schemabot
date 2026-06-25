@@ -385,13 +385,18 @@ message LintViolation {
   string severity = 6; // "error", "warning", or "info"
 }
 
-// ShardPlan reports per-shard membership and drift for a namespace. A shard is
-// listed with needs_change=true when its current schema differs from the
-// desired schema.
+// ShardPlan reports per-shard membership, drift, and changes for a namespace. A
+// shard is listed with needs_change=true when its current schema differs from
+// the desired schema. changes carries that shard's own table changes so a
+// keyspace whose shards diverge (drift, or a partially-applied canary rollout)
+// is represented per shard rather than collapsed to a single namespace-level
+// change set. When empty, the shard's changes are the namespace-level changes
+// (the uniform case, and plans produced before per-shard changes were carried).
 message ShardPlan {
   string shard = 1;
   string namespace = 2;
   bool needs_change = 3;
+  repeated TableChange changes = 4;
 }
 
 // PlanResponse contains the generated schema change plan.
