@@ -2044,7 +2044,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 </details>
 
 <details>
-<summary><a name="vitess-vschemaonly"></a><strong>Vitess: Vschema-only</strong></summary>
+<summary><a name="vitess-vschema-only"></a><strong>Vitess: VSchema Only</strong></summary>
 
 
 ## Schema Change In Progress
@@ -3718,7 +3718,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 </details>
 
 <details>
-<summary><a name="vitess-vschemaonly-update"></a><strong>Vitess: Vschema-only Update</strong></summary>
+<summary><a name="vitess-vschema-only-update"></a><strong>Vitess: VSchema Only Update</strong></summary>
 
 ```
 
@@ -3943,7 +3943,7 @@ Vitess plan: DDL + VSchema changes in a sharded keyspace
 </details>
 
 <details>
-<summary><a name="vitess-plan-vschemaonly"></a><strong>Vitess: Plan (Vschema-only)</strong></summary>
+<summary><a name="vitess-plan-vschema-only"></a><strong>Vitess: Plan (VSchema Only)</strong></summary>
 
 ```
 

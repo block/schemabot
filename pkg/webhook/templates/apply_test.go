@@ -918,6 +918,29 @@ func TestRenderApplySummaryComment_Cancelled(t *testing.T) {
 	assert.NotContains(t, result, "schemabot start", "a cancelled change is permanent — no resume affordance")
 }
 
+// A VSchema-only apply completes with no per-table tasks, so the terminal
+// summary reports the VSchema outcome instead of an inaccurate "All 0 tables
+// applied" message, and still records which keyspaces were applied.
+func TestRenderApplySummaryComment_VSchemaOnly(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Completed,
+		Engine:      "PlanetScale",
+		VSchemaChanges: []apitypes.VSchemaChange{
+			{Namespace: "commerce_sharded", Status: "applied", Diff: `+ "xxhash": {"type": "xxhash"}`},
+		},
+	}
+
+	result := RenderApplySummaryComment(data)
+
+	assert.NotContains(t, result, "0 tables")
+	assert.Contains(t, result, "VSchema applied successfully")
+	assert.Contains(t, result, "### VSchema")
+	assert.Contains(t, result, "**`commerce_sharded`**: Applied")
+}
+
 func TestPreviewCommentSummaryCompletedLargeSingleNamespaceKeepsApplyIDInsideSection(t *testing.T) {
 	result := PreviewCommentSummaryCompletedLarge()
 
