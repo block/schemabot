@@ -19,12 +19,20 @@ import (
 // without a database.
 type stubApplyOperationStore struct {
 	storage.ApplyOperationStore
-	ops []*storage.ApplyOperation
-	err error
+	ops        []*storage.ApplyOperation
+	err        error
+	resumeByOp map[int64]*storage.EngineResumeState
 }
 
 func (s *stubApplyOperationStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
 	return s.ops, s.err
+}
+
+func (s *stubApplyOperationStore) GetEngineResumeState(_ context.Context, opID int64) (*storage.EngineResumeState, error) {
+	if rs, ok := s.resumeByOp[opID]; ok {
+		return rs, nil
+	}
+	return nil, storage.ErrEngineResumeStateNotFound
 }
 
 // stubStorage exposes only the ApplyOperations accessor the comment dispatch
@@ -41,6 +49,34 @@ func newDispatchTestObserver(opStore storage.ApplyOperationStore) *CommentObserv
 	return &CommentObserver{
 		stor:   &stubStorage{ops: opStore},
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+}
+
+// A PlanetScale apply's VSchema status reaches the PR comment through the real
+// observer path: the comment is built from storage (buildApplyCommentData), and
+// VSchema is projected from the operation's engine resume metadata — the comment
+// path never reads a progress response, so this is where VSchema must come from.
+func TestStatusCommentRendersVSchemaFromEngineResumeState(t *testing.T) {
+	const resume = `{"vschema_status":"applying","vschema_diffs":[{"namespace":"commerce_sharded","diff":"+ \"xxhash\": {\"type\": \"xxhash\"}"}]}`
+	o := newDispatchTestObserver(&stubApplyOperationStore{
+		ops:        []*storage.ApplyOperation{{ID: 7, Deployment: "eu", State: state.ApplyOperation.Running}},
+		resumeByOp: map[int64]*storage.EngineResumeState{7: {Metadata: resume}},
+	})
+
+	body := o.formatStatusComment(planetscaleApply(), nil)
+
+	assert.Contains(t, body, "### VSchema")
+	assert.Contains(t, body, "**`commerce_sharded`**: Applying...")
+	assert.Contains(t, body, `+ "xxhash": {"type": "xxhash"}`)
+}
+
+func planetscaleApply() *storage.Apply {
+	return &storage.Apply{
+		ApplyIdentifier: "apply-1",
+		Database:        "commerce",
+		Environment:     "production",
+		State:           state.Apply.Running,
+		Engine:          storage.EnginePlanetScale,
 	}
 }
 

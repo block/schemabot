@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/clock"
 	"github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
@@ -377,7 +378,16 @@ func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*stor
 			"apply_id", o.applyID, "error", opsErr)
 		return formatProgressComment(apply, tasks)
 	}
-	return formatApplyStatusComment(apply, ops, tasks)
+	return formatApplyStatusComment(apply, ops, tasks, o.resolveVSchema(apply, ops))
+}
+
+// resolveVSchema projects the apply's per-operation VSchema display state for
+// comment rendering. It uses a short, independent deadline so a slow storage
+// read degrades to a comment without VSchema rather than blocking the update.
+func (o *CommentObserver) resolveVSchema(apply *storage.Apply, ops []*storage.ApplyOperation) map[int64][]apitypes.VSchemaChange {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return resolveVSchemaByOperation(ctx, o.stor, apply, ops)
 }
 
 // formatTerminalSummaryComment renders the apply's terminal summary comment,
@@ -406,7 +416,7 @@ func (o *CommentObserver) summaryCommentFromOps(apply *storage.Apply, ops []*sto
 			"apply_id", o.applyID, "error", opsErr)
 		return formatSummaryComment(apply, tasks)
 	}
-	return formatApplySummaryComment(apply, ops, tasks)
+	return formatApplySummaryComment(apply, ops, tasks, o.resolveVSchema(apply, ops))
 }
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {

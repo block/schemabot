@@ -3,6 +3,7 @@ package webhook
 import (
 	"time"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -18,11 +19,11 @@ import (
 // ops must be in resolved deployment order (as returned by
 // ApplyOperations().ListByApply); tasks are the apply's tasks across all
 // deployments, regrouped per operation for the multi-deployment layout.
-func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task) string {
+func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, vschemaByOp map[int64][]apitypes.VSchemaChange) string {
 	if len(ops) <= 1 {
-		return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks))
+		return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks, singleOpVSchema(ops, vschemaByOp)))
 	}
-	return templates.RenderMultiDeploymentApplyComment(buildMultiApplyData(apply, ops, tasks))
+	return templates.RenderMultiDeploymentApplyComment(buildMultiApplyData(apply, ops, tasks, vschemaByOp))
 }
 
 // formatApplySummaryComment renders the terminal summary PR comment for an apply,
@@ -35,23 +36,33 @@ func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperatio
 // ops must be in resolved deployment order (as returned by
 // ApplyOperations().ListByApply); tasks are the apply's tasks across all
 // deployments, regrouped per operation for the multi-deployment layout.
-func formatApplySummaryComment(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task) string {
+func formatApplySummaryComment(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, vschemaByOp map[int64][]apitypes.VSchemaChange) string {
 	if len(ops) <= 1 {
-		return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks))
+		return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks, singleOpVSchema(ops, vschemaByOp)))
 	}
-	return templates.RenderMultiDeploymentApplySummaryComment(buildMultiApplyData(apply, ops, tasks))
+	return templates.RenderMultiDeploymentApplySummaryComment(buildMultiApplyData(apply, ops, tasks, vschemaByOp))
+}
+
+// singleOpVSchema returns the VSchema changes for a zero/one-operation apply
+// rendered with the single-deployment layout: the lone operation's changes, or
+// nil when the apply has no operation (legacy) or no VSchema.
+func singleOpVSchema(ops []*storage.ApplyOperation, vschemaByOp map[int64][]apitypes.VSchemaChange) []apitypes.VSchemaChange {
+	if len(ops) != 1 {
+		return nil
+	}
+	return vschemaByOp[ops[0].ID]
 }
 
 // buildMultiApplyData assembles the multi-deployment comment input: the derived
 // rollup plus each deployment's own single-deployment comment data, so each
 // deployment's section reuses the existing per-table renderer.
-func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task) templates.MultiDeploymentApplyData {
+func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, vschemaByOp map[int64][]apitypes.VSchemaChange) templates.MultiDeploymentApplyData {
 	tasksByOp := groupTasksByOperation(tasks)
 
 	model := deriveApplyPresentation(ops)
 	details := make(map[string]templates.ApplyStatusCommentData, len(ops))
 	for _, op := range ops {
-		details[op.Deployment] = buildDeploymentDetail(apply, op, tasksByOp[op.ID])
+		details[op.Deployment] = buildDeploymentDetail(apply, op, tasksByOp[op.ID], vschemaByOp[op.ID])
 	}
 
 	data := templates.MultiDeploymentApplyData{
@@ -102,15 +113,16 @@ func applyOperationToPresentation(op *storage.ApplyOperation) presentation.Opera
 // identity and timing, and the deployment's own tasks. The deployment's database
 // target is shown via the section's deployment name; the per-table rows fall back
 // to the apply database for namespace, matching the single-deployment renderer.
-func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tasks []*storage.Task) templates.ApplyStatusCommentData {
+func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tasks []*storage.Task, vschemaChanges []apitypes.VSchemaChange) templates.ApplyStatusCommentData {
 	data := templates.ApplyStatusCommentData{
-		ApplyID:      apply.ApplyIdentifier,
-		Database:     apply.Database,
-		Environment:  apply.Environment,
-		State:        op.State,
-		Engine:       apply.Engine,
-		ErrorMessage: op.ErrorMessage,
-		Tables:       tableProgressFromTasks(apply.Database, tasks),
+		ApplyID:        apply.ApplyIdentifier,
+		Database:       apply.Database,
+		Environment:    apply.Environment,
+		State:          op.State,
+		Engine:         apply.Engine,
+		ErrorMessage:   op.ErrorMessage,
+		Tables:         tableProgressFromTasks(apply.Database, tasks),
+		VSchemaChanges: vschemaChanges,
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)

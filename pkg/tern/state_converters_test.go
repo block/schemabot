@@ -3,6 +3,7 @@ package tern
 import (
 	"testing"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -32,14 +33,22 @@ func TestProtoToSchemaFiles_NilNamespaceValue(t *testing.T) {
 func TestPSDisplayMetadata(t *testing.T) {
 	// A populated resume-state blob projects every display field the renderer
 	// surfaces for a PlanetScale apply.
-	m, err := PSDisplayMetadata(`{"branch_name":"schemabot-db-1","deploy_request_url":"https://app/deploy/9","is_instant":true,"deferred_deploy":true,"vschema_status":"applying"}`)
+	m, err := PSDisplayMetadata(`{"branch_name":"schemabot-db-1","deploy_request_url":"https://app/deploy/9","is_instant":true,"deferred_deploy":true,"vschema_status":"applying","vschema_diffs":[{"namespace":"commerce","diff":"+ \"x\": {}"}]}`)
 	require.NoError(t, err)
 	require.NotNil(t, m)
 	assert.Equal(t, "schemabot-db-1", m["branch_name"])
 	assert.Equal(t, "https://app/deploy/9", m["deploy_request_url"])
 	assert.Equal(t, "true", m["is_instant"])
 	assert.Equal(t, "true", m["deferred_deploy"])
-	assert.Equal(t, "applying", m["vschema_status"])
+
+	// Per-keyspace VSchema is projected as JSON under a shared key; decode it
+	// back to assert each keyspace carries the deploy-level status and its diff.
+	changes, err := apitypes.ParseVSchemaChanges(m)
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	assert.Equal(t, "commerce", changes[0].Namespace)
+	assert.Equal(t, "applying", changes[0].Status)
+	assert.Equal(t, `+ "x": {}`, changes[0].Diff)
 
 	// An empty blob yields no fields and no error.
 	m, err = PSDisplayMetadata("")

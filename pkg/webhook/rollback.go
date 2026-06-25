@@ -471,7 +471,9 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 		return
 	}
 
-	// Post initial progress comment for the observer to edit.
+	// Post initial progress comment for the observer to edit. VSchema status is
+	// omitted on this first comment — the observer refreshes it from engine
+	// display metadata on the next progress tick.
 	progressBody := formatProgressComment(apply, nil)
 	h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, progressBody)
 }

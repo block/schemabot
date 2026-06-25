@@ -837,9 +837,12 @@ func nextVSchemaStatus(current, drState string) string {
 	case deployState.InProgressVSchema:
 		return vschemaStatusApplying
 	case deployState.Complete, deployState.CompletePendingRevert:
-		if current == vschemaStatusApplying {
-			return vschemaStatusApplied
-		}
+		// A completed deploy has applied its VSchema. Mark it applied even when no
+		// poll observed the in-progress VSchema phase (a fast deploy can pass
+		// between polls), so a completed VSchema change never renders as still
+		// "Pending". Harmless when the deploy carries no VSchema change — the
+		// status is only surfaced for keyspaces that have a diff.
+		return vschemaStatusApplied
 	}
 	return current
 }
