@@ -106,18 +106,51 @@ func TestVitessConnectionAssemblerBuildsMetadataTarget(t *testing.T) {
 	}, meta)
 }
 
-// The host argument is irrelevant for Vitess; resolution keys on organization.
-func TestVitessConnectionAssemblerIgnoresHost(t *testing.T) {
+// A vtgate DSN is only produced when the credentials carry a MySQL username. A
+// token-only credential (PlanetScale API access, no MySQL user) yields the API
+// metadata but no DSN, so the apply runs API-only with deploy-request-level
+// progress — even when a host is present.
+func TestVitessConnectionAssemblerNoVtgateDSNWithoutMySQLUsername(t *testing.T) {
 	a := VitessConnectionAssembler{}
 
-	_, meta, err := a.Assemble(
-		"writer.example:3306",
+	dsn, meta, err := a.Assemble(
+		"vtgate.example:3306",
 		map[string]string{MetadataOrganization: "acme"},
 		&Credentials{Metadata: map[string]string{MetadataTokenName: "id", MetadataTokenValue: "secret"}},
 	)
 	require.NoError(t, err)
+	assert.Empty(t, dsn, "no MySQL username → no vtgate DSN even with a host")
 	assert.Equal(t, DefaultPlanetScaleAPIURL, meta[MetadataAPIURL])
 	assert.Equal(t, "acme", meta[MetadataOrganization])
+}
+
+// When the endpoint exposes a vtgate host and the credentials carry a MySQL
+// username/password, the assembler returns a namespace-free vtgate DSN for SHOW
+// VITESS_MIGRATIONS progress, alongside the PlanetScale API metadata.
+func TestVitessConnectionAssemblerBuildsVtgateDSN(t *testing.T) {
+	a := VitessConnectionAssembler{APIURL: "https://localscale.test", DefaultPort: "3306"}
+
+	dsn, meta, err := a.Assemble(
+		"vtgate.example",
+		map[string]string{MetadataOrganization: "acme"},
+		&Credentials{
+			Username: "ddl-user",
+			Password: "ddl-pass",
+			Metadata: map[string]string{MetadataTokenName: "tok-id", MetadataTokenValue: "tok-secret"},
+		},
+	)
+	require.NoError(t, err)
+	// PlanetScale API metadata is still populated.
+	assert.Equal(t, "acme", meta[MetadataOrganization])
+	assert.Equal(t, "tok-secret", meta[MetadataTokenValue])
+	// And a namespace-free vtgate DSN is produced for progress queries.
+	cfg, err := mysql.ParseDSN(dsn)
+	require.NoError(t, err)
+	assert.Equal(t, "ddl-user", cfg.User)
+	assert.Equal(t, "ddl-pass", cfg.Passwd)
+	assert.Equal(t, "tcp", cfg.Net)
+	assert.Equal(t, "vtgate.example:3306", cfg.Addr)
+	assert.Equal(t, "", cfg.DBName, "vtgate DSN is namespace-free; the schema is supplied per operation")
 }
 
 // A custom organization attribute lets the resolver surface the organization
@@ -214,6 +247,19 @@ func TestDecodePlanetScaleSecretOptionalAPIURL(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "tok-id", creds.Metadata[MetadataTokenName])
 	assert.NotContains(t, creds.Metadata, MetadataAPIURL, "api_url is optional in the secret")
+}
+
+// A secret carrying read-only vtgate credentials populates the MySQL
+// Username/Password the assembler builds the vtgate DSN from, alongside the API
+// token metadata. The vtgate fields are optional — a token-only secret leaves
+// them empty (covered by TestDecodePlanetScaleSecret).
+func TestDecodePlanetScaleSecretVtgateCredentials(t *testing.T) {
+	creds, err := DecodePlanetScaleSecret(
+		`{"token":"tok-id=tok-secret","vtgate_username":"vt-user","vtgate_password":"vt-pass"}`)
+	require.NoError(t, err)
+	assert.Equal(t, "vt-user", creds.Username)
+	assert.Equal(t, "vt-pass", creds.Password)
+	assert.Equal(t, "tok-id", creds.Metadata[MetadataTokenName])
 }
 
 func TestDecodePlanetScaleSecretRejectsBadInput(t *testing.T) {

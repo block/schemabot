@@ -99,11 +99,17 @@ const (
 // tests).
 const DefaultPlanetScaleAPIURL = "https://api.planetscale.com"
 
-// VitessConnectionAssembler assembles a metadata-only Target for Vitess via
-// PlanetScale. Vitess connects through the PlanetScale API rather than a MySQL
-// DSN, so connection details travel in Metadata: the organization comes from the
-// resolved endpoint's attributes, the service token from credentials, and the
-// API URL from deployment configuration.
+// VitessConnectionAssembler assembles a Target for Vitess via PlanetScale.
+// Vitess applies DDL through the PlanetScale API (organization + service token,
+// carried in Metadata), so those fields are always populated: the organization
+// comes from the resolved endpoint's attributes, the service token from
+// credentials, and the API URL from deployment configuration.
+//
+// When the resolved endpoint also exposes a vtgate host and the credentials carry
+// a MySQL username, the assembler additionally returns a namespace-free vtgate
+// DSN so the engine can read per-shard progress via SHOW VITESS_MIGRATIONS.
+// Without a host or username the DSN is empty and progress degrades to the
+// deploy-request state only.
 type VitessConnectionAssembler struct {
 	// OrganizationAttribute is the endpoint attribute holding the PlanetScale
 	// organization. Defaults to "organization" when empty.
@@ -112,6 +118,12 @@ type VitessConnectionAssembler struct {
 	// the credential secret (api_url) takes precedence; this is the deployment
 	// default, itself falling back to DefaultPlanetScaleAPIURL when empty.
 	APIURL string
+	// DefaultPort is appended to the vtgate host when it carries no port. Empty
+	// means the resolved endpoint must already include one.
+	DefaultPort string
+	// Params are extra MySQL DSN parameters for the vtgate connection (for
+	// example TLS settings).
+	Params map[string]string
 	// Metadata is attached to every assembled target for engine-specific
 	// configuration the data plane reads, merged after the resolved fields.
 	Metadata map[string]string
@@ -122,10 +134,12 @@ var _ ConnectionAssembler = VitessConnectionAssembler{}
 // DatabaseType returns the Vitess engine type.
 func (VitessConnectionAssembler) DatabaseType() string { return "vitess" }
 
-// Assemble builds a metadata-only Vitess Target. The host is unused — Vitess
-// reaches the database through the PlanetScale API keyed by organization, not a
-// host endpoint. The returned DSN is always empty.
-func (a VitessConnectionAssembler) Assemble(_ string, attrs map[string]string, creds *Credentials) (string, map[string]string, error) {
+// Assemble builds a Vitess Target. The PlanetScale API fields (organization,
+// service token, API URL) always populate Metadata. When a vtgate host and a
+// MySQL username are available, a namespace-free vtgate DSN is also returned for
+// SHOW VITESS_MIGRATIONS progress; otherwise the DSN is empty (progress falls
+// back to the deploy-request state).
+func (a VitessConnectionAssembler) Assemble(host string, attrs map[string]string, creds *Credentials) (string, map[string]string, error) {
 	if creds == nil {
 		return "", nil, fmt.Errorf("vitess connection requires credentials")
 	}
@@ -162,22 +176,58 @@ func (a VitessConnectionAssembler) Assemble(_ string, attrs map[string]string, c
 	metadata[MetadataTokenName] = tokenName
 	metadata[MetadataTokenValue] = tokenValue
 	metadata[MetadataAPIURL] = apiURL
-	return "", metadata, nil
+	return a.vtgateDSN(host, creds), metadata, nil
 }
 
-// DecodePlanetScaleSecret decodes a PlanetScale credential secret into engine
-// metadata for a Vitess target. The secret is JSON carrying a service token in
-// "name=value" form and an optional API URL override:
+// vtgateDSN builds the namespace-free MySQL DSN the engine uses to read per-shard
+// progress via SHOW VITESS_MIGRATIONS at the vtgate. It returns "" — not an error
+// — when the endpoint exposes no vtgate host or the credentials carry no MySQL
+// username: that target is simply API-only and reports deploy-request-level
+// progress. The schema is injected per operation, so the DSN carries no database.
+func (a VitessConnectionAssembler) vtgateDSN(host string, creds *Credentials) string {
+	if host == "" || creds.Username == "" {
+		return ""
+	}
+	// Append the default port only when the host has none (net.SplitHostPort
+	// errors when no port is present, including for bare IPv6).
+	if a.DefaultPort != "" {
+		if _, _, err := net.SplitHostPort(host); err != nil {
+			host = net.JoinHostPort(host, a.DefaultPort)
+		}
+	}
+	cfg := mysql.NewConfig()
+	cfg.User = creds.Username
+	cfg.Passwd = creds.Password
+	cfg.Net = "tcp"
+	cfg.Addr = host
+	if len(a.Params) > 0 {
+		cfg.Params = maps.Clone(a.Params)
+	}
+	return cfg.FormatDSN()
+}
+
+// DecodePlanetScaleSecret decodes a PlanetScale credential secret into a Vitess
+// Target's credentials. The secret is JSON carrying a service token in
+// "name=value" form (for the PlanetScale API), an optional API URL override, and
+// optional read-only vtgate MySQL credentials used for SHOW VITESS_MIGRATIONS
+// progress:
 //
-//	{"token": "<id>=<value>", "api_url": "https://..."}
+//	{"token": "<id>=<value>", "api_url": "https://...",
+//	 "vtgate_username": "...", "vtgate_password": "..."}
 //
-// The organization is not part of the secret — it comes from the inventory
-// entity. As a SecretDecoder it plugs into any credential backend that fetches
-// the raw secret (a reference, or an assumed-role Secrets Manager read).
+// The token populates engine Metadata; the vtgate username/password populate the
+// MySQL Username/Password the assembler builds the vtgate DSN from. When the
+// vtgate fields are absent the target is API-only and progress falls back to the
+// deploy-request state. The organization is not part of the secret — it comes
+// from the inventory entity. As a SecretDecoder it plugs into any credential
+// backend that fetches the raw secret (a reference, or an assumed-role Secrets
+// Manager read).
 func DecodePlanetScaleSecret(raw string) (*Credentials, error) {
 	var secret struct {
-		Token  string `json:"token"`
-		APIURL string `json:"api_url"`
+		Token          string `json:"token"`
+		APIURL         string `json:"api_url"`
+		VtgateUsername string `json:"vtgate_username"`
+		VtgatePassword string `json:"vtgate_password"`
 	}
 	if err := json.Unmarshal([]byte(raw), &secret); err != nil {
 		return nil, fmt.Errorf("parse planetscale secret as JSON: %w", err)
@@ -193,5 +243,9 @@ func DecodePlanetScaleSecret(raw string) (*Credentials, error) {
 	if secret.APIURL != "" {
 		metadata[MetadataAPIURL] = secret.APIURL
 	}
-	return &Credentials{Metadata: metadata}, nil
+	return &Credentials{
+		Username: secret.VtgateUsername,
+		Password: secret.VtgatePassword,
+		Metadata: metadata,
+	}, nil
 }
