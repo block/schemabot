@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -111,18 +112,19 @@ func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task, shar
 			IsInstant:       t.IsInstant,
 			ReadyToComplete: t.ReadyToComplete,
 			ErrorMessage:    t.ErrorMessage,
-			Shards:          shardProgressForTable(shardsByTable, t.Namespace, t.TableName),
+			Shards:          shardProgressForTable(shardsByTable, t.ApplyOperationID, t.Namespace, t.TableName),
 		})
 	}
 	return out
 }
 
 // shardProgressForTable returns the per-shard summary rows for a table, sorted by
-// shard name for stable rendering. The map is keyed on the raw task namespace
-// (the same value the shard rows carry), so it is looked up before the database
-// fallback is applied.
-func shardProgressForTable(shardsByTable map[string][]*storage.Task, namespace, table string) []templates.ShardProgressData {
-	rows := shardsByTable[shardCommentTableKey(namespace, table)]
+// shard name for stable rendering. The map is keyed by the table's owning
+// apply operation plus its raw namespace (the same values the shard rows carry),
+// so a multi-deployment apply that shares a namespace/table name across
+// deployments keeps each deployment's shards in its own section.
+func shardProgressForTable(shardsByTable map[string][]*storage.Task, applyOperationID *int64, namespace, table string) []templates.ShardProgressData {
+	rows := shardsByTable[shardCommentTableKey(applyOperationID, namespace, table)]
 	if len(rows) == 0 {
 		return nil
 	}
@@ -138,11 +140,17 @@ func shardProgressForTable(shardsByTable map[string][]*storage.Task, namespace, 
 	return out
 }
 
-// shardCommentTableKey keys the per-table shard map for the PR comment. It uses
-// the raw namespace (before any database fallback) so table rows and shard rows —
-// which both carry the same raw namespace — line up.
-func shardCommentTableKey(namespace, table string) string {
-	return namespace + "\x00" + table
+// shardCommentTableKey keys the per-table shard map for the PR comment. It scopes
+// the key by the owning apply operation so a multi-deployment apply does not merge
+// shards across deployments, then by the raw namespace (before any database
+// fallback) so table rows and shard rows — which both carry the same raw
+// namespace — line up. A nil operation (legacy single-deployment task) keys to 0.
+func shardCommentTableKey(applyOperationID *int64, namespace, table string) string {
+	var opID int64
+	if applyOperationID != nil {
+		opID = *applyOperationID
+	}
+	return strconv.FormatInt(opID, 10) + "\x00" + namespace + "\x00" + table
 }
 
 // formatProgressComment renders the progress comment using the template system.

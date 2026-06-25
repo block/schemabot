@@ -381,13 +381,18 @@ func (o *CommentObserver) shardsByTable(ctx context.Context, apply *storage.Appl
 	}
 	byTable := map[string][]*storage.Task{}
 	for _, op := range ops {
-		shardTasks, err := o.stor.Tasks().GetShardProgressByApplyOperationID(ctx, op.ID)
+		if err := ctx.Err(); err != nil {
+			o.logError(apply, "comment per-shard summary will omit remaining operations' shards: context done", "error", err)
+			break
+		}
+		opID := op.ID
+		shardTasks, err := o.stor.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 		if err != nil {
-			o.logError(apply, "comment per-shard summary will omit an operation's shards: failed to load shard rows", "apply_operation_id", op.ID, "error", err)
+			o.logError(apply, "comment per-shard summary will omit an operation's shards: failed to load shard rows", "apply_operation_id", opID, "error", err)
 			continue
 		}
 		for _, st := range shardTasks {
-			key := shardCommentTableKey(st.Namespace, st.TableName)
+			key := shardCommentTableKey(&opID, st.Namespace, st.TableName)
 			byTable[key] = append(byTable[key], st)
 		}
 	}

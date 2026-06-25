@@ -111,6 +111,38 @@ func TestBuildMultiApplyData_RoutesTasksByOperation(t *testing.T) {
 	assert.Equal(t, "orders", data.Details["us"].Tables[0].TableName)
 }
 
+// Per-shard rows are scoped to their owning deployment: when two deployments
+// share a namespace and table name, each section shows only its own shards
+// rather than a merged list across deployments.
+func TestBuildMultiApplyData_ScopesShardsByOperation(t *testing.T) {
+	euID, usID := int64(1), int64(2)
+	ops := []*storage.ApplyOperation{
+		{ID: euID, Deployment: "eu", State: state.ApplyOperation.Running},
+		{ID: usID, Deployment: "us", State: state.ApplyOperation.Running},
+	}
+	tasks := []*storage.Task{
+		{ApplyOperationID: &euID, Namespace: "commerce", TableName: "users", State: state.Task.Running},
+		{ApplyOperationID: &usID, Namespace: "commerce", TableName: "users", State: state.Task.Running},
+	}
+	shardsByTable := map[string][]*storage.Task{
+		shardCommentTableKey(&euID, "commerce", "users"): {
+			{Shard: "-80", State: state.Task.Completed, ProgressPercent: 100},
+		},
+		shardCommentTableKey(&usID, "commerce", "users"): {
+			{Shard: "80-", State: state.Task.Running, ProgressPercent: 40},
+		},
+	}
+
+	data := buildMultiApplyData(runningApply(), ops, tasks, nil, shardsByTable)
+
+	require.Len(t, data.Details["eu"].Tables, 1)
+	require.Len(t, data.Details["eu"].Tables[0].Shards, 1)
+	assert.Equal(t, "-80", data.Details["eu"].Tables[0].Shards[0].Shard)
+	require.Len(t, data.Details["us"].Tables, 1)
+	require.Len(t, data.Details["us"].Tables[0].Shards, 1)
+	assert.Equal(t, "80-", data.Details["us"].Tables[0].Shards[0].Shard)
+}
+
 // The per-deployment section reflects the operation's own state and error, not
 // the parent apply's aggregate state.
 func TestBuildDeploymentDetail_UsesOperationStateAndError(t *testing.T) {
