@@ -166,7 +166,7 @@ func writeJSON(v any) error {
 }
 
 var (
-	loadingSpinnerDelay              = 400 * time.Millisecond
+	loadingSpinnerDelay              = 500 * time.Millisecond
 	loadingSpinnerInterval           = 100 * time.Millisecond
 	loadingSpinnerFrames             = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	loadingSpinnerWriter   io.Writer = os.Stderr
