@@ -2044,6 +2044,75 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 </details>
 
 <details>
+<summary><a name="vitess-vschemaonly"></a><strong>Vitess: Vschema-only</strong></summary>
+
+
+## Schema Change In Progress
+
+**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+### VSchema
+
+Applying...
+
+```diff
++ "xxhash": {"type": "xxhash"}
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="vitess-ddl--vschema"></a><strong>Vitess: DDL + VSchema</strong></summary>
+
+
+## Schema Change In Progress
+
+**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+### Table Progress
+
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+```
+
+
+### VSchema
+
+Applying...
+
+```diff
++ "xxhash": {"type": "xxhash"}
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="first-table-failed"></a><strong>First Table Failed</strong></summary>
 
 
@@ -3628,9 +3697,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Duration:        10s                                                          │
 └────────────────────────────────────────────────────────────────────────────────┘
 
-
-  ── myapp_sharded ──
-
     ~ VSchema: Applying...
        + "xxhash": {"type": "xxhash"}
 
@@ -3694,16 +3760,11 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 
   ── myapp_sharded ──
 
-    ~ VSchema: Applying...
-       + "xxhash": {"type": "xxhash"}
-
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
-
-  ── myapp ──
-
-    ~ VSchema: Applied
+    ~ VSchema: Applying...
+       + "xxhash": {"type": "xxhash"}
 
 
 ```

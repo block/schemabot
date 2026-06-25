@@ -27,6 +27,22 @@ func FormatNumber(n int64) string {
 	return string(result)
 }
 
+// VSchemaStatusLabel maps an engine's vschema_status display value to a human
+// label, shared by the CLI progress view and the PR comment so both surfaces
+// describe VSchema application identically.
+func VSchemaStatusLabel(status string) string {
+	switch status {
+	case "applying":
+		return "Applying..."
+	case "applied":
+		return "Applied"
+	case "":
+		return "Pending"
+	default:
+		return status
+	}
+}
+
 // FormatETA formats a duration in seconds as a human-readable string.
 // Examples: 45 → "45s", 195 → "3m 15s", 3700 → "1h 1m"
 func FormatETA(seconds int64) string {

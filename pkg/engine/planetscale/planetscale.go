@@ -322,16 +322,15 @@
 // rows copied (~94%), task 2 (8bbc0560, items) completed instantly with no
 // row copy.
 //
-// # VSchema Tasks
+// # VSchema Application
 //
-// VSchema updates are tracked as VSchema tasks in the regular tasks table, not a
-// separate table. They are marked by a synthetic table_name (e.g.
-// "VSchema: <keyspace>") rather than a real table and never appear in
-// SHOW VITESS_MIGRATIONS. Their state follows the deploy request: they transition
-// to running when the deploy reaches in_progress_vschema and complete when it
-// passes, and the overall apply state aggregates them alongside the DDL tasks.
-// This lets a VSchema-only deploy (zero DDLs) still have a task to aggregate and
-// surfaces the in_progress_vschema phase in the progress view.
+// VSchema application is not modeled as a task. Its status and diff ride in the
+// apply's engine resume metadata and are projected onto the progress response's
+// display metadata (vschema_status / vschema_diff), which the CLI and PR comment
+// render as their own VSchema section. The status follows the deploy request:
+// it becomes "applying" when the deploy reaches in_progress_vschema and
+// "applied" when it passes. A VSchema-only deploy (zero DDLs) carries no task
+// rows and is driven to completion by a task-less group finalizer.
 //
 // # Storage
 //

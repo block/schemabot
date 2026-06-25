@@ -175,6 +175,53 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 	assert.Contains(t, result, "Queued")
 }
 
+// A Vitess apply surfaces its VSchema application status (and diff) from engine
+// display metadata as a dedicated section, so the PR comment shows VSchema
+// progress the same way the CLI does — including a VSchema-only apply that has
+// no per-table tasks at all.
+func TestRenderApplyStatusComment_VSchema(t *testing.T) {
+	t.Run("populated from progress metadata", func(t *testing.T) {
+		data := ApplyStatusFromProgress(&apitypes.ProgressResponse{
+			Database:    "testapp",
+			Environment: "staging",
+			State:       "running",
+			Engine:      "PlanetScale",
+			Metadata: map[string]string{
+				"vschema_status": "applying",
+				"vschema_diff":   `+ "xxhash": {"type": "xxhash"}`,
+			},
+		}, "aparajon")
+
+		assert.Equal(t, "applying", data.VSchemaStatus)
+		assert.Equal(t, `+ "xxhash": {"type": "xxhash"}`, data.VSchemaDiff)
+	})
+
+	t.Run("renders a VSchema section with status and diff", func(t *testing.T) {
+		data := ApplyStatusCommentData{
+			Database: "testapp", Environment: "staging", RequestedBy: "aparajon",
+			State: "running", Engine: "PlanetScale",
+			VSchemaStatus: "applying",
+			VSchemaDiff:   `+ "xxhash": {"type": "xxhash"}`,
+		}
+
+		result := RenderApplyStatusComment(data)
+
+		assert.Contains(t, result, "### VSchema")
+		assert.Contains(t, result, "Applying...")
+		assert.Contains(t, result, "```diff")
+		assert.Contains(t, result, `+ "xxhash": {"type": "xxhash"}`)
+	})
+
+	t.Run("no VSchema change renders no section", func(t *testing.T) {
+		data := ApplyStatusCommentData{
+			Database: "testapp", Environment: "staging", State: "running", Engine: "Spirit",
+			Tables: []TableProgressData{{TableName: "users", Status: "running"}},
+		}
+
+		assert.NotContains(t, RenderApplyStatusComment(data), "### VSchema")
+	})
+}
+
 // A PlanetScale apply in a deploy-request phase renders its first-class phase
 // header (not a generic "In Progress") and still offers the operator a stop
 // action — the change is active, stoppable work before cutover.

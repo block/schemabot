@@ -33,6 +33,13 @@ func TestTableStatePriority(t *testing.T) {
 	}
 }
 
+func TestVSchemaStatusLabel(t *testing.T) {
+	assert.Equal(t, "Applying...", VSchemaStatusLabel("applying"))
+	assert.Equal(t, "Applied", VSchemaStatusLabel("applied"))
+	assert.Equal(t, "Pending", VSchemaStatusLabel(""))
+	assert.Equal(t, "rolling_back", VSchemaStatusLabel("rolling_back"), "unknown status passes through")
+}
+
 func TestProgressBarActivity(t *testing.T) {
 	bar := ProgressBarActivity()
 

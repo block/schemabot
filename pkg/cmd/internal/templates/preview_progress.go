@@ -125,13 +125,8 @@ func previewVitessVSchemaOnlyOutput() {
 		Metadata: map[string]string{
 			"branch_name":        "schemabot-myapp-28471035",
 			"deploy_request_url": "https://app.planetscale.com/my-org/myapp/deploy-requests/43",
-		},
-		Tables: []TableProgress{
-			{
-				TableName: "VSchema: myapp_sharded", Namespace: "myapp_sharded",
-				DDL:    `+ "xxhash": {"type": "xxhash"}`,
-				Status: state.Apply.Running,
-			},
+			"vschema_status":     "applying",
+			"vschema_diff":       `+ "xxhash": {"type": "xxhash"}`,
 		},
 	}
 	WriteProgress(data)
@@ -148,6 +143,8 @@ func previewVitessDDLWithVSchemaOutput() {
 		Metadata: map[string]string{
 			"branch_name":        "schemabot-myapp-28471035",
 			"deploy_request_url": "https://app.planetscale.com/my-org/myapp/deploy-requests/45",
+			"vschema_status":     "applying",
+			"vschema_diff":       `+ "xxhash": {"type": "xxhash"}`,
 		},
 		Tables: []TableProgress{
 			{
@@ -158,15 +155,6 @@ func previewVitessDDLWithVSchemaOutput() {
 				RowsCopied:      50000,
 				RowsTotal:       50000,
 				PercentComplete: 100,
-			},
-			{
-				TableName: "VSchema: myapp_sharded", Namespace: "myapp_sharded",
-				DDL:    `+ "xxhash": {"type": "xxhash"}`,
-				Status: state.Apply.Running,
-			},
-			{
-				TableName: "VSchema: myapp", Namespace: "myapp",
-				Status: state.Apply.Completed,
 			},
 		},
 	}

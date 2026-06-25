@@ -213,6 +213,8 @@ func previewCommentApplyFlowAllOutput() {
 		{"SECOND TABLE ESTIMATE EXCEEDED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyEstimateExceeded()) }},
 		{"THIRD TABLE RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyThirdRunning()) }},
 		{"ALL COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCompleted()) }},
+		{"VITESS: VSCHEMA-ONLY", func() { fmt.Print(webhooktemplates.PreviewCommentApplyVitessVSchemaOnly()) }},
+		{"VITESS: DDL + VSCHEMA", func() { fmt.Print(webhooktemplates.PreviewCommentApplyVitessDDLWithVSchema()) }},
 		{"FIRST TABLE FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFirstFailed()) }},
 		{"MIDDLE TABLE FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFailed()) }},
 		{"STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStopped()) }},

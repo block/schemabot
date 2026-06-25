@@ -252,14 +252,6 @@ func FormatNamespacedTablesWithActivity(tables []TableProgress, activityBar, act
 		if ns == "" {
 			ns = "(default)"
 		}
-		// Strip namespace prefix from VSchema task names (e.g., "VSchema: myapp_sharded" -> "VSchema")
-		// since the keyspace header already provides context.
-		if strings.HasPrefix(t.TableName, "vschema:") || strings.HasPrefix(t.TableName, "VSchema:") {
-			parts := strings.SplitN(t.TableName, ": ", 2)
-			if len(parts) == 2 {
-				t.TableName = "VSchema"
-			}
-		}
 		if idx, ok := nsIndex[ns]; ok {
 			ordered[idx].tables = append(ordered[idx].tables, t)
 		} else {
@@ -330,27 +322,12 @@ func FormatVSchemaStatus(status, diff string) string {
 		return ""
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "    ~ VSchema: %s\n", vschemaMetadataStatusLabel(status))
+	fmt.Fprintf(&b, "    ~ VSchema: %s\n", ui.VSchemaStatusLabel(status))
 	if diff != "" {
 		b.WriteString(FormatVSchemaDiff(diff, indentContent))
 	}
 	b.WriteString("\n")
 	return b.String()
-}
-
-// vschemaMetadataStatusLabel maps the engine's vschema_status display value to a
-// human label.
-func vschemaMetadataStatusLabel(status string) string {
-	switch status {
-	case "applying":
-		return "Applying..."
-	case "applied":
-		return "Applied"
-	case "":
-		return "Pending"
-	default:
-		return status
-	}
 }
 
 // FormatVSchemaDiff returns a VSchema diff with colorized +/- lines as a string,

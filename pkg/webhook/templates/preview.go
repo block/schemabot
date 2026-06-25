@@ -794,6 +794,36 @@ func PreviewCommentApplyThirdRunning() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
 }
 
+// PreviewCommentApplyVitessVSchemaOnly renders a VSchema-only Vitess apply,
+// which has no per-table tasks — only the VSchema status section.
+func PreviewCommentApplyVitessVSchemaOnly() string {
+	data := sampleApplyData(state.Apply.Running, nil)
+	data.Engine = "PlanetScale"
+	data.VSchemaStatus = "applying"
+	data.VSchemaDiff = `+ "xxhash": {"type": "xxhash"}`
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyVitessDDLWithVSchema renders a Vitess apply where a DDL
+// table has completed while the VSchema change is still applying.
+func PreviewCommentApplyVitessDDLWithVSchema() string {
+	tables := []TableProgressData{
+		{
+			TableName:       "users",
+			DDL:             "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
+			Status:          state.Task.Completed,
+			RowsCopied:      50000,
+			RowsTotal:       50000,
+			PercentComplete: 100,
+		},
+	}
+	data := sampleApplyData(state.Apply.Running, tables)
+	data.Engine = "PlanetScale"
+	data.VSchemaStatus = "applying"
+	data.VSchemaDiff = `+ "xxhash": {"type": "xxhash"}`
+	return RenderApplyStatusComment(data)
+}
+
 // PreviewCommentApplyCompleted renders a sample apply-completed comment.
 func PreviewCommentApplyCompleted() string {
 	tables := sampleApplyTables()
