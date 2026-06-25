@@ -147,7 +147,7 @@ func TestBuildMultiApplyData_ScopesShardsByOperation(t *testing.T) {
 // the parent apply's aggregate state.
 func TestBuildDeploymentDetail_UsesOperationStateAndError(t *testing.T) {
 	op := &storage.ApplyOperation{ID: 1, Deployment: "us", State: state.ApplyOperation.Failed, ErrorMessage: "lock wait timeout"}
-	detail := buildDeploymentDetail(runningApply(), op, nil, nil, nil)
+	detail := buildDeploymentDetail(runningApply(), op, nil, operationDisplay{}, nil)
 	assert.Equal(t, state.Apply.Failed, detail.State)
 	assert.Equal(t, "lock wait timeout", detail.ErrorMessage)
 	assert.Equal(t, "payments", detail.Database)

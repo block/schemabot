@@ -114,9 +114,6 @@ func WriteProgress(data ProgressData) {
 		}
 	}
 	if data.Metadata != nil {
-		if branch := data.Metadata["branch_name"]; branch != "" {
-			rows = append(rows, BoxRow{"Branch", branch})
-		}
 		if url := data.Metadata["deploy_request_url"]; url != "" {
 			rows = append(rows, BoxRow{"Deploy Request", url})
 		}

@@ -176,7 +176,7 @@ func TestBuildApplyCommentData(t *testing.T) {
 		},
 	}
 
-	data := buildApplyCommentData(apply, tasks, nil, nil)
+	data := buildApplyCommentData(apply, tasks, operationDisplay{}, nil)
 
 	assert.Equal(t, "apply-abc123", data.ApplyID)
 	assert.Equal(t, "testdb", data.Database)
@@ -198,7 +198,7 @@ func TestBuildApplyCommentData_DefaultNamespace(t *testing.T) {
 		{TableName: "users", State: state.Task.Running},
 	}
 
-	data := buildApplyCommentData(apply, tasks, nil, nil)
+	data := buildApplyCommentData(apply, tasks, operationDisplay{}, nil)
 
 	assert.Equal(t, "testdb", data.Tables[0].Namespace, "empty namespace should default to database name")
 }

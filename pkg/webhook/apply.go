@@ -14,21 +14,22 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
-// buildApplyCommentData maps storage types to template data. vschemaChanges
-// carries the apply's per-keyspace VSchema application state, projected from
-// engine display metadata by resolveVSchemaByOperation (nil when there is none).
-// shardsByTable holds the per-shard detail rows grouped by table (nil for
-// unsharded engines); it is attached to each table's progress for the compact
-// per-shard summary.
-func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, vschemaChanges []apitypes.VSchemaChange, shardsByTable map[string][]*storage.Task) templates.ApplyStatusCommentData {
+// buildApplyCommentData maps storage types to template data. display carries the
+// apply's per-operation engine display projection (VSchema application state and
+// the PlanetScale deploy-request URL), resolved from engine resume metadata by
+// resolveDisplayByOperation (zero value when there is none). shardsByTable holds
+// the per-shard detail rows grouped by table (nil for unsharded engines); it is
+// attached to each table's progress for the compact per-shard summary.
+func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display operationDisplay, shardsByTable map[string][]*storage.Task) templates.ApplyStatusCommentData {
 	data := templates.ApplyStatusCommentData{
-		ApplyID:        apply.ApplyIdentifier,
-		Database:       apply.Database,
-		Environment:    apply.Environment,
-		State:          apply.State,
-		Engine:         apply.Engine,
-		ErrorMessage:   apply.ErrorMessage,
-		VSchemaChanges: vschemaChanges,
+		ApplyID:          apply.ApplyIdentifier,
+		Database:         apply.Database,
+		Environment:      apply.Environment,
+		State:            apply.State,
+		Engine:           apply.Engine,
+		ErrorMessage:     apply.ErrorMessage,
+		VSchemaChanges:   display.VSchema,
+		DeployRequestURL: display.DeployRequestURL,
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)
@@ -40,47 +41,57 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, vschemaC
 	return data
 }
 
-// resolveVSchemaByOperation projects each operation's VSchema display state from
-// the engine resume metadata persisted on the apply's operations — the same
-// storage-backed projection the progress API uses (overlayStoredDisplayMetadata).
-// The comment path builds from storage and never reads the engine progress
-// response, so VSchema must be projected here too. Best-effort: a non-PlanetScale
-// apply, an operation without resume state, or a decode error contributes
-// nothing rather than blocking the comment.
-func resolveVSchemaByOperation(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) map[int64][]apitypes.VSchemaChange {
+// operationDisplay is the per-operation engine display projection surfaced in the
+// PR comment: VSchema application state and the PlanetScale deploy-request URL.
+// Both come from the same engine resume metadata, so they are resolved together.
+type operationDisplay struct {
+	VSchema          []apitypes.VSchemaChange
+	DeployRequestURL string
+}
+
+// resolveDisplayByOperation projects each operation's engine display state
+// (VSchema status + deploy-request URL) from the engine resume metadata persisted
+// on the apply's operations — the same storage-backed projection the progress API
+// uses (overlayStoredDisplayMetadata). The comment path builds from storage and
+// never reads the engine progress response, so it is projected here too.
+// Best-effort: a non-PlanetScale apply, an operation without resume state, or a
+// decode error contributes nothing rather than blocking the comment.
+func resolveDisplayByOperation(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) map[int64]operationDisplay {
 	if apply == nil || apply.Engine != storage.EnginePlanetScale || len(ops) == 0 {
 		return nil
 	}
-	var byOp map[int64][]apitypes.VSchemaChange
+	var byOp map[int64]operationDisplay
 	for _, op := range ops {
 		rs, err := stor.ApplyOperations().GetEngineResumeState(ctx, op.ID)
 		if errors.Is(err, storage.ErrEngineResumeStateNotFound) {
 			continue
 		}
 		if err != nil {
-			slog.Warn("comment will omit VSchema status: failed to load engine resume state",
+			slog.Warn("comment will omit engine display metadata: failed to load engine resume state",
 				"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
 			continue
 		}
 		display, err := tern.PSDisplayMetadata(rs.Metadata)
 		if err != nil {
-			slog.Warn("comment will omit VSchema status: failed to decode engine resume state",
+			slog.Warn("comment will omit engine display metadata: failed to decode engine resume state",
 				"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
 			continue
 		}
 		changes, err := apitypes.ParseVSchemaChanges(display)
 		if err != nil {
+			// A malformed VSchema blob should not also drop the deploy-request URL,
+			// so log and continue with no VSchema rather than skipping the operation.
 			slog.Warn("comment will omit VSchema status: failed to parse VSchema changes",
 				"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
-			continue
 		}
-		if len(changes) == 0 {
+		od := operationDisplay{VSchema: changes, DeployRequestURL: display["deploy_request_url"]}
+		if len(od.VSchema) == 0 && od.DeployRequestURL == "" {
 			continue
 		}
 		if byOp == nil {
-			byOp = make(map[int64][]apitypes.VSchemaChange, len(ops))
+			byOp = make(map[int64]operationDisplay, len(ops))
 		}
-		byOp[op.ID] = changes
+		byOp[op.ID] = od
 	}
 	return byOp
 }
@@ -157,12 +168,12 @@ func shardCommentTableKey(applyOperationID *int64, namespace, table string) stri
 // It is the no-operations fallback (load error, or the initial rollback comment),
 // so it carries no VSchema — the observer refreshes VSchema once operations load.
 func formatProgressComment(apply *storage.Apply, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
-	return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks, nil, shardsByTable))
+	return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks, operationDisplay{}, shardsByTable))
 }
 
 // formatSummaryComment renders the final summary comment for a terminal apply
 // state. Like formatProgressComment it is the no-operations fallback and carries
 // no VSchema.
 func formatSummaryComment(apply *storage.Apply, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
-	return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks, nil, shardsByTable))
+	return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks, operationDisplay{}, shardsByTable))
 }

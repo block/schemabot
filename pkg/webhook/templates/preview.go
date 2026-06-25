@@ -837,6 +837,7 @@ func PreviewCommentApplyVitessDDLWithVSchema() string {
 	}
 	data := sampleApplyData(state.Apply.Running, tables)
 	data.Engine = "PlanetScale"
+	data.DeployRequestURL = "https://app.planetscale.com/acme/myapp/deploy-requests/42"
 	data.VSchemaChanges = []apitypes.VSchemaChange{
 		{Namespace: "myapp_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
 	}

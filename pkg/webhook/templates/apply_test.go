@@ -338,6 +338,25 @@ func TestRenderApplyStatusComment_ValidatingDeployRequest(t *testing.T) {
 	assert.Contains(t, result, "schemabot stop apply-7aa13cf03496454b -e staging")
 }
 
+// A PlanetScale apply links its deploy request so the operator can follow the
+// deploy's own progress (the comment does not otherwise surface it). The link is
+// omitted when no deploy request exists yet.
+func TestRenderApplyStatusComment_DeployRequestLink(t *testing.T) {
+	base := ApplyStatusCommentData{
+		Database: "boardgames", Environment: "staging", RequestedBy: "aparajon",
+		ApplyID: "apply-7aa13cf03496454b", State: state.Apply.Running, Engine: "PlanetScale",
+		Tables: []TableProgressData{{TableName: "customers", Status: state.Task.Running}},
+	}
+
+	withURL := base
+	withURL.DeployRequestURL = "https://app.planetscale.com/block-staging/boardgames/deploy-requests/103"
+	result := RenderApplyStatusComment(withURL)
+	assert.Contains(t, result, "🔗 **Deploy request**: https://app.planetscale.com/block-staging/boardgames/deploy-requests/103")
+
+	// No deploy request yet — no link line.
+	assert.NotContains(t, RenderApplyStatusComment(base), "Deploy request**:")
+}
+
 func TestRenderApplyStatusComment_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",

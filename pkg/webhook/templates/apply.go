@@ -64,6 +64,12 @@ type ApplyStatusCommentData struct {
 	// the engine's display metadata rather than as a per-table task. Empty when
 	// the apply carries no VSchema change.
 	VSchemaChanges []apitypes.VSchemaChange
+
+	// DeployRequestURL links the PlanetScale deploy request driving this apply
+	// (Vitess/PlanetScale only). It is the operator's entry point into the deploy
+	// request's own progress, which the comment does not otherwise surface. Empty
+	// for engines without a deploy request or before one is created.
+	DeployRequestURL string
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -82,6 +88,10 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	// Metadata line
 	writeApplyMetadata(&sb, data, renderedAt)
 	writeApplyStatusDetail(&sb, data.State)
+
+	// Deploy-request link (PlanetScale) — the operator's entry point into the
+	// deploy request's own progress, which the comment does not otherwise surface.
+	writeDeployRequestLink(&sb, data)
 
 	// Cutover readiness summary
 	if data.State == state.Apply.WaitingForCutover || data.State == state.Apply.CuttingOver {
@@ -202,6 +212,17 @@ func applyStatusDetail(applyState string) string {
 		}
 		return humanizeState(applyState)
 	}
+}
+
+// writeDeployRequestLink writes a link to the PlanetScale deploy request driving
+// the apply, when one is known. For a Vitess/PlanetScale apply the meaningful
+// in-flight work happens in the deploy request, so this gives the operator a way
+// to follow it directly rather than hunting for it in the PlanetScale UI.
+func writeDeployRequestLink(sb *strings.Builder, data ApplyStatusCommentData) {
+	if data.DeployRequestURL == "" {
+		return
+	}
+	fmt.Fprintf(sb, "\n🔗 **Deploy request**: %s\n", data.DeployRequestURL)
 }
 
 // writeCutoverSummary writes a readiness summary for cutover states,

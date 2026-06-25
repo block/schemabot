@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
-	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/clock"
 	"github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
@@ -409,16 +408,17 @@ func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*stor
 			"apply_id", o.applyID, "error", opsErr)
 		return formatProgressComment(apply, tasks, shardsByTable)
 	}
-	return formatApplyStatusComment(apply, ops, tasks, o.resolveVSchema(apply, ops), shardsByTable)
+	return formatApplyStatusComment(apply, ops, tasks, o.resolveDisplay(apply, ops), shardsByTable)
 }
 
-// resolveVSchema projects the apply's per-operation VSchema display state for
-// comment rendering. It uses a short, independent deadline so a slow storage
-// read degrades to a comment without VSchema rather than blocking the update.
-func (o *CommentObserver) resolveVSchema(apply *storage.Apply, ops []*storage.ApplyOperation) map[int64][]apitypes.VSchemaChange {
+// resolveDisplay projects the apply's per-operation engine display state (VSchema
+// status + deploy-request URL) for comment rendering. It uses a short, independent
+// deadline so a slow storage read degrades to a comment without these fields
+// rather than blocking the update.
+func (o *CommentObserver) resolveDisplay(apply *storage.Apply, ops []*storage.ApplyOperation) map[int64]operationDisplay {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	return resolveVSchemaByOperation(ctx, o.stor, apply, ops)
+	return resolveDisplayByOperation(ctx, o.stor, apply, ops)
 }
 
 // formatTerminalSummaryComment renders the apply's terminal summary comment,
@@ -447,7 +447,7 @@ func (o *CommentObserver) summaryCommentFromOps(apply *storage.Apply, ops []*sto
 			"apply_id", o.applyID, "error", opsErr)
 		return formatSummaryComment(apply, tasks, shardsByTable)
 	}
-	return formatApplySummaryComment(apply, ops, tasks, o.resolveVSchema(apply, ops), shardsByTable)
+	return formatApplySummaryComment(apply, ops, tasks, o.resolveDisplay(apply, ops), shardsByTable)
 }
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {
