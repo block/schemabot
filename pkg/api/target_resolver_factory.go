@@ -116,7 +116,7 @@ func buildEtreResolver(ctx context.Context, cfg EtreConfig, logger *slog.Logger)
 	if addr == "" {
 		return nil, fmt.Errorf("target_resolver.etre.addr resolved to an empty value")
 	}
-	client, err := etre.New(etre.Config{Addr: addr, EntityType: cfg.EntityType, Logger: logger})
+	client, err := etre.New(etre.Config{Addr: addr, EntityType: cfg.EntityType, Headers: cfg.Headers, Logger: logger})
 	if err != nil {
 		return nil, fmt.Errorf("build etre client: %w", err)
 	}

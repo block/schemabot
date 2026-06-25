@@ -37,6 +37,10 @@ type Config struct {
 	// HTTPClient is used for Etre requests. The deployment owns any required
 	// routing/TLS. When nil, http.DefaultClient is used.
 	HTTPClient *http.Client
+	// Headers, when set, are added to every Etre request. Deployments that reach
+	// Etre through a header-aware proxy or service mesh can supply the routing
+	// headers that proxy requires; no header is baked into the client.
+	Headers map[string]string
 	// Retry is the per-request retry count on network or API error.
 	Retry uint
 	// Logger receives debug logs for lookups. Defaults to slog.Default().
@@ -64,6 +68,9 @@ func New(cfg Config) (*Client, error) {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
+	if len(cfg.Headers) > 0 {
+		httpClient = clientWithHeaders(httpClient, cfg.Headers)
+	}
 	entities := etre.NewEntityClientWithConfig(etre.EntityClientConfig{
 		EntityType: cfg.EntityType,
 		Addr:       cfg.Addr,
@@ -71,6 +78,38 @@ func New(cfg Config) (*Client, error) {
 		Retry:      cfg.Retry,
 	})
 	return newClient(entities, cfg.EntityType, cfg.Logger), nil
+}
+
+// clientWithHeaders returns a shallow copy of base whose transport sets the
+// given headers on every request. The original client and its transport are
+// left unmodified, so a shared client (including http.DefaultClient) is safe to
+// pass in.
+func clientWithHeaders(base *http.Client, headers map[string]string) *http.Client {
+	transport := base.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	copied := *base
+	copied.Transport = &headerRoundTripper{base: transport, headers: headers}
+	return &copied
+}
+
+// headerRoundTripper sets a fixed set of headers on every request before
+// delegating to the wrapped RoundTripper. It is the generic seam a deployment
+// uses to route Etre requests through a header-aware proxy or mesh; the client
+// itself knows nothing about which headers mean what.
+type headerRoundTripper struct {
+	base    http.RoundTripper
+	headers map[string]string
+}
+
+func (h *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Clone so the caller's request (and its header map) is never mutated.
+	cloned := req.Clone(req.Context())
+	for k, v := range h.headers {
+		cloned.Header.Set(k, v)
+	}
+	return h.base.RoundTrip(cloned)
 }
 
 // newClient constructs a Client over a given entity client. It exists so tests

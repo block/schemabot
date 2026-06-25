@@ -433,6 +433,10 @@ type EtreConfig struct {
 	DatabaseType string `yaml:"database_type"`
 	// EntityType is the Etre entity type recording the target clusters.
 	EntityType string `yaml:"entity_type"`
+	// Headers are added to every Etre request, for deployments that reach Etre
+	// through a header-aware proxy or service mesh that routes by request header.
+	// Optional; no header is sent unless configured here.
+	Headers map[string]string `yaml:"headers,omitempty"`
 	// TargetLabel is the Etre label the request's opaque target matches.
 	TargetLabel string `yaml:"target_label"`
 	// EnvLabel, when set, scopes the lookup to the request environment.
