@@ -584,7 +584,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	if err != nil {
 		return nil, fmt.Errorf("begin claim apply_operation transaction: %w", err)
 	}
-	defer rollbackApplyTx(ctx, tx, "claim apply_operation")
+	defer rollbackTx(ctx, tx, "claim apply_operation")
 
 	activeStates := claimableApplyStates()
 	activeStatePlaceholders := placeholders(len(activeStates))
@@ -1011,7 +1011,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	if err != nil {
 		return nil, fmt.Errorf("begin claim apply_operation cutover transaction: %w", err)
 	}
-	defer rollbackApplyTx(ctx, tx, "claim apply_operation cutover")
+	defer rollbackTx(ctx, tx, "claim apply_operation cutover")
 
 	// Eligibility gate (the three leading conditions in the SQL below). The
 	// cutover worker may only claim operations it is actually responsible for

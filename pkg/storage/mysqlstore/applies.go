@@ -142,12 +142,6 @@ func nonTerminalApplyStatePredicate(column string) (string, []any) {
 	return fmt.Sprintf("%s NOT IN (%s)", column, placeholders(len(terminalStates))), stringArgs(terminalStates)
 }
 
-func rollbackApplyTx(ctx context.Context, tx *sql.Tx, operation string) {
-	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-		slog.WarnContext(ctx, "failed to roll back apply transaction", "operation", operation, "error", err)
-	}
-}
-
 func beginApplyWriteTx(ctx context.Context, beginner txBeginner, operation string) (*applyWriteTx, error) {
 	tx, err := beginner.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if err != nil {
@@ -178,7 +172,7 @@ func (w *applyWriteTx) close(ctx context.Context, operation string) {
 		return
 	}
 	if w.tx != nil {
-		rollbackApplyTx(ctx, w.tx, operation)
+		rollbackTx(ctx, w.tx, operation)
 	}
 	if w.targetLockConn != nil {
 		releaseApplyTargetLockConn(ctx, w.targetLockConn, w.targetLockName, operation)
@@ -1088,7 +1082,7 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 	if err != nil {
 		return nil, fmt.Errorf("begin claim apply transaction: %w", err)
 	}
-	defer rollbackApplyTx(ctx, tx, "claim apply")
+	defer rollbackTx(ctx, tx, "claim apply")
 
 	activeStates := claimableApplyStates()
 	activeStatePlaceholders := placeholders(len(activeStates))
@@ -1193,7 +1187,7 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 	if err != nil {
 		return nil, fmt.Errorf("begin claim apply %d transaction: %w", applyID, err)
 	}
-	defer rollbackApplyTx(ctx, tx, "claim apply by id")
+	defer rollbackTx(ctx, tx, "claim apply by id")
 
 	activeStates := claimableApplyStates()
 	activeStatePlaceholders := placeholders(len(activeStates))
@@ -1293,7 +1287,7 @@ func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, own
 	if err != nil {
 		return nil, fmt.Errorf("begin claim apply for stop reconciliation transaction: %w", err)
 	}
-	defer rollbackApplyTx(ctx, tx, "claim apply for stop reconciliation")
+	defer rollbackTx(ctx, tx, "claim apply for stop reconciliation")
 
 	// Parent eligibility: pending plus the active recovery-claimable states
 	// (claimableApplyStates); the resumable failed_retryable and stopped states
@@ -1657,7 +1651,7 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 	if err != nil {
 		return nil, fmt.Errorf("begin expire retryable applies transaction: %w", err)
 	}
-	defer rollbackApplyTx(ctx, tx, "expire retryable applies")
+	defer rollbackTx(ctx, tx, "expire retryable applies")
 
 	rows, err := tx.QueryContext(ctx, `
 		SELECT `+applyColumns+`

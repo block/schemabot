@@ -56,7 +56,7 @@ func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.A
 	if err != nil {
 		return nil, false, fmt.Errorf("begin control request transaction for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
 	}
-	defer rollbackControlRequestTx(ctx, tx, "request pending")
+	defer rollbackTx(ctx, tx, "request pending")
 
 	existing, err := s.getByApplyOperationForUpdate(ctx, tx, req.ApplyID, req.Operation)
 	if err != nil {
@@ -226,12 +226,6 @@ func (s *controlRequestStore) getByApplyOperationForUpdate(
 		return nil, fmt.Errorf("get control request for apply %d operation %s: %w", applyID, operation, err)
 	}
 	return req, nil
-}
-
-func rollbackControlRequestTx(ctx context.Context, tx *sql.Tx, operation string) {
-	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-		slog.WarnContext(ctx, "failed to roll back control request transaction", "operation", operation, "error", err)
-	}
 }
 
 func scanControlRequest(s scanner) (*storage.ApplyControlRequest, error) {
