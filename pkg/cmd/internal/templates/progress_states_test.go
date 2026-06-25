@@ -193,19 +193,24 @@ func TestFormatTableProgress_ChangeTypeSymbol(t *testing.T) {
 	}
 }
 
-// A checksumming table renders its own verify label rather than a row-copy
-// percent — its copy is done and the engine is now verifying the data.
+// A checksumming table renders its verify progress rather than a row-copy
+// percent — its copy is done and the engine is now verifying the data, which
+// can run for hours on a large table.
 func TestFormatTableProgress_Checksumming(t *testing.T) {
-	tp := TableProgress{
-		TableName:  "orders",
-		ChangeType: "alter",
-		Status:     state.Task.Checksumming,
-	}
+	// Before Spirit reports a total, the verify shows an indeterminate label.
+	measuring := FormatTableProgress(TableProgress{
+		TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
+	})
+	assert.Contains(t, measuring, "orders: ")
+	assert.Contains(t, measuring, "🔍 Checksumming to verify data...")
 
-	output := FormatTableProgress(tp)
-
-	assert.Contains(t, output, "orders: ")
-	assert.Contains(t, output, "🔍 Checksumming to verify data...")
+	// Once a total is known, it shows how far the verify has progressed.
+	withProgress := FormatTableProgress(TableProgress{
+		TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
+		ChecksumRowsChecked: 321450, ChecksumRowsTotal: 1466232,
+	})
+	assert.Contains(t, withProgress, "🔍 Checksumming to verify data (21%)")
+	assert.Contains(t, withProgress, "Rows verified: 321,450 / 1,466,232")
 }
 
 func TestFormatTableProgress_InstantDDL(t *testing.T) {

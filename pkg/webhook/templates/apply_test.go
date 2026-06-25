@@ -164,7 +164,7 @@ func TestRenderApplyStatusComment_Checksumming(t *testing.T) {
 		State:       "running",
 		Engine:      "Spirit",
 		Tables: []TableProgressData{
-			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "checksumming"},
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "checksumming", ChecksumRowsChecked: 321450, ChecksumRowsTotal: 1466232},
 			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: "pending"},
 		},
 	}
@@ -173,7 +173,8 @@ func TestRenderApplyStatusComment_Checksumming(t *testing.T) {
 
 	assert.Contains(t, result, "## Schema Change In Progress", "apply stays in progress; checksumming is table-level")
 	assert.Contains(t, result, "**`orders`**")
-	assert.Contains(t, result, "🔍 Checksumming to verify data")
+	assert.Contains(t, result, "🔍 Checksumming to verify data (21%)")
+	assert.Contains(t, result, "Rows verified: 321,450 / 1,466,232")
 	assert.Contains(t, result, "1 checksumming")
 }
 

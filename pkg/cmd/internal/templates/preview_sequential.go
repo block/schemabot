@@ -115,7 +115,7 @@ func previewSeqChecksummingOutput() {
 		StartedAt: previewTime.Add(-25 * time.Minute).Format(time.RFC3339),
 		Tables: []TableProgress{
 			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
-			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Task.Checksumming},
+			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Task.Checksumming, ChecksumRowsChecked: 3000000, ChecksumRowsTotal: 5000000},
 			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
 		},
 	}

@@ -395,20 +395,24 @@ type TableProgressResponse struct {
 	DDL       string `json:"ddl"`
 	// Deployment attributes this table/task to a deployment in a multi-deployment apply.
 	// Empty for single-deployment applies.
-	Deployment      string                   `json:"deployment,omitempty"`
-	Keyspace        string                   `json:"keyspace,omitempty"`
-	ChangeType      string                   `json:"change_type,omitempty"` // create, alter, drop
-	Status          string                   `json:"status"`
-	RowsCopied      int64                    `json:"rows_copied"`
-	RowsTotal       int64                    `json:"rows_total"`
-	PercentComplete int32                    `json:"percent_complete"`
-	ETASeconds      int64                    `json:"eta_seconds,omitempty"`
-	IsInstant       bool                     `json:"is_instant,omitempty"`
-	ProgressDetail  string                   `json:"progress_detail,omitempty"`
-	TaskID          string                   `json:"task_id,omitempty"`
-	StartedAt       string                   `json:"started_at,omitempty"`
-	CompletedAt     string                   `json:"completed_at,omitempty"`
-	Shards          []*ShardProgressResponse `json:"shards,omitempty"`
+	Deployment      string `json:"deployment,omitempty"`
+	Keyspace        string `json:"keyspace,omitempty"`
+	ChangeType      string `json:"change_type,omitempty"` // create, alter, drop
+	Status          string `json:"status"`
+	RowsCopied      int64  `json:"rows_copied"`
+	RowsTotal       int64  `json:"rows_total"`
+	PercentComplete int32  `json:"percent_complete"`
+	ETASeconds      int64  `json:"eta_seconds,omitempty"`
+	// Checksum phase progress: rows verified so far and total to verify.
+	// Non-zero only while the table is checksumming (verifying copied data).
+	ChecksumRowsChecked int64                    `json:"checksum_rows_checked,omitempty"`
+	ChecksumRowsTotal   int64                    `json:"checksum_rows_total,omitempty"`
+	IsInstant           bool                     `json:"is_instant,omitempty"`
+	ProgressDetail      string                   `json:"progress_detail,omitempty"`
+	TaskID              string                   `json:"task_id,omitempty"`
+	StartedAt           string                   `json:"started_at,omitempty"`
+	CompletedAt         string                   `json:"completed_at,omitempty"`
+	Shards              []*ShardProgressResponse `json:"shards,omitempty"`
 }
 
 // ShardProgressResponse contains per-shard progress for Vitess schema changes.

@@ -479,6 +479,10 @@ message TableProgress {
   repeated ShardProgress shards = 11;
   string progress_detail = 12;
   ChangeType change_type = 13;
+  // Checksum phase progress: rows verified so far and the total to verify.
+  // Populated while the table is checksumming (verifying copied data), 0 otherwise.
+  int64 checksum_rows_checked = 14;
+  int64 checksum_rows_total = 15;
 }
 
 // ProgressResponse contains detailed progress information.

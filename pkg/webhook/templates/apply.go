@@ -24,8 +24,12 @@ type TableProgressData struct {
 	RowsTotal       int64
 	PercentComplete int
 	ETASeconds      int64
-	IsInstant       bool
-	ReadyToComplete bool
+	// Checksum phase progress: rows verified so far and total to verify.
+	// Non-zero only while the table is checksumming (verifying copied data).
+	ChecksumRowsChecked int64
+	ChecksumRowsTotal   int64
+	IsInstant           bool
+	ReadyToComplete     bool
 
 	// ErrorMessage is the task's last error. Rendered for states where the
 	// per-table error explains what the user is seeing (e.g. a retrying task).
@@ -431,10 +435,18 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData) {
 
 	case state.Task.Checksumming:
 		// Row copy is complete; the engine is verifying the copied data against
-		// the source before cutover. On a large table this can run for hours.
-		bar := ui.ProgressBarRowCopy(100)
-		fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data...\n", table.TableName, bar)
-		writeDDLLine(sb, table.DDL)
+		// the source before cutover. On a large table this can run for hours, so
+		// show how far the verify has progressed once Spirit reports a total.
+		if table.ChecksumRowsTotal > 0 {
+			pct := ui.ClampPercent(int(table.ChecksumRowsChecked * 100 / table.ChecksumRowsTotal))
+			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data (%d%%)\n", table.TableName, ui.ProgressBarRowCopy(pct), pct)
+			writeDDLLine(sb, table.DDL)
+			fmt.Fprintf(sb, "Rows verified: %s / %s\n",
+				ui.FormatNumber(ui.ClampRows(table.ChecksumRowsChecked, table.ChecksumRowsTotal)), ui.FormatNumber(table.ChecksumRowsTotal))
+		} else {
+			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data...\n", table.TableName, ui.ProgressBarRowCopy(100))
+			writeDDLLine(sb, table.DDL)
+		}
 
 	case state.Task.WaitingForCutover:
 		bar := ui.ProgressBarWaitingCutover()

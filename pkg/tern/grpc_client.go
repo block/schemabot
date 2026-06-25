@@ -2434,6 +2434,8 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 			storedTask.RowsCopied = remoteTask.RowsCopied
 			storedTask.RowsTotal = remoteTask.RowsTotal
 			storedTask.ProgressPercent = int(remoteTask.PercentComplete)
+			storedTask.ChecksumRowsChecked = remoteTask.ChecksumRowsChecked
+			storedTask.ChecksumRowsTotal = remoteTask.ChecksumRowsTotal
 		}
 		if state.IsState(storedTask.State, state.Task.Completed) && storedTask.ProgressPercent != 100 {
 			storedTask.ProgressPercent = 100

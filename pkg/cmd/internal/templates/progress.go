@@ -459,10 +459,22 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
 	case state.Task.Checksumming:
-		bar := ui.ProgressBarRowCopy(100) // blue — row copy done, verifying data
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data...\n", t.TableName, bar)
-		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+		// Row copy is done; the engine is verifying the copied data against the
+		// source. On a large table this can run for hours, so show how far the
+		// verify has progressed once Spirit has reported a total.
+		if t.ChecksumRowsTotal > 0 {
+			pct := ui.ClampPercent(int(t.ChecksumRowsChecked * 100 / t.ChecksumRowsTotal))
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data (%d%%)\n", t.TableName, ui.ProgressBarRowCopy(pct), pct)
+			if t.DDL != "" {
+				b.WriteString(formatProgressDDL(t.DDL))
+			}
+			fmt.Fprintf(&b, indentDetail+"Rows verified: %s / %s\n",
+				ui.FormatNumber(ui.ClampRows(t.ChecksumRowsChecked, t.ChecksumRowsTotal)), ui.FormatNumber(t.ChecksumRowsTotal))
+		} else {
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data...\n", t.TableName, ui.ProgressBarRowCopy(100))
+			if t.DDL != "" {
+				b.WriteString(formatProgressDDL(t.DDL))
+			}
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))

@@ -340,19 +340,23 @@ type ProgressResult struct {
 
 // TableProgress tracks progress for a single table.
 type TableProgress struct {
-	Namespace      string          // Schema/keyspace name when the engine can distinguish it
-	Table          string          // Table name
-	State          string          // "pending", "copying", "ready", "complete", "failed"
-	Progress       int             // 0-100 percent
-	RowsCopied     int64           // Actual rows copied
-	RowsTotal      int64           // Total rows to copy
-	ETASeconds     int64           // Estimated seconds remaining
-	Shards         []ShardProgress // Per-shard breakdown (for Vitess)
-	IsInstant      bool            // True if using instant DDL
-	ProgressDetail string          // Human-readable progress (e.g., Spirit: "12.5% copyRows ETA 1h 30m")
-	DDL            string          // The DDL statement being applied
-	StartedAt      *time.Time      // When execution actually began (from engine, e.g., SHOW VITESS_MIGRATIONS started_timestamp)
-	CompletedAt    *time.Time      // When execution completed (from engine)
+	Namespace  string // Schema/keyspace name when the engine can distinguish it
+	Table      string // Table name
+	State      string // "pending", "copying", "ready", "complete", "failed"
+	Progress   int    // 0-100 percent
+	RowsCopied int64  // Actual rows copied
+	RowsTotal  int64  // Total rows to copy
+	ETASeconds int64  // Estimated seconds remaining
+	// Checksum phase progress: rows verified so far and the total to verify.
+	// Populated while the table is checksumming (verifying copied data), 0 otherwise.
+	ChecksumRowsChecked int64
+	ChecksumRowsTotal   int64
+	Shards              []ShardProgress // Per-shard breakdown (for Vitess)
+	IsInstant           bool            // True if using instant DDL
+	ProgressDetail      string          // Human-readable progress (e.g., Spirit: "12.5% copyRows ETA 1h 30m")
+	DDL                 string          // The DDL statement being applied
+	StartedAt           *time.Time      // When execution actually began (from engine, e.g., SHOW VITESS_MIGRATIONS started_timestamp)
+	CompletedAt         *time.Time      // When execution completed (from engine)
 }
 
 // ShardProgress tracks progress for a single shard.

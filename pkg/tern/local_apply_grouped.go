@@ -1061,6 +1061,8 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 			task.RowsTotal = tp.RowsTotal
 			task.ProgressPercent = tp.Progress
 			task.ETASeconds = int(tp.ETASeconds)
+			task.ChecksumRowsChecked = tp.ChecksumRowsChecked
+			task.ChecksumRowsTotal = tp.ChecksumRowsTotal
 			task.IsInstant = tp.IsInstant
 			if tp.StartedAt != nil && task.StartedAt == nil {
 				task.StartedAt = tp.StartedAt

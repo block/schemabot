@@ -101,18 +101,20 @@ func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task, shar
 			ns = databaseFallback
 		}
 		out = append(out, templates.TableProgressData{
-			Namespace:       ns,
-			TableName:       t.TableName,
-			DDL:             t.DDL,
-			Status:          string(t.State),
-			RowsCopied:      t.RowsCopied,
-			RowsTotal:       t.RowsTotal,
-			PercentComplete: t.ProgressPercent,
-			ETASeconds:      int64(t.ETASeconds),
-			IsInstant:       t.IsInstant,
-			ReadyToComplete: t.ReadyToComplete,
-			ErrorMessage:    t.ErrorMessage,
-			Shards:          shardProgressForTable(shardsByTable, t.ApplyOperationID, t.Namespace, t.TableName),
+			Namespace:           ns,
+			TableName:           t.TableName,
+			DDL:                 t.DDL,
+			Status:              string(t.State),
+			RowsCopied:          t.RowsCopied,
+			RowsTotal:           t.RowsTotal,
+			PercentComplete:     t.ProgressPercent,
+			ETASeconds:          int64(t.ETASeconds),
+			ChecksumRowsChecked: t.ChecksumRowsChecked,
+			ChecksumRowsTotal:   t.ChecksumRowsTotal,
+			IsInstant:           t.IsInstant,
+			ReadyToComplete:     t.ReadyToComplete,
+			ErrorMessage:        t.ErrorMessage,
+			Shards:              shardProgressForTable(shardsByTable, t.ApplyOperationID, t.Namespace, t.TableName),
 		})
 	}
 	return out

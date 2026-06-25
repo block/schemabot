@@ -172,18 +172,20 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 
 	for _, t := range resp.Tables {
 		tpr := &apitypes.TableProgressResponse{
-			TableName:       t.TableName,
-			Keyspace:        t.Namespace,
-			ChangeType:      changeTypeToString(t.ChangeType),
-			DDL:             t.Ddl,
-			Status:          t.Status,
-			RowsCopied:      t.RowsCopied,
-			RowsTotal:       t.RowsTotal,
-			PercentComplete: t.PercentComplete,
-			ETASeconds:      t.EtaSeconds,
-			IsInstant:       t.IsInstant,
-			ProgressDetail:  t.ProgressDetail,
-			TaskID:          t.TaskId,
+			TableName:           t.TableName,
+			Keyspace:            t.Namespace,
+			ChangeType:          changeTypeToString(t.ChangeType),
+			DDL:                 t.Ddl,
+			Status:              t.Status,
+			RowsCopied:          t.RowsCopied,
+			RowsTotal:           t.RowsTotal,
+			PercentComplete:     t.PercentComplete,
+			ETASeconds:          t.EtaSeconds,
+			ChecksumRowsChecked: t.ChecksumRowsChecked,
+			ChecksumRowsTotal:   t.ChecksumRowsTotal,
+			IsInstant:           t.IsInstant,
+			ProgressDetail:      t.ProgressDetail,
+			TaskID:              t.TaskId,
 		}
 		for _, sh := range t.Shards {
 			var pct int32
@@ -904,16 +906,18 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 
 	for _, task := range tasks {
 		tpr := &apitypes.TableProgressResponse{
-			TableName:       task.TableName,
-			Keyspace:        task.Namespace,
-			ChangeType:      task.DDLAction,
-			DDL:             task.DDL,
-			Status:          task.State,
-			RowsCopied:      task.RowsCopied,
-			RowsTotal:       task.RowsTotal,
-			PercentComplete: int32(task.ProgressPercent),
-			IsInstant:       task.IsInstant,
-			TaskID:          task.TaskIdentifier,
+			TableName:           task.TableName,
+			Keyspace:            task.Namespace,
+			ChangeType:          task.DDLAction,
+			DDL:                 task.DDL,
+			Status:              task.State,
+			RowsCopied:          task.RowsCopied,
+			RowsTotal:           task.RowsTotal,
+			PercentComplete:     int32(task.ProgressPercent),
+			ChecksumRowsChecked: task.ChecksumRowsChecked,
+			ChecksumRowsTotal:   task.ChecksumRowsTotal,
+			IsInstant:           task.IsInstant,
+			TaskID:              task.TaskIdentifier,
 		}
 		if task.ApplyOperationID != nil {
 			if deployment, ok := deploymentByOperationID[*task.ApplyOperationID]; ok {
@@ -976,6 +980,8 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 		task.RowsCopied = tp.RowsCopied
 		task.RowsTotal = tp.RowsTotal
 		task.ProgressPercent = int(tp.PercentComplete)
+		task.ChecksumRowsChecked = tp.ChecksumRowsChecked
+		task.ChecksumRowsTotal = tp.ChecksumRowsTotal
 		task.UpdatedAt = now
 		if err := s.storage.Tasks().Update(ctx, task); err != nil {
 			s.logger.Error("sync task failed", "task_id", task.TaskIdentifier, "error", err)

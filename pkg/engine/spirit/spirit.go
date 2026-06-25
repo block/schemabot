@@ -556,6 +556,14 @@ func buildSpiritTableProgress(prog status.Progress, stateStr string, ddlByTable,
 		} else if st.RowsTotal > 0 {
 			tp.ETASeconds = etaSeconds
 		}
+		// Spirit reports a single runner-wide checksum estimate (rows verified so
+		// far / total to verify), populated only during the verify phase and zero
+		// otherwise. Surface it on the tables still in flight so consumers can
+		// render verify progress; completed tables keep zero.
+		if !st.IsComplete {
+			tp.ChecksumRowsChecked = int64(prog.Checksum.RowsChecked)
+			tp.ChecksumRowsTotal = int64(prog.Checksum.RowsTotal)
+		}
 		tableProgress = append(tableProgress, tp)
 	}
 	return tableProgress

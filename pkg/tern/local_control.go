@@ -819,6 +819,8 @@ func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.T
 			task.RowsTotal = et.RowsTotal
 			task.ProgressPercent = et.Progress
 			task.ETASeconds = int(et.ETASeconds)
+			task.ChecksumRowsChecked = et.ChecksumRowsChecked
+			task.ChecksumRowsTotal = et.ChecksumRowsTotal
 		}
 
 		c.transitionTaskState(ctx, task, task.ApplyID, newState,

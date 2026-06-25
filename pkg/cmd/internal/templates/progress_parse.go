@@ -57,9 +57,13 @@ type TableProgress struct {
 	RowsTotal       int64
 	PercentComplete int
 	ETASeconds      int64
-	IsInstant       bool
-	ProgressDetail  string // e.g., Spirit: "12.5% copyRows ETA 1h 30m"
-	Shards          []ShardProgress
+	// Checksum phase progress: rows verified so far and total to verify.
+	// Non-zero only while the table is checksumming (verifying copied data).
+	ChecksumRowsChecked int64
+	ChecksumRowsTotal   int64
+	IsInstant           bool
+	ProgressDetail      string // e.g., Spirit: "12.5% copyRows ETA 1h 30m"
+	Shards              []ShardProgress
 }
 
 // ShardProgress contains per-shard progress for template rendering.
@@ -156,18 +160,20 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 
 	for _, tbl := range result.Tables {
 		tp := TableProgress{
-			TableName:       tbl.TableName,
-			Deployment:      tbl.Deployment,
-			Namespace:       tbl.Keyspace,
-			ChangeType:      tbl.ChangeType,
-			DDL:             tbl.DDL,
-			Status:          state.NormalizeState(tbl.Status),
-			RowsCopied:      tbl.RowsCopied,
-			RowsTotal:       tbl.RowsTotal,
-			PercentComplete: int(tbl.PercentComplete),
-			ETASeconds:      tbl.ETASeconds,
-			IsInstant:       tbl.IsInstant,
-			ProgressDetail:  tbl.ProgressDetail,
+			TableName:           tbl.TableName,
+			Deployment:          tbl.Deployment,
+			Namespace:           tbl.Keyspace,
+			ChangeType:          tbl.ChangeType,
+			DDL:                 tbl.DDL,
+			Status:              state.NormalizeState(tbl.Status),
+			RowsCopied:          tbl.RowsCopied,
+			RowsTotal:           tbl.RowsTotal,
+			PercentComplete:     int(tbl.PercentComplete),
+			ETASeconds:          tbl.ETASeconds,
+			ChecksumRowsChecked: tbl.ChecksumRowsChecked,
+			ChecksumRowsTotal:   tbl.ChecksumRowsTotal,
+			IsInstant:           tbl.IsInstant,
+			ProgressDetail:      tbl.ProgressDetail,
 		}
 		for _, sh := range tbl.Shards {
 			tp.Shards = append(tp.Shards, ShardProgress{
