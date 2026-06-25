@@ -318,11 +318,11 @@ func multiDeployEnsureNoActiveChange(t *testing.T, database, env string, deploym
 // two deployments honours barrier-policy ordered cutover.
 //
 // Scenario: testapp/production fans out to deployments [eu, us] with
-// deployment_order [eu, us] and cutover_policy: barrier. Both deployments copy
-// concurrently and park at the cutover barrier; the operator then drives cutover
-// strictly in order — eu cuts over and completes before us is allowed to cut
-// over. The later deployment must never reach a terminal completed state ahead
-// of the earlier one, and the whole apply settles to completed.
+// deployment_order [eu, us] and cutover_policy: barrier. Once eu reaches the
+// cutover barrier, us may start its copy phase; cutover itself remains strictly
+// ordered, so eu cuts over and completes before us is allowed to cut over. The
+// later deployment must never reach a terminal completed state ahead of the
+// earlier one, and the whole apply settles to completed.
 func TestGRPCMultiDeploy_OrderedCutover(t *testing.T) {
 	requireMultiDeploy(t)
 
@@ -337,8 +337,8 @@ func TestGRPCMultiDeploy_OrderedCutover(t *testing.T) {
 	createDDL := fmt.Sprintf(
 		"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT)", tableName)
 
-	// Seed both deployments so each runs a full copy-swap (not instant DDL),
-	// giving the barrier a real window in which the later deployment parks.
+	// Seed both deployments so each runs a full copy-swap rather than a
+	// metadata-only schema change.
 	for _, d := range []string{first, second} {
 		multiDeployCreateTestTable(t, d, tableName, createDDL)
 		multiDeploySeedRows(t, d, tableName, "name, data",
@@ -359,10 +359,7 @@ func TestGRPCMultiDeploy_OrderedCutover(t *testing.T) {
 	apply := grpcApply(t, plan.PlanID, env, nil)
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
-	var (
-		sawSecondParked      bool // second deployment reached waiting_for_cutover
-		secondParkedPreFirst bool // second parked while first had not yet completed
-	)
+	var sawSecondParked bool // second deployment reached waiting_for_cutover
 	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
 		func() bool {
 			ops := multiDeployOps(t, apply.ApplyID, first, second)
@@ -374,9 +371,6 @@ func TestGRPCMultiDeploy_OrderedCutover(t *testing.T) {
 
 			if state.IsState(secondOp.State, state.Apply.WaitingForCutover) {
 				sawSecondParked = true
-				if !state.IsState(firstOp.State, state.Apply.Completed) {
-					secondParkedPreFirst = true
-				}
 			}
 
 			// Barrier ordering invariant: the later deployment must never
@@ -396,12 +390,11 @@ func TestGRPCMultiDeploy_OrderedCutover(t *testing.T) {
 		},
 	)
 
-	// Barrier engaged: the later deployment parked at the cutover barrier, and
-	// did so before the earlier deployment completed (ordered cutover).
+	// Barrier engaged: the later deployment parked at the cutover barrier.
+	// Ordered cutover is checked by the in-poll violation guard and the
+	// completion timestamps below.
 	require.Truef(t, sawSecondParked,
 		"expected %s to park at waiting_for_cutover under barrier policy", second)
-	assert.Truef(t, secondParkedPreFirst,
-		"expected %s to be parked at the barrier before %s completed", second, first)
 
 	// Completion timestamps confirm the earlier deployment cut over first.
 	final := multiDeployOperationStates(t, apply.ApplyID)
