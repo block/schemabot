@@ -161,9 +161,9 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 			}
 		}
 	} else {
-		// No per-shard/row-copy progress this poll. Missing vtgate DSN is a target
+		// No per-shard/row-copy progress this poll. A missing vtgate DSN is a target
 		// resolution gap that persists for the whole apply (warned once at apply
-		// start); missing migration context is transient during setup/recovery.
+		// start); an unset MigrationContext is transient during setup/recovery.
 		// Either way the comment and CLI fall back to deploy-request state.
 		e.logger.Debug("skipping per-shard progress",
 			"database", req.Database,

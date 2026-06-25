@@ -88,6 +88,43 @@ func TestEtreResolverResolvesMySQLTarget(t *testing.T) {
 	assert.Equal(t, "", cfg.DBName, "MySQL DSN must be namespace-free; the request supplies the schema")
 }
 
+// End to end with the real Vitess assembler: the resolver looks up the endpoint
+// (vtgate host) and the credentials (read-only vtgate user/pass + API token), and
+// the assembler produces a namespace-free vtgate DSN for SHOW VITESS_MIGRATIONS
+// progress alongside the PlanetScale API metadata.
+func TestEtreResolverResolvesVitessTarget(t *testing.T) {
+	entity := etre.Entity{"endpoint": "vtgate.example", "organization": "acme"}
+	creds := &capturingCredResolver{creds: &inventory.Credentials{
+		Username: "vt-user",
+		Password: "vt-pass",
+		Metadata: map[string]string{
+			inventory.MetadataTokenName:  "tok-id",
+			inventory.MetadataTokenValue: "tok-secret",
+		},
+	}}
+	r := newEtreResolverForTest(t, nil, []etre.Entity{entity}, EtreResolverConfig{
+		TargetLabel:     "dsid",
+		HostField:       "endpoint",
+		AttributeFields: []string{"organization"},
+		Credentials:     creds,
+		Assembler:       inventory.VitessConnectionAssembler{DefaultPort: "3306"},
+	})
+
+	target, err := r.ResolveTarget(t.Context(), inventory.Request{Target: "boardgames-dsid", DatabaseType: "vitess"})
+	require.NoError(t, err)
+
+	assert.Equal(t, "vitess", target.DatabaseType)
+	assert.Equal(t, "acme", target.Metadata[inventory.MetadataOrganization])
+	assert.Equal(t, "tok-secret", target.Metadata[inventory.MetadataTokenValue])
+
+	cfg, err := mysql.ParseDSN(target.DSN)
+	require.NoError(t, err)
+	assert.Equal(t, "vt-user", cfg.User)
+	assert.Equal(t, "vt-pass", cfg.Passwd)
+	assert.Equal(t, "vtgate.example:3306", cfg.Addr)
+	assert.Equal(t, "", cfg.DBName, "vtgate DSN is namespace-free; the schema is supplied per operation")
+}
+
 // The resolver surfaces the endpoint host and configured attributes to both the
 // credential resolver and the assembler, and returns the assembler's output.
 func TestEtreResolverDelegatesToAssembler(t *testing.T) {
