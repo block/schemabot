@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"sort"
 	"strings"
@@ -90,7 +91,9 @@ func clientWithHeaders(base *http.Client, headers map[string]string) *http.Clien
 		transport = http.DefaultTransport
 	}
 	copied := *base
-	copied.Transport = &headerRoundTripper{base: transport, headers: headers}
+	// Snapshot the headers so the transport holds an immutable copy: a caller
+	// mutating its map after construction can't race RoundTrip's iteration.
+	copied.Transport = &headerRoundTripper{base: transport, headers: maps.Clone(headers)}
 	return &copied
 }
 

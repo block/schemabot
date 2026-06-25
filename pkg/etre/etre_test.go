@@ -139,9 +139,11 @@ func TestNewValidatesConfig(t *testing.T) {
 // Configured headers must be sent on every Etre request, so a deployment behind
 // a header-routed proxy or mesh can supply the routing headers that path needs.
 func TestNewSendsConfiguredHeaders(t *testing.T) {
-	var gotHeaders http.Header
+	// Pass the captured headers back over a channel so the handler goroutine and
+	// the test goroutine don't share a variable without synchronization.
+	headerCh := make(chan http.Header, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHeaders = r.Header.Clone()
+		headerCh <- r.Header.Clone()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[{"name":"orders","host":"orders.example:3306"}]`))
 	}))
@@ -156,13 +158,18 @@ func TestNewSendsConfiguredHeaders(t *testing.T) {
 
 	_, err = c.QueryOne(t.Context(), map[string]string{"name": "orders"})
 	require.NoError(t, err)
-	require.NotNil(t, gotHeaders)
+	var gotHeaders http.Header
+	select {
+	case gotHeaders = <-headerCh:
+	default:
+		t.Fatal("Etre handler was not invoked")
+	}
 	assert.Equal(t, "production", gotHeaders.Get("X-Env-Override"))
 	assert.Equal(t, "etre", gotHeaders.Get("X-Route-Label"))
 }
 
-// Wrapping a shared client (here, the default client) to add headers must not
-// mutate the original client's transport.
+// Wrapping a client to add headers must not mutate the original client's
+// transport, so a shared client is safe to pass in.
 func TestClientWithHeadersDoesNotMutateBase(t *testing.T) {
 	base := &http.Client{}
 	wrapped := clientWithHeaders(base, map[string]string{"X-Test": "1"})
