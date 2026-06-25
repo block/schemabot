@@ -157,6 +157,17 @@ type LocalConfig struct {
 	// api.Service.RegisterEngine); NewLocalClient uses the matching factory for a
 	// Type that has no built-in engine.
 	EngineFactories map[string]EngineFactory
+
+	// ClaimOperations mirrors ServerConfig.ShouldClaimOperations: when true the
+	// operator drives applies by claiming apply_operations rows, so Apply creates
+	// the apply's operations (fanning a sharded engine out into one work
+	// operation per shard) and leaves them for the operator to claim and drive
+	// rather than driving the whole apply inline. When false (the default) Apply
+	// keeps the legacy single-operation, inline-driven path. The two modes must
+	// not be mixed on one process: an inline-driven operation holds the apply
+	// lease but not the operation lease, so an operation-level claimer would
+	// double-drive it.
+	ClaimOperations bool
 }
 
 // EngineFactory builds an Engine for a database type this build does not
@@ -1777,54 +1788,47 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		)
 	}
 
-	tasks := make([]*storage.Task, len(ddlChanges))
-	for i, ddlChange := range ddlChanges {
-		taskIdentifier := "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
-		tasks[i] = &storage.Task{
-			TaskIdentifier: taskIdentifier,
-			PlanID:         plan.ID,
-			Database:       plan.Database,
-			DatabaseType:   plan.DatabaseType,
-			Engine:         eng.Name(),
-			Repository:     plan.Repository,
-			PullRequest:    plan.PullRequest,
-			Environment:    req.Environment,
-			State:          state.Task.Pending,
-			Options:        optionsJSON,
-			TableName:      ddlChange.Table,
-			Namespace:      ddlChange.Namespace,
-			DDL:            ddlChange.DDL,
-			DDLAction:      ddlChange.Operation,
-			CreatedAt:      now,
-			UpdatedAt:      now,
-		}
-	}
-
-	// Dual-write one apply_operations row alongside the applies row in the
-	// same transaction so every apply created via the Tern client carries a
-	// claimable, resumable operation. CreateWithTasksAndOperations links each
-	// task to the single operation via ApplyOperationID, which the engine
-	// resume-state path requires and the operator claim loop selects on.
+	// Build the apply's operations and their tasks, then create them atomically
+	// with the apply row. CreateWith{Grouped,TasksAnd}Operations links each task
+	// to its operation via ApplyOperationID, which the engine resume-state path
+	// requires and the operator claim loop selects on.
+	//
+	// Two shapes, selected by claim mode:
+	//   - Operation-claiming (ClaimOperations): the operator drives each operation,
+	//     so buildApplyOperationGroups fans a sharded engine out into one work
+	//     operation per shard (each with a single shard-tagged task) and the
+	//     operator hands the engine exactly one target shard. The apply is not
+	//     driven inline here — that would race the operator, which holds the
+	//     operation lease the inline path does not.
+	//   - Legacy inline drive (default): one apply_operations row carries all
+	//     tasks and this client drives the whole apply inline in the background.
 	//
 	// CutoverPolicy and HaltOnFailure are intentionally left unset: the Tern
 	// client has no environment config to resolve them from (unlike the API
 	// apply path), so the store applies its safe defaults (rolling cutover,
 	// halt on failure).
-	operations := []*storage.ApplyOperation{{
-		Deployment: apply.Deployment,
-		Target:     plan.Target,
-		State:      state.ApplyOperation.Pending,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-	}}
-
-	applyID, err := c.storage.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, operations)
+	var (
+		applyID     int64
+		inlineTasks []*storage.Task
+	)
+	if c.config.ClaimOperations {
+		groups := c.buildApplyOperationGroups(apply, plan, ddlChanges, optionsJSON, now)
+		applyID, err = c.storage.Applies().CreateWithGroupedOperations(ctx, apply, groups)
+	} else {
+		tasks := make([]*storage.Task, len(ddlChanges))
+		for i, ddlChange := range ddlChanges {
+			tasks[i] = c.newApplyTask(apply, plan, ddlChange, "", optionsJSON, now)
+		}
+		operations := []*storage.ApplyOperation{c.newWorkOperation(apply, plan, "", now)}
+		applyID, err = c.storage.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, operations)
+		inlineTasks = tasks
+	}
 	if err != nil {
 		// Two same-key dispatches racing to create: the loser sees a duplicate
 		// idempotency key (or the active-apply guard the create runs). Resolve by
 		// key so the winner's apply is returned instead of a create error.
 		if existing, lookupErr := c.existingIdempotentApply(ctx, req); lookupErr != nil {
-			return nil, fmt.Errorf("create apply %s with tasks and operations (idempotency re-lookup also failed): %w", applyIdentifier, errors.Join(err, lookupErr))
+			return nil, fmt.Errorf("create apply %s with operations (idempotency re-lookup also failed): %w", applyIdentifier, errors.Join(err, lookupErr))
 		} else if existing != nil {
 			c.logger.Info("Apply: idempotency key resolved a create race",
 				"apply_id", existing.ApplyIdentifier,
@@ -1834,7 +1838,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			metrics.RecordRemoteApplyDedup(ctx, req.Database, req.Environment, "create_race")
 			return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier}, nil
 		}
-		return nil, fmt.Errorf("create apply %s with tasks and operations: %w", applyIdentifier, err)
+		return nil, fmt.Errorf("create apply %s with operations: %w", applyIdentifier, err)
 	}
 	apply.ID = applyID
 
@@ -1855,13 +1859,26 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		c.SetObserver(apply.ID, obs)
 	}
 
+	if c.config.ClaimOperations {
+		// The operator claims and drives each operation (one per shard for a
+		// sharded engine). Nudge it to pick up the freshly created operations
+		// promptly instead of waiting for the next poll.
+		if c.config.WakeOperator != nil {
+			c.config.WakeOperator(apply.ApplyIdentifier, apply.Database, req.Environment)
+		}
+		return &ternv1.ApplyResponse{
+			Accepted: true,
+			ApplyId:  apply.ApplyIdentifier,
+		}, nil
+	}
+
 	// Start apply in background with cancellable context (Stop() cancels this)
 	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
 	cancelGeneration := c.setApplyCancel(cancelApply)
 	// A fresh dispatch (including a remote gRPC drive) has no operation context,
 	// so it never auto-parks at the cutover barrier; ordered-cutover parking is
 	// driven by the operator's operation-scoped resume path.
-	c.startApplyExecution(applyCtx, cancelGeneration, cancelApply, apply, tasks, plan, options, false)
+	c.startApplyExecution(applyCtx, cancelGeneration, cancelApply, apply, inlineTasks, plan, options, false)
 
 	return &ternv1.ApplyResponse{
 		Accepted: true,

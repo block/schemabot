@@ -551,6 +551,7 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		Metadata:        metadata,
 		WakeOperator:    s.wakeOperator,
 		EngineFactories: s.engineFactories,
+		ClaimOperations: s.config.ShouldClaimOperations(),
 	}, s.storage, s.logger)
 	if err != nil {
 		return nil, fmt.Errorf("create local tern client for %s: %w", key, err)

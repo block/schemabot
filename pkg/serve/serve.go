@@ -547,6 +547,7 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysq
 // share identical execution semantics and can resolve custom database types.
 func grpcLocalClientFactory(config *api.ServerConfig, wakeOperator func(applyIdentifier, database, environment string), engineFactories map[string]tern.EngineFactory) tern.LocalClientFactory {
 	pendingDropsDisabled := !config.PendingDropsEnabled()
+	claimOperations := config.ShouldClaimOperations()
 	return func(cfg tern.LocalConfig, st storage.Storage, logger *slog.Logger) (tern.Client, error) {
 		if pendingDropsDisabled {
 			if cfg.Metadata == nil {
@@ -557,6 +558,10 @@ func grpcLocalClientFactory(config *api.ServerConfig, wakeOperator func(applyIde
 		if cfg.WakeOperator == nil {
 			cfg.WakeOperator = wakeOperator
 		}
+		// Mirror the operator's claim mode onto the client so Apply creates the
+		// operations the operator will claim (fanning a sharded engine out per
+		// shard) instead of driving the whole apply inline.
+		cfg.ClaimOperations = claimOperations
 		// Merge the embedder registry into this config so custom types always
 		// resolve, regardless of whether the resolved config already carries
 		// factories. Build a fresh map so the caller's is never mutated, and let
@@ -695,13 +700,20 @@ func getEnv(key, defaultValue string) string {
 }
 
 // applyDataPlaneClaimDefault sets the operator claim mode for a data-plane tern
-// process. A process serving the Tern proto over gRPC drives applies inline via
-// LocalClient and does not own the apply_operations lifecycle, so its operator
-// must recover work at the apply level via FindNextApply; operation-level
-// claiming reads a vestigial operation row that never tracks the apply and so
-// cannot resume it. When the mode is unset, default it to apply-level claiming
-// for this process; an operator can still opt in explicitly. Operation-level
-// claiming is a control-plane concept. Reports whether the default was applied.
+// process. By default a process serving the Tern proto over gRPC drives applies
+// inline via LocalClient, so its operator recovers work at the apply level via
+// FindNextApply; mixing inline drive with operation-level claiming is unsafe
+// because an inline-driven operation holds the apply lease but not the
+// operation lease, so an operation claimer would double-drive it. When the mode
+// is unset, default it to apply-level claiming for this process.
+//
+// A data plane CAN opt in to operation-level claiming explicitly
+// (operator_claim_operations: true). When it does, LocalClient.Apply stops
+// driving inline and instead creates the apply's operations for the operator to
+// claim and drive (see LocalClient.ClaimOperations); this is what lets a sharded
+// engine fan a plan out into one claimable work operation per shard, since the
+// engine is handed a single target shard per operation. Reports whether the
+// default was applied.
 func applyDataPlaneClaimDefault(cfg *api.ServerConfig, isDataPlane bool) bool {
 	if !isDataPlane || cfg.OperatorClaimOperations != nil {
 		return false
