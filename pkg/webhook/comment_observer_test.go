@@ -52,32 +52,61 @@ func newDispatchTestObserver(opStore storage.ApplyOperationStore) *CommentObserv
 	}
 }
 
-// A PlanetScale apply's VSchema status reaches the PR comment through the real
-// observer path: the comment is built from storage (buildApplyCommentData), and
-// VSchema is projected from the operation's engine resume metadata — the comment
-// path never reads a progress response, so this is where VSchema must come from.
-func TestStatusCommentRendersVSchemaFromEngineResumeState(t *testing.T) {
-	const resume = `{"vschema_status":"applying","vschema_diffs":[{"namespace":"commerce_sharded","diff":"+ \"xxhash\": {\"type\": \"xxhash\"}"}]}`
-	o := newDispatchTestObserver(&stubApplyOperationStore{
-		ops:        []*storage.ApplyOperation{{ID: 7, Deployment: "eu", State: state.ApplyOperation.Running}},
-		resumeByOp: map[int64]*storage.EngineResumeState{7: {Metadata: resume}},
+// VSchema status must reach real PR comments through the production observer
+// path: comments are built from storage (buildApplyCommentData), and VSchema is
+// projected from each operation's engine resume metadata — the comment path
+// never reads a progress response. These cases drive that path end to end from a
+// stubbed resume state, covering the progress comment, the terminal summary, a
+// multi-keyspace deploy, and the fail-soft cases that must render no section.
+func TestCommentObserverRendersVSchemaFromEngineResumeState(t *testing.T) {
+	const opID = 7
+	psApply := func(s string) *storage.Apply {
+		return &storage.Apply{
+			ApplyIdentifier: "apply-1", Database: "commerce", Environment: "production",
+			State: s, Engine: storage.EnginePlanetScale,
+		}
+	}
+	observer := func(blob string) *CommentObserver {
+		stub := &stubApplyOperationStore{ops: []*storage.ApplyOperation{{ID: opID, Deployment: "eu", State: state.ApplyOperation.Running}}}
+		if blob != "" {
+			stub.resumeByOp = map[int64]*storage.EngineResumeState{opID: {Metadata: blob}}
+		}
+		return newDispatchTestObserver(stub)
+	}
+
+	t.Run("progress comment shows the applying keyspace and diff", func(t *testing.T) {
+		body := observer(`{"vschema_status":"applying","vschema_diffs":[{"namespace":"commerce_sharded","diff":"+ \"xxhash\": {\"type\": \"xxhash\"}"}]}`).
+			formatStatusComment(psApply(state.Apply.Running), nil)
+		assert.Contains(t, body, "### VSchema")
+		assert.Contains(t, body, "**`commerce_sharded`**: Applying...")
+		assert.Contains(t, body, `+ "xxhash": {"type": "xxhash"}`)
 	})
 
-	body := o.formatStatusComment(planetscaleApply(), nil)
+	t.Run("terminal summary of a VSchema-only apply reports the VSchema outcome", func(t *testing.T) {
+		body := observer(`{"vschema_status":"applied","vschema_diffs":[{"namespace":"commerce_sharded","diff":"+ \"xxhash\": {}"}]}`).
+			formatTerminalSummaryComment(psApply(state.Apply.Completed), nil)
+		assert.Contains(t, body, "VSchema applied successfully")
+		assert.Contains(t, body, "**`commerce_sharded`**: Applied")
+		assert.NotContains(t, body, "0 tables")
+	})
 
-	assert.Contains(t, body, "### VSchema")
-	assert.Contains(t, body, "**`commerce_sharded`**: Applying...")
-	assert.Contains(t, body, `+ "xxhash": {"type": "xxhash"}`)
-}
+	t.Run("multi-keyspace renders each keyspace independently", func(t *testing.T) {
+		body := observer(`{"vschema_status":"applying","vschema_diffs":[{"namespace":"commerce","diff":"+ \"lookup\": {}"},{"namespace":"commerce_sharded","diff":"+ \"xxhash\": {}"}]}`).
+			formatStatusComment(psApply(state.Apply.Running), nil)
+		assert.Contains(t, body, "**`commerce`**: Applying...")
+		assert.Contains(t, body, "**`commerce_sharded`**: Applying...")
+	})
 
-func planetscaleApply() *storage.Apply {
-	return &storage.Apply{
-		ApplyIdentifier: "apply-1",
-		Database:        "commerce",
-		Environment:     "production",
-		State:           state.Apply.Running,
-		Engine:          storage.EnginePlanetScale,
-	}
+	t.Run("no engine resume state renders no VSchema section", func(t *testing.T) {
+		body := observer("").formatStatusComment(psApply(state.Apply.Running), nil)
+		assert.NotContains(t, body, "### VSchema")
+	})
+
+	t.Run("non-PlanetScale apply skips VSchema projection", func(t *testing.T) {
+		body := observer(`{"vschema_status":"applying","vschema_diffs":[{"namespace":"x","diff":"+ y"}]}`).
+			formatStatusComment(runningApply(), nil)
+		assert.NotContains(t, body, "### VSchema")
+	})
 }
 
 // A multi-deployment apply renders the aggregated comment: the observer loads
