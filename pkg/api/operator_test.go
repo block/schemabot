@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"sync"
@@ -1122,4 +1123,37 @@ type singleCutoverOpStore struct {
 func (s *singleCutoverOpStore) FindNextApplyOperationCutover(context.Context, string) (*storage.ApplyOperation, error) {
 	op := *s.op
 	return &op, nil
+}
+
+// expiryErrorApplyStore fails the retryable-apply expiry maintenance pass and
+// records whether the claim path (FindNextApply) was still reached afterwards.
+type expiryErrorApplyStore struct {
+	storage.ApplyStore
+	findNextCalled bool
+}
+
+func (s *expiryErrorApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {
+	return nil, errors.New("storage unavailable")
+}
+
+func (s *expiryErrorApplyStore) FindNextApply(context.Context, string) (*storage.Apply, error) {
+	s.findNextCalled = true
+	return nil, nil
+}
+
+// Retryable-apply expiry is best-effort maintenance: a storage failure there
+// must not stop a driver from claiming new pending work in the same tick, or a
+// transient expiry error would starve every queued apply behind it.
+func TestRecoverApplies_ExpiryErrorDoesNotBlockClaim(t *testing.T) {
+	applyStore := &expiryErrorApplyStore{}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	claimOperations := false
+	cfg := testServerConfig()
+	cfg.OperatorClaimOperations = &claimOperations
+	svc := New(&mockStorageWithApplyStores{applies: applyStore}, cfg, nil, logger)
+
+	svc.recoverApplies(t.Context(), 1)
+
+	assert.True(t, applyStore.findNextCalled,
+		"FindNextApply must run even when ExpireRetryable fails")
 }

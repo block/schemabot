@@ -167,9 +167,11 @@ func (s *Service) operatorDriver(ctx context.Context, driverID int, stop <-chan 
 	}
 }
 
-// recoverApplies claims and resumes applies that need attention.
-// Each call claims one apply (if available) to keep the scheduling loop responsive.
-func (s *Service) recoverApplies(ctx context.Context, driverID int) {
+// expireRetryableApplies runs the retryable-apply expiry maintenance pass,
+// terminalizing failed_retryable applies that have exhausted their attempts or
+// freshness window. It is best-effort: a storage error is logged and recorded
+// but not returned, so the caller can still claim new work in the same tick.
+func (s *Service) expireRetryableApplies(ctx context.Context, driverID int) {
 	expired, err := s.storage.Applies().ExpireRetryable(ctx)
 	if err != nil {
 		s.logger.Error("operator: failed to expire retryable applies", "driver", driverID, "error", err)
@@ -187,6 +189,16 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int) {
 			"reason", expiration.Reason)
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, string(expiration.Reason))
 	}
+}
+
+// recoverApplies claims and resumes applies that need attention.
+// Each call claims one apply (if available) to keep the scheduling loop responsive.
+func (s *Service) recoverApplies(ctx context.Context, driverID int) {
+	// Retryable-apply expiry is best-effort maintenance: run it first, but a
+	// storage failure here must not stop the driver from claiming new pending
+	// work in the same tick, or a transient expiry error would starve every
+	// queued apply behind it.
+	s.expireRetryableApplies(ctx, driverID)
 
 	owner := driverLeaseOwner(driverID)
 
