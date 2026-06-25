@@ -550,11 +550,15 @@ type ApplyOperation struct {
 	OnFailure string
 
 	// Attempt counts deliberate redispatches of this operation. It starts at 0
-	// and advances only when a driver re-claims the row from failed_retryable —
-	// the operation's own retry — not on crash-recovery re-lease of an in-flight
-	// drive. It is the operation-local counterpart to applies.attempt: a sibling
-	// operation's retry advances the shared parent attempt but never this row's,
-	// so an operation-scoped dispatch generation rotates only on its own retry.
+	// and advances only when a driver re-claims the row as a deliberate retry —
+	// the operation is failed_retryable and so is its parent apply. It does not
+	// advance on a crash-recovery re-lease (a still-active parent with a stale
+	// heartbeat, or an in-flight drive whose driver died), so an orphaned
+	// dispatch's idempotency key stays stable and is reused rather than
+	// duplicated. It is the operation-local counterpart to applies.attempt: a
+	// sibling operation's retry advances the shared parent attempt but never this
+	// row's, so an operation-scoped dispatch generation rotates only on its own
+	// retry.
 	Attempt int
 
 	// StartedAt is when the operator claimed this child row and execution began.

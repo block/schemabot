@@ -952,22 +952,33 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		// the row lock this UPDATE takes serializes them, so the second sees the
 		// already-incremented attempt and does not overshoot maxRecoveryAttempts.
 		if ad.State == state.ApplyOperation.FailedRetryable {
-			// Advance the operation's own attempt: a failed_retryable re-claim is
-			// this operation's deliberate redispatch, so its dispatch generation
-			// rotates. Crash-recovery re-lease of an in-flight drive (the other
-			// arm of this default case) leaves attempt untouched so the orphaned
-			// dispatch's idempotency key stays stable and is reused, not
-			// duplicated. Unlike the parent budget bump below, this is not gated
-			// on multi-operation: attempt is operation-local and a sibling's
-			// retry must never rotate it.
-			if _, err := tx.ExecContext(ctx, `
-				UPDATE apply_operations
-				SET attempt = attempt + 1
-				WHERE id = ?
-			`, ad.ID); err != nil {
+			// Advance the operation's own attempt only on a genuine deliberate
+			// redispatch — the parent apply is still failed_retryable. A
+			// failed_retryable child is also re-claimed for crash recovery when
+			// the parent apply is already active (running) with a stale heartbeat
+			// (its retry was admitted, then the driver crashed); that re-lease
+			// must leave attempt untouched so the orphaned dispatch's idempotency
+			// key stays stable and is reused, not duplicated. The parent-state
+			// gate mirrors the budget bump below; the join lets one statement both
+			// test the parent state and write the child row. Unlike the budget
+			// bump this is not gated on multi-operation: attempt is
+			// operation-local and a sibling's retry must never rotate it.
+			res, err := tx.ExecContext(ctx, `
+				UPDATE apply_operations o
+				JOIN applies a ON a.id = o.apply_id
+				SET o.attempt = o.attempt + 1
+				WHERE o.id = ? AND a.state = ?
+			`, ad.ID, state.Apply.FailedRetryable)
+			if err != nil {
 				return nil, fmt.Errorf("advance attempt for apply_operation %d redispatch: %w", ad.ID, err)
 			}
-			ad.Attempt++
+			bumped, err := res.RowsAffected()
+			if err != nil {
+				return nil, fmt.Errorf("read attempt bump rows affected for apply_operation %d: %w", ad.ID, err)
+			}
+			if bumped > 0 {
+				ad.Attempt++
+			}
 
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE applies a

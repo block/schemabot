@@ -1423,6 +1423,44 @@ func TestApplyOperationStore_FindNextApplyOperation_CrashRecoveryLeavesOperation
 	assert.Equal(t, 0, persisted.Attempt, "crash-recovery re-lease must leave the persisted operation attempt unchanged")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_FailedRetryableCrashRecoveryLeavesOperationAttempt
+// verifies the deliberate-retry vs crash-recovery distinction for a
+// failed_retryable child: when the parent apply is already active (running) with
+// a stale heartbeat — its retry was admitted, then the driver crashed — the
+// re-claim recovers the in-flight drive and must NOT advance the operation's
+// attempt, so the orphaned dispatch's idempotency key stays stable. This is the
+// crash-recovery sibling of the deliberate-redispatch case (parent still
+// failed_retryable), which does advance the attempt.
+func TestApplyOperationStore_FindNextApplyOperation_FailedRetryableCrashRecoveryLeavesOperationAttempt(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_fr_crash_attempt", 1, state.Apply.Running, "staging")
+	// Parent claimed then crashed: running, budget remaining, heartbeat stale.
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET state = ?, attempt = ?, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, state.Apply.Running, maxRecoveryAttempts-1, apply.ID)
+	require.NoError(t, err)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "recovery-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a failed_retryable child must be reclaimable when its parent retry crashed (active + stale)")
+	assert.Equal(t, id, claimed.ID)
+	assert.Equal(t, 0, claimed.Attempt, "crash recovery of a failed_retryable child (active parent) must not advance the operation attempt")
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, 0, persisted.Attempt, "the persisted operation attempt must be unchanged after crash recovery")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableBudgetExhausted
 // verifies the recovery budget is enforced: once the parent apply's attempt
 // count reaches the limit, the failed_retryable operation is no longer
