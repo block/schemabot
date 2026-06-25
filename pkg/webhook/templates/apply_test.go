@@ -131,6 +131,31 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 	}
 }
 
+// A table that has finished copying enters the checksum phase, where the engine
+// verifies the copied data before cutover. It is a table-level state: the apply
+// header stays "In Progress" while the per-table line and summary report
+// checksumming, since on a large table the verify can run for hours.
+func TestRenderApplyStatusComment_Checksumming(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       "running",
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "checksumming"},
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: "pending"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "## Schema Change In Progress", "apply stays in progress; checksumming is table-level")
+	assert.Contains(t, result, "**`orders`**")
+	assert.Contains(t, result, "🔍 Checksumming to verify data")
+	assert.Contains(t, result, "1 checksumming")
+}
+
 func TestRenderApplyStatusComment_Running(t *testing.T) {
 	withTemplateTimestamp(t, "2026-06-16 19:42:00 UTC")
 	data := ApplyStatusCommentData{

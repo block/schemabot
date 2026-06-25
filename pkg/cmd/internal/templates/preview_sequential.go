@@ -104,6 +104,24 @@ func previewSeqThirdRunOutput() {
 	WriteProgress(data)
 }
 
+func previewSeqChecksummingOutput() {
+	fmt.Println("Sequential mode: First complete, second checksumming")
+	fmt.Println()
+
+	data := ProgressData{
+		State:     state.Apply.Running,
+		Engine:    "Spirit",
+		ApplyID:   "apply-a1b2c3d4e5f6",
+		StartedAt: previewTime.Add(-25 * time.Minute).Format(time.RFC3339),
+		Tables: []TableProgress{
+			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
+			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Task.Checksumming},
+			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
+		},
+	}
+	WriteProgress(data)
+}
+
 func previewSeqAllDoneOutput() {
 	fmt.Println("Sequential mode: All tables completed successfully")
 	fmt.Println()

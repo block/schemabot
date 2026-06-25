@@ -232,7 +232,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		return
 	}
 
-	var completed, running, queued, failed, retrying, stopped, waiting, recovering, cutting, cancelled int
+	var completed, running, checksumming, queued, failed, retrying, stopped, waiting, recovering, cutting, cancelled int
 	var runningPct int
 	var runningEstimateExceeded bool
 
@@ -247,6 +247,8 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			} else {
 				runningPct = ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			}
+		case state.Task.Checksumming:
+			checksumming++
 		case state.Task.Pending:
 			queued++
 		case state.Task.WaitingForCutover:
@@ -285,6 +287,13 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			label += fmt.Sprintf(" (%d%%)", runningPct)
 		}
 		parts = append(parts, label)
+	}
+	if checksumming > 0 {
+		if multi {
+			parts = append(parts, fmt.Sprintf("%d checksumming", checksumming))
+		} else {
+			parts = append(parts, "checksumming")
+		}
 	}
 	if queued > 0 && multi {
 		parts = append(parts, fmt.Sprintf("%d queued", queued))
@@ -418,6 +427,13 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData) {
 		fmt.Fprintf(sb, "**`%s`**: %s \u2713 Complete\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
+	case state.Task.Checksumming:
+		// Row copy is complete; the engine is verifying the copied data against
+		// the source before cutover. On a large table this can run for hours.
+		bar := ui.ProgressBarRowCopy(100)
+		fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data...\n", table.TableName, bar)
+		writeDDLLine(sb, table.DDL)
+
 	case state.Task.WaitingForCutover:
 		bar := ui.ProgressBarWaitingCutover()
 		if table.ReadyToComplete {
@@ -491,7 +507,7 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 		return
 	}
 	switch state.NormalizeTaskStatus(table.Status) {
-	case state.Task.Running, state.Task.Recovering, state.Task.CuttingOver, state.Task.WaitingForCutover:
+	case state.Task.Running, state.Task.Checksumming, state.Task.Recovering, state.Task.CuttingOver, state.Task.WaitingForCutover:
 		// in flight — a breakdown adds signal
 	default:
 		return // completed/pending/cancelled/failed: no breakdown, stay quiet

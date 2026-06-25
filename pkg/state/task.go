@@ -12,6 +12,7 @@ import (
 var Task = struct {
 	Pending           string
 	Running           string
+	Checksumming      string
 	WaitingForDeploy  string
 	WaitingForCutover string
 	Recovering        string
@@ -26,6 +27,7 @@ var Task = struct {
 }{
 	Pending:           "pending",
 	Running:           "running",
+	Checksumming:      "checksumming",
 	WaitingForDeploy:  "waiting_for_deploy",
 	WaitingForCutover: "waiting_for_cutover",
 	Recovering:        "recovering",
@@ -62,14 +64,14 @@ func IsTerminalTaskState(s string) bool {
 }
 
 // IsInFlightTaskState returns true if the state implies the engine is actively
-// working on the task. These are the only states for which a missing engine
-// migration means the task was abandoned (e.g. a server crash). Resting states
-// such as Stopped and FailedRetryable also have no active engine work, but that
+// working on the task. These are the only states for which missing engine-side
+// work means the task was abandoned (e.g. a server crash). Resting states such
+// as Stopped and FailedRetryable also have no active engine work, but that
 // absence is expected — Spirit keeps the checkpoint while the operator decides
 // whether to resume or retry — so they are excluded here.
 func IsInFlightTaskState(s string) bool {
 	switch NormalizeState(s) {
-	case Task.Running, Task.WaitingForCutover, Task.CuttingOver, Task.WaitingForDeploy, Task.Recovering:
+	case Task.Running, Task.Checksumming, Task.WaitingForCutover, Task.CuttingOver, Task.WaitingForDeploy, Task.Recovering:
 		return true
 	default:
 		return false
@@ -91,13 +93,20 @@ func NormalizeTaskStatus(raw string) string {
 		spiritstatus.Close.String():
 		return Task.Completed
 
+	// Checksumming — Spirit verifies the copied data against the source before
+	// cutover. On a large table this phase can run for hours, so it is surfaced
+	// as its own table state rather than folded into Running. PostChecksum stays
+	// Running: it is applying changeset deltas accumulated during the verify, not
+	// verifying.
+	case spiritstatus.Checksum.String():
+		return Task.Checksumming
+
 	// Running — Spirit sub-states (camelCase from Spirit's State.String())
 	case spiritstatus.CopyRows.String(),
 		spiritstatus.Initial.String(),
 		spiritstatus.ApplyChangeset.String(),
 		spiritstatus.RestoreSecondaryIndexes.String(),
 		spiritstatus.AnalyzeTable.String(),
-		spiritstatus.Checksum.String(),
 		spiritstatus.PostChecksum.String(),
 		spiritstatus.ErrCleanup.String():
 		return Task.Running
@@ -129,7 +138,7 @@ func NormalizeTaskStatus(raw string) string {
 		return Task.Cancelled
 
 	// Pass-through for already-normalized values
-	case Task.Pending, Task.Running, Task.Completed, Task.Stopped, Task.Failed,
+	case Task.Pending, Task.Running, Task.Checksumming, Task.Completed, Task.Stopped, Task.Failed,
 		Task.FailedRetryable, Task.RevertWindow, Task.Reverted,
 		Task.WaitingForDeploy, Task.WaitingForCutover, Task.Recovering,
 		Task.CuttingOver, Task.Cancelled:
@@ -139,7 +148,7 @@ func NormalizeTaskStatus(raw string) string {
 	switch normalized := NormalizeState(s); normalized {
 	case NormalizeState(string(vitessstatus.OnlineDDLStatusComplete)):
 		return Task.Completed
-	case Task.Pending, Task.Running, Task.Completed, Task.Stopped, Task.Failed,
+	case Task.Pending, Task.Running, Task.Checksumming, Task.Completed, Task.Stopped, Task.Failed,
 		Task.FailedRetryable, Task.RevertWindow, Task.Reverted,
 		Task.WaitingForDeploy, Task.WaitingForCutover, Task.Recovering,
 		Task.CuttingOver, Task.Cancelled:

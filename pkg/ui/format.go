@@ -201,7 +201,7 @@ func PluralizeLabel(singular, plural string, count int) string {
 // Used by both CLI (watch TUI) and PR comment rendering for consistent ordering.
 func TableStatePriority(taskState string) int {
 	switch taskState {
-	case state.Task.Running, state.Task.CuttingOver:
+	case state.Task.Running, state.Task.Checksumming, state.Task.CuttingOver:
 		return 0 // active — top
 	case state.Task.WaitingForCutover, state.Task.Recovering, state.Task.FailedRetryable:
 		return 1

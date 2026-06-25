@@ -211,6 +211,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"FIRST TABLE RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFirstRunning()) }},
 		{"SECOND TABLE RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyProgress()) }},
 		{"SECOND TABLE ESTIMATE EXCEEDED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyEstimateExceeded()) }},
+		{"SECOND TABLE CHECKSUMMING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyChecksumming()) }},
 		{"THIRD TABLE RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyThirdRunning()) }},
 		// Sharded tables: compact per-shard summary (inline for few, collapsed for many)
 		{"SHARDED: SHARD PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyShardProgress()) }},
@@ -305,6 +306,7 @@ func previewCLIApplyAllOutput() {
 		{"MYSQL: MULTI-TABLE ALL PENDING", previewSeqPendingOutput},
 		{"MYSQL: MULTI-TABLE FIRST TABLE RUNNING", previewSeqFirstRunOutput},
 		{"MYSQL: MULTI-TABLE SECOND TABLE RUNNING", previewSeqSecondRunOutput},
+		{"MYSQL: MULTI-TABLE SECOND TABLE CHECKSUMMING", previewSeqChecksummingOutput},
 		{"MYSQL: MULTI-TABLE THIRD TABLE RUNNING", previewSeqThirdRunOutput},
 		{"MYSQL: MULTI-TABLE ALL COMPLETED", previewSeqAllDoneOutput},
 		{"MYSQL: MULTI-TABLE FIRST TABLE FAILED", previewSeqFirstFailOutput},

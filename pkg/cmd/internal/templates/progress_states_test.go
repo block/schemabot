@@ -193,6 +193,21 @@ func TestFormatTableProgress_ChangeTypeSymbol(t *testing.T) {
 	}
 }
 
+// A checksumming table renders its own verify label rather than a row-copy
+// percent — its copy is done and the engine is now verifying the data.
+func TestFormatTableProgress_Checksumming(t *testing.T) {
+	tp := TableProgress{
+		TableName:  "orders",
+		ChangeType: "alter",
+		Status:     state.Task.Checksumming,
+	}
+
+	output := FormatTableProgress(tp)
+
+	assert.Contains(t, output, "orders: ")
+	assert.Contains(t, output, "🔍 Checksumming to verify data...")
+}
+
 func TestFormatTableProgress_InstantDDL(t *testing.T) {
 	tp := TableProgress{
 		TableName:  "users",

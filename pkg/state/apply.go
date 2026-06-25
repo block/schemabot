@@ -275,6 +275,11 @@ func normalizeApplyState(raw string) string {
 		return Apply.Pending
 	case "RUNNING":
 		return Apply.Running
+	// Checksumming is a table-level (task) state, not an apply state: while one
+	// or more tables verify their copied data, the apply as a whole is still
+	// running. Fold it into Running for the aggregate derivation.
+	case "CHECKSUMMING":
+		return Apply.Running
 	case "RUNNING_DEGRADED":
 		return Apply.RunningDegraded
 	case "PAUSED":

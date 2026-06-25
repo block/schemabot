@@ -458,6 +458,15 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
+	case state.Task.Checksumming:
+		bar := ui.ProgressBarRowCopy(100) // blue — row copy done, verifying data
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data...\n", t.TableName, bar)
+		if t.DDL != "" {
+			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		b.WriteString("\n")
+		b.WriteString(FormatShardProgress(t.Shards))
+		return b.String()
 	case state.Apply.WaitingForCutover:
 		bar := ui.ProgressBarRowCopy(100) // blue — in progress, row copy done
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Waiting for cutover\n", t.TableName, bar)

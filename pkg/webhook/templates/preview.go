@@ -771,6 +771,16 @@ func PreviewCommentApplyProgress() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
 }
 
+// PreviewCommentApplyChecksumming renders an apply comment where a table has
+// finished copying and entered the checksum phase to verify the copied data.
+func PreviewCommentApplyChecksumming() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Checksumming
+	tables[2].Status = state.Task.Pending
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+}
+
 // PreviewCommentApplyEstimateExceeded renders an apply comment where the active row copy has exceeded MySQL's initial estimate.
 func PreviewCommentApplyEstimateExceeded() string {
 	tables := sampleApplyTables()

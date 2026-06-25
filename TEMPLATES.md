@@ -1964,6 +1964,50 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="second-table-checksumming"></a><strong>Second Table Checksumming</strong></summary>
+
+
+## Schema Change In Progress
+
+**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+📊 1/3 complete · 1 checksumming · 1 queued
+
+### Table Progress
+
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔍 Checksumming to verify data...
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: ⏳ Queued
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="third-table-running"></a><strong>Third Table Running</strong></summary>
 
 
@@ -3150,6 +3194,34 @@ Sequential mode: First complete, second running
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60%
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
        • Rows: 3,000,000 / 5,000,000 · ETA: 12m 15s
+
+     ~ products: ⏳ Queued
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+
+
+```
+</details>
+
+<details>
+<summary><a name="mysql-multitable-second-table-checksumming"></a><strong>MySQL: Multi-table Second Table Checksumming</strong></summary>
+
+```
+
+Sequential mode: First complete, second checksumming
+
+┌──────────────────────────────────┐
+│  Apply ID:  apply-a1b2c3d4e5f6   │
+│  State:     Running              │
+│  Started:   Jan 15 14:05:00 UTC  │
+│  Duration:  25m                  │
+└──────────────────────────────────┘
+
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔍 Checksumming to verify data...
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
      ~ products: ⏳ Queued
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
