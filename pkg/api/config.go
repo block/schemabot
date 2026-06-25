@@ -433,10 +433,10 @@ type EtreConfig struct {
 	DatabaseType string `yaml:"database_type"`
 	// EntityType is the Etre entity type recording the target clusters.
 	EntityType string `yaml:"entity_type"`
-	// Headers are added to every Etre request, for deployments that reach Etre
-	// through a header-aware proxy or service mesh that routes by request header.
-	// Optional; no header is sent unless configured here.
-	Headers map[string]string `yaml:"headers,omitempty"`
+	// HTTP configures how Etre requests are transported, for deployments that
+	// reach Etre through a local egress proxy or header-routed service mesh.
+	// Optional; the default transport is used when unset.
+	HTTP EtreHTTPConfig `yaml:"http,omitempty"`
 	// TargetLabel is the Etre label the request's opaque target matches.
 	TargetLabel string `yaml:"target_label"`
 	// EnvLabel, when set, scopes the lookup to the request environment.
@@ -452,6 +452,20 @@ type EtreConfig struct {
 	Vitess EtreVitessConfig `yaml:"vitess,omitempty"`
 	// Credentials configures the credentials for the connection.
 	Credentials EtreCredentialsConfig `yaml:"credentials"`
+}
+
+// EtreHTTPConfig configures the transport for Etre requests. Both fields are
+// generic HTTP-client concerns, so a deployment behind any egress proxy or
+// header-routing mesh can be expressed in config without engine code.
+type EtreHTTPConfig struct {
+	// UnixSocket, when set, dials this unix domain socket for every Etre request
+	// instead of TCP (supports secret refs, e.g. env:EGRESS_SOCKET). Use it to
+	// reach Etre through a local egress proxy; the request Host (from Addr) is
+	// still sent so the proxy can route by host and Headers.
+	UnixSocket string `yaml:"unix_socket,omitempty"`
+	// Headers are added to every Etre request, for proxies/meshes that route by
+	// request header. No header is sent unless configured here.
+	Headers map[string]string `yaml:"headers,omitempty"`
 }
 
 // EtreMySQLConfig holds the MySQL-specific knobs for an Etre resolver: how to

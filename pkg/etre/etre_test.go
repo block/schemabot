@@ -3,8 +3,10 @@ package etre
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"github.com/square/etre"
@@ -176,4 +178,48 @@ func TestClientWithHeadersDoesNotMutateBase(t *testing.T) {
 	assert.Nil(t, base.Transport, "base client transport must be untouched")
 	assert.NotNil(t, wrapped.Transport)
 	assert.NotSame(t, base, wrapped)
+}
+
+// A configured unix socket makes every Etre request dial that socket instead of
+// the Addr host — the path for reaching Etre through a local egress proxy. The
+// Addr host is intentionally unresolvable to prove the socket is used, and the
+// configured headers still ride along for the proxy to route by.
+func TestNewDialsUnixSocket(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "etre.sock")
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "unix", socketPath)
+	require.NoError(t, err)
+
+	type captured struct {
+		host    string
+		headers http.Header
+	}
+	capCh := make(chan captured, 1)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capCh <- captured{host: r.Host, headers: r.Header.Clone()}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"name":"orders","host":"orders.example:3306"}]`))
+	}))
+	srv.Listener = ln
+	srv.Start()
+	defer srv.Close()
+
+	c, err := New(Config{
+		Addr:       "http://etre.invalid",
+		EntityType: "cluster",
+		UnixSocket: socketPath,
+		Headers:    map[string]string{"X-Env-Override": "production"},
+	})
+	require.NoError(t, err)
+
+	_, err = c.QueryOne(t.Context(), map[string]string{"name": "orders"})
+	require.NoError(t, err)
+	var got captured
+	select {
+	case got = <-capCh:
+	default:
+		t.Fatal("Etre handler was not invoked over the unix socket")
+	}
+	assert.Equal(t, "etre.invalid", got.host, "request Host (from Addr) is preserved for proxy routing")
+	assert.Equal(t, "production", got.headers.Get("X-Env-Override"))
 }

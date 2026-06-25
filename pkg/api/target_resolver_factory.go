@@ -116,7 +116,11 @@ func buildEtreResolver(ctx context.Context, cfg EtreConfig, logger *slog.Logger)
 	if addr == "" {
 		return nil, fmt.Errorf("target_resolver.etre.addr resolved to an empty value")
 	}
-	client, err := etre.New(etre.Config{Addr: addr, EntityType: cfg.EntityType, Headers: cfg.Headers, Logger: logger})
+	unixSocket, err := secrets.Resolve(cfg.HTTP.UnixSocket, "")
+	if err != nil {
+		return nil, fmt.Errorf("resolve target_resolver.etre.http.unix_socket: %w", err)
+	}
+	client, err := etre.New(etre.Config{Addr: addr, EntityType: cfg.EntityType, UnixSocket: unixSocket, Headers: cfg.HTTP.Headers, Logger: logger})
 	if err != nil {
 		return nil, fmt.Errorf("build etre client: %w", err)
 	}

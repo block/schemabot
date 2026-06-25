@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -36,8 +37,14 @@ type Config struct {
 	// EntityType is the Etre entity type this client queries.
 	EntityType string
 	// HTTPClient is used for Etre requests. The deployment owns any required
-	// routing/TLS. When nil, http.DefaultClient is used.
+	// routing/TLS. When nil, http.DefaultClient is used (or, if UnixSocket is set,
+	// a client that dials that socket).
 	HTTPClient *http.Client
+	// UnixSocket, when set and no HTTPClient is supplied, dials this unix domain
+	// socket for every Etre request instead of TCP. Use it to reach Etre through a
+	// local egress proxy; the request Host (from Addr) is still sent, so the proxy
+	// can route by host and Headers.
+	UnixSocket string
 	// Headers, when set, are added to every Etre request. Deployments that reach
 	// Etre through a header-aware proxy or service mesh can supply the routing
 	// headers that proxy requires; no header is baked into the client.
@@ -67,7 +74,11 @@ func New(cfg Config) (*Client, error) {
 	// first request, so default it here.
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		if cfg.UnixSocket != "" {
+			httpClient = unixSocketClient(cfg.UnixSocket)
+		} else {
+			httpClient = http.DefaultClient
+		}
 	}
 	if len(cfg.Headers) > 0 {
 		httpClient = clientWithHeaders(httpClient, cfg.Headers)
@@ -79,6 +90,22 @@ func New(cfg Config) (*Client, error) {
 		Retry:      cfg.Retry,
 	})
 	return newClient(entities, cfg.EntityType, cfg.Logger), nil
+}
+
+// unixSocketClient builds an HTTP client that dials the given unix domain
+// socket for every request instead of the request URL's host:port. The request
+// Host is still sent, so an egress proxy listening on the socket can route by
+// host (and any headers). It is the generic seam for reaching a service through
+// a local egress proxy rather than directly over TCP.
+func unixSocketClient(socketPath string) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var dialer net.Dialer
+				return dialer.DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
 }
 
 // clientWithHeaders returns a shallow copy of base whose transport sets the
