@@ -27,7 +27,6 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 	}
 
 	// Step 1: Generate rollback plan from the specified apply
-	fmt.Println("Generating rollback plan...")
 	var planResult *apitypes.PlanResponse
 	err = withLoading("Generating rollback plan...", true, func() error {
 		var planErr error

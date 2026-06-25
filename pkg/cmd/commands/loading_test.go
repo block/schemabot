@@ -78,6 +78,17 @@ func TestWithLoadingDisabledIsSilent(t *testing.T) {
 	assert.Empty(t, out.String())
 }
 
+func TestWithLoadingNonTerminalIsSilent(t *testing.T) {
+	var out bytes.Buffer
+	withTestLoadingSpinner(t, &out)
+	loadingSpinnerTerminal = func() bool { return false }
+
+	err := withLoading("Loading schema change progress...", true, func() error { return nil })
+
+	require.NoError(t, err)
+	assert.Empty(t, out.String())
+}
+
 func withTestLoadingSpinner(t *testing.T, writer interface{ Write([]byte) (int, error) }) {
 	t.Helper()
 	originalDelay := loadingSpinnerDelay
