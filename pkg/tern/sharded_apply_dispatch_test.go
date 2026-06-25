@@ -10,18 +10,6 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// A gRPC data plane must advertise sharded-apply fan-out so the control plane
-// fans a sharded plan out into one claimable apply_operation per shard and
-// dispatches each scoped to its shard. The capability is unconditional: apply-
-// create only fans out when the stored plan carries changing shards, so a
-// non-sharded plan is unaffected.
-func TestGRPCClientAdvertisesShardedApplyFanout(t *testing.T) {
-	var client Client = &GRPCClient{}
-	capable, ok := client.(ShardedApplyFanoutSupport)
-	require.True(t, ok, "GRPCClient must implement ShardedApplyFanoutSupport")
-	assert.True(t, capable.SupportsShardedApplyFanout())
-}
-
 // A dispatched apply carries the control plane's authoritative, already-scoped
 // DDL changes for one apply_operation; the data plane must execute exactly
 // those, not re-expand the whole stored plan. This is what lets a per-(shard,

@@ -26,7 +26,6 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/schemabot/pkg/tern"
 )
 
 const applyOperationKeyMaxLen = 255
@@ -859,7 +858,7 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		client.SetObserver(storedApplyID, observer)
 	}
 
-	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, options, clientSupportsShardedApplyFanout(client), attachObserver)
+	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, options, attachObserver)
 	if err != nil {
 		recordApplyError("enqueue apply", err)
 		return nil, 0, err
@@ -886,11 +885,10 @@ func (s *Service) enqueueApply(
 	plan *storage.Plan,
 	req ApplyRequest,
 	options map[string]string,
-	shardedFanoutSupported bool,
 	onApplyCreated func(int64),
 ) (string, int64, error) {
 	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
-	apply, storedApplyID, err := s.createStoredApply(ctx, plan, req, options, applyIdentifier, shardedFanoutSupported)
+	apply, storedApplyID, err := s.createStoredApply(ctx, plan, req, options, applyIdentifier)
 	if err != nil {
 		return "", 0, err
 	}
@@ -906,7 +904,6 @@ func (s *Service) createStoredApply(
 	req ApplyRequest,
 	options map[string]string,
 	applyIdentifier string,
-	shardedFanoutSupported bool,
 ) (*storage.Apply, int64, error) {
 	now := time.Now()
 	applyOpts := storage.ApplyOptionsFromMap(options)
@@ -961,7 +958,7 @@ func (s *Service) createStoredApply(
 	taskChanges := applyTaskChanges(plan)
 	cutoverPolicy := s.config.CutoverPolicyFor(plan.Database, req.Environment)
 	onFailure := s.config.OnFailure(plan.Database, req.Environment)
-	groups, shardedFanout, err := buildApplyOperationGroups(plan, taskChanges, targets, req.Environment, applyOpts, cutoverPolicy, onFailure, now, shardedFanoutSupported)
+	groups, shardedFanout, err := buildApplyOperationGroups(plan, taskChanges, targets, req.Environment, applyOpts, cutoverPolicy, onFailure, now)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -998,11 +995,6 @@ func (s *Service) createStoredApply(
 	return apply, storedApplyID, nil
 }
 
-func clientSupportsShardedApplyFanout(client tern.Client) bool {
-	capability, ok := client.(tern.ShardedApplyFanoutSupport)
-	return ok && capability.SupportsShardedApplyFanout()
-}
-
 // applyTaskChanges returns the per-table DDL changes that become apply tasks.
 // VSchema application is no longer modeled as a synthetic task: PlanetScale
 // surfaces its VSchema status/diff from engine resume metadata, and a sharded
@@ -1020,9 +1012,12 @@ func buildApplyOperationGroups(
 	cutoverPolicy string,
 	onFailure string,
 	now time.Time,
-	shardedFanoutSupported bool,
 ) ([]*storage.ApplyOperationWithTasks, bool, error) {
-	if shardedFanoutSupported && canBuildShardedOperationGroups(plan, taskChanges) {
+	// Fan a plan out per shard whenever it carries per-shard changes. Only an
+	// instance-local sharded engine (Strata) produces those, so an
+	// externally-authoritative engine (e.g. PlanetScale) — whose plans never
+	// carry per-shard changes — is never fanned out, regardless of transport.
+	if canBuildShardedOperationGroups(plan, taskChanges) {
 		groups, err := buildShardedApplyOperationGroups(plan, targets, environment, applyOpts, cutoverPolicy, onFailure, now)
 		if err != nil {
 			return nil, false, err

@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -956,6 +957,65 @@ func TestGRPCClient_ResumeApplyOperationDispatchesScopedTasks(t *testing.T) {
 	require.Len(t, req.DdlChanges, 1)
 	assert.Equal(t, "users", req.DdlChanges[0].TableName)
 	assert.Equal(t, []string{"-80"}, req.TargetShards)
+}
+
+func TestGRPCClient_ResumeApplyOperationDispatchesGroupFinalizerAsVSchemaOnly(t *testing.T) {
+	// A task-less group_finalizer operation is driven over the remote path by
+	// dispatching the namespace VSchema as a VSchema-only apply (no DDL, no target
+	// shards) rather than failing closed on the empty task set. The data plane
+	// applies it via its task-less VSchema-only path.
+	server := &capturingTernServer{remoteApplyID: "remote-finalizer-1"} // default Progress = COMPLETED
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              8,
+		ApplyIdentifier: "apply-finalizer",
+		PlanID:          99,
+		Database:        "commerce",
+		DatabaseType:    storage.DatabaseTypeStrata,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "commerce-target"})
+	operationID := int64(51)
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{getByApplyIDErr: errors.New("finalizer drive must not load tasks")},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-finalizer",
+			SchemaFiles: schema.SchemaFiles{
+				"commerce": {Files: map[string]string{vSchemaArtifactName: `{"sharded":true}`}},
+			},
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"commerce": {Artifacts: map[string]string{vSchemaArtifactName: `{"sharded":true}`}},
+			},
+		}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {
+				ID:            operationID,
+				ApplyID:       apply.ID,
+				Deployment:    "commerce-deployment",
+				OperationKey:  "commerce/group_finalizer",
+				OperationKind: storage.ApplyOperationKindGroupFinalizer,
+				State:         state.ApplyOperation.Pending,
+			},
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.NoError(t, err, "a group_finalizer must dispatch, not fail closed on no tasks")
+
+	req := server.getApplyRequest()
+	require.NotNil(t, req, "expected the finalizer to dispatch a VSchema apply to remote Tern")
+	require.Len(t, req.DdlChanges, 1)
+	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_VSCHEMA, req.DdlChanges[0].ChangeType)
+	assert.Equal(t, "commerce", req.DdlChanges[0].Namespace)
+	assert.Empty(t, req.TargetShards, "a namespace VSchema apply targets no shard")
+	assert.Contains(t, req.SchemaFiles, "commerce", "the vschema.json must be carried for a materializing remote")
 }
 
 func TestGRPCClient_ResumeApplyOperationDispatchParksBarrierCutoverRemotely(t *testing.T) {

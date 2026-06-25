@@ -233,16 +233,6 @@ func (c *GRPCClient) IsRemote() bool { return true }
 // Endpoint returns the gRPC dial address for this client.
 func (c *GRPCClient) Endpoint() string { return c.address }
 
-// SupportsShardedApplyFanout reports that a sharded plan dispatched over this
-// client may be fanned out into one claimable apply_operation per shard. The
-// control plane owns that fan-out (and its rollout sequencing); the data plane
-// behind this client executes one shard per dispatch, scoped by the per-shard
-// ApplyRequest's TargetShards and DdlChanges. Reporting true is safe regardless
-// of the remote engine: apply-create only fans out when the stored plan carries
-// changing shards (canBuildShardedOperationGroups), which non-sharded engines
-// never produce, so a non-sharded plan is dispatched whole exactly as before.
-func (c *GRPCClient) SupportsShardedApplyFanout() bool { return true }
-
 // SetPendingObserver sets an observer consumed by the next Apply() call.
 func (c *GRPCClient) SetPendingObserver(observer ProgressObserver) {
 	c.observerMu.Lock()
@@ -1199,7 +1189,14 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 	if err != nil {
 		return err
 	}
-	// Fail closed before any dispatch or state mutation: an operation that
+	// A group_finalizer is task-less by design: it applies the namespace VSchema
+	// once its sibling shard work completes. Drive it over gRPC as a VSchema-only
+	// apply rather than failing closed on the empty task set, mirroring
+	// LocalClient.ResumeApplyOperation's finalizer branch.
+	if scope.operation != nil && scope.operation.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+		return c.dispatchRemoteGroupFinalizer(ctx, apply, scope)
+	}
+	// Fail closed before any dispatch or state mutation: a work operation that
 	// resolves to no tasks is an invalid or stale claim. The shared resume path
 	// would otherwise mark the whole parent apply failed (dispatchPendingApply
 	// and the remote-failure sites set applies.state regardless of scope), which
@@ -1213,6 +1210,86 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
 	}
 	return c.resumeApply(ctx, apply, scope)
+}
+
+// dispatchRemoteGroupFinalizer drives a task-less group_finalizer apply_operation
+// over gRPC. It is the remote counterpart to LocalClient.driveGroupFinalizer:
+// the control plane cannot run the engine, so it dispatches the namespace's
+// VSchema as a VSchema-only apply (no DDL, no target shards) to the data plane,
+// which applies it via its task-less VSchema-only path
+// (isTasklessVSchemaOnlyPlan); records the remote apply id on the operation; and
+// polls to completion. Carrying both a VSchema change and the plan's schema
+// files lets the remote drive it whether it has the plan locally or materializes
+// it from the dispatch.
+func (c *GRPCClient) dispatchRemoteGroupFinalizer(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
+	op := scope.operation
+	namespace := namespaceFromFinalizerKey(op.OperationKey)
+	if namespace == "" {
+		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): malformed operation key %q", op.ID, apply.ApplyIdentifier, op.OperationKey)
+	}
+	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	if err != nil {
+		return fmt.Errorf("load plan %d for group_finalizer apply_operation %d (apply %s): %w", apply.PlanID, op.ID, apply.ApplyIdentifier, err)
+	}
+	if plan == nil {
+		return fmt.Errorf("plan %d not found for group_finalizer apply_operation %d (apply %s)", apply.PlanID, op.ID, apply.ApplyIdentifier)
+	}
+	// Fail closed if the namespace carries no VSchema artifact, mirroring the
+	// local finalizer drive.
+	if _, err := finalizerVSchemaChanges(plan, namespace); err != nil {
+		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
+	}
+
+	// Dispatch only if this operation has not already been dispatched. On resume
+	// the recorded remote apply id lets us poll the existing remote apply instead
+	// of starting a duplicate.
+	if scope.remoteApplyID(apply) == "" {
+		options := effectiveCopyDriveOptions(apply, scope.multiOperation, scope.operation).Map()
+		target := options["target"]
+		if target == "" {
+			target = apply.Database
+		}
+		if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
+			return err
+		}
+		resp, err := c.client.Apply(ctx, &ternv1.ApplyRequest{
+			PlanId:      plan.PlanIdentifier,
+			Options:     options,
+			Database:    apply.Database,
+			Type:        apply.DatabaseType,
+			DdlChanges:  []*ternv1.TableChange{{Namespace: namespace, TableName: "VSchema: " + namespace, ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA}},
+			SchemaFiles: schemaFilesToProto(plan.SchemaFiles),
+			Environment: apply.Environment,
+			Target:      target,
+			Caller:      apply.Caller,
+			// No TargetShards: the VSchema is namespace-level, not per shard.
+			IdempotencyKey: remoteApplyIdempotencyKey(apply, scope),
+		})
+		if err != nil {
+			if isAmbiguousRemoteApplyDispatchError(err) {
+				return fmt.Errorf("group_finalizer apply_operation %d (apply %s) has ambiguous remote dispatch outcome: %w", op.ID, apply.ApplyIdentifier, err)
+			}
+			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, err.Error(), isRetryableRemoteApplyError(err), scope); markErr != nil {
+				return fmt.Errorf("mark group_finalizer apply_operation %d failed after remote apply error: %w", op.ID, markErr)
+			}
+			return fmt.Errorf("dispatch group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
+		}
+		if resp == nil || !resp.Accepted || resp.ApplyId == "" {
+			errMsg := "remote group_finalizer apply was not accepted"
+			if resp != nil && resp.ErrorMessage != "" {
+				errMsg = resp.ErrorMessage
+			}
+			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
+				return fmt.Errorf("mark group_finalizer apply_operation %d failed: %w", op.ID, markErr)
+			}
+			return fmt.Errorf("dispatch group_finalizer apply_operation %d (apply %s): %s", op.ID, apply.ApplyIdentifier, errMsg)
+		}
+		if err := c.persistRemoteApplyID(ctx, apply, scope, resp.ApplyId); err != nil {
+			return fmt.Errorf("store remote apply id for group_finalizer apply_operation %d: %w", op.ID, err)
+		}
+	}
+
+	return c.pollForCompletion(ctx, apply, false, scope, false)
 }
 
 // ResumeApplyOperationCutover drives a single barrier-parked apply_operation
