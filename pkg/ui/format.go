@@ -43,16 +43,25 @@ func VSchemaStatusLabel(status string) string {
 	}
 }
 
-// FormatETA formats a duration in seconds as a human-readable string.
-// Examples: 45 → "45s", 195 → "3m 15s", 3700 → "1h 1m"
+// FormatETA formats a duration in seconds as a human-readable string, using the
+// two largest non-zero units so a long copy stays readable.
+// Examples: 45 → "45s", 195 → "3m 15s", 3700 → "1h 1m", 180000 → "2d 2h"
 func FormatETA(seconds int64) string {
-	if seconds < 60 {
+	const (
+		minute = 60
+		hour   = 60 * minute
+		day    = 24 * hour
+	)
+	switch {
+	case seconds < minute:
 		return fmt.Sprintf("%ds", seconds)
+	case seconds < hour:
+		return fmt.Sprintf("%dm %ds", seconds/minute, seconds%minute)
+	case seconds < day:
+		return fmt.Sprintf("%dh %dm", seconds/hour, (seconds%hour)/minute)
+	default:
+		return fmt.Sprintf("%dd %dh", seconds/day, (seconds%day)/hour)
 	}
-	if seconds < 3600 {
-		return fmt.Sprintf("%dm %ds", seconds/60, seconds%60)
-	}
-	return fmt.Sprintf("%dh %dm", seconds/3600, (seconds%3600)/60)
 }
 
 // ClampRows returns rows clamped to total for display purposes.

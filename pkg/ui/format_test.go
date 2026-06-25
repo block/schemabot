@@ -47,6 +47,31 @@ func TestProgressBarActivity(t *testing.T) {
 	assert.Zero(t, strings.Count(bar, ColorEmpty))
 }
 
+func TestFormatETA(t *testing.T) {
+	tests := []struct {
+		name    string
+		seconds int64
+		want    string
+	}{
+		{"zero", 0, "0s"},
+		{"sub-minute", 45, "45s"},
+		{"exactly a minute", 60, "1m 0s"},
+		{"minutes and seconds", 195, "3m 15s"},
+		{"exactly an hour", 3600, "1h 0m"},
+		{"hours and minutes", 3700, "1h 1m"},
+		{"just under a day", 86399, "23h 59m"},
+		{"exactly a day", 86400, "1d 0h"},
+		{"days and hours", 180000, "2d 2h"},
+		{"multi-week copy", 1814400, "21d 0h"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, FormatETA(tt.seconds))
+		})
+	}
+}
+
 func TestRowCopyDisplayPercent(t *testing.T) {
 	assert.Equal(t, 0, RowCopyDisplayPercent(0, 0))
 	assert.Equal(t, 1, RowCopyDisplayPercent(0, 42))
