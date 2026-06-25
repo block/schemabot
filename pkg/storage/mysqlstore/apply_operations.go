@@ -164,10 +164,11 @@ func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, err
 	if err != nil {
 		return err
 	}
-	args := make([]any, 0, len(setArgs)+1+len(guard.args()))
+	guardArgs := guard.args()
+	args := make([]any, 0, len(setArgs)+1+len(guardArgs))
 	args = append(args, setArgs...)
 	args = append(args, id)
-	args = append(args, guard.args()...)
+	args = append(args, guardArgs...)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
 		`+guard.join()+`
