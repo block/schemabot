@@ -18,6 +18,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -198,7 +199,7 @@ func withLoading(message string, show bool, fn func() error) error {
 		defer ticker.Stop()
 
 		for {
-			if _, err := fmt.Fprintf(loadingSpinnerWriter, "\r%s %s", loadingSpinnerFrames[frame%len(loadingSpinnerFrames)], message); err != nil {
+			if _, err := fmt.Fprintf(loadingSpinnerWriter, "\r%s%s %s%s", templates.ANSIDim, loadingSpinnerFrames[frame%len(loadingSpinnerFrames)], message, templates.ANSIReset); err != nil {
 				return
 			}
 			frame++
