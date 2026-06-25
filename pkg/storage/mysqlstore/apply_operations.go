@@ -20,7 +20,7 @@ import (
 
 // applyOperationColumns lists all columns for SELECT queries.
 const applyOperationColumns = `id, apply_id, deployment, operation_key, operation_kind, target, state, error_message,
-	cutover_policy, on_failure, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
+	cutover_policy, on_failure, attempt, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
 	engine_resume_context, engine_resume_metadata, created_at, updated_at`
 
 // mysqlErrDupEntry is MySQL's error number for a duplicate-key violation.
@@ -952,6 +952,23 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		// the row lock this UPDATE takes serializes them, so the second sees the
 		// already-incremented attempt and does not overshoot maxRecoveryAttempts.
 		if ad.State == state.ApplyOperation.FailedRetryable {
+			// Advance the operation's own attempt: a failed_retryable re-claim is
+			// this operation's deliberate redispatch, so its dispatch generation
+			// rotates. Crash-recovery re-lease of an in-flight drive (the other
+			// arm of this default case) leaves attempt untouched so the orphaned
+			// dispatch's idempotency key stays stable and is reused, not
+			// duplicated. Unlike the parent budget bump below, this is not gated
+			// on multi-operation: attempt is operation-local and a sibling's
+			// retry must never rotate it.
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE apply_operations
+				SET attempt = attempt + 1
+				WHERE id = ?
+			`, ad.ID); err != nil {
+				return nil, fmt.Errorf("advance attempt for apply_operation %d redispatch: %w", ad.ID, err)
+			}
+			ad.Attempt++
+
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE applies a
 				SET a.attempt = a.attempt + 1, a.updated_at = NOW()
@@ -1357,7 +1374,7 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 
 	if err := s.Scan(
 		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.OperationKey, &ad.OperationKind, &ad.Target, &ad.State, &errMsg,
-		&ad.CutoverPolicy, &ad.OnFailure, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
+		&ad.CutoverPolicy, &ad.OnFailure, &ad.Attempt, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
 		&engineResumeContext, &engineResumeMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {
 		return nil, err

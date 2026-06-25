@@ -549,6 +549,14 @@ type ApplyOperation struct {
 	// omits the policy never silently degrades to the less-safe behaviour.
 	OnFailure string
 
+	// Attempt counts deliberate redispatches of this operation. It starts at 0
+	// and advances only when a driver re-claims the row from failed_retryable —
+	// the operation's own retry — not on crash-recovery re-lease of an in-flight
+	// drive. It is the operation-local counterpart to applies.attempt: a sibling
+	// operation's retry advances the shared parent attempt but never this row's,
+	// so an operation-scoped dispatch generation rotates only on its own retry.
+	Attempt int
+
 	// StartedAt is when the operator claimed this child row and execution began.
 	StartedAt *time.Time
 

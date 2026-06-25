@@ -1305,6 +1305,124 @@ func TestApplyOperationStore_FindNextApplyOperation_SingleOpRedispatchDoesNotCon
 	assert.Equal(t, maxRecoveryAttempts-1, persistedApply.Attempt, "a single-op apply's retry budget is charged by ClaimApplyByID, not by the operation claim")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_RedispatchAdvancesOperationAttempt
+// verifies that re-claiming a failed_retryable operation — its deliberate
+// redispatch — advances the operation's own attempt counter, both on the
+// returned row and as persisted. This is the per-operation dispatch generation
+// the operation-scoped idempotency key rotates on.
+func TestApplyOperationStore_FindNextApplyOperation_RedispatchAdvancesOperationAttempt(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_attempt_bump", 1, state.Apply.FailedRetryable, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ?, updated_at = NOW() WHERE id = ?
+	`, maxRecoveryAttempts-1, apply.ID)
+	require.NoError(t, err)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, id, claimed.ID)
+	assert.Equal(t, 1, claimed.Attempt, "a failed_retryable redispatch must advance the operation's own attempt")
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, 1, persisted.Attempt, "the advanced operation attempt must be persisted")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_SiblingRedispatchLeavesOperationAttempt
+// verifies the operation attempt is operation-local: redispatching one
+// failed_retryable operation advances the shared parent attempt but never a
+// sibling operation's own attempt. This is what keeps a sibling's idempotency
+// key stable while it sits in its dispatch-then-crash window, so it is not
+// dispatched a second time when an unrelated operation retries.
+func TestApplyOperationStore_FindNextApplyOperation_SiblingRedispatchLeavesOperationAttempt(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_sibling_attempt", 1, state.Apply.FailedRetryable, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ?, updated_at = NOW() WHERE id = ?
+	`, maxRecoveryAttempts-1, apply.ID)
+	require.NoError(t, err)
+
+	// region-a is the failed_retryable operation about to be redispatched.
+	retryID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+	// region-b is a sibling in its own (running) drive; its attempt must not move.
+	siblingID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.WaitingForCutover,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, retryID, claimed.ID, "the failed_retryable operation is the one redispatched")
+	assert.Equal(t, 1, claimed.Attempt, "the redispatched operation's own attempt advances")
+
+	persistedApply, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persistedApply)
+	assert.Equal(t, maxRecoveryAttempts, persistedApply.Attempt, "the shared parent attempt advances on the redispatch")
+
+	sibling, err := store.ApplyOperations().Get(ctx, siblingID)
+	require.NoError(t, err)
+	require.NotNil(t, sibling)
+	assert.Equal(t, 0, sibling.Attempt, "a sibling's own attempt must not move when an unrelated operation retries")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_CrashRecoveryLeavesOperationAttempt
+// verifies that re-leasing a stale in-flight drive (crash recovery, not a
+// deliberate retry) leaves the operation's attempt untouched, so the orphaned
+// dispatch's idempotency key stays stable and the lost-response self-redispatch
+// is reused rather than duplicated.
+func TestApplyOperationStore_FindNextApplyOperation_CrashRecoveryLeavesOperationAttempt(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_crash_attempt", 1)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApplyOperations().MarkStarted(ctx, id))
+
+	// Backdate the heartbeat past the staleness window so the running row is
+	// re-leasable as crash recovery.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, id)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "recovery-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, id, claimed.ID)
+	assert.Equal(t, 0, claimed.Attempt, "crash-recovery re-lease must not advance the operation attempt")
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, 0, persisted.Attempt, "crash-recovery re-lease must leave the persisted operation attempt unchanged")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableBudgetExhausted
 // verifies the recovery budget is enforced: once the parent apply's attempt
 // count reaches the limit, the failed_retryable operation is no longer
