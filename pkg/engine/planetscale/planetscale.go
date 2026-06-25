@@ -427,6 +427,12 @@ func formatDeployRequestError(dr *ps.DeployRequest) string {
 	return b.String()
 }
 
+// vschemaKeyspaceDiff is one keyspace's VSchema diff captured at deploy creation.
+type vschemaKeyspaceDiff struct {
+	Namespace string `json:"namespace"`
+	Diff      string `json:"diff"`
+}
+
 // psMetadata holds PlanetScale-specific state stored as JSON in ResumeState.Metadata.
 type psMetadata struct {
 	BranchName       string     `json:"branch_name"`
@@ -444,13 +450,12 @@ type psMetadata struct {
 	// same path branch/deploy-URL/instant use.
 	VSchemaStatus string `json:"vschema_status,omitempty"`
 
-	// VSchemaDiff is the VSchema change rendered as a unified diff, captured at
-	// deploy creation from the plan annotation. It is surfaced through the
-	// display-metadata projection so the progress view can show the VSchema
-	// change alongside its status without a synthetic task row. Empty when the
-	// deploy carries no VSchema change. For a deploy spanning multiple keyspaces
-	// the per-keyspace diffs are concatenated under keyspace headers.
-	VSchemaDiff string `json:"vschema_diff,omitempty"`
+	// VSchemaDiffs holds the per-keyspace VSchema diffs, captured at deploy
+	// creation from the plan annotations and kept separate so each keyspace
+	// renders and tracks independently. Surfaced through the display-metadata
+	// projection alongside the deploy's VSchema status, without a synthetic task
+	// row. Empty when the deploy carries no VSchema change.
+	VSchemaDiffs []vschemaKeyspaceDiff `json:"vschema_diffs,omitempty"`
 
 	// ExistingMigrationCtxs is the set of SHOW VITESS_MIGRATIONS contexts that
 	// already existed just before this deploy started, keyed by context. It is

@@ -2055,7 +2055,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ### VSchema
 
-Applying...
+**`myapp_sharded`**: Applying...
 
 ```diff
 + "xxhash": {"type": "xxhash"}
@@ -2094,7 +2094,43 @@ ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 ### VSchema
 
-Applying...
+**`myapp_sharded`**: Applying...
+
+```diff
++ "xxhash": {"type": "xxhash"}
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="vitess-multikeyspace-vschema"></a><strong>Vitess: Multi-keyspace VSchema</strong></summary>
+
+
+## Schema Change In Progress
+
+**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+### VSchema
+
+**`commerce`**: Applied
+
+```diff
++ "lookup_orders": {"type": "lookup_hash"}
+```
+
+**`commerce_sharded`**: Applying...
 
 ```diff
 + "xxhash": {"type": "xxhash"}
@@ -3697,7 +3733,32 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Duration:        10s                                                          │
 └────────────────────────────────────────────────────────────────────────────────┘
 
-    ~ VSchema: Applying...
+    ~ VSchema (myapp_sharded): Applying...
+       + "xxhash": {"type": "xxhash"}
+
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-multikeyspace-vschema"></a><strong>Vitess: Multi-keyspace VSchema</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     staging                                                      │
+│  State:           Running                                                      │
+│  Branch:          schemabot-myapp-28471035                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/46  │
+│  Started:         Jan 15 14:29:50 UTC                                          │
+│  Duration:        10s                                                          │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+    ~ VSchema (commerce): Applied
+       + "lookup_orders": {"type": "lookup_hash"}
+    ~ VSchema (commerce_sharded): Applying...
        + "xxhash": {"type": "xxhash"}
 
 
@@ -3763,7 +3824,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
-    ~ VSchema: Applying...
+    ~ VSchema (myapp_sharded): Applying...
        + "xxhash": {"type": "xxhash"}
 
 

@@ -5,9 +5,21 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
 	"vitess.io/vitess/go/vt/key"
 )
+
+// vschemaPreviewMetadata encodes VSchema changes for preview progress metadata.
+// Preview data is static and developer-controlled, so an encode error is a
+// programming bug rather than a runtime condition.
+func vschemaPreviewMetadata(changes ...apitypes.VSchemaChange) string {
+	encoded, err := apitypes.EncodeVSchemaChanges(changes)
+	if err != nil {
+		panic(fmt.Sprintf("encode VSchema preview metadata: %v", err))
+	}
+	return encoded
+}
 
 func previewPreparingBranchOutput() {
 	data := ProgressData{
@@ -125,8 +137,9 @@ func previewVitessVSchemaOnlyOutput() {
 		Metadata: map[string]string{
 			"branch_name":        "schemabot-myapp-28471035",
 			"deploy_request_url": "https://app.planetscale.com/my-org/myapp/deploy-requests/43",
-			"vschema_status":     "applying",
-			"vschema_diff":       `+ "xxhash": {"type": "xxhash"}`,
+			apitypes.VSchemaChangesMetadataKey: vschemaPreviewMetadata(
+				apitypes.VSchemaChange{Namespace: "myapp_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
+			),
 		},
 	}
 	WriteProgress(data)
@@ -143,8 +156,9 @@ func previewVitessDDLWithVSchemaOutput() {
 		Metadata: map[string]string{
 			"branch_name":        "schemabot-myapp-28471035",
 			"deploy_request_url": "https://app.planetscale.com/my-org/myapp/deploy-requests/45",
-			"vschema_status":     "applying",
-			"vschema_diff":       `+ "xxhash": {"type": "xxhash"}`,
+			apitypes.VSchemaChangesMetadataKey: vschemaPreviewMetadata(
+				apitypes.VSchemaChange{Namespace: "myapp_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
+			),
 		},
 		Tables: []TableProgress{
 			{
@@ -156,6 +170,26 @@ func previewVitessDDLWithVSchemaOutput() {
 				RowsTotal:       50000,
 				PercentComplete: 100,
 			},
+		},
+	}
+	WriteProgress(data)
+}
+
+func previewVitessMultiKeyspaceVSchemaOutput() {
+	data := ProgressData{
+		State:       state.Apply.Running,
+		Engine:      "PlanetScale",
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Database:    "myapp",
+		Environment: "staging",
+		StartedAt:   previewTime.Add(-10 * time.Second).Format(time.RFC3339),
+		Metadata: map[string]string{
+			"branch_name":        "schemabot-myapp-28471035",
+			"deploy_request_url": "https://app.planetscale.com/my-org/myapp/deploy-requests/46",
+			apitypes.VSchemaChangesMetadataKey: vschemaPreviewMetadata(
+				apitypes.VSchemaChange{Namespace: "commerce", Status: "applied", Diff: `+ "lookup_orders": {"type": "lookup_hash"}`},
+				apitypes.VSchemaChange{Namespace: "commerce_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
+			),
 		},
 	}
 	WriteProgress(data)

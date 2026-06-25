@@ -5,6 +5,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
@@ -322,20 +323,23 @@ func TestFormatTableProgress_EstimateExceeded(t *testing.T) {
 
 func TestFormatVSchemaStatus(t *testing.T) {
 	// No VSchema change → nothing rendered.
-	assert.Empty(t, FormatVSchemaStatus("", ""))
+	assert.Empty(t, FormatVSchemaStatus(nil))
 
-	// Status only.
-	applying := FormatVSchemaStatus("applying", "")
-	assert.Contains(t, applying, "VSchema")
-	assert.Contains(t, applying, "Applying")
+	// A single keyspace renders its name, status, and diff.
+	single := FormatVSchemaStatus([]apitypes.VSchemaChange{
+		{Namespace: "commerce", Status: "applied", Diff: "--- a/commerce.json\n+++ b/commerce.json\n+  \"new_table\": {}"},
+	})
+	assert.Contains(t, single, "VSchema (commerce)")
+	assert.Contains(t, single, "Applied")
+	assert.Contains(t, single, "new_table")
 
-	applied := FormatVSchemaStatus("applied", "")
-	assert.Contains(t, applied, "Applied")
-
-	// Status + diff: the diff is rendered with the VSchema status.
-	withDiff := FormatVSchemaStatus("applied", "--- a/commerce.json\n+++ b/commerce.json\n+  \"new_table\": {}")
-	assert.Contains(t, withDiff, "Applied")
-	assert.Contains(t, withDiff, "new_table")
+	// Multiple keyspaces each render independently, with their own status.
+	multi := FormatVSchemaStatus([]apitypes.VSchemaChange{
+		{Namespace: "commerce", Status: "applied", Diff: `+ "lookup": {}`},
+		{Namespace: "commerce_sharded", Status: "applying", Diff: `+ "xxhash": {}`},
+	})
+	assert.Contains(t, multi, "VSchema (commerce): Applied")
+	assert.Contains(t, multi, "VSchema (commerce_sharded): Applying...")
 }
 
 func TestStateColorFunc_PlanetScalePhases(t *testing.T) {

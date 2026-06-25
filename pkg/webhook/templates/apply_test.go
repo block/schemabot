@@ -175,39 +175,49 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 	assert.Contains(t, result, "Queued")
 }
 
-// A Vitess apply surfaces its VSchema application status (and diff) from engine
-// display metadata as a dedicated section, so the PR comment shows VSchema
-// progress the same way the CLI does — including a VSchema-only apply that has
-// no per-table tasks at all.
+// A Vitess apply surfaces each keyspace's VSchema application status (and diff)
+// from engine display metadata as a dedicated section, so the PR comment shows
+// VSchema progress the same way the CLI does — including a multi-keyspace apply
+// where each keyspace tracks independently, and a VSchema-only apply with no
+// per-table tasks at all.
 func TestRenderApplyStatusComment_VSchema(t *testing.T) {
 	t.Run("populated from progress metadata", func(t *testing.T) {
+		changesJSON, err := apitypes.EncodeVSchemaChanges([]apitypes.VSchemaChange{
+			{Namespace: "commerce", Status: "applied", Diff: `+ "lookup": {}`},
+			{Namespace: "commerce_sharded", Status: "applying", Diff: `+ "xxhash": {}`},
+		})
+		require.NoError(t, err)
+
 		data := ApplyStatusFromProgress(&apitypes.ProgressResponse{
 			Database:    "testapp",
 			Environment: "staging",
 			State:       "running",
 			Engine:      "PlanetScale",
-			Metadata: map[string]string{
-				"vschema_status": "applying",
-				"vschema_diff":   `+ "xxhash": {"type": "xxhash"}`,
-			},
+			Metadata:    map[string]string{apitypes.VSchemaChangesMetadataKey: changesJSON},
 		}, "aparajon")
 
-		assert.Equal(t, "applying", data.VSchemaStatus)
-		assert.Equal(t, `+ "xxhash": {"type": "xxhash"}`, data.VSchemaDiff)
+		require.Len(t, data.VSchemaChanges, 2)
+		assert.Equal(t, "commerce", data.VSchemaChanges[0].Namespace)
+		assert.Equal(t, "applied", data.VSchemaChanges[0].Status)
+		assert.Equal(t, "commerce_sharded", data.VSchemaChanges[1].Namespace)
+		assert.Equal(t, "applying", data.VSchemaChanges[1].Status)
 	})
 
-	t.Run("renders a VSchema section with status and diff", func(t *testing.T) {
+	t.Run("renders a VSchema section per keyspace with status and diff", func(t *testing.T) {
 		data := ApplyStatusCommentData{
 			Database: "testapp", Environment: "staging", RequestedBy: "aparajon",
 			State: "running", Engine: "PlanetScale",
-			VSchemaStatus: "applying",
-			VSchemaDiff:   `+ "xxhash": {"type": "xxhash"}`,
+			VSchemaChanges: []apitypes.VSchemaChange{
+				{Namespace: "commerce", Status: "applied", Diff: `+ "lookup": {}`},
+				{Namespace: "commerce_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
+			},
 		}
 
 		result := RenderApplyStatusComment(data)
 
 		assert.Contains(t, result, "### VSchema")
-		assert.Contains(t, result, "Applying...")
+		assert.Contains(t, result, "**`commerce`**: Applied")
+		assert.Contains(t, result, "**`commerce_sharded`**: Applying...")
 		assert.Contains(t, result, "```diff")
 		assert.Contains(t, result, `+ "xxhash": {"type": "xxhash"}`)
 	})

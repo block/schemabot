@@ -2,6 +2,7 @@ package templates
 
 import (
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -44,10 +45,10 @@ type ApplyStatusCommentData struct {
 	CompletedAt  string // RFC3339 format
 	Tables       []TableProgressData
 
-	// VSchema application is surfaced from the engine's display metadata rather
-	// than as a per-table task. Empty when the apply carries no VSchema change.
-	VSchemaStatus string
-	VSchemaDiff   string
+	// VSchemaChanges holds per-keyspace VSchema application state, surfaced from
+	// the engine's display metadata rather than as a per-table task. Empty when
+	// the apply carries no VSchema change.
+	VSchemaChanges []apitypes.VSchemaChange
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -329,12 +330,15 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 // VSchema application is not a per-table task. Renders nothing when the apply
 // carries no VSchema change.
 func writeVSchemaStatus(sb *strings.Builder, data ApplyStatusCommentData) {
-	if data.VSchemaStatus == "" && data.VSchemaDiff == "" {
+	if len(data.VSchemaChanges) == 0 {
 		return
 	}
-	fmt.Fprintf(sb, "\n### VSchema\n\n%s\n\n", ui.VSchemaStatusLabel(data.VSchemaStatus))
-	if data.VSchemaDiff != "" {
-		fmt.Fprintf(sb, "```diff\n%s\n```\n\n", data.VSchemaDiff)
+	sb.WriteString("\n### VSchema\n\n")
+	for _, c := range data.VSchemaChanges {
+		fmt.Fprintf(sb, "**`%s`**: %s\n\n", c.Namespace, ui.VSchemaStatusLabel(c.Status))
+		if c.Diff != "" {
+			fmt.Fprintf(sb, "```diff\n%s\n```\n\n", c.Diff)
+		}
 	}
 }
 
@@ -951,9 +955,10 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 		CompletedAt:  resp.CompletedAt,
 	}
 
-	if resp.Metadata != nil {
-		data.VSchemaStatus = resp.Metadata["vschema_status"]
-		data.VSchemaDiff = resp.Metadata["vschema_diff"]
+	if changes, err := apitypes.ParseVSchemaChanges(resp.Metadata); err != nil {
+		slog.Warn("failed to parse VSchema changes from progress metadata", "apply_id", resp.ApplyID, "error", err)
+	} else {
+		data.VSchemaChanges = changes
 	}
 
 	for _, t := range resp.Tables {

@@ -3,6 +3,7 @@ package templates
 import (
 	"time"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -799,8 +800,9 @@ func PreviewCommentApplyThirdRunning() string {
 func PreviewCommentApplyVitessVSchemaOnly() string {
 	data := sampleApplyData(state.Apply.Running, nil)
 	data.Engine = "PlanetScale"
-	data.VSchemaStatus = "applying"
-	data.VSchemaDiff = `+ "xxhash": {"type": "xxhash"}`
+	data.VSchemaChanges = []apitypes.VSchemaChange{
+		{Namespace: "myapp_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
+	}
 	return RenderApplyStatusComment(data)
 }
 
@@ -819,8 +821,22 @@ func PreviewCommentApplyVitessDDLWithVSchema() string {
 	}
 	data := sampleApplyData(state.Apply.Running, tables)
 	data.Engine = "PlanetScale"
-	data.VSchemaStatus = "applying"
-	data.VSchemaDiff = `+ "xxhash": {"type": "xxhash"}`
+	data.VSchemaChanges = []apitypes.VSchemaChange{
+		{Namespace: "myapp_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
+	}
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyVitessMultiKeyspaceVSchema renders a Vitess apply that
+// changes VSchema in multiple keyspaces, each tracked independently — one
+// already applied, one still applying.
+func PreviewCommentApplyVitessMultiKeyspaceVSchema() string {
+	data := sampleApplyData(state.Apply.Running, nil)
+	data.Engine = "PlanetScale"
+	data.VSchemaChanges = []apitypes.VSchemaChange{
+		{Namespace: "commerce", Status: "applied", Diff: `+ "lookup_orders": {"type": "lookup_hash"}`},
+		{Namespace: "commerce_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
+	}
 	return RenderApplyStatusComment(data)
 }
 
