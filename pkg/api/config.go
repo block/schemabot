@@ -428,8 +428,8 @@ type EtreConfig struct {
 	// Addr is the Etre server address (supports secret refs, e.g. env:ETRE_ADDR).
 	Addr string `yaml:"addr"`
 	// DatabaseType selects the engine the resolver assembles connections for and
-	// is required (no implicit default): "mysql" reads the MySQL block; "vitess"
-	// reads the Vitess block.
+	// is required (no implicit default): "mysql" and "strata" read the MySQL
+	// block; "vitess" reads the Vitess block.
 	DatabaseType string `yaml:"database_type"`
 	// EntityType is the Etre entity type recording the target clusters.
 	EntityType string `yaml:"entity_type"`
@@ -441,7 +441,8 @@ type EtreConfig struct {
 	Labels map[string]string `yaml:"labels,omitempty"`
 	// AttributeFields are entity fields surfaced to the credential resolver.
 	AttributeFields []string `yaml:"attribute_fields,omitempty"`
-	// MySQL holds the MySQL engine knobs, read when DatabaseType is "mysql".
+	// MySQL holds the MySQL engine knobs, read when DatabaseType is "mysql" or
+	// "strata" (Strata is Aurora-backed and assembles its connection the same way).
 	MySQL EtreMySQLConfig `yaml:"mysql,omitempty"`
 	// Vitess holds the Vitess engine knobs, read when DatabaseType is "vitess".
 	Vitess EtreVitessConfig `yaml:"vitess,omitempty"`
