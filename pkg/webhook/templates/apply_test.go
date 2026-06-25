@@ -245,13 +245,17 @@ func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 			TableName: "users", Status: "running", PercentComplete: 50,
 			Shards: []ShardProgressData{
 				{Shard: "-80", Status: "completed", PercentComplete: 100},
-				{Shard: "80-", Status: "running", PercentComplete: 45},
+				{Shard: "80-c0", Status: "running", PercentComplete: 45},
+				{Shard: "c0-", Status: "waiting_for_cutover", PercentComplete: 100},
 			},
 		}},
 	})
 	assert.Contains(t, inline, "shards:")
 	assert.Contains(t, inline, "✓ -80")
-	assert.Contains(t, inline, "◐ 80- 45%")
+	assert.Contains(t, inline, "◐ 80-c0 45%")
+	// A shard ready for cutover shows ● and no percent (it is no longer copying).
+	assert.Contains(t, inline, "● c0-")
+	assert.NotContains(t, inline, "● c0- 100%")
 
 	// Collapsed: >8 shards bucket by state and name the slowest copier.
 	many := make([]ShardProgressData, 0, 12)
@@ -261,15 +265,17 @@ func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 	many = append(many,
 		ShardProgressData{Shard: "slow1", Status: "running", PercentComplete: 12},
 		ShardProgressData{Shard: "fast1", Status: "running", PercentComplete: 80},
+		ShardProgressData{Shard: "ready1", Status: "waiting_for_cutover", PercentComplete: 100},
 		ShardProgressData{Shard: "q1", Status: "pending"},
 	)
 	collapsed := RenderApplyStatusComment(ApplyStatusCommentData{
 		Database: "shop", Environment: "staging", State: "running", Engine: "Vitess",
 		Tables: []TableProgressData{{TableName: "orders", Status: "running", PercentComplete: 70, Shards: many}},
 	})
-	assert.Contains(t, collapsed, "12 shards:")
+	assert.Contains(t, collapsed, "13 shards:")
 	assert.Contains(t, collapsed, "9 ✓")
 	assert.Contains(t, collapsed, "2 ◐ copying")
+	assert.Contains(t, collapsed, "1 ● ready")
 	assert.Contains(t, collapsed, "slowest slow1 12%")
 
 	// Suppressed once the table completes — no shard line even with shard rows.
