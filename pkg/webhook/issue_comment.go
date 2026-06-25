@@ -393,6 +393,9 @@ func appendSupportChannelFooter(body string, support api.SupportChannelConfig) s
 func shouldShowSupportChannel(body string) bool {
 	firstLine, _, _ := strings.Cut(body, "\n")
 	firstLine = strings.ToLower(firstLine)
+	if strings.Contains(body, "\n**Status**: Failed\n") {
+		return true
+	}
 
 	if strings.Contains(firstLine, "help") {
 		return true
