@@ -437,8 +437,8 @@ func TestGRPCMultiDeploy_FailureHaltsRollout(t *testing.T) {
 	// The earlier deployment gets identical names so adding UNIQUE(name) fails
 	// during its copy; the later deployment gets unique names so it would
 	// succeed if the rollout were allowed to proceed past the failure.
-	multiDeploySeedRows(t, first, tableName, "name, data", "'dup', REPEAT('x', 200)", 10000)
-	multiDeploySeedRows(t, second, tableName, "name, data", "CONCAT('user_', seq), REPEAT('x', 200)", 10000)
+	multiDeploySeedRows(t, first, tableName, "name, data", "'dup', REPEAT('x', 200)", 2)
+	multiDeploySeedRows(t, second, tableName, "name, data", "CONCAT('user_', seq), REPEAT('x', 200)", 2)
 
 	multiDeployEnsureNoActiveChange(t, database, env, first, second)
 
@@ -613,8 +613,8 @@ func TestGRPCMultiDeploy_OnFailureContinue(t *testing.T) {
 	}
 	// The earlier deployment gets identical names so adding UNIQUE(name) fails
 	// during its copy; the later deployment gets unique names so it completes.
-	multiDeploySeedRows(t, first, tableName, "name, data", "'dup', REPEAT('x', 200)", 10000)
-	multiDeploySeedRows(t, second, tableName, "name, data", "CONCAT('user_', seq), REPEAT('x', 200)", 10000)
+	multiDeploySeedRows(t, first, tableName, "name, data", "'dup', REPEAT('x', 200)", 2)
+	multiDeploySeedRows(t, second, tableName, "name, data", "CONCAT('user_', seq), REPEAT('x', 200)", 2)
 
 	multiDeployEnsureNoActiveChange(t, database, env, first, second)
 

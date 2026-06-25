@@ -265,11 +265,19 @@ jobs:
           docker compose -f deploy/e2e/docker-compose.yml logs --tail=300 schemabot localscale 2>/dev/null || true
 
   e2e-grpc-multideploy:
-    name: "E2E gRPC Multi-Deployment Tests"
+    name: "E2E gRPC Multi-Deployment Tests (${{ matrix.shard }})"
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: ordered
+            run: TestGRPCMultiDeploy_(SchemaBot_Health|TernHealth_BothDeployments|Plan_FansOut|OrderedCutover|OrderedCutoverObservability)$$
+          - shard: failure-policy
+            run: TestGRPCMultiDeploy_(FailureHaltsRollout|OnFailureContinue)$$
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -286,7 +294,7 @@ jobs:
           key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Test"
-        run: make test-e2e-grpc-multideploy
+        run: make test-e2e-grpc-multideploy E2E_GRPC_MD_RUN='${{ matrix.run }}'
       - name: "Container logs on failure"
         if: failure()
         run: |
