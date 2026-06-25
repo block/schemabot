@@ -385,17 +385,17 @@ message LintViolation {
   string severity = 6; // "error", "warning", or "info"
 }
 
-// ShardPlan reports per-shard membership, drift, and changes for a namespace. A
-// shard is listed with needs_change=true when its current schema differs from
-// the desired schema. changes carries that shard's own table changes so a
-// keyspace whose shards diverge (drift, or a partially-applied canary rollout)
-// is represented per shard rather than collapsed to a single namespace-level
-// change set. When empty, the shard's changes are the namespace-level changes
-// (the uniform case, and plans produced before per-shard changes were carried).
+// ShardPlan reports a shard's own changes for a namespace. A shard is changing
+// when changes is non-empty; carrying the changes (rather than a separate
+// needs_change flag) means a keyspace whose shards diverge — drift, or a
+// partially-applied canary rollout — is represented per shard, and the exact
+// reviewed DDL is what gets applied (no plan-time/apply-time TOCTOU where a
+// membership flag was saved but the DDL was not).
 message ShardPlan {
+  reserved 3; // was needs_change; a shard is changing iff changes is non-empty
+  reserved "needs_change";
   string shard = 1;
   string namespace = 2;
-  bool needs_change = 3;
   repeated TableChange changes = 4;
 }
 

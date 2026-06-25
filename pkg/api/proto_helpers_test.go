@@ -160,14 +160,14 @@ func TestProtoChangesToNamespacesRejectsDuplicateDefaultNamespaces(t *testing.T)
 
 func TestProtoShardPlansToStorage(t *testing.T) {
 	got, err := protoShardPlansToStorage([]*ternv1.ShardPlan{
-		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
-		{Shard: "80-", NeedsChange: false},
+		{Namespace: "commerce", Shard: "-80"},
+		{Shard: "80-"},
 	})
 
 	require.NoError(t, err)
 	assert.Equal(t, []storage.ShardPlan{
-		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
-		{Namespace: "default", Shard: "80-", NeedsChange: false},
+		{Namespace: "commerce", Shard: "-80"},
+		{Namespace: "default", Shard: "80-"},
 	}, got)
 }
 

@@ -1218,18 +1218,16 @@ func (x *LintViolation) GetSeverity() string {
 	return ""
 }
 
-// ShardPlan reports per-shard membership, drift, and changes for a namespace. A
-// shard is listed with needs_change=true when its current schema differs from
-// the desired schema. changes carries that shard's own table changes so a
-// keyspace whose shards diverge (drift, or a partially-applied canary rollout)
-// is represented per shard rather than collapsed to a single namespace-level
-// change set. When empty, the shard's changes are the namespace-level changes
-// (the uniform case, and plans produced before per-shard changes were carried).
+// ShardPlan reports a shard's own changes for a namespace. A shard is changing
+// when changes is non-empty; carrying the changes (rather than a separate
+// needs_change flag) means a keyspace whose shards diverge — drift, or a
+// partially-applied canary rollout — is represented per shard, and the exact
+// reviewed DDL is what gets applied (no plan-time/apply-time TOCTOU where a
+// membership flag was saved but the DDL was not).
 type ShardPlan struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Shard         string                 `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
 	Namespace     string                 `protobuf:"bytes,2,opt,name=namespace,proto3" json:"namespace,omitempty"`
-	NeedsChange   bool                   `protobuf:"varint,3,opt,name=needs_change,json=needsChange,proto3" json:"needs_change,omitempty"`
 	Changes       []*TableChange         `protobuf:"bytes,4,rep,name=changes,proto3" json:"changes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1277,13 +1275,6 @@ func (x *ShardPlan) GetNamespace() string {
 		return x.Namespace
 	}
 	return ""
-}
-
-func (x *ShardPlan) GetNeedsChange() bool {
-	if x != nil {
-		return x.NeedsChange
-	}
-	return false
 }
 
 func (x *ShardPlan) GetChanges() []*TableChange {
@@ -2927,12 +2918,11 @@ const file_tern_proto_rawDesc = "" +
 	"\x06column\x18\x03 \x01(\tR\x06column\x12\x16\n" +
 	"\x06linter\x18\x04 \x01(\tR\x06linter\x12\x19\n" +
 	"\bfix_type\x18\x05 \x01(\tR\afixType\x12\x1a\n" +
-	"\bseverity\x18\x06 \x01(\tR\bseverity\"\x92\x01\n" +
+	"\bseverity\x18\x06 \x01(\tR\bseverity\"\x83\x01\n" +
 	"\tShardPlan\x12\x14\n" +
 	"\x05shard\x18\x01 \x01(\tR\x05shard\x12\x1c\n" +
-	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12!\n" +
-	"\fneeds_change\x18\x03 \x01(\bR\vneedsChange\x12.\n" +
-	"\achanges\x18\x04 \x03(\v2\x14.tern.v1.TableChangeR\achanges\"\x86\x02\n" +
+	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12.\n" +
+	"\achanges\x18\x04 \x03(\v2\x14.tern.v1.TableChangeR\achangesJ\x04\b\x03\x10\x04R\fneeds_change\"\x86\x02\n" +
 	"\fPlanResponse\x12\x17\n" +
 	"\aplan_id\x18\x01 \x01(\tR\x06planId\x12'\n" +
 	"\x06engine\x18\x02 \x01(\x0e2\x0f.tern.v1.EngineR\x06engine\x12/\n" +

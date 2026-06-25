@@ -1036,13 +1036,13 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 				Operation: ddl.StatementTypeToOp(tc.Operation),
 			})
 		}
-		// Record per-shard membership and this shard's own changes so apply-create
-		// can rebuild per-shard operation groups with per-shard DDL (a keyspace
-		// whose shards diverge is persisted per shard, not collapsed). A
-		// SchemaChange with an empty shard targets the whole namespace (non-sharded
-		// engines) and contributes no shard rows.
+		// Record each changing shard's own changes so apply-create can rebuild
+		// per-shard operation groups with per-shard DDL (a keyspace whose shards
+		// diverge is persisted per shard, not collapsed; a shard is changing iff
+		// it has changes). A SchemaChange with an empty shard targets the whole
+		// namespace (non-sharded engines) and contributes no shard rows.
 		if shardName := strings.TrimSpace(sc.Shard.Name); shardName != "" {
-			sp := storage.ShardPlan{Shard: shardName, Namespace: ns, NeedsChange: true}
+			sp := storage.ShardPlan{Shard: shardName, Namespace: ns}
 			for _, tc := range sc.TableChanges {
 				sp.Changes = append(sp.Changes, storage.TableChange{
 					Namespace: ns,
@@ -1187,9 +1187,8 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	var protoShards []*ternv1.ShardPlan
 	for _, sp := range allShardPlans {
 		protoSP := &ternv1.ShardPlan{
-			Shard:       sp.Shard,
-			Namespace:   sp.Namespace,
-			NeedsChange: sp.NeedsChange,
+			Shard:     sp.Shard,
+			Namespace: sp.Namespace,
 		}
 		for _, ch := range sp.Changes {
 			protoSP.Changes = append(protoSP.Changes, &ternv1.TableChange{

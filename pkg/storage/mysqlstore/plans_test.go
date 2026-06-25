@@ -42,8 +42,8 @@ func TestPlanStore_RoundTripsShardPlans(t *testing.T) {
 			},
 		},
 		Shards: []storage.ShardPlan{
-			{Namespace: "commerce", Shard: "80-", NeedsChange: false},
-			{Namespace: "commerce", Shard: "-80", NeedsChange: true},
+			{Namespace: "commerce", Shard: "80-"},
+			{Namespace: "commerce", Shard: "-80"},
 		},
 		CreatedAt: time.Now(),
 	})
@@ -54,8 +54,8 @@ func TestPlanStore_RoundTripsShardPlans(t *testing.T) {
 	require.NotNil(t, got)
 
 	assert.Equal(t, []storage.ShardPlan{
-		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
-		{Namespace: "commerce", Shard: "80-", NeedsChange: false},
+		{Namespace: "commerce", Shard: "-80"},
+		{Namespace: "commerce", Shard: "80-"},
 	}, got.Shards)
 	require.Contains(t, got.Namespaces, "commerce")
 	assert.Equal(t, got.Shards, got.Namespaces["commerce"].Shards)

@@ -1020,8 +1020,8 @@ func TestExecutePlanPersistsShardPlans(t *testing.T) {
 				}},
 			}},
 			Shards: []*ternv1.ShardPlan{
-				{Namespace: "commerce", Shard: "-80", NeedsChange: true},
-				{Namespace: "commerce", Shard: "80-", NeedsChange: false},
+				{Namespace: "commerce", Shard: "-80"},
+				{Namespace: "commerce", Shard: "80-"},
 			},
 		},
 	}
@@ -1057,8 +1057,8 @@ func TestExecutePlanPersistsShardPlans(t *testing.T) {
 	require.NotNil(t, resp)
 	require.NotNil(t, plans.created)
 	assert.Equal(t, []storage.ShardPlan{
-		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
-		{Namespace: "commerce", Shard: "80-", NeedsChange: false},
+		{Namespace: "commerce", Shard: "-80"},
+		{Namespace: "commerce", Shard: "80-"},
 	}, plans.created.Shards)
 }
 
@@ -1941,10 +1941,11 @@ func TestCreateStoredApplyFansOutShardedPlanOperations(t *testing.T) {
 			},
 		},
 	}
+	usersChange := storage.TableChange{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"}
 	plan.Shards = []storage.ShardPlan{
-		{Namespace: "commerce", Shard: "80-", NeedsChange: true},
-		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
-		{Namespace: "commerce", Shard: "-", NeedsChange: false},
+		{Namespace: "commerce", Shard: "80-", Changes: []storage.TableChange{usersChange}},
+		{Namespace: "commerce", Shard: "-80", Changes: []storage.TableChange{usersChange}},
+		{Namespace: "commerce", Shard: "-"}, // unchanged: no changes, stays out of the apply
 	}
 	cfg := testServerConfig()
 	cfg.Databases = map[string]DatabaseConfig{}
@@ -2009,9 +2010,10 @@ func TestCreateStoredApplyFansOutShardedPlanWithFinalizerOperation(t *testing.T)
 			},
 		},
 	}
+	usersChange := storage.TableChange{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"}
 	plan.Shards = []storage.ShardPlan{
-		{Namespace: "commerce", Shard: "80-", NeedsChange: true},
-		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
+		{Namespace: "commerce", Shard: "80-", Changes: []storage.TableChange{usersChange}},
+		{Namespace: "commerce", Shard: "-80", Changes: []storage.TableChange{usersChange}},
 	}
 	cfg := testServerConfig()
 	cfg.Databases = map[string]DatabaseConfig{}
@@ -2069,7 +2071,7 @@ func TestCreateStoredApplyDoesNotDropFinalizerOnlyNamespace(t *testing.T) {
 			Artifacts: map[string]string{vSchemaArtifactName: "{\"routing\":true}"},
 		},
 	}
-	plan.Shards = []storage.ShardPlan{{Namespace: "commerce", Shard: "-", NeedsChange: true}}
+	plan.Shards = []storage.ShardPlan{{Namespace: "commerce", Shard: "-", Changes: []storage.TableChange{{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"}}}}
 	cfg := testServerConfig()
 	cfg.Databases = map[string]DatabaseConfig{}
 	cfg.Databases["testdb"] = DatabaseConfig{
@@ -2114,9 +2116,10 @@ func TestCreateStoredApplyDoesNotShardWithoutClientOptIn(t *testing.T) {
 			},
 		},
 	}
+	usersChange := storage.TableChange{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"}
 	plan.Shards = []storage.ShardPlan{
-		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
-		{Namespace: "commerce", Shard: "80-", NeedsChange: true},
+		{Namespace: "commerce", Shard: "-80", Changes: []storage.TableChange{usersChange}},
+		{Namespace: "commerce", Shard: "80-", Changes: []storage.TableChange{usersChange}},
 	}
 	svc := New(&mockStorageWithApplyStores{
 		plans:     &staticPlanStore{plan: plan},

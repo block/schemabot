@@ -45,24 +45,18 @@ func TestBuildShardedApplyOperationGroupsUsesPerShardDDL(t *testing.T) {
 	plan := &storage.Plan{
 		Database: "cdb-resolute",
 		Shards: []storage.ShardPlan{
-			{Namespace: pershardNamespace, Shard: "-80", NeedsChange: true, Changes: []storage.TableChange{
+			{Namespace: pershardNamespace, Shard: "-80", Changes: []storage.TableChange{
 				{Namespace: pershardNamespace, Table: "mutes", DDL: mutesDDL, Operation: "alter"},
 			}},
 			// 80- has drifted further: it needs both tables.
-			{Namespace: pershardNamespace, Shard: "80-", NeedsChange: true, Changes: []storage.TableChange{
+			{Namespace: pershardNamespace, Shard: "80-", Changes: []storage.TableChange{
 				{Namespace: pershardNamespace, Table: "mutes", DDL: mutesDDL, Operation: "alter"},
 				{Namespace: pershardNamespace, Table: "logs", DDL: logsDDL, Operation: "alter"},
 			}},
 		},
 	}
-	// Namespace-level union (the fallback set); unused here because every shard
-	// carries its own changes.
-	taskChanges := []storage.TableChange{
-		{Namespace: pershardNamespace, Table: "mutes", DDL: mutesDDL, Operation: "alter"},
-		{Namespace: pershardNamespace, Table: "logs", DDL: logsDDL, Operation: "alter"},
-	}
 
-	groups, err := buildShardedApplyOperationGroups(plan, taskChanges, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	groups, err := buildShardedApplyOperationGroups(plan, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.NoError(t, err)
 
 	got := operationDDLByKey(groups)
@@ -78,38 +72,34 @@ func TestBuildShardedApplyOperationGroupsUsesPerShardDDL(t *testing.T) {
 	}
 }
 
-// A shard carrying no per-shard changes (a uniform keyspace, or a plan persisted
-// before per-shard changes were recorded) falls back to the namespace-level
-// changes, preserving the prior behavior.
-func TestBuildShardedApplyOperationGroupsFallsBackToNamespaceChanges(t *testing.T) {
+// A shard with no changes is not a changing shard, so it produces no operations
+// (membership is implied by changes, not a separate flag).
+func TestBuildShardedApplyOperationGroupsSkipsShardsWithoutChanges(t *testing.T) {
 	mutesDDL := "ALTER TABLE `mutes` ADD INDEX (`created_at`)"
 	plan := &storage.Plan{
 		Database: "cdb-resolute",
 		Shards: []storage.ShardPlan{
-			{Namespace: pershardNamespace, Shard: "-80", NeedsChange: true},
-			{Namespace: pershardNamespace, Shard: "80-", NeedsChange: true},
+			{Namespace: pershardNamespace, Shard: "-80", Changes: []storage.TableChange{
+				{Namespace: pershardNamespace, Table: "mutes", DDL: mutesDDL, Operation: "alter"},
+			}},
+			{Namespace: pershardNamespace, Shard: "80-"}, // unchanged: no changes
 		},
 	}
-	taskChanges := []storage.TableChange{
-		{Namespace: pershardNamespace, Table: "mutes", DDL: mutesDDL, Operation: "alter"},
-	}
 
-	groups, err := buildShardedApplyOperationGroups(plan, taskChanges, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	groups, err := buildShardedApplyOperationGroups(plan, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.NoError(t, err)
 
 	assert.Equal(t, map[string][]string{
 		pershardNamespace + "/-80/mutes": {mutesDDL},
-		pershardNamespace + "/80-/mutes": {mutesDDL},
-	}, operationDDLByKey(groups), "both shards fall back to the namespace-level change")
+	}, operationDDLByKey(groups), "only the shard with changes fans out; the unchanged shard stays out")
 }
 
 // Per-shard changes survive the proto boundary so the control plane rebuilds the
 // fan-out from each shard's own DDL.
 func TestProtoShardPlansToStorageCarriesPerShardChanges(t *testing.T) {
 	got, err := protoShardPlansToStorage([]*ternv1.ShardPlan{{
-		Namespace:   pershardNamespace,
-		Shard:       "-80",
-		NeedsChange: true,
+		Namespace: pershardNamespace,
+		Shard:     "-80",
 		Changes: []*ternv1.TableChange{{
 			Namespace:  pershardNamespace,
 			TableName:  "mutes",

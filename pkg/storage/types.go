@@ -252,14 +252,13 @@ type NamespacePlanData struct {
 // sharded namespace. It is generic storage metadata used by apply-create to
 // reconstruct operation groups after the original plan request has returned.
 type ShardPlan struct {
-	Shard       string `json:"shard"`
-	Namespace   string `json:"namespace,omitempty"`
-	NeedsChange bool   `json:"needs_change,omitempty"`
-	// Changes are this shard's own table changes. They let a keyspace whose
-	// shards diverge (drift, or a partially-applied canary rollout) be persisted
-	// per shard instead of collapsed to one namespace-level change set. Empty
-	// means the shard's changes are the namespace-level Tables — the uniform
-	// case, and plans persisted before per-shard changes were carried.
+	Shard     string `json:"shard"`
+	Namespace string `json:"namespace,omitempty"`
+	// Changes are this shard's own table changes; a shard is changing when this
+	// is non-empty. Persisting the changes (rather than a separate membership
+	// flag) lets a keyspace whose shards diverge — drift, or a partially-applied
+	// canary rollout — be represented per shard, and makes the reviewed DDL the
+	// exact DDL that gets applied.
 	Changes []TableChange `json:"changes,omitempty"`
 }
 

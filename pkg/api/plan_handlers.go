@@ -1023,7 +1023,7 @@ func buildApplyOperationGroups(
 	shardedFanoutSupported bool,
 ) ([]*storage.ApplyOperationWithTasks, bool, error) {
 	if shardedFanoutSupported && canBuildShardedOperationGroups(plan, taskChanges) {
-		groups, err := buildShardedApplyOperationGroups(plan, taskChanges, targets, environment, applyOpts, cutoverPolicy, onFailure, now)
+		groups, err := buildShardedApplyOperationGroups(plan, targets, environment, applyOpts, cutoverPolicy, onFailure, now)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1066,7 +1066,6 @@ func canBuildShardedOperationGroups(plan *storage.Plan, taskChanges []storage.Ta
 
 func buildShardedApplyOperationGroups(
 	plan *storage.Plan,
-	taskChanges []storage.TableChange,
 	targets []routing.ExecutionTarget,
 	environment string,
 	applyOpts storage.ApplyOptions,
@@ -1075,32 +1074,20 @@ func buildShardedApplyOperationGroups(
 	now time.Time,
 ) ([]*storage.ApplyOperationWithTasks, error) {
 	shardsByNamespace := changingShardsByNamespace(plan.Shards)
-	// Namespace-level changes, keyed by namespace, used as the fallback for a
-	// shard that carries no per-shard changes — the uniform case, and plans
-	// persisted before per-shard changes were recorded.
-	taskChangesByNamespace := make(map[string][]storage.TableChange)
-	for _, ddlChange := range taskChanges {
-		taskChangesByNamespace[ddlChange.Namespace] = append(taskChangesByNamespace[ddlChange.Namespace], ddlChange)
-	}
 	namespaces := make([]string, 0, len(shardsByNamespace))
 	for namespace := range shardsByNamespace {
 		namespaces = append(namespaces, namespace)
 	}
 	sort.Strings(namespaces)
 
-	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets)*(len(taskChanges)+1))
+	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets)*(len(plan.Shards)+1))
 	groupsByTargetAndKey := make(map[string]*storage.ApplyOperationWithTasks)
 	for _, target := range targets {
 		for _, namespace := range namespaces {
 			for _, shard := range shardsByNamespace[namespace] {
-				// Drive each shard from its own changes so a divergent keyspace
-				// applies the right DDL per shard; fall back to the namespace-level
-				// changes when a shard carries none.
-				shardChanges := shard.Changes
-				if len(shardChanges) == 0 {
-					shardChanges = taskChangesByNamespace[namespace]
-				}
-				for _, ddlChange := range shardChanges {
+				// Each shard is driven from its own changes; it is in
+				// shardsByNamespace only because those changes are non-empty.
+				for _, ddlChange := range shard.Changes {
 					if err := validateShardOperationKeyParts(namespace, shard.Shard, ddlChange.Table); err != nil {
 						return nil, err
 					}
@@ -1185,7 +1172,8 @@ func validateOperationKeyPart(label, value string) error {
 func changingShardsByNamespace(shards []storage.ShardPlan) map[string][]storage.ShardPlan {
 	shardsByNamespace := make(map[string][]storage.ShardPlan)
 	for _, shard := range shards {
-		if !shard.NeedsChange {
+		// A shard is changing iff it carries its own changes.
+		if len(shard.Changes) == 0 {
 			continue
 		}
 		shardsByNamespace[shard.Namespace] = append(shardsByNamespace[shard.Namespace], shard)

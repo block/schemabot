@@ -81,8 +81,8 @@ func TestPlanRecordsPerShardSchemaChanges(t *testing.T) {
 		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 		Operation: "alter",
 	}
-	assert.Equal(t, storage.ShardPlan{Shard: "-80", Namespace: "resolute", NeedsChange: true, Changes: []storage.TableChange{wantChange}}, ns.Shards[0])
-	assert.Equal(t, storage.ShardPlan{Shard: "80-", Namespace: "resolute", NeedsChange: true, Changes: []storage.TableChange{wantChange}}, ns.Shards[1])
+	assert.Equal(t, storage.ShardPlan{Shard: "-80", Namespace: "resolute", Changes: []storage.TableChange{wantChange}}, ns.Shards[0])
+	assert.Equal(t, storage.ShardPlan{Shard: "80-", Namespace: "resolute", Changes: []storage.TableChange{wantChange}}, ns.Shards[1])
 	require.Len(t, ns.Tables, 1, "the table repeated across shards is deduped at the namespace level")
 	assert.Equal(t, "users", ns.Tables[0].Table)
 }
@@ -131,7 +131,6 @@ func TestPlanSurfacesShardPlanOnResponse(t *testing.T) {
 	require.Len(t, resp.Shards, 2)
 	assert.Equal(t, "-80", resp.Shards[0].Shard)
 	assert.Equal(t, "resolute", resp.Shards[0].Namespace)
-	assert.True(t, resp.Shards[0].NeedsChange)
 	assert.Equal(t, "80-", resp.Shards[1].Shard)
 	// Each shard surfaces its own changes so the control plane can rebuild the
 	// fan-out (and present per-shard divergence) from the response.

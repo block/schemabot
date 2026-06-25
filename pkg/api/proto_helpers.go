@@ -243,9 +243,8 @@ func protoShardPlansToStorage(shards []*ternv1.ShardPlan) ([]storage.ShardPlan, 
 			namespace = "default"
 		}
 		sp := storage.ShardPlan{
-			Shard:       shardName,
-			Namespace:   namespace,
-			NeedsChange: shard.NeedsChange,
+			Shard:     shardName,
+			Namespace: namespace,
 		}
 		// Carry the shard's own changes so the apply-create fan-out can build
 		// per-shard tasks from per-shard DDL. Empty leaves the shard on the
