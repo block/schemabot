@@ -12,18 +12,25 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// checkActiveTaskConflict verifies there's no active schema change for this database.
+// checkActiveTaskConflict verifies there's no active schema change for this
+// database that would conflict with a new apply targeting dispatchShard.
 // Uses retry loop and engine verification to handle stale storage state.
-func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan) error {
+//
+// dispatchShard scopes the conflict to a single shard: a sharded apply is
+// dispatched one shard at a time, and different shards of the same database are
+// distinct physical primaries that run concurrently by design, so a task on
+// another shard is not a conflict. dispatchShard is "" for a non-sharded apply,
+// which conflicts with any active task on the database (today's behaviour).
+func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, dispatchShard string) error {
 	for attempt := range 10 {
 		existingTasks, err := c.storage.Tasks().GetByDatabase(ctx, plan.Database)
 		if err != nil {
 			return fmt.Errorf("check existing tasks: %w", err)
 		}
 
-		c.logger.Debug("conflict check: found tasks", "count", len(existingTasks), "database", plan.Database, "attempt", attempt)
+		c.logger.Debug("conflict check: found tasks", "count", len(existingTasks), "database", plan.Database, "shard", dispatchShard, "attempt", attempt)
 
-		blockingTaskID := c.findBlockingTask(ctx, existingTasks, plan)
+		blockingTaskID := c.findBlockingTask(ctx, existingTasks, plan, dispatchShard)
 		if blockingTaskID == "" {
 			return nil
 		}
@@ -44,10 +51,22 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 // findBlockingTask checks if any non-terminal task for this database is truly active.
 // Returns the blocking task's identifier, or "" if no conflict exists.
 // As a side effect, resolves stale tasks by checking engine state.
-func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan) string {
+//
+// dispatchShard scopes the conflict to a single shard (see checkActiveTaskConflict):
+// when both the candidate apply and an existing task target a non-empty shard,
+// a different shard does not conflict, so a sharded fan-out runs its shards
+// concurrently instead of serializing on the first one.
+func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan, dispatchShard string) string {
 	for _, t := range tasks {
-		c.logger.Debug("conflict check: checking task", "task_id", t.TaskIdentifier, "state", t.State, "is_terminal", state.IsTerminalTaskState(t.State))
+		c.logger.Debug("conflict check: checking task", "task_id", t.TaskIdentifier, "state", t.State, "shard", t.Shard, "is_terminal", state.IsTerminalTaskState(t.State))
 		if t.DatabaseType != plan.DatabaseType || state.IsTerminalTaskState(t.State) {
+			continue
+		}
+
+		// A task on a different shard targets a different physical primary, so it
+		// does not block this shard's apply. Only same-shard work, or work where
+		// either side is non-sharded (database-wide), can conflict.
+		if dispatchShard != "" && t.Shard != "" && t.Shard != dispatchShard {
 			continue
 		}
 

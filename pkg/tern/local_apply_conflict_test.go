@@ -60,7 +60,7 @@ func TestConflictCheckPreservesStoppedTask(t *testing.T) {
 	assert.Nil(t, stopped.CompletedAt)
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan)
+	err := client.checkActiveTaskConflict(t.Context(), plan, "")
 	require.Error(t, err, "a new apply must be refused while a stopped task holds the database")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.Stopped, stopped.State)
@@ -89,7 +89,7 @@ func TestConflictCheckPreservesRetryableTask(t *testing.T) {
 	assert.Nil(t, retryable.CompletedAt)
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan)
+	err := client.checkActiveTaskConflict(t.Context(), plan, "")
 	require.Error(t, err, "a new apply must be refused while a retryable task holds the database")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.FailedRetryable, retryable.State)
@@ -162,6 +162,52 @@ func TestConflictCheckFailsAbandonedInFlightTask(t *testing.T) {
 	}
 }
 
+// A sharded apply is dispatched one shard at a time, and different shards are
+// distinct physical primaries that run concurrently. The conflict check must
+// therefore be per-shard: an active task on another shard of the same database
+// must not refuse a new shard's apply (otherwise a sharded fan-out serializes on
+// its first shard), while same-shard work still conflicts.
+func TestConflictCheckIsPerShard(t *testing.T) {
+	activeShard := &storage.Task{
+		ID:             1,
+		TaskIdentifier: "task-shard-neg40",
+		Database:       "cdb_resolute",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Namespace:      "cdb_resolute_sharded",
+		TableName:      "mutes",
+		Shard:          "-40",
+		State:          state.Task.Running,
+	}
+	// The engine reports active work (not "No active schema change"), so the
+	// running task genuinely blocks rather than being cleaned up as abandoned.
+	client := &LocalClient{
+		config: LocalConfig{Database: "cdb_resolute", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{
+			tasks: &exactProgressTaskStore{tasks: []*storage.Task{activeShard}},
+			logs:  &mockApplyLogStore{},
+		},
+		spiritEngine: &fakeControlEngine{
+			progressResult: &engine.ProgressResult{State: engine.StateRunning, Message: "Copying rows"},
+		},
+		logger: slog.Default(),
+	}
+	plan := &storage.Plan{Database: "cdb_resolute", DatabaseType: storage.DatabaseTypeMySQL}
+	tasks := []*storage.Task{activeShard}
+
+	// Assert the shard gate directly via findBlockingTask. checkActiveTaskConflict
+	// wraps it in a stale-task retry loop that sleeps ~1s on the blocking case,
+	// which this test does not need to exercise.
+
+	// A different shard is not a conflict — it runs concurrently.
+	assert.Empty(t, client.findBlockingTask(t.Context(), tasks, plan, "40-80"),
+		"an active task on shard -40 must not block an apply on shard 40-80")
+	assert.Equal(t, state.Task.Running, activeShard.State, "the other shard's task is left running")
+
+	// The same shard still conflicts.
+	assert.Equal(t, "task-shard-neg40", client.findBlockingTask(t.Context(), tasks, plan, "-40"),
+		"an active task on shard -40 must block another apply on shard -40")
+}
+
 // Once an abandoned in-flight task has been failed, it no longer blocks the
 // database, so a new apply is admitted.
 func TestConflictCheckAdmitsApplyAfterFailingAbandonedTask(t *testing.T) {
@@ -176,7 +222,7 @@ func TestConflictCheckAdmitsApplyAfterFailingAbandonedTask(t *testing.T) {
 	client := newNoActiveChangeClient("testdb", []*storage.Task{running})
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan)
+	err := client.checkActiveTaskConflict(t.Context(), plan, "")
 	require.NoError(t, err, "new apply should proceed once the abandoned task is failed")
 	assert.Equal(t, state.Task.Failed, running.State)
 }
