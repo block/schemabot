@@ -240,10 +240,18 @@ type UnsafeChange struct {
 	ChangeType string
 }
 
-// UnsafeChanges returns all table changes marked as unsafe across all namespaces.
+// UnsafeChanges returns all table changes marked as unsafe across all
+// namespaces. DROP table changes are treated as unsafe even when an engine omits
+// IsUnsafe, so destructive table deletion fails closed.
 func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
+	if r == nil {
+		return nil
+	}
 	var result []UnsafeChange
 	for _, sc := range r.Changes {
+		if sc == nil {
+			continue
+		}
 		for _, t := range sc.TableChanges {
 			if unsafeChange, ok := t.UnsafeChange(); ok {
 				result = append(result, unsafeChange)
