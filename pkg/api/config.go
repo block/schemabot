@@ -861,9 +861,9 @@ func (c *ServerConfig) Validate() error {
 					return fmt.Errorf("database %q environment %q sets cutover_policy without a deployments map", name, env)
 				}
 				switch envConfig.CutoverPolicy {
-				case storage.CutoverPolicyRolling, storage.CutoverPolicyBarrier:
+				case storage.CutoverPolicyRolling, storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel:
 				default:
-					return fmt.Errorf("database %q environment %q has invalid cutover_policy %q (want %q or %q)", name, env, envConfig.CutoverPolicy, storage.CutoverPolicyRolling, storage.CutoverPolicyBarrier)
+					return fmt.Errorf("database %q environment %q has invalid cutover_policy %q (want %q, %q, or %q)", name, env, envConfig.CutoverPolicy, storage.CutoverPolicyRolling, storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel)
 				}
 			}
 			if envConfig.OnFailure != "" {

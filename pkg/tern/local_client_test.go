@@ -83,10 +83,11 @@ func TestLocalClient_PullSchemaLoadsVitessKeyspaceWithVSchemaArtifact(t *testing
 	}
 
 	resp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
-		Database:    "commerce",
-		Type:        storage.DatabaseTypeVitess,
-		Environment: "production",
-		Namespace:   "commerce_sharded",
+		Database:      "commerce",
+		Type:          storage.DatabaseTypeVitess,
+		Environment:   "production",
+		Namespace:     "commerce_sharded",
+		CatalogDetail: ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED,
 	})
 
 	require.NoError(t, err)

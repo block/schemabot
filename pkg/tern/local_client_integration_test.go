@@ -540,6 +540,9 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	assert.Equal(t, "timestamp", tableCatalog.Columns[2].Type)
 	assert.True(t, tableCatalog.Columns[2].Nullable)
 	assert.Equal(t, "CURRENT_TIMESTAMP", tableCatalog.Columns[2].DefaultValue)
+	// An expression default (DEFAULT CURRENT_TIMESTAMP) reports EXTRA
+	// "DEFAULT_GENERATED" but is not a generated column.
+	assert.False(t, tableCatalog.Columns[2].Generated, "expression default is not a generated column")
 	require.Len(t, tableCatalog.Indexes, 2)
 	indexesByName := make(map[string]*ternv1.IndexCatalog, len(tableCatalog.Indexes))
 	for _, index := range tableCatalog.Indexes {
@@ -553,16 +556,114 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	assert.False(t, indexesByName["idx_email"].Primary)
 	assert.True(t, indexesByName["idx_email"].Unique)
 	assert.Equal(t, []string{"email"}, indexesByName["idx_email"].Parts)
+	assert.True(t, tableCatalog.Columns[0].AutoIncrement, "id column is AUTO_INCREMENT")
+	assert.False(t, tableCatalog.Columns[1].AutoIncrement, "email column is not AUTO_INCREMENT")
+	assert.False(t, tableCatalog.Columns[0].Generated, "id column is not generated")
+	// Size is an engine estimate; a freshly created InnoDB table always reports
+	// a non-zero data_length, so the field is wired even with no rows.
+	assert.Positive(t, tableCatalog.DataSizeBytes, "table should report a non-zero size estimate at detailed")
+	assert.Empty(t, tableCatalog.ForeignKeys, "users table has no foreign keys")
 
 	basicResp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
 		Type:        storage.DatabaseTypeMySQL,
 		Environment: localClientTestEnvironment,
 	})
 	require.NoError(t, err, "pull schema with basic catalog detail")
-	basicCatalog := basicResp.Namespaces["testdb"].TableCatalog["pull_schema_users"]
-	require.NotNil(t, basicCatalog)
-	assert.Empty(t, basicCatalog.Columns)
-	assert.Empty(t, basicCatalog.Indexes)
+	basicNamespace := basicResp.Namespaces["testdb"]
+	require.NotNil(t, basicNamespace)
+	// BASIC returns only canonical DDL and artifacts — the pre-catalog pull
+	// shape. The entire structured catalog is DETAILED-only.
+	assert.Contains(t, basicNamespace.Tables["pull_schema_users"], "CREATE TABLE `pull_schema_users`")
+	assert.Nil(t, basicNamespace.NamespaceCatalog, "namespace catalog is detailed-only")
+	assert.Empty(t, basicNamespace.TableCatalog, "table catalog is detailed-only")
+}
+
+// A DETAILED pull surfaces engine-agnostic constraint and column metadata that
+// schema-intelligence consumers need beyond raw DDL: foreign-key relationships
+// (local/referenced columns plus referential actions), generated and
+// auto-increment columns, and engine row-count estimates once statistics exist.
+func TestLocalClient_PullSchemaCatalogForeignKeysAndGeneratedColumns(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	container, dsn := setupMySQLContainer(t)
+	_ = container
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err, "open database")
+	defer utils.CloseAndLog(db)
+
+	// Drop child before parent to satisfy the foreign key.
+	dropStmt := "DROP TABLE IF EXISTS `pull_cat_orders`, `pull_cat_users`"
+	_, err = db.ExecContext(t.Context(), dropStmt)
+	require.NoError(t, err, "drop old catalog tables")
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		require.NoError(t, cleanupErr, "open database for catalog cleanup")
+		defer utils.CloseAndLog(cleanupDB)
+		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, dropStmt)
+		assert.NoError(t, cleanupErr, "drop catalog tables")
+	})
+
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE `pull_cat_users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `name` varchar(255) NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err, "create parent table")
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE `pull_cat_orders` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `user_id` bigint unsigned DEFAULT NULL, `amount` int NOT NULL, `amount_doubled` int GENERATED ALWAYS AS (`amount` * 2) STORED, PRIMARY KEY (`id`), CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `pull_cat_users` (`id`) ON DELETE SET NULL ON UPDATE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err, "create child table with foreign key")
+	_, err = db.ExecContext(t.Context(), "INSERT INTO `pull_cat_users` (`name`) VALUES ('a'), ('b')")
+	require.NoError(t, err, "seed users")
+	_, err = db.ExecContext(t.Context(), "INSERT INTO `pull_cat_orders` (`user_id`, `amount`) VALUES (1, 10), (2, 20)")
+	require.NoError(t, err, "seed orders")
+	// Refresh engine statistics so the row-count estimate is populated.
+	_, err = db.ExecContext(t.Context(), "ANALYZE TABLE `pull_cat_users`, `pull_cat_orders`")
+	require.NoError(t, err, "analyze tables")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, nil, logger)
+	require.NoError(t, err, "create client")
+	defer utils.CloseAndLog(client)
+
+	resp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Type:          storage.DatabaseTypeMySQL,
+		Environment:   localClientTestEnvironment,
+		CatalogDetail: ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED,
+	})
+	require.NoError(t, err, "pull schema")
+	require.Contains(t, resp.Namespaces, "testdb")
+	tableCatalog := resp.Namespaces["testdb"].TableCatalog
+
+	require.Contains(t, tableCatalog, "pull_cat_orders")
+	orders := tableCatalog["pull_cat_orders"]
+	require.Len(t, orders.ForeignKeys, 1, "orders has one foreign key")
+	fk := orders.ForeignKeys[0]
+	assert.Equal(t, "fk_orders_user", fk.Name)
+	assert.Equal(t, []string{"user_id"}, fk.Columns)
+	assert.Equal(t, "pull_cat_users", fk.ReferencedTable)
+	assert.Equal(t, []string{"id"}, fk.ReferencedColumns)
+	assert.Equal(t, "SET NULL", fk.OnDelete)
+	assert.Equal(t, "CASCADE", fk.OnUpdate)
+
+	columnsByName := make(map[string]*ternv1.ColumnCatalog, len(orders.Columns))
+	for _, column := range orders.Columns {
+		columnsByName[column.Name] = column
+	}
+	require.Contains(t, columnsByName, "id")
+	assert.True(t, columnsByName["id"].AutoIncrement, "id is AUTO_INCREMENT")
+	assert.False(t, columnsByName["id"].Generated, "id is not generated")
+	require.Contains(t, columnsByName, "amount_doubled")
+	assert.True(t, columnsByName["amount_doubled"].Generated, "amount_doubled is a generated column")
+	assert.False(t, columnsByName["amount_doubled"].AutoIncrement)
+
+	require.Contains(t, tableCatalog, "pull_cat_users")
+	users := tableCatalog["pull_cat_users"]
+	assert.Empty(t, users.ForeignKeys, "users table has no foreign keys")
+	// After ANALYZE on a seeded table the engine reports a non-zero estimate.
+	assert.Positive(t, users.EstimatedRowCount, "row-count estimate should be populated after ANALYZE")
 }
 
 // Pulling all live MySQL namespaces discovers application schemas while

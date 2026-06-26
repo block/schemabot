@@ -17,13 +17,15 @@ func isCutoverDriveState(opState string) bool {
 
 // shouldAutoDeferCutover reports whether an operation-scoped copy drive must park
 // at the cutover barrier automatically. It is true only for an operation of a
-// multi-deployment (fan-out) apply running under the barrier cutover policy, so
-// the high-risk cutover swaps can later be driven in deployment order by the
-// cutover-claim path. A single-operation apply has no siblings to order, so it
-// never auto-defers even when its stored cutover_policy is barrier: behaviour is
-// unchanged until multi-deployment fan-out lands.
+// multi-deployment (fan-out) apply running under an ordered-cutover policy
+// (barrier or parallel), so the high-risk cutover swaps can later be driven in
+// deployment order by the cutover-claim path. The two policies differ only in
+// the copy-start gate, not in how cutover is sequenced, so both park here. A
+// single-operation apply has no siblings to order, so it never auto-defers even
+// when its stored cutover_policy is ordered: behaviour is unchanged until
+// multi-deployment fan-out lands.
 func shouldAutoDeferCutover(multiOperation bool, op *storage.ApplyOperation) bool {
-	return multiOperation && op != nil && op.CutoverPolicy == storage.CutoverPolicyBarrier
+	return multiOperation && op != nil && storage.IsOrderedCutoverPolicy(op.CutoverPolicy)
 }
 
 // shouldReleaseAtCutoverBarrier reports whether an operation-scoped copy drive

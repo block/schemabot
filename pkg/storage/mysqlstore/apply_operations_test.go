@@ -117,10 +117,23 @@ func TestApplyOperationStore_CutoverPolicyRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, storage.CutoverPolicyRolling, defaultedOp.CutoverPolicy, "Insert normalizes an empty policy to rolling on the passed struct")
 
+	parallelID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:       apply.ID,
+		Deployment:    "region-c",
+		Target:        "payments",
+		CutoverPolicy: storage.CutoverPolicyParallel,
+	})
+	require.NoError(t, err)
+
 	barrier, err := store.ApplyOperations().Get(ctx, barrierID)
 	require.NoError(t, err)
 	require.NotNil(t, barrier)
 	assert.Equal(t, storage.CutoverPolicyBarrier, barrier.CutoverPolicy, "an explicit barrier policy round-trips unchanged")
+
+	parallel, err := store.ApplyOperations().Get(ctx, parallelID)
+	require.NoError(t, err)
+	require.NotNil(t, parallel)
+	assert.Equal(t, storage.CutoverPolicyParallel, parallel.CutoverPolicy, "an explicit parallel policy round-trips unchanged")
 
 	defaulted, err := store.ApplyOperations().Get(ctx, defaultedID)
 	require.NoError(t, err)
@@ -2391,6 +2404,76 @@ func TestApplyOperationStore_FindNextApplyOperation_BarrierStillBlocksOnRunningS
 	assert.Nil(t, claimed, "barrier must still block a later deployment while an earlier sibling is still copying")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_ParallelClaimsPastRunningSibling
+// verifies the defining parallel behaviour: the copy phase has no earlier-sibling
+// gate, so a later deployment may start copying while an earlier sibling is still
+// copying (running) — every deployment copies concurrently. This is exactly the
+// case barrier blocks.
+func TestApplyOperationStore_FindNextApplyOperation_ParallelClaimsPastRunningSibling(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_parallel_running", 1)
+
+	// region-a is still copying (running, fresh so not stale-reclaimable);
+	// region-b is pending behind it. Both carry the parallel policy.
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+		State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel,
+	})
+	require.NoError(t, err)
+	regionBID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", CutoverPolicy: storage.CutoverPolicyParallel,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "parallel must let a later deployment copy while an earlier sibling is still copying")
+	assert.Equal(t, regionBID, claimed.ID)
+	assert.Equal(t, "region-b", claimed.Deployment)
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_ParallelClaimsPastFailedSibling
+// verifies that parallel drops copy-phase ordering entirely: a terminal-failed
+// earlier sibling does not block a later deployment's copy start, because the
+// copy gate has no earlier-sibling arm for parallel at all. Cutover ordering
+// (where halt-on-failure still applies) is enforced separately on the cutover
+// claim path.
+func TestApplyOperationStore_FindNextApplyOperation_ParallelClaimsPastFailedSibling(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_parallel_failed", 1)
+
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+		State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel,
+	})
+	require.NoError(t, err)
+	regionBID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", CutoverPolicy: storage.CutoverPolicyParallel,
+	})
+	require.NoError(t, err)
+
+	// Backdate the failed row so staleness can't be confused with the reason the
+	// later row is claimable; parallel claims past it on copy regardless.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failedID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "parallel must let a later deployment copy past a failed earlier sibling")
+	assert.Equal(t, regionBID, claimed.ID)
+	assert.Equal(t, "region-b", claimed.Deployment)
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_BarrierHaltsOnFailedSibling
 // verifies that barrier does not weaken halt-on-first-failure: a terminal-failed
 // earlier sibling still blocks later deployments under barrier, so a failed
@@ -2461,6 +2544,45 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsStaleMultiOpBarrierPark
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	assert.Nil(t, claimed, "the copy claim must not re-lease a parked multi-op barrier deployment")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_SkipsStaleMultiOpParallelParked
+// verifies the stale-park exemption covers parallel too: a multi-deployment
+// parallel operation parked at the cutover barrier is reserved for the
+// deployment-ordered cutover claim, so the copy claim must not re-lease it even
+// once its heartbeat goes stale. Without the exemption a parked parallel
+// deployment would be re-driven on the copy path and loop.
+func TestApplyOperationStore_FindNextApplyOperation_SkipsStaleMultiOpParallelParked(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_parallel_parked_skip", 1)
+
+	parkedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+		State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyParallel,
+	})
+	require.NoError(t, err)
+	// A completed sibling makes this a multi-operation apply without leaving any
+	// other claimable (pending) row, so the parked row is the only candidate.
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b",
+		State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyParallel,
+	})
+	require.NoError(t, err)
+
+	// Backdate the parked row past the staleness window so only the barrier-park
+	// exemption — not freshness — keeps it from being re-claimed.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, parkedID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "the copy claim must not re-lease a parked multi-op parallel deployment")
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_ClaimsStaleSingleOpBarrierParked
@@ -2934,6 +3056,45 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_SkipsRollingPolicy(t 
 	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
 	require.NoError(t, err)
 	assert.Nil(t, claimed, "the cutover worker must not claim rolling-policy operations")
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_ClaimsParallel verifies
+// the strand guard for parallel: a multi-deployment parallel operation parked at
+// the cutover barrier IS eligible for the deployment-ordered cutover claim, just
+// like barrier. Parallel and barrier share identical cutover sequencing; they
+// differ only in the copy-start gate. Without this, a parked parallel operation
+// would never be claimed for cutover and would be stranded.
+func TestApplyOperationStore_FindNextApplyOperationCutover_ClaimsParallel(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_parallel", 1)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+		State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyParallel,
+	})
+	require.NoError(t, err)
+	// A completed earlier sibling makes this a multi-operation apply and leaves
+	// no earlier non-completed sibling to block the ordered cutover claim.
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-z",
+		State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyParallel,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "the cutover worker must claim a parked multi-op parallel deployment")
+	assert.Equal(t, id, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.WaitingForCutover, claimed.State, "returned row carries its pre-claim state")
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.ApplyOperation.CuttingOver, persisted.State, "cutover claim must transition waiting_for_cutover → cutting_over")
 }
 
 // TestApplyOperationStore_FindNextApplyOperationCutover_SkipsSingleOpBarrier

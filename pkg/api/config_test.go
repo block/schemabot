@@ -1484,9 +1484,10 @@ func TestServerConfig_CutoverPolicyFor(t *testing.T) {
 			"payments": {
 				Type: "mysql",
 				Environments: map[string]EnvironmentConfig{
-					"policy-unset":   {Target: "payments", Deployment: "payments-a"},
-					"policy-rolling": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, CutoverPolicy: storage.CutoverPolicyRolling},
-					"policy-barrier": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, CutoverPolicy: storage.CutoverPolicyBarrier},
+					"policy-unset":    {Target: "payments", Deployment: "payments-a"},
+					"policy-rolling":  {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, CutoverPolicy: storage.CutoverPolicyRolling},
+					"policy-barrier":  {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, CutoverPolicy: storage.CutoverPolicyBarrier},
+					"policy-parallel": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, CutoverPolicy: storage.CutoverPolicyParallel},
 				},
 			},
 		},
@@ -1495,6 +1496,7 @@ func TestServerConfig_CutoverPolicyFor(t *testing.T) {
 	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "policy-unset"), "unset defaults to rolling")
 	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "policy-rolling"), "explicit rolling is rolling")
 	assert.Equal(t, storage.CutoverPolicyBarrier, cfg.CutoverPolicyFor("payments", "policy-barrier"), "explicit barrier is barrier")
+	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "policy-parallel"), "explicit parallel is parallel")
 	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "missing-env"), "unconfigured env defaults to rolling")
 	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("missing-db", "policy-barrier"), "unconfigured database defaults to rolling")
 }
@@ -1674,6 +1676,16 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 					"payments-a": {Target: "payments"},
 				},
 				CutoverPolicy: storage.CutoverPolicyBarrier,
+			},
+			tern: baseTern,
+		},
+		{
+			name: "cutover_policy parallel with a deployments map is accepted",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+				},
+				CutoverPolicy: storage.CutoverPolicyParallel,
 			},
 			tern: baseTern,
 		},

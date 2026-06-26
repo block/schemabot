@@ -706,20 +706,30 @@ func (c *LocalClient) pullVitessSchemaNamespace(ctx context.Context, req *ternv1
 		"artifact_count", len(artifacts),
 	)
 
+	pulledNamespace := &ternv1.PulledNamespace{
+		Tables:    pulledTables,
+		Artifacts: artifacts,
+	}
+	// BASIC pulls only DDL and artifacts; the namespace catalog is DETAILED-only,
+	// consistent with the MySQL path. Per-table catalog (table_catalog with
+	// columns, indexes, and foreign keys) is not yet populated for Vitess — that
+	// metadata comes from information_schema on the MySQL path and has no
+	// PlanetScale equivalent wired up here; DETAILED currently returns only the
+	// namespace-level catalog for Vitess.
+	if req.GetCatalogDetail() == ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED {
+		pulledNamespace.NamespaceCatalog = &ternv1.NamespaceCatalog{
+			Name:       namespace,
+			Engine:     c.config.Type,
+			TableCount: int32(len(pulledTables)),
+		}
+	}
+
 	return &ternv1.PullSchemaResponse{
 		Database:    c.pullResponseDatabase(req),
 		Type:        c.config.Type,
 		Environment: req.Environment,
 		Namespaces: map[string]*ternv1.PulledNamespace{
-			namespace: {
-				Tables:    pulledTables,
-				Artifacts: artifacts,
-				NamespaceCatalog: &ternv1.NamespaceCatalog{
-					Name:       namespace,
-					Engine:     c.config.Type,
-					TableCount: int32(len(pulledTables)),
-				},
-			},
+			namespace: pulledNamespace,
 		},
 		TableCount: int32(len(pulledTables)),
 	}, nil
@@ -750,6 +760,12 @@ type pulledCatalog struct {
 }
 
 func (c *LocalClient) pullNamespaceCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalogDetail ternv1.PullCatalogDetail) (*pulledCatalog, error) {
+	// BASIC pulls only canonical DDL and artifacts (the pre-catalog pull shape):
+	// no namespace or table catalog. The full structured catalog is built only
+	// at DETAILED detail.
+	if catalogDetail != ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED {
+		return &pulledCatalog{}, nil
+	}
 	catalog := &pulledCatalog{
 		namespace: &ternv1.NamespaceCatalog{
 			Name:       namespace,
@@ -764,13 +780,16 @@ func (c *LocalClient) pullNamespaceCatalog(ctx context.Context, db *sql.DB, name
 	if err := c.loadTableCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
 		return nil, err
 	}
-	if catalogDetail != ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED {
-		return catalog, nil
-	}
 	if err := c.loadColumnCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
 		return nil, err
 	}
 	if err := c.loadIndexCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+		return nil, err
+	}
+	if err := c.loadForeignKeyCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+		return nil, err
+	}
+	if err := c.loadTableEstimates(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
 		return nil, err
 	}
 	return catalog, nil
@@ -806,9 +825,42 @@ func (c *LocalClient) loadTableCatalog(ctx context.Context, db *sql.DB, namespac
 	return nil
 }
 
+// loadTableEstimates populates engine-maintained row-count and on-disk-size
+// estimates from information_schema.tables. These are approximations (NULL for
+// views, stale until statistics are refreshed) and are only loaded at DETAILED
+// catalog detail.
+func (c *LocalClient) loadTableEstimates(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+	rows, err := db.QueryContext(ctx, `
+		SELECT table_name, table_rows, data_length, index_length
+		FROM information_schema.tables
+		WHERE table_schema = ?
+		ORDER BY table_name`, namespace)
+	if err != nil {
+		return fmt.Errorf("load table estimates for database %s namespace %s: %w", c.config.Database, namespace, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	for rows.Next() {
+		var tableName string
+		var tableRows, dataLength, indexLength sql.NullInt64
+		if err := rows.Scan(&tableName, &tableRows, &dataLength, &indexLength); err != nil {
+			return fmt.Errorf("scan table estimates for database %s namespace %s: %w", c.config.Database, namespace, err)
+		}
+		if _, ok := pulledTables[tableName]; ok {
+			tableCatalog := ensurePulledTableCatalog(catalog, tableName)
+			tableCatalog.EstimatedRowCount = tableRows.Int64
+			tableCatalog.DataSizeBytes = dataLength.Int64 + indexLength.Int64
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate table estimates for database %s namespace %s: %w", c.config.Database, namespace, err)
+	}
+	return nil
+}
+
 func (c *LocalClient) loadColumnCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
 	rows, err := db.QueryContext(ctx, `
-		SELECT table_name, column_name, column_type, is_nullable, column_default, column_comment
+		SELECT table_name, column_name, column_type, is_nullable, column_default, column_comment, extra
 		FROM information_schema.columns
 		WHERE table_schema = ?
 		ORDER BY table_name, ordinal_position`, namespace)
@@ -818,18 +870,25 @@ func (c *LocalClient) loadColumnCatalog(ctx context.Context, db *sql.DB, namespa
 	defer utils.CloseAndLog(rows)
 
 	for rows.Next() {
-		var tableName, columnName, columnType, nullable, comment string
+		var tableName, columnName, columnType, nullable, comment, extra string
 		var defaultValue sql.NullString
-		if err := rows.Scan(&tableName, &columnName, &columnType, &nullable, &defaultValue, &comment); err != nil {
+		if err := rows.Scan(&tableName, &columnName, &columnType, &nullable, &defaultValue, &comment, &extra); err != nil {
 			return fmt.Errorf("scan column catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
 		}
 		if _, ok := pulledTables[tableName]; ok {
 			tableCatalog := ensurePulledTableCatalog(catalog, tableName)
+			// EXTRA marks generated columns as "STORED GENERATED" or "VIRTUAL
+			// GENERATED". Match those specifically: a bare "GENERATED" substring
+			// would also match "DEFAULT_GENERATED" (an expression default such as
+			// DEFAULT CURRENT_TIMESTAMP), which is not a generated column.
+			upperExtra := strings.ToUpper(extra)
 			column := &ternv1.ColumnCatalog{
-				Name:     columnName,
-				Type:     columnType,
-				Nullable: nullable == "YES",
-				Comment:  comment,
+				Name:          columnName,
+				Type:          columnType,
+				Nullable:      nullable == "YES",
+				Comment:       comment,
+				AutoIncrement: strings.Contains(upperExtra, "AUTO_INCREMENT"),
+				Generated:     strings.Contains(upperExtra, "STORED GENERATED") || strings.Contains(upperExtra, "VIRTUAL GENERATED"),
 			}
 			if defaultValue.Valid {
 				column.DefaultValue = defaultValue.String
@@ -892,6 +951,61 @@ func (c *LocalClient) loadIndexCatalog(ctx context.Context, db *sql.DB, namespac
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate index catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+	}
+	return nil
+}
+
+// loadForeignKeyCatalog reads foreign keys by joining key_column_usage (the
+// per-column local→referenced mapping) with referential_constraints (the
+// per-constraint ON UPDATE / ON DELETE rules). referential_constraints
+// contains only foreign-key constraints, so the join naturally restricts to
+// them; primary-key and unique constraints are already represented as indexes.
+func (c *LocalClient) loadForeignKeyCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+	rows, err := db.QueryContext(ctx, `
+		SELECT kcu.table_name, kcu.constraint_name, kcu.column_name,
+		       kcu.referenced_table_name, kcu.referenced_column_name,
+		       rc.update_rule, rc.delete_rule
+		FROM information_schema.key_column_usage kcu
+		JOIN information_schema.referential_constraints rc
+		  ON rc.constraint_schema = kcu.constraint_schema
+		 AND rc.constraint_name = kcu.constraint_name
+		WHERE kcu.table_schema = ?
+		ORDER BY kcu.table_name, kcu.constraint_name, kcu.ordinal_position`, namespace)
+	if err != nil {
+		return fmt.Errorf("load foreign key catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	foreignKeysByTable := make(map[string]map[string]*ternv1.ForeignKeyCatalog)
+	for rows.Next() {
+		var tableName, constraintName string
+		var columnName, referencedTable, referencedColumn, updateRule, deleteRule sql.NullString
+		if err := rows.Scan(&tableName, &constraintName, &columnName, &referencedTable, &referencedColumn, &updateRule, &deleteRule); err != nil {
+			return fmt.Errorf("scan foreign key catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		}
+		if _, ok := pulledTables[tableName]; !ok {
+			continue
+		}
+		tableCatalog := ensurePulledTableCatalog(catalog, tableName)
+		if foreignKeysByTable[tableName] == nil {
+			foreignKeysByTable[tableName] = make(map[string]*ternv1.ForeignKeyCatalog)
+		}
+		fk := foreignKeysByTable[tableName][constraintName]
+		if fk == nil {
+			fk = &ternv1.ForeignKeyCatalog{
+				Name:            constraintName,
+				ReferencedTable: referencedTable.String,
+				OnUpdate:        updateRule.String,
+				OnDelete:        deleteRule.String,
+			}
+			foreignKeysByTable[tableName][constraintName] = fk
+			tableCatalog.ForeignKeys = append(tableCatalog.ForeignKeys, fk)
+		}
+		fk.Columns = append(fk.Columns, columnName.String)
+		fk.ReferencedColumns = append(fk.ReferencedColumns, referencedColumn.String)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate foreign key catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
 	}
 	return nil
 }

@@ -21,6 +21,13 @@ func barrier(dep, st string) Operation {
 	return Operation{Deployment: dep, State: st, Barrier: true, HaltOnFailure: true}
 }
 
+// parallel builds a parallel, halt-on-failure operation. Under parallel the copy
+// phase has no earlier-sibling gate, so a pending parallel operation is never
+// shown waiting for or halted by an earlier sibling.
+func parallel(dep, st string) Operation {
+	return Operation{Deployment: dep, State: st, Parallel: true, HaltOnFailure: true}
+}
+
 // continuing builds a rolling, on_failure=continue operation. HaltOnFailure and
 // ContinueOnFailure are exact complements at the real boundary mappers (both
 // derive from the same on_failure value), so a continue operation sets
@@ -128,6 +135,30 @@ func TestDerivePending_Ordering(t *testing.T) {
 			label: "waiting for eu",
 		},
 		{
+			name:  "parallel: earlier still copying does not block (concurrent copy)",
+			ops:   []Operation{parallel("eu", so.Running), parallel("us", so.Pending)},
+			want:  StateQueuedNext,
+			label: "queued — next in order",
+		},
+		{
+			name:  "parallel: earlier pending does not block",
+			ops:   []Operation{parallel("eu", so.Pending), parallel("us", so.Pending)},
+			want:  StateQueuedNext,
+			label: "queued — next in order",
+		},
+		{
+			name:  "parallel: earlier failed does not halt copy start",
+			ops:   []Operation{parallel("eu", so.Failed), parallel("us", so.Pending)},
+			want:  StateQueuedNext,
+			label: "queued — next in order",
+		},
+		{
+			name:  "parallel: earlier cancelled does not halt copy start",
+			ops:   []Operation{parallel("eu", so.Cancelled), parallel("us", so.Pending)},
+			want:  StateQueuedNext,
+			label: "queued — next in order",
+		},
+		{
 			name:  "halt: earlier failed halts the rollout",
 			ops:   []Operation{rolling("eu", so.Failed), rolling("us", so.Pending)},
 			want:  StateHalted,
@@ -190,6 +221,12 @@ func TestDeriveWaitingForCutover_Ordering(t *testing.T) {
 		{
 			name:  "barrier: earlier also at barrier still blocks cutover (cutover stays ordered)",
 			ops:   []Operation{barrier("eu", so.WaitingForCutover), barrier("us", so.WaitingForCutover)},
+			want:  StateReadyForCutoverWaiting,
+			label: "ready for cutover — waiting for eu",
+		},
+		{
+			name:  "parallel: earlier also at barrier still blocks cutover (cutover stays ordered)",
+			ops:   []Operation{parallel("eu", so.WaitingForCutover), parallel("us", so.WaitingForCutover)},
 			want:  StateReadyForCutoverWaiting,
 			label: "ready for cutover — waiting for eu",
 		},

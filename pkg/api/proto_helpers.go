@@ -69,11 +69,14 @@ func protoTableCatalogToAPI(catalog map[string]*ternv1.TableCatalog) map[string]
 			continue
 		}
 		result[table] = &apitypes.TableCatalog{
-			Name:    protoTable.Name,
-			Kind:    protoTable.Kind,
-			Comment: protoTable.Comment,
-			Columns: protoColumnCatalogToAPI(protoTable.Columns),
-			Indexes: protoIndexCatalogToAPI(protoTable.Indexes),
+			Name:              protoTable.Name,
+			Kind:              protoTable.Kind,
+			Comment:           protoTable.Comment,
+			Columns:           protoColumnCatalogToAPI(protoTable.Columns),
+			Indexes:           protoIndexCatalogToAPI(protoTable.Indexes),
+			EstimatedRowCount: protoTable.EstimatedRowCount,
+			DataSizeBytes:     protoTable.DataSizeBytes,
+			ForeignKeys:       protoForeignKeyCatalogToAPI(protoTable.ForeignKeys),
 		}
 	}
 	return result
@@ -89,11 +92,38 @@ func protoColumnCatalogToAPI(columns []*ternv1.ColumnCatalog) []*apitypes.Column
 			continue
 		}
 		result = append(result, &apitypes.ColumnCatalog{
-			Name:         column.Name,
-			Type:         column.Type,
-			Nullable:     column.Nullable,
-			DefaultValue: column.DefaultValue,
-			Comment:      column.Comment,
+			Name:          column.Name,
+			Type:          column.Type,
+			Nullable:      column.Nullable,
+			DefaultValue:  column.DefaultValue,
+			Comment:       column.Comment,
+			AutoIncrement: column.AutoIncrement,
+			Generated:     column.Generated,
+		})
+	}
+	return result
+}
+
+func protoForeignKeyCatalogToAPI(foreignKeys []*ternv1.ForeignKeyCatalog) []*apitypes.ForeignKeyCatalog {
+	if len(foreignKeys) == 0 {
+		return nil
+	}
+	result := make([]*apitypes.ForeignKeyCatalog, 0, len(foreignKeys))
+	for _, fk := range foreignKeys {
+		if fk == nil {
+			continue
+		}
+		columns := make([]string, len(fk.Columns))
+		copy(columns, fk.Columns)
+		referencedColumns := make([]string, len(fk.ReferencedColumns))
+		copy(referencedColumns, fk.ReferencedColumns)
+		result = append(result, &apitypes.ForeignKeyCatalog{
+			Name:              fk.Name,
+			Columns:           columns,
+			ReferencedTable:   fk.ReferencedTable,
+			ReferencedColumns: referencedColumns,
+			OnUpdate:          fk.OnUpdate,
+			OnDelete:          fk.OnDelete,
 		})
 	}
 	return result
