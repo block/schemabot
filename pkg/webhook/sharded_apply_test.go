@@ -118,3 +118,22 @@ func TestBuildShardedApplyData_DivergentGroupsByTable(t *testing.T) {
 	assert.Equal(t, "-40", data.Shards[0].Shard)
 	assert.Equal(t, "40-80", data.Shards[1].Shard)
 }
+
+// An operation with more than one task for its (shard, table) joins every task's
+// DDL into the cell, rather than dropping all but the first.
+func TestBuildShardedApplyData_JoinsMultiTaskDDL(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running}
+	op := &storage.ApplyOperation{ID: 1, ApplyID: 1, Deployment: "cake", OperationKey: "ks/-40/mutes", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	oid := int64(1)
+	tasks := []*storage.Task{
+		{ID: 1, ApplyID: 1, ApplyOperationID: &oid, Namespace: "ks", TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX a"},
+		{ID: 2, ApplyID: 1, ApplyOperationID: &oid, Namespace: "ks", TableName: "mutes", DDL: ""}, // empty is skipped
+		{ID: 3, ApplyID: 1, ApplyOperationID: &oid, Namespace: "ks", TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX b"},
+	}
+
+	data := buildShardedApplyData(apply, []*storage.ApplyOperation{op}, tasks)
+
+	require.Len(t, data.Cells, 1)
+	assert.Equal(t, "ALTER TABLE `mutes` ADD INDEX a\nALTER TABLE `mutes` ADD INDEX b", data.Cells[0].DDL,
+		"all non-empty task DDLs are joined in order")
+}

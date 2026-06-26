@@ -81,11 +81,18 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		if keyspace == "" {
 			keyspace = ns
 		}
-		ddl := ""
-		if ts := tasksByOp[op.ID]; len(ts) > 0 {
-			ddl = ts[0].DDL
+		// An operation can carry more than one task for its (namespace, shard,
+		// table) — a shard plan may yield multiple statements for the same table —
+		// so join every non-empty task DDL in task order. Taking only the first
+		// would drop statements and corrupt the change signature used to group
+		// shards.
+		var ddls []string
+		for _, t := range tasksByOp[op.ID] {
+			if strings.TrimSpace(t.DDL) != "" {
+				ddls = append(ddls, t.DDL)
+			}
 		}
-		cells = append(cells, templates.ShardCell{Shard: shard, Table: table, DDL: ddl})
+		cells = append(cells, templates.ShardCell{Shard: shard, Table: table, DDL: strings.Join(ddls, "\n")})
 		if _, seen := opsByShard[shard]; !seen {
 			shardOrder = append(shardOrder, shard)
 		}
