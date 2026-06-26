@@ -17,6 +17,10 @@ func rollingOp() *storage.ApplyOperation {
 	return &storage.ApplyOperation{CutoverPolicy: storage.CutoverPolicyRolling}
 }
 
+func parallelOp() *storage.ApplyOperation {
+	return &storage.ApplyOperation{CutoverPolicy: storage.CutoverPolicyParallel}
+}
+
 func TestShouldAutoDeferCutover(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -25,7 +29,9 @@ func TestShouldAutoDeferCutover(t *testing.T) {
 		want           bool
 	}{
 		{"multi-op barrier parks", true, barrierOp(), true},
+		{"multi-op parallel parks", true, parallelOp(), true},
 		{"single-op barrier does not park", false, barrierOp(), false},
+		{"single-op parallel does not park", false, parallelOp(), false},
 		{"multi-op rolling does not park", true, rollingOp(), false},
 		{"multi-op nil op does not park", true, nil, false},
 		{"single-op rolling does not park", false, rollingOp(), false},
@@ -46,8 +52,11 @@ func TestShouldReleaseAtCutoverBarrier(t *testing.T) {
 		want           bool
 	}{
 		{"multi-op barrier auto-releases", false, true, barrierOp(), true},
+		{"multi-op parallel auto-releases", false, true, parallelOp(), true},
 		{"manual defer holds the claim", true, true, barrierOp(), false},
+		{"manual defer holds the claim (parallel)", true, true, parallelOp(), false},
 		{"single-op barrier does not release", false, false, barrierOp(), false},
+		{"single-op parallel does not release", false, false, parallelOp(), false},
 		{"multi-op rolling does not release", false, true, rollingOp(), false},
 	}
 	for _, tt := range tests {

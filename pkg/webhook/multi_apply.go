@@ -101,6 +101,7 @@ func applyOperationToPresentation(op *storage.ApplyOperation) presentation.Opera
 		Deployment:        op.Deployment,
 		State:             op.State,
 		Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
+		Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
 		HaltOnFailure:     op.OnFailure != storage.OnFailureContinue,
 		ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
 		Error:             op.ErrorMessage,

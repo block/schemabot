@@ -22,7 +22,25 @@ const (
 	// CutoverPolicyBarrier lets later deployments run their copy phase once
 	// earlier siblings reach the cutover barrier, while cutover stays ordered.
 	CutoverPolicyBarrier = "barrier"
+
+	// CutoverPolicyParallel drops copy-phase ordering entirely: every deployment
+	// copies concurrently from the start, with no earlier-sibling gate on copy
+	// start. Only the cutover phase stays deployment-ordered, exactly like
+	// barrier. This collapses copy wall-clock toward "longest copy" for rollouts
+	// whose hours-long copy dominates, while preserving the ordered, one-at-a-time
+	// cutover swaps.
+	CutoverPolicyParallel = "parallel"
 )
+
+// IsOrderedCutoverPolicy reports whether a cutover policy parks each
+// multi-deployment operation at the cutover barrier and drives the high-risk
+// swaps in deployment order via the cutover-claim path. Both barrier and
+// parallel share this ordered-cutover behaviour; they differ only in the
+// copy-start gate (barrier staggers copies, parallel runs them concurrently).
+// rolling and any unrecognized value are not ordered-cutover policies.
+func IsOrderedCutoverPolicy(policy string) bool {
+	return policy == CutoverPolicyBarrier || policy == CutoverPolicyParallel
+}
 
 // On-failure policies control multi-deployment rollout continuation when an
 // earlier deployment terminally fails. Like the cutover policy, the value is

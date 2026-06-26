@@ -588,11 +588,14 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// Sibling-gate args for the pending claim, cutover_policy-aware (see the
 	// gate SQL below). Under barrier, an earlier sibling stops blocking once it
 	// reaches the cutover barrier or succeeds (waiting_for_cutover, cutting_over,
-	// revert_window, completed); under rolling — and any non-barrier value, which
-	// fails closed to the serial gate — only a completed earlier sibling stops
-	// blocking. The trailing on_failure/Failed pair drives the exemption: when
-	// the policy is "continue", a terminal-failed earlier sibling no longer
-	// blocks later ones.
+	// revert_window, completed). Under parallel there is intentionally no arm: a
+	// parallel operation matches neither branch, so no earlier sibling can make
+	// the blocking EXISTS true and its copy starts immediately (concurrent copy).
+	// Under rolling — and any unrecognized value, which fails closed to the
+	// serial gate via NOT IN (barrier, parallel) — only a completed earlier
+	// sibling stops blocking. The trailing on_failure/Failed pair drives the
+	// exemption: when the policy is "continue", a terminal-failed earlier sibling
+	// no longer blocks later ones.
 	queryArgs = append(queryArgs,
 		storage.CutoverPolicyBarrier,
 		state.ApplyOperation.WaitingForCutover,
@@ -600,6 +603,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		state.ApplyOperation.RevertWindow,
 		state.ApplyOperation.Completed,
 		storage.CutoverPolicyBarrier,
+		storage.CutoverPolicyParallel,
 		state.ApplyOperation.Completed,
 		storage.OnFailureContinue,
 		state.ApplyOperation.Failed,
@@ -620,13 +624,14 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		storage.ControlOperationStop, storage.ControlRequestPending)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	// Stale-active barrier-park exemption (see the staleness clause below): a
-	// multi-deployment operation parked at the cutover barrier under the barrier
-	// policy is reserved for the deployment-ordered cutover claim, so the copy
-	// claim must not re-lease it as stale-active work. A single-operation apply
-	// has no sibling and is never exempted, so manual --defer-cutover behaviour
-	// is unchanged.
+	// multi-deployment operation parked at the cutover barrier under an
+	// ordered-cutover policy (barrier or parallel) is reserved for the
+	// deployment-ordered cutover claim, so the copy claim must not re-lease it as
+	// stale-active work. A single-operation apply has no sibling and is never
+	// exempted, so manual --defer-cutover behaviour is unchanged.
 	queryArgs = append(queryArgs,
-		state.ApplyOperation.WaitingForCutover, storage.CutoverPolicyBarrier)
+		state.ApplyOperation.WaitingForCutover,
+		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel)
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationStart, storage.ControlRequestPending)
@@ -708,7 +713,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 										AND earlier.state NOT IN (?, ?, ?, ?)
 									)
 									OR (
-										apply_operations.cutover_policy <> ?
+										apply_operations.cutover_policy NOT IN (?, ?)
 										AND earlier.state <> ?
 									)
 								)
@@ -741,7 +746,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 				AND updated_at < NOW() - INTERVAL %s
 				AND NOT (
 					state = ?
-					AND cutover_policy = ?
+					AND cutover_policy IN (?, ?)
 					AND EXISTS (
 						SELECT 1
 						FROM apply_operations AS sibling
@@ -1012,8 +1017,10 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	// driving — exactly the population OC-2 parks-and-releases. This mirrors
 	// shouldReleaseAtCutoverBarrier in pkg/tern/cutover_barrier.go:
 	//
-	//   1. cutover_policy = barrier — rolling rows are never deployment-ordered
-	//      at the cutover phase.
+	//   1. cutover_policy is ordered (barrier or parallel) — rolling rows are
+	//      never deployment-ordered at the cutover phase. Barrier and parallel
+	//      both park at the barrier and cut over in deployment order; they differ
+	//      only in the copy-start gate, so both are eligible here.
 	//   2. multi-operation apply (EXISTS sibling) — a single-op apply has no
 	//      siblings to order, so it never auto-defers; its cutover stays on the
 	//      copy/manual path. Mirrors shouldAutoDeferCutover's multiOperation arg.
@@ -1026,7 +1033,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	// The gate wraps BOTH claim branches (start and stale recovery): a stale
 	// cutting_over/revert_window row outside this population reached that state
 	// via the copy/manual path, so recovering it here would steal legitimate work.
-	queryArgs := []any{storage.CutoverPolicyBarrier}
+	queryArgs := []any{storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel}
 	// Start-a-parked-cutover gate (see SQL below). A waiting_for_cutover row is
 	// claimable only when no earlier deployment_order sibling is still
 	// non-completed; the on_failure/Failed pair is the "continue" exemption (a
@@ -1051,7 +1058,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
-		WHERE apply_operations.cutover_policy = ?
+		WHERE apply_operations.cutover_policy IN (?, ?)
 		AND EXISTS (
 			SELECT 1
 			FROM apply_operations AS sibling

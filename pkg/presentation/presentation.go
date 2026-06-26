@@ -39,6 +39,16 @@ type Operation struct {
 	// succeeds; under rolling only a completed earlier sibling stops blocking.
 	Barrier bool
 
+	// Parallel is true when the operation's cutover_policy is "parallel" (resolved
+	// by the caller from storage.CutoverPolicyParallel). Under parallel the copy
+	// phase has no earlier-sibling gate at all — every deployment copies
+	// concurrently from the start — so a pending operation is never shown waiting
+	// for or halted by an earlier sibling. Cutover ordering is unchanged (it is
+	// strict-complete and policy-independent), so a parked parallel operation
+	// still waits for earlier cutovers exactly like barrier. Barrier and Parallel
+	// are mutually exclusive: the caller derives each from the same stored policy.
+	Parallel bool
+
 	// HaltOnFailure is the resolved halt-on-failure policy (the caller derefs the
 	// stored *bool, treating nil as true — the safe default). When false, a
 	// terminal-failed earlier sibling no longer blocks later deployments.
@@ -269,6 +279,14 @@ func deriveDeployment(ops []Operation, i int) Deployment {
 // label agrees with what the operator will claim next.
 func derivePending(d *Deployment, ops []Operation, i int) {
 	op := ops[i]
+	// Under parallel the copy phase has no earlier-sibling gate, so a pending
+	// operation is immediately claimable regardless of any earlier sibling — it
+	// is never halted by or waiting for one. Mirror FindNextApplyOperation, whose
+	// copy-start gate matches no arm for parallel.
+	if op.Parallel {
+		d.set(StateQueuedNext, "queued — next in order", "⏳", false)
+		return
+	}
 	if h := haltingBlocker(ops, i); h != nil {
 		d.set(StateHalted, fmt.Sprintf("halted — %s %s", h.Deployment, haltedReason(h.State)), "⏸", true)
 		return
