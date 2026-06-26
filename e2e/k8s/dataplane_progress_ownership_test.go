@@ -175,6 +175,7 @@ func planAndApplyIndexOnPod(t *testing.T, client ternv1.TernClient, tableName st
 		PlanId:      planResp.PlanId,
 		Environment: "staging",
 		Caller:      "e2e",
+		Options:     map[string]string{"allow_unsafe": "true"},
 	})
 	require.NoError(t, err, "apply on data-plane pod")
 	require.True(t, applyResp.Accepted, "apply not accepted: %s", applyResp.ErrorMessage)
