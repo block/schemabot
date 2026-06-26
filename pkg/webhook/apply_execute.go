@@ -96,7 +96,7 @@ func (h *Handler) executeApply(
 		options["allow_unsafe"] = "true"
 	}
 
-	caller := fmt.Sprintf("github:%s@%s#%d", requestedBy, repo, pr)
+	caller := formatGitHubCaller(requestedBy, repo, pr)
 
 	// Resolve the App factory for this repo once so the observer captures
 	// the correct App for all subsequent GitHub calls (comments, check runs).

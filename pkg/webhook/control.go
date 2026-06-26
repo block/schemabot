@@ -153,7 +153,7 @@ func runControlCommand[R any](
 		return nil
 	}
 
-	caller := fmt.Sprintf("github:%s@%s#%d", requestedBy, repo, pr)
+	caller := formatGitHubCaller(requestedBy, repo, pr)
 	resp, err := execute(ctx, apitypes.ControlRequest{
 		ApplyID:     result.ApplyID,
 		Environment: result.Environment,
