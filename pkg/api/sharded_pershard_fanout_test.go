@@ -94,6 +94,47 @@ func TestBuildShardedApplyOperationGroupsSkipsShardsWithoutChanges(t *testing.T)
 	}, operationDDLByKey(groups), "only the shard with changes fans out; the unchanged shard stays out")
 }
 
+// Per-shard change data is remote/untrusted (it crosses the gRPC boundary), so a
+// malformed change fails closed rather than persisting corrupt plan_data.
+func TestProtoShardPlansToStorageFailsClosedOnMalformedChange(t *testing.T) {
+	shardWith := func(ch *ternv1.TableChange) []*ternv1.ShardPlan {
+		return []*ternv1.ShardPlan{{Namespace: pershardNamespace, Shard: "-80", Changes: []*ternv1.TableChange{ch}}}
+	}
+	cases := []struct {
+		name string
+		ch   *ternv1.TableChange
+		want string
+	}{
+		{"nil change", nil, "is null"},
+		{"empty table", &ternv1.TableChange{Ddl: "ALTER TABLE `mutes` ADD INDEX (`x`)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER}, "empty table or DDL"},
+		{"empty ddl", &ternv1.TableChange{TableName: "mutes", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER}, "empty table or DDL"},
+		{"unsupported type", &ternv1.TableChange{TableName: "mutes", Ddl: "x", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA}, "unsupported change type"},
+		{"namespace mismatch", &ternv1.TableChange{TableName: "mutes", Ddl: "x", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "other"}, "disagrees with shard namespace"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := protoShardPlansToStorage(shardWith(tc.ch))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+// A malformed per-shard change in the stored plan fails closed before building an
+// operation key or engine request from empty/mismatched fields.
+func TestBuildShardedApplyOperationGroupsFailsClosedOnMalformedChange(t *testing.T) {
+	plan := &storage.Plan{
+		Database: "cdb-resolute",
+		Shards: []storage.ShardPlan{{
+			Namespace: pershardNamespace, Shard: "-80",
+			Changes: []storage.TableChange{{Namespace: pershardNamespace, Table: "", DDL: "ALTER TABLE `mutes` ADD INDEX (`x`)", Operation: "alter"}},
+		}},
+	}
+	_, err := buildShardedApplyOperationGroups(plan, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty table")
+}
+
 // Per-shard changes survive the proto boundary so the control plane rebuilds the
 // fan-out from each shard's own DDL.
 func TestProtoShardPlansToStorageCarriesPerShardChanges(t *testing.T) {

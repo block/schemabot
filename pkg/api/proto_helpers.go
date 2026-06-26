@@ -247,19 +247,26 @@ func protoShardPlansToStorage(shards []*ternv1.ShardPlan) ([]storage.ShardPlan, 
 			Namespace: namespace,
 		}
 		// Carry the shard's own changes so the apply-create fan-out can build
-		// per-shard tasks from per-shard DDL. This comes from the data plane over
-		// gRPC, so a nil entry is malformed input — fail closed rather than
-		// silently dropping a change and generating an incomplete plan.
+		// per-shard tasks from per-shard DDL. This is remote/untrusted data-plane
+		// input over gRPC, so validate and fail closed rather than persisting
+		// corrupt plan_data that later builds tasks with empty/mismatched fields.
 		for j, ch := range shard.Changes {
 			if ch == nil {
 				return nil, fmt.Errorf("shard plan %d (namespace %q shard %q) change %d is null", i, namespace, shardName, j)
 			}
-			chNamespace := ch.Namespace
-			if chNamespace == "" {
-				chNamespace = namespace
+			if strings.TrimSpace(ch.TableName) == "" || strings.TrimSpace(ch.Ddl) == "" {
+				return nil, fmt.Errorf("shard plan %d (namespace %q shard %q) change %d has an empty table or DDL", i, namespace, shardName, j)
+			}
+			switch ch.ChangeType {
+			case ternv1.ChangeType_CHANGE_TYPE_CREATE, ternv1.ChangeType_CHANGE_TYPE_ALTER, ternv1.ChangeType_CHANGE_TYPE_DROP:
+			default:
+				return nil, fmt.Errorf("shard plan %d (namespace %q shard %q) change %d (table %q) has unsupported change type %v", i, namespace, shardName, j, ch.TableName, ch.ChangeType)
+			}
+			if ch.Namespace != "" && ch.Namespace != namespace {
+				return nil, fmt.Errorf("shard plan %d shard %q change %d (table %q) namespace %q disagrees with shard namespace %q", i, shardName, j, ch.TableName, ch.Namespace, namespace)
 			}
 			sp.Changes = append(sp.Changes, storage.TableChange{
-				Namespace: chNamespace,
+				Namespace: namespace,
 				Table:     ch.TableName,
 				DDL:       ch.Ddl,
 				Operation: protoChangeTypeToOperation(ch.ChangeType),

@@ -1083,6 +1083,14 @@ func buildShardedApplyOperationGroups(
 				// Each shard is driven from its own changes; it is in
 				// shardsByNamespace only because those changes are non-empty.
 				for _, ddlChange := range shard.Changes {
+					// Fail closed on a malformed per-shard change rather than building
+					// an operation key or engine request from empty/mismatched fields.
+					if strings.TrimSpace(ddlChange.Table) == "" || strings.TrimSpace(ddlChange.DDL) == "" || strings.TrimSpace(ddlChange.Operation) == "" {
+						return nil, fmt.Errorf("namespace %q shard %q has a change with an empty table, DDL, or operation", namespace, shard.Shard)
+					}
+					if ddlChange.Namespace != "" && ddlChange.Namespace != namespace {
+						return nil, fmt.Errorf("namespace %q shard %q change for table %q has mismatched namespace %q", namespace, shard.Shard, ddlChange.Table, ddlChange.Namespace)
+					}
 					if err := validateShardOperationKeyParts(namespace, shard.Shard, ddlChange.Table); err != nil {
 						return nil, err
 					}

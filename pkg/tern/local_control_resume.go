@@ -324,7 +324,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		// between re-plan (which reads schema) and Spirit's cutover (which renames
 		// the shadow table). If Spirit completed the cutover after the re-plan read
 		// the schema, the table already has the desired changes.
-		needsChange, err := c.tableStillNeedsChange(ctx, apply, plan, task.TableName)
+		needsChange, err := c.tableStillNeedsChange(ctx, apply, plan, task)
 		if err != nil {
 			c.logger.Warn("could not verify table schema state, proceeding with apply",
 				"task_id", task.TaskIdentifier, "table", task.TableName, "error", err)
@@ -364,21 +364,40 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 	c.logger.Info("sequential resume finished", "apply_id", apply.ApplyIdentifier, "state", apply.State)
 }
 
-// tableStillNeedsChange does a quick re-plan to check if a specific table
-// still needs schema changes. Returns false if the table already has the
+// shardTableKey identifies a table change within a specific shard. For a
+// non-sharded engine the shard is empty, so keying degrades to table-only and
+// matches the pre-sharding behavior.
+type shardTableKey struct {
+	shard string
+	table string
+}
+
+// replanShardTableDDL indexes a re-plan's table changes by (shard, table) -> DDL
+// so the resume/recovery path reconciles each task against its own shard. A
+// sharded engine emits one SchemaChange per shard and the same table repeats
+// across shards, so keying by table name alone would conflate per-shard tasks:
+// another shard's remaining diff could keep this shard's task active, or update
+// it with another shard's DDL.
+func replanShardTableDDL(result *engine.PlanResult) map[shardTableKey]string {
+	out := make(map[shardTableKey]string)
+	for _, sc := range result.Changes {
+		for _, tc := range sc.TableChanges {
+			out[shardTableKey{shard: sc.Shard.Name, table: tc.Table}] = tc.DDL
+		}
+	}
+	return out
+}
+
+// tableStillNeedsChange does a quick re-plan to check if a task's table on its
+// own shard still needs schema changes. Returns false if it already has the
 // desired schema (e.g., Spirit's cutover completed during the stop sequence).
-func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.Apply, plan *storage.Plan, tableName string) (bool, error) {
+func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.Apply, plan *storage.Plan, task *storage.Task) (bool, error) {
 	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{}, apply.Database, plan.SchemaFiles)
 	if err != nil {
 		return false, fmt.Errorf("re-plan check failed: %w", err)
 	}
-
-	for _, tc := range result.FlatTableChanges() {
-		if tc.Table == tableName {
-			return true, nil
-		}
-	}
-	return false, nil
+	_, stillNeeded := replanShardTableDDL(result)[shardTableKey{shard: task.Shard, table: task.TableName}]
+	return stillNeeded, nil
 }
 
 // replanResult holds the result of replanAndFilterTasks.
@@ -400,13 +419,10 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 		return nil, fmt.Errorf("re-plan failed: %w", err)
 	}
 
-	// Build set of tables that still need changes
-	needsChange := make(map[string]bool, len(replanOut.FlatTableChanges()))
-	replanDDL := make(map[string]string, len(replanOut.FlatTableChanges()))
-	for _, tc := range replanOut.FlatTableChanges() {
-		needsChange[tc.Table] = true
-		replanDDL[tc.Table] = tc.DDL
-	}
+	// Index the re-plan's remaining changes by (shard, table) so each task is
+	// reconciled against its own shard rather than conflated with same-named
+	// tables on other shards.
+	replanDDL := replanShardTableDDL(replanOut)
 
 	// Partition tasks: already-done vs still-needed
 	now := time.Now()
@@ -416,17 +432,16 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 		if task.State == state.Task.Completed {
 			continue
 		}
-		if !needsChange[task.TableName] {
-			// Table no longer in diff — it already completed
+		ddl, stillNeeded := replanDDL[shardTableKey{shard: task.Shard, table: task.TableName}]
+		if !stillNeeded {
+			// This shard's table is no longer in the diff — it already completed.
 			task.ProgressPercent = 100
 			task.CompletedAt = &now
 			c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
 				fmt.Sprintf("Task %s already completed (re-plan shows no remaining changes)", task.TaskIdentifier))
 			completedCount++
 		} else {
-			if ddl, ok := replanDDL[task.TableName]; ok {
-				task.DDL = ddl
-			}
+			task.DDL = ddl
 			activeTasks = append(activeTasks, task)
 		}
 	}
