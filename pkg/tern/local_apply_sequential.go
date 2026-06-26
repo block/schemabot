@@ -343,11 +343,19 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				ResumeState: resumeState,
 			})
 			if err != nil {
-				// A poll that can never succeed (e.g. a persistently malformed
-				// progress request) must not spin forever: an apply that cannot
-				// reach a terminal state holds the database's active-apply slot and
-				// blocks every later apply. Fail fast after a bounded run of errors,
-				// matching the grouped poll's behaviour.
+				// A permanent error can never succeed on retry, so fail immediately
+				// rather than waiting out the consecutive-error budget — matching the
+				// grouped poll.
+				var permanent *engine.PermanentError
+				if errors.As(err, &permanent) {
+					c.logger.Error("progress check failed with permanent error", "error", err, "task_id", task.TaskIdentifier)
+					c.markTaskFailed(ctx, task, fmt.Sprintf("progress polling failed: %v", err))
+					return taskFailed
+				}
+				// A transient poll that nonetheless never succeeds must not spin
+				// forever: an apply that cannot reach a terminal state holds the
+				// database's active-apply slot and blocks every later apply. Fail
+				// after a bounded run of errors, matching the grouped poll.
 				consecutiveErrors++
 				c.logger.Warn("progress check failed", "error", err, "task_id", task.TaskIdentifier, "consecutive_errors", consecutiveErrors)
 				if consecutiveErrors >= 10 {

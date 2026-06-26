@@ -60,7 +60,7 @@ func TestPollTaskToCompletion_ThreadsResumeState(t *testing.T) {
 		},
 		logger: slog.Default(),
 	}
-	resume := &engine.ResumeState{MigrationContext: "spirit-ctx", Metadata: "shard-meta"}
+	resume := &engine.ResumeState{Metadata: "shard-meta"}
 
 	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, resume)
 
@@ -68,4 +68,42 @@ func TestPollTaskToCompletion_ThreadsResumeState(t *testing.T) {
 	assert.Equal(t, state.Task.Completed, task.State)
 	require.NotNil(t, eng.gotResumeState, "Progress must receive the resume state")
 	assert.Equal(t, "shard-meta", eng.gotResumeState.Metadata, "the engine's resume-state metadata is threaded into Progress")
+}
+
+// permanentProgressErrorEngine always fails Progress with a permanent error.
+type permanentProgressErrorEngine struct{ engine.Engine }
+
+func (permanentProgressErrorEngine) Name() string { return "permanent-error" }
+func (permanentProgressErrorEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return nil, engine.NewPermanentError("deploy request not found")
+}
+
+// A permanent progress error fails the task immediately rather than waiting out
+// the consecutive-error budget, matching the grouped poll.
+func TestPollTaskToCompletion_PermanentErrorFailsFast(t *testing.T) {
+	task := &storage.Task{
+		ID: 1, ApplyID: 1, TaskIdentifier: "task-1",
+		Database: "cdb_resolute", DatabaseType: storage.DatabaseTypeStrata,
+		Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: "-40",
+		State: state.Task.Running,
+	}
+	apply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply-1", Database: "cdb_resolute",
+		DatabaseType: storage.DatabaseTypeStrata, Environment: "staging",
+	}
+	client := &LocalClient{
+		config:       LocalConfig{Database: "cdb_resolute", Type: storage.DatabaseTypeStrata},
+		customEngine: permanentProgressErrorEngine{},
+		storage: &exactProgressStorage{
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			controlRequests: &testControlRequestStore{},
+			logs:            &mockApplyLogStore{},
+		},
+		logger: slog.Default(),
+	}
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, &engine.ResumeState{Metadata: "shard-meta"})
+
+	assert.Equal(t, taskFailed, action)
+	assert.Equal(t, state.Task.Failed, task.State, "a permanent progress error fails the task without exhausting the retry budget")
 }
