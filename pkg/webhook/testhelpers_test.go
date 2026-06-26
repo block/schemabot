@@ -43,9 +43,10 @@ func setupGitHubServer(t *testing.T) (*gh.Client, *http.ServeMux) {
 
 // prWebhookPayloadOpts configures how buildPRWebhookRequest constructs the payload.
 type prWebhookPayloadOpts struct {
-	action  string // "opened", "synchronize", "reopened", "closed", etc.
-	headSHA string
-	headRef string
+	action    string // "opened", "synchronize", "reopened", "closed", etc.
+	beforeSHA string
+	headSHA   string
+	headRef   string
 }
 
 type checkRunWebhookPayloadOpts struct {
@@ -87,6 +88,9 @@ func buildPRWebhookRequest(t *testing.T, opts prWebhookPayloadOpts, secret []byt
 		"installation": map[string]any{
 			"id": 12345,
 		},
+	}
+	if opts.beforeSHA != "" {
+		payload["before"] = opts.beforeSHA
 	}
 
 	body, err := json.Marshal(payload)

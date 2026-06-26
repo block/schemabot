@@ -394,6 +394,21 @@ func isSchemaFile(filename string) bool {
 	return strings.HasSuffix(filename, ".sql") || strings.HasSuffix(filename, "vschema.json")
 }
 
+// HasSchemaInputFiles reports whether a changed file list touches inputs that
+// should refresh the visible SchemaBot plan.
+func HasSchemaInputFiles(files []PRFile) bool {
+	for _, file := range files {
+		if isSchemaInputFile(file.Filename) || isSchemaInputFile(file.PreviousFilename) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSchemaInputFile(filename string) bool {
+	return isSchemaFile(filename) || isConfigFile(filename)
+}
+
 func isConfigFile(filename string) bool {
 	return path.Base(filename) == ConfigFileName
 }

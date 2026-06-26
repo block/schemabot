@@ -531,6 +531,14 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	return result
 }
 
+func registerCompareFiles(t *testing.T, mux *http.ServeMux, baseSHA, headSHA string, files []*gh.CommitFile) {
+	t.Helper()
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/"+baseSHA+"..."+headSHA, func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{Files: files}))
+	})
+}
+
 func TestE2EPlanWithChanges(t *testing.T) {
 	dbName := "webhook_plan_changes"
 	svc := setupE2EService(t, dbName)
@@ -1019,6 +1027,65 @@ func TestE2EAutoPlan(t *testing.T) {
 		assert.Equal(t, "action_required", cr.Conclusion)
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for check run")
+	}
+}
+
+// A push that only changes non-schema inputs still refreshes SchemaBot checks
+// for the new PR commit without adding another plan comment to the PR timeline.
+func TestE2EAutoPlanSynchronizeApplicationOnlyChangeSkipsComment(t *testing.T) {
+	dbName := "webhook_autoplan_app_only_sync"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	registerCompareFiles(t, mux, "oldsha", "newsha", []*gh.CommitFile{{
+		Filename: new("app/service.go"),
+		Status:   new("modified"),
+	}})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:    "synchronize",
+		beforeSHA: "oldsha",
+		headSHA:   "newsha",
+		headRef:   "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	select {
+	case cr := <-result.checkRuns:
+		assert.Contains(t, cr.Name, "SchemaBot")
+		assert.Equal(t, "completed", cr.Status)
+		assert.Equal(t, "action_required", cr.Conclusion)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for check run")
+	}
+
+	select {
+	case body := <-result.comments:
+		t.Fatalf("expected no comment for application-only synchronize, got: %s", body)
+	case <-time.After(3 * time.Second):
 	}
 }
 

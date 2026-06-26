@@ -16,6 +16,7 @@ import (
 // pullRequestPayload represents the relevant fields from a GitHub pull_request webhook.
 type pullRequestPayload struct {
 	Action      string `json:"action"`
+	Before      string `json:"before"`
 	PullRequest struct {
 		Number int `json:"number"`
 		Head   struct {
@@ -100,7 +101,8 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 	}
 	defer cancel()
 
-	message := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request")
+	postPlanComment := h.shouldPostAutoPlanComment(ctx, client, payload.Action, repo, pr, payload.Before, headSHA)
+	message := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", postPlanComment)
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": message})
 }
 
@@ -117,7 +119,30 @@ func (h *Handler) autoPlanBootstrap(repo string, installationID int64) (context.
 	return ctx, cancel, client, nil
 }
 
-func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string) string {
+func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclient.InstallationClient, action, repo string, pr int, beforeSHA, headSHA string) bool {
+	if action != "synchronize" {
+		return true
+	}
+	if beforeSHA == "" {
+		h.logger.Info("auto-plan will post plan comment because synchronize payload has no previous HEAD SHA",
+			"repo", repo, "pr", pr, "head_sha", headSHA)
+		return true
+	}
+	files, err := client.FetchChangedFilesBetween(ctx, repo, beforeSHA, headSHA)
+	if err != nil {
+		h.logger.Warn("auto-plan will post plan comment because changed files could not be compared",
+			"repo", repo, "pr", pr, "before_sha", beforeSHA, "head_sha", headSHA, "error", err)
+		return true
+	}
+	if ghclient.HasSchemaInputFiles(files) {
+		return true
+	}
+	h.logger.Info("auto-plan will refresh checks without posting a plan comment because synchronize changed no schema inputs",
+		"repo", repo, "pr", pr, "before_sha", beforeSHA, "head_sha", headSHA)
+	return false
+}
+
+func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, postPlanComment bool) string {
 	// Discover all configs matching changed schema files in this PR
 	configs, err := client.FindAllConfigsForPR(ctx, repo, pr)
 	if err != nil {
@@ -164,7 +189,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	for _, cfg := range configs {
 		database := cfg.Config.Database
 		h.goSafe(repo, pr, installationID, func() {
-			h.handleMultiEnvPlan(repo, pr, database, "", installationID, "", true)
+			h.handleMultiEnvPlan(repo, pr, database, "", installationID, "", true, postPlanComment)
 		})
 	}
 

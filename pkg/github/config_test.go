@@ -35,6 +35,50 @@ environments:
 	assert.Contains(t, err.Error(), "field environments not found")
 }
 
+func TestHasSchemaInputFiles(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		files []PRFile
+		want  bool
+	}{
+		{
+			name:  "schema SQL file",
+			files: []PRFile{{Filename: "schema/users.sql", Status: "modified"}},
+			want:  true,
+		},
+		{
+			name:  "VSchema file",
+			files: []PRFile{{Filename: "schema/main/vschema.json", Status: "modified"}},
+			want:  true,
+		},
+		{
+			name:  "SchemaBot config file",
+			files: []PRFile{{Filename: "schema/schemabot.yaml", Status: "modified"}},
+			want:  true,
+		},
+		{
+			name:  "renamed schema file",
+			files: []PRFile{{Filename: "docs/users.md", PreviousFilename: "schema/users.sql", Status: "renamed"}},
+			want:  true,
+		},
+		{
+			name:  "application file",
+			files: []PRFile{{Filename: "app/service.go", Status: "modified"}},
+			want:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tt.want, HasSchemaInputFiles(tt.files))
+		})
+	}
+}
+
 func TestFindAllConfigsForPRClassifiesGitHubUnavailable(t *testing.T) {
 	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
 

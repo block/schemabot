@@ -154,7 +154,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			// Plan without -e: run for all configured environments
 			h.logger.Info("plan without -e flag", "repo", repo, "pr", pr)
 			h.goSafe(repo, pr, installationID, func() {
-				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false)
+				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, true)
 			})
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "multi-env plan started"})
 			return

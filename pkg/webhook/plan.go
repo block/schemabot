@@ -138,7 +138,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 // handleMultiEnvPlan runs plan for all configured environments and posts a single combined comment.
 // When isAutoPlan is true and no environments have changes or errors, the comment is skipped to reduce PR noise.
-func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool) {
+func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, postPlanComment bool) {
 	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
 		h.logger.Error("multi-env plan: failed to bootstrap command", "error", err)
@@ -342,6 +342,11 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			h.logger.Info("auto-plan: no changes detected, skipping comment", "repo", repo, "pr", pr)
 			return
 		}
+	}
+
+	if !postPlanComment {
+		h.logger.Info("auto-plan refreshed checks without posting plan comment", "repo", repo, "pr", pr, "database", multiEnvData.Database)
+		return
 	}
 
 	// Post a single combined comment

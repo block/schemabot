@@ -535,8 +535,9 @@ func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string,
 
 // PRFile represents a file changed in a PR.
 type PRFile struct {
-	Filename string
-	Status   string // added, removed, modified, renamed
+	Filename         string
+	PreviousFilename string
+	Status           string // added, removed, modified, renamed
 }
 
 // GitHub caps pull request file listings at this documented maximum and does
@@ -544,6 +545,10 @@ type PRFile struct {
 // the cap as incomplete so schema discovery fails closed instead of assuming
 // there are no managed schema changes later in the list.
 const maxGitHubPRFiles = 3000
+
+// GitHub includes at most this many changed files on compare responses.
+// Treat reaching the cap as incomplete so comment suppression fails open.
+const maxGitHubCompareFiles = 300
 
 // FetchPRFiles gets the list of files changed in a PR.
 func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr int) ([]PRFile, error) {
@@ -573,8 +578,9 @@ func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr 
 		}
 		for _, f := range readResult.files {
 			allFiles = append(allFiles, PRFile{
-				Filename: f.GetFilename(),
-				Status:   f.GetStatus(),
+				Filename:         f.GetFilename(),
+				PreviousFilename: f.GetPreviousFilename(),
+				Status:           f.GetStatus(),
 			})
 		}
 		if len(allFiles) >= maxGitHubPRFiles {
@@ -587,6 +593,34 @@ func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr 
 	}
 
 	return allFiles, nil
+}
+
+// FetchChangedFilesBetween gets the files changed between two refs.
+func (ic *InstallationClient) FetchChangedFilesBetween(ctx context.Context, repo string, base, head string) ([]PRFile, error) {
+	owner, repoName := splitRepo(repo)
+	readResult, err := retryGitHubUnavailableRead(ctx, ic.logger, "compare commits", []any{"repo", repo, "base", base, "head", head}, func(ctx context.Context) (*gh.CommitsComparison, error) {
+		comparison, _, err := ic.client.Repositories.CompareCommits(ctx, owner, repoName, base, head, nil)
+		if err != nil {
+			return nil, fmt.Errorf("compare commits %s...%s: %w", base, head, classifyGitHubAPIError(err))
+		}
+		return comparison, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	files := make([]PRFile, 0, len(readResult.Files))
+	for _, f := range readResult.Files {
+		files = append(files, PRFile{
+			Filename:         f.GetFilename(),
+			PreviousFilename: f.GetPreviousFilename(),
+			Status:           f.GetStatus(),
+		})
+	}
+	if len(files) >= maxGitHubCompareFiles {
+		return nil, fmt.Errorf("compare commits %s...%s for %s reached GitHub API file limit: %w", base, head, repo, ErrPRFilesIncomplete)
+	}
+	return files, nil
 }
 
 // CheckRunOptions contains options for creating or updating a GitHub Check Run.
