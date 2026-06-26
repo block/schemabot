@@ -363,6 +363,25 @@ func TestFetchSchemaFilesOptimizedRejectsEscapingSymlink(t *testing.T) {
 	assert.Contains(t, err.Error(), "outside the repository")
 }
 
+// A namespace symlink that resolves back to its own path is rejected rather than
+// re-fetched, which would otherwise loop or surface a confusing "not a directory"
+// error from the directory listing.
+func TestFetchSchemaFilesOptimizedRejectsSelfReferentialSymlink(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema", func(w http.ResponseWriter, _ *http.Request) {
+		entries := []gh.RepositoryContent{
+			{Type: new("symlink"), Name: new("shard_001"), Path: new("schema/shard_001"), Target: new("shard_001")},
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(entries))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, err := ic.FetchSchemaFilesOptimized(t.Context(), "octocat/hello-world", "abc123", "schema", "mysql")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "distinct directory")
+}
+
 // When the Contents API cannot list the schema root, discovery falls back to the
 // git tree. A symlinked namespace there is a mode-120000 blob whose target's
 // files live outside the schema root, so the fallback cannot resolve it and must

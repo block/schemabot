@@ -1456,8 +1456,8 @@ func (ic *InstallationClient) symlinkedNamespaceLocators(ctx context.Context, re
 	if !schemaPathWithinDirectory(".", resolved) {
 		return nil, fmt.Errorf("schema namespace symlink %s points outside the repository: %s", entry.GetPath(), target)
 	}
-	if resolved == "." || resolved == path.Clean(schemaPath) {
-		return nil, fmt.Errorf("schema namespace symlink %s must point to a distinct directory, not the repository root or its own schema root: %s", entry.GetPath(), target)
+	if resolved == "." || resolved == path.Clean(schemaPath) || resolved == path.Clean(entry.GetPath()) {
+		return nil, fmt.Errorf("schema namespace symlink %s must point to a distinct directory, not the repository root, its own schema root, or itself: %s", entry.GetPath(), target)
 	}
 
 	targetEntries, err := ic.fetchDirectoryContents(ctx, repo, resolved, ref)
