@@ -11,6 +11,29 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
+func TestShardedApplyActor(t *testing.T) {
+	assert.Equal(t, "morgo", shardedApplyActor("github:morgo@squareup/gap#11890"), "extract the username from the structured caller")
+	assert.Equal(t, "", shardedApplyActor("morgo"), "an unrecognised caller falls back to the timestamp")
+	assert.Equal(t, "", shardedApplyActor(""), "empty caller falls back to the timestamp")
+}
+
+// A sharded apply comment renders the attribution from the username, not the raw
+// structured caller (which produced a malformed "@github:morgo@…#…" line).
+func TestFormatApplyStatusComment_ShardedAttributionFromCaller(t *testing.T) {
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running,
+		Caller: "github:morgo@squareup/gap#11890",
+	}
+	op := &storage.ApplyOperation{ID: 1, ApplyID: 1, Deployment: "cake", OperationKey: "cdb_resolute_sharded/-40/mutes", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	oid := int64(1)
+	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: "-40", DDL: "ALTER TABLE `mutes` ADD INDEX a"}}
+
+	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, tasks, nil, nil)
+
+	assert.Contains(t, out, "by @morgo at", "attribution shows the clean username")
+	assert.NotContains(t, out, "github:", "the raw structured caller is not rendered")
+}
+
 func TestParseShardOperationKey(t *testing.T) {
 	ns, shard, table, ok := parseShardOperationKey("cdb_resolute_sharded/-40/mutes")
 	require.True(t, ok)

@@ -249,6 +249,13 @@ func writeShardStatusTable(sb *strings.Builder, shards []ShardStatus) {
 // writeGroupDDL writes a group's table changes, each DDL once.
 func writeGroupDDL(sb *strings.Builder, changes []ShardChange) {
 	for _, c := range changes {
+		// Guard against an empty DDL, which would render a blank ```sql box. The
+		// DDL should always be present; if it is missing the change data is
+		// incomplete, so say so rather than show an empty code block.
+		if strings.TrimSpace(c.DDL) == "" {
+			fmt.Fprintf(sb, "\n`%s` — _DDL unavailable_\n", c.Table)
+			continue
+		}
 		fmt.Fprintf(sb, "\n`%s`\n```sql\n%s\n```\n", c.Table, c.DDL)
 	}
 }

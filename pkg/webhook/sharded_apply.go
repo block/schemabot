@@ -35,6 +35,21 @@ func isFinalizerOperationKey(key string) bool {
 	return ok && ns != "" && !strings.Contains(ns, "/")
 }
 
+// shardedApplyActor extracts the display username from an apply's Caller. The
+// webhook stores it as "github:<user>@<repo>#<pr>"; the comment shows just
+// "@<user>". An unrecognised format returns "" so the attribution falls back to
+// the timestamp rather than rendering the raw structured caller.
+func shardedApplyActor(caller string) string {
+	rest, ok := strings.CutPrefix(caller, "github:")
+	if !ok {
+		return ""
+	}
+	if at := strings.IndexByte(rest, '@'); at > 0 {
+		return rest[:at]
+	}
+	return ""
+}
+
 // isShardedApply reports whether the apply's operations are the per-shard
 // fan-out of a single keyspace within one deployment: at least one work
 // operation carries a "namespace/shard/table" key, every operation is a shard
@@ -125,7 +140,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		Database:    apply.Database,
 		Keyspace:    keyspace,
 		ApplyID:     apply.ApplyIdentifier,
-		RequestedBy: apply.Caller,
+		RequestedBy: shardedApplyActor(apply.Caller),
 		Shards:      shardStatuses(shardOrder, opsByShard, tasksByOp),
 		Cells:       cells,
 	}
