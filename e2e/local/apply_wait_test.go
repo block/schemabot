@@ -79,6 +79,95 @@ func waitForApplyState(t *testing.T, endpoint, applyID, expectedState string, ti
 	)
 }
 
+func waitForApplyRevertWindow(t *testing.T, endpoint, applyID string, timeout time.Duration) string {
+	t.Helper()
+	var lastState, lastError, lastLogError, matchedState string
+	start := time.Now()
+	testutil.Poll(t, timeout, testutil.PollInterval,
+		func() bool {
+			ctx, cancel := context.WithTimeout(t.Context(), testutil.ProgressTimeout)
+			result, err := client.GetProgressCtx(ctx, endpoint, applyID)
+			cancel()
+			if err != nil {
+				t.Logf("waitForApplyRevertWindow: %s poll error: %v (elapsed=%s)", applyID, err, time.Since(start))
+				return false
+			}
+			newState := state.NormalizeState(result.State)
+			if newState != lastState {
+				t.Logf("waitForApplyRevertWindow: %s state=%s (elapsed=%s)", applyID, newState, time.Since(start))
+			}
+			lastState = newState
+			lastError = result.ErrorMessage
+			if state.IsState(lastState, state.Apply.RevertWindow) {
+				matchedState = lastState
+				return true
+			}
+			if !state.IsState(lastState, state.Apply.Completed) {
+				return false
+			}
+			recorded, err := applyRecordedState(t.Context(), applyID, state.Apply.RevertWindow)
+			if err != nil {
+				lastLogError = err.Error()
+				return false
+			}
+			lastLogError = ""
+			if recorded {
+				matchedState = lastState
+				return true
+			}
+			return false
+		},
+		func() string {
+			return fmt.Sprintf("timeout waiting for apply %s to enter or record state %q after %s, last API state: %q, error: %q, log_error: %q\n%s",
+				applyID, state.Apply.RevertWindow, time.Since(start), lastState, lastError, lastLogError,
+				applyTimeoutDiagnostics(applyID))
+		},
+	)
+	return matchedState
+}
+
+func applyRecordedState(ctx context.Context, applyID, expectedState string) (bool, error) {
+	dsn := os.Getenv("E2E_MYSQL_DSN")
+	if dsn == "" {
+		return false, fmt.Errorf("E2E_MYSQL_DSN not set")
+	}
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return false, fmt.Errorf("open schemabot db: %w", err)
+	}
+	defer utils.CloseAndLog(db)
+
+	queryCtx, cancel := context.WithTimeout(ctx, testutil.ProgressTimeout)
+	defer cancel()
+	if err := db.PingContext(queryCtx); err != nil {
+		return false, fmt.Errorf("ping schemabot db for %s: %w", applyID, err)
+	}
+	rows, err := db.QueryContext(queryCtx, `
+		SELECT COALESCE(l.new_state, '')
+		FROM apply_logs l
+		JOIN applies a ON a.id = l.apply_id
+		WHERE a.apply_identifier = ?
+		ORDER BY l.id ASC
+	`, applyID)
+	if err != nil {
+		return false, fmt.Errorf("query apply logs for %s: %w", applyID, err)
+	}
+	defer utils.CloseAndLog(rows)
+	for rows.Next() {
+		var loggedState string
+		if err := rows.Scan(&loggedState); err != nil {
+			return false, fmt.Errorf("scan apply log state for %s: %w", applyID, err)
+		}
+		if state.IsState(loggedState, expectedState) {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate apply log states for %s: %w", applyID, err)
+	}
+	return false, nil
+}
+
 // applyTimeoutDiagnostics returns a best-effort dump of the SchemaBot storage
 // state for applyID plus the operator's overall backlog, for inclusion in a
 // wait-timeout failure message. It answers the triage question when an apply

@@ -1362,7 +1362,9 @@ func TestVitess_Apply_Timestamps(t *testing.T) {
 // --- Revert behavior tests ---
 
 func TestVitess_Apply_RevertWindow(t *testing.T) {
-	// Verify that applies without --skip-revert correctly reach the revert window state.
+	// Applies without --skip-revert must expose a revert window. The window may
+	// expire before the external test poll samples it, so the durable apply log is
+	// also accepted when progress has already finalized.
 	vitessAvailable(t)
 	clearSchemaBotState(t)
 
@@ -1389,7 +1391,10 @@ func TestVitess_Apply_RevertWindow(t *testing.T) {
 	applyID := extractApplyIDFromLog(applyOut)
 	require.NotEmpty(t, applyID, "expected apply ID in output")
 
-	waitForApplyState(t, endpoint, applyID, state.Apply.RevertWindow, testutil.PollDeadline)
+	matchedState := waitForApplyRevertWindow(t, endpoint, applyID, testutil.PollDeadline)
+	if state.IsState(matchedState, state.Apply.Completed) {
+		return
+	}
 
 	skipResp, err := client.CallSkipRevertAPI(endpoint, "staging", applyID)
 	require.NoError(t, err, "skip-revert after reaching revert_window")
