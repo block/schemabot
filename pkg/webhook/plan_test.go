@@ -70,6 +70,63 @@ func TestBuildPlanCommentData_PerShardUnsafe(t *testing.T) {
 	assert.Equal(t, []string{"40-80"}, data.UnsafeChanges[0].Shards, "the unsafe change is scoped to the drifted shard")
 }
 
+// A shard that already matches the desired schema while siblings change is
+// carried as a satisfied (no-change) group, so a partially-applied keyspace
+// renders its divergent state instead of hiding the shard.
+func TestBuildPlanCommentData_CarriesSatisfiedShard(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "cdb_resolute", Type: "strata"}
+	const mutes = "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace:    "cdb_resolute_sharded",
+			TableChanges: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: mutes, ChangeType: "alter"}},
+		}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "cdb_resolute_sharded", Shard: "-40"}, // already matches — no changes
+			{Namespace: "cdb_resolute_sharded", Shard: "40-80", Changes: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: mutes, ChangeType: "alter"}}},
+		},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+
+	require.Len(t, data.Changes, 1)
+	require.Len(t, data.Changes[0].Shards, 2, "the satisfied shard is carried, not dropped")
+	assert.Equal(t, "-40", data.Changes[0].Shards[0].Shard)
+	assert.True(t, data.Changes[0].Shards[0].Satisfied, "a shard with no changes is marked satisfied")
+	assert.Empty(t, data.Changes[0].Shards[0].Statements)
+	assert.False(t, data.Changes[0].Shards[1].Satisfied, "the changing shard is not satisfied")
+	assert.Empty(t, data.Errors, "a satisfied shard is not an error")
+}
+
+// A shard that reports changes but produces no usable DDL is malformed: the plan
+// is incomplete for that shard. It is surfaced as an error rather than silently
+// dropped, which would hide the divergent state the sharded view exists to show.
+func TestBuildPlanCommentData_MalformedShardSurfacesError(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "cdb_resolute", Type: "strata"}
+	const mutes = "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace:    "cdb_resolute_sharded",
+			TableChanges: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: mutes, ChangeType: "alter"}},
+		}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "cdb_resolute_sharded", Shard: "-40", Changes: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: mutes, ChangeType: "alter"}}},
+			// Reports a change but yields no DDL — malformed.
+			{Namespace: "cdb_resolute_sharded", Shard: "40-80", Changes: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: "", ChangeType: "alter"}}},
+		},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+
+	require.Len(t, data.Changes, 1)
+	require.Len(t, data.Changes[0].Shards, 1, "the malformed shard is not carried into the rendered shards")
+	assert.Equal(t, "-40", data.Changes[0].Shards[0].Shard)
+	require.Len(t, data.Errors, 1, "the malformed shard is surfaced as an error")
+	assert.Contains(t, data.Errors[0], `shard "40-80"`)
+	assert.Contains(t, data.Errors[0], `keyspace "cdb_resolute_sharded"`)
+	assert.Contains(t, data.Errors[0], "no DDL")
+}
+
 func TestBuildPlanCommentData_UnsafeChangesPopulated(t *testing.T) {
 	schema := &ghclient.SchemaRequestResult{
 		Database: "testdb",

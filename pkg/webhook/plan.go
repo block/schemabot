@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -486,6 +487,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 	// Per-shard changes, grouped by keyspace, so a sharded keyspace can show what
 	// applies to which shard rather than the collapsed namespace-level view.
 	shardsByKeyspace := make(map[string][]templates.KeyspaceShardChange)
+	var malformedShardErrors []string
 	for _, sp := range planResp.Shards {
 		if sp == nil {
 			continue
@@ -497,15 +499,21 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			}
 			shard.Statements = append(shard.Statements, t.DDL)
 		}
-		// A shard with zero changes already matches the desired schema while
-		// sibling shards change; carry it as a satisfied (no-change) group so a
-		// partially-applied keyspace renders its divergent "already applied vs will
-		// change" state instead of hiding the shard. A shard that carries changes
-		// but yields no usable DDL is malformed — skip it.
 		if len(shard.Statements) == 0 {
 			if len(sp.Changes) > 0 {
+				// The shard reported changes but none produced usable DDL — the
+				// plan is incomplete for this shard. Surface it as an error rather
+				// than dropping the shard, which would silently hide the divergent
+				// state this view exists to show.
+				malformedShardErrors = append(malformedShardErrors, fmt.Sprintf(
+					"shard %q in keyspace %q reported %d change(s) with no DDL — plan is incomplete for this shard",
+					sp.Shard, sp.Namespace, len(sp.Changes)))
 				continue
 			}
+			// A shard with zero changes already matches the desired schema while
+			// sibling shards change; carry it as a satisfied (no-change) group so a
+			// partially-applied keyspace renders its divergent "already applied vs
+			// will change" state instead of hiding the shard.
 			shard.Satisfied = true
 		}
 		shardsByKeyspace[sp.Namespace] = append(shardsByKeyspace[sp.Namespace], shard)
@@ -554,8 +562,11 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		})
 	}
 
-	// Add errors
-	data.Errors = planResp.Errors
+	// Add errors. Malformed-shard errors (changes reported with no usable DDL)
+	// are surfaced alongside the plan's own errors so the operator sees the plan
+	// is incomplete rather than reading a silently-shortened shard list.
+	data.Errors = append(data.Errors, planResp.Errors...)
+	data.Errors = append(data.Errors, malformedShardErrors...)
 
 	return data
 }

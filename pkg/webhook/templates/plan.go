@@ -401,9 +401,9 @@ func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange) {
 	groups := groupKeyspaceShardsByStatements(shards)
 	if len(groups) <= 1 {
 		// A single group of changing shards shows the DDL once. A lone group of
-		// satisfied shards (no statements) means nothing is changing, so render
-		// nothing rather than an empty code block.
-		if len(groups) == 1 && len(groups[0].Statements) > 0 {
+		// satisfied shards means nothing is changing, so render nothing rather
+		// than an empty code block.
+		if len(groups) == 1 && !groups[0].Satisfied {
 			writePlanDDLBlock(sb, groups[0].Statements)
 		}
 		return
@@ -411,9 +411,9 @@ func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange) {
 	sb.WriteString("Shards diverge — what applies where:\n\n")
 	for _, g := range groups {
 		fmt.Fprintf(sb, "**%s**\n\n", planShardList(g.Shards))
-		// A satisfied group already matches the desired schema (no statements);
-		// say so instead of rendering an empty code block.
-		if len(g.Statements) == 0 {
+		// A satisfied group already matches the desired schema; say so instead
+		// of rendering an empty code block.
+		if g.Satisfied {
 			sb.WriteString("_Already applied — no change._\n\n")
 			continue
 		}
@@ -424,18 +424,20 @@ func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange) {
 type keyspaceShardGroup struct {
 	Shards     []string
 	Statements []string
+	Satisfied  bool
 }
 
-// groupKeyspaceShardsByStatements buckets shards whose statement set is
-// identical, preserving resolved order, so a uniform keyspace yields one group.
+// groupKeyspaceShardsByStatements buckets shards whose statement set and
+// satisfied status are identical, preserving resolved order, so a uniform
+// keyspace yields one group.
 func groupKeyspaceShardsByStatements(shards []KeyspaceShardChange) []keyspaceShardGroup {
 	var order []string
 	bySig := make(map[string]*keyspaceShardGroup)
 	for _, s := range shards {
-		sig := strings.Join(s.Statements, "\x01")
+		sig := shardGroupSignature(s)
 		g := bySig[sig]
 		if g == nil {
-			g = &keyspaceShardGroup{Statements: s.Statements}
+			g = &keyspaceShardGroup{Statements: s.Statements, Satisfied: s.Satisfied}
 			bySig[sig] = g
 			order = append(order, sig)
 		}
@@ -446,6 +448,19 @@ func groupKeyspaceShardsByStatements(shards []KeyspaceShardChange) []keyspaceSha
 		groups = append(groups, *bySig[sig])
 	}
 	return groups
+}
+
+// shardGroupSignature keys shards into the same group only when they carry the
+// same planned statements and the same satisfied status. Keying on Satisfied —
+// not just an empty statement set — keeps a satisfied shard from ever merging
+// with a changing shard, and ensures only a shard explicitly marked satisfied
+// renders as "already applied".
+func shardGroupSignature(s KeyspaceShardChange) string {
+	status := "change"
+	if s.Satisfied {
+		status = "satisfied"
+	}
+	return status + "\x02" + strings.Join(s.Statements, "\x01")
 }
 
 // planShardList renders a group's shards as "shard `x`" or "shards `x`, `y`".
