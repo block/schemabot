@@ -315,6 +315,70 @@ func TestRenderPlanComment_EnvironmentScopedTitle(t *testing.T) {
 		assert.NotContains(t, rendered, "### Staging")
 		assert.Contains(t, rendered, "schemabot apply -e staging")
 	})
+
+	t.Run("single environment tenant plan keeps tenant in production command", func(t *testing.T) {
+		data := templates.MultiEnvPlanCommentData{
+			Database:     "testdb",
+			IsMySQL:      true,
+			Tenant:       "alpha",
+			Environments: []string{"production"},
+			Plans: map[string]*templates.PlanCommentData{
+				"production": {
+					Database:    "testdb",
+					Environment: "production",
+					IsMySQL:     true,
+					Changes: []templates.KeyspaceChangeData{{
+						Keyspace:   "testdb",
+						Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
+					}},
+				},
+			},
+			Errors: map[string]string{},
+		}
+
+		rendered := templates.RenderMultiEnvPlanComment(data)
+		firstLine, _, _ := strings.Cut(rendered, "\n")
+
+		assert.Equal(t, "## Schema Change Plan — Production", firstLine)
+		assert.Contains(t, rendered, "**Tenant**: `alpha`")
+		assert.Contains(t, rendered, "schemabot apply -e production --tenant alpha")
+	})
+
+	t.Run("multi environment tenant plan keeps tenant in metadata and commands", func(t *testing.T) {
+		data := templates.MultiEnvPlanCommentData{
+			Database:     "testdb",
+			IsMySQL:      true,
+			Tenant:       "alpha",
+			Environments: []string{"staging", "production"},
+			Plans: map[string]*templates.PlanCommentData{
+				"staging": {
+					Database:    "testdb",
+					Environment: "staging",
+					IsMySQL:     true,
+					Changes: []templates.KeyspaceChangeData{{
+						Keyspace:   "testdb",
+						Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
+					}},
+				},
+				"production": {
+					Database:    "testdb",
+					Environment: "production",
+					IsMySQL:     true,
+					Changes: []templates.KeyspaceChangeData{{
+						Keyspace:   "testdb",
+						Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
+					}},
+				},
+			},
+			Errors: map[string]string{},
+		}
+
+		rendered := templates.RenderMultiEnvPlanComment(data)
+
+		assert.Contains(t, rendered, "**Tenant**: `alpha`")
+		assert.Contains(t, rendered, "schemabot apply -e staging --tenant alpha")
+		assert.Contains(t, rendered, "schemabot apply -e production --tenant alpha")
+	})
 }
 
 func TestRenderPlanComment_NoUnsafe_NoWarning(t *testing.T) {

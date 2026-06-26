@@ -975,6 +975,7 @@ func TestE2EMultiEnvPlanDifferentChanges(t *testing.T) {
 func TestE2EAutoPlan(t *testing.T) {
 	dbName := "webhook_autoplan"
 	svc := setupE2EService(t, dbName)
+	svc.Config().Tenant = "alpha"
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -1014,8 +1015,10 @@ func TestE2EAutoPlan(t *testing.T) {
 	case body := <-result.comments:
 		firstLine, _, _ := strings.Cut(body, "\n")
 		assert.Equal(t, "## Schema Change Plan — Staging", firstLine)
+		assert.Contains(t, body, "**Tenant**: `alpha`")
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
+		assert.Contains(t, body, "schemabot apply -e staging --tenant alpha")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for auto-plan comment")
 	}

@@ -1360,6 +1360,35 @@ func PreviewCommentSummaryCompleted() string {
 	return RenderApplySummaryComment(sampleSummaryData(state.Apply.Completed, tables))
 }
 
+// PreviewCommentSummaryCompletedVitessDDLWithVSchema renders a completed Vitess
+// summary where the schema change included both table work and VSchema updates.
+func PreviewCommentSummaryCompletedVitessDDLWithVSchema() string {
+	tables := []TableProgressData{
+		{
+			TableName: "users",
+			DDL:       "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
+			Status:    state.Task.Completed,
+		},
+	}
+	data := sampleSummaryData(state.Apply.Completed, tables)
+	data.Engine = "PlanetScale"
+	data.VSchemaChanges = []apitypes.VSchemaChange{
+		{Namespace: "myapp_sharded", Status: "applied", Diff: `+ "xxhash": {"type": "xxhash"}`},
+	}
+	return RenderApplySummaryComment(data)
+}
+
+// PreviewCommentSummaryCompletedVitessVSchemaOnly renders a completed Vitess
+// summary where only VSchema changed and there were no per-table tasks.
+func PreviewCommentSummaryCompletedVitessVSchemaOnly() string {
+	data := sampleSummaryData(state.Apply.Completed, nil)
+	data.Engine = "PlanetScale"
+	data.VSchemaChanges = []apitypes.VSchemaChange{
+		{Namespace: "myapp_sharded", Status: "applied", Diff: `+ "xxhash": {"type": "xxhash"}`},
+	}
+	return RenderApplySummaryComment(data)
+}
+
 // PreviewCommentSummaryFailed renders a sample failed summary comment.
 func PreviewCommentSummaryFailed() string {
 	tables := sampleApplyTables()

@@ -225,6 +225,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	var headSHA string
 	multiEnvData := templates.MultiEnvPlanCommentData{
 		RequestedBy:  requestedBy,
+		Tenant:       tenant,
 		Environments: environments,
 		Plans:        make(map[string]*templates.PlanCommentData),
 		Errors:       make(map[string]string),

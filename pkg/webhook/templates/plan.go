@@ -480,6 +480,7 @@ type MultiEnvPlanCommentData struct {
 	DatabaseType string
 	IsMySQL      bool
 	RequestedBy  string
+	Tenant       string
 
 	// Environments in display order (staging first, production second, etc.)
 	Environments []string
@@ -503,7 +504,7 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	// Header
 	writeEnvironmentTitle(&sb, "Schema Change Plan", singleEnvironmentTitleEnvironment(data.Environments))
 
-	writePlanMetadata(&sb, PlanCommentData{Database: data.Database, SchemaName: data.SchemaName, DatabaseType: data.DatabaseType, IsMySQL: data.IsMySQL})
+	writePlanMetadata(&sb, PlanCommentData{Database: data.Database, SchemaName: data.SchemaName, DatabaseType: data.DatabaseType, IsMySQL: data.IsMySQL, Tenant: data.Tenant})
 	writePlanAttribution(&sb, PlanCommentData{
 		HeadSHA:     data.HeadSHA,
 		Repository:  data.Repository,
@@ -593,6 +594,9 @@ func singleEnvironmentPlan(data MultiEnvPlanCommentData) (PlanCommentData, bool)
 	if merged.RequestedBy == "" {
 		merged.RequestedBy = data.RequestedBy
 	}
+	if merged.Tenant == "" {
+		merged.Tenant = data.Tenant
+	}
 	return merged, true
 }
 
@@ -679,14 +683,14 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	switch {
 	case len(envsWithChanges) >= 2:
 		sb.WriteString("💡 **To apply** these changes, start with the first environment:\n")
-		fmt.Fprintf(sb, "```\nschemabot apply -e %s\n```\n", envsWithChanges[0])
+		fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot apply", envsWithChanges[0], data.Tenant))
 		for i := 1; i < len(envsWithChanges); i++ {
 			fmt.Fprintf(sb, "\nAfter verifying %s, apply to %s:\n", envsWithChanges[i-1], envsWithChanges[i])
-			fmt.Fprintf(sb, "```\nschemabot apply -e %s\n```\n", envsWithChanges[i])
+			fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot apply", envsWithChanges[i], data.Tenant))
 		}
 	case len(envsWithChanges) == 1:
 		sb.WriteString("💡 **To apply** these changes, comment:\n")
-		fmt.Fprintf(sb, "```\nschemabot apply -e %s\n```\n", envsWithChanges[0])
+		fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot apply", envsWithChanges[0], data.Tenant))
 	case len(envsWithErrors) == 0:
 		sb.WriteString("No changes to apply.\n")
 	}
@@ -696,9 +700,17 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 		sb.WriteString("\n")
 		for _, env := range envsWithErrors {
 			fmt.Fprintf(sb, "⚠️ **%s** failed to plan. Resolve the error above and re-run:\n", capitalizeFirst(env))
-			fmt.Fprintf(sb, "```\nschemabot plan -e %s\n```\n", env)
+			fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot plan", env, data.Tenant))
 		}
 	}
+}
+
+func tenantCommand(baseCommand, environment, tenant string) string {
+	command := fmt.Sprintf("%s -e %s", baseCommand, environment)
+	if tenant != "" {
+		command += fmt.Sprintf(" --tenant %s", tenant)
+	}
+	return command
 }
 
 // allPlansIdentical returns true if all environments have identical changes.
