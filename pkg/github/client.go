@@ -1072,6 +1072,10 @@ type TreeEntry struct {
 	Size int
 }
 
+// gitSymlinkMode is the git tree file mode for a symbolic link. Symlinks appear
+// as "blob" tree entries with this mode; their content is the target path.
+const gitSymlinkMode = "120000"
+
 // FetchGitTree fetches the entire directory tree in one API call using recursive mode.
 func (ic *InstallationClient) FetchGitTree(ctx context.Context, repo, treeSHA string) ([]TreeEntry, bool, error) {
 	owner, repoName := splitRepo(repo)
@@ -1218,7 +1222,7 @@ type fileResult struct {
 //	  schema/commerce/orders.sql
 //	  schema/customers/users.sql
 func (ic *InstallationClient) FetchSchemaFilesOptimized(ctx context.Context, repo string, headSHA, schemaPath, dbType string) ([]GitHubFile, error) {
-	entries, err := ic.schemaDirectoryEntries(ctx, repo, headSHA, schemaPath)
+	locators, err := ic.schemaFileLocators(ctx, repo, headSHA, schemaPath)
 	if err != nil {
 		if IsNotFoundError(err) {
 			return ic.fetchSchemaFilesFromTree(ctx, repo, headSHA, schemaPath)
@@ -1226,41 +1230,42 @@ func (ic *InstallationClient) FetchSchemaFilesOptimized(ctx context.Context, rep
 		return nil, err
 	}
 
-	var filesToFetch []*gh.RepositoryContent
-	for _, entry := range entries {
-		if entry.GetType() != "file" {
+	var filesToFetch []schemaFileLocator
+	for _, loc := range locators {
+		if !isManagedSchemaFile(loc.displayPath) {
 			continue
 		}
-		if !isManagedSchemaFile(entry.GetPath()) {
-			continue
-		}
-		filesToFetch = append(filesToFetch, entry)
+		filesToFetch = append(filesToFetch, loc)
 	}
 
 	if len(filesToFetch) == 0 {
 		return []GitHubFile{}, nil
 	}
 
-	// Fetch all file contents in parallel with concurrency limit
+	// Fetch all file contents in parallel with concurrency limit. Content is
+	// fetched from fetchPath (the real path on the branch — the symlink target
+	// for files reached through a symlinked namespace, since the Contents API
+	// does not traverse symlinked directories), but each file is labeled with
+	// displayPath so namespace grouping uses the symlink name.
 	results := make(chan fileResult, len(filesToFetch))
 	var wg sync.WaitGroup
 	semaphore := make(chan struct{}, 10)
 
-	for _, entry := range filesToFetch {
+	for _, loc := range filesToFetch {
 		wg.Go(func() {
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			content, err := ic.FetchFileContent(ctx, repo, entry.GetPath(), headSHA)
+			content, err := ic.FetchFileContent(ctx, repo, loc.fetchPath, headSHA)
 			if err != nil {
-				results <- fileResult{err: fmt.Errorf("fetch %s: %w", entry.GetPath(), err)}
+				results <- fileResult{err: fmt.Errorf("fetch %s: %w", loc.fetchPath, err)}
 				return
 			}
 			results <- fileResult{
 				file: GitHubFile{
-					Name:    path.Base(entry.GetPath()),
+					Name:    path.Base(loc.displayPath),
 					Content: content,
-					Path:    entry.GetPath(),
+					Path:    loc.displayPath,
 				},
 			}
 		})
@@ -1307,6 +1312,15 @@ func (ic *InstallationClient) fetchSchemaFilesFromTree(ctx context.Context, repo
 		}
 		if !strings.HasPrefix(entry.Path, schemaPathPrefix) {
 			continue
+		}
+		// A symbolic link under the schema root (such as a symlinked namespace
+		// directory) is recorded in the git tree as a blob whose content is the
+		// target path, not the target's files — which live elsewhere in the tree
+		// and outside schemaPathPrefix. The tree fallback cannot resolve it, so
+		// fail closed rather than silently dropping the symlinked schema. The
+		// Contents API path (schemaFileLocators) resolves these.
+		if entry.Mode == gitSymlinkMode {
+			return nil, fmt.Errorf("schema path %s in repo %s ref %s contains a symlink the git-tree fallback cannot resolve: %s", schemaPath, repo, headSHA, entry.Path)
 		}
 		if !isManagedSchemaFile(entry.Path) {
 			continue
@@ -1366,30 +1380,104 @@ func (ic *InstallationClient) fetchSchemaFilesFromTree(ctx context.Context, repo
 	return files, nil
 }
 
-func (ic *InstallationClient) schemaDirectoryEntries(ctx context.Context, repo, ref, schemaPath string) ([]*gh.RepositoryContent, error) {
+// schemaFileLocator points at one schema file. fetchPath is where its content
+// lives on the branch (used to GET content); displayPath is the path under the
+// schema root used for namespace grouping. The two differ only when the file is
+// reached through a symlinked namespace directory: fetchPath is the real symlink
+// target, displayPath keeps the symlink (keyspace) name.
+type schemaFileLocator struct {
+	fetchPath   string
+	displayPath string
+}
+
+// schemaFileLocators lists every schema file directly under the schema root and
+// its namespace subdirectories. A namespace entry may be a real directory or a
+// symlink to a directory elsewhere in the repository; symlinked namespaces are
+// resolved so their files are discovered under the symlink's name. This is the
+// server-side equivalent of the CLI following symlinks on the local filesystem.
+func (ic *InstallationClient) schemaFileLocators(ctx context.Context, repo, ref, schemaPath string) ([]schemaFileLocator, error) {
 	rootEntries, err := ic.fetchDirectoryContents(ctx, repo, schemaPath, ref)
 	if err != nil {
 		return nil, err
 	}
 
-	entries := make([]*gh.RepositoryContent, 0, len(rootEntries))
-	entries = append(entries, rootEntries...)
+	var locators []schemaFileLocator
 	for _, entry := range rootEntries {
-		if entry.GetType() != "dir" {
-			continue
+		switch entry.GetType() {
+		case "file":
+			// Flat layout: a file directly under the schema root.
+			locators = append(locators, schemaFileLocator{fetchPath: entry.GetPath(), displayPath: entry.GetPath()})
+		case "dir":
+			subEntries, err := ic.fetchDirectoryContents(ctx, repo, entry.GetPath(), ref)
+			if err != nil {
+				return nil, fmt.Errorf("fetch schema namespace directory %s: %w", entry.GetPath(), err)
+			}
+			for _, sub := range subEntries {
+				if sub.GetType() != "file" {
+					ic.logger.Debug("skipping non-file entry in schema namespace directory",
+						"repo", repo, "ref", ref, "path", sub.GetPath(), "type", sub.GetType())
+					continue
+				}
+				locators = append(locators, schemaFileLocator{fetchPath: sub.GetPath(), displayPath: sub.GetPath()})
+			}
+		case "symlink":
+			symlinked, err := ic.symlinkedNamespaceLocators(ctx, repo, ref, schemaPath, entry)
+			if err != nil {
+				return nil, err
+			}
+			locators = append(locators, symlinked...)
+		default:
+			ic.logger.Debug("skipping unsupported schema entry type",
+				"repo", repo, "ref", ref, "path", entry.GetPath(), "type", entry.GetType())
 		}
-
-		subEntries, err := ic.fetchDirectoryContents(ctx, repo, entry.GetPath(), ref)
-		if err != nil {
-			return nil, fmt.Errorf("fetch schema namespace directory %s: %w", entry.GetPath(), err)
-		}
-		entries = append(entries, subEntries...)
 	}
 
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].GetPath() < entries[j].GetPath()
+	sort.Slice(locators, func(i, j int) bool {
+		return locators[i].displayPath < locators[j].displayPath
 	})
-	return entries, nil
+	return locators, nil
+}
+
+// symlinkedNamespaceLocators resolves a symlinked namespace directory under the
+// schema root and returns a locator for each file inside the symlink target,
+// keyed under the symlink's own name. The target must be a repository-relative
+// directory that stays inside the repository; absolute targets and targets that
+// escape the repository root are rejected.
+func (ic *InstallationClient) symlinkedNamespaceLocators(ctx context.Context, repo, ref, schemaPath string, entry *gh.RepositoryContent) ([]schemaFileLocator, error) {
+	symlinkName := path.Base(entry.GetPath())
+	target := strings.TrimSpace(entry.GetTarget())
+	if target == "" {
+		return nil, fmt.Errorf("schema namespace symlink %s has empty target", entry.GetPath())
+	}
+	if strings.HasPrefix(target, "/") {
+		return nil, fmt.Errorf("schema namespace symlink %s points to absolute path %s", entry.GetPath(), target)
+	}
+	resolved := path.Clean(path.Join(schemaPath, target))
+	if !schemaPathWithinDirectory(".", resolved) {
+		return nil, fmt.Errorf("schema namespace symlink %s points outside the repository: %s", entry.GetPath(), target)
+	}
+	if resolved == "." || resolved == path.Clean(schemaPath) {
+		return nil, fmt.Errorf("schema namespace symlink %s must point to a distinct directory, not the repository root or its own schema root: %s", entry.GetPath(), target)
+	}
+
+	targetEntries, err := ic.fetchDirectoryContents(ctx, repo, resolved, ref)
+	if err != nil {
+		return nil, fmt.Errorf("resolve schema namespace symlink %s target %s: %w", entry.GetPath(), resolved, err)
+	}
+
+	locators := make([]schemaFileLocator, 0, len(targetEntries))
+	for _, sub := range targetEntries {
+		if sub.GetType() != "file" {
+			ic.logger.Debug("skipping non-file entry in symlinked schema namespace target",
+				"repo", repo, "ref", ref, "symlink", entry.GetPath(), "target_path", sub.GetPath(), "type", sub.GetType())
+			continue
+		}
+		locators = append(locators, schemaFileLocator{
+			fetchPath:   sub.GetPath(),
+			displayPath: path.Join(schemaPath, symlinkName, path.Base(sub.GetPath())),
+		})
+	}
+	return locators, nil
 }
 
 func isManagedSchemaFile(filePath string) bool {

@@ -290,6 +290,105 @@ func TestFetchSchemaFilesOptimizedSmallDirectory(t *testing.T) {
 	assert.Equal(t, "CREATE TABLE users (id INT);", files[0].Content)
 }
 
+// A namespace directory under the schema root may be a symlink to a directory
+// elsewhere in the repository (the layout some services use to share one
+// canonical table set across many keyspaces). The server-side discovery follows
+// the symlink, fetches the target's files, and presents them under the symlink's
+// name so each symlinked keyspace becomes its own namespace — even when several
+// symlinks point at the same target.
+func TestFetchSchemaFilesOptimizedFollowsSymlinkedNamespaces(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema", func(w http.ResponseWriter, _ *http.Request) {
+		entries := []gh.RepositoryContent{
+			{Type: new("file"), Name: new("schemabot.yaml"), Path: new("schema/schemabot.yaml")},
+			{Type: new("symlink"), Name: new("shard_001"), Path: new("schema/shard_001"), Target: new("../canonical/shard")},
+			{Type: new("symlink"), Name: new("shard_002"), Path: new("schema/shard_002"), Target: new("../canonical/shard")},
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(entries))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/canonical/shard", func(w http.ResponseWriter, _ *http.Request) {
+		entries := []gh.RepositoryContent{
+			{Type: new("file"), Name: new("orders.sql"), Path: new("canonical/shard/orders.sql")},
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(entries))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/canonical/shard/orders.sql", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.RepositoryContent{
+			Type:     new("file"),
+			Name:     new("orders.sql"),
+			Path:     new("canonical/shard/orders.sql"),
+			Encoding: new("base64"),
+			Content:  new(base64.StdEncoding.EncodeToString([]byte("CREATE TABLE orders (id INT);"))),
+		}))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	files, err := ic.FetchSchemaFilesOptimized(t.Context(), "octocat/hello-world", "abc123", "schema", "vitess")
+	require.NoError(t, err)
+
+	// Both symlinked keyspaces are discovered, each carrying the shared target's
+	// content but labeled under its own namespace path.
+	require.Len(t, files, 2)
+	assert.Equal(t, "schema/shard_001/orders.sql", files[0].Path)
+	assert.Equal(t, "schema/shard_002/orders.sql", files[1].Path)
+	for _, f := range files {
+		assert.Equal(t, "orders.sql", f.Name)
+		assert.Equal(t, "CREATE TABLE orders (id INT);", f.Content)
+	}
+
+	// Grouping keys each file under its symlink (keyspace) name.
+	grouped, err := groupFilesByNamespace(files, "schema", "")
+	require.NoError(t, err)
+	require.Contains(t, grouped, "shard_001")
+	require.Contains(t, grouped, "shard_002")
+}
+
+// A symlinked namespace whose target escapes the repository root is rejected
+// rather than followed, so a crafted schema layout cannot read files outside the
+// repository.
+func TestFetchSchemaFilesOptimizedRejectsEscapingSymlink(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema", func(w http.ResponseWriter, _ *http.Request) {
+		entries := []gh.RepositoryContent{
+			{Type: new("symlink"), Name: new("evil"), Path: new("schema/evil"), Target: new("../../../../etc")},
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(entries))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, err := ic.FetchSchemaFilesOptimized(t.Context(), "octocat/hello-world", "abc123", "schema", "mysql")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "outside the repository")
+}
+
+// When the Contents API cannot list the schema root, discovery falls back to the
+// git tree. A symlinked namespace there is a mode-120000 blob whose target's
+// files live outside the schema root, so the fallback cannot resolve it and must
+// fail closed rather than silently dropping the symlinked schema (which would
+// otherwise surface as a missing keyspace / spurious DROP proposals).
+func TestFetchSchemaFilesFromTreeFailsClosedOnSymlink(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"truncated": false,
+			"tree": []map[string]any{
+				{"path": "schema/shard_001", "mode": "120000", "type": "blob", "sha": "deadbeef"},
+			},
+		}))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, err := ic.FetchSchemaFilesOptimized(t.Context(), "octocat/hello-world", "abc123", "schema", "mysql")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "symlink")
+}
+
 // TestFindCheckRunByNameAcceptsTrustedSiblingAppCheckRun covers the
 // split-deployment topology where the looked-up check run was created by a
 // sibling SchemaBot deployment's GitHub App. The lookup must return the
