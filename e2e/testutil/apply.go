@@ -3,6 +3,7 @@
 package testutil
 
 import (
+	"maps"
 	"testing"
 	"time"
 
@@ -41,7 +42,7 @@ func ApplySchemaAndWait(t *testing.T, endpoint, database, dbType, env string, sc
 		return "" // no changes needed
 	}
 
-	applyResp, err := client.CallApplyAPI(endpoint, resp.PlanID, env, "", nil)
+	applyResp, err := client.CallApplyAPI(endpoint, resp.PlanID, env, "", applyOptionsForPlan(resp, nil))
 	require.NoError(t, err, "apply API call")
 	require.True(t, applyResp.Accepted, "apply not accepted: %s", applyResp.ErrorMessage)
 
@@ -62,7 +63,7 @@ func PlanAndApply(t *testing.T, endpoint, database, dbType, env string, schemaFi
 		t.Fatal("plan returned no changes")
 	}
 
-	applyResp, err := client.CallApplyAPI(endpoint, resp.PlanID, env, "", applyOpts)
+	applyResp, err := client.CallApplyAPI(endpoint, resp.PlanID, env, "", applyOptionsForPlan(resp, applyOpts))
 	require.NoError(t, err, "apply API call")
 	require.True(t, applyResp.Accepted, "apply not accepted: %s", applyResp.ErrorMessage)
 
@@ -71,4 +72,14 @@ func PlanAndApply(t *testing.T, endpoint, database, dbType, env string, schemaFi
 	}
 
 	return resp.PlanID, applyResp.ApplyID
+}
+
+func applyOptionsForPlan(resp *apitypes.PlanResponse, applyOpts map[string]string) map[string]string {
+	if len(resp.UnsafeChanges()) == 0 {
+		return applyOpts
+	}
+	options := make(map[string]string, len(applyOpts)+1)
+	maps.Copy(options, applyOpts)
+	options["allow_unsafe"] = "true"
+	return options
 }

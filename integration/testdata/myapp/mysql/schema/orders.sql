@@ -6,7 +6,7 @@ CREATE TABLE orders (
     user_id BIGINT NOT NULL,
     total_amount DECIMAL(10, 2) NOT NULL,
     status VARCHAR(50) DEFAULT 'pending',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 
     INDEX idx_user_id (user_id),
     INDEX idx_status (status)

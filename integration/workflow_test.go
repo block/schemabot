@@ -373,7 +373,7 @@ func TestFullWorkflow_Spirit_DDLScenarios(t *testing.T) {
 	defer func() { _ = appDB.Close() }()
 
 	// Helper to plan and apply a schema change
-	planAndApply := func(t *testing.T, schemaFiles map[string]string, prNum int) map[string]any {
+	planAndApply := func(t *testing.T, schemaFiles map[string]string, prNum int, allowUnsafe bool) map[string]any {
 		t.Helper()
 		planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
 			"database":    appDBName,
@@ -395,8 +395,11 @@ func TestFullWorkflow_Spirit_DDLScenarios(t *testing.T) {
 		planID, ok := planResp["plan_id"].(string)
 		require.True(t, ok && planID != "", "No plan_id in response: %v", planResp)
 
-		// Apply
-		applyResp := postJSON(t, "http://"+ts.Addr+"/api/apply", map[string]any{"plan_id": planID, "environment": "staging"})
+		applyReq := map[string]any{"plan_id": planID, "environment": "staging"}
+		if allowUnsafe {
+			applyReq["options"] = map[string]string{"allow_unsafe": "true"}
+		}
+		applyResp := postJSON(t, "http://"+ts.Addr+"/api/apply", applyReq)
 		applyID, _ := applyResp["apply_id"].(string)
 		require.NotEmpty(t, applyID, "apply response missing apply_id: %v", applyResp)
 
@@ -440,7 +443,7 @@ CREATE TABLE orders (
 	status VARCHAR(50) NOT NULL DEFAULT 'pending',
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );`
-		planResp := planAndApply(t, currentSchema, 101)
+		planResp := planAndApply(t, currentSchema, 101, false)
 
 		// Verify plan detected CREATE
 		tables := flatTablesFromPlan(planResp)
@@ -467,7 +470,7 @@ CREATE TABLE orders (
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	notes TEXT
 );`
-		planResp := planAndApply(t, currentSchema, 102)
+		planResp := planAndApply(t, currentSchema, 102, false)
 
 		// Log full response for debugging
 		respJSON, _ := json.MarshalIndent(planResp, "", "  ")
@@ -500,7 +503,7 @@ CREATE TABLE orders (
 	notes TEXT,
 	shipping_address VARCHAR(500)
 );`
-		planResp := planAndApply(t, currentSchema, 103)
+		planResp := planAndApply(t, currentSchema, 103, false)
 
 		// Verify plan detected ALTER
 		tables := flatTablesFromPlan(planResp)
@@ -523,7 +526,7 @@ CREATE TABLE customers (
 	email VARCHAR(255) NOT NULL,
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );`
-		planResp := planAndApply(t, currentSchema, 104)
+		planResp := planAndApply(t, currentSchema, 104, false)
 
 		// Verify plan includes CREATE for customers
 		tables := flatTablesFromPlan(planResp)
@@ -560,7 +563,7 @@ CREATE TABLE orders (
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	shipping_address VARCHAR(500)
 );`
-		planResp := planAndApply(t, currentSchema, 105)
+		planResp := planAndApply(t, currentSchema, 105, true)
 
 		// Verify plan detected changes (may include orders ALTER)
 		tables := flatTablesFromPlan(planResp)
@@ -580,7 +583,7 @@ CREATE TABLE orders (
 		// Remove customers.sql from schema files (orders remains)
 		delete(currentSchema, "customers.sql")
 
-		planResp := planAndApply(t, currentSchema, 106)
+		planResp := planAndApply(t, currentSchema, 106, true)
 
 		// Verify plan includes DROP for customers
 		tables := flatTablesFromPlan(planResp)
@@ -983,7 +986,7 @@ func TestFullWorkflow_Spirit_DDLWithProgress(t *testing.T) {
 	endpoint := "http://" + ts.Addr
 
 	// Helper to plan and apply a schema change with progress collection
-	planAndApplyWithProgress := func(t *testing.T, schemaFiles map[string]string, prNum int) (planResp map[string]any, progressStates []string) {
+	planAndApplyWithProgress := func(t *testing.T, schemaFiles map[string]string, prNum int, allowUnsafe bool) (planResp map[string]any, progressStates []string) {
 		t.Helper()
 		planResp = postJSON(t, endpoint+"/api/plan", map[string]any{
 			"database":    appDBName,
@@ -1012,8 +1015,11 @@ func TestFullWorkflow_Spirit_DDLWithProgress(t *testing.T) {
 			}
 		}
 
-		// Apply
-		applyResp := postJSON(t, endpoint+"/api/apply", map[string]any{"plan_id": planID, "environment": "staging"})
+		applyReq := map[string]any{"plan_id": planID, "environment": "staging"}
+		if allowUnsafe {
+			applyReq["options"] = map[string]string{"allow_unsafe": "true"}
+		}
+		applyResp := postJSON(t, endpoint+"/api/apply", applyReq)
 		applyID, _ := applyResp["apply_id"].(string)
 		require.NotEmpty(t, applyID, "apply response missing apply_id: %v", applyResp)
 		t.Logf("Apply response: apply_id=%s", applyID)
@@ -1073,7 +1079,7 @@ CREATE TABLE users (
 	name VARCHAR(100),
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );`
-		planResp, states := planAndApplyWithProgress(t, currentSchema, 201)
+		planResp, states := planAndApplyWithProgress(t, currentSchema, 201, false)
 
 		tables := flatTablesFromPlan(planResp)
 		require.Len(t, tables, 1, "plan response tables: %v", planResp)
@@ -1124,7 +1130,7 @@ CREATE TABLE users (
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	INDEX idx_email (email)
 );`
-		planResp, states := planAndApplyWithProgress(t, currentSchema, 202)
+		planResp, states := planAndApplyWithProgress(t, currentSchema, 202, false)
 
 		// Verify plan detected ALTER
 		tables := flatTablesFromPlan(planResp)
@@ -1153,7 +1159,7 @@ CREATE TABLE users (
 	INDEX idx_email (email),
 	status VARCHAR(20) DEFAULT 'active'
 );`
-		planResp, states := planAndApplyWithProgress(t, currentSchema, 203)
+		planResp, states := planAndApplyWithProgress(t, currentSchema, 203, false)
 
 		tables := flatTablesFromPlan(planResp)
 		require.Len(t, tables, 1, "plan response tables: %v", planResp)
@@ -1184,7 +1190,7 @@ CREATE TABLE users (
 	status VARCHAR(20) DEFAULT 'active',
 	INDEX idx_name (name)
 );`
-		planResp, states := planAndApplyWithProgress(t, currentSchema, 204)
+		planResp, states := planAndApplyWithProgress(t, currentSchema, 204, false)
 
 		tables := flatTablesFromPlan(planResp)
 		require.Len(t, tables, 1, "plan response tables: %v", planResp)
@@ -1210,7 +1216,7 @@ CREATE TABLE users (
 	INDEX idx_email (email),
 	status VARCHAR(20) DEFAULT 'active'
 );`
-		planResp, states := planAndApplyWithProgress(t, currentSchema, 205)
+		planResp, states := planAndApplyWithProgress(t, currentSchema, 205, true)
 
 		tables := flatTablesFromPlan(planResp)
 		require.Len(t, tables, 1, "plan response tables: %v", planResp)
@@ -1237,7 +1243,7 @@ CREATE TABLE users (
 	INDEX idx_email (email),
 	status VARCHAR(20) DEFAULT 'active'
 );`
-		planResp, states := planAndApplyWithProgress(t, currentSchema, 206)
+		planResp, states := planAndApplyWithProgress(t, currentSchema, 206, true)
 
 		tables := flatTablesFromPlan(planResp)
 		require.Len(t, tables, 1, "plan response tables: %v", planResp)

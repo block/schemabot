@@ -121,6 +121,7 @@ func TestRemoteApplyID_ControlOperations(t *testing.T) {
 	applyCode, applyBody := doPost(t, ctx, baseURL, "/api/apply", map[string]any{
 		"plan_id":     planID,
 		"environment": "staging",
+		"options":     map[string]string{"allow_unsafe": "true"},
 	})
 	require.Equal(t, http.StatusOK, applyCode, string(applyBody))
 	var applyResult map[string]any
