@@ -1277,6 +1277,22 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 	return result, nil
 }
 
+// dispatchTargetShard validates a shard-scoped dispatch's target shard set and
+// returns the single, trimmed shard name. The per-shard fan-out emits exactly
+// one shard per operation, so more than one shard — or an empty/whitespace
+// shard (which would build tasks with an invalid scope the engine rejects or,
+// worse, mis-scopes) — is a malformed dispatch and fails closed.
+func dispatchTargetShard(targetShards []string) (string, error) {
+	if len(targetShards) != 1 {
+		return "", fmt.Errorf("a sharded dispatch must target exactly one shard, got %d (%v)", len(targetShards), targetShards)
+	}
+	shard := strings.TrimSpace(targetShards[0])
+	if shard == "" {
+		return "", fmt.Errorf("sharded dispatch has an empty target shard")
+	}
+	return shard, nil
+}
+
 // scopedDispatchDDLChanges converts a shard-scoped dispatch's DDL changes to
 // storage table changes, failing closed on a missing or malformed set. A
 // shard-scoped dispatch is already scoped by the control-plane operator (one
@@ -1297,7 +1313,11 @@ func scopedDispatchDDLChanges(changes []*ternv1.TableChange) ([]storage.TableCha
 			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d has empty table or DDL", i)
 		}
 		op := protoChangeTypeToDDLAction(ch.ChangeType)
-		if op == "unknown" {
+		// A shard-scoped dispatch carries only table DDL (create/alter/drop) for one
+		// shard. A VSchema update is keyspace-wide, never shard-scoped — it is applied
+		// by the task-less group_finalizer path — so accepting it here would build a
+		// shard-tagged task with an unexpected operation. Reject it explicitly.
+		if op == "unknown" || op == "vschema_update" {
 			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d (table %q) has unsupported change type %v", i, ch.TableName, ch.ChangeType)
 		}
 		out = append(out, storage.TableChange{
@@ -1557,14 +1577,15 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	ddlChanges := plan.FlatDDLChanges()
 	dispatchShard := ""
 	if len(req.TargetShards) > 0 {
-		if len(req.TargetShards) != 1 {
-			return nil, fmt.Errorf("apply for plan %s: a sharded dispatch must target exactly one shard, got %d (%v)", req.PlanId, len(req.TargetShards), req.TargetShards)
+		shard, err := dispatchTargetShard(req.TargetShards)
+		if err != nil {
+			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
 		}
 		scoped, err := scopedDispatchDDLChanges(req.DdlChanges)
 		if err != nil {
 			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
 		}
-		dispatchShard = req.TargetShards[0]
+		dispatchShard = shard
 		ddlChanges = scoped
 	}
 	c.logger.Info("Apply: retrieved plan",

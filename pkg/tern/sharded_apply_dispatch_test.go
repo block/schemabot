@@ -32,6 +32,29 @@ func TestScopedDispatchDDLChangesHonorsDispatchedScope(t *testing.T) {
 // carry valid, non-empty changes. Anything malformed fails closed rather than
 // falling back to the whole plan (which would apply unrelated tables on the
 // targeted shard).
+func TestDispatchTargetShard(t *testing.T) {
+	t.Run("single shard is trimmed", func(t *testing.T) {
+		shard, err := dispatchTargetShard([]string{"  -80  "})
+		require.NoError(t, err)
+		assert.Equal(t, "-80", shard)
+	})
+	t.Run("zero shards", func(t *testing.T) {
+		_, err := dispatchTargetShard(nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "exactly one shard")
+	})
+	t.Run("more than one shard", func(t *testing.T) {
+		_, err := dispatchTargetShard([]string{"-80", "80-"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "exactly one shard")
+	})
+	t.Run("empty after trim fails closed", func(t *testing.T) {
+		_, err := dispatchTargetShard([]string{"   "})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "empty target shard")
+	})
+}
+
 func TestScopedDispatchDDLChangesFailsClosed(t *testing.T) {
 	t.Run("no changes", func(t *testing.T) {
 		_, err := scopedDispatchDDLChanges(nil)
@@ -50,6 +73,13 @@ func TestScopedDispatchDDLChangesFailsClosed(t *testing.T) {
 	})
 	t.Run("unsupported change type", func(t *testing.T) {
 		_, err := scopedDispatchDDLChanges([]*ternv1.TableChange{{TableName: "mutes", Ddl: "ALTER TABLE `mutes` ADD INDEX (`x`)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_OTHER}})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unsupported change type")
+	})
+	t.Run("vschema is not shard-scoped", func(t *testing.T) {
+		// A VSchema update is keyspace-wide (applied by the task-less
+		// group_finalizer), never shard-scoped — reject it here.
+		_, err := scopedDispatchDDLChanges([]*ternv1.TableChange{{TableName: "mutes", Ddl: "x", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA}})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "unsupported change type")
 	})

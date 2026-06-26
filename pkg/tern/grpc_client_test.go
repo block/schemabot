@@ -735,6 +735,29 @@ func (m *mockApplyOperationStore) MarkTerminal(_ context.Context, id int64, newS
 	return nil
 }
 
+func (m *mockApplyOperationStore) MarkCompleted(_ context.Context, id int64) error {
+	op, ok := m.ops[id]
+	if !ok {
+		return storage.ErrApplyOperationNotFound
+	}
+	now := time.Now()
+	op.State = state.ApplyOperation.Completed
+	op.CompletedAt = &now
+	return nil
+}
+
+func (m *mockApplyOperationStore) MarkFailed(_ context.Context, id int64, errMsg string) error {
+	op, ok := m.ops[id]
+	if !ok {
+		return storage.ErrApplyOperationNotFound
+	}
+	now := time.Now()
+	op.State = state.ApplyOperation.Failed
+	op.ErrorMessage = errMsg
+	op.CompletedAt = &now
+	return nil
+}
+
 func (m *mockApplyOperationStore) SaveEngineResumeState(_ context.Context, operationID int64, resumeState *storage.EngineResumeState) error {
 	if m.saveErr != nil {
 		return m.saveErr
@@ -1016,6 +1039,95 @@ func TestGRPCClient_ResumeApplyOperationDispatchesGroupFinalizerAsVSchemaOnly(t 
 	assert.Equal(t, "commerce", req.DdlChanges[0].Namespace)
 	assert.Empty(t, req.TargetShards, "a namespace VSchema apply targets no shard")
 	assert.Contains(t, req.SchemaFiles, "commerce", "the vschema.json must be carried for a materializing remote")
+}
+
+func TestGRPCClient_ResumeApplyOperationReflectsFinalizerTerminalStateOntoOperationRow(t *testing.T) {
+	// A task-less group_finalizer in a multi-operation apply carries no task rows,
+	// so the operator's task-derived projection can never move its operation row.
+	// The remote drive must therefore reflect the remote terminal state onto the
+	// operation row itself, or the operation is stranded in pending and the
+	// operator retries forever (and a terminal failure is silently lost).
+	cases := []struct {
+		name        string
+		progress    ternv1.State
+		progressSet bool
+		wantState   string
+	}{
+		{name: "completed", wantState: state.ApplyOperation.Completed}, // default Progress = COMPLETED
+		{name: "failed", progress: ternv1.State_STATE_FAILED, progressSet: true, wantState: state.ApplyOperation.Failed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &capturingTernServer{
+				remoteApplyID:    "remote-finalizer-terminal",
+				progressState:    tc.progress,
+				progressStateSet: tc.progressSet,
+			}
+			client, cleanup := testCapturingGRPCClient(t, server)
+			defer cleanup()
+
+			apply := &storage.Apply{
+				ID:              8,
+				ApplyIdentifier: "apply-finalizer-terminal",
+				PlanID:          99,
+				Database:        "commerce",
+				DatabaseType:    storage.DatabaseTypeStrata,
+				Environment:     "staging",
+				State:           state.Apply.Pending,
+			}
+			apply.SetOptions(storage.ApplyOptions{Target: "commerce-target"})
+			// The drive mutates its in-memory parent apply but, for a multi-operation
+			// scope, must not persist it (the operator owns parent state). Store an
+			// independent copy so the terminal reload reflects the persisted pending
+			// parent, not the drive's in-memory mutation.
+			storedParent := *apply
+			finalizerID := int64(51)
+			siblingID := int64(52) // a second operation makes this a multi-operation apply
+			operations := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+				finalizerID: {
+					ID:            finalizerID,
+					ApplyID:       apply.ID,
+					Deployment:    "commerce-deployment",
+					OperationKey:  "commerce/group_finalizer",
+					OperationKind: storage.ApplyOperationKindGroupFinalizer,
+					State:         state.ApplyOperation.Pending,
+				},
+				siblingID: {
+					ID:           siblingID,
+					ApplyID:      apply.ID,
+					Deployment:   "commerce-deployment",
+					OperationKey: "commerce/-80/mutes",
+					State:        state.ApplyOperation.Completed,
+				},
+			}}
+			client.storage = &mockStorage{
+				applies: &mockApplyStore{apply: &storedParent},
+				tasks:   &mockTaskStore{getByApplyIDErr: errors.New("finalizer drive must not load tasks")},
+				plans: &mockPlanStore{plan: &storage.Plan{
+					ID:             apply.PlanID,
+					PlanIdentifier: "plan-finalizer",
+					SchemaFiles: schema.SchemaFiles{
+						"commerce": {Files: map[string]string{vSchemaArtifactName: `{"sharded":true}`}},
+					},
+					Namespaces: map[string]*storage.NamespacePlanData{
+						"commerce": {Artifacts: map[string]string{vSchemaArtifactName: `{"sharded":true}`}},
+					},
+				}},
+				operations: operations,
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			// Reaching a terminal remote state — success or failure — is a successful
+			// drive: the outcome lives in the persisted operation state, not a Go
+			// error (mirroring the non-suppressed terminal path).
+			require.NoError(t, client.ResumeApplyOperation(ctx, apply, finalizerID))
+
+			assert.Equal(t, tc.wantState, operations.ops[finalizerID].State,
+				"the finalizer operation row must reflect the remote terminal state, not stay pending")
+			assert.NotNil(t, operations.ops[finalizerID].CompletedAt, "a terminal operation row is stamped completed_at")
+		})
+	}
 }
 
 func TestGRPCClient_ResumeApplyOperationDispatchParksBarrierCutoverRemotely(t *testing.T) {
