@@ -65,6 +65,29 @@ func TestPlanResponseFromProto_ChangeType(t *testing.T) {
 	assert.Equal(t, "drop", tables[2].ChangeType, "DROP should be lowercase 'drop', not proto enum string")
 }
 
+// A shard plan with no changes is a shard already matching the desired schema
+// in a partially-applied keyspace. planResponseFromProto must carry it (rather
+// than dropping it) so the plan comment can show the divergent state; the
+// changing shard is carried with its DDL alongside.
+func TestPlanResponseFromProto_CarriesSatisfiedShard(t *testing.T) {
+	resp := &ternv1.PlanResponse{
+		Shards: []*ternv1.ShardPlan{
+			{Namespace: "cdb_resolute_sharded", Shard: "-40"}, // satisfied: no changes
+			{Namespace: "cdb_resolute_sharded", Shard: "40-80", Changes: []*ternv1.TableChange{
+				{TableName: "mutes", Ddl: "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER},
+			}},
+		},
+	}
+
+	result := planResponseFromProto(resp)
+
+	require.Len(t, result.Shards, 2, "the satisfied shard is carried, not dropped")
+	assert.Equal(t, "-40", result.Shards[0].Shard)
+	assert.Empty(t, result.Shards[0].Changes, "the satisfied shard carries no changes")
+	assert.Equal(t, "40-80", result.Shards[1].Shard)
+	require.Len(t, result.Shards[1].Changes, 1, "the changing shard keeps its DDL")
+}
+
 func TestProtoChangesToNamespacesPreservesUnsafeMetadata(t *testing.T) {
 	namespaces, err := protoChangesToNamespaces([]*ternv1.SchemaChange{{
 		Namespace: "testapp",

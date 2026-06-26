@@ -84,6 +84,11 @@ type KeyspaceChangeData struct {
 type KeyspaceShardChange struct {
 	Shard      string
 	Statements []string
+	// Satisfied marks a shard that already matches the desired schema while
+	// sibling shards in the keyspace change — a partially-applied keyspace. It
+	// carries no Statements and renders as an "already applied" group, so the
+	// plan comment shows the divergent state rather than hiding the shard.
+	Satisfied bool
 }
 
 // RenderPlanComment renders the plan comment markdown.
@@ -395,7 +400,10 @@ func writePlanDDLBlock(sb *strings.Builder, statements []string) {
 func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange) {
 	groups := groupKeyspaceShardsByStatements(shards)
 	if len(groups) <= 1 {
-		if len(groups) == 1 {
+		// A single group of changing shards shows the DDL once. A lone group of
+		// satisfied shards (no statements) means nothing is changing, so render
+		// nothing rather than an empty code block.
+		if len(groups) == 1 && len(groups[0].Statements) > 0 {
 			writePlanDDLBlock(sb, groups[0].Statements)
 		}
 		return
@@ -403,6 +411,12 @@ func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange) {
 	sb.WriteString("Shards diverge — what applies where:\n\n")
 	for _, g := range groups {
 		fmt.Fprintf(sb, "**%s**\n\n", planShardList(g.Shards))
+		// A satisfied group already matches the desired schema (no statements);
+		// say so instead of rendering an empty code block.
+		if len(g.Statements) == 0 {
+			sb.WriteString("_Already applied — no change._\n\n")
+			continue
+		}
 		writePlanDDLBlock(sb, g.Statements)
 	}
 }

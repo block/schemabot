@@ -5877,6 +5877,41 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="plan-partially-applied-shards"></a><strong>Plan: Partially Applied Shards</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+#### Keyspace: `cdb_resolute_sharded`
+Shards diverge — what applies where:
+
+**shard `-40`**
+
+_Already applied — no change._
+
+**shards `40-80`, `80-c0`, `c0-`**
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+📋 **Plan**: 1 DDL statement
+
+
+---
+
+💡 **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
 <summary><a name="plan-unsafe-change-on-one-shard"></a><strong>Plan: Unsafe Change On One Shard</strong></summary>
 
 

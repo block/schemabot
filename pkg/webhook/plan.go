@@ -497,10 +497,16 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			}
 			shard.Statements = append(shard.Statements, t.DDL)
 		}
-		// A shard with no DDL is not changing; skipping it keeps it out of the
-		// shard-grouped rendering and the change count.
+		// A shard with zero changes already matches the desired schema while
+		// sibling shards change; carry it as a satisfied (no-change) group so a
+		// partially-applied keyspace renders its divergent "already applied vs will
+		// change" state instead of hiding the shard. A shard that carries changes
+		// but yields no usable DDL is malformed — skip it.
 		if len(shard.Statements) == 0 {
-			continue
+			if len(sp.Changes) > 0 {
+				continue
+			}
+			shard.Satisfied = true
 		}
 		shardsByKeyspace[sp.Namespace] = append(shardsByKeyspace[sp.Namespace], shard)
 	}

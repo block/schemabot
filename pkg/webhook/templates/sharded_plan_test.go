@@ -30,6 +30,32 @@ func TestRenderPlanComment_ShardedDivergent(t *testing.T) {
 	assert.Equal(t, 2, strings.Count(out, "```sql"), "one DDL block per group")
 }
 
+// A partially-applied keyspace — some shards already have the change, the rest
+// don't — is divergent: the satisfied shards render as an "already applied"
+// group alongside the changing shards' DDL, instead of being hidden (which
+// would mislead the operator into reading it as a clean uniform apply).
+func TestRenderPlanComment_ShardedPartiallyApplied(t *testing.T) {
+	stmt := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	out := RenderPlanComment(PlanCommentData{
+		Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata",
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "cdb_resolute_sharded",
+			Shards: []KeyspaceShardChange{
+				{Shard: "-40", Satisfied: true}, // already has the index
+				{Shard: "40-80", Statements: []string{stmt}},
+				{Shard: "80-c0", Statements: []string{stmt}},
+				{Shard: "c0-", Statements: []string{stmt}},
+			},
+		}},
+	})
+
+	assert.Contains(t, out, "Shards diverge — what applies where:", "a partially-applied keyspace is divergent")
+	assert.Contains(t, out, "Already applied — no change.", "satisfied shards are surfaced, not hidden")
+	assert.Contains(t, out, "**shard `-40`**", "the satisfied shard is named")
+	assert.Contains(t, out, "**shards `40-80`, `80-c0`, `c0-`**", "the changing shards share one group")
+	assert.Equal(t, 1, strings.Count(out, "```sql"), "the satisfied group shows no empty code block")
+}
+
 // A uniform sharded plan (every shard the same change) shows the DDL once with
 // no divergence header.
 func TestRenderPlanComment_ShardedUniform(t *testing.T) {

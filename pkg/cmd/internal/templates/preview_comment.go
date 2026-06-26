@@ -276,6 +276,7 @@ func previewCommentShardedAllOutput() {
 		fn   func()
 	}{
 		{"PLAN: DIVERGENT SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanDivergent()) }},
+		{"PLAN: PARTIALLY APPLIED SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanPartiallyApplied()) }},
 		{"PLAN: UNSAFE CHANGE ON ONE SHARD", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanUnsafe()) }},
 		{"APPLY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyInProgress()) }},
 		{"APPLY FAILED (ONE SHARD FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyFailed()) }},
@@ -387,7 +388,11 @@ func printSections(sections []struct {
 		if i > 0 {
 			fmt.Println()
 		}
-		fmt.Println("---", s.name, strings.Repeat("-", 50-len(s.name)))
+		// Clamp the trailing rule so a section name longer than the target width
+		// doesn't pass a negative count to strings.Repeat (which panics and would
+		// abort the whole TEMPLATES.md regeneration).
+		dashes := max(50-len(s.name), 0)
+		fmt.Println("---", s.name, strings.Repeat("-", dashes))
 		fmt.Println()
 		s.fn()
 	}

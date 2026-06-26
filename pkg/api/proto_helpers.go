@@ -228,11 +228,11 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 				UnsafeReason: t.UnsafeReason,
 			})
 		}
-		// A shard is changing iff it carries changes (the proto contract); drop an
-		// empty shard plan so it never renders a blank shard section downstream.
-		if len(apiSP.Changes) == 0 {
-			continue
-		}
+		// An empty shard plan is a shard that already matches the desired schema
+		// while sibling shards change (a partially-applied keyspace). Keep it so the
+		// plan comment can show the divergent "already applied vs will change"
+		// picture; carrying no changes, it renders as a no-change group downstream
+		// and the apply fan-out skips it (a shard is changing iff it has changes).
 		httpResp.Shards = append(httpResp.Shards, apiSP)
 	}
 

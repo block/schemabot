@@ -98,6 +98,27 @@ func PreviewCommentShardedPlanDivergent() string {
 	})
 }
 
+// PreviewCommentShardedPlanPartiallyApplied renders a sharded plan where one
+// shard already has the change (e.g. an interrupted earlier rollout) and the
+// rest still need it. The satisfied shard renders as an "already applied" group
+// so the partially-applied keyspace shows its divergent state.
+func PreviewCommentShardedPlanPartiallyApplied() string {
+	idx := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	return RenderPlanComment(PlanCommentData{
+		Database: "cdb_resolute", Environment: "production", DatabaseType: "strata",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "cdb_resolute_sharded",
+			Shards: []KeyspaceShardChange{
+				{Shard: "-40", Satisfied: true},
+				{Shard: "40-80", Statements: []string{idx}},
+				{Shard: "80-c0", Statements: []string{idx}},
+				{Shard: "c0-", Statements: []string{idx}},
+			},
+		}},
+	})
+}
+
 // PreviewCommentShardedPlanUnsafe renders a sharded plan where one shard's
 // combined ALTER drops a column (unsafe), flagged with the shard.
 func PreviewCommentShardedPlanUnsafe() string {
