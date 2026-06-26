@@ -212,8 +212,12 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	c.transitionTaskState(ctx, task, 0, state.Task.Running, "")
 	c.logger.Info("task running", "task_id", task.TaskIdentifier, "table", task.TableName)
 
-	// Poll to completion
-	pollAction := c.pollTaskToCompletion(ctx, apply, task, taskCreds)
+	// Poll to completion. Thread the engine's returned resume state into the
+	// poll: a sharded engine (Strata) identifies the operation to report on from
+	// ResumeState.Metadata and errors without it, so Progress must carry what
+	// Apply returned. (Spirit reports per-database and returns no resume state, so
+	// this stays nil and its behaviour is unchanged.)
+	pollAction := c.pollTaskToCompletion(ctx, apply, task, taskCreds, result.ResumeState)
 	if pollAction == taskAbort || pollAction == taskStopped {
 		return pollAction
 	}
@@ -297,10 +301,12 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
 
 // pollTaskToCompletion polls a single task to completion (sequential mode).
-func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.Apply, task *storage.Task, creds *engine.Credentials) taskAction {
+func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.Apply, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState) taskAction {
 	eng := c.getEngine()
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
+
+	var consecutiveErrors int
 
 	for {
 		select {
@@ -334,11 +340,27 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			result, err := eng.Progress(ctx, &engine.ProgressRequest{
 				Database:    task.Database,
 				Credentials: creds,
+				ResumeState: resumeState,
 			})
 			if err != nil {
-				c.logger.Warn("progress check failed", "error", err, "task_id", task.TaskIdentifier)
+				// A poll that can never succeed (e.g. a persistently malformed
+				// progress request) must not spin forever: an apply that cannot
+				// reach a terminal state holds the database's active-apply slot and
+				// blocks every later apply. Fail fast after a bounded run of errors,
+				// matching the grouped poll's behaviour.
+				consecutiveErrors++
+				c.logger.Warn("progress check failed", "error", err, "task_id", task.TaskIdentifier, "consecutive_errors", consecutiveErrors)
+				if consecutiveErrors >= 10 {
+					if c.shouldRetryEngineError(err) {
+						c.markTaskRetryable(ctx, task, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", consecutiveErrors, err))
+						return taskFailed
+					}
+					c.markTaskFailed(ctx, task, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", consecutiveErrors, err))
+					return taskFailed
+				}
 				continue
 			}
+			consecutiveErrors = 0
 
 			now := time.Now()
 			prevState := task.State
