@@ -239,6 +239,107 @@ func TestControlRequestStore_LeaseGuardsPendingResolution(t *testing.T) {
 	assert.Equal(t, storage.ControlRequestCompleted, completed.Status)
 }
 
+// A release is a one-way latch: requesting it twice (an operator double-click or
+// a retried release call) converges on the single durable row rather than
+// creating extra control work.
+func TestControlRequestStore_RequestPendingReleaseLatchIdempotent(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	applyID := createControlRequestTestApply(t, store, "apply_control_request_release")
+	first, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     applyID,
+		Operation:   storage.ControlOperationRelease,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator-a",
+		Metadata:    []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	second, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     applyID,
+		Operation:   storage.ControlOperationRelease,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator-b",
+		Metadata:    []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.True(t, alreadyPending)
+	assert.Equal(t, first.ID, second.ID)
+}
+
+// GetByOperation reads the latch regardless of status, so callers can observe a
+// completed (or failed) release that GetPending hides. The release latch holds a
+// paused rollout open while pending or completed; a failed release does not
+// latch (fail-closed), matching ApplyControlRequest.ReleasesPausedRollout.
+func TestControlRequestStore_GetByOperationReturnsRegardlessOfStatus(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	applyID := createControlRequestTestApply(t, store, "apply_control_request_get_by_op")
+
+	none, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationRelease)
+	require.NoError(t, err)
+	assert.Nil(t, none)
+
+	created, _, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:   applyID,
+		Operation: storage.ControlOperationRelease,
+		Status:    storage.ControlRequestPending,
+		Metadata:  []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	pending, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationRelease)
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+	assert.Equal(t, created.ID, pending.ID)
+	assert.Equal(t, storage.ControlRequestPending, pending.Status)
+	assert.True(t, pending.ReleasesPausedRollout())
+
+	require.NoError(t, store.ControlRequests().CompletePending(ctx, applyID, storage.ControlOperationRelease))
+
+	gone, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationRelease)
+	require.NoError(t, err)
+	assert.Nil(t, gone)
+
+	completed, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationRelease)
+	require.NoError(t, err)
+	require.NotNil(t, completed)
+	assert.Equal(t, created.ID, completed.ID)
+	assert.Equal(t, storage.ControlRequestCompleted, completed.Status)
+	assert.True(t, completed.ReleasesPausedRollout())
+}
+
+// A failed release does not latch the rollout open: GetByOperation still returns
+// the row for audit, but ReleasesPausedRollout reports false so the rollout
+// stays paused until a fresh release succeeds.
+func TestControlRequestStore_GetByOperationFailedReleaseDoesNotLatch(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	applyID := createControlRequestTestApply(t, store, "apply_control_request_failed_release")
+	_, _, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:   applyID,
+		Operation: storage.ControlOperationRelease,
+		Status:    storage.ControlRequestPending,
+		Metadata:  []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ControlRequests().FailPending(ctx, applyID, storage.ControlOperationRelease, "remote release failed"))
+
+	failed, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationRelease)
+	require.NoError(t, err)
+	require.NotNil(t, failed)
+	assert.Equal(t, storage.ControlRequestFailed, failed.Status)
+	assert.Equal(t, "remote release failed", failed.ErrorMessage)
+	assert.False(t, failed.ReleasesPausedRollout())
+}
+
 func getControlRequestByID(t *testing.T, store *Storage, id int64) *storage.ApplyControlRequest {
 	t.Helper()
 	row := store.db.QueryRowContext(t.Context(), `

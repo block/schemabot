@@ -582,6 +582,13 @@ type ControlRequestStore interface {
 	// GetPending returns the pending request for an apply operation.
 	GetPending(ctx context.Context, applyID int64, operation ControlOperation) (*ApplyControlRequest, error)
 
+	// GetByOperation returns the request for an apply operation regardless of
+	// status (nil if none). Unlike GetPending it does not filter on status, so
+	// callers can observe a completed or failed latch — for example the release
+	// latch that exempts a paused rollout (see ReleasesPausedRollout). At most
+	// one row exists per (apply_id, operation).
+	GetByOperation(ctx context.Context, applyID int64, operation ControlOperation) (*ApplyControlRequest, error)
+
 	// CompletePending marks the pending request for an apply operation completed.
 	CompletePending(ctx context.Context, applyID int64, operation ControlOperation) error
 

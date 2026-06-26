@@ -123,6 +123,19 @@ func (s *controlRequestStore) GetPending(ctx context.Context, applyID int64, ope
 	return scanControlRequest(row)
 }
 
+func (s *controlRequestStore) GetByOperation(ctx context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+controlRequestColumns+`
+		FROM apply_control_requests
+		WHERE apply_id = ? AND operation = ?
+	`, applyID, operation)
+	req, err := scanControlRequest(row)
+	if err != nil {
+		return nil, fmt.Errorf("get control request for apply %d operation %s: %w", applyID, operation, err)
+	}
+	return req, nil
+}
+
 func (s *controlRequestStore) CompletePending(ctx context.Context, applyID int64, operation storage.ControlOperation) error {
 	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
 	if err != nil {

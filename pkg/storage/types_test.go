@@ -37,6 +37,50 @@ func TestApplyOptionsFromMapRoundTrip(t *testing.T) {
 	}, options.Map())
 }
 
+// TestReleasesPausedRollout verifies the one-way release latch semantics: a
+// pending or completed release request releases a paused rollout, while a
+// failed release, any non-release operation, and a nil request do not (the
+// rollout stays paused — fail-closed).
+func TestReleasesPausedRollout(t *testing.T) {
+	tests := []struct {
+		name string
+		req  *ApplyControlRequest
+		want bool
+	}{
+		{name: "nil request", req: nil, want: false},
+		{
+			name: "pending release latches",
+			req:  &ApplyControlRequest{Operation: ControlOperationRelease, Status: ControlRequestPending},
+			want: true,
+		},
+		{
+			name: "completed release latches",
+			req:  &ApplyControlRequest{Operation: ControlOperationRelease, Status: ControlRequestCompleted},
+			want: true,
+		},
+		{
+			name: "failed release does not latch",
+			req:  &ApplyControlRequest{Operation: ControlOperationRelease, Status: ControlRequestFailed},
+			want: false,
+		},
+		{
+			name: "pending start is not a release",
+			req:  &ApplyControlRequest{Operation: ControlOperationStart, Status: ControlRequestPending},
+			want: false,
+		},
+		{
+			name: "completed stop is not a release",
+			req:  &ApplyControlRequest{Operation: ControlOperationStop, Status: ControlRequestCompleted},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.req.ReleasesPausedRollout())
+		})
+	}
+}
+
 // TestApplyOptionsFromMapIgnoresInvalidVolume verifies that malformed numeric
 // options and out-of-range volumes are ignored instead of being persisted back
 // into apply metadata.

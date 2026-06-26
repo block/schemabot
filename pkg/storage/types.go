@@ -677,6 +677,12 @@ const (
 	ControlOperationStop ControlOperation = "stop"
 	// ControlOperationCutover triggers deferred cutover.
 	ControlOperationCutover ControlOperation = "cutover"
+	// ControlOperationRelease releases a rollout paused after a failure under
+	// on_failure 'pause', letting the held later deployments proceed (like
+	// 'continue'). It is a one-way latch and is deliberately distinct from
+	// 'start': 'start' resumes stopped work and carries no claim-ordering
+	// clause, so it cannot release a paused rollout.
+	ControlOperationRelease ControlOperation = "release"
 )
 
 // ControlRequestStatus is the durable processing status for a control request.
@@ -705,6 +711,17 @@ type ApplyControlRequest struct {
 	CompletedAt  *time.Time
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+}
+
+// ReleasesPausedRollout reports whether this request latches a rollout paused
+// under on_failure 'pause' open, so the held later deployments may proceed.
+// release is a one-way latch: a release request that is pending or completed
+// releases the rollout; a failed release attempt does not latch, so the rollout
+// stays paused (fail-closed). Any non-release operation never releases.
+func (r *ApplyControlRequest) ReleasesPausedRollout() bool {
+	return r != nil &&
+		r.Operation == ControlOperationRelease &&
+		(r.Status == ControlRequestPending || r.Status == ControlRequestCompleted)
 }
 
 // ApplyOptionsFromMap converts API/proto option strings into typed storage options.
