@@ -136,6 +136,35 @@ func (c *LocalClient) checkTaskReady(ctx context.Context, task *storage.Task) ta
 	return taskContinue
 }
 
+// sequentialEngineApplyRequest builds the engine request for one task in the
+// sequential drive. A sharded task carries the shard it targets; propagate it so
+// a sharded engine (Strata) receives exactly one target shard — without it the
+// engine rejects the work with "expected exactly one target shard, got 0" even
+// though the task is correctly shard-tagged. A non-sharded task has an empty
+// shard and leaves both shard fields unset, unchanged. The grouped and resume
+// drive paths already set TargetShards via taskTargetShards; this is the
+// single-task path's equivalent.
+func sequentialEngineApplyRequest(task *storage.Task, options map[string]string, creds *engine.Credentials) *engine.ApplyRequest {
+	change := engine.SchemaChange{
+		Namespace:    task.Namespace,
+		TableChanges: []engine.TableChange{{Table: task.TableName, DDL: task.DDL}},
+	}
+	if task.Shard != "" {
+		change.Shard = engine.Shard{Name: task.Shard}
+	}
+	req := &engine.ApplyRequest{
+		Database:    task.Database,
+		Changes:     []engine.SchemaChange{change},
+		Options:     options,
+		ResumeState: &engine.ResumeState{MigrationContext: task.TaskIdentifier},
+		Credentials: creds,
+	}
+	if task.Shard != "" {
+		req.TargetShards = []string{task.Shard}
+	}
+	return req
+}
+
 // runEngineTask calls the engine for a single DDL, marks the task running, and polls to completion.
 // Returns the outcome: taskContinue (completed), taskFailed, or taskStopped.
 func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, task *storage.Task, options map[string]string, creds *engine.Credentials) taskAction {
@@ -157,18 +186,10 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 		}
 	}
 
-	// Sequential mode: one DDL per engine call. Use the task identifier as
-	// MigrationContext so each table's schema change is tracked independently.
-	result, err := c.getEngine().Apply(ctx, &engine.ApplyRequest{
-		Database: task.Database,
-		Changes: []engine.SchemaChange{{
-			Namespace:    task.Namespace,
-			TableChanges: []engine.TableChange{{Table: task.TableName, DDL: task.DDL}},
-		}},
-		Options:     options,
-		ResumeState: &engine.ResumeState{MigrationContext: task.TaskIdentifier},
-		Credentials: taskCreds,
-	})
+	// Sequential mode: one DDL per engine call. The task identifier is used as the
+	// engine resume key (ResumeState.MigrationContext) so each table's schema
+	// change is tracked independently.
+	result, err := c.getEngine().Apply(ctx, sequentialEngineApplyRequest(task, options, taskCreds))
 
 	if err != nil {
 		if c.shouldRetryEngineError(err) {
