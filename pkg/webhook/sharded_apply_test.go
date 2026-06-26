@@ -16,7 +16,7 @@ import (
 func TestFormatApplyStatusComment_ShardedAttributionFromCaller(t *testing.T) {
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running,
-		Caller: "github:morgo@squareup/gap#11890",
+		Caller: "github:morgo@block/example#11890",
 	}
 	op := &storage.ApplyOperation{ID: 1, ApplyID: 1, Deployment: "cake", OperationKey: "cdb_resolute_sharded/-40/mutes", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
 	oid := int64(1)
