@@ -237,6 +237,40 @@ func TestEngine_Plan_DropColumn(t *testing.T) {
 	assert.True(t, result.HasErrors(), "Spirit unsafe drop lint should remain the blocking gate")
 }
 
+func TestEngine_Plan_DropTable(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE legacy_users (
+		id INT PRIMARY KEY AUTO_INCREMENT,
+		name VARCHAR(100) NOT NULL
+	)`)
+	require.NoError(t, err, "create table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database:    "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{}),
+		Credentials: &engine.Credentials{
+			DSN: dsn,
+		},
+	})
+	require.NoError(t, err, "Plan()")
+
+	require.False(t, result.NoChanges, "expected changes, got NoChanges")
+	require.NotEmpty(t, result.Changes)
+	require.NotEmpty(t, result.Changes[0].TableChanges)
+	change := result.Changes[0].TableChanges[0]
+	assert.Equal(t, "legacy_users", change.Table)
+	assert.True(t, change.IsUnsafe)
+	assert.Contains(t, change.UnsafeReason, "DROP TABLE `legacy_users`")
+	assert.True(t, result.HasErrors(), "Spirit unsafe drop lint should remain the blocking gate")
+	_, err = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS `legacy_users`")
+	require.NoError(t, err, "drop table")
+}
+
 func TestEngine_Plan_NoChanges(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db) // Start with clean database
