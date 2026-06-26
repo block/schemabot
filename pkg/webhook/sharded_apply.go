@@ -34,14 +34,17 @@ func isFinalizerOperationKey(key string) bool {
 // isShardedApply reports whether the apply's operations are the per-shard
 // fan-out of a single keyspace within one deployment: at least one work
 // operation carries a "namespace/shard/table" key, every operation is a shard
-// or finalizer operation, and they all share one deployment. A non-sharded
-// multi-deployment apply (empty operation keys) and any apply spanning more than
-// one deployment return false, so they keep the existing layout.
+// or finalizer operation, they all share one deployment, and every shard work
+// operation is in the same namespace. A non-sharded multi-deployment apply
+// (empty operation keys), an apply spanning more than one deployment, and a
+// multi-keyspace apply all return false, so they keep the existing layout rather
+// than mislabelling — the sharded layout shows a single keyspace.
 func isShardedApply(ops []*storage.ApplyOperation) bool {
 	deployment := ""
+	namespace := ""
 	hasShard := false
 	for _, op := range ops {
-		_, _, _, isShard := parseShardOperationKey(op.OperationKey)
+		ns, _, _, isShard := parseShardOperationKey(op.OperationKey)
 		if !isShard && !isFinalizerOperationKey(op.OperationKey) {
 			return false
 		}
@@ -51,6 +54,11 @@ func isShardedApply(ops []*storage.ApplyOperation) bool {
 			return false
 		}
 		if isShard {
+			if namespace == "" {
+				namespace = ns
+			} else if ns != namespace {
+				return false
+			}
 			hasShard = true
 		}
 	}

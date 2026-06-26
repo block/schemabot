@@ -49,3 +49,24 @@ func TestRenderPlanComment_ShardedUniform(t *testing.T) {
 	assert.NotContains(t, out, "diverge", "a uniform plan is not grouped")
 	assert.Equal(t, 1, strings.Count(out, "```sql"), "the shared DDL is shown once")
 }
+
+// A sharded plan whose DDL lives only per-shard (no collapsed namespace-level
+// Statements) must not short-circuit to "no changes" — the count incorporates
+// the per-shard statements.
+func TestRenderPlanComment_ShardedOnlyPerShardDDLNotMiscounted(t *testing.T) {
+	stmt := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	out := RenderPlanComment(PlanCommentData{
+		Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata",
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "cdb_resolute_sharded",
+			// No namespace-level Statements — only per-shard.
+			Shards: []KeyspaceShardChange{
+				{Shard: "-40", Statements: []string{stmt}},
+				{Shard: "80-", Statements: []string{stmt}},
+			},
+		}},
+	})
+
+	assert.NotContains(t, out, "No schema changes", "per-shard-only DDL is still counted as a change")
+	assert.Contains(t, out, "```sql", "the per-shard DDL is rendered")
+}

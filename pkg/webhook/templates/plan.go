@@ -249,14 +249,30 @@ func writeOptions(sb *strings.Builder, data PlanCommentData) {
 
 func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspacesWithVSchema int) {
 	for _, ks := range changes {
-		if len(ks.Statements) > 0 {
-			totalStatements += len(ks.Statements)
-		}
+		totalStatements += keyspaceStatementCount(ks)
 		if ks.VSchemaChanged {
 			keyspacesWithVSchema++
 		}
 	}
 	return
+}
+
+// keyspaceStatementCount counts a keyspace's DDL statements for the summary and
+// the no-changes short-circuit. It prefers the collapsed namespace-level
+// Statements; when those are absent but the keyspace carries per-shard changes,
+// it counts the distinct statements across shards, so a sharded plan whose only
+// DDL is per-shard is never miscounted as "no changes".
+func keyspaceStatementCount(ks KeyspaceChangeData) int {
+	if len(ks.Statements) > 0 {
+		return len(ks.Statements)
+	}
+	seen := make(map[string]struct{})
+	for _, sh := range ks.Shards {
+		for _, stmt := range sh.Statements {
+			seen[stmt] = struct{}{}
+		}
+	}
+	return len(seen)
 }
 
 func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements, keyspacesWithVSchema int) {

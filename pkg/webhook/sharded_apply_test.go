@@ -43,6 +43,9 @@ func TestIsShardedApply(t *testing.T) {
 	assert.False(t, isShardedApply([]*storage.ApplyOperation{
 		{Deployment: "cake", OperationKey: "ks/-40/mutes"}, {Deployment: "eu", OperationKey: "ks/80-/mutes"},
 	}), "shards spanning deployments fall back to the deployment layout")
+	assert.False(t, isShardedApply([]*storage.ApplyOperation{
+		{Deployment: "cake", OperationKey: "ks1/-40/mutes"}, {Deployment: "cake", OperationKey: "ks2/-40/mutes"},
+	}), "shard work across multiple keyspaces falls back rather than mislabelling one keyspace")
 }
 
 // The failed sharded apply must render the shard-unit layout AND surface the
