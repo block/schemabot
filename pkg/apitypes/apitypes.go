@@ -205,6 +205,19 @@ type PlanResponse struct {
 	Changes      []*SchemaChangeResponse  `json:"changes"`
 	LintResults  []*LintViolationResponse `json:"lint_violations"`
 	Errors       []string                 `json:"errors"`
+	// Shards carries the per-shard plan for a sharded engine: each changing shard
+	// and the changes it needs. The namespace-level Changes above collapse a
+	// keyspace to one entry, so a keyspace whose shards diverge is represented
+	// faithfully only here. Empty for non-sharded plans.
+	Shards []*ShardPlanResponse `json:"shards,omitempty"`
+}
+
+// ShardPlanResponse is one changing shard's plan: the keyspace it belongs to and
+// the table changes that shard needs.
+type ShardPlanResponse struct {
+	Namespace string                 `json:"namespace,omitempty"`
+	Shard     string                 `json:"shard"`
+	Changes   []*TableChangeResponse `json:"changes,omitempty"`
 }
 
 // HasErrors returns true if any lint result has error severity.

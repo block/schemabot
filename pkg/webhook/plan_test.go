@@ -17,6 +17,32 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
+// A sharded plan response's per-shard changes are threaded into the keyspace's
+// Shards, so the plan comment can render "what applies where" — not just the
+// collapsed namespace-level Changes.
+func TestBuildPlanCommentData_CarriesPerShardChanges(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "cdb_resolute", Type: "strata"}
+	const mutes = "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	const mutesDrift = "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`), ADD COLUMN `reason` varchar(255)"
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace:    "cdb_resolute_sharded",
+			TableChanges: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: mutes, ChangeType: "alter"}},
+		}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "cdb_resolute_sharded", Shard: "-40", Changes: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: mutes, ChangeType: "alter"}}},
+			{Namespace: "cdb_resolute_sharded", Shard: "40-80", Changes: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: mutesDrift, ChangeType: "alter"}}},
+		},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+
+	require.Len(t, data.Changes, 1)
+	require.Len(t, data.Changes[0].Shards, 2, "per-shard changes are threaded into the keyspace")
+	assert.Equal(t, "-40", data.Changes[0].Shards[0].Shard)
+	assert.Equal(t, []string{mutesDrift}, data.Changes[0].Shards[1].Statements, "the drifted shard keeps its own DDL")
+}
+
 func TestBuildPlanCommentData_UnsafeChangesPopulated(t *testing.T) {
 	schema := &ghclient.SchemaRequestResult{
 		Database: "testdb",

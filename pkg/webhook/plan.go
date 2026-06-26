@@ -445,10 +445,25 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		IsMySQL:      schema.Type == "mysql",
 	}
 
+	// Per-shard changes, grouped by keyspace, so a sharded keyspace can show what
+	// applies to which shard rather than the collapsed namespace-level view.
+	shardsByKeyspace := make(map[string][]templates.KeyspaceShardChange)
+	for _, sp := range planResp.Shards {
+		if sp == nil {
+			continue
+		}
+		shard := templates.KeyspaceShardChange{Shard: sp.Shard}
+		for _, t := range sp.Changes {
+			shard.Statements = append(shard.Statements, t.DDL)
+		}
+		shardsByKeyspace[sp.Namespace] = append(shardsByKeyspace[sp.Namespace], shard)
+	}
+
 	// Build keyspace changes from namespace-grouped plan response
 	for _, sc := range planResp.Changes {
 		ksData := templates.KeyspaceChangeData{
 			Keyspace: sc.Namespace,
+			Shards:   shardsByKeyspace[sc.Namespace],
 		}
 		for _, t := range sc.TableChanges {
 			ksData.Statements = append(ksData.Statements, t.DDL)
