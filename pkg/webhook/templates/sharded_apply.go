@@ -209,12 +209,20 @@ func shardCountLabel(s ShardStatus) string {
 	return s.Label
 }
 
+// isShardFailureState reports whether a shard's state carries an operator-facing
+// error to surface — a terminal failure or an automatic retry after one. The
+// retry case matters because SchemaBot holds the apply in failed_retryable while
+// it retries, and the operator still needs to see what went wrong.
+func isShardFailureState(opState string) bool {
+	return opState == state.ApplyOperation.Failed || opState == state.ApplyOperation.FailedRetryable
+}
+
 // writeShardFirstFailure lifts the first failed shard's error to the top so an
 // operator sees the cause without scanning the table. Renders nothing when no
-// shard failed.
+// shard has failed or is retrying after a failure.
 func writeShardFirstFailure(sb *strings.Builder, shards []ShardStatus) {
 	for _, s := range shards {
-		if s.State != state.ApplyOperation.Failed {
+		if !isShardFailureState(s.State) {
 			continue
 		}
 		shard := html.EscapeString(s.Shard)
@@ -252,19 +260,22 @@ func shardStatusCell(s ShardStatus) string {
 	if s.Emoji != "" {
 		cell = fmt.Sprintf("%s %s", s.Emoji, cell)
 	}
-	if s.State == state.ApplyOperation.Failed && s.Error != "" {
+	if isShardFailureState(s.State) && s.Error != "" {
 		cell = fmt.Sprintf("%s — %s", cell, html.EscapeString(s.Error))
 	}
 	return cell
 }
 
-// writeShardedFooter renders the single next operator action. A failed or
-// stopped sharded apply is retried/resumed at the apply level, matching the
-// single-deployment footer vocabulary.
+// writeShardedFooter renders the single next operator action, matching the
+// single-deployment footer vocabulary: a failed apply is retried, an
+// auto-retrying (failed_retryable) apply offers the stop-retrying command, and a
+// stopped apply is resumed.
 func writeShardedFooter(sb *strings.Builder, data ShardedApplyData) {
 	switch {
 	case state.IsState(data.State, state.Apply.Failed):
 		writeFooterAction(sb, "To retry:", fmt.Sprintf("schemabot apply -e %s", data.Environment))
+	case state.IsState(data.State, state.Apply.FailedRetryable):
+		writeFooterAction(sb, "An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:", fmt.Sprintf("schemabot stop %s -e %s", data.ApplyID, data.Environment))
 	case state.IsState(data.State, state.Apply.Stopped):
 		writeFooterAction(sb, "Paused — to resume from where it stopped:", fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment))
 	}

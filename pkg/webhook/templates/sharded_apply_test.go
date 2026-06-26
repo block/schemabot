@@ -52,6 +52,26 @@ func TestRenderShardedApplyComment_FailedSurfacesError(t *testing.T) {
 	assert.Contains(t, out, "To retry:")
 }
 
+// An auto-retrying (failed_retryable) shard surfaces its error and the apply
+// offers the stop-retrying action, matching the single-deployment footer.
+func TestRenderShardedApplyComment_FailedRetryableSurfacesErrorAndStop(t *testing.T) {
+	const retryErr = "lost connection to shard primary; retrying"
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.FailedRetryable, Environment: "staging", Database: "cdb_resolute",
+		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
+		Shards: []ShardStatus{
+			{Shard: "-40", Emoji: "🔁", Label: "retrying", State: state.ApplyOperation.FailedRetryable, Error: retryErr},
+			{Shard: "80-", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
+		},
+		Cells: []ShardCell{mutesCell("-40"), mutesCell("80-")},
+	})
+
+	assert.Contains(t, out, "First failure:", "a retrying shard's error is still lifted")
+	assert.Contains(t, out, retryErr, "the retrying shard's error is shown, not dropped")
+	assert.Contains(t, out, "To stop retrying:")
+	assert.Contains(t, out, "schemabot stop apply-x")
+}
+
 // When shards diverge, they are grouped by change signature: each group lists
 // its shards' statuses next to the exact DDL it runs. The same table computing
 // to different DDL across shards yields two groups.
