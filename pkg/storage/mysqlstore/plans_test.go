@@ -34,10 +34,12 @@ func TestPlanStore_RoundTripsShardPlans(t *testing.T) {
 		Namespaces: map[string]*storage.NamespacePlanData{
 			"commerce": {
 				Tables: []storage.TableChange{{
-					Namespace: "commerce",
-					Table:     "users",
-					DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
-					Operation: "alter",
+					Namespace:    "commerce",
+					Table:        "users",
+					DDL:          "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+					Operation:    "alter",
+					IsUnsafe:     true,
+					UnsafeReason: "DROP COLUMN removes data",
 				}},
 			},
 		},
@@ -45,10 +47,12 @@ func TestPlanStore_RoundTripsShardPlans(t *testing.T) {
 			{Namespace: "commerce", Shard: "80-"},
 			// -80 carries its own per-shard DDL; the round-trip must preserve it.
 			{Namespace: "commerce", Shard: "-80", Changes: []storage.TableChange{{
-				Namespace: "commerce",
-				Table:     "users",
-				DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
-				Operation: "alter",
+				Namespace:    "commerce",
+				Table:        "users",
+				DDL:          "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+				Operation:    "alter",
+				IsUnsafe:     true,
+				UnsafeReason: "DROP COLUMN removes data",
 			}}},
 		},
 		CreatedAt: time.Now(),
@@ -61,20 +65,24 @@ func TestPlanStore_RoundTripsShardPlans(t *testing.T) {
 
 	assert.Equal(t, []storage.ShardPlan{
 		{Namespace: "commerce", Shard: "-80", Changes: []storage.TableChange{{
-			Namespace: "commerce",
-			Table:     "users",
-			DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
-			Operation: "alter",
+			Namespace:    "commerce",
+			Table:        "users",
+			DDL:          "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			Operation:    "alter",
+			IsUnsafe:     true,
+			UnsafeReason: "DROP COLUMN removes data",
 		}}},
 		{Namespace: "commerce", Shard: "80-"},
 	}, got.Shards, "per-shard Changes must round-trip through plan_data JSON")
 	require.Contains(t, got.Namespaces, "commerce")
 	assert.Equal(t, got.Shards, got.Namespaces["commerce"].Shards)
 	assert.Equal(t, []storage.TableChange{{
-		Namespace: "commerce",
-		Table:     "users",
-		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
-		Operation: "alter",
+		Namespace:    "commerce",
+		Table:        "users",
+		DDL:          "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		Operation:    "alter",
+		IsUnsafe:     true,
+		UnsafeReason: "DROP COLUMN removes data",
 	}}, got.Namespaces["commerce"].Tables)
 }
 

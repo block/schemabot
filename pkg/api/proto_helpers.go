@@ -258,9 +258,11 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange, schemaFiles map[st
 		nsData := &storage.NamespacePlanData{}
 		for _, t := range sc.TableChanges {
 			nsData.Tables = append(nsData.Tables, storage.TableChange{
-				Table:     t.TableName,
-				DDL:       t.Ddl,
-				Operation: protoChangeTypeToOperation(t.ChangeType),
+				Table:        t.TableName,
+				DDL:          t.Ddl,
+				Operation:    protoChangeTypeToOperation(t.ChangeType),
+				IsUnsafe:     t.IsUnsafe,
+				UnsafeReason: t.UnsafeReason,
 			})
 		}
 		if len(sc.OriginalFiles) > 0 {
@@ -331,10 +333,12 @@ func protoShardPlansToStorage(shards []*ternv1.ShardPlan) ([]storage.ShardPlan, 
 				return nil, fmt.Errorf("shard plan %d shard %q change %d (table %q) namespace %q disagrees with shard namespace %q", i, shardName, j, table, cn, namespace)
 			}
 			sp.Changes = append(sp.Changes, storage.TableChange{
-				Namespace: namespace,
-				Table:     table,
-				DDL:       changeDDL,
-				Operation: protoChangeTypeToOperation(ch.ChangeType),
+				Namespace:    namespace,
+				Table:        table,
+				DDL:          changeDDL,
+				Operation:    protoChangeTypeToOperation(ch.ChangeType),
+				IsUnsafe:     ch.IsUnsafe,
+				UnsafeReason: ch.UnsafeReason,
 			})
 		}
 		out = append(out, sp)

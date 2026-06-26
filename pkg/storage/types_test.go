@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestApplyOptionsFromMapRoundTrip verifies that user-facing apply options can
@@ -35,6 +36,31 @@ func TestApplyOptionsFromMapRoundTrip(t *testing.T) {
 		"skip_revert":   "true",
 		"volume":        "7",
 	}, options.Map())
+}
+
+func TestPlanUnsafeDDLChanges(t *testing.T) {
+	plan := &Plan{Namespaces: map[string]*NamespacePlanData{
+		"testdb": {Tables: []TableChange{
+			{Namespace: "testdb", Table: "users", Operation: "alter", IsUnsafe: true, UnsafeReason: "DROP COLUMN removes data"},
+			{Namespace: "testdb", Table: "orders", Operation: "drop"},
+			{Namespace: "testdb", Table: "products", Operation: "alter"},
+		}},
+	}, Shards: []ShardPlan{{
+		Namespace: "testdb",
+		Shard:     "-80",
+		Changes:   []TableChange{{Table: "accounts", Operation: "alter", IsUnsafe: true, UnsafeReason: "DROP PRIMARY KEY rebuilds the table"}},
+	}}}
+
+	changes := plan.UnsafeDDLChanges()
+
+	require.Len(t, changes, 3)
+	assert.Equal(t, "users", changes[0].Table)
+	assert.Equal(t, "DROP COLUMN removes data", changes[0].UnsafeOptInReason())
+	assert.Equal(t, "orders", changes[1].Table)
+	assert.Equal(t, "DROP TABLE removes all data", changes[1].UnsafeOptInReason())
+	assert.Equal(t, "accounts", changes[2].Table)
+	assert.Equal(t, "testdb", changes[2].Namespace)
+	assert.Equal(t, "DROP PRIMARY KEY rebuilds the table", changes[2].UnsafeOptInReason())
 }
 
 // TestReleasesPausedRollout verifies the one-way release latch semantics: a

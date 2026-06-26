@@ -907,6 +907,9 @@ func (s *Service) createStoredApply(
 ) (*storage.Apply, int64, error) {
 	now := time.Now()
 	applyOpts := storage.ApplyOptionsFromMap(options)
+	if err := rejectUnsafeStoredPlanWithoutOptIn(plan, applyOpts); err != nil {
+		return nil, 0, err
+	}
 
 	// The plan already carries the resolved primary (deployment, target) from
 	// plan time, and is authoritative for single-deployment applies and the
@@ -993,6 +996,18 @@ func (s *Service) createStoredApply(
 	}
 
 	return apply, storedApplyID, nil
+}
+
+func rejectUnsafeStoredPlanWithoutOptIn(plan *storage.Plan, applyOpts storage.ApplyOptions) error {
+	if applyOpts.AllowUnsafe {
+		return nil
+	}
+	unsafeChanges := plan.UnsafeDDLChanges()
+	if len(unsafeChanges) == 0 {
+		return nil
+	}
+	change := unsafeChanges[0]
+	return fmt.Errorf("stored plan %s contains unsafe change for table %q: %s; retry with allow_unsafe=true", plan.PlanIdentifier, change.Table, change.UnsafeOptInReason())
 }
 
 // applyTaskChanges returns the per-table DDL changes that become apply tasks.

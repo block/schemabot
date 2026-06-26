@@ -142,3 +142,46 @@ func TestPlanSurfacesShardPlanOnResponse(t *testing.T) {
 	require.Len(t, resp.Changes, 1)
 	require.Len(t, resp.Changes[0].TableChanges, 1)
 }
+
+func TestPlanPreservesUnsafeMetadataInStoredPlanAndResponse(t *testing.T) {
+	store := &fakePlanStore{
+		getFn:    func(string) (*storage.Plan, error) { return nil, nil },
+		createID: 9,
+	}
+	unsafeDrop := []engine.TableChange{{
+		Table:        "users",
+		Operation:    statement.StatementDropTable,
+		DDL:          "DROP TABLE `users`",
+		IsUnsafe:     true,
+		UnsafeReason: "DROP TABLE removes all data",
+	}}
+	result := &engine.PlanResult{
+		PlanID: "plan_unsafe",
+		Changes: []engine.SchemaChange{
+			{Namespace: "resolute", Shard: engine.Shard{Name: "-80"}, TableChanges: unsafeDrop},
+		},
+	}
+	c := shardPlanTestClient(t, store, result)
+
+	resp, err := c.Plan(t.Context(), &ternv1.PlanRequest{Database: "commerce"})
+	require.NoError(t, err)
+
+	require.NotNil(t, store.created)
+	require.Len(t, store.created.Namespaces["resolute"].Tables, 1)
+	stored := store.created.Namespaces["resolute"].Tables[0]
+	assert.True(t, stored.IsUnsafe)
+	assert.Equal(t, "DROP TABLE removes all data", stored.UnsafeReason)
+	require.Len(t, store.created.Shards, 1)
+	require.Len(t, store.created.Shards[0].Changes, 1)
+	assert.True(t, store.created.Shards[0].Changes[0].IsUnsafe)
+	assert.Equal(t, "DROP TABLE removes all data", store.created.Shards[0].Changes[0].UnsafeReason)
+
+	require.Len(t, resp.Changes, 1)
+	require.Len(t, resp.Changes[0].TableChanges, 1)
+	assert.True(t, resp.Changes[0].TableChanges[0].IsUnsafe)
+	assert.Equal(t, "DROP TABLE removes all data", resp.Changes[0].TableChanges[0].UnsafeReason)
+	require.Len(t, resp.Shards, 1)
+	require.Len(t, resp.Shards[0].Changes, 1)
+	assert.True(t, resp.Shards[0].Changes[0].IsUnsafe)
+	assert.Equal(t, "DROP TABLE removes all data", resp.Shards[0].Changes[0].UnsafeReason)
+}

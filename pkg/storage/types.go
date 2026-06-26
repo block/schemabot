@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/schema"
@@ -253,6 +254,32 @@ type TableChange struct {
 
 	// Operation is "create", "alter", or "drop".
 	Operation string `json:"operation"`
+
+	// IsUnsafe records whether the planner marked this change unsafe.
+	IsUnsafe bool `json:"is_unsafe,omitempty"`
+
+	// UnsafeReason records the planner's reason for unsafe changes.
+	UnsafeReason string `json:"unsafe_reason,omitempty"`
+}
+
+// RequiresUnsafeOptIn reports whether applying this change requires explicit
+// unsafe opt-in. Stored plans keep the planner's unsafe metadata; drop remains
+// fail-closed so older plans without the metadata cannot queue table deletion as
+// safe.
+func (tc TableChange) RequiresUnsafeOptIn() bool {
+	return tc.IsUnsafe || strings.EqualFold(tc.Operation, "drop")
+}
+
+// UnsafeOptInReason returns the planner-provided unsafe reason, or a generic
+// table-drop reason for older/malformed plans that only persisted the operation.
+func (tc TableChange) UnsafeOptInReason() string {
+	if tc.UnsafeReason != "" {
+		return tc.UnsafeReason
+	}
+	if strings.EqualFold(tc.Operation, "drop") {
+		return "DROP TABLE removes all data"
+	}
+	return "unsafe schema change requires explicit opt-in"
 }
 
 // NamespacePlanData contains plan data for a single namespace. OriginalFiles is
@@ -362,6 +389,29 @@ func (p *Plan) FlatDDLChanges() []TableChange {
 				tc.Namespace = k
 			}
 			result = append(result, tc)
+		}
+	}
+	return result
+}
+
+// UnsafeDDLChanges returns stored DDL changes that require explicit unsafe
+// opt-in before queueing operator work.
+func (p *Plan) UnsafeDDLChanges() []TableChange {
+	var result []TableChange
+	appendUnsafe := func(tc TableChange) {
+		if tc.RequiresUnsafeOptIn() {
+			result = append(result, tc)
+		}
+	}
+	for _, tc := range p.FlatDDLChanges() {
+		appendUnsafe(tc)
+	}
+	for _, shard := range p.Shards {
+		for _, tc := range shard.Changes {
+			if tc.Namespace == "" {
+				tc.Namespace = shard.Namespace
+			}
+			appendUnsafe(tc)
 		}
 	}
 	return result

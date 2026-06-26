@@ -1117,9 +1117,11 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	ddlChanges := make([]storage.TableChange, len(result.FlatTableChanges()))
 	for i, t := range result.FlatTableChanges() {
 		ddlChanges[i] = storage.TableChange{
-			Table:     t.Table,
-			DDL:       t.DDL,
-			Operation: ddl.StatementTypeToOp(t.Operation),
+			Table:        t.Table,
+			DDL:          t.DDL,
+			Operation:    ddl.StatementTypeToOp(t.Operation),
+			IsUnsafe:     t.IsUnsafe,
+			UnsafeReason: t.UnsafeReason,
 		}
 	}
 
@@ -1145,9 +1147,11 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 			}
 			seenTable[ns][tc.Table] = true
 			nsData.Tables = append(nsData.Tables, storage.TableChange{
-				Table:     tc.Table,
-				DDL:       tc.DDL,
-				Operation: ddl.StatementTypeToOp(tc.Operation),
+				Table:        tc.Table,
+				DDL:          tc.DDL,
+				Operation:    ddl.StatementTypeToOp(tc.Operation),
+				IsUnsafe:     tc.IsUnsafe,
+				UnsafeReason: tc.UnsafeReason,
 			})
 		}
 		// Record each changing shard's own changes so apply-create can rebuild
@@ -1159,10 +1163,12 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 			sp := storage.ShardPlan{Shard: shardName, Namespace: ns}
 			for _, tc := range sc.TableChanges {
 				sp.Changes = append(sp.Changes, storage.TableChange{
-					Namespace: ns,
-					Table:     tc.Table,
-					DDL:       tc.DDL,
-					Operation: ddl.StatementTypeToOp(tc.Operation),
+					Namespace:    ns,
+					Table:        tc.Table,
+					DDL:          tc.DDL,
+					Operation:    ddl.StatementTypeToOp(tc.Operation),
+					IsUnsafe:     tc.IsUnsafe,
+					UnsafeReason: tc.UnsafeReason,
 				})
 			}
 			nsData.Shards = append(nsData.Shards, sp)
@@ -1223,6 +1229,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		Environment:    req.Environment,
 		SchemaFiles:    schemaFiles,
 		Namespaces:     namespaces,
+		Shards:         allShardPlans,
 		HeadSHA:        req.HeadSha,
 		CreatedAt:      time.Now(),
 	}
@@ -1306,10 +1313,12 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		}
 		for _, ch := range sp.Changes {
 			protoSP.Changes = append(protoSP.Changes, &ternv1.TableChange{
-				Namespace:  ch.Namespace,
-				TableName:  ch.Table,
-				Ddl:        ch.DDL,
-				ChangeType: ddlActionToProtoChangeType(ch.Operation),
+				Namespace:    ch.Namespace,
+				TableName:    ch.Table,
+				Ddl:          ch.DDL,
+				ChangeType:   ddlActionToProtoChangeType(ch.Operation),
+				IsUnsafe:     ch.IsUnsafe,
+				UnsafeReason: ch.UnsafeReason,
 			})
 		}
 		protoShards = append(protoShards, protoSP)
@@ -1446,10 +1455,12 @@ func scopedDispatchDDLChanges(changes []*ternv1.TableChange) ([]storage.TableCha
 			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d (table %q) has unsupported change type %v", i, table, ch.ChangeType)
 		}
 		out = append(out, storage.TableChange{
-			Namespace: namespace,
-			Table:     table,
-			DDL:       ddl,
-			Operation: op,
+			Namespace:    namespace,
+			Table:        table,
+			DDL:          ddl,
+			Operation:    op,
+			IsUnsafe:     ch.IsUnsafe,
+			UnsafeReason: ch.UnsafeReason,
 		})
 	}
 	return out, nil
@@ -1571,10 +1582,12 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 		}
 		nsData := ensure(ch.Namespace)
 		nsData.Tables = append(nsData.Tables, storage.TableChange{
-			Namespace: ch.Namespace,
-			Table:     ch.TableName,
-			DDL:       ch.Ddl,
-			Operation: op,
+			Namespace:    ch.Namespace,
+			Table:        ch.TableName,
+			DDL:          ch.Ddl,
+			Operation:    op,
+			IsUnsafe:     ch.IsUnsafe,
+			UnsafeReason: ch.UnsafeReason,
 		})
 	}
 
@@ -1614,6 +1627,18 @@ func materializedTableChangeOperation(ch *ternv1.TableChange) (string, error) {
 		return "", fmt.Errorf("classify DDL for table %q: %w", ch.TableName, err)
 	}
 	return op, nil
+}
+
+func rejectUnsafeDDLChangesWithoutOptIn(planIdentifier string, changes []storage.TableChange, applyOpts storage.ApplyOptions) error {
+	if applyOpts.AllowUnsafe {
+		return nil
+	}
+	for _, change := range changes {
+		if change.RequiresUnsafeOptIn() {
+			return fmt.Errorf("stored plan %s contains unsafe change for table %q: %s; retry with allow_unsafe=true", planIdentifier, change.Table, change.UnsafeOptInReason())
+		}
+	}
+	return nil
 }
 
 // existingIdempotentApply returns the apply previously created for
@@ -1771,6 +1796,12 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		AllowUnsafe:  allowUnsafe,
 		SkipRevert:   skipRevert,
 		Target:       plan.Target,
+	}
+	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, ddlChanges, applyOpts); err != nil {
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: err.Error(),
+		}, nil
 	}
 	optionsJSON := storage.MarshalApplyOptions(applyOpts)
 

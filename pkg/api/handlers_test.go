@@ -2432,6 +2432,102 @@ func TestExecuteApplyQueuesLocalApplyForOperator(t *testing.T) {
 	assert.Equal(t, state.Task.Pending, tasks.tasks[0].State)
 }
 
+func TestExecuteApplyRejectsUnsafeStoredPlanWithoutOptIn(t *testing.T) {
+	plan := executeApplyTestPlan()
+	plan.Namespaces["testdb"].Tables[0].IsUnsafe = true
+	plan.Namespaces["testdb"].Tables[0].UnsafeReason = "DROP COLUMN removes data"
+
+	applies := &capturingApplyStore{}
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+	}, testServerConfig(), map[string]tern.Client{
+		"default/staging": &mockTernClient{},
+	}, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-1",
+		Environment: "staging",
+	})
+
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Zero(t, applyID)
+	assert.Contains(t, err.Error(), "DROP COLUMN removes data")
+	assert.Nil(t, applies.apply)
+	assert.Empty(t, tasks.tasks)
+}
+
+func TestExecuteApplyRejectsStoredTableDropWithoutOptIn(t *testing.T) {
+	plan := executeApplyTestPlan()
+	plan.Namespaces["testdb"].Tables[0].Table = "users"
+	plan.Namespaces["testdb"].Tables[0].DDL = "DROP TABLE `users`"
+	plan.Namespaces["testdb"].Tables[0].Operation = "drop"
+
+	applies := &capturingApplyStore{}
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+	}, testServerConfig(), map[string]tern.Client{
+		"default/staging": &mockTernClient{},
+	}, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-1",
+		Environment: "staging",
+	})
+
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Zero(t, applyID)
+	assert.Contains(t, err.Error(), "DROP TABLE removes all data")
+	assert.Nil(t, applies.apply)
+	assert.Empty(t, tasks.tasks)
+}
+
+func TestExecuteApplyQueuesUnsafeStoredPlanWithOptIn(t *testing.T) {
+	plan := executeApplyTestPlan()
+	plan.Namespaces["testdb"].Tables[0].IsUnsafe = true
+	plan.Namespaces["testdb"].Tables[0].UnsafeReason = "DROP COLUMN removes data"
+
+	applies := &capturingApplyStore{}
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+	}, testServerConfig(), map[string]tern.Client{
+		"default/staging": &mockTernClient{},
+	}, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-1",
+		Environment: "staging",
+		Options:     map[string]string{"allow_unsafe": "true"},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(123), applyID)
+	require.NotNil(t, applies.apply)
+	require.Len(t, tasks.tasks, 1)
+	assert.True(t, applies.apply.GetOptions().AllowUnsafe)
+}
+
 func TestExecuteApplyDoesNotStorePartialQueueWhenTaskCreateFails(t *testing.T) {
 	plan := executeApplyTestPlan()
 	plan.Namespaces["testdb"].Tables = append(plan.Namespaces["testdb"].Tables, storage.TableChange{

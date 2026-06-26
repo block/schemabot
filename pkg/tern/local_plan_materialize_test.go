@@ -191,7 +191,7 @@ func TestPlanForApplyRequest_DuplicateCreateReloads(t *testing.T) {
 func TestNamespacesFromApplyRequest(t *testing.T) {
 	c := newPlanMaterializeClient(&fakePlanStore{})
 	changes := []*ternv1.TableChange{
-		{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "shop"},
+		{TableName: "users", Ddl: "ALTER TABLE `users` DROP COLUMN `legacy_id`", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "shop", IsUnsafe: true, UnsafeReason: "DROP COLUMN removes data"},
 		{TableName: "orders", Ddl: "CREATE TABLE `orders` (`id` bigint)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_CREATE, Namespace: ""},
 		{TableName: "VSchema: shop", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA, Namespace: "shop"},
 	}
@@ -209,6 +209,8 @@ func TestNamespacesFromApplyRequest(t *testing.T) {
 	require.Len(t, shop.Tables, 1, "vschema change must not become a table change")
 	assert.Equal(t, "users", shop.Tables[0].Table)
 	assert.Equal(t, "alter", shop.Tables[0].Operation)
+	assert.True(t, shop.Tables[0].IsUnsafe)
+	assert.Equal(t, "DROP COLUMN removes data", shop.Tables[0].UnsafeReason)
 	assert.Equal(t, `{"sharded":true}`, shop.Artifacts[vSchemaArtifactName])
 
 	fallback := got["testapp"]

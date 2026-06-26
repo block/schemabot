@@ -609,6 +609,23 @@ func TestLocalClient_Apply_RequiresEnvironmentField(t *testing.T) {
 	require.ErrorContains(t, err, "environment is required")
 }
 
+func TestRejectUnsafeDDLChangesWithoutOptIn(t *testing.T) {
+	changes := []storage.TableChange{{
+		Namespace:    "testdb",
+		Table:        "users",
+		DDL:          "ALTER TABLE `users` DROP COLUMN `legacy_id`",
+		Operation:    "alter",
+		IsUnsafe:     true,
+		UnsafeReason: "DROP COLUMN removes data",
+	}}
+
+	err := rejectUnsafeDDLChangesWithoutOptIn("plan-unsafe", changes, storage.ApplyOptions{})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "DROP COLUMN removes data")
+	assert.NoError(t, rejectUnsafeDDLChangesWithoutOptIn("plan-unsafe", changes, storage.ApplyOptions{AllowUnsafe: true}))
+}
+
 func TestLocalClient_ProgressRequiresApplyID(t *testing.T) {
 	client := &LocalClient{logger: slog.Default()}
 

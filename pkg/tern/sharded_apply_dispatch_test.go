@@ -91,15 +91,19 @@ func TestScopedDispatchDDLChangesFailsClosed(t *testing.T) {
 	})
 	t.Run("values are trimmed before storing", func(t *testing.T) {
 		got, err := scopedDispatchDDLChanges([]*ternv1.TableChange{{
-			Namespace:  "  ks  ",
-			TableName:  "  mutes  ",
-			Ddl:        "  ALTER TABLE `mutes` ADD INDEX (`x`)  ",
-			ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+			Namespace:    "  ks  ",
+			TableName:    "  mutes  ",
+			Ddl:          "  ALTER TABLE `mutes` ADD INDEX (`x`)  ",
+			ChangeType:   ternv1.ChangeType_CHANGE_TYPE_ALTER,
+			IsUnsafe:     true,
+			UnsafeReason: "DROP COLUMN removes data",
 		}})
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 		assert.Equal(t, "ks", got[0].Namespace)
 		assert.Equal(t, "mutes", got[0].Table)
 		assert.Equal(t, "ALTER TABLE `mutes` ADD INDEX (`x`)", got[0].DDL, "surrounding whitespace must not leak into operation keys/tasks")
+		assert.True(t, got[0].IsUnsafe)
+		assert.Equal(t, "DROP COLUMN removes data", got[0].UnsafeReason)
 	})
 }

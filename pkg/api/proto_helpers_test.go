@@ -65,6 +65,48 @@ func TestPlanResponseFromProto_ChangeType(t *testing.T) {
 	assert.Equal(t, "drop", tables[2].ChangeType, "DROP should be lowercase 'drop', not proto enum string")
 }
 
+func TestProtoChangesToNamespacesPreservesUnsafeMetadata(t *testing.T) {
+	namespaces, err := protoChangesToNamespaces([]*ternv1.SchemaChange{{
+		Namespace: "testapp",
+		TableChanges: []*ternv1.TableChange{{
+			TableName:    "users",
+			Ddl:          "ALTER TABLE `users` DROP COLUMN `legacy_id`",
+			ChangeType:   ternv1.ChangeType_CHANGE_TYPE_ALTER,
+			IsUnsafe:     true,
+			UnsafeReason: "DROP COLUMN removes data",
+		}},
+	}}, nil)
+	require.NoError(t, err)
+
+	require.Contains(t, namespaces, "testapp")
+	require.Len(t, namespaces["testapp"].Tables, 1)
+	change := namespaces["testapp"].Tables[0]
+	assert.True(t, change.IsUnsafe)
+	assert.Equal(t, "DROP COLUMN removes data", change.UnsafeReason)
+}
+
+func TestProtoShardPlansToStoragePreservesUnsafeMetadata(t *testing.T) {
+	shards, err := protoShardPlansToStorage([]*ternv1.ShardPlan{{
+		Namespace: "testapp",
+		Shard:     "-80",
+		Changes: []*ternv1.TableChange{{
+			Namespace:    "testapp",
+			TableName:    "users",
+			Ddl:          "DROP TABLE `users`",
+			ChangeType:   ternv1.ChangeType_CHANGE_TYPE_DROP,
+			IsUnsafe:     true,
+			UnsafeReason: "DROP TABLE removes all data",
+		}},
+	}})
+	require.NoError(t, err)
+
+	require.Len(t, shards, 1)
+	require.Len(t, shards[0].Changes, 1)
+	change := shards[0].Changes[0]
+	assert.True(t, change.IsUnsafe)
+	assert.Equal(t, "DROP TABLE removes all data", change.UnsafeReason)
+}
+
 // A null namespace value in the proto map (e.g. JSON `{"default": null}`)
 // converts to an empty namespace rather than dereferencing a nil pointer.
 func TestProtoToSchemaFiles_NilNamespaceValue(t *testing.T) {
