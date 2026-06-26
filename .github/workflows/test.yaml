@@ -279,7 +279,7 @@ jobs:
       matrix:
         include:
           - shard: ordered
-            run: TestGRPCMultiDeploy_(SchemaBot_Health|TernHealth_BothDeployments|Plan_FansOut|OrderedCutover|OrderedCutoverObservability)$$
+            run: TestGRPCMultiDeploy_(SchemaBot_Health|TernHealth_BothDeployments|Plan_FansOut|OrderedCutover|OrderedCutoverObservability|BarrierReleaseBounded)$$
           - shard: failure-policy
             run: TestGRPCMultiDeploy_(FailureHaltsRollout|OnFailureContinue)$$
     steps:
