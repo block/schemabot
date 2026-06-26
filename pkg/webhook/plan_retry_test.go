@@ -48,6 +48,32 @@ func (c *flakyPlanTernClient) calls() int {
 	return c.planCalls
 }
 
+type sequencePlanTernClient struct {
+	tern.Client
+	mu        sync.Mutex
+	planCalls int
+	errors    []error
+}
+
+func (c *sequencePlanTernClient) Plan(context.Context, *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.planCalls++
+	if c.planCalls <= len(c.errors) {
+		return nil, c.errors[c.planCalls-1]
+	}
+	return &ternv1.PlanResponse{PlanId: "plan-after-retry"}, nil
+}
+
+func (c *sequencePlanTernClient) IsRemote() bool   { return true }
+func (c *sequencePlanTernClient) Endpoint() string { return "remote:9090" }
+
+func (c *sequencePlanTernClient) calls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.planCalls
+}
+
 type planRetryStorage struct {
 	emptyStorage
 }
@@ -168,6 +194,24 @@ func TestExecutePlanNoRetryForNonTransientErrors(t *testing.T) {
 	assert.Nil(t, resp)
 	assert.Contains(t, err.Error(), "schema name is required")
 	assert.Equal(t, 1, client.calls(), "non-transient failures must not be retried")
+}
+
+// If a transient retry reaches a deterministic failure, retries stop and the
+// deterministic error is surfaced immediately instead of spending the remaining
+// retry budget.
+func TestExecutePlanTransientRetryStopsOnNonTransientError(t *testing.T) {
+	client := &sequencePlanTernClient{errors: []error{
+		grpcstatus.Error(grpccodes.Unavailable, "upstream connect error"),
+		grpcstatus.Error(grpccodes.InvalidArgument, "schema name is required"),
+	}}
+	h := newPlanRetryTestHandler(client, time.Millisecond)
+
+	resp, err := h.executePlanWithTransientRetry(t.Context(), planRetryTestRequest(), "octocat/hello-world", 1)
+
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Contains(t, err.Error(), "schema name is required")
+	assert.Equal(t, 2, client.calls(), "handler should stop when a retry reaches a deterministic failure")
 }
 
 // A cancelled webhook context aborts the retry wait immediately instead of

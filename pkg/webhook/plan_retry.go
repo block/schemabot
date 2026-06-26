@@ -63,6 +63,7 @@ func (h *Handler) executePlanWithTransientRetry(ctx context.Context, planReq api
 	}
 
 	delay := h.planRetryDelay()
+	firstErr := err
 	lastErr := err
 	for retryAttempt := 1; retryAttempt <= maxTransientPlanRetries; retryAttempt++ {
 		h.logger.Warn("plan failed with transient remote unavailability; retrying",
@@ -96,6 +97,7 @@ func (h *Handler) executePlanWithTransientRetry(ctx context.Context, planReq api
 			return planResp, nil
 		}
 		if !isTransientRemotePlanError(retryErr) {
+			metrics.RecordTransientPlanRetry(ctx, planReq.Database, planReq.Environment, "stopped_non_transient")
 			h.logger.Warn("plan retry reached non-transient failure; stopping retries",
 				"repo", repo,
 				"pr", pr,
@@ -115,6 +117,7 @@ func (h *Handler) executePlanWithTransientRetry(ctx context.Context, planReq api
 		"database", planReq.Database,
 		"environment", planReq.Environment,
 		"max_retries", maxTransientPlanRetries,
-		"error", lastErr)
-	return nil, lastErr
+		"first_error", firstErr,
+		"last_error", lastErr)
+	return nil, firstErr
 }
