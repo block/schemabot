@@ -115,7 +115,7 @@ func (h *Handler) handleCheckRun(w http.ResponseWriter, body []byte) {
 		"check_run_id", payload.CheckRun.ID,
 		"check_name", payload.CheckRun.Name)
 
-	message := h.runAutoPlanForPR(ctx, client, repo, pr, payload.CheckRun.HeadSHA, installationID, "check_run.rerequested", true)
+	message := h.runAutoPlanForPR(ctx, client, repo, pr, payload.CheckRun.HeadSHA, installationID, "check_run.rerequested", "check_run.rerequested", "")
 
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": message})
 }

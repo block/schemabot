@@ -101,8 +101,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 	}
 	defer cancel()
 
-	postPlanComment := h.shouldPostAutoPlanComment(ctx, client, payload.Action, repo, pr, payload.Before, headSHA)
-	message := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", postPlanComment)
+	message := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before)
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": message})
 }
 
@@ -142,7 +141,7 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 	return false
 }
 
-func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, postPlanComment bool) string {
+func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string) string {
 	// Discover all configs matching changed schema files in this PR
 	configs, err := client.FindAllConfigsForPR(ctx, repo, pr)
 	if err != nil {
@@ -184,6 +183,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		})
 		return "no schema files in PR"
 	}
+	postPlanComment := h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA)
 
 	// Launch auto-plan for each discovered config
 	for _, cfg := range configs {
