@@ -1747,7 +1747,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	)
 
 	// Local mode: check for active tasks with engine verification
-	if err := c.checkActiveTaskConflict(ctx, plan); err != nil {
+	if err := c.checkActiveTaskConflict(ctx, plan, dispatchShard); err != nil {
 		// A same-key request that committed while we were in the conflict check
 		// races as "already in progress". Re-resolve by idempotency key so the
 		// winning apply is returned instead of a spurious rejection.
