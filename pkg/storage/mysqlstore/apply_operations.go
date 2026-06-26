@@ -506,6 +506,48 @@ func (s *applyOperationStore) GetEngineResumeState(ctx context.Context, operatio
 // heartbeat staleness in applies.go.
 const applyOperationHeartbeatStaleness = "1 MINUTE"
 
+// releasedFailureExemptionSQL stops a terminal-failed earlier sibling from
+// blocking a later deployment's claim once the rollout policy says to keep
+// going: on_failure='continue', or on_failure='pause' after a release control
+// request latches the rollout open. A release latches while pending or
+// completed; a failed release does not (fail-closed), mirroring
+// storage.ApplyControlRequest.ReleasesPausedRollout. Only terminal `failed` is
+// exempted — in-flight or recoverable earlier siblings still block. The
+// fragment references the apply_operations and earlier aliases, so the copy
+// claim (FindNextApplyOperation) and the cutover claim
+// (FindNextApplyOperationCutover) embed it identically. Placeholders, in order:
+// earlier-failed state, continue, pause, release operation, pending, completed
+// (see releasedFailureExemptionArgs).
+const releasedFailureExemptionSQL = `NOT (
+	earlier.state = ?
+	AND (
+		apply_operations.on_failure = ?
+		OR (
+			apply_operations.on_failure = ?
+			AND EXISTS (
+				SELECT 1
+				FROM apply_control_requests AS release_req
+				WHERE release_req.apply_id = apply_operations.apply_id
+					AND release_req.operation = ?
+					AND release_req.status IN (?, ?)
+			)
+		)
+	)
+)`
+
+// releasedFailureExemptionArgs returns the positional arguments for
+// releasedFailureExemptionSQL, in placeholder order.
+func releasedFailureExemptionArgs() []any {
+	return []any{
+		state.ApplyOperation.Failed,
+		storage.OnFailureContinue,
+		storage.OnFailurePause,
+		storage.ControlOperationRelease,
+		storage.ControlRequestPending,
+		storage.ControlRequestCompleted,
+	}
+}
+
 // FindNextApplyOperation atomically claims the next apply_operations row that
 // needs attention and refreshes its heartbeat in the same transaction.
 //
@@ -544,11 +586,14 @@ const applyOperationHeartbeatStaleness = "1 MINUTE"
 // earlier sibling blocking every later sibling, so the rollout halts on the
 // first failure. "continue" treats a terminal `failed` earlier sibling as
 // settled so it no longer blocks: later deployments are still claimed and
-// attempted. Only terminal `failed` is exempted — pending, running,
-// failed_retryable, and stopped earlier siblings still block under both
+// attempted. "pause" holds the rollout like "halt" until an operator releases
+// it; once a release control request latches the apply open (pending or
+// completed), a terminal-failed earlier sibling stops blocking and the rollout
+// proceeds like "continue". Only terminal `failed` is exempted — pending,
+// running, failed_retryable, and stopped earlier siblings still block under all
 // policies (work is in-flight or recoverable). The policy governs only rollout
 // continuation; the apply's pass/fail verdict and the merge gate stay
-// fail-closed on any failed deployment.
+// fail-closed on any failed deployment. See releasedFailureExemptionSQL.
 //
 // A pending stop control request layers a hard halt on top: while a stop is
 // pending for the apply, no pending sibling is claimable for start, regardless
@@ -593,9 +638,9 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// the blocking EXISTS true and its copy starts immediately (concurrent copy).
 	// Under rolling — and any unrecognized value, which fails closed to the
 	// serial gate via NOT IN (barrier, parallel) — only a completed earlier
-	// sibling stops blocking. The trailing on_failure/Failed pair drives the
-	// exemption: when the policy is "continue", a terminal-failed earlier sibling
-	// no longer blocks later ones.
+	// sibling stops blocking. The trailing releasedFailureExemptionArgs drive the
+	// exemption: a terminal-failed earlier sibling no longer blocks later ones
+	// under "continue", or under "pause" once a release latches the rollout open.
 	queryArgs = append(queryArgs,
 		storage.CutoverPolicyBarrier,
 		state.ApplyOperation.WaitingForCutover,
@@ -605,9 +650,8 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		storage.CutoverPolicyBarrier,
 		storage.CutoverPolicyParallel,
 		state.ApplyOperation.Completed,
-		storage.OnFailureContinue,
-		state.ApplyOperation.Failed,
 	)
+	queryArgs = append(queryArgs, releasedFailureExemptionArgs()...)
 	queryArgs = append(queryArgs,
 		storage.ApplyOperationKindGroupFinalizer,
 		storage.ApplyOperationKindWork,
@@ -717,7 +761,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 										AND earlier.state <> ?
 									)
 								)
-								AND NOT (apply_operations.on_failure = ? AND earlier.state = ?)
+								AND `+releasedFailureExemptionSQL+`
 						)
 					)
 					OR (
@@ -1036,15 +1080,16 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	queryArgs := []any{storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel}
 	// Start-a-parked-cutover gate (see SQL below). A waiting_for_cutover row is
 	// claimable only when no earlier deployment_order sibling is still
-	// non-completed; the on_failure/Failed pair is the "continue" exemption (a
-	// terminal-failed earlier sibling no longer blocks later cutovers), and the
-	// pending-stop NOT EXISTS makes `stop` halt remaining cutovers even under
-	// "continue".
+	// non-completed; releasedFailureExemptionArgs exempt a terminal-failed earlier
+	// sibling so it no longer blocks later cutovers under "continue", or under
+	// "pause" once a release latches the rollout open; and the pending-stop NOT
+	// EXISTS makes `stop` halt remaining cutovers even under those exemptions.
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.WaitingForCutover,
 		state.ApplyOperation.Completed,
-		storage.OnFailureContinue,
-		state.ApplyOperation.Failed,
+	)
+	queryArgs = append(queryArgs, releasedFailureExemptionArgs()...)
+	queryArgs = append(queryArgs,
 		storage.ControlOperationStop, storage.ControlRequestPending,
 	)
 	// Recovery clause: a row already mid-cutover whose heartbeat has gone stale is
@@ -1080,7 +1125,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 					WHERE earlier.apply_id = apply_operations.apply_id
 						AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
 						AND earlier.state <> ?
-						AND NOT (apply_operations.on_failure = ? AND earlier.state = ?)
+						AND `+releasedFailureExemptionSQL+`
 				)
 				AND NOT EXISTS (
 					SELECT 1

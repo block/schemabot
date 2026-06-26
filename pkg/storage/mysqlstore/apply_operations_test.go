@@ -2236,11 +2236,12 @@ func TestApplyOperationStore_FindNextApplyOperation_OnFailureContinueStillBlocks
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_UnrecognizedOnFailureBlocksFailedSibling
-// pins the fail-closed property of the claim predicate: only the exact value
-// "continue" exempts a terminal-failed earlier sibling. Any other stored value
-// — here "pause", which config validation rejects today but a future change or
-// a hand-written row could let reach storage — must keep the failed sibling
-// blocking so the rollout never races ahead on an unrecognized policy.
+// pins the fail-closed property of the claim predicate: only the recognized
+// continuation policies ("continue", or "pause" once released) exempt a
+// terminal-failed earlier sibling. Any other stored value — an unknown policy a
+// future change or a hand-written row could let reach storage — must keep the
+// failed sibling blocking so the rollout never races ahead on a policy the gate
+// does not understand.
 func TestApplyOperationStore_FindNextApplyOperation_UnrecognizedOnFailureBlocksFailedSibling(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -2249,15 +2250,17 @@ func TestApplyOperationStore_FindNextApplyOperation_UnrecognizedOnFailureBlocksF
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_op_unrecognized", 1)
 
+	const unknownPolicy = "escalate"
+
 	// region-a failed; region-b is pending behind it. The failed row carries an
-	// unrecognized on_failure value, so the exemption (which keys on exact
-	// "continue") does not apply and the failed sibling keeps blocking.
+	// unrecognized on_failure value, so neither exemption applies and the failed
+	// sibling keeps blocking.
 	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed, OnFailure: storage.OnFailurePause,
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed, OnFailure: unknownPolicy,
 	})
 	require.NoError(t, err)
 	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-b", OnFailure: storage.OnFailurePause,
+		ApplyID: apply.ID, Deployment: "region-b", OnFailure: unknownPolicy,
 	})
 	require.NoError(t, err)
 
@@ -2265,7 +2268,7 @@ func TestApplyOperationStore_FindNextApplyOperation_UnrecognizedOnFailureBlocksF
 	// known enum on the way into storage.
 	failedRow, err := store.ApplyOperations().Get(ctx, failedID)
 	require.NoError(t, err)
-	assert.Equal(t, storage.OnFailurePause, failedRow.OnFailure, "an unrecognized on_failure value is stored as-is")
+	assert.Equal(t, unknownPolicy, failedRow.OnFailure, "an unrecognized on_failure value is stored as-is")
 
 	// Backdate the failed row so staleness can't be the reason it's skipped —
 	// the only thing holding the rollout is the earlier failed sibling.
@@ -2277,6 +2280,180 @@ func TestApplyOperationStore_FindNextApplyOperation_UnrecognizedOnFailureBlocksF
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	assert.Nil(t, claimed, "an unrecognized on_failure value must fail closed and keep the failed sibling blocking")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_OnFailurePauseBlocksUntilReleased
+// verifies that on_failure "pause" holds the rollout like "halt" until a human
+// releases it: a terminal-failed earlier sibling keeps later deployments
+// blocked while no release control request exists for the apply.
+func TestApplyOperationStore_FindNextApplyOperation_OnFailurePauseBlocksUntilReleased(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_pause_blocks", 1)
+
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed, OnFailure: storage.OnFailurePause,
+	})
+	require.NoError(t, err)
+	for _, deployment := range []string{"region-b", "region-c"} {
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: deployment, OnFailure: storage.OnFailurePause,
+		})
+		require.NoError(t, err)
+	}
+
+	// Backdate the failed row so staleness can't be the reason it's skipped —
+	// the only thing holding the rollout is the unreleased pause.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failedID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "on_failure pause must keep later siblings blocked until released")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_OnFailurePauseClaimsPastFailedSiblingAfterRelease
+// verifies the released-failure exemption: once a release control request
+// latches a paused apply open, a terminal-failed earlier sibling stops blocking
+// and the rollout proceeds to the next ordered deployment, exactly like
+// "continue".
+func TestApplyOperationStore_FindNextApplyOperation_OnFailurePauseClaimsPastFailedSiblingAfterRelease(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_pause_release", 1)
+
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed, OnFailure: storage.OnFailurePause,
+	})
+	require.NoError(t, err)
+	for _, deployment := range []string{"region-b", "region-c"} {
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: deployment, OnFailure: storage.OnFailurePause,
+		})
+		require.NoError(t, err)
+	}
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failedID)
+	require.NoError(t, err)
+
+	// Without a release the rollout is held.
+	held, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.Nil(t, held, "the paused rollout must be held before a release exists")
+
+	// A pending release latches the apply open.
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationRelease,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a released pause must let the rollout proceed past a failed sibling")
+	assert.Equal(t, "region-b", claimed.Deployment, "the next ordered deployment after the failed one is claimed")
+
+	stored, err := store.ApplyOperations().Get(ctx, claimed.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.ApplyOperation.Running, stored.State, "the claimed pending row is transitioned to running")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_OnFailurePauseFailedReleaseStaysBlocked
+// verifies the latch is fail-closed: a release control request that itself
+// failed does not exempt the failed sibling, so the rollout stays paused until
+// a release actually succeeds.
+func TestApplyOperationStore_FindNextApplyOperation_OnFailurePauseFailedReleaseStaysBlocked(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_pause_failed_release", 1)
+
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed, OnFailure: storage.OnFailurePause,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", OnFailure: storage.OnFailurePause,
+	})
+	require.NoError(t, err)
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failedID)
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationRelease,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ControlRequests().FailPending(ctx, apply.ID, storage.ControlOperationRelease, "remote release failed"))
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a failed release must not latch the rollout open")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_OnFailurePauseReleaseStillBlockedByStop
+// verifies that `stop` dominates `release`: even after a paused apply is
+// released, a pending stop control request keeps the next pending sibling from
+// being claimed, so an operator can abort a rollout they just released.
+func TestApplyOperationStore_FindNextApplyOperation_OnFailurePauseReleaseStillBlockedByStop(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_pause_release_stop", 1)
+
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed, OnFailure: storage.OnFailurePause,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", OnFailure: storage.OnFailurePause,
+	})
+	require.NoError(t, err)
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failedID)
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationRelease,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a pending stop must dominate a release and keep the pending sibling blocked")
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_BarrierClaimsPastSiblingAtCutoverBarrier
@@ -2878,6 +3055,93 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_OnFailureContinueClai
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "on_failure continue must let the cutover proceed past a failed sibling")
 	assert.Equal(t, "region-b", claimed.Deployment)
+
+	persisted, err := store.ApplyOperations().Get(ctx, claimed.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.ApplyOperation.CuttingOver, persisted.State, "the claimed parked row is transitioned to cutting_over")
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_OnFailurePauseBlocksUntilReleased
+// verifies the cutover gate mirrors the copy gate under "pause": a
+// terminal-failed earlier sibling keeps a later parked cutover blocked while no
+// release control request exists for the apply.
+func TestApplyOperationStore_FindNextApplyOperationCutover_OnFailurePauseBlocksUntilReleased(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_pause_blocks", 1)
+
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+		State: state.ApplyOperation.Failed, OnFailure: storage.OnFailurePause,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b",
+		State: state.ApplyOperation.WaitingForCutover, OnFailure: storage.OnFailurePause,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failedID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "on_failure pause must keep a later cutover blocked until released")
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_OnFailurePauseClaimsPastFailedSiblingAfterRelease
+// verifies the released-failure exemption applies to the cutover gate too: once
+// a release control request (here already completed) latches the paused apply
+// open, the failed earlier sibling stops blocking and the parked cutover is
+// claimed.
+func TestApplyOperationStore_FindNextApplyOperationCutover_OnFailurePauseClaimsPastFailedSiblingAfterRelease(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_pause_release", 1)
+
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+		State: state.ApplyOperation.Failed, OnFailure: storage.OnFailurePause,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+	parkedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b",
+		State: state.ApplyOperation.WaitingForCutover, OnFailure: storage.OnFailurePause,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failedID)
+	require.NoError(t, err)
+
+	// A completed release latches the apply open just as a pending one does.
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationRelease,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ControlRequests().CompletePending(ctx, apply.ID, storage.ControlOperationRelease))
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a released pause must let the cutover proceed past a failed sibling")
+	assert.Equal(t, "region-b", claimed.Deployment)
+	assert.Equal(t, parkedID, claimed.ID)
 
 	persisted, err := store.ApplyOperations().Get(ctx, claimed.ID)
 	require.NoError(t, err)
