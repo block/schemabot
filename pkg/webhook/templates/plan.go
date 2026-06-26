@@ -494,10 +494,14 @@ type MultiEnvPlanCommentData struct {
 // RenderMultiEnvPlanComment renders a combined plan comment showing all environments.
 // If all environments have identical plans, deduplicates into a single section.
 func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
+	if plan, ok := singleEnvironmentPlan(data); ok {
+		return RenderPlanComment(plan)
+	}
+
 	var sb strings.Builder
 
 	// Header
-	sb.WriteString("## Schema Change Plan\n\n")
+	writeEnvironmentTitle(&sb, "Schema Change Plan", singleEnvironmentTitleEnvironment(data.Environments))
 
 	writePlanMetadata(&sb, PlanCommentData{Database: data.Database, SchemaName: data.SchemaName, DatabaseType: data.DatabaseType, IsMySQL: data.IsMySQL})
 	writePlanAttribution(&sb, PlanCommentData{
@@ -553,6 +557,50 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	writeMultiEnvFooter(&sb, data)
 
 	return sb.String()
+}
+
+func singleEnvironmentPlan(data MultiEnvPlanCommentData) (PlanCommentData, bool) {
+	if len(data.Environments) != 1 || len(data.Errors) > 0 {
+		return PlanCommentData{}, false
+	}
+	environment := data.Environments[0]
+	plan, ok := data.Plans[environment]
+	if !ok || plan == nil {
+		return PlanCommentData{}, false
+	}
+	merged := *plan
+	if merged.Database == "" {
+		merged.Database = data.Database
+	}
+	if merged.SchemaName == "" {
+		merged.SchemaName = data.SchemaName
+	}
+	if merged.Environment == "" {
+		merged.Environment = environment
+	}
+	if merged.HeadSHA == "" {
+		merged.HeadSHA = data.HeadSHA
+	}
+	if merged.Repository == "" {
+		merged.Repository = data.Repository
+	}
+	if merged.DatabaseType == "" {
+		merged.DatabaseType = data.DatabaseType
+	}
+	if !merged.IsMySQL {
+		merged.IsMySQL = data.IsMySQL
+	}
+	if merged.RequestedBy == "" {
+		merged.RequestedBy = data.RequestedBy
+	}
+	return merged, true
+}
+
+func singleEnvironmentTitleEnvironment(environments []string) string {
+	if len(environments) != 1 {
+		return ""
+	}
+	return environments[0]
 }
 
 func schemaChangePlanDatabaseTypeLabel(databaseType string, isMySQL bool) string {

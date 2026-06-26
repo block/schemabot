@@ -1012,7 +1012,8 @@ func TestE2EAutoPlan(t *testing.T) {
 	// Auto-plan runs in a background goroutine — wait for the plan comment
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Schema Change Plan")
+		firstLine, _, _ := strings.Cut(body, "\n")
+		assert.Equal(t, "## Schema Change Plan — Staging", firstLine)
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
 	case <-time.After(30 * time.Second):

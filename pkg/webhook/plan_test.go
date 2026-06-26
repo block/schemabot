@@ -287,6 +287,34 @@ func TestRenderPlanComment_EnvironmentScopedTitle(t *testing.T) {
 		assert.Equal(t, "## Schema Change Plan", firstLine)
 		assert.Contains(t, rendered, "**Type**: `MySQL`")
 	})
+
+	t.Run("single environment multi-env plan title includes environment", func(t *testing.T) {
+		data := templates.MultiEnvPlanCommentData{
+			Database:     "testdb",
+			IsMySQL:      true,
+			Environments: []string{"staging"},
+			Plans: map[string]*templates.PlanCommentData{
+				"staging": {
+					Database:    "testdb",
+					Environment: "staging",
+					IsMySQL:     true,
+					Changes: []templates.KeyspaceChangeData{{
+						Keyspace:   "testdb",
+						Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
+					}},
+				},
+			},
+			Errors: map[string]string{},
+		}
+
+		rendered := templates.RenderMultiEnvPlanComment(data)
+		firstLine, _, _ := strings.Cut(rendered, "\n")
+
+		assert.Equal(t, "## Schema Change Plan — Staging", firstLine)
+		assert.Contains(t, rendered, "**Type**: `MySQL`")
+		assert.NotContains(t, rendered, "### Staging")
+		assert.Contains(t, rendered, "schemabot apply -e staging")
+	})
 }
 
 func TestRenderPlanComment_NoUnsafe_NoWarning(t *testing.T) {
@@ -405,7 +433,9 @@ func TestRenderMultiEnvPlanComment_ShowsPRHeadSHA(t *testing.T) {
 	}
 
 	rendered := templates.RenderMultiEnvPlanComment(data)
+	firstLine, _, _ := strings.Cut(rendered, "\n")
 
+	assert.Equal(t, "## Schema Change Plan — Staging", firstLine)
 	assert.Contains(t, rendered, "planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890)")
 	assert.NotContains(t, rendered, "**PR head SHA**")
 }
@@ -420,8 +450,10 @@ func TestRenderMultiEnvPlanComment_StrataHeaderWithErrors(t *testing.T) {
 	}
 
 	rendered := templates.RenderMultiEnvPlanComment(data)
+	firstLine, _, _ := strings.Cut(rendered, "\n")
 
-	assert.Contains(t, rendered, "## Schema Change Plan")
+	assert.Equal(t, "## Schema Change Plan — Staging", firstLine)
+	assert.Contains(t, rendered, "**Type**: `Strata`")
 }
 
 func TestUserFacingErrorExplainsNoHealthyUpstream(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -525,12 +526,39 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 		return failClosed()
 	}
 
+	// Load the release latch only when some operation uses on_failure=pause: it
+	// is the only policy whose projection depends on whether an operator has
+	// released the rollout, so an apply without a pause operation never pays the
+	// read or fails closed on an unrelated latch read error. A released pause
+	// behaves like continue; a failed release does not latch (fail-closed), per
+	// ApplyControlRequest.ReleasesPausedRollout.
+	released := false
+	if slices.ContainsFunc(ops, func(op *storage.ApplyOperation) bool { return op.OnFailure == storage.OnFailurePause }) {
+		if requests := c.storage.ControlRequests(); requests != nil {
+			releaseReq, err := requests.GetByOperation(ctx, apply.ID, storage.ControlOperationRelease)
+			if err != nil {
+				c.logger.Warn("cannot determine aggregate apply state: failed to load release latch",
+					"apply_id", apply.ApplyIdentifier, "apply_operation_id", operationID, "error", err)
+				return failClosed()
+			}
+			released = releaseReq.ReleasesPausedRollout()
+		} else {
+			// No control-request store: a release latch cannot exist, so an
+			// unreleased pause stays held (fail-closed).
+			c.logger.Debug("deriving apply state from tasks: control request store is not configured; treating rollout as unreleased",
+				"apply_id", apply.ApplyIdentifier)
+		}
+	}
+
 	children := make([]state.RolloutChild, len(ops))
 	foundCurrent := false
 	for i, op := range ops {
+		isContinue := op.OnFailure == storage.OnFailureContinue
+		isPause := op.OnFailure == storage.OnFailurePause
 		child := state.RolloutChild{
 			State:             op.State,
-			ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
+			ContinueOnFailure: isContinue || (isPause && released),
+			PauseOnFailure:    isPause && !released,
 		}
 		if op.ID == operationID {
 			child.State = currentOpState

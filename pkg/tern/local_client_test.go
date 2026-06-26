@@ -509,6 +509,17 @@ func TestApplyCancelHandleDoesNotCancelNewerOwner(t *testing.T) {
 	assert.Nil(t, client.currentApplyCancel().cancel)
 }
 
+// errControlRequestStore fails GetByOperation so the projection's release-latch
+// read can be driven into its fail-closed path.
+type errControlRequestStore struct {
+	storage.ControlRequestStore
+	err error
+}
+
+func (s *errControlRequestStore) GetByOperation(context.Context, int64, storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	return nil, s.err
+}
+
 type testControlRequestStore struct {
 	storage.ControlRequestStore
 	requests []*storage.ApplyControlRequest
@@ -1942,6 +1953,105 @@ func TestDeriveAggregateApplyState(t *testing.T) {
 		got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
 		assert.True(t, ok, "current op row present, projection must be determined")
 		assert.Equal(t, state.Apply.RunningDegraded, got, "continue policy must hold the apply degraded until the pending sibling settles")
+	})
+
+	// Under on_failure "pause" a terminally failed deployment holds the apply
+	// paused for a human while a sibling is still pending. An operator release
+	// latches the rollout open so the same failure projects running_degraded like
+	// continue; a failed release does not latch and the rollout stays paused.
+	pauseCases := []struct {
+		name      string
+		release   *storage.ApplyControlRequest
+		wantState string
+	}{
+		{
+			name:      "unreleased pause holds the apply paused",
+			release:   nil,
+			wantState: state.Apply.Paused,
+		},
+		{
+			name:      "released pause holds the apply degraded like continue",
+			release:   &storage.ApplyControlRequest{ApplyID: 7, Operation: storage.ControlOperationRelease, Status: storage.ControlRequestCompleted},
+			wantState: state.Apply.RunningDegraded,
+		},
+		{
+			name:      "failed release does not latch and stays paused",
+			release:   &storage.ApplyControlRequest{ApplyID: 7, Operation: storage.ControlOperationRelease, Status: storage.ControlRequestFailed},
+			wantState: state.Apply.Paused,
+		},
+	}
+	for _, tc := range pauseCases {
+		t.Run("pause policy ("+tc.name+")", func(t *testing.T) {
+			control := &testControlRequestStore{}
+			if tc.release != nil {
+				control.requests = []*storage.ApplyControlRequest{tc.release}
+			}
+			tasks := []*storage.Task{taskWith(state.Task.Failed)}
+			client := &LocalClient{
+				storage: &exactProgressStorage{
+					controlRequests: control,
+					applyOperations: &listApplyOperationStore{
+						ops: []*storage.ApplyOperation{
+							{ID: currentOpID, State: state.ApplyOperation.Failed, OnFailure: storage.OnFailurePause},
+							{ID: 2, State: state.ApplyOperation.Pending, OnFailure: storage.OnFailurePause},
+						},
+					},
+				},
+				logger: slog.Default(),
+			}
+			apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-pause"}
+
+			got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+			assert.True(t, ok, "current op row present, projection must be determined")
+			assert.Equal(t, tc.wantState, got)
+		})
+	}
+
+	// A read failure on the release latch leaves the rollout's release state
+	// unknown, so the projection fails closed (ok=false) and the caller keeps the
+	// stored apply state rather than risk treating an unreleased pause as open.
+	t.Run("pause policy (release latch read failure fails closed)", func(t *testing.T) {
+		tasks := []*storage.Task{taskWith(state.Task.Failed)}
+		client := &LocalClient{
+			storage: &exactProgressStorage{
+				controlRequests: &errControlRequestStore{err: assert.AnError},
+				applyOperations: &listApplyOperationStore{
+					ops: []*storage.ApplyOperation{
+						{ID: currentOpID, State: state.ApplyOperation.Failed, OnFailure: storage.OnFailurePause},
+						{ID: 2, State: state.ApplyOperation.Pending, OnFailure: storage.OnFailurePause},
+					},
+				},
+			},
+			logger: slog.Default(),
+		}
+		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-pause-readfail"}
+
+		_, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+		assert.False(t, ok, "an unreadable release latch must not terminalize or release the rollout")
+	})
+
+	// A rollout with no pause operation never reads the release latch: an
+	// unrelated latch read error must not fail the projection closed, since a
+	// continue/halt rollout cannot depend on a release.
+	t.Run("no pause operation does not read the release latch", func(t *testing.T) {
+		tasks := []*storage.Task{taskWith(state.Task.Failed)}
+		client := &LocalClient{
+			storage: &exactProgressStorage{
+				controlRequests: &errControlRequestStore{err: assert.AnError},
+				applyOperations: &listApplyOperationStore{
+					ops: []*storage.ApplyOperation{
+						{ID: currentOpID, State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureContinue},
+						{ID: 2, State: state.ApplyOperation.Pending, OnFailure: storage.OnFailureContinue},
+					},
+				},
+			},
+			logger: slog.Default(),
+		}
+		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-continue-noread"}
+
+		got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+		assert.True(t, ok, "a non-pause rollout must not fail closed on a latch read it never makes")
+		assert.Equal(t, state.Apply.RunningDegraded, got, "continue holds the apply degraded past the failed sibling")
 	})
 
 	// Default policy (on_failure unset) fails closed: a terminally failed

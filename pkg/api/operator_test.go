@@ -289,6 +289,114 @@ func TestUpdateApplyStateFromOperations_ContinuePolicy(t *testing.T) {
 	}
 }
 
+// releaseLatchControlStore returns a fixed release latch from GetByOperation so
+// the operator's apply-state writer can be driven with or without a release. It
+// records the queried applyID so a test can assert the latch is read for the
+// apply being projected, not some other apply.
+type releaseLatchControlStore struct {
+	storage.ControlRequestStore
+	release        *storage.ApplyControlRequest
+	queriedApply   int64
+	queriedRelease bool
+}
+
+func (s *releaseLatchControlStore) GetByOperation(_ context.Context, applyID int64, op storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	if op == storage.ControlOperationRelease {
+		s.queriedApply = applyID
+		s.queriedRelease = true
+		return s.release, nil
+	}
+	return nil, nil
+}
+
+// TestUpdateApplyStateFromOperations_PausePolicy verifies the operator projects
+// the release latch over an on_failure "pause" rollout: an unreleased pause
+// holds the apply paused while a later sibling is still pending, and an operator
+// release latches the rollout open so the same failure projects running_degraded
+// like continue.
+func TestUpdateApplyStateFromOperations_PausePolicy(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, State: state.ApplyOperation.Failed, OnFailure: storage.OnFailurePause},
+		{ID: 2, State: state.ApplyOperation.Pending, OnFailure: storage.OnFailurePause},
+	}
+	cases := []struct {
+		name      string
+		release   *storage.ApplyControlRequest
+		wantState string
+	}{
+		{
+			name:      "unreleased pause holds the apply paused",
+			release:   nil,
+			wantState: state.Apply.Paused,
+		},
+		{
+			name:      "released pause projects running_degraded like continue",
+			release:   &storage.ApplyControlRequest{Operation: storage.ControlOperationRelease, Status: storage.ControlRequestCompleted},
+			wantState: state.Apply.RunningDegraded,
+		},
+		{
+			name:      "failed release does not latch and stays paused",
+			release:   &storage.ApplyControlRequest{Operation: storage.ControlOperationRelease, Status: storage.ControlRequestFailed},
+			wantState: state.Apply.Paused,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			applyStore := &recordingApplyStore{swapped: true}
+			control := &releaseLatchControlStore{release: tc.release}
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorageWithControlAndOps{
+				applies:  applyStore,
+				applyOps: &listingApplyOperationStore{ops: ops},
+				control:  control,
+			}, testServerConfig(), nil, logger)
+
+			apply := &storage.Apply{
+				ID:              3,
+				ApplyIdentifier: "apply-pause",
+				State:           state.Apply.Pending,
+				Environment:     "staging",
+			}
+
+			_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+			require.NoError(t, err)
+			require.NotNil(t, applyStore.updated)
+			assert.Equal(t, tc.wantState, applyStore.updated.State)
+			require.True(t, control.queriedRelease, "a pause rollout must read the release latch")
+			assert.Equal(t, apply.ID, control.queriedApply, "the release latch must be read for the apply being projected")
+		})
+	}
+}
+
+// TestUpdateApplyStateFromOperations_NoPauseSkipsReleaseLatch verifies the
+// operator does not read the release latch when no operation uses on_failure
+// pause: a non-pause rollout's projection cannot depend on a release, so it pays
+// neither the read nor its failure mode.
+func TestUpdateApplyStateFromOperations_NoPauseSkipsReleaseLatch(t *testing.T) {
+	applyStore := &recordingApplyStore{swapped: true}
+	control := &releaseLatchControlStore{}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithControlAndOps{
+		applies: applyStore,
+		applyOps: &listingApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureContinue},
+			{ID: 2, State: state.ApplyOperation.Pending, OnFailure: storage.OnFailureContinue},
+		}},
+		control: control,
+	}, testServerConfig(), nil, logger)
+
+	apply := &storage.Apply{
+		ID:              3,
+		ApplyIdentifier: "apply-continue",
+		State:           state.Apply.Pending,
+		Environment:     "staging",
+	}
+
+	_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+	require.NoError(t, err)
+	assert.False(t, control.queriedRelease, "a rollout with no pause operation must not read the release latch")
+}
+
 func TestUpdateApplyStateFromOperations_FinalizerPendingIsNonTerminal(t *testing.T) {
 	applyStore := &recordingApplyStore{swapped: true}
 	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: []*storage.ApplyOperation{
