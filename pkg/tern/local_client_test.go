@@ -2030,6 +2030,30 @@ func TestDeriveAggregateApplyState(t *testing.T) {
 		assert.False(t, ok, "an unreadable release latch must not terminalize or release the rollout")
 	})
 
+	// A rollout with no pause operation never reads the release latch: an
+	// unrelated latch read error must not fail the projection closed, since a
+	// continue/halt rollout cannot depend on a release.
+	t.Run("no pause operation does not read the release latch", func(t *testing.T) {
+		tasks := []*storage.Task{taskWith(state.Task.Failed)}
+		client := &LocalClient{
+			storage: &exactProgressStorage{
+				controlRequests: &errControlRequestStore{err: assert.AnError},
+				applyOperations: &listApplyOperationStore{
+					ops: []*storage.ApplyOperation{
+						{ID: currentOpID, State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureContinue},
+						{ID: 2, State: state.ApplyOperation.Pending, OnFailure: storage.OnFailureContinue},
+					},
+				},
+			},
+			logger: slog.Default(),
+		}
+		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-continue-noread"}
+
+		got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+		assert.True(t, ok, "a non-pause rollout must not fail closed on a latch read it never makes")
+		assert.Equal(t, state.Apply.RunningDegraded, got, "continue holds the apply degraded past the failed sibling")
+	})
+
 	// Default policy (on_failure unset) fails closed: a terminally failed
 	// deployment terminalizes the apply even with a pending sibling.
 	t.Run("default policy terminalizes the apply on a failed deployment", func(t *testing.T) {
