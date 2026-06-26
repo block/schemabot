@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"errors"
 	"log/slog"
 	"testing"
 
@@ -92,6 +93,43 @@ func TestConflictCheckPreservesRetryableTask(t *testing.T) {
 	require.Error(t, err, "a new apply must be refused while a retryable task holds the database")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.FailedRetryable, retryable.State)
+}
+
+// When the engine's Progress call errors it returns a nil result. The conflict
+// check must treat the task as unresolved (and keep it blocking) without
+// dereferencing that nil result — an earlier version logged result.State before
+// the error check and panicked, crashing the Apply RPC whenever Progress failed
+// (e.g. a DB connection torn down during shutdown).
+func TestConflictCheckHandlesProgressError(t *testing.T) {
+	running := &storage.Task{
+		ID:             5,
+		TaskIdentifier: "task-running",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "events",
+		State:          state.Task.Running,
+	}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			tasks: &exactProgressTaskStore{tasks: []*storage.Task{running}},
+			logs:  &mockApplyLogStore{},
+		},
+		spiritEngine: &fakeControlEngine{
+			progressErr: errors.New("engine unreachable"),
+		},
+		logger: slog.Default(),
+	}
+
+	require.NotPanics(t, func() {
+		resolved := client.tryResolveStaleTask(t.Context(), running, "testdb")
+		assert.False(t, resolved, "task must not be resolved when the engine progress call errors")
+	})
+	assert.Equal(t, state.Task.Running, running.State, "task state must be left untouched on progress error")
+	assert.Nil(t, running.CompletedAt)
 }
 
 // A running task whose engine has gone silent (e.g. the server crashed mid-apply)
