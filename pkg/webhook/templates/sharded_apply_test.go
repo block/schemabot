@@ -99,6 +99,26 @@ func TestRenderShardedApplyComment_DivergentGroupsByVariant(t *testing.T) {
 	assert.Equal(t, 2, strings.Count(out, "```sql"), "one DDL block per group")
 }
 
+// A change whose DDL never reached the comment (incomplete change data) renders
+// a "DDL unavailable" note instead of an empty ```sql box that reads as a no-op.
+func TestRenderShardedApplyComment_EmptyDDLRendersUnavailable(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
+		Shards: []ShardStatus{
+			{Shard: "-40", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
+			{Shard: "80-", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
+		},
+		Cells: []ShardCell{
+			{Shard: "-40", Table: "mutes", DDL: "   "}, // whitespace-only DDL is treated as missing
+			{Shard: "80-", Table: "mutes", DDL: ""},
+		},
+	})
+
+	assert.Contains(t, out, "`mutes` — _DDL unavailable_", "the missing DDL is called out")
+	assert.Equal(t, 0, strings.Count(out, "```sql"), "no blank SQL box for the missing DDL")
+}
+
 // A single-shard divergent group degrades cleanly: one group, no spurious
 // grouping header for a uniform apply (covered above) — here every shard shares
 // the same multi-table change set, so it is still one group.
