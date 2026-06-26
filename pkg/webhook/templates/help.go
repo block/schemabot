@@ -6,8 +6,8 @@ func commandReference() string {
 	return `| Command | Description |
 |---------|-------------|
 | ` + "`schemabot plan [-e <env>]`" + ` | Preview schema changes |
-| ` + "`schemabot apply -e <env>`" + ` | Plan, lock, and confirm deployment |
-| ` + "`schemabot apply-confirm -e <env>`" + ` | Execute a locked plan |
+| ` + "`schemabot apply -e <env>`" + ` | Plan, lock, and apply after safety rechecks |
+| ` + "`schemabot apply-confirm -e <env>`" + ` | Confirm a downgraded locked plan |
 | ` + "`schemabot unlock`" + ` | Release lock and discard plan |
 | ` + "`schemabot stop <apply-id> -e <env>`" + ` | Stop an in-progress deployment |
 | ` + "`schemabot start <apply-id> -e <env>`" + ` | Resume a stopped deployment |
@@ -17,7 +17,7 @@ func commandReference() string {
 
 **Options**: ` + "`-e <env>`" + ` environment, ` + "`-d <db>`" + ` database, ` + "`-t, --tenant <name>`" + ` deployment routing, ` + "`--defer-cutover`" + `, ` + "`--allow-unsafe`" + `, ` + "`--skip-revert`" + ` (Vitess)
 
-**Quick start**: ` + "`plan`" + ` → ` + "`apply`" + ` → ` + "`apply-confirm`" + `
+**Quick start**: ` + "`plan`" + ` → ` + "`apply`" + `
 `
 }
 

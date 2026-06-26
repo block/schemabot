@@ -60,9 +60,8 @@ type PlanCommentData struct {
 	LockOwner    string
 	LockAcquired string // formatted timestamp
 
-	// Auto-confirm state
-	AutoConfirm                bool   // -y flag was used, will auto-execute
-	AutoConfirmDowngradeReason string // Non-empty: -y was downgraded to manual, this is the reason
+	// Automatic apply state
+	AutoConfirmDowngradeReason string // Non-empty when automatic apply downgraded to manual confirmation
 
 	RecoveredApplyOwnedCheckState bool
 }
@@ -161,23 +160,17 @@ func RenderPlanComment(data PlanCommentData) string {
 			applyConfirmCmd += " --skip-revert"
 		}
 
-		switch {
-		case data.AutoConfirmDowngradeReason != "":
-			// -y was downgraded to manual confirmation — show unlock since user needs to act
-			fmt.Fprintf(&sb, "⚠️ **Auto-confirm skipped**: %s\n\n", data.AutoConfirmDowngradeReason)
+		if data.AutoConfirmDowngradeReason != "" {
+			// Automatic apply was downgraded to manual confirmation — show unlock since user needs to act
+			fmt.Fprintf(&sb, "⚠️ **Automatic apply paused**: %s\n\n", data.AutoConfirmDowngradeReason)
 			sb.WriteString("Review the plan above, then confirm manually:\n")
 			fmt.Fprintf(&sb, "```\n%s\n```\n", applyConfirmCmd)
 			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
 			sb.WriteString("```\nschemabot unlock\n```\n")
-		case data.AutoConfirm:
-			// -y is proceeding — include unlock hint in case the apply fails before starting
-			sb.WriteString("**Applying automatically** (`-y` flag)\n")
+		} else {
+			// Automatic apply is proceeding — include unlock hint in case the apply fails before starting
+			sb.WriteString("**Applying automatically**\n")
 			sb.WriteString("\n🔓 If the apply fails, unlock with:\n")
-			sb.WriteString("```\nschemabot unlock\n```\n")
-		default:
-			// Normal two-step flow: confirm instructions + unlock option
-			writeApplyHint(&sb, applyConfirmCmd)
-			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
 			sb.WriteString("```\nschemabot unlock\n```\n")
 		}
 	} else {

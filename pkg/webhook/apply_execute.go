@@ -15,7 +15,7 @@ import (
 )
 
 // executeApply re-plans for drift detection and executes the apply. This is the shared
-// execution core used by both handleApplyConfirmCommand and handleApplyCommand (with -y).
+// execution core used by both handleApplyConfirmCommand and handleApplyCommand.
 //
 // When storedPlan is non-nil (auto-confirm path), the re-plan DDL is compared against it.
 // If the DDL differs, execution is downgraded to manual confirmation — a plan comment is
@@ -64,10 +64,10 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// Auto-confirm DDL drift check: if the re-plan DDL differs from the stored auto-plan,
+	// Automatic apply DDL drift check: if the re-plan DDL differs from the stored auto-plan,
 	// downgrade to manual confirmation so the user reviews the new plan.
 	if storedPlan != nil && !ddlMatchesStoredPlan(planResp, storedPlan) {
-		h.logger.Info("auto-confirm downgraded: DDL drift detected",
+		h.logger.Info("automatic apply downgraded: DDL drift detected",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
 		commentData.IsLocked = true

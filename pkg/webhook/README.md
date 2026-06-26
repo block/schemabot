@@ -164,8 +164,8 @@ schemabot <command> [args] [-e <environment>] [-d <database>] [--defer-cutover] 
 | Command | `-e` required | Description |
 |---|---|---|
 | `plan` | No (runs all envs) | Preview schema changes |
-| `apply` | Yes | Lock plan for deployment |
-| `apply-confirm` | Yes | Execute locked plan |
+| `apply` | Yes | Lock and apply after safety rechecks |
+| `apply-confirm` | Yes | Confirm a downgraded locked plan |
 | `unlock` | No | Discard locked plans |
 | `cancel` | Yes | Cancel in-progress apply |
 | `cutover` | Yes | Complete deferred cutover |

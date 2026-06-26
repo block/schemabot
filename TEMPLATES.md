@@ -378,12 +378,9 @@ CREATE TABLE `addresses` (
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
-```
-schemabot apply-confirm -e staging --defer-cutover --skip-revert
-```
+**Applying automatically**
 
-🔓 To discard this plan and unlock, comment:
+🔓 If the apply fails, unlock with:
 ```
 schemabot unlock
 ```
@@ -726,8 +723,8 @@ schemabot apply -e staging --allow-unsafe
 | Command | Description |
 |---------|-------------|
 | `schemabot plan [-e <env>]` | Preview schema changes |
-| `schemabot apply -e <env>` | Plan, lock, and confirm deployment |
-| `schemabot apply-confirm -e <env>` | Execute a locked plan |
+| `schemabot apply -e <env>` | Plan, lock, and apply after safety rechecks |
+| `schemabot apply-confirm -e <env>` | Confirm a downgraded locked plan |
 | `schemabot unlock` | Release lock and discard plan |
 | `schemabot stop <apply-id> -e <env>` | Stop an in-progress deployment |
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
@@ -737,7 +734,7 @@ schemabot apply -e staging --allow-unsafe
 
 **Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
 
-**Quick start**: `plan` → `apply` → `apply-confirm`
+**Quick start**: `plan` → `apply`
 
 </details>
 
@@ -754,8 +751,8 @@ That command wasn't recognized. Available commands:
 | Command | Description |
 |---------|-------------|
 | `schemabot plan [-e <env>]` | Preview schema changes |
-| `schemabot apply -e <env>` | Plan, lock, and confirm deployment |
-| `schemabot apply-confirm -e <env>` | Execute a locked plan |
+| `schemabot apply -e <env>` | Plan, lock, and apply after safety rechecks |
+| `schemabot apply-confirm -e <env>` | Confirm a downgraded locked plan |
 | `schemabot unlock` | Release lock and discard plan |
 | `schemabot stop <apply-id> -e <env>` | Stop an in-progress deployment |
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
@@ -765,7 +762,7 @@ That command wasn't recognized. Available commands:
 
 **Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
 
-**Quick start**: `plan` → `apply` → `apply-confirm`
+**Quick start**: `plan` → `apply`
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
 
@@ -946,8 +943,8 @@ That command wasn't recognized. Available commands:
 | Command | Description |
 |---------|-------------|
 | `schemabot plan [-e <env>]` | Preview schema changes |
-| `schemabot apply -e <env>` | Plan, lock, and confirm deployment |
-| `schemabot apply-confirm -e <env>` | Execute a locked plan |
+| `schemabot apply -e <env>` | Plan, lock, and apply after safety rechecks |
+| `schemabot apply-confirm -e <env>` | Confirm a downgraded locked plan |
 | `schemabot unlock` | Release lock and discard plan |
 | `schemabot stop <apply-id> -e <env>` | Stop an in-progress deployment |
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
@@ -957,7 +954,7 @@ That command wasn't recognized. Available commands:
 
 **Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
 
-**Quick start**: `plan` → `apply` → `apply-confirm`
+**Quick start**: `plan` → `apply`
 </details>
 
 ### CLI Output
@@ -1533,7 +1530,7 @@ No active locks.
 ### PR Comments
 
 <details>
-<summary><a name="schema-change-apply-lock--confirm"></a><strong>Schema Change Apply (Lock + Confirm)</strong></summary>
+<summary><a name="schema-change-apply-automatic"></a><strong>Schema Change Apply (Automatic)</strong></summary>
 
 
 ## Schema Change Apply — Staging
@@ -1574,12 +1571,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
-```
-schemabot apply-confirm -e staging
-```
+**Applying automatically**
 
-🔓 To discard this plan and unlock, comment:
+🔓 If the apply fails, unlock with:
 ```
 schemabot unlock
 ```
@@ -1630,9 +1624,62 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+**Applying automatically**
+
+🔓 If the apply fails, unlock with:
 ```
-schemabot apply-confirm -e staging --defer-cutover --skip-revert
+schemabot unlock
+```
+
+</details>
+
+<details>
+<summary><a name="schema-change-apply-downgraded"></a><strong>Schema Change Apply (Downgraded)</strong></summary>
+
+
+## Schema Change Apply — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+⚠️ **Automatic apply paused**: Schema changes differ from auto-plan — review and confirm manually
+
+Review the plan above, then confirm manually:
+```
+schemabot apply-confirm -e staging
 ```
 
 🔓 To discard this plan and unlock, comment:
@@ -1727,12 +1774,9 @@ CREATE TABLE `addresses` (
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
-```
-schemabot apply-confirm -e staging --defer-cutover --skip-revert
-```
+**Applying automatically**
 
-🔓 To discard this plan and unlock, comment:
+🔓 If the apply fails, unlock with:
 ```
 schemabot unlock
 ```
@@ -4651,7 +4695,7 @@ No schema changes found for database 'new-db'
 ### PR Comments
 
 <details>
-<summary><a name="apply-gate-schema-change-apply-lock--confirm"></a><strong>Apply Gate: Schema Change Apply (Lock + Confirm)</strong></summary>
+<summary><a name="apply-gate-schema-change-apply-automatic"></a><strong>Apply Gate: Schema Change Apply (Automatic)</strong></summary>
 
 
 ## Schema Change Apply — Staging
@@ -4692,12 +4736,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
-```
-schemabot apply-confirm -e staging
-```
+**Applying automatically**
 
-🔓 To discard this plan and unlock, comment:
+🔓 If the apply fails, unlock with:
 ```
 schemabot unlock
 ```
@@ -4749,9 +4790,63 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+**Applying automatically**
+
+🔓 If the apply fails, unlock with:
 ```
-schemabot apply-confirm -e staging --defer-cutover --skip-revert
+schemabot unlock
+```
+
+
+</details>
+
+<details>
+<summary><a name="apply-gate-schema-change-apply-downgraded"></a><strong>Apply Gate: Schema Change Apply (Downgraded)</strong></summary>
+
+
+## Schema Change Apply — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+⚠️ **Automatic apply paused**: Schema changes differ from auto-plan — review and confirm manually
+
+Review the plan above, then confirm manually:
+```
+schemabot apply-confirm -e staging
 ```
 
 🔓 To discard this plan and unlock, comment:

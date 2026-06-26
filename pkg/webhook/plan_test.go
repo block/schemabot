@@ -213,7 +213,8 @@ func TestRenderPlanComment_UnsafeWithAllowUnsafe(t *testing.T) {
 
 	assert.Contains(t, rendered, "--allow-unsafe` enabled")
 	assert.Contains(t, rendered, "`users`")
-	assert.Contains(t, rendered, "apply-confirm -e staging --allow-unsafe")
+	assert.Contains(t, rendered, "Applying automatically")
+	assert.NotContains(t, rendered, "apply-confirm -e staging --allow-unsafe")
 }
 
 func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
@@ -235,7 +236,7 @@ func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
 		assert.Contains(t, rendered, "schemabot apply -e staging --tenant alpha")
 	})
 
-	t.Run("apply-confirm hint preserves tenant", func(t *testing.T) {
+	t.Run("automatic apply preserves tenant metadata without showing apply-confirm", func(t *testing.T) {
 		data := templates.PlanCommentData{
 			Database:    "testdb",
 			Environment: "staging",
@@ -251,6 +252,28 @@ func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
 		rendered := templates.RenderPlanComment(data)
 
 		assert.Contains(t, rendered, "**Tenant**: `alpha`")
+		assert.Contains(t, rendered, "Applying automatically")
+		assert.NotContains(t, rendered, "schemabot apply-confirm -e staging --tenant alpha")
+	})
+
+	t.Run("downgrade hint preserves tenant", func(t *testing.T) {
+		data := templates.PlanCommentData{
+			Database:                   "testdb",
+			Environment:                "staging",
+			Tenant:                     "alpha",
+			IsMySQL:                    true,
+			IsLocked:                   true,
+			AutoConfirmDowngradeReason: "Schema changes differ from auto-plan — review and confirm manually",
+			Changes: []templates.KeyspaceChangeData{{
+				Keyspace:   "testdb",
+				Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
+			}},
+		}
+
+		rendered := templates.RenderPlanComment(data)
+
+		assert.Contains(t, rendered, "**Tenant**: `alpha`")
+		assert.Contains(t, rendered, "Automatic apply paused")
 		assert.Contains(t, rendered, "schemabot apply-confirm -e staging --tenant alpha")
 	})
 

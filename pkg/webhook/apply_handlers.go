@@ -16,7 +16,8 @@ import (
 )
 
 // handleApplyCommand handles the "schemabot apply -e <env>" PR comment command.
-// It generates a plan, acquires a lock, and posts a plan comment with a confirmation footer.
+// It generates a plan, acquires a lock, and applies automatically unless safety
+// rechecks require a manual confirmation.
 func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) {
 	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
@@ -201,112 +202,20 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	commentData.SkipRevert = result.SkipRevert
 	commentData.AllowUnsafe = result.AllowUnsafe
 
-	// Auto-confirm (-y): check safety conditions before proceeding
-	if result.AutoConfirm {
-		// Reject if the PR HEAD advanced after discovery loaded schema files.
-		// Running against the loaded files would execute DDL derived from an
-		// older commit than the branch is on right now. Release the lock
-		// acquired above so the user can re-run `schemabot apply -e <env>`
-		// cleanly without a manual unlock.
-		//
-		// Use FetchPullRequestNoCache: the cached FetchPullRequest used by
-		// discovery would return the discovery-time HeadSHA, masking the race.
-		prInfo, prErr := client.FetchPullRequestNoCache(ctx, repo, pr)
-		if prErr != nil {
-			h.logger.Error("failed to fetch PR for stale-schema check, releasing lock",
-				"repo", repo, "pr", pr, "database", database, "error", prErr)
-			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to verify PR HEAD before auto-confirm: "+prErr.Error())
-			relErr := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner)
-			if relErr != nil && !errors.Is(relErr, storage.ErrLockNotFound) && !errors.Is(relErr, storage.ErrLockNotOwned) {
-				h.logger.Error("failed to release lock after PR fetch failure",
-					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "error", relErr)
-			}
-			return
-		}
-		if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, prInfo.HeadSHA, environment, requestedBy, action.Apply); rejected {
-			relErr := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner)
-			if relErr != nil && !errors.Is(relErr, storage.ErrLockNotFound) && !errors.Is(relErr, storage.ErrLockNotOwned) {
-				h.logger.Error("failed to release lock after stale-schema rejection",
-					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "error", relErr)
-			}
-			return
-		}
-
-		// Re-evaluate the checks gate against the fresh HEAD before executing.
-		// The early gate at the top of handleApplyCommand ran against the
-		// discovery-time HeadSHA. On the auto-confirm path there is no second
-		// user action between plan and apply, so a required check that
-		// transitioned to failing on the same SHA (e.g. CI re-ran red, or a
-		// new required check was added) would otherwise sneak past. Release
-		// the lock on block so the user can re-run `schemabot apply -e <env>`
-		// once the checks recover, without a manual unlock.
-		//
-		// Use owner-scoped Release rather than ForceRelease: although this
-		// handler invocation acquired the lock earlier, ownership can change
-		// between acquisition and this point (e.g. `schemabot unlock` clears
-		// the lock and another PR acquires it). Release deletes only when
-		// owner matches; ErrLockNotFound / ErrLockNotOwned are expected here
-		// (lock may be absent or now held by another PR) and are not logged
-		// as errors.
-		if blocked := h.enforcePassingChecks(ctx, client, repo, pr, installationID, prInfo.HeadSHA, environment); blocked {
-			relErr := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner)
-			if relErr != nil && !errors.Is(relErr, storage.ErrLockNotFound) && !errors.Is(relErr, storage.ErrLockNotOwned) {
-				h.logger.Error("failed to release lock after fresh-HEAD checks gate block",
-					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "error", relErr)
-			}
-			return
-		}
-
-		// Look up the plan we just created for DDL comparison in executeApply.
-		// Fail closed: if we can't load the plan, downgrade to manual confirmation
-		// rather than skipping the DDL drift check entirely.
-		storedPlan, planErr := h.service.Storage().Plans().Get(ctx, planResp.PlanID)
-		if planErr != nil || storedPlan == nil {
-			h.logger.Info("auto-confirm downgraded: could not load plan for DDL comparison",
-				"repo", repo, "pr", pr, "planID", planResp.PlanID, "error", planErr)
-			commentData.AutoConfirmDowngradeReason = "Could not verify plan — confirm manually"
-			h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
-			headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
-			if checkRunErr != nil {
-				h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
-			}
-			if headSHA != "" {
-				h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
-			}
-			return
-		}
-
-		commentData.AutoConfirm = true
-		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
-		headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
-		if checkErr != nil {
-			h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkErr)
-		}
-		if headSHA != "" {
-			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
-		}
-
-		// Check 2 (DDL drift) happens inside executeApply after re-plan
-		h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan)
-		return
-	}
-
-	// Manual apply: reject if the PR HEAD advanced after discovery loaded
-	// schema files. Posting the confirmation plan against the loaded files
-	// would render DDL for a commit the branch is no longer on — and the
-	// user's subsequent `apply-confirm` does its own fresh discovery, so the
-	// confirm-time freshness check passes against the new HEAD even though
-	// the plan the user reviewed was rendered for the old commit. Catching
-	// it here is the symmetric guard to the auto-confirm branch above.
-	// Use FetchPullRequestNoCache; the cached fetch returns the discovery
-	// SHA. Release the lock with owner-scoped Release so a concurrent
-	// `schemabot unlock` + re-acquire by another PR doesn't get its lock
-	// clobbered here; ErrLockNotFound / ErrLockNotOwned are expected.
+	// Check safety conditions before proceeding.
+	// Reject if the PR HEAD advanced after discovery loaded schema files.
+	// Running against the loaded files would execute DDL derived from an
+	// older commit than the branch is on right now. Release the lock
+	// acquired above so the user can re-run `schemabot apply -e <env>`
+	// cleanly without a manual unlock.
+	//
+	// Use FetchPullRequestNoCache: the cached FetchPullRequest used by
+	// discovery would return the discovery-time HeadSHA, masking the race.
 	prInfo, prErr := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if prErr != nil {
 		h.logger.Error("failed to fetch PR for stale-schema check, releasing lock",
 			"repo", repo, "pr", pr, "database", database, "error", prErr)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to verify PR HEAD before posting plan: "+prErr.Error())
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to verify PR HEAD before apply: "+prErr.Error())
 		relErr := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner)
 		if relErr != nil && !errors.Is(relErr, storage.ErrLockNotFound) && !errors.Is(relErr, storage.ErrLockNotOwned) {
 			h.logger.Error("failed to release lock after PR fetch failure",
@@ -323,9 +232,51 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		return
 	}
 
-	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+	// Re-evaluate the checks gate against the fresh HEAD before executing.
+	// The early gate at the top of handleApplyCommand ran against the
+	// discovery-time HeadSHA. On the automatic apply path there is no second
+	// user action between plan and apply, so a required check that
+	// transitioned to failing on the same SHA (e.g. CI re-ran red, or a
+	// new required check was added) would otherwise sneak past. Release
+	// the lock on block so the user can re-run `schemabot apply -e <env>`
+	// once the checks recover, without a manual unlock.
+	//
+	// Use owner-scoped Release rather than ForceRelease: although this
+	// handler invocation acquired the lock earlier, ownership can change
+	// between acquisition and this point (e.g. `schemabot unlock` clears
+	// the lock and another PR acquires it). Release deletes only when
+	// owner matches; ErrLockNotFound / ErrLockNotOwned are expected here
+	// (lock may be absent or now held by another PR) and are not logged
+	// as errors.
+	if blocked := h.enforcePassingChecks(ctx, client, repo, pr, installationID, prInfo.HeadSHA, environment); blocked {
+		relErr := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner)
+		if relErr != nil && !errors.Is(relErr, storage.ErrLockNotFound) && !errors.Is(relErr, storage.ErrLockNotOwned) {
+			h.logger.Error("failed to release lock after fresh-HEAD checks gate block",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "error", relErr)
+		}
+		return
+	}
 
-	// Create check run (action_required — waiting for apply-confirm) and update aggregate
+	// Look up the plan we just created for DDL comparison in executeApply.
+	// Fail closed: if we can't load the plan, downgrade to manual confirmation
+	// rather than skipping the DDL drift check entirely.
+	storedPlan, planErr := h.service.Storage().Plans().Get(ctx, planResp.PlanID)
+	if planErr != nil || storedPlan == nil {
+		h.logger.Info("automatic apply downgraded: could not load plan for DDL comparison",
+			"repo", repo, "pr", pr, "planID", planResp.PlanID, "error", planErr)
+		commentData.AutoConfirmDowngradeReason = "Could not verify plan — confirm manually"
+		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
+		if checkRunErr != nil {
+			h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
+		}
+		if headSHA != "" {
+			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+		}
+		return
+	}
+
+	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 	headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 	if checkErr != nil {
 		h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkErr)
@@ -333,6 +284,9 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
+
+	// Check 2 (DDL drift) happens inside executeApply after re-plan
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan)
 }
 
 // handleApplyConfirmCommand handles the "schemabot apply-confirm -e <env>" PR comment command.

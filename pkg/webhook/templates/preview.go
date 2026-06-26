@@ -509,6 +509,25 @@ func PreviewCommentApplyPlanUnsafe() string {
 	})
 }
 
+// PreviewCommentApplyPlanDowngraded renders a locked apply-plan that requires
+// manual confirmation after automatic apply was downgraded by a safety recheck.
+func PreviewCommentApplyPlanDowngraded() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:                   "testapp",
+		SchemaName:                 "testapp",
+		Environment:                "staging",
+		HeadSHA:                    previewHeadSHA,
+		Repository:                 previewRepository,
+		RequestedBy:                previewRequestedBy,
+		IsMySQL:                    true,
+		Changes:                    samplePlanChanges(),
+		IsLocked:                   true,
+		LockOwner:                  "acme/myapp#42",
+		LockAcquired:               "2026-03-14 10:30:00 UTC",
+		AutoConfirmDowngradeReason: "Schema changes differ from auto-plan — review and confirm manually",
+	})
+}
+
 // =============================================================================
 // Vitess Plan Comment Previews
 // =============================================================================

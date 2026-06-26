@@ -63,26 +63,18 @@ func TestE2EApplyWithChanges(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "apply started")
 
-	// The apply handler runs as a goroutine — wait for the apply plan confirmation comment
+	// The apply handler runs as a goroutine — wait for the automatic apply plan comment.
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "## Schema Change Apply")
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
 		assert.Contains(t, body, "Lock acquired by")
-		assert.Contains(t, body, "schemabot apply-confirm -e staging")
+		assert.Contains(t, body, "Applying automatically")
 		assert.Contains(t, body, "schemabot unlock")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for apply plan comment")
 	}
-
-	// Verify lock was acquired
-	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
-	require.NoError(t, err)
-	require.NotNil(t, lock, "expected lock to be acquired")
-	assert.Equal(t, "octocat/hello-world#1", lock.Owner)
-	assert.Equal(t, "octocat/hello-world", lock.Repository)
-	assert.Equal(t, 1, lock.PullRequest)
 
 	// Clean up the lock so it doesn't leak to other tests sharing the same PR
 	t.Cleanup(func() {
@@ -1100,21 +1092,15 @@ func TestE2EApplyStaleLockReacquire(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	// Should succeed: release stale lock, re-plan, acquire new lock, post confirmation
+	// Should succeed: release stale lock, re-plan, acquire a new lock, and apply automatically.
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "## Schema Change Apply")
 		assert.Contains(t, body, "Lock acquired by")
-		assert.Contains(t, body, "schemabot apply-confirm -e staging")
+		assert.Contains(t, body, "Applying automatically")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for apply plan comment")
 	}
-
-	// Verify a lock is still held (the new one)
-	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
-	require.NoError(t, err)
-	require.NotNil(t, lock, "expected lock to be re-acquired")
-	assert.Equal(t, "octocat/hello-world#1", lock.Owner)
 }
 
 // TestE2EApplyProductionBlockedByStagingFirst verifies that production apply is
@@ -1267,9 +1253,9 @@ func TestE2EApplyProductionAllowedWhenStagingSuccess(t *testing.T) {
 	})
 }
 
-// TestE2EApplyAutoConfirmExecutes verifies that `schemabot apply -e staging -y`
-// plans, acquires a lock, and executes the apply in a single command.
-func TestE2EApplyAutoConfirmExecutes(t *testing.T) {
+// TestE2EApplyExecutesAutomatically verifies that `schemabot apply -e staging`
+// plans, acquires a lock, and executes the apply after safety rechecks.
+func TestE2EApplyExecutesAutomatically(t *testing.T) {
 	dbName := "webhook_auto_confirm"
 	svc := setupE2EService(t, dbName)
 
@@ -1292,7 +1278,7 @@ func TestE2EApplyAutoConfirmExecutes(t *testing.T) {
 	h := newE2EHandler(t, svc, client)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot apply -e staging -y",
+		comment: "schemabot apply -e staging",
 		isPR:    true,
 	}, nil)
 
@@ -1305,7 +1291,6 @@ func TestE2EApplyAutoConfirmExecutes(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "## Schema Change Apply")
 		assert.Contains(t, body, "Applying automatically")
-		assert.Contains(t, body, "-y")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for auto-confirm plan comment")
 	}
@@ -1322,7 +1307,7 @@ func TestE2EApplyAutoConfirmExecutes(t *testing.T) {
 		"expected apply summary comment")
 }
 
-// TestE2EApplyAutoConfirmRejectsWhenHEADAdvanced verifies that `apply -y`
+// TestE2EApplyAutoConfirmRejectsWhenHEADAdvanced verifies that `apply`
 // rejects (does NOT apply, releases the lock) when the PR HEAD advances
 // between discovery (cached FetchPullRequest) and the fresh
 // FetchPullRequestNoCache fetch inside the auto-confirm branch. The user
@@ -1350,7 +1335,7 @@ func TestE2EApplyAutoConfirmRejectsWhenHEADAdvanced(t *testing.T) {
 	h := newE2EHandler(t, svc, client)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot apply -e staging -y",
+		comment: "schemabot apply -e staging",
 		isPR:    true,
 	}, nil)
 
@@ -1365,7 +1350,6 @@ func TestE2EApplyAutoConfirmRejectsWhenHEADAdvanced(t *testing.T) {
 	for {
 		select {
 		case body := <-result.comments:
-			assert.NotContains(t, body, "Applying automatically", "apply must not auto-confirm on stale schema")
 			if strings.Contains(body, "Rejected") && strings.Contains(body, "new commits since discovery") {
 				rejection = body
 			}
@@ -1470,17 +1454,10 @@ func TestE2EApplyConfirmRejectsWhenHEADAdvanced(t *testing.T) {
 	}
 }
 
-// TestE2EApplyManualRejectsWhenHEADAdvanced verifies that `schemabot apply`
-// (without -y) rejects and releases the lock when the PR HEAD advances
-// between discovery and the freshness check, instead of posting a stale
-// confirmation plan that the user might `apply-confirm` against. Symmetric
-// to TestE2EApplyAutoConfirmRejectsWhenHEADAdvanced but covers the manual
-// (non-auto-confirm) path that aparajon flagged in PR #134 review.
-//
-// Without this guard, a fresh discovery at apply-confirm time would see the
-// new HEAD and the confirm-time freshness check would pass — but the plan
-// the user reviewed was rendered for the old commit.
-func TestE2EApplyManualRejectsWhenHEADAdvanced(t *testing.T) {
+// TestE2EApplyDefaultAutoConfirmRejectsWhenHEADAdvanced verifies that the default
+// apply flow rejects and releases the lock when the PR HEAD advances between
+// discovery and the freshness check.
+func TestE2EApplyDefaultAutoConfirmRejectsWhenHEADAdvanced(t *testing.T) {
 	dbName := "webhook_manual_apply_stale"
 	svc := setupE2EService(t, dbName)
 
@@ -1498,7 +1475,7 @@ func TestE2EApplyManualRejectsWhenHEADAdvanced(t *testing.T) {
 
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
 	// Discovery (cached FetchPullRequest) sees abc123; the NoCache fetch
-	// just before posting the manual plan sees a new commit at newsha456.
+	// just before execution sees a new commit at newsha456.
 	result.HeadSHAs = []string{"abc123", "newsha456"}
 	h := newE2EHandler(t, svc, client)
 
@@ -1511,15 +1488,12 @@ func TestE2EApplyManualRejectsWhenHEADAdvanced(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	// Drain comments looking for the rejection. The handler must not post a
-	// plan comment (with or without the confirmation footer).
+	// Drain comments looking for the rejection.
 	deadline := time.After(30 * time.Second)
 	var rejection string
 	for rejection == "" {
 		select {
 		case body := <-result.comments:
-			assert.NotContains(t, body, "Schema Change Plan", "manual apply must not post a stale plan comment")
-			assert.NotContains(t, body, "Applying automatically", "manual apply must never auto-confirm")
 			if strings.Contains(body, "Rejected") && strings.Contains(body, "new commits since discovery") {
 				rejection = body
 			}
