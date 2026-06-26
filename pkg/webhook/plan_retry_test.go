@@ -97,8 +97,8 @@ func planRetryTestRequest() api.PlanRequest {
 }
 
 // A brief remote outage during a webhook command's plan request is absorbed:
-// the handler retries once after the configured delay and the command flow
-// continues with the successful plan instead of posting a failure comment.
+// the handler retries after the configured delay and the command flow continues
+// with the successful plan instead of posting a failure comment.
 func TestExecutePlanTransientRetryRecovers(t *testing.T) {
 	client := &flakyPlanTernClient{
 		failPlans: 1,
@@ -111,12 +111,29 @@ func TestExecutePlanTransientRetryRecovers(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	assert.Equal(t, "plan-after-retry", resp.PlanID)
-	assert.Equal(t, 2, client.calls(), "handler should retry the failed plan attempt once")
+	assert.Equal(t, 2, client.calls(), "handler should stop retrying after the first successful plan")
 }
 
-// A sustained remote outage still surfaces within one retry: the handler does
-// not loop, and the caller posts the same operator-visible error it would
-// have without retries.
+// A longer transient outage can recover on the final bounded retry without the
+// caller posting an operator-visible failure comment.
+func TestExecutePlanTransientRetryRecoversOnFinalRetry(t *testing.T) {
+	client := &flakyPlanTernClient{
+		failPlans: maxTransientPlanRetries,
+		planErr:   grpcstatus.Error(grpccodes.Unavailable, "upstream connect error"),
+	}
+	h := newPlanRetryTestHandler(client, time.Millisecond)
+
+	resp, err := h.executePlanWithTransientRetry(t.Context(), planRetryTestRequest(), "octocat/hello-world", 1)
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, "plan-after-retry", resp.PlanID)
+	assert.Equal(t, maxTransientPlanRetries+1, client.calls(), "handler should allow the final configured retry to recover")
+}
+
+// A sustained remote outage still surfaces after the bounded retries: the
+// handler does not loop forever, and the caller posts the same operator-visible
+// error it would have without retries.
 func TestExecutePlanTransientRetryExhausted(t *testing.T) {
 	client := &flakyPlanTernClient{
 		failPlans: 10,
@@ -132,7 +149,7 @@ func TestExecutePlanTransientRetryExhausted(t *testing.T) {
 	require.True(t, errors.As(err, &remoteErr), "exhausted retry should surface the remote unavailability error")
 	assert.Equal(t, "remote", remoteErr.Deployment)
 	assert.Equal(t, "orders-target", remoteErr.Target)
-	assert.Equal(t, 2, client.calls(), "handler should stop after one retry")
+	assert.Equal(t, maxTransientPlanRetries+1, client.calls(), "handler should stop after the configured retry budget")
 }
 
 // Only transient remote unavailability is retried. Deterministic failures

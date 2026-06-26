@@ -98,7 +98,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	}
 
 	// Execute plan via the service
-	planResp, err := h.service.ExecutePlan(ctx, planReq)
+	planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)
 	if err != nil {
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "error", err)
 		metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "error")
@@ -285,7 +285,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			SourceTrusted: true,
 		}
 
-		planResp, err := h.service.ExecutePlan(ctx, planReq)
+		planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)
 		if err != nil {
 			h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "env", env, "error", err)
 			multiEnvData.Errors[env] = userFacingError(err)
