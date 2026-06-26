@@ -103,6 +103,31 @@ func TestBuildPlanCommentData_UnsafeChangesPopulated(t *testing.T) {
 	assert.Equal(t, "DROP INDEX without making invisible first", data.UnsafeChanges[0].Reason)
 }
 
+func TestBuildPlanCommentData_TableDropIsUnsafeWithoutEngineFlag(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{
+		Database: "testdb",
+		Type:     "mysql",
+	}
+
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "testdb",
+			TableChanges: []*apitypes.TableChangeResponse{{
+				TableName:  "users",
+				DDL:        "DROP TABLE `users`",
+				ChangeType: "drop",
+			}},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+
+	assert.True(t, data.HasUnsafeChanges)
+	require.Len(t, data.UnsafeChanges, 1)
+	assert.Equal(t, "users", data.UnsafeChanges[0].Table)
+	assert.Equal(t, "DROP TABLE removes all data", data.UnsafeChanges[0].Reason)
+}
+
 func TestBuildPlanCommentData_NoUnsafeChanges(t *testing.T) {
 	schema := &ghclient.SchemaRequestResult{
 		Database:   "testdb",

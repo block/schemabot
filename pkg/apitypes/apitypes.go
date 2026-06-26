@@ -3,6 +3,8 @@
 // This package has zero dependencies — import it freely from any package.
 package apitypes
 
+import "strings"
+
 // =============================================================================
 // Error Codes
 // =============================================================================
@@ -243,13 +245,8 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 	var result []UnsafeChange
 	for _, sc := range r.Changes {
 		for _, t := range sc.TableChanges {
-			if t.IsUnsafe {
-				result = append(result, UnsafeChange{
-					Table:      t.TableName,
-					Reason:     t.UnsafeReason,
-					DDL:        t.DDL,
-					ChangeType: t.ChangeType,
-				})
+			if unsafeChange, ok := t.UnsafeChange(); ok {
+				result = append(result, unsafeChange)
 			}
 		}
 	}
@@ -322,6 +319,29 @@ type TableChangeResponse struct {
 
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
 func (t *TableChangeResponse) GetTableName() string { return t.TableName }
+
+// UnsafeChange returns the unsafe-change view for table changes that require
+// explicit operator opt-in. Engines should mark unsafe table changes directly;
+// the drop fallback keeps table deletion fail-closed if an engine omits that
+// metadata.
+func (t *TableChangeResponse) UnsafeChange() (UnsafeChange, bool) {
+	if t == nil {
+		return UnsafeChange{}, false
+	}
+	if !t.IsUnsafe && !strings.EqualFold(t.ChangeType, "drop") {
+		return UnsafeChange{}, false
+	}
+	reason := t.UnsafeReason
+	if reason == "" && strings.EqualFold(t.ChangeType, "drop") {
+		reason = "DROP TABLE removes all data"
+	}
+	return UnsafeChange{
+		Table:      t.TableName,
+		Reason:     reason,
+		DDL:        t.DDL,
+		ChangeType: t.ChangeType,
+	}, true
+}
 
 // LintViolationResponse represents a lint violation in the HTTP response.
 type LintViolationResponse struct {

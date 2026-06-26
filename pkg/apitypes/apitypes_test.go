@@ -27,6 +27,24 @@ func TestPlanResponse_UnsafeChanges(t *testing.T) {
 	assert.Equal(t, "items", changes[1].Table)
 }
 
+func TestPlanResponse_UnsafeChangesTreatsTableDropAsUnsafe(t *testing.T) {
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace: "testdb",
+			TableChanges: []*TableChangeResponse{
+				{TableName: "users", DDL: "DROP TABLE `users`", ChangeType: "drop"},
+			},
+		}},
+	}
+
+	changes := resp.UnsafeChanges()
+	require.Len(t, changes, 1)
+	assert.Equal(t, "users", changes[0].Table)
+	assert.Equal(t, "DROP TABLE removes all data", changes[0].Reason)
+	assert.Equal(t, "DROP TABLE `users`", changes[0].DDL)
+	assert.Equal(t, "drop", changes[0].ChangeType)
+}
+
 func TestPlanResponse_UnsafeChanges_None(t *testing.T) {
 	resp := &PlanResponse{
 		Changes: []*SchemaChangeResponse{{
