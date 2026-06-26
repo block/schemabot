@@ -19,6 +19,12 @@ import (
 // ApplyOperations().ListByApply); tasks are the apply's tasks across all
 // deployments, regrouped per operation for the multi-deployment layout.
 func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task) string {
+	// A sharded apply fans out across the shards of one keyspace within a single
+	// deployment, so it gets the shard-unit layout rather than the deployment-unit
+	// one — its operations differ by shard, not deployment.
+	if isShardedApply(ops) {
+		return templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, tasks))
+	}
 	if len(ops) <= 1 {
 		return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks, singleOpDisplay(ops, displayByOp), shardsByTable))
 	}
@@ -36,6 +42,12 @@ func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperatio
 // ApplyOperations().ListByApply); tasks are the apply's tasks across all
 // deployments, regrouped per operation for the multi-deployment layout.
 func formatApplySummaryComment(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task) string {
+	// The sharded layout is terminal-aware (header, footer, no last-updated line),
+	// so the same renderer serves the terminal summary; only the deployment-unit
+	// path has a distinct summary renderer.
+	if isShardedApply(ops) {
+		return templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, tasks))
+	}
 	if len(ops) <= 1 {
 		return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks, singleOpDisplay(ops, displayByOp), shardsByTable))
 	}
