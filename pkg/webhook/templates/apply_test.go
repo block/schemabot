@@ -1234,19 +1234,21 @@ func TestRenderApplySummaryComment_VSchemaOnly(t *testing.T) {
 
 	assert.NotContains(t, result, "0 tables")
 	assert.Contains(t, result, "VSchema applied successfully")
+	assert.Contains(t, result, "<details><summary>Applied details (1 VSchema update)</summary>")
 	assert.Contains(t, result, "### VSchema")
 	assert.Contains(t, result, "**`commerce_sharded`**: Applied")
 }
 
-func TestPreviewCommentSummaryCompletedLargeSingleNamespaceKeepsApplyIDInsideSection(t *testing.T) {
+func TestPreviewCommentSummaryCompletedLargeCollapsesAppliedDetails(t *testing.T) {
 	result := PreviewCommentSummaryCompletedLarge()
 
 	assert.Contains(t, result, "All 8 tables applied successfully")
+	assert.Contains(t, result, "<details><summary>Applied details (8 tables)</summary>")
 	assert.Contains(t, result, "_Apply ID: `apply-a1b2c3d4e5f6`_")
-	assert.Equal(t, 0, strings.Count(result, "</details>"))
+	assert.Equal(t, 1, strings.Count(result, "</details>"))
 }
 
-func TestRenderApplySummaryCommentCompletedCollapsedGroupSeparatesApplyID(t *testing.T) {
+func TestRenderApplySummaryCommentCompletedCollapsedDetailsSeparateApplyID(t *testing.T) {
 	tableNames := []string{"users", "orders", "products", "invoices", "payments", "shipments"}
 	tables := make([]TableProgressData, 0, len(tableNames))
 	for _, tableName := range tableNames {
@@ -1270,9 +1272,62 @@ func TestRenderApplySummaryCommentCompletedCollapsedGroupSeparatesApplyID(t *tes
 
 	result := RenderApplySummaryComment(data)
 
-	assert.Contains(t, result, "<details><summary>✅ <strong>testapp_primary</strong> (6 tables)</summary>")
+	assert.Contains(t, result, "<details><summary>Applied details (6 tables)</summary>")
+	assert.Contains(t, result, "### ✅ testapp_primary")
 	assert.Contains(t, result, "</details>\n\n_Apply ID: `apply-a1b2c3d4e5f6`_")
 	assert.NotContains(t, result, "</details>\n_Apply ID")
+}
+
+func TestPreviewCommentSummaryCompletedVitessTracksVSchema(t *testing.T) {
+	result := PreviewCommentSummaryCompletedVitessDDLWithVSchema()
+
+	assert.Contains(t, result, "Schema change applied successfully")
+	assert.Contains(t, result, "<details><summary>Applied details (1 table, 1 VSchema update)</summary>")
+	assert.Contains(t, result, "**`users`**")
+	assert.Contains(t, result, "### VSchema")
+	assert.Contains(t, result, "**`myapp_sharded`**: Applied")
+}
+
+func TestPreviewCommentSummaryCompletedVitessVSchemaOnly(t *testing.T) {
+	result := PreviewCommentSummaryCompletedVitessVSchemaOnly()
+
+	assert.NotContains(t, result, "0 tables")
+	assert.Contains(t, result, "VSchema applied successfully")
+	assert.Contains(t, result, "<details><summary>Applied details (1 VSchema update)</summary>")
+	assert.Contains(t, result, "### VSchema")
+	assert.Contains(t, result, "**`myapp_sharded`**: Applied")
+}
+
+func TestPreviewCommentSummaryMultiNamespaceCompletedShowsNamespaceSummary(t *testing.T) {
+	result := PreviewCommentSummaryMultiNamespaceCompleted()
+
+	assert.Contains(t, result, "Applied by namespace:")
+	assert.Contains(t, result, "- `commerce`: 2 tables")
+	assert.Contains(t, result, "- `customers`: 2 tables")
+	assert.Contains(t, result, "- `analytics`: 1 table")
+}
+
+func TestRenderApplySummaryCommentCompletedMultiNamespaceVSchemaSummary(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Completed,
+		Tables: []TableProgressData{
+			{Namespace: "commerce", TableName: "orders", Status: state.Task.Completed},
+			{Namespace: "customers", TableName: "users", Status: state.Task.Completed},
+		},
+		VSchemaChanges: []apitypes.VSchemaChange{
+			{Namespace: "commerce", Status: "applied"},
+			{Namespace: "customers_sharded", Status: "applied"},
+		},
+	}
+
+	result := RenderApplySummaryComment(data)
+
+	assert.Contains(t, result, "<details><summary>Applied details (2 tables, 2 VSchema updates)</summary>")
+	assert.Contains(t, result, "- `commerce`: 1 table, 1 VSchema update")
+	assert.Contains(t, result, "- `customers`: 1 table")
+	assert.Contains(t, result, "- `customers_sharded`: 1 VSchema update")
 }
 
 func TestRenderApplyBlockedByNonPassingChecks(t *testing.T) {

@@ -96,7 +96,10 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentSingleFailed, templates.PreviewCommentSingleStopped,
 		templates.PreviewCommentSummaryCompleted, templates.PreviewCommentSummaryFailed,
 		templates.PreviewCommentSummaryStopped,
-		templates.PreviewCommentSummaryCompletedLarge, templates.PreviewCommentSummaryFailedLarge,
+		templates.PreviewCommentSummaryCompletedLarge, templates.PreviewCommentSummaryVitessVSchema,
+		templates.PreviewCommentSummaryVitessVSchemaOnly,
+		templates.PreviewCommentSummaryFailedLarge,
+		templates.PreviewCommentSummaryMultiNSFailed, templates.PreviewCommentSummaryMultiNSCompleted,
 		templates.PreviewCommentAll:
 		templates.PreviewCLIOutput(previewType)
 	// Apply command comment types
@@ -266,7 +269,11 @@ Comment Templates (GitHub PR comments):
   comment_summary_failed          Summary: apply failed (with error)
   comment_summary_stopped         Summary: apply stopped
   comment_summary_completed_large Summary: completed (8 tables, rollup format)
+  comment_summary_vitess_vschema  Summary: completed Vitess DDL + VSchema
+  comment_summary_vitess_vschema_only Summary: completed Vitess VSchema-only
   comment_summary_failed_large    Summary: failed (8 tables, rollup format)
+  comment_summary_multi_ns_failed Summary: failed across multiple namespaces
+  comment_summary_multi_ns_completed Summary: completed across multiple namespaces
   comment_all                   Show all comment template previews
 
 Apply Command Comments (GitHub PR apply commands):

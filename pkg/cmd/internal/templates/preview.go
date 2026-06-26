@@ -148,18 +148,20 @@ const (
 	PreviewCLIMultiDeployAll            PreviewType = "cli_multi_deploy_all"             // Show all CLI multi-deployment apply previews
 
 	// Single-table apply comment previews (most common case)
-	PreviewCommentSingleProgress          PreviewType = "comment_single_progress"            // Single table running
-	PreviewCommentSingleComplete          PreviewType = "comment_single_complete"            // Single table completed
-	PreviewCommentSingleFailed            PreviewType = "comment_single_failed"              // Single table failed
-	PreviewCommentSingleStopped           PreviewType = "comment_single_stopped"             // Single table stopped
-	PreviewCommentSummaryCompleted        PreviewType = "comment_summary_completed"          // Summary: completed
-	PreviewCommentSummaryFailed           PreviewType = "comment_summary_failed"             // Summary: failed
-	PreviewCommentSummaryStopped          PreviewType = "comment_summary_stopped"            // Summary: stopped
-	PreviewCommentSummaryCompletedLarge   PreviewType = "comment_summary_completed_large"    // Summary: completed (8 tables, rollup)
-	PreviewCommentSummaryFailedLarge      PreviewType = "comment_summary_failed_large"       // Summary: failed (8 tables, rollup)
-	PreviewCommentSummaryMultiNSFailed    PreviewType = "comment_summary_multi_ns_failed"    // Summary: failed (multi-namespace)
-	PreviewCommentSummaryMultiNSCompleted PreviewType = "comment_summary_multi_ns_completed" // Summary: completed (multi-namespace)
-	PreviewCommentAll                     PreviewType = "comment_all"                        // Show all comment template previews
+	PreviewCommentSingleProgress           PreviewType = "comment_single_progress"             // Single table running
+	PreviewCommentSingleComplete           PreviewType = "comment_single_complete"             // Single table completed
+	PreviewCommentSingleFailed             PreviewType = "comment_single_failed"               // Single table failed
+	PreviewCommentSingleStopped            PreviewType = "comment_single_stopped"              // Single table stopped
+	PreviewCommentSummaryCompleted         PreviewType = "comment_summary_completed"           // Summary: completed
+	PreviewCommentSummaryFailed            PreviewType = "comment_summary_failed"              // Summary: failed
+	PreviewCommentSummaryStopped           PreviewType = "comment_summary_stopped"             // Summary: stopped
+	PreviewCommentSummaryCompletedLarge    PreviewType = "comment_summary_completed_large"     // Summary: completed (8 tables, rollup)
+	PreviewCommentSummaryVitessVSchema     PreviewType = "comment_summary_vitess_vschema"      // Summary: completed Vitess DDL + VSchema
+	PreviewCommentSummaryVitessVSchemaOnly PreviewType = "comment_summary_vitess_vschema_only" // Summary: completed Vitess VSchema-only
+	PreviewCommentSummaryFailedLarge       PreviewType = "comment_summary_failed_large"        // Summary: failed (8 tables, rollup)
+	PreviewCommentSummaryMultiNSFailed     PreviewType = "comment_summary_multi_ns_failed"     // Summary: failed (multi-namespace)
+	PreviewCommentSummaryMultiNSCompleted  PreviewType = "comment_summary_multi_ns_completed"  // Summary: completed (multi-namespace)
+	PreviewCommentAll                      PreviewType = "comment_all"                         // Show all comment template previews
 
 	// Apply command comment previews (GitHub PR apply commands)
 	PreviewCommentApplyStartedType      PreviewType = "comment_apply_started"                // Apply started notification

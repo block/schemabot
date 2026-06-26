@@ -853,8 +853,7 @@ func writeSummaryCompleted(sb *strings.Builder, data ApplyStatusCommentData, tot
 		msg = fmt.Sprintf("All %d tables applied successfully — your schema changes are live!", totalTables)
 	}
 	writeSuccessBlock(sb, msg)
-	writeSummaryTableList(sb, data)
-	writeVSchemaStatus(sb, data)
+	writeCompletedSummaryDetails(sb, data)
 	if data.ApplyID != "" {
 		if !strings.HasSuffix(sb.String(), "\n\n") {
 			sb.WriteString("\n")
@@ -979,10 +978,98 @@ func formatDuration(d time.Duration) string {
 	return strings.Join(parts, " ")
 }
 
+func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentData) {
+	if len(data.Tables) == 0 && len(data.VSchemaChanges) == 0 {
+		return
+	}
+
+	fmt.Fprintf(sb, "\n<details><summary>%s</summary>\n\n", completedSummaryDetailsLabel(data))
+	writeCompletedNamespaceSummary(sb, data)
+	if len(data.Tables) > 0 {
+		writeSummaryTableListWithOptions(sb, data, false)
+	}
+	writeVSchemaStatus(sb, data)
+	sb.WriteString("</details>\n")
+}
+
+func completedSummaryDetailsLabel(data ApplyStatusCommentData) string {
+	var parts []string
+	if len(data.Tables) > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", len(data.Tables), pluralize("table", len(data.Tables))))
+	}
+	if len(data.VSchemaChanges) > 0 {
+		parts = append(parts, fmt.Sprintf("%d VSchema %s", len(data.VSchemaChanges), pluralize("update", len(data.VSchemaChanges))))
+	}
+	return fmt.Sprintf("Applied details (%s)", strings.Join(parts, ", "))
+}
+
+type completedNamespaceSummary struct {
+	namespace      string
+	tableCount     int
+	vschemaUpdates int
+}
+
+func writeCompletedNamespaceSummary(sb *strings.Builder, data ApplyStatusCommentData) {
+	summaries := completedNamespaceSummaries(data)
+	if len(summaries) <= 1 {
+		return
+	}
+
+	sb.WriteString("Applied by namespace:\n\n")
+	for _, summary := range summaries {
+		var parts []string
+		if summary.tableCount > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", summary.tableCount, pluralize("table", summary.tableCount)))
+		}
+		if summary.vschemaUpdates > 0 {
+			parts = append(parts, fmt.Sprintf("%d VSchema %s", summary.vschemaUpdates, pluralize("update", summary.vschemaUpdates)))
+		}
+		fmt.Fprintf(sb, "- `%s`: %s\n", summary.namespace, strings.Join(parts, ", "))
+	}
+	sb.WriteString("\n")
+}
+
+func completedNamespaceSummaries(data ApplyStatusCommentData) []completedNamespaceSummary {
+	seen := make(map[string]int)
+	var summaries []completedNamespaceSummary
+	for _, table := range data.Tables {
+		namespace := displayNamespace(table.Namespace, data.Database)
+		idx, ok := seen[namespace]
+		if !ok {
+			idx = len(summaries)
+			seen[namespace] = idx
+			summaries = append(summaries, completedNamespaceSummary{namespace: namespace})
+		}
+		summaries[idx].tableCount++
+	}
+	for _, change := range data.VSchemaChanges {
+		namespace := displayNamespace(change.Namespace, data.Database)
+		idx, ok := seen[namespace]
+		if !ok {
+			idx = len(summaries)
+			seen[namespace] = idx
+			summaries = append(summaries, completedNamespaceSummary{namespace: namespace})
+		}
+		summaries[idx].vschemaUpdates++
+	}
+	return summaries
+}
+
+func displayNamespace(namespace, database string) string {
+	if namespace == "" || namespace == "default" {
+		return database
+	}
+	return namespace
+}
+
 // writeSummaryTableList writes table outcomes with inline DDL, grouped by namespace.
 // Failed/stopped tables are listed first within each group.
 // For 6+ tables, each namespace group is collapsible.
 func writeSummaryTableList(sb *strings.Builder, data ApplyStatusCommentData) {
+	writeSummaryTableListWithOptions(sb, data, true)
+}
+
+func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusCommentData, collapseNamespaceGroups bool) {
 	if len(data.Tables) == 0 {
 		return
 	}
@@ -1041,7 +1128,7 @@ func writeSummaryTableList(sb *strings.Builder, data ApplyStatusCommentData) {
 		}
 	}
 
-	collapsed := len(data.Tables) > 5
+	collapsed := collapseNamespaceGroups && len(data.Tables) > 5
 	// Skip namespace header when there's only one group and it's "default" or
 	// matches the database name — the header is redundant with the metadata line.
 	singleGroup := len(groups) == 1

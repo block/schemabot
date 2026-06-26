@@ -186,10 +186,14 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	postPlanComment := h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA)
 
 	// Launch auto-plan for each discovered config
+	tenant := ""
+	if config := h.service.Config(); config != nil {
+		tenant = config.Tenant
+	}
 	for _, cfg := range configs {
 		database := cfg.Config.Database
 		h.goSafe(repo, pr, installationID, func() {
-			h.handleMultiEnvPlan(repo, pr, database, "", installationID, "", true, postPlanComment)
+			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, postPlanComment)
 		})
 	}
 

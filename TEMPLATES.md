@@ -2691,6 +2691,9 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 
 > All 3 tables applied successfully — your schema changes are live!
 
+<details><summary>Applied details (3 tables)</summary>
+
+
 **`orders`**
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -2705,6 +2708,8 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+
+</details>
 
 _Apply ID: `apply-a1b2c3d4e5f6`_
 
@@ -2829,6 +2834,9 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
 > All 8 tables applied successfully — your schema changes are live!
 
+<details><summary>Applied details (8 tables)</summary>
+
+
 **`orders`**
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -2868,6 +2876,75 @@ ALTER TABLE `audit_logs` ADD INDEX `idx_created_at`(`created_at`);
 ```sql
 ALTER TABLE `notifications` ADD INDEX `idx_user_status`(`user_id`, `status`);
 ```
+
+</details>
+
+_Apply ID: `apply-a1b2c3d4e5f6`_
+
+</details>
+
+<details>
+<summary><a name="summary-vitess-ddl--vschema"></a><strong>Summary: Vitess DDL + VSchema</strong></summary>
+
+
+## ✅ Schema Change Applied — Staging
+
+**Database**: `testapp`
+
+
+> Schema change applied successfully — your changes are live!
+
+<details><summary>Applied details (1 table, 1 VSchema update)</summary>
+
+Applied by namespace:
+
+- `testapp`: 1 table
+- `myapp_sharded`: 1 VSchema update
+
+
+**`users`**
+```sql
+ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+```
+
+
+### VSchema
+
+**`myapp_sharded`**: Applied
+
+```diff
++ "xxhash": {"type": "xxhash"}
+```
+
+</details>
+
+_Apply ID: `apply-a1b2c3d4e5f6`_
+
+</details>
+
+<details>
+<summary><a name="summary-vitess-vschema-only"></a><strong>Summary: Vitess VSchema Only</strong></summary>
+
+
+## ✅ Schema Change Applied — Staging
+
+**Database**: `testapp`
+
+
+> VSchema applied successfully — your changes are live!
+
+<details><summary>Applied details (1 VSchema update)</summary>
+
+
+### VSchema
+
+**`myapp_sharded`**: Applied
+
+```diff
++ "xxhash": {"type": "xxhash"}
+```
+
+</details>
 
 _Apply ID: `apply-a1b2c3d4e5f6`_
 
@@ -3005,6 +3082,15 @@ schemabot apply -e staging
 
 > All 5 tables applied successfully — your schema changes are live!
 
+<details><summary>Applied details (5 tables)</summary>
+
+Applied by namespace:
+
+- `commerce`: 2 tables
+- `customers`: 2 tables
+- `analytics`: 1 table
+
+
 ### ✅ commerce
 
 **`orders`**
@@ -3037,6 +3123,8 @@ ALTER TABLE `addresses` ADD INDEX `idx_zip`(`zip_code`);
 ```sql
 ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 ```
+
+</details>
 
 _Apply ID: `apply-a1b2c3d4e5f6`_
 </details>
@@ -5405,6 +5493,9 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 > All 3 tables applied successfully — your schema changes are live!
 
+<details><summary>Applied details (3 tables)</summary>
+
+
 ### ✅ testapp
 
 **`orders`**
@@ -5421,6 +5512,8 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+
+</details>
 
 _Apply ID: `apply-a1b2c3d4e5f6`_
 
@@ -5436,6 +5529,9 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 
 > All 3 tables applied successfully — your schema changes are live!
 
+<details><summary>Applied details (3 tables)</summary>
+
+
 ### ✅ testapp
 
 **`orders`**
@@ -5452,6 +5548,8 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+
+</details>
 
 _Apply ID: `apply-a1b2c3d4e5f6`_
 
@@ -5467,6 +5565,9 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 
 > All 3 tables applied successfully — your schema changes are live!
 
+<details><summary>Applied details (3 tables)</summary>
+
+
 ### ✅ testapp
 
 **`orders`**
@@ -5483,6 +5584,8 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+
+</details>
 
 _Apply ID: `apply-a1b2c3d4e5f6`_
 
@@ -5526,6 +5629,9 @@ schemabot apply -e production
 
 > All 3 tables applied successfully — your schema changes are live!
 
+<details><summary>Applied details (3 tables)</summary>
+
+
 ### ✅ testapp
 
 **`orders`**
@@ -5542,6 +5648,8 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+
+</details>
 
 _Apply ID: `apply-a1b2c3d4e5f6`_
 
