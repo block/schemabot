@@ -284,21 +284,27 @@ func protoShardPlansToStorage(shards []*ternv1.ShardPlan) ([]storage.ShardPlan, 
 			if ch == nil {
 				return nil, fmt.Errorf("shard plan %d (namespace %q shard %q) change %d is null", i, namespace, shardName, j)
 			}
-			if strings.TrimSpace(ch.TableName) == "" || strings.TrimSpace(ch.Ddl) == "" {
+			// Trim before validating and persisting: these values cross the gRPC
+			// boundary and later build operation keys and task rows, so preserved
+			// surrounding whitespace would yield surprising keys and reconciliation/
+			// progress mismatches.
+			table := strings.TrimSpace(ch.TableName)
+			changeDDL := strings.TrimSpace(ch.Ddl)
+			if table == "" || changeDDL == "" {
 				return nil, fmt.Errorf("shard plan %d (namespace %q shard %q) change %d has an empty table or DDL", i, namespace, shardName, j)
 			}
 			switch ch.ChangeType {
 			case ternv1.ChangeType_CHANGE_TYPE_CREATE, ternv1.ChangeType_CHANGE_TYPE_ALTER, ternv1.ChangeType_CHANGE_TYPE_DROP:
 			default:
-				return nil, fmt.Errorf("shard plan %d (namespace %q shard %q) change %d (table %q) has unsupported change type %v", i, namespace, shardName, j, ch.TableName, ch.ChangeType)
+				return nil, fmt.Errorf("shard plan %d (namespace %q shard %q) change %d (table %q) has unsupported change type %v", i, namespace, shardName, j, table, ch.ChangeType)
 			}
-			if ch.Namespace != "" && ch.Namespace != namespace {
-				return nil, fmt.Errorf("shard plan %d shard %q change %d (table %q) namespace %q disagrees with shard namespace %q", i, shardName, j, ch.TableName, ch.Namespace, namespace)
+			if cn := strings.TrimSpace(ch.Namespace); cn != "" && cn != namespace {
+				return nil, fmt.Errorf("shard plan %d shard %q change %d (table %q) namespace %q disagrees with shard namespace %q", i, shardName, j, table, cn, namespace)
 			}
 			sp.Changes = append(sp.Changes, storage.TableChange{
 				Namespace: namespace,
-				Table:     ch.TableName,
-				DDL:       ch.Ddl,
+				Table:     table,
+				DDL:       changeDDL,
 				Operation: protoChangeTypeToOperation(ch.ChangeType),
 			})
 		}

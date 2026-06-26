@@ -66,21 +66,40 @@ func TestScopedDispatchDDLChangesFailsClosed(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "nil")
 	})
+	t.Run("empty namespace", func(t *testing.T) {
+		// The namespace is authoritative scope for a shard-scoped dispatch.
+		_, err := scopedDispatchDDLChanges([]*ternv1.TableChange{{TableName: "mutes", Ddl: "x", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER}})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "empty namespace")
+	})
 	t.Run("empty table or DDL", func(t *testing.T) {
-		_, err := scopedDispatchDDLChanges([]*ternv1.TableChange{{TableName: "mutes", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER}})
+		_, err := scopedDispatchDDLChanges([]*ternv1.TableChange{{Namespace: "ks", TableName: "mutes", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER}})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "empty table or DDL")
 	})
 	t.Run("unsupported change type", func(t *testing.T) {
-		_, err := scopedDispatchDDLChanges([]*ternv1.TableChange{{TableName: "mutes", Ddl: "ALTER TABLE `mutes` ADD INDEX (`x`)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_OTHER}})
+		_, err := scopedDispatchDDLChanges([]*ternv1.TableChange{{Namespace: "ks", TableName: "mutes", Ddl: "ALTER TABLE `mutes` ADD INDEX (`x`)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_OTHER}})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "unsupported change type")
 	})
 	t.Run("vschema is not shard-scoped", func(t *testing.T) {
 		// A VSchema update is keyspace-wide (applied by the task-less
 		// group_finalizer), never shard-scoped — reject it here.
-		_, err := scopedDispatchDDLChanges([]*ternv1.TableChange{{TableName: "mutes", Ddl: "x", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA}})
+		_, err := scopedDispatchDDLChanges([]*ternv1.TableChange{{Namespace: "ks", TableName: "mutes", Ddl: "x", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA}})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "unsupported change type")
+	})
+	t.Run("values are trimmed before storing", func(t *testing.T) {
+		got, err := scopedDispatchDDLChanges([]*ternv1.TableChange{{
+			Namespace:  "  ks  ",
+			TableName:  "  mutes  ",
+			Ddl:        "  ALTER TABLE `mutes` ADD INDEX (`x`)  ",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		}})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, "ks", got[0].Namespace)
+		assert.Equal(t, "mutes", got[0].Table)
+		assert.Equal(t, "ALTER TABLE `mutes` ADD INDEX (`x`)", got[0].DDL, "surrounding whitespace must not leak into operation keys/tasks")
 	})
 }

@@ -1423,7 +1423,18 @@ func scopedDispatchDDLChanges(changes []*ternv1.TableChange) ([]storage.TableCha
 		if ch == nil {
 			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d is nil", i)
 		}
-		if strings.TrimSpace(ch.TableName) == "" || strings.TrimSpace(ch.Ddl) == "" {
+		// Trim before validating and storing: these values build operation keys and
+		// task rows, so preserved surrounding whitespace would yield surprising keys
+		// and reconciliation/progress mismatches. A shard-scoped dispatch is the
+		// per-(namespace, shard) fan-out the control plane owns, so the namespace is
+		// authoritative scope and must be present.
+		namespace := strings.TrimSpace(ch.Namespace)
+		table := strings.TrimSpace(ch.TableName)
+		ddl := strings.TrimSpace(ch.Ddl)
+		if namespace == "" {
+			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d has empty namespace", i)
+		}
+		if table == "" || ddl == "" {
 			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d has empty table or DDL", i)
 		}
 		op := protoChangeTypeToDDLAction(ch.ChangeType)
@@ -1432,12 +1443,12 @@ func scopedDispatchDDLChanges(changes []*ternv1.TableChange) ([]storage.TableCha
 		// by the task-less group_finalizer path — so accepting it here would build a
 		// shard-tagged task with an unexpected operation. Reject it explicitly.
 		if op == "unknown" || op == "vschema_update" {
-			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d (table %q) has unsupported change type %v", i, ch.TableName, ch.ChangeType)
+			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d (table %q) has unsupported change type %v", i, table, ch.ChangeType)
 		}
 		out = append(out, storage.TableChange{
-			Namespace: ch.Namespace,
-			Table:     ch.TableName,
-			DDL:       ch.Ddl,
+			Namespace: namespace,
+			Table:     table,
+			DDL:       ddl,
 			Operation: op,
 		})
 	}

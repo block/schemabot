@@ -43,7 +43,13 @@ func TestPlanStore_RoundTripsShardPlans(t *testing.T) {
 		},
 		Shards: []storage.ShardPlan{
 			{Namespace: "commerce", Shard: "80-"},
-			{Namespace: "commerce", Shard: "-80"},
+			// -80 carries its own per-shard DDL; the round-trip must preserve it.
+			{Namespace: "commerce", Shard: "-80", Changes: []storage.TableChange{{
+				Namespace: "commerce",
+				Table:     "users",
+				DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+				Operation: "alter",
+			}}},
 		},
 		CreatedAt: time.Now(),
 	})
@@ -54,9 +60,14 @@ func TestPlanStore_RoundTripsShardPlans(t *testing.T) {
 	require.NotNil(t, got)
 
 	assert.Equal(t, []storage.ShardPlan{
-		{Namespace: "commerce", Shard: "-80"},
+		{Namespace: "commerce", Shard: "-80", Changes: []storage.TableChange{{
+			Namespace: "commerce",
+			Table:     "users",
+			DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			Operation: "alter",
+		}}},
 		{Namespace: "commerce", Shard: "80-"},
-	}, got.Shards)
+	}, got.Shards, "per-shard Changes must round-trip through plan_data JSON")
 	require.Contains(t, got.Namespaces, "commerce")
 	assert.Equal(t, got.Shards, got.Namespaces["commerce"].Shards)
 	assert.Equal(t, []storage.TableChange{{

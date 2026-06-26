@@ -364,25 +364,30 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 	c.logger.Info("sequential resume finished", "apply_id", apply.ApplyIdentifier, "state", apply.State)
 }
 
-// shardTableKey identifies a table change within a specific shard. For a
-// non-sharded engine the shard is empty, so keying degrades to table-only and
-// matches the pre-sharding behavior.
+// shardTableKey identifies a table change within a specific (namespace, shard).
+// A plan is keyed by (Namespace, Shard), so the same table name can appear in
+// more than one namespace (multiple Vitess keyspaces) and on more than one shard
+// within a namespace; both must be in the key to avoid conflating tasks. For a
+// non-sharded engine the shard is empty, so keying degrades to (namespace,
+// table) and matches the pre-sharding behavior.
 type shardTableKey struct {
-	shard string
-	table string
+	namespace string
+	shard     string
+	table     string
 }
 
-// replanShardTableDDL indexes a re-plan's table changes by (shard, table) -> DDL
-// so the resume/recovery path reconciles each task against its own shard. A
-// sharded engine emits one SchemaChange per shard and the same table repeats
-// across shards, so keying by table name alone would conflate per-shard tasks:
-// another shard's remaining diff could keep this shard's task active, or update
-// it with another shard's DDL.
+// replanShardTableDDL indexes a re-plan's table changes by
+// (namespace, shard, table) -> DDL so the resume/recovery path reconciles each
+// task against its own namespace and shard. A sharded engine emits one
+// SchemaChange per (namespace, shard) and the same table repeats across them, so
+// keying by table name alone would conflate tasks: another shard's (or another
+// keyspace's) remaining diff could keep this task active, or update it with the
+// wrong DDL.
 func replanShardTableDDL(result *engine.PlanResult) map[shardTableKey]string {
 	out := make(map[shardTableKey]string)
 	for _, sc := range result.Changes {
 		for _, tc := range sc.TableChanges {
-			out[shardTableKey{shard: sc.Shard.Name, table: tc.Table}] = tc.DDL
+			out[shardTableKey{namespace: sc.Namespace, shard: sc.Shard.Name, table: tc.Table}] = tc.DDL
 		}
 	}
 	return out
@@ -396,7 +401,7 @@ func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.
 	if err != nil {
 		return false, fmt.Errorf("re-plan check failed: %w", err)
 	}
-	_, stillNeeded := replanShardTableDDL(result)[shardTableKey{shard: task.Shard, table: task.TableName}]
+	_, stillNeeded := replanShardTableDDL(result)[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
 	return stillNeeded, nil
 }
 
@@ -419,9 +424,9 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 		return nil, fmt.Errorf("re-plan failed: %w", err)
 	}
 
-	// Index the re-plan's remaining changes by (shard, table) so each task is
-	// reconciled against its own shard rather than conflated with same-named
-	// tables on other shards.
+	// Index the re-plan's remaining changes by (namespace, shard, table) so each
+	// task is reconciled against its own namespace and shard rather than conflated
+	// with same-named tables in other keyspaces or on other shards.
 	replanDDL := replanShardTableDDL(replanOut)
 
 	// Partition tasks: already-done vs still-needed
@@ -432,7 +437,7 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 		if task.State == state.Task.Completed {
 			continue
 		}
-		ddl, stillNeeded := replanDDL[shardTableKey{shard: task.Shard, table: task.TableName}]
+		ddl, stillNeeded := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
 		if !stillNeeded {
 			// This shard's table is no longer in the diff — it already completed.
 			task.ProgressPercent = 100
