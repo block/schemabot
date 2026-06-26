@@ -289,6 +289,76 @@ func TestUpdateApplyStateFromOperations_ContinuePolicy(t *testing.T) {
 	}
 }
 
+// releaseLatchControlStore returns a fixed release latch from GetByOperation so
+// the operator's apply-state writer can be driven with or without a release.
+type releaseLatchControlStore struct {
+	storage.ControlRequestStore
+	release *storage.ApplyControlRequest
+}
+
+func (s *releaseLatchControlStore) GetByOperation(_ context.Context, _ int64, op storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	if op == storage.ControlOperationRelease {
+		return s.release, nil
+	}
+	return nil, nil
+}
+
+// TestUpdateApplyStateFromOperations_PausePolicy verifies the operator projects
+// the release latch over an on_failure "pause" rollout: an unreleased pause
+// holds the apply paused while a later sibling is still pending, and an operator
+// release latches the rollout open so the same failure projects running_degraded
+// like continue.
+func TestUpdateApplyStateFromOperations_PausePolicy(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, State: state.ApplyOperation.Failed, OnFailure: storage.OnFailurePause},
+		{ID: 2, State: state.ApplyOperation.Pending, OnFailure: storage.OnFailurePause},
+	}
+	cases := []struct {
+		name      string
+		release   *storage.ApplyControlRequest
+		wantState string
+	}{
+		{
+			name:      "unreleased pause holds the apply paused",
+			release:   nil,
+			wantState: state.Apply.Paused,
+		},
+		{
+			name:      "released pause projects running_degraded like continue",
+			release:   &storage.ApplyControlRequest{Operation: storage.ControlOperationRelease, Status: storage.ControlRequestCompleted},
+			wantState: state.Apply.RunningDegraded,
+		},
+		{
+			name:      "failed release does not latch and stays paused",
+			release:   &storage.ApplyControlRequest{Operation: storage.ControlOperationRelease, Status: storage.ControlRequestFailed},
+			wantState: state.Apply.Paused,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			applyStore := &recordingApplyStore{swapped: true}
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorageWithControlAndOps{
+				applies:  applyStore,
+				applyOps: &listingApplyOperationStore{ops: ops},
+				control:  &releaseLatchControlStore{release: tc.release},
+			}, testServerConfig(), nil, logger)
+
+			apply := &storage.Apply{
+				ID:              3,
+				ApplyIdentifier: "apply-pause",
+				State:           state.Apply.Pending,
+				Environment:     "staging",
+			}
+
+			_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+			require.NoError(t, err)
+			require.NotNil(t, applyStore.updated)
+			assert.Equal(t, tc.wantState, applyStore.updated.State)
+		})
+	}
+}
+
 func TestUpdateApplyStateFromOperations_FinalizerPendingIsNonTerminal(t *testing.T) {
 	applyStore := &recordingApplyStore{swapped: true}
 	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: []*storage.ApplyOperation{

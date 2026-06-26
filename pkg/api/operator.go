@@ -1553,13 +1553,31 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		return applyProjectionResult{}, fmt.Errorf("derive apply state for apply %s (%d): no apply_operations rows", apply.ApplyIdentifier, apply.ID)
 	}
 
+	// Load the release latch once for the whole apply: a released pause behaves
+	// like continue for the rollout projection, so a paused apply that an
+	// operator has released no longer holds at paused. A failed release does not
+	// latch (fail-closed), per ApplyControlRequest.ReleasesPausedRollout. With
+	// no control-request store a release latch cannot exist, so an unreleased
+	// pause stays held.
+	released := false
+	if requests := s.storage.ControlRequests(); requests != nil {
+		releaseReq, err := requests.GetByOperation(ctx, apply.ID, storage.ControlOperationRelease)
+		if err != nil {
+			return applyProjectionResult{}, fmt.Errorf("load release latch for apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+		}
+		released = releaseReq.ReleasesPausedRollout()
+	}
+
 	childStates := make([]string, len(ops))
 	children := make([]state.RolloutChild, len(ops))
 	for i, op := range ops {
 		childStates[i] = op.State
+		isContinue := op.OnFailure == storage.OnFailureContinue
+		isPause := op.OnFailure == storage.OnFailurePause
 		children[i] = state.RolloutChild{
 			State:             op.State,
-			ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
+			ContinueOnFailure: isContinue || (isPause && released),
+			PauseOnFailure:    isPause && !released,
 		}
 	}
 	base := state.DeriveApplyState(childStates)
