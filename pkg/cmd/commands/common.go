@@ -309,13 +309,13 @@ func resolveControlFlags(endpoint, profile, applyID, environment string) (string
 // applyAndWatch extracts a plan ID, calls the apply API, prints status, and
 // optionally watches progress. Used by both RunApply and RunRollback.
 func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, environment, caller, operation string,
-	deferCutover, deferDeploy, skipRevert bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) error {
+	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) error {
 
 	if planResult.PlanID == "" {
 		return fmt.Errorf("no plan_id in response")
 	}
 
-	options := buildApplyOptions(planResult, deferCutover, deferDeploy, skipRevert, branch, watch, format)
+	options := buildApplyOptions(planResult, deferCutover, deferDeploy, skipRevert, allowUnsafe, branch, watch, format)
 
 	var applyResult *apitypes.ApplyResponse
 	err := withLoading("Submitting schema change...", format != OutputFormatJSON, func() error {
@@ -364,7 +364,7 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 	return nil
 }
 
-func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDeploy, skipRevert bool, branch string, watch bool, format OutputFormat) map[string]string {
+func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat) map[string]string {
 	options := make(map[string]string)
 	isPlanetScale := planResult != nil && state.IsPlanetScaleEngine(planResult.Engine)
 	if deferCutover {
@@ -377,6 +377,9 @@ func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDep
 	}
 	if skipRevert {
 		options["skip_revert"] = "true"
+	}
+	if allowUnsafe {
+		options["allow_unsafe"] = "true"
 	}
 	if branch != "" {
 		options["branch"] = branch

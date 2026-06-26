@@ -88,7 +88,7 @@ func TestBuildApplyOptionsDefersDeployOnlyForPlanetScale(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			options := buildApplyOptions(&apitypes.PlanResponse{Engine: tt.engine}, false, tt.deferDeploy, false, "", tt.watch, tt.format)
+			options := buildApplyOptions(&apitypes.PlanResponse{Engine: tt.engine}, false, tt.deferDeploy, false, false, "", tt.watch, tt.format)
 			_, gotDeferred := options["defer_deploy"]
 			assert.Equal(t, tt.wantDeferred, gotDeferred)
 		})
@@ -96,10 +96,11 @@ func TestBuildApplyOptionsDefersDeployOnlyForPlanetScale(t *testing.T) {
 }
 
 func TestBuildApplyOptionsPreservesOtherOptions(t *testing.T) {
-	options := buildApplyOptions(&apitypes.PlanResponse{Engine: storage.EnginePlanetScale}, true, true, true, "feature-branch", false, OutputFormatLog)
+	options := buildApplyOptions(&apitypes.PlanResponse{Engine: storage.EnginePlanetScale}, true, true, true, true, "feature-branch", false, OutputFormatLog)
 
 	require.Equal(t, "true", options["defer_cutover"])
 	require.Equal(t, "true", options["defer_deploy"])
 	require.Equal(t, "true", options["skip_revert"])
+	require.Equal(t, "true", options["allow_unsafe"])
 	require.Equal(t, "feature-branch", options["branch"])
 }
