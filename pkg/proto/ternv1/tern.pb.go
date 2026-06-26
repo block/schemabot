@@ -1376,10 +1376,13 @@ func (x *LintViolation) GetSeverity() string {
 // reviewed DDL is what gets applied (no plan-time/apply-time TOCTOU where a
 // membership flag was saved but the DDL was not).
 type ShardPlan struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Shard         string                 `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
-	Namespace     string                 `protobuf:"bytes,2,opt,name=namespace,proto3" json:"namespace,omitempty"`
-	Changes       []*TableChange         `protobuf:"bytes,4,rep,name=changes,proto3" json:"changes,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// needs_change (field 3) was removed pre-release: a shard is changing iff
+	// changes is non-empty. No reserved marker — this proto has no released
+	// consumers, so reusing the field number is a safe, deliberate breaking change.
+	Shard         string         `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
+	Namespace     string         `protobuf:"bytes,2,opt,name=namespace,proto3" json:"namespace,omitempty"`
+	Changes       []*TableChange `protobuf:"bytes,3,rep,name=changes,proto3" json:"changes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3081,11 +3084,11 @@ const file_tern_proto_rawDesc = "" +
 	"\x06column\x18\x03 \x01(\tR\x06column\x12\x16\n" +
 	"\x06linter\x18\x04 \x01(\tR\x06linter\x12\x19\n" +
 	"\bfix_type\x18\x05 \x01(\tR\afixType\x12\x1a\n" +
-	"\bseverity\x18\x06 \x01(\tR\bseverity\"\x83\x01\n" +
+	"\bseverity\x18\x06 \x01(\tR\bseverity\"o\n" +
 	"\tShardPlan\x12\x14\n" +
 	"\x05shard\x18\x01 \x01(\tR\x05shard\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12.\n" +
-	"\achanges\x18\x04 \x03(\v2\x14.tern.v1.TableChangeR\achangesJ\x04\b\x03\x10\x04R\fneeds_change\"\x86\x02\n" +
+	"\achanges\x18\x03 \x03(\v2\x14.tern.v1.TableChangeR\achanges\"\x86\x02\n" +
 	"\fPlanResponse\x12\x17\n" +
 	"\aplan_id\x18\x01 \x01(\tR\x06planId\x12'\n" +
 	"\x06engine\x18\x02 \x01(\x0e2\x0f.tern.v1.EngineR\x06engine\x12/\n" +

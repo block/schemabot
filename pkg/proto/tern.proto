@@ -433,11 +433,12 @@ message LintViolation {
 // reviewed DDL is what gets applied (no plan-time/apply-time TOCTOU where a
 // membership flag was saved but the DDL was not).
 message ShardPlan {
-  reserved 3; // was needs_change; a shard is changing iff changes is non-empty
-  reserved "needs_change";
+  // needs_change (field 3) was removed pre-release: a shard is changing iff
+  // changes is non-empty. No reserved marker — this proto has no released
+  // consumers, so reusing the field number is a safe, deliberate breaking change.
   string shard = 1;
   string namespace = 2;
-  repeated TableChange changes = 4;
+  repeated TableChange changes = 3;
 }
 
 // PlanResponse contains the generated schema change plan.
