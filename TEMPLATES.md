@@ -689,9 +689,9 @@ schemabot apply -e staging --allow-unsafe
 <summary><a name="drop-index-blocked"></a><strong>Drop Index Blocked</strong></summary>
 
 
-## MySQL Schema Change Plan
+## Schema Change Plan — Staging
 
-**Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
