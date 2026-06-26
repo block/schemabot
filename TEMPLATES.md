@@ -5710,6 +5710,204 @@ _No details available yet._
 </details>
 </details>
 
+## Sharded Apply
+
+### PR Comments
+
+<details>
+<summary><a name="plan-divergent-shards"></a><strong>Plan: Divergent Shards</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+#### Keyspace: `cdb_resolute_sharded`
+Shards diverge — what applies where:
+
+**shards `-40`, `80-c0`, `c0-`**
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+**shard `40-80`**
+
+```sql
+ALTER TABLE `mutes`
+    ADD INDEX `created_at`(`created_at`),
+    ADD COLUMN `reason` varchar(255);
+```
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+💡 **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="plan-unsafe-change-on-one-shard"></a><strong>Plan: Unsafe Change On One Shard</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+#### Keyspace: `cdb_resolute_sharded`
+Shards diverge — what applies where:
+
+**shards `-40`, `80-c0`, `c0-`**
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+**shard `40-80`**
+
+```sql
+ALTER TABLE `mutes`
+    ADD INDEX `created_at`(`created_at`),
+    DROP COLUMN `legacy_reason`;
+```
+
+**⛔ Unsafe Changes Detected:**
+- `mutes` (shard `40-80`): DROP COLUMN removes data and is irreversible
+
+**Destructive drop guidance:**
+
+Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
+
+📋 **Plan**: 2 DDL statements
+
+
+---
+
+💡 **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="apply-in-progress"></a><strong>Apply In Progress</strong></summary>
+
+
+## Schema Change In Progress — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Shards**: 1 running table copy, 3 waiting for -40
+
+#### Keyspace `cdb_resolute_sharded`
+
+| Shard | Status |
+| --- | --- |
+| `-40` | 🔄 running table copy |
+| `40-80` | ⏳ waiting for -40 |
+| `80-c0` | ⏳ waiting for -40 |
+| `c0-` | ⏳ waiting for -40 |
+
+`mutes`
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="apply-failed-one-shard-failed"></a><strong>Apply Failed (One Shard Failed)</strong></summary>
+
+
+## ❌ Schema Change Failed — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Shards**: 1 failed, 3 halted
+
+> ⚠️ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
+
+#### Keyspace `cdb_resolute_sharded`
+
+| Shard | Status |
+| --- | --- |
+| `-40` | ❌ failed — resolve shard primary for `-40`: context deadline exceeded |
+| `40-80` | ⏸ halted — -40 failed |
+| `80-c0` | ⏸ halted — -40 failed |
+| `c0-` | ⏸ halted — -40 failed |
+
+`mutes`
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+---
+
+To retry:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="apply-with-divergent-shards"></a><strong>Apply With Divergent Shards</strong></summary>
+
+
+## Schema Change In Progress — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Shards**: 1 running table copy, 2 waiting for -40
+
+#### Keyspace `cdb_resolute_sharded`
+
+Shards diverge — grouped by change:
+
+**shards `-40`, `80-c0`**
+
+| Shard | Status |
+| --- | --- |
+| `-40` | 🔄 running table copy |
+| `80-c0` | ⏳ waiting for -40 |
+
+`mutes`
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+**shard `40-80`**
+
+| Shard | Status |
+| --- | --- |
+| `40-80` | ⏳ waiting for -40 |
+
+`mutes`
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`), ADD COLUMN `reason` varchar(255);
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+</details>
+
 ## Multi-Deployment Apply (CLI)
 
 <details>

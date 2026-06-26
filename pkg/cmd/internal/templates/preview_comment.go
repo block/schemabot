@@ -267,6 +267,20 @@ func previewCommentMultiDeployAllOutput() {
 	printSections(sections)
 }
 
+func previewCommentShardedAllOutput() {
+	sections := []struct {
+		name string
+		fn   func()
+	}{
+		{"PLAN: DIVERGENT SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanDivergent()) }},
+		{"PLAN: UNSAFE CHANGE ON ONE SHARD", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanUnsafe()) }},
+		{"APPLY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyInProgress()) }},
+		{"APPLY FAILED (ONE SHARD FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyFailed()) }},
+		{"APPLY WITH DIVERGENT SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyDivergent()) }},
+	}
+	printSections(sections)
+}
+
 func previewCLIPlanAllOutput() {
 	sections := []struct {
 		name string

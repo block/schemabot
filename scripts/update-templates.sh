@@ -162,6 +162,15 @@ render_paired_section "Apply Flow"     "comment_apply_flow_all" "cli_apply_all"
     "$BINARY" preview "comment_multi_deploy_all" 2>&1 | wrap_sections
 } >> "$SNAPSHOT"
 
+{
+    echo ""
+    echo "## Sharded Apply"
+    echo ""
+    echo "### PR Comments"
+    echo ""
+    "$BINARY" preview "comment_sharded_all" 2>&1 | wrap_sections
+} >> "$SNAPSHOT"
+
 # === CLI-only sections ===
 render_cli_section "Multi-Deployment Apply (CLI)" "cli_multi_deploy_all"
 render_cli_section "Sequential Mode (CLI)" "sequential_all"
