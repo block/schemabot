@@ -24,6 +24,7 @@ func TestSequentialEngineApplyRequest_PropagatesShard(t *testing.T) {
 	require.Equal(t, []string{"-40"}, req.TargetShards, "the task's shard must reach the engine as a single target shard")
 	require.Len(t, req.Changes, 1)
 	assert.Equal(t, "-40", req.Changes[0].Shard.Name, "the shard is also set on the SchemaChange")
+	require.Len(t, req.Changes[0].TableChanges, 1)
 	assert.Equal(t, "mutes", req.Changes[0].TableChanges[0].Table)
 	assert.Equal(t, task.DDL, req.Changes[0].TableChanges[0].DDL)
 }

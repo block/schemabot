@@ -186,8 +186,9 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 		}
 	}
 
-	// Sequential mode: one DDL per engine call. Use the task identifier as
-	// MigrationContext so each table's schema change is tracked independently.
+	// Sequential mode: one DDL per engine call. The task identifier is used as the
+	// engine resume key (ResumeState.MigrationContext) so each table's schema
+	// change is tracked independently.
 	result, err := c.getEngine().Apply(ctx, sequentialEngineApplyRequest(task, options, taskCreds))
 
 	if err != nil {
