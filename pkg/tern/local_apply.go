@@ -79,8 +79,8 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		Credentials: c.credentials(),
 	})
 	if err != nil {
-		// result is nil on error, so it must not be dereferenced here.
-		c.logger.Debug("conflict check: engine progress failed", "task_id", t.TaskIdentifier, "err", err)
+		// result may be nil when err is non-nil, so it must not be dereferenced here.
+		c.logger.Warn("conflict check: engine progress failed", "task_id", t.TaskIdentifier, "err", err)
 		return false
 	}
 	c.logger.Debug("conflict check: engine progress", "task_id", t.TaskIdentifier, "engine_state", result.State, "message", result.Message)

@@ -95,11 +95,11 @@ func TestConflictCheckPreservesRetryableTask(t *testing.T) {
 	assert.Equal(t, state.Task.FailedRetryable, retryable.State)
 }
 
-// When the engine's Progress call errors it returns a nil result. The conflict
+// When the engine's Progress call errors it may return a nil result. The conflict
 // check must treat the task as unresolved (and keep it blocking) without
-// dereferencing that nil result — an earlier version logged result.State before
-// the error check and panicked, crashing the Apply RPC whenever Progress failed
-// (e.g. a DB connection torn down during shutdown).
+// dereferencing the result when err is non-nil — an earlier version logged
+// result.State before the error check and panicked, crashing the Apply RPC
+// whenever Progress failed (e.g. a DB connection torn down during shutdown).
 func TestConflictCheckHandlesProgressError(t *testing.T) {
 	running := &storage.Task{
 		ID:             5,
