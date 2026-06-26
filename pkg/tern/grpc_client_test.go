@@ -909,6 +909,45 @@ func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
 	assert.Equal(t, "staging", progressReq.Environment)
 }
 
+// A shard work operation (key "namespace/shard/table") whose tasks carry no
+// shard must fail closed at the control plane with a clear error, rather than
+// dispatching an empty TargetShards that the data plane rejects opaquely as
+// "expected exactly one target shard, got 0". This makes a version/data skew
+// self-diagnosing instead of surfacing as a confusing data-plane failure.
+func TestGRPCClient_ResumeApplyOperationFailsClosedOnShardOpMissingShard(t *testing.T) {
+	server := &capturingTernServer{remoteApplyID: "remote-skew"}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID: 7, ApplyIdentifier: "apply-skew", PlanID: 99, Database: "cdb_resolute",
+		DatabaseType: storage.DatabaseTypeStrata, Environment: "staging", State: state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "cdb-resolute-target"})
+	operationID := int64(42)
+	// The task is missing its shard — the skew this guard catches.
+	task := &storage.Task{
+		ID: 11, TaskIdentifier: "task-mutes", ApplyID: apply.ID, ApplyOperationID: &operationID,
+		TableName: "mutes", Shard: "", Namespace: "cdb_resolute_sharded",
+		DDL: "ALTER TABLE mutes ADD INDEX created_at (created_at)", DDLAction: "alter", State: state.Task.Pending,
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		plans:   &mockPlanStore{plan: &storage.Plan{ID: apply.PlanID, PlanIdentifier: "plan-skew"}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "cdb-resolute-deployment", OperationKey: "cdb_resolute_sharded/-40/mutes", State: state.ApplyOperation.Pending},
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected exactly one target shard")
+	assert.Nil(t, server.getApplyRequest(), "must not dispatch to the data plane when the shard scope is missing")
+}
+
 func TestGRPCClient_ResumeApplyOperationDispatchesScopedTasks(t *testing.T) {
 	// An operator driver resumes a single apply_operation over the remote path.
 	// The drive loads tasks scoped to that operation (GetByApplyOperationID) and

@@ -1901,6 +1901,22 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		return err
 	}
 
+	// Fail closed before dispatch when a shard-scoped operation resolves no target
+	// shard. A shard work operation (key "namespace/shard/table") must dispatch
+	// exactly one shard; if its tasks carry no shard the dispatch would send an
+	// empty TargetShards and the data plane would reject it opaquely with
+	// "expected exactly one target shard, got 0". Surfacing it here — as a clear
+	// control-plane error — turns a version/data skew into an actionable message
+	// instead of a confusing data-plane failure.
+	targetShards := taskTargetShards(tasks)
+	if scope.operation != nil && isShardWorkOperationKey(scope.operation.OperationKey) && len(targetShards) != 1 {
+		errMsg := fmt.Sprintf("queued gRPC apply failed: shard operation %q resolved %d target shards, expected exactly 1 — its tasks carry no shard, so refusing to dispatch (the data plane would reject with \"expected exactly one target shard, got 0\"); this indicates a version or data skew", scope.operation.OperationKey, len(targetShards))
+		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
+			return fmt.Errorf("mark queued gRPC apply %s failed after shard-scope guard: %w", apply.ApplyIdentifier, markErr)
+		}
+		return fmt.Errorf("queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
+	}
+
 	// Use the per-operation copy-drive options so a multi-operation barrier
 	// deployment parks the remote engine at the cutover barrier instead of
 	// running straight through the swap. effectiveCopyDriveOptions OR's
@@ -1927,7 +1943,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		Environment:    apply.Environment,
 		Target:         target,
 		Caller:         apply.Caller,
-		TargetShards:   taskTargetShards(tasks),
+		TargetShards:   targetShards,
 		IdempotencyKey: remoteApplyIdempotencyKey(apply, scope),
 	})
 	if err != nil {
@@ -2110,6 +2126,15 @@ func tasksToProtoTableChanges(tasks []*storage.Task) []*ternv1.TableChange {
 		})
 	}
 	return changes
+}
+
+// isShardWorkOperationKey reports whether an operation key is a sharded work
+// key ("namespace/shard/table") — the per-shard fan-out's unit. A whole-apply
+// key (empty) and a finalizer key ("namespace/group_finalizer") are not, so the
+// shard-scope guard applies only to per-shard work.
+func isShardWorkOperationKey(key string) bool {
+	parts := strings.Split(key, "/")
+	return len(parts) == 3 && parts[0] != "" && parts[1] != "" && parts[2] != ""
 }
 
 func taskTargetShards(tasks []*storage.Task) []string {

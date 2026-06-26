@@ -490,7 +490,15 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		}
 		shard := templates.KeyspaceShardChange{Shard: sp.Shard}
 		for _, t := range sp.Changes {
+			if t == nil || t.DDL == "" {
+				continue
+			}
 			shard.Statements = append(shard.Statements, t.DDL)
+		}
+		// A shard with no DDL is not changing; skipping it keeps it out of the
+		// shard-grouped rendering and the change count.
+		if len(shard.Statements) == 0 {
+			continue
 		}
 		shardsByKeyspace[sp.Namespace] = append(shardsByKeyspace[sp.Namespace], shard)
 	}

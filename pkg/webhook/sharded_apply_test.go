@@ -142,8 +142,10 @@ func TestBuildShardedApplyData_DivergentGroupsByTable(t *testing.T) {
 	assert.Equal(t, "40-80", data.Shards[1].Shard)
 }
 
-// An operation with more than one task for its (shard, table) joins every task's
-// DDL into the cell, rather than dropping all but the first.
+// Defensive: in practice a (shard, table) operation has a single task — multiple
+// statements for one table are combined into one ALTER upstream — but if more
+// than one task ever shows up, every non-empty DDL is joined in deterministic id
+// order rather than dropping all but the first.
 func TestBuildShardedApplyData_JoinsMultiTaskDDL(t *testing.T) {
 	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running}
 	op := &storage.ApplyOperation{ID: 1, ApplyID: 1, Deployment: "cake", OperationKey: "ks/-40/mutes", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}

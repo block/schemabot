@@ -54,9 +54,10 @@ func TestBuildPlanCommentData_PerShardUnsafe(t *testing.T) {
 		}},
 		Shards: []*apitypes.ShardPlanResponse{
 			{Namespace: "cdb_resolute_sharded", Shard: "-40", Changes: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX a", ChangeType: "alter"}}},
+			// One combined ALTER per table; the drifted shard's single mutes change
+			// also drops a column and is flagged unsafe.
 			{Namespace: "cdb_resolute_sharded", Shard: "40-80", Changes: []*apitypes.TableChangeResponse{
-				{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX a", ChangeType: "alter"},
-				{TableName: "mutes", DDL: "ALTER TABLE `mutes` DROP COLUMN x", ChangeType: "alter", IsUnsafe: true, UnsafeReason: "DROP COLUMN removes data"},
+				{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX a, DROP COLUMN x", ChangeType: "alter", IsUnsafe: true, UnsafeReason: "DROP COLUMN removes data"},
 			}},
 		},
 	}

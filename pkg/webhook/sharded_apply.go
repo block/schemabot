@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"sort"
 	"strings"
 	"time"
 
@@ -17,7 +18,10 @@ const finalizerKeySegment = "group_finalizer"
 // empty key (a non-sharded apply) or a "namespace/group_finalizer" finalizer
 // key — so callers can tell shard work apart from the rest.
 func parseShardOperationKey(key string) (namespace, shard, table string, ok bool) {
-	parts := strings.SplitN(key, "/", 3)
+	// Split without a limit so a key with extra segments (e.g.
+	// "ns/-40/table/extra") fails the exact-three-parts check rather than folding
+	// the remainder into the table and being misclassified as shard work.
+	parts := strings.Split(key, "/")
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
 		return "", "", "", false
 	}
@@ -74,6 +78,14 @@ func isShardedApply(ops []*storage.ApplyOperation) bool {
 // their outcome is still reflected in the aggregate headline state.
 func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task) templates.ShardedApplyData {
 	tasksByOp := groupTasksByOperation(tasks)
+	// Tasks arrive in created_at DESC order with no id tiebreaker. Sort each
+	// operation's tasks by id so the joined DDL (and the change signature derived
+	// from it) is deterministic. In practice a (shard, table) operation has a
+	// single task — multiple statements for one table are combined into one ALTER
+	// upstream — but this keeps the rendering stable regardless.
+	for _, ts := range tasksByOp {
+		sort.Slice(ts, func(i, j int) bool { return ts[i].ID < ts[j].ID })
+	}
 
 	keyspace := ""
 	cells := make([]templates.ShardCell, 0, len(ops))

@@ -81,13 +81,16 @@ func TestRenderPlanComment_UnsafeShardChangeShowsShard(t *testing.T) {
 		Changes: []KeyspaceChangeData{{
 			Keyspace: "cdb_resolute_sharded",
 			Shards: []KeyspaceShardChange{
+				// One combined ALTER per table per shard; the drifted shard's single
+				// statement also drops a column (multiple statements for one table are
+				// not supported — they are combined into one ALTER upstream).
 				{Shard: "-40", Statements: []string{"ALTER TABLE `mutes` ADD INDEX a"}},
-				{Shard: "40-80", Statements: []string{"ALTER TABLE `mutes` ADD INDEX a", "ALTER TABLE `mutes` DROP COLUMN `x`"}},
+				{Shard: "40-80", Statements: []string{"ALTER TABLE `mutes` ADD INDEX a, DROP COLUMN `x`"}},
 			},
 		}},
 	})
 
 	assert.Contains(t, out, "Unsafe Changes")
 	assert.Contains(t, out, "`mutes` (shard `40-80`)", "the unsafe change names the shard it applies to")
-	assert.Contains(t, out, "DROP COLUMN `x`", "the drop statement is shown in that shard's group")
+	assert.Contains(t, out, "DROP COLUMN `x`", "the drop is shown in that shard's combined ALTER")
 }

@@ -228,6 +228,11 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 				UnsafeReason: t.UnsafeReason,
 			})
 		}
+		// A shard is changing iff it carries changes (the proto contract); drop an
+		// empty shard plan so it never renders a blank shard section downstream.
+		if len(apiSP.Changes) == 0 {
+			continue
+		}
 		httpResp.Shards = append(httpResp.Shards, apiSP)
 	}
 
