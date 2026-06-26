@@ -192,16 +192,20 @@ func TestConflictCheckIsPerShard(t *testing.T) {
 		logger: slog.Default(),
 	}
 	plan := &storage.Plan{Database: "cdb_resolute", DatabaseType: storage.DatabaseTypeMySQL}
+	tasks := []*storage.Task{activeShard}
+
+	// Assert the shard gate directly via findBlockingTask. checkActiveTaskConflict
+	// wraps it in a stale-task retry loop that sleeps ~1s on the blocking case,
+	// which this test does not need to exercise.
 
 	// A different shard is not a conflict — it runs concurrently.
-	require.NoError(t, client.checkActiveTaskConflict(t.Context(), plan, "40-80"),
+	assert.Empty(t, client.findBlockingTask(t.Context(), tasks, plan, "40-80"),
 		"an active task on shard -40 must not block an apply on shard 40-80")
 	assert.Equal(t, state.Task.Running, activeShard.State, "the other shard's task is left running")
 
 	// The same shard still conflicts.
-	err := client.checkActiveTaskConflict(t.Context(), plan, "-40")
-	require.Error(t, err, "an active task on shard -40 must block another apply on shard -40")
-	assert.Contains(t, err.Error(), "schema change already in progress")
+	assert.Equal(t, "task-shard-neg40", client.findBlockingTask(t.Context(), tasks, plan, "-40"),
+		"an active task on shard -40 must block another apply on shard -40")
 }
 
 // Once an abandoned in-flight task has been failed, it no longer blocks the
