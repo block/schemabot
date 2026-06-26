@@ -544,6 +544,16 @@ func (s *testControlRequestStore) GetPending(_ context.Context, applyID int64, o
 	return nil, nil
 }
 
+func (s *testControlRequestStore) GetByOperation(_ context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	for _, v := range slices.Backward(s.requests) {
+		req := v
+		if req.ApplyID == applyID && req.Operation == operation {
+			return cloneTestControlRequest(req), nil
+		}
+	}
+	return nil, nil
+}
+
 func (s *testControlRequestStore) CompletePending(_ context.Context, applyID int64, operation storage.ControlOperation) error {
 	for _, req := range s.requests {
 		if req.ApplyID == applyID && req.Operation == operation && req.Status == storage.ControlRequestPending {

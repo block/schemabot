@@ -291,6 +291,18 @@ func (s *memoryControlRequestStore) GetPending(_ context.Context, applyID int64,
 	return nil, nil
 }
 
+func (s *memoryControlRequestStore) GetByOperation(_ context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, v := range slices.Backward(s.requests) {
+		req := v
+		if req.ApplyID == applyID && req.Operation == operation {
+			return cloneControlRequest(req), nil
+		}
+	}
+	return nil, nil
+}
+
 func (s *memoryControlRequestStore) CompletePending(_ context.Context, applyID int64, operation storage.ControlOperation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
