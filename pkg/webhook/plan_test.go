@@ -43,6 +43,32 @@ func TestBuildPlanCommentData_CarriesPerShardChanges(t *testing.T) {
 	assert.Equal(t, []string{mutesDrift}, data.Changes[0].Shards[1].Statements, "the drifted shard keeps its own DDL")
 }
 
+// An unsafe change on a single shard (per-shard plan) is surfaced with its shard,
+// even when the collapsed namespace-level Changes don't carry it.
+func TestBuildPlanCommentData_PerShardUnsafe(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "cdb_resolute", Type: "strata"}
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace:    "cdb_resolute_sharded",
+			TableChanges: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX a", ChangeType: "alter"}},
+		}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "cdb_resolute_sharded", Shard: "-40", Changes: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX a", ChangeType: "alter"}}},
+			{Namespace: "cdb_resolute_sharded", Shard: "40-80", Changes: []*apitypes.TableChangeResponse{
+				{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX a", ChangeType: "alter"},
+				{TableName: "mutes", DDL: "ALTER TABLE `mutes` DROP COLUMN x", ChangeType: "alter", IsUnsafe: true, UnsafeReason: "DROP COLUMN removes data"},
+			}},
+		},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+
+	assert.True(t, data.HasUnsafeChanges)
+	require.Len(t, data.UnsafeChanges, 1)
+	assert.Equal(t, "mutes", data.UnsafeChanges[0].Table)
+	assert.Equal(t, []string{"40-80"}, data.UnsafeChanges[0].Shards, "the unsafe change is scoped to the drifted shard")
+}
+
 func TestBuildPlanCommentData_UnsafeChangesPopulated(t *testing.T) {
 	schema := &ghclient.SchemaRequestResult{
 		Database: "testdb",

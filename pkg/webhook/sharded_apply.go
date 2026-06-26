@@ -114,7 +114,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		Keyspace:    keyspace,
 		ApplyID:     apply.ApplyIdentifier,
 		RequestedBy: apply.Caller,
-		Shards:      shardStatuses(shardOrder, opsByShard),
+		Shards:      shardStatuses(shardOrder, opsByShard, tasksByOp),
 		Cells:       cells,
 	}
 	if apply.StartedAt != nil {
@@ -130,11 +130,11 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 // aggregated to a single representative state, then the shards are projected
 // together through pkg/presentation (shard name as identity) so ordering labels
 // reference sibling shards.
-func shardStatuses(shardOrder []string, opsByShard map[string][]*storage.ApplyOperation) []templates.ShardStatus {
+func shardStatuses(shardOrder []string, opsByShard map[string][]*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task) []templates.ShardStatus {
 	inputs := make([]presentation.Operation, 0, len(shardOrder))
 	for _, shard := range shardOrder {
 		shardOps := opsByShard[shard]
-		st, errMsg := aggregateShardState(shardOps)
+		st, errMsg := aggregateShardState(shardOps, tasksByOp)
 		first := shardOps[0]
 		inputs = append(inputs, presentation.Operation{
 			Deployment:        shard,
@@ -163,15 +163,33 @@ func shardStatuses(shardOrder []string, opsByShard map[string][]*storage.ApplyOp
 // aggregateShardState reduces a shard's operations to its most significant
 // state (and that operation's error), so a shard whose tables are in different
 // states shows the state an operator should act on first. A shard with a single
-// operation — the common case — returns that operation's state unchanged.
-func aggregateShardState(ops []*storage.ApplyOperation) (string, string) {
+// operation — the common case — returns that operation's state unchanged. When
+// the chosen operation row carries no error message (a remote failure records
+// the error on the operation's tasks, and the operator may not have stamped the
+// row), it falls back to the first task error so a failed shard always shows why
+// — otherwise the comment is silent and the operator has to dig through logs.
+func aggregateShardState(ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task) (string, string) {
 	best := ops[0]
 	for _, op := range ops[1:] {
 		if shardStateRank(op.State) > shardStateRank(best.State) {
 			best = op
 		}
 	}
-	return best.State, best.ErrorMessage
+	errMsg := best.ErrorMessage
+	if errMsg == "" {
+		errMsg = firstTaskError(tasksByOp[best.ID])
+	}
+	return best.State, errMsg
+}
+
+// firstTaskError returns the first non-empty task error for an operation.
+func firstTaskError(tasks []*storage.Task) string {
+	for _, t := range tasks {
+		if t.ErrorMessage != "" {
+			return t.ErrorMessage
+		}
+	}
+	return ""
 }
 
 // shardStateRank orders operation states by how much they demand attention, so

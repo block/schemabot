@@ -95,6 +95,26 @@ func TestFormatApplyStatusComment_ShardedFailedSurfacesError(t *testing.T) {
 	}
 }
 
+// A remote failure records the error on the operation's task, and the operator
+// may not stamp it onto the operation row. The apply comment must still surface
+// it (falling back to the task error) rather than going silent — the gap that
+// forced digging through Datadog.
+func TestFormatApplyStatusComment_ShardedFailureFallsBackToTaskError(t *testing.T) {
+	const gotZero = "strata work operation expected exactly one target shard, got 0"
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Failed}
+	op := &storage.ApplyOperation{
+		ID: 1, ApplyID: 1, Deployment: "cake", OperationKey: "cdb_resolute_sharded/-40/mutes",
+		State: state.ApplyOperation.Failed, ErrorMessage: "", // operation row carries no error
+		CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt,
+	}
+	oid := int64(1)
+	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: "-40", DDL: "ALTER ...", ErrorMessage: gotZero}}
+
+	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, tasks, nil, nil)
+
+	assert.Contains(t, out, gotZero, "the task error is surfaced when the operation row has none")
+}
+
 // A divergent sharded apply groups shards by change signature and keeps each
 // table's DDL once; the keyspace and cells come from the operation keys/tasks.
 func TestBuildShardedApplyData_DivergentGroupsByTable(t *testing.T) {

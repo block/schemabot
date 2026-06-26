@@ -70,3 +70,24 @@ func TestRenderPlanComment_ShardedOnlyPerShardDDLNotMiscounted(t *testing.T) {
 	assert.NotContains(t, out, "No schema changes", "per-shard-only DDL is still counted as a change")
 	assert.Contains(t, out, "```sql", "the per-shard DDL is rendered")
 }
+
+// An unsafe change confined to one shard is flagged with that shard in the
+// unsafe-changes warning.
+func TestRenderPlanComment_UnsafeShardChangeShowsShard(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata",
+		HasUnsafeChanges: true,
+		UnsafeChanges:    []UnsafeChangeData{{Table: "mutes", Reason: "DROP COLUMN removes data", Shards: []string{"40-80"}}},
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "cdb_resolute_sharded",
+			Shards: []KeyspaceShardChange{
+				{Shard: "-40", Statements: []string{"ALTER TABLE `mutes` ADD INDEX a"}},
+				{Shard: "40-80", Statements: []string{"ALTER TABLE `mutes` ADD INDEX a", "ALTER TABLE `mutes` DROP COLUMN `x`"}},
+			},
+		}},
+	})
+
+	assert.Contains(t, out, "Unsafe Changes")
+	assert.Contains(t, out, "`mutes` (shard `40-80`)", "the unsafe change names the shard it applies to")
+	assert.Contains(t, out, "DROP COLUMN `x`", "the drop statement is shown in that shard's group")
+}

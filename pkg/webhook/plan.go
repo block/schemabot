@@ -432,6 +432,42 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 	h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
 }
 
+// shardedUnsafeChanges collects unsafe per-shard changes, grouped by (table,
+// reason) so a change present on several shards lists them together rather than
+// repeating. Returns nil when the plan carries no per-shard changes (the
+// non-sharded path uses the namespace-level unsafe view instead).
+func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.UnsafeChangeData {
+	if len(shards) == 0 {
+		return nil
+	}
+	type key struct{ table, reason string }
+	var order []key
+	byKey := make(map[key]*templates.UnsafeChangeData)
+	for _, sp := range shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if t == nil || !t.IsUnsafe {
+				continue
+			}
+			k := key{table: t.TableName, reason: t.UnsafeReason}
+			uc := byKey[k]
+			if uc == nil {
+				uc = &templates.UnsafeChangeData{Table: t.TableName, Reason: t.UnsafeReason}
+				byKey[k] = uc
+				order = append(order, k)
+			}
+			uc.Shards = append(uc.Shards, sp.Shard)
+		}
+	}
+	out := make([]templates.UnsafeChangeData, 0, len(order))
+	for _, k := range order {
+		out = append(out, *byKey[k])
+	}
+	return out
+}
+
 // buildPlanCommentData converts plan results into template data.
 func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
@@ -476,8 +512,15 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		data.Changes = append(data.Changes, ksData)
 	}
 
-	unsafeChanges := planResp.UnsafeChanges()
-	if len(unsafeChanges) > 0 {
+	// Unsafe changes. For a sharded plan, derive them from the per-shard changes
+	// so an unsafe change confined to one shard (e.g. a column drop on a single
+	// drifted shard) is still flagged with the shard it applies to — the
+	// collapsed namespace-level Changes can omit it. Otherwise use the
+	// namespace-level view.
+	if unsafe := shardedUnsafeChanges(planResp.Shards); len(unsafe) > 0 {
+		data.HasUnsafeChanges = true
+		data.UnsafeChanges = unsafe
+	} else if unsafeChanges := planResp.UnsafeChanges(); len(unsafeChanges) > 0 {
 		data.HasUnsafeChanges = true
 		for _, uc := range unsafeChanges {
 			data.UnsafeChanges = append(data.UnsafeChanges, templates.UnsafeChangeData{

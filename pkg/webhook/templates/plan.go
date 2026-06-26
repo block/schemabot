@@ -23,6 +23,10 @@ type LintViolationData struct {
 type UnsafeChangeData struct {
 	Table  string
 	Reason string
+	// Shards names the shards this unsafe change applies to, for a sharded plan
+	// where only some shards carry it. Empty for a non-sharded change (applies to
+	// the whole table).
+	Shards []string
 }
 
 // PlanCommentData contains all data needed to render a plan comment.
@@ -456,11 +460,15 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, allowUn
 		sb.WriteString("**⛔ Unsafe Changes Detected:**\n")
 	}
 	for _, c := range changes {
+		table := "`" + c.Table + "`"
+		if len(c.Shards) > 0 {
+			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
+		}
 		reason := ui.CleanLintReason(c.Reason)
 		if reason != "" {
-			fmt.Fprintf(sb, "- `%s`: %s\n", c.Table, reason)
+			fmt.Fprintf(sb, "- %s: %s\n", table, reason)
 		} else {
-			fmt.Fprintf(sb, "- `%s`\n", c.Table)
+			fmt.Fprintf(sb, "- %s\n", table)
 		}
 	}
 	sb.WriteString("\n")
