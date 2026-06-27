@@ -812,6 +812,64 @@ func (m *mockApplyOperationStore) SaveEngineResumeState(_ context.Context, opera
 	return nil
 }
 
+// For a remote PlanetScale apply the engine runs in the data plane, so the
+// control plane mirrors the progress display fields (deploy-request URL, VSchema)
+// onto the operation's engine_resume_metadata — the source the PR comment reads.
+// The mirror must preserve a multi-operation drive's remote-apply-id context,
+// resolve the operation for a whole-apply (single-operation) drive, skip
+// redundant writes, and stay a no-op for non-PlanetScale applies.
+func TestGRPCClientMirrorsRemoteDisplayMetadata(t *testing.T) {
+	display := map[string]string{
+		"deploy_request_url": "https://app.planetscale.com/org/db/deploy-requests/106",
+		"branch_name":        "schemabot-db",
+	}
+
+	t.Run("multi-operation preserves the remote-apply-id context", func(t *testing.T) {
+		ops := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			7: {ID: 7, ApplyID: 100, EngineResumeContext: "remote-apply-xyz"},
+		}}
+		client := &GRPCClient{storage: &mockStorage{operations: ops}}
+		apply := &storage.Apply{ID: 100, ApplyIdentifier: "apply-x", Engine: storage.EnginePlanetScale}
+		scope := applyTaskScope{applyOperationID: 7, operation: ops.ops[7], multiOperation: true}
+
+		blob := client.mirrorRemoteDisplayMetadata(t.Context(), apply, scope, display, "")
+		require.NotEmpty(t, blob)
+
+		got, err := PSDisplayMetadata(ops.ops[7].EngineResumeMetadata)
+		require.NoError(t, err)
+		assert.Equal(t, "https://app.planetscale.com/org/db/deploy-requests/106", got["deploy_request_url"])
+		assert.Equal(t, "remote-apply-xyz", ops.ops[7].EngineResumeContext, "the remote apply id must survive the display-metadata write")
+
+		// A second poll with the same metadata skips the redundant write.
+		before := len(ops.savedResumes)
+		blob2 := client.mirrorRemoteDisplayMetadata(t.Context(), apply, scope, display, blob)
+		assert.Equal(t, blob, blob2)
+		assert.Len(t, ops.savedResumes, before, "unchanged metadata must not re-write")
+	})
+
+	t.Run("whole-apply drive resolves the sole operation", func(t *testing.T) {
+		ops := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			9: {ID: 9, ApplyID: 200},
+		}}
+		client := &GRPCClient{storage: &mockStorage{operations: ops}}
+		apply := &storage.Apply{ID: 200, ApplyIdentifier: "apply-y", Engine: storage.EnginePlanetScale}
+
+		blob := client.mirrorRemoteDisplayMetadata(t.Context(), apply, wholeApplyTaskScope(), display, "")
+		require.NotEmpty(t, blob)
+		got, err := PSDisplayMetadata(ops.ops[9].EngineResumeMetadata)
+		require.NoError(t, err)
+		assert.Equal(t, "https://app.planetscale.com/org/db/deploy-requests/106", got["deploy_request_url"])
+	})
+
+	t.Run("non-PlanetScale apply is a no-op", func(t *testing.T) {
+		ops := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{9: {ID: 9, ApplyID: 200}}}
+		client := &GRPCClient{storage: &mockStorage{operations: ops}}
+		apply := &storage.Apply{ID: 200, Engine: storage.EngineSpirit}
+		assert.Empty(t, client.mirrorRemoteDisplayMetadata(t.Context(), apply, wholeApplyTaskScope(), display, ""))
+		assert.Empty(t, ops.savedResumes)
+	})
+}
+
 func (m *mockStorage) Applies() storage.ApplyStore {
 	if m.applies != nil {
 		return m.applies

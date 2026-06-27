@@ -64,3 +64,49 @@ func TestPSDisplayMetadata(t *testing.T) {
 	_, err = PSDisplayMetadata(`{not json`)
 	require.Error(t, err)
 }
+
+// The display map a data-plane progress poll returns round-trips through
+// EngineDisplayMetadataStorageBlob back into the same display fields when read
+// via PSDisplayMetadata — the path the control plane uses to mirror a remote
+// apply's deploy-request URL and VSchema status onto its operation so the PR
+// comment can render them.
+func TestEngineDisplayMetadataStorageBlobRoundTrip(t *testing.T) {
+	encodedVSchema, err := apitypes.EncodeVSchemaChanges([]apitypes.VSchemaChange{
+		{Namespace: "commerce_sharded", Status: "applied", Diff: `+ "xxhash": {}`},
+	})
+	require.NoError(t, err)
+	display := map[string]string{
+		"branch_name":                      "schemabot-db-7",
+		"deploy_request_url":               "https://app.planetscale.com/org/db/deploy-requests/106",
+		"is_instant":                       "true",
+		apitypes.VSchemaChangesMetadataKey: encodedVSchema,
+	}
+
+	blob, err := EngineDisplayMetadataStorageBlob(display)
+	require.NoError(t, err)
+	require.NotEmpty(t, blob)
+
+	got, err := PSDisplayMetadata(blob)
+	require.NoError(t, err)
+	assert.Equal(t, "https://app.planetscale.com/org/db/deploy-requests/106", got["deploy_request_url"])
+	assert.Equal(t, "schemabot-db-7", got["branch_name"])
+	assert.Equal(t, "true", got["is_instant"])
+
+	changes, err := apitypes.ParseVSchemaChanges(got)
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	assert.Equal(t, "commerce_sharded", changes[0].Namespace)
+	assert.Equal(t, "applied", changes[0].Status)
+}
+
+// A display map with nothing worth storing yields an empty blob, so the caller
+// leaves the operation's metadata untouched rather than clobbering it with "{}".
+func TestEngineDisplayMetadataStorageBlobEmpty(t *testing.T) {
+	blob, err := EngineDisplayMetadataStorageBlob(nil)
+	require.NoError(t, err)
+	assert.Empty(t, blob)
+
+	blob, err = EngineDisplayMetadataStorageBlob(map[string]string{"volume": "2"})
+	require.NoError(t, err)
+	assert.Empty(t, blob)
+}

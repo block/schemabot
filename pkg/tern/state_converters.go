@@ -363,3 +363,42 @@ func PSDisplayMetadata(resumeStateMetadata string) (map[string]string, error) {
 	}
 	return m, nil
 }
+
+// EngineDisplayMetadataStorageBlob converts a progress response's display
+// metadata — the map a data-plane progress poll returns (deploy_request_url, the
+// encoded VSchema status, instant/deferred flags) — back into the stored
+// psMetadataForStorage JSON that the PR comment's display projection
+// (resolveDisplayByOperation → PSDisplayMetadata) reads. For a remote (gRPC)
+// apply the engine runs in the data plane, so its resume metadata never lands on
+// the control-plane operation; mirroring these display fields is how the comment
+// surfaces the deploy-request link and VSchema status. Returns "" when there is
+// nothing worth storing, so callers leave the operation's metadata untouched.
+func EngineDisplayMetadataStorageBlob(md map[string]string) (string, error) {
+	if len(md) == 0 {
+		return "", nil
+	}
+	m := psMetadataForStorage{
+		BranchName:       md["branch_name"],
+		DeployRequestURL: md["deploy_request_url"],
+		IsInstant:        md["is_instant"] == "true",
+		DeferredDeploy:   md["deferred_deploy"] == "true",
+	}
+	changes, err := apitypes.ParseVSchemaChanges(md)
+	if err != nil {
+		return "", fmt.Errorf("parse vschema changes from display metadata: %w", err)
+	}
+	for _, ch := range changes {
+		if m.VSchemaStatus == "" {
+			m.VSchemaStatus = ch.Status
+		}
+		m.VSchemaDiffs = append(m.VSchemaDiffs, vschemaKeyspaceDiff{Namespace: ch.Namespace, Diff: ch.Diff})
+	}
+	if m.DeployRequestURL == "" && m.BranchName == "" && !m.IsInstant && !m.DeferredDeploy && len(m.VSchemaDiffs) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(m)
+	if err != nil {
+		return "", fmt.Errorf("encode display metadata for storage: %w", err)
+	}
+	return string(encoded), nil
+}
