@@ -231,7 +231,16 @@ func (s *taskStore) UpsertShardProgress(ctx context.Context, task *storage.Task)
 		task.ID = id
 		return s.Update(ctx, task)
 	case errors.Is(err, sql.ErrNoRows):
-		// New shard row: insert gated on the held lease so a lost lease fails closed.
+		// New shard row: verify the operation belongs to the task's apply before
+		// inserting. tasks has no foreign-key constraints, so neither the
+		// operation-lease guard (which only matches the operation token) nor the
+		// apply-lease guard (which only matches the apply token) would otherwise
+		// catch an inconsistent (apply_id, apply_operation_id) pair, which would
+		// corrupt the per-operation read-model. Fail closed on mismatch.
+		if err := s.verifyOperationBelongsToApply(ctx, *task.ApplyOperationID, task.ApplyID); err != nil {
+			return err
+		}
+		// Insert gated on the held lease so a displaced operator fails closed.
 		if hasOpLease {
 			return s.insertShardTaskGuarded(ctx, task, opLease)
 		}
@@ -239,6 +248,26 @@ func (s *taskStore) UpsertShardProgress(ctx context.Context, task *storage.Task)
 	default:
 		return fmt.Errorf("look up shard task for operation %d %s.%s shard %q: %w",
 			*task.ApplyOperationID, task.Namespace, task.TableName, task.Shard, err)
+	}
+}
+
+// verifyOperationBelongsToApply fails closed when apply_operation operationID
+// does not belong to applyID. tasks has no foreign-key constraints, so a
+// per-shard insert with an inconsistent (apply_id, apply_operation_id) pair
+// would silently corrupt the per-operation read-model; this guard rejects it
+// before the insert with an explicit error rather than a silent no-op.
+func (s *taskStore) verifyOperationBelongsToApply(ctx context.Context, operationID, applyID int64) error {
+	var opApplyID int64
+	err := s.db.QueryRowContext(ctx, `SELECT apply_id FROM apply_operations WHERE id = ?`, operationID).Scan(&opApplyID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("shard progress references apply_operation %d that does not exist", operationID)
+	case err != nil:
+		return fmt.Errorf("verify apply_operation %d belongs to apply %d: %w", operationID, applyID, err)
+	case opApplyID != applyID:
+		return fmt.Errorf("shard progress apply_operation %d belongs to apply %d, not apply %d", operationID, opApplyID, applyID)
+	default:
+		return nil
 	}
 }
 

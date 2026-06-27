@@ -547,4 +547,17 @@ func TestTaskStore_UpsertShardProgressUnderApplyLease(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, state.Task.Completed, got[0].State, "a lost apply lease must not overwrite the shard row")
+
+	// A shard task whose operation belongs to a different apply is rejected:
+	// tasks has no FK constraints, so the apply-lease guard alone would not catch
+	// an inconsistent (apply_id, apply_operation_id) pair.
+	otherLock := createTestLock(t, store, "other_resolute", "vitess", "staging")
+	otherApply := createTestApply(t, store, otherLock, "apply_other_applylease", apply.PlanID)
+	otherOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: otherApply.ID, Deployment: "region-a", Target: "resolute",
+	})
+	require.NoError(t, err)
+	crossApply := shardTask("a0-")
+	crossApply.ApplyOperationID = &otherOpID // belongs to otherApply, not the leased apply
+	require.ErrorContains(t, store.Tasks().UpsertShardProgress(applyCtx("apply-token"), crossApply), "belongs to apply")
 }
