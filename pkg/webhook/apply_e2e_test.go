@@ -947,6 +947,18 @@ func TestE2EApplyConfirmNoChanges(t *testing.T) {
 		lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 		return err == nil && lock == nil
 	}, 5*time.Second, 100*time.Millisecond, "expected lock to be released after no-changes confirm")
+
+	// A no-changes apply must set the schema check to passing here — the operator
+	// should not have to re-run plan just to clear it.
+	require.Eventually(t, func() bool {
+		check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+		return err == nil && check != nil && check.Conclusion == checkConclusionSuccess && !check.HasChanges
+	}, 5*time.Second, 100*time.Millisecond, "no-changes apply must record a passing per-database check")
+
+	aggregate, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, aggregate, "aggregate check must exist after a no-changes apply")
+	assert.Equal(t, checkConclusionSuccess, aggregate.Conclusion, "no-changes apply must pass the aggregate schema check")
 }
 
 func TestE2EUnlockBlockedByActiveApply(t *testing.T) {
