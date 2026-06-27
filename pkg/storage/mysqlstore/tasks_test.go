@@ -389,9 +389,9 @@ func TestTaskStore_UpsertShardProgress(t *testing.T) {
 		}
 	}
 
-	// Without an operation lease on the context the write is refused outright.
+	// Without any drive lease on the context the write is refused outright.
 	require.ErrorContains(t, store.Tasks().UpsertShardProgress(ctx, shardTask("-80")),
-		"requires an operation lease")
+		"requires an operation or apply lease")
 
 	// A displaced operator (stale token) fails closed on the insert path: nothing written.
 	require.ErrorIs(t, store.Tasks().UpsertShardProgress(opCtx("stale"), shardTask("-80")), storage.ErrApplyLeaseLost)
@@ -456,4 +456,95 @@ func TestTaskStore_UpsertShardProgress(t *testing.T) {
 	got, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	assert.Len(t, got, 2, "refused writes must not create rows")
+}
+
+// A single-operation (whole-apply) drive holds the apply lease rather than an
+// operation lease. UpsertShardProgress accepts the apply lease as the
+// single-writer guarantee, so per-shard rows are persisted for PlanetScale
+// applies that never claim an operation; a displaced operator (stale apply
+// token) still fails closed on both the insert and update paths.
+func TestTaskStore_UpsertShardProgressUnderApplyLease(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "resolute", "vitess", "staging")
+	apply := createTestApply(t, store, lock, "apply_upsert_shard_applylease", 1)
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "resolute",
+	})
+	require.NoError(t, err)
+
+	// The whole-apply drive holds the apply lease; no operation lease is claimed.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE applies SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW() WHERE id = ?
+	`, "driver", "apply-token", apply.ID)
+	require.NoError(t, err)
+
+	applyCtx := func(token string) context.Context {
+		return storage.WithApplyLease(ctx, storage.ApplyLease{
+			ApplyID: apply.ID, Owner: "driver", Token: token,
+		})
+	}
+
+	now := time.Now()
+	shardTask := func(shard string) *storage.Task {
+		return &storage.Task{
+			TaskIdentifier:   "task-applylease-" + shard,
+			ApplyID:          apply.ID,
+			ApplyOperationID: &opID,
+			PlanID:           apply.PlanID,
+			Database:         apply.Database,
+			DatabaseType:     apply.DatabaseType,
+			Engine:           storage.EnginePlanetScale,
+			Environment:      apply.Environment,
+			State:            state.Task.Running,
+			Namespace:        "resolute",
+			TableName:        "users",
+			Shard:            shard,
+			DDL:              "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
+			DDLAction:        "ALTER",
+			RowsCopied:       100000,
+			RowsTotal:        500000,
+			ProgressPercent:  20,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
+	}
+
+	// A displaced operator (stale apply token) fails closed on the insert path.
+	require.ErrorIs(t, store.Tasks().UpsertShardProgress(applyCtx("stale"), shardTask("-80")), storage.ErrApplyLeaseLost)
+	got, err := store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	assert.Empty(t, got, "a lost apply lease must not insert a shard task")
+
+	// The apply-lease holder inserts the shard row.
+	require.NoError(t, store.Tasks().UpsertShardProgress(applyCtx("apply-token"), shardTask("-80")))
+	got, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "-80", got[0].Shard)
+	assert.Equal(t, 20, got[0].ProgressPercent)
+
+	// Re-upserting advances the same row in place under the apply lease.
+	advanced := shardTask("-80")
+	advanced.State = state.Task.Completed
+	advanced.ProgressPercent = 100
+	advanced.RowsCopied = 500000
+	require.NoError(t, store.Tasks().UpsertShardProgress(applyCtx("apply-token"), advanced))
+	got, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	require.Len(t, got, 1, "re-upserting the same shard must update in place")
+	assert.Equal(t, state.Task.Completed, got[0].State)
+	assert.Equal(t, 100, got[0].ProgressPercent)
+
+	// A stale apply token must not overwrite the existing shard row (update path fails closed).
+	stale := shardTask("-80")
+	stale.State = state.Task.Failed
+	stale.ProgressPercent = 5
+	require.ErrorIs(t, store.Tasks().UpsertShardProgress(applyCtx("stale"), stale), storage.ErrApplyLeaseLost)
+	got, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, state.Task.Completed, got[0].State, "a lost apply lease must not overwrite the shard row")
 }

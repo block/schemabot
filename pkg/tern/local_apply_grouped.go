@@ -1128,15 +1128,19 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 
 // writeShardProgress persists a table's per-shard breakdown as per-shard tasks
 // (shard != ""), so the renderer can show per-shard state from storage instead
-// of a live re-query. It runs only inside the operator's lease-held drive:
-// UpsertShardProgress requires the operation lease, and read-path callers (which
-// carry no operation lease) skip it so a plain progress read never writes. A
-// failed shard write is logged, not fatal — the next reconcile re-applies it.
+// of a live re-query. It runs only inside the operator's lease-held drive: a
+// multi-operation fan-out drive holds the operation lease, a single-operation
+// (whole-apply) drive holds the apply lease, and UpsertShardProgress accepts
+// either. Read-path callers carry neither lease and skip, so a plain progress
+// read never writes. A failed shard write is logged, not fatal — the next
+// reconcile re-applies it.
 func (c *LocalClient) writeShardProgress(ctx context.Context, table *storage.Task, tp *engine.TableProgress, now time.Time) {
 	if len(tp.Shards) == 0 {
 		return
 	}
-	if _, ok := storage.OperationLeaseFromContext(ctx); !ok {
+	_, hasOpLease := storage.OperationLeaseFromContext(ctx)
+	_, hasApplyLease := storage.ApplyLeaseFromContext(ctx)
+	if !hasOpLease && !hasApplyLease {
 		return
 	}
 	var operationID int64

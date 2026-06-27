@@ -149,10 +149,29 @@ func TestWriteShardProgressPersistsPerShardTasksUnderLease(t *testing.T) {
 		}
 	}
 
-	// A read-path caller (no operation lease) must not write.
+	// A single-operation (whole-apply) drive holds the apply lease instead of an
+	// operation lease; the write-through accepts it and persists per-shard rows
+	// so the PlanetScale per-shard breakdown reaches storage even when no
+	// operation is claimed. Clear the operation-lease rows first (keeping the
+	// parent apply), then stamp the apply lease and drive under it alone.
+	_, err = leaseDB.ExecContext(ctx, `DELETE FROM tasks`)
+	require.NoError(t, err)
+	_, err = leaseDB.ExecContext(ctx, `
+		UPDATE applies SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW() WHERE id = ?
+	`, "driver", "apply-token", applyID)
+	require.NoError(t, err)
+	applyLeaseCtx := storage.WithApplyLease(ctx, storage.ApplyLease{
+		ApplyID: applyID, Owner: "driver", Token: "apply-token",
+	})
+	client.writeShardProgress(applyLeaseCtx, perTable, tp, time.Now())
+	got, err = stor.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	assert.Len(t, got, 2, "the apply lease alone persists per-shard tasks for a single-operation drive")
+
+	// A read-path caller (no drive lease) must not write.
 	cleanupTasks(t, dsn)
 	client.writeShardProgress(ctx, perTable, tp, time.Now())
 	got, err = stor.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
-	assert.Empty(t, got, "without an operation lease the drive write-through is a no-op")
+	assert.Empty(t, got, "without a drive lease the write-through is a no-op")
 }
