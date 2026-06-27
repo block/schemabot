@@ -62,8 +62,8 @@ func (h *Handler) executeApply(
 		}
 		// The target already matches the PR schema — apply found nothing to do.
 		// Record the passing (no-change) check result and refresh the aggregate so
-		// the schema check goes green here, instead of leaving it pending until the
-		// user re-runs plan just to clear it.
+		// the schema check reflects that the target is up to date, the same as the
+		// no-change plan path.
 		if headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment); checkErr != nil {
 			h.logger.Error("failed to record no-changes check after apply",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", checkErr)

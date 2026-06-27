@@ -955,10 +955,12 @@ func TestE2EApplyConfirmNoChanges(t *testing.T) {
 		return err == nil && check != nil && check.Conclusion == checkConclusionSuccess && !check.HasChanges
 	}, 5*time.Second, 100*time.Millisecond, "no-changes apply must record a passing per-database check")
 
-	aggregate, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
-	require.NoError(t, err)
-	require.NotNil(t, aggregate, "aggregate check must exist after a no-changes apply")
-	assert.Equal(t, checkConclusionSuccess, aggregate.Conclusion, "no-changes apply must pass the aggregate schema check")
+	// Poll the aggregate too: publishing it includes a GitHub check-run call that
+	// can lag the per-database upsert.
+	require.Eventually(t, func() bool {
+		aggregate, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+		return err == nil && aggregate != nil && aggregate.Conclusion == checkConclusionSuccess
+	}, 5*time.Second, 100*time.Millisecond, "no-changes apply must pass the aggregate schema check")
 }
 
 func TestE2EUnlockBlockedByActiveApply(t *testing.T) {
