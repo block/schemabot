@@ -1239,12 +1239,25 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		return nil
 	}
 	if len(tasks) == 0 && !isTasklessVSchemaOnlyPlan(tasks, plan) {
-		c.logger.Warn("no tasks found for apply, marking as failed",
+		// A task-less apply has no per-table work to drive — e.g. a sharded
+		// dispatch for a shard whose schema already matches the desired state (a
+		// no-op), or an apply whose tasks already completed. The initial drive
+		// completes such an apply (finalizeSequentialApply with no failed task);
+		// recovery must complete it too rather than failing it. (A VSchema-only
+		// plan is exempted above and re-driven below so its VSchema is applied.)
+		now := time.Now()
+		if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err == nil && freshApply != nil && state.IsTerminalApplyState(freshApply.State) {
+			// A concurrent drive already settled it — don't overwrite its verdict.
+			*apply = *freshApply
+			return nil
+		}
+		c.logger.Info("no tasks found for apply during recovery; completing as a no-op",
 			"apply_id", apply.ApplyIdentifier)
-		apply.State = state.Apply.Failed
-		apply.ErrorMessage = "no tasks found during recovery"
+		apply.State = state.Apply.Completed
+		apply.CompletedAt = &now
+		apply.UpdatedAt = now
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
-			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Failed, "error", err)
+			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Completed, "error", err)
 		}
 		c.notifyTerminalObserver(apply, tasks)
 		return nil
