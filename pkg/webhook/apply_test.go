@@ -125,7 +125,7 @@ func TestFormatSummaryComment(t *testing.T) {
 	assert.Contains(t, body, "Schema Change Applied")
 	assert.Contains(t, body, "`users`")
 	assert.Contains(t, body, "`orders`")
-	assert.Contains(t, body, "applied successfully")
+	assert.Contains(t, body, "Applied successfully")
 }
 
 func TestFormatSummaryComment_Failed(t *testing.T) {

@@ -380,11 +380,6 @@ CREATE TABLE `addresses` (
 
 **Applying automatically**
 
-🔓 If the apply fails, unlock with:
-```
-schemabot unlock
-```
-
 </details>
 
 <details>
@@ -1573,11 +1568,6 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 **Applying automatically**
 
-🔓 If the apply fails, unlock with:
-```
-schemabot unlock
-```
-
 </details>
 
 <details>
@@ -1625,11 +1615,6 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ---
 
 **Applying automatically**
-
-🔓 If the apply fails, unlock with:
-```
-schemabot unlock
-```
 
 </details>
 
@@ -1775,11 +1760,6 @@ CREATE TABLE `addresses` (
 ---
 
 **Applying automatically**
-
-🔓 If the apply fails, unlock with:
-```
-schemabot unlock
-```
 
 </details>
 
@@ -2751,9 +2731,11 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 **Database**: `testapp`
 
 
-> All 3 tables applied successfully — your schema changes are live!
+> Applied successfully — your schema changes are live!
 
-<details><summary>Applied details (3 tables)</summary>
+<details><summary>Apply details (3 tables)</summary>
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
 
 
 **`orders`**
@@ -2772,8 +2754,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 </details>
-
-_Apply ID: `apply-a1b2c3d4e5f6`_
 
 </details>
 
@@ -2894,9 +2874,11 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 **Database**: `testapp`
 
 
-> All 8 tables applied successfully — your schema changes are live!
+> Applied successfully — your schema changes are live!
 
-<details><summary>Applied details (8 tables)</summary>
+<details><summary>Apply details (8 tables)</summary>
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
 
 
 **`orders`**
@@ -2941,8 +2923,6 @@ ALTER TABLE `notifications` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
 </details>
 
-_Apply ID: `apply-a1b2c3d4e5f6`_
-
 </details>
 
 <details>
@@ -2954,9 +2934,11 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 **Database**: `testapp`
 
 
-> Schema change applied successfully — your changes are live!
+> Applied successfully — your schema changes are live!
 
-<details><summary>Applied details (1 table, 1 VSchema update)</summary>
+<details><summary>Apply details (1 table, 1 VSchema update)</summary>
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
 
 Applied by namespace:
 
@@ -2980,8 +2962,6 @@ ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 </details>
 
-_Apply ID: `apply-a1b2c3d4e5f6`_
-
 </details>
 
 <details>
@@ -2993,9 +2973,11 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 **Database**: `testapp`
 
 
-> VSchema applied successfully — your changes are live!
+> Applied successfully — your schema change is live!
 
-<details><summary>Applied details (1 VSchema update)</summary>
+<details><summary>Apply details (1 VSchema update)</summary>
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
 
 
 ### VSchema
@@ -3007,8 +2989,6 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 ```
 
 </details>
-
-_Apply ID: `apply-a1b2c3d4e5f6`_
 
 </details>
 
@@ -3142,9 +3122,11 @@ schemabot apply -e staging
 **Database**: `testapp`
 
 
-> All 5 tables applied successfully — your schema changes are live!
+> Applied successfully — your schema changes are live!
 
-<details><summary>Applied details (5 tables)</summary>
+<details><summary>Apply details (5 tables)</summary>
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
 
 Applied by namespace:
 
@@ -3187,8 +3169,6 @@ ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 ```
 
 </details>
-
-_Apply ID: `apply-a1b2c3d4e5f6`_
 </details>
 
 ### CLI Output
@@ -4739,11 +4719,6 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 **Applying automatically**
 
-🔓 If the apply fails, unlock with:
-```
-schemabot unlock
-```
-
 
 </details>
 
@@ -4792,11 +4767,6 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ---
 
 **Applying automatically**
-
-🔓 If the apply fails, unlock with:
-```
-schemabot unlock
-```
 
 
 </details>
@@ -5615,9 +5585,11 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 **Database**: `payments_eu`
 
 
-> All 3 tables applied successfully — your schema changes are live!
+> Applied successfully — your schema changes are live!
 
-<details><summary>Applied details (3 tables)</summary>
+<details><summary>Apply details (3 tables)</summary>
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
 
 
 ### ✅ testapp
@@ -5638,8 +5610,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 </details>
-
-_Apply ID: `apply-a1b2c3d4e5f6`_
 
 </details>
 
@@ -5651,9 +5621,11 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 **Database**: `payments_us`
 
 
-> All 3 tables applied successfully — your schema changes are live!
+> Applied successfully — your schema changes are live!
 
-<details><summary>Applied details (3 tables)</summary>
+<details><summary>Apply details (3 tables)</summary>
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
 
 
 ### ✅ testapp
@@ -5674,8 +5646,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 </details>
-
-_Apply ID: `apply-a1b2c3d4e5f6`_
 
 </details>
 
@@ -5687,9 +5657,11 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 **Database**: `payments_au`
 
 
-> All 3 tables applied successfully — your schema changes are live!
+> Applied successfully — your schema changes are live!
 
-<details><summary>Applied details (3 tables)</summary>
+<details><summary>Apply details (3 tables)</summary>
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
 
 
 ### ✅ testapp
@@ -5710,8 +5682,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 </details>
-
-_Apply ID: `apply-a1b2c3d4e5f6`_
 
 </details>
 
@@ -5751,9 +5721,11 @@ schemabot apply -e production
 **Database**: `payments_eu`
 
 
-> All 3 tables applied successfully — your schema changes are live!
+> Applied successfully — your schema changes are live!
 
-<details><summary>Applied details (3 tables)</summary>
+<details><summary>Apply details (3 tables)</summary>
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
 
 
 ### ✅ testapp
@@ -5774,8 +5746,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 </details>
-
-_Apply ID: `apply-a1b2c3d4e5f6`_
 
 </details>
 

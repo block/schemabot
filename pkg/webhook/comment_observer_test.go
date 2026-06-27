@@ -97,7 +97,7 @@ func TestCommentObserverRendersVSchemaFromEngineResumeState(t *testing.T) {
 	t.Run("terminal summary of a VSchema-only apply reports the VSchema outcome", func(t *testing.T) {
 		body := observer(`{"vschema_status":"applied","vschema_diffs":[{"namespace":"commerce_sharded","diff":"+ \"xxhash\": {}"}]}`).
 			formatTerminalSummaryComment(psApply(state.Apply.Completed))
-		assert.Contains(t, body, "VSchema applied successfully")
+		assert.Contains(t, body, "Applied successfully — your schema change is live!")
 		assert.Contains(t, body, "**`commerce_sharded`**: Applied")
 		assert.NotContains(t, body, "0 tables")
 	})

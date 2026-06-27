@@ -868,26 +868,14 @@ func countTableOutcomes(tables []TableProgressData) (completed, failed int) {
 func writeSummaryCompleted(sb *strings.Builder, data ApplyStatusCommentData, totalTables int) {
 	writeApplyHeader(sb, data)
 	writeSummaryCompletedMetadata(sb, data)
-	var msg string
-	switch {
-	case totalTables == 0 && len(data.VSchemaChanges) > 0:
-		// VSchema-only apply: no per-table tasks, so report the VSchema outcome.
-		msg = "VSchema applied successfully — your changes are live!"
-	case totalTables == 0:
-		msg = "Schema change applied successfully — your changes are live!"
-	case totalTables == 1:
-		msg = "Schema change applied successfully — your changes are live!"
-	default:
-		msg = fmt.Sprintf("All %d tables applied successfully — your schema changes are live!", totalTables)
+	// A VSchema update counts as a schema change alongside table changes, so the
+	// singular/plural wording reflects the total operation count.
+	msg := "Applied successfully — your schema changes are live!"
+	if totalTables+len(data.VSchemaChanges) == 1 {
+		msg = "Applied successfully — your schema change is live!"
 	}
 	writeSuccessBlock(sb, msg)
 	writeCompletedSummaryDetails(sb, data)
-	if data.ApplyID != "" {
-		if !strings.HasSuffix(sb.String(), "\n\n") {
-			sb.WriteString("\n")
-		}
-		fmt.Fprintf(sb, "_Apply ID: `%s`_\n", data.ApplyID)
-	}
 }
 
 // writeSummaryCompletedMetadata writes a clean metadata line for completed applies.
@@ -1012,6 +1000,9 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 	}
 
 	fmt.Fprintf(sb, "\n<details><summary>%s</summary>\n\n", completedSummaryDetailsLabel(data))
+	if data.ApplyID != "" {
+		fmt.Fprintf(sb, "**Apply ID**: `%s`\n\n", data.ApplyID)
+	}
 	writeCompletedNamespaceSummary(sb, data)
 	if len(data.Tables) > 0 {
 		writeSummaryTableListWithOptions(sb, data, false)
@@ -1028,7 +1019,7 @@ func completedSummaryDetailsLabel(data ApplyStatusCommentData) string {
 	if len(data.VSchemaChanges) > 0 {
 		parts = append(parts, fmt.Sprintf("%d VSchema %s", len(data.VSchemaChanges), pluralize("update", len(data.VSchemaChanges))))
 	}
-	return fmt.Sprintf("Applied details (%s)", strings.Join(parts, ", "))
+	return fmt.Sprintf("Apply details (%s)", strings.Join(parts, ", "))
 }
 
 type completedNamespaceSummary struct {

@@ -1199,7 +1199,7 @@ func TestPreviewCommentSummaryCompleted(t *testing.T) {
 	result := PreviewCommentSummaryCompleted()
 
 	assert.Contains(t, result, "Schema Change Applied")
-	assert.Contains(t, result, "All 3 tables applied successfully")
+	assert.Contains(t, result, "Applied successfully — your schema changes are live!")
 	// Single namespace matching database name — header skipped
 	assert.NotContains(t, result, "### ")
 	assert.Contains(t, result, "**`orders`**")
@@ -1281,8 +1281,8 @@ func TestRenderApplySummaryComment_VSchemaOnly(t *testing.T) {
 	result := RenderApplySummaryComment(data)
 
 	assert.NotContains(t, result, "0 tables")
-	assert.Contains(t, result, "VSchema applied successfully")
-	assert.Contains(t, result, "<details><summary>Applied details (1 VSchema update)</summary>")
+	assert.Contains(t, result, "Applied successfully — your schema change is live!")
+	assert.Contains(t, result, "<details><summary>Apply details (1 VSchema update)</summary>")
 	assert.Contains(t, result, "### VSchema")
 	assert.Contains(t, result, "**`commerce_sharded`**: Applied")
 }
@@ -1290,13 +1290,13 @@ func TestRenderApplySummaryComment_VSchemaOnly(t *testing.T) {
 func TestPreviewCommentSummaryCompletedLargeCollapsesAppliedDetails(t *testing.T) {
 	result := PreviewCommentSummaryCompletedLarge()
 
-	assert.Contains(t, result, "All 8 tables applied successfully")
-	assert.Contains(t, result, "<details><summary>Applied details (8 tables)</summary>")
-	assert.Contains(t, result, "_Apply ID: `apply-a1b2c3d4e5f6`_")
+	assert.Contains(t, result, "Applied successfully — your schema changes are live!")
+	assert.Contains(t, result, "<details><summary>Apply details (8 tables)</summary>")
+	assert.Contains(t, result, "**Apply ID**: `apply-a1b2c3d4e5f6`")
 	assert.Equal(t, 1, strings.Count(result, "</details>"))
 }
 
-func TestRenderApplySummaryCommentCompletedCollapsedDetailsSeparateApplyID(t *testing.T) {
+func TestRenderApplySummaryCommentCompletedCollapsedDetailsApplyIDInside(t *testing.T) {
 	tableNames := []string{"users", "orders", "products", "invoices", "payments", "shipments"}
 	tables := make([]TableProgressData, 0, len(tableNames))
 	for _, tableName := range tableNames {
@@ -1320,17 +1320,21 @@ func TestRenderApplySummaryCommentCompletedCollapsedDetailsSeparateApplyID(t *te
 
 	result := RenderApplySummaryComment(data)
 
-	assert.Contains(t, result, "<details><summary>Applied details (6 tables)</summary>")
+	assert.Contains(t, result, "<details><summary>Apply details (6 tables)</summary>")
 	assert.Contains(t, result, "### ✅ testapp_primary")
-	assert.Contains(t, result, "</details>\n\n_Apply ID: `apply-a1b2c3d4e5f6`_")
-	assert.NotContains(t, result, "</details>\n_Apply ID")
+	// The Apply ID lives inside the collapsed details block, not as a trailing line.
+	assert.Contains(t, result, "**Apply ID**: `apply-a1b2c3d4e5f6`")
+	assert.NotContains(t, result, "_Apply ID:")
+	idIdx := strings.Index(result, "**Apply ID**: `apply-a1b2c3d4e5f6`")
+	closeIdx := strings.LastIndex(result, "</details>")
+	assert.True(t, idIdx >= 0 && idIdx < closeIdx, "Apply ID should appear inside the details, before the closing tag")
 }
 
 func TestPreviewCommentSummaryCompletedVitessTracksVSchema(t *testing.T) {
 	result := PreviewCommentSummaryCompletedVitessDDLWithVSchema()
 
-	assert.Contains(t, result, "Schema change applied successfully")
-	assert.Contains(t, result, "<details><summary>Applied details (1 table, 1 VSchema update)</summary>")
+	assert.Contains(t, result, "Applied successfully — your schema changes are live!")
+	assert.Contains(t, result, "<details><summary>Apply details (1 table, 1 VSchema update)</summary>")
 	assert.Contains(t, result, "**`users`**")
 	assert.Contains(t, result, "### VSchema")
 	assert.Contains(t, result, "**`myapp_sharded`**: Applied")
@@ -1340,8 +1344,8 @@ func TestPreviewCommentSummaryCompletedVitessVSchemaOnly(t *testing.T) {
 	result := PreviewCommentSummaryCompletedVitessVSchemaOnly()
 
 	assert.NotContains(t, result, "0 tables")
-	assert.Contains(t, result, "VSchema applied successfully")
-	assert.Contains(t, result, "<details><summary>Applied details (1 VSchema update)</summary>")
+	assert.Contains(t, result, "Applied successfully — your schema change is live!")
+	assert.Contains(t, result, "<details><summary>Apply details (1 VSchema update)</summary>")
 	assert.Contains(t, result, "### VSchema")
 	assert.Contains(t, result, "**`myapp_sharded`**: Applied")
 }
@@ -1372,7 +1376,7 @@ func TestRenderApplySummaryCommentCompletedMultiNamespaceVSchemaSummary(t *testi
 
 	result := RenderApplySummaryComment(data)
 
-	assert.Contains(t, result, "<details><summary>Applied details (2 tables, 2 VSchema updates)</summary>")
+	assert.Contains(t, result, "<details><summary>Apply details (2 tables, 2 VSchema updates)</summary>")
 	assert.Contains(t, result, "- `commerce`: 1 table, 1 VSchema update")
 	assert.Contains(t, result, "- `customers`: 1 table")
 	assert.Contains(t, result, "- `customers_sharded`: 1 VSchema update")

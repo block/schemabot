@@ -308,7 +308,7 @@ func TestRenderMultiDeploymentApplySummaryComment_CompletedReusesSummaryRenderer
 	assert.Contains(t, out, "- ✅ us — completed")
 
 	// Each <details> body is the summary renderer's output, not the status one.
-	assert.Contains(t, out, "Schema change applied successfully — your changes are live!")
+	assert.Contains(t, out, "Applied successfully — your schema change is live!")
 	assert.Contains(t, out, "**Database**: `payments_eu`")
 	assert.Contains(t, out, "**Database**: `payments_us`")
 }

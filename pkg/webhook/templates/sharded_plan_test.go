@@ -7,6 +7,31 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// Lint warnings belong on the plan comment, where the operator reviews them
+// before applying. On the locked apply comment they are noise — the operator
+// already saw them at plan time — so the apply comment omits them.
+func TestRenderPlanComment_LintShownOnPlanNotOnApply(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		LintViolations: []LintViolationData{
+			{Message: "Column added without DEFAULT value", Table: "users", LinterName: "no_default"},
+		},
+	}
+
+	plan := RenderPlanComment(data)
+	assert.Contains(t, plan, "⚠️ **Lint Warnings**:", "the plan comment surfaces lint for review")
+	assert.Contains(t, plan, "Column added without DEFAULT value")
+
+	data.IsLocked = true
+	apply := RenderPlanComment(data)
+	assert.NotContains(t, apply, "Lint Warnings", "the locked apply comment omits lint as noise")
+	assert.NotContains(t, apply, "Column added without DEFAULT value")
+}
+
 // A sharded plan whose shards diverge renders "what applies where": one DDL
 // block per distinct change set, each labelled with the shards it applies to.
 func TestRenderPlanComment_ShardedDivergent(t *testing.T) {

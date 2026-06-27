@@ -133,8 +133,10 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeUnsafeWarning(&sb, data.UnsafeChanges, data.AllowUnsafe, data.IsMySQL)
 	}
 
-	// Lint violations
-	if len(data.LintViolations) > 0 {
+	// Lint violations — shown on the plan comment for review, omitted on the
+	// locked apply comment where they are noise (the operator already reviewed
+	// them at plan time).
+	if len(data.LintViolations) > 0 && !data.IsLocked {
 		writeLintViolations(&sb, data.LintViolations)
 	}
 
@@ -173,10 +175,9 @@ func RenderPlanComment(data PlanCommentData) string {
 			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
 			sb.WriteString("```\nschemabot unlock\n```\n")
 		} else {
-			// Automatic apply is proceeding — include unlock hint in case the apply fails before starting
+			// Automatic apply is proceeding. No unlock hint — it's noise on the
+			// happy path; the operator can still unlock from the CLI if needed.
 			sb.WriteString("**Applying automatically**\n")
-			sb.WriteString("\n🔓 If the apply fails, unlock with:\n")
-			sb.WriteString("```\nschemabot unlock\n```\n")
 		}
 	} else {
 		applyCmd := fmt.Sprintf("schemabot apply -e %s", data.Environment)
