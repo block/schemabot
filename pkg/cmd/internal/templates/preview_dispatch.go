@@ -98,6 +98,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewVolumeModeOutput()
 	case PreviewStatusList:
 		previewStatusListOutput()
+	case PreviewStatusDeployment:
+		previewStatusDeploymentOutput()
 	case PreviewStatusHistory:
 		previewStatusHistoryOutput()
 	case PreviewLintViolations:

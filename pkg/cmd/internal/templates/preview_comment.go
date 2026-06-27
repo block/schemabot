@@ -374,6 +374,7 @@ func previewCLIApplyAllOutput() {
 		{"START COMMAND", previewStartCommandOutput},
 		{"VOLUME MODE", previewVolumeModeOutput},
 		{"STATUS LIST", previewStatusListOutput},
+		{"STATUS FOR DEPLOYMENT", previewStatusDeploymentOutput},
 		{"STATUS HISTORY", previewStatusHistoryOutput},
 	}
 	printSections(sections)

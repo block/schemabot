@@ -72,6 +72,50 @@ func previewStatusListOutput() {
 	})
 }
 
+func previewStatusDeploymentOutput() {
+	WriteStatusList(StatusListData{
+		ActiveCount:    1,
+		ShowExternalID: true,
+		Deployment:     "us-east",
+		Applies: []ActiveApplyData{
+			{
+				ApplyID:             "apply-multi-a1b2c3d4",
+				ExternalOperationID: "remote-op-us-east-001",
+				Database:            "orders-db",
+				Environment:         "production",
+				Deployment:          "us-east",
+				State:               state.Apply.WaitingForCutover,
+				Engine:              "Spirit",
+				Caller:              "octocat",
+				StartedAt:           previewTime.Add(-8 * time.Minute).Format(time.RFC3339),
+				UpdatedAt:           previewTime.Add(-30 * time.Second).Format(time.RFC3339),
+			},
+		},
+	})
+
+	fmt.Println()
+	fmt.Println("Multiple matching operations:")
+	fmt.Println()
+	WriteStatusList(StatusListData{
+		ActiveCount:    1,
+		ShowExternalID: true,
+		Deployment:     "us-east",
+		Applies: []ActiveApplyData{
+			{
+				ApplyID:     "apply-sharded-d5e6f7g8",
+				Database:    "inventory-db",
+				Environment: "production",
+				Deployment:  "us-east",
+				State:       state.Apply.Running,
+				Engine:      "Spirit",
+				Caller:      "octocat",
+				StartedAt:   previewTime.Add(-4 * time.Minute).Format(time.RFC3339),
+				UpdatedAt:   previewTime.Add(-20 * time.Second).Format(time.RFC3339),
+			},
+		},
+	})
+}
+
 func previewStatusHistoryOutput() {
 	WriteDatabaseHistory(DatabaseHistoryData{
 		Database: "orders-db",

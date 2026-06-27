@@ -4650,6 +4650,30 @@ No recent schema changes
 </details>
 
 <details>
+<summary><a name="status-for-deployment"></a><strong>Status For Deployment</strong></summary>
+
+```
+
+1 active schema change
+
+  APPLY ID              EXTERNAL OP ID         DATABASE   ENV         DEPLOYMENT  STATE                STARTED        DURATION  CALLER
+  apply-multi-a1b2c3d4  remote-op-us-east-001  orders-db  production  us-east     Waiting for cutover  8 minutes ago  8m        octocat
+
+Use 'schemabot status <apply_id>' to view details
+
+Multiple matching operations:
+
+1 active schema change
+
+  APPLY ID                EXTERNAL OP ID  DATABASE      ENV         DEPLOYMENT  STATE    STARTED        DURATION  CALLER
+  apply-sharded-d5e6f7g8  -               inventory-db  production  us-east     Running  4 minutes ago  4m        octocat
+
+Use 'schemabot status <apply_id>' to view details
+
+```
+</details>
+
+<details>
 <summary><a name="status-history"></a><strong>Status History</strong></summary>
 
 ```

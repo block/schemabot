@@ -81,8 +81,9 @@ const (
 	PreviewVolumeMode PreviewType = "volume_mode" // Volume adjustment mode
 
 	// Status previews
-	PreviewStatusList    PreviewType = "status_list"    // List of active schema changes
-	PreviewStatusHistory PreviewType = "status_history" // Database apply history
+	PreviewStatusList       PreviewType = "status_list"       // List of active schema changes
+	PreviewStatusDeployment PreviewType = "status_deployment" // Deployment-scoped schema change status
+	PreviewStatusHistory    PreviewType = "status_history"    // Database apply history
 
 	// Lint and unsafe previews
 	PreviewLintViolations PreviewType = "lint_violations" // Lint violations output

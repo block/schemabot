@@ -63,7 +63,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 	case templates.PreviewVolumeMode, templates.PreviewVolumeBar:
 		templates.PreviewCLIOutput(previewType)
 	// Status types
-	case templates.PreviewStatusList, templates.PreviewStatusHistory:
+	case templates.PreviewStatusList, templates.PreviewStatusDeployment, templates.PreviewStatusHistory:
 		templates.PreviewCLIOutput(previewType)
 	// Lint and unsafe types
 	case templates.PreviewLintViolations, templates.PreviewUnsafeBlocked,
@@ -212,6 +212,7 @@ Volume Control:
 
 Status:
   status_list           List of active schema changes
+  status_deployment     Deployment-scoped schema change status
   status_history        Database apply history
 
 Lint and Unsafe:
