@@ -1287,6 +1287,24 @@ func TestRenderApplySummaryComment_VSchemaOnly(t *testing.T) {
 	assert.Contains(t, result, "**`commerce_sharded`**: Applied")
 }
 
+// A task-less apply that completes with no table or VSchema changes still
+// surfaces its Apply ID so the summary stays auditable — without rendering an
+// empty details block or an "Apply details ()" label.
+func TestRenderApplySummaryComment_TasklessStillShowsApplyID(t *testing.T) {
+	data := ApplyStatusCommentData{
+		ApplyID:     "apply-tasklessabc",
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Completed,
+	}
+
+	result := RenderApplySummaryComment(data)
+
+	assert.Contains(t, result, "_Apply ID: `apply-tasklessabc`_")
+	assert.NotContains(t, result, "Apply details ()")
+	assert.NotContains(t, result, "<details>")
+}
+
 func TestPreviewCommentSummaryCompletedLargeCollapsesAppliedDetails(t *testing.T) {
 	result := PreviewCommentSummaryCompletedLarge()
 

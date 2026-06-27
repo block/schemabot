@@ -996,6 +996,11 @@ func formatDuration(d time.Duration) string {
 
 func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentData) {
 	if len(data.Tables) == 0 && len(data.VSchemaChanges) == 0 {
+		// No per-operation detail to collapse (e.g. a task-less apply that found
+		// no changes). Still surface the Apply ID so the summary stays auditable.
+		if data.ApplyID != "" {
+			fmt.Fprintf(sb, "\n_Apply ID: `%s`_\n", data.ApplyID)
+		}
 		return
 	}
 
