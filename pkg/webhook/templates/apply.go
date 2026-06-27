@@ -688,6 +688,15 @@ func renderRunningTable(sb *strings.Builder, table TableProgressData) {
 		}
 
 		pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied)
+		if pct == 0 {
+			// Row total is known but the copy hasn't reported progress yet
+			// (VReplication / Spirit ramp-up). A 0% bar reads as stuck, so show
+			// a starting indicator and the row total instead.
+			fmt.Fprintf(sb, "**`%s`**: ⏳ Starting copy...\n", table.TableName)
+			writeDDLLine(sb, table.DDL)
+			writeRowsAndETA(sb, table)
+			return
+		}
 		bar := ui.ProgressBarRowCopy(pct)
 		fmt.Fprintf(sb, "**`%s`**: %s %d%%\n", table.TableName, bar, pct)
 		writeDDLLine(sb, table.DDL)

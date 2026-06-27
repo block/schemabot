@@ -347,7 +347,7 @@ func previewVitessStagingOutput() {
 				TableName: "customers", Namespace: "myapp_sharded",
 				DDL:    "ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`)",
 				Status: state.Apply.Running,
-				// RowsTotal > 0 but RowsCopied == 0 triggers "Staging schema changes..."
+				// RowsTotal > 0 but RowsCopied == 0 triggers "⏳ Starting copy..."
 				RowsCopied: 0,
 				RowsTotal:  124760460,
 				Shards: []ShardProgress{

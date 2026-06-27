@@ -3740,8 +3740,9 @@ Use 'schemabot start' to resume from checkpoint.
 
   ── myapp_sharded ──
 
-     ~ customers: Staging schema changes...
+     ~ customers: ⏳ Starting copy...
        ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`);
+       • Rows: 0 / 124,760,460
        • Shards: 2 (2 copying)
            ◉ -80: 0% (0/60,483,380 rows)
            ◉ 80-: 0% (0/64,277,080 rows)

@@ -126,6 +126,16 @@ func (m WatchModel) progressView() string {
 		b.WriteString(m.spinner.View() + "Starting...\n")
 	}
 
+	// Keep the PlanetScale deploy request link visible throughout the apply,
+	// not only during deploy-request setup, so operators can open the console
+	// to inspect a copy in flight. Setup phases already show it inline above;
+	// terminal states surface it via the exit context.
+	if !state.IsSetupPhase(m.state) && !state.IsTerminalApplyState(m.state) && m.metadata != nil {
+		if url := m.metadata["deploy_request_url"]; url != "" {
+			fmt.Fprintf(&b, "  Deploy Request:  %s\n", url)
+		}
+	}
+
 	// Show table progress once past branch setup phases.
 	if !state.IsSetupPhase(m.state) {
 		m.renderTables(&b, tables)

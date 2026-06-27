@@ -620,13 +620,16 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			}
 			fmt.Fprintf(&b, "    %s\n", t.ProgressDetail)
 		}
-	case t.RowsTotal > 0 && t.RowsCopied == 0 && len(t.Shards) > 0:
-		// Staging phase — shards have row totals but no rows copied yet.
-		// Show "Staging schema changes..." instead of a misleading 0% bar.
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: Staging schema changes...\n", t.TableName)
+	case t.RowsTotal > 0 && t.RowsCopied == 0:
+		// Row total is known but the copy hasn't reported progress yet
+		// (Vitess VReplication / Spirit ramp-up — can take a while on a large
+		// table). Show a starting indicator and the row total instead of a 0%
+		// bar that reads as stuck.
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⏳ Starting copy...\n", t.TableName)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}
+		writeStructuredRowsAndETA(&b, t)
 	case t.RowsTotal > 0:
 		if ui.EstimateExceeded(t.RowsCopied, t.RowsTotal) {
 			b.WriteString(formatEstimateExceededTable(t, t.RowsCopied, activityBar, activityLabel))

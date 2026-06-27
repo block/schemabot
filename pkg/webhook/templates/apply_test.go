@@ -536,6 +536,28 @@ func TestRenderApplyStatusComment_RowCopyDisplaysOnePercentAfterCopyStarts(t *te
 	assert.NotContains(t, result, " 0%")
 }
 
+func TestRenderApplyStatusComment_StartingCopyBeforeRowsReported(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Running,
+		Engine:      "PlanetScale",
+		Tables: []TableProgressData{
+			{TableName: "customers", DDL: "ALTER TABLE `customers` ADD INDEX `idx_updated_at`(`updated_at`)", Status: state.Task.Running, RowsCopied: 0, RowsTotal: 144_484_274, PercentComplete: 0},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	// Row total is known but nothing has copied yet (VReplication ramp-up).
+	// Show a starting indicator and the row total, never a bare 0% bar that
+	// reads as stuck.
+	assert.Contains(t, result, "**`customers`**: ⏳ Starting copy...")
+	assert.Contains(t, result, "Rows: 0 / 144,484,274")
+	assert.NotContains(t, result, " 0%")
+}
+
 func TestRenderApplyStatusComment_EstimateExceeded(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",

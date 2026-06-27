@@ -171,3 +171,21 @@ func TestTUIBranchApplyProgress(t *testing.T) {
 		})
 	}
 }
+
+// The deploy request link stays visible while the apply is running, not only
+// during deploy-request setup, so an operator watching a long copy can open the
+// PlanetScale console to inspect it.
+func TestTUIShowsDeployRequestURLWhileRunning(t *testing.T) {
+	const url = "https://app.planetscale.com/block-staging/boardgames/deploy-requests/106"
+	m := WatchModel{
+		state:       state.Apply.Running,
+		metadata:    map[string]string{"deploy_request_url": url},
+		tables:      []tableProgress{{Name: "customers", Keyspace: "boardgames_sharded", Status: "running"}},
+		initialized: true,
+		spinner:     spinner.New(),
+		engine:      "PlanetScale",
+	}
+
+	view := m.progressView()
+	assert.Contains(t, view, "Deploy Request:  "+url)
+}

@@ -193,6 +193,38 @@ func TestFormatTableProgress_ChangeTypeSymbol(t *testing.T) {
 	}
 }
 
+// A running table whose row total is known but with nothing copied yet (the
+// VReplication / Spirit ramp-up window) shows a starting indicator and the row
+// total, not a 0% bar that reads as stuck. Holds whether or not per-shard data
+// has arrived.
+func TestFormatTableProgress_StartingCopy(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		shards []ShardProgress
+	}{
+		{name: "no shard data yet"},
+		{name: "sharded", shards: []ShardProgress{
+			{Shard: "-80", Status: state.Task.Running, RowsTotal: 70_000_000},
+			{Shard: "80-", Status: state.Task.Running, RowsTotal: 74_484_274},
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			output := FormatTableProgress(TableProgress{
+				TableName: "customers", ChangeType: "alter", Status: state.Apply.Running,
+				DDL:        "ALTER TABLE `customers` ADD INDEX `idx_updated_at`(`updated_at`)",
+				RowsCopied: 0, RowsTotal: 144_484_274, PercentComplete: 0,
+				Shards: tt.shards,
+			})
+			// The table line shows the starting indicator and total, never a
+			// bare 0% bar. (Per-shard detail lines may still show 0% — that is
+			// the separate per-shard rendering path.)
+			assert.Contains(t, output, "customers: ⏳ Starting copy...")
+			assert.Contains(t, output, "Rows: 0 / 144,484,274")
+			assert.NotContains(t, output, "customers: "+ui.ProgressBarRowCopy(0))
+		})
+	}
+}
+
 // A checksumming table renders its verify progress rather than a row-copy
 // percent — its copy is done and the engine is now verifying the data, which
 // can run for hours on a large table.
