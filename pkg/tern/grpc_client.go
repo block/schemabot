@@ -1156,6 +1156,14 @@ func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Ap
 		}
 		op.ExternalOperationID = remoteOperationID
 	}
+	slog.InfoContext(ctx, "stored remote gRPC apply identifiers for operation",
+		"apply_id", apply.ApplyIdentifier,
+		"apply_operation_id", op.ID,
+		"deployment", op.Deployment,
+		"operation_key", op.OperationKey,
+		"operation_kind", op.OperationKind,
+		"external_id", remoteID,
+		"external_operation_id", remoteOperationID)
 	return nil
 }
 

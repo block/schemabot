@@ -82,6 +82,12 @@ func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presen
 		fmt.Fprintf(b, " (%s)", target)
 	}
 	b.WriteString("\n")
+	if externalOperationID := externalOperationIDForTUIDeployment(m.operations, deployment.Deployment); externalOperationID != "" {
+		fmt.Fprintf(b, "  External operation ID: %s\n", externalOperationID)
+	}
+	if externalID := externalIDForTUIDeployment(m.operations, deployment.Deployment); externalID != "" {
+		fmt.Fprintf(b, "  External apply ID: %s\n", externalID)
+	}
 
 	if deployment.Error != "" {
 		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
@@ -100,6 +106,24 @@ func targetForTUIDeployment(ops []templates.ProgressOperation, deployment string
 	for _, op := range ops {
 		if op.Deployment == deployment {
 			return op.Target
+		}
+	}
+	return ""
+}
+
+func externalOperationIDForTUIDeployment(ops []templates.ProgressOperation, deployment string) string {
+	for _, op := range ops {
+		if op.Deployment == deployment && op.ExternalOperationID != "" {
+			return op.ExternalOperationID
+		}
+	}
+	return ""
+}
+
+func externalIDForTUIDeployment(ops []templates.ProgressOperation, deployment string) string {
+	for _, op := range ops {
+		if op.Deployment == deployment && op.ExternalID != "" {
+			return op.ExternalID
 		}
 	}
 	return ""

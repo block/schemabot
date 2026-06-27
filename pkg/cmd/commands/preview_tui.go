@@ -63,8 +63,8 @@ var tuiPreviewScenarios = map[string]tuiPreviewScenario{
 				Caller:      "octocat",
 				StartedAt:   time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339),
 				Operations: []*apitypes.ProgressOperationResponse{
-					{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt},
-					{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt},
+					{Deployment: "us-east", ExternalID: "remote-apply-us-east-001", ExternalOperationID: "remote-op-us-east-001", Target: "orders-us-east", State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt},
+					{Deployment: "eu-west", ExternalID: "remote-apply-eu-west-001", ExternalOperationID: "remote-op-eu-west-001", Target: "orders-eu-west", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt},
 					{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt},
 				},
 				Tables: []*apitypes.TableProgressResponse{

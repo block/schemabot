@@ -6688,12 +6688,16 @@ Apply ID: apply-multi-a1b2c3d4
 Environment: production
 
 🟢 us-east — ready for cutover — next in order (orders-us-east)
+  External operation ID: remote-op-us-east-001
+  External apply ID: remote-apply-us-east-001
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
 
 
 🔄 eu-west — running table copy (orders-eu-west)
+  External operation ID: remote-op-eu-west-001
+  External apply ID: remote-apply-eu-west-001
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
