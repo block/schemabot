@@ -2058,7 +2058,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			Engine: c.protoEngine(),
 		}, nil
 	}
-	c.logger.Info("Progress: selected task", "task_id", activeTask.TaskIdentifier, "state", activeTask.State, "apply_id", activeTask.ApplyID)
+	c.logger.Debug("Progress: selected task", "task_id", activeTask.TaskIdentifier, "state", activeTask.State, "apply_id", activeTask.ApplyID)
 
 	// Get ALL tasks for this apply (completed + running + pending)
 	currentApplyTasks := filterTasksByApply(tasks, activeTask.ApplyID)
