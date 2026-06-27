@@ -58,6 +58,9 @@ type Client interface {
 	// For Vitess/PlanetScale: fully stops and cannot be restarted.
 	Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1.StopResponse, error)
 
+	// Cancel terminates an in-progress schema change permanently.
+	Cancel(ctx context.Context, req *ternv1.CancelRequest) (*ternv1.CancelResponse, error)
+
 	// Start resumes a stopped schema change.
 	Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error)
 

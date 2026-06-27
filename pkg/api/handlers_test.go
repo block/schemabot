@@ -658,6 +658,9 @@ func (m *mockTernClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*te
 	}
 	return nil, m.stopErr
 }
+func (m *mockTernClient) Cancel(ctx context.Context, req *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
+	return &ternv1.CancelResponse{}, nil
+}
 func (m *mockTernClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
 	m.startReq = req
 	if m.startResp != nil {

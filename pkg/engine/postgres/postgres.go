@@ -44,6 +44,11 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	return nil, fmt.Errorf("postgres engine not implemented")
 }
 
+// Cancel terminates a running schema change.
+func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	return nil, fmt.Errorf("postgres engine not implemented")
+}
+
 // Start resumes a stopped schema change.
 func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
 	return nil, fmt.Errorf("postgres engine not implemented")

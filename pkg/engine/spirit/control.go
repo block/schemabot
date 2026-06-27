@@ -89,6 +89,10 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	}, nil
 }
 
+func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	return nil, fmt.Errorf("cancel is not supported for Spirit schema changes")
+}
+
 // Start resumes a stopped schema change.
 // Spirit automatically resumes from its checkpoint table, which stores:
 // - copier watermark (where the copy was)

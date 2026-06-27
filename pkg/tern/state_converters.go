@@ -47,6 +47,8 @@ func engineStateToStorage(es engine.State) string {
 		return state.Task.Failed
 	case engine.StateStopped:
 		return state.Task.Stopped
+	case engine.StateCancelled:
+		return state.Task.Cancelled
 	case engine.StateReverted:
 		return state.Task.Reverted
 	default:

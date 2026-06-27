@@ -21,6 +21,7 @@ func TestState_IsTerminal(t *testing.T) {
 		{StateCompleted, true},
 		{StateFailed, true},
 		{StateStopped, true},
+		{StateCancelled, true},
 		{StateReverted, true},
 	}
 

@@ -165,6 +165,19 @@ service Tern {
     };
   }
 
+  // Cancel terminates a schema change permanently.
+  //
+  // Transitions: any non-terminal state -> cancelled.
+  //
+  // For engines where stop is already permanent, cancel uses the same engine
+  // control operation and records the final state as cancelled.
+  rpc Cancel(CancelRequest) returns (CancelResponse) {
+    option (google.api.http) = {
+      post: "/v1/cancel"
+      body: "*"
+    };
+  }
+
   // Start resumes a previously stopped schema change from its checkpoint.
   //
   // Transitions: stopped -> running.
@@ -616,6 +629,24 @@ message StopResponse {
   int64 stopped_count = 4;
   // Number of tasks skipped (already in terminal state).
   int64 skipped_count = 5;
+}
+
+// CancelRequest permanently cancels an in-progress schema change by apply ID.
+message CancelRequest {
+  // Apply ID for the schema change to cancel.
+  string apply_id = 1;
+  // Environment: "staging" or "production".
+  string environment = 2;
+}
+
+// CancelResponse indicates whether the cancel was accepted.
+message CancelResponse {
+  bool accepted = 1;
+  string error_message = 2;
+  // Number of tasks that were cancelled.
+  int64 cancelled_count = 3;
+  // Number of tasks skipped (already in terminal state).
+  int64 skipped_count = 4;
 }
 
 // StartRequest resumes a stopped schema change by apply ID.

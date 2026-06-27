@@ -239,6 +239,11 @@ func (r *TargetRouter) Stop(ctx context.Context, req *ternv1.StopRequest) (*tern
 	return routeStoredApply(ctx, r, req, "stop", Client.Stop)
 }
 
+// Cancel terminates a stored apply by routing through its target.
+func (r *TargetRouter) Cancel(ctx context.Context, req *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
+	return routeStoredApply(ctx, r, req, "cancel", Client.Cancel)
+}
+
 // Start resumes a stored apply by routing through its target.
 func (r *TargetRouter) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
 	return routeStoredApply(ctx, r, req, "start", Client.Start)

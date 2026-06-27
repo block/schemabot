@@ -28,6 +28,7 @@ const (
 	Tern_SkipRevert_FullMethodName = "/tern.v1.Tern/SkipRevert"
 	Tern_Health_FullMethodName     = "/tern.v1.Tern/Health"
 	Tern_Stop_FullMethodName       = "/tern.v1.Tern/Stop"
+	Tern_Cancel_FullMethodName     = "/tern.v1.Tern/Cancel"
 	Tern_Start_FullMethodName      = "/tern.v1.Tern/Start"
 	Tern_Volume_FullMethodName     = "/tern.v1.Tern/Volume"
 )
@@ -144,6 +145,13 @@ type TernClient interface {
 	// Returns stopped_count and skipped_count to indicate how many tasks
 	// were affected.
 	Stop(ctx context.Context, in *StopRequest, opts ...grpc.CallOption) (*StopResponse, error)
+	// Cancel terminates a schema change permanently.
+	//
+	// Transitions: any non-terminal state -> cancelled.
+	//
+	// For engines where stop is already permanent, cancel uses the same engine
+	// control operation and records the final state as cancelled.
+	Cancel(ctx context.Context, in *CancelRequest, opts ...grpc.CallOption) (*CancelResponse, error)
 	// Start resumes a previously stopped schema change from its checkpoint.
 	//
 	// Transitions: stopped -> running.
@@ -260,6 +268,16 @@ func (c *ternClient) Stop(ctx context.Context, in *StopRequest, opts ...grpc.Cal
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StopResponse)
 	err := c.cc.Invoke(ctx, Tern_Stop_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *ternClient) Cancel(ctx context.Context, in *CancelRequest, opts ...grpc.CallOption) (*CancelResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CancelResponse)
+	err := c.cc.Invoke(ctx, Tern_Cancel_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -398,6 +416,13 @@ type TernServer interface {
 	// Returns stopped_count and skipped_count to indicate how many tasks
 	// were affected.
 	Stop(context.Context, *StopRequest) (*StopResponse, error)
+	// Cancel terminates a schema change permanently.
+	//
+	// Transitions: any non-terminal state -> cancelled.
+	//
+	// For engines where stop is already permanent, cancel uses the same engine
+	// control operation and records the final state as cancelled.
+	Cancel(context.Context, *CancelRequest) (*CancelResponse, error)
 	// Start resumes a previously stopped schema change from its checkpoint.
 	//
 	// Transitions: stopped -> running.
@@ -455,6 +480,9 @@ func (UnimplementedTernServer) Health(context.Context, *HealthRequest) (*HealthR
 }
 func (UnimplementedTernServer) Stop(context.Context, *StopRequest) (*StopResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Stop not implemented")
+}
+func (UnimplementedTernServer) Cancel(context.Context, *CancelRequest) (*CancelResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Cancel not implemented")
 }
 func (UnimplementedTernServer) Start(context.Context, *StartRequest) (*StartResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Start not implemented")
@@ -644,6 +672,24 @@ func _Tern_Stop_Handler(srv interface{}, ctx context.Context, dec func(interface
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Tern_Cancel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CancelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TernServer).Cancel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tern_Cancel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TernServer).Cancel(ctx, req.(*CancelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Tern_Start_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(StartRequest)
 	if err := dec(in); err != nil {
@@ -722,6 +768,10 @@ var Tern_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Stop",
 			Handler:    _Tern_Stop_Handler,
+		},
+		{
+			MethodName: "Cancel",
+			Handler:    _Tern_Cancel_Handler,
 		},
 		{
 			MethodName: "Start",

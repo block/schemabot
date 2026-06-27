@@ -11,6 +11,10 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestEngineStateToStorageCancelled(t *testing.T) {
+	assert.Equal(t, state.Task.Cancelled, engineStateToStorage(engine.StateCancelled))
+}
+
 // TestDeriveApplyPhase verifies that engine events with structured state
 // produce the correct transitions, and events without a state produce none.
 func TestDeriveApplyPhase(t *testing.T) {

@@ -569,6 +569,10 @@ func (c *GRPCClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1
 	return c.client.Stop(ctx, req)
 }
 
+func (c *GRPCClient) Cancel(ctx context.Context, req *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
+	return c.client.Cancel(ctx, req)
+}
+
 // logOperationDriveLeavesParentStop records that a multi-operation
 // operation-only drive observed an apply-level pending stop request and is
 // leaving it pending. Such a drive owns only its operation; the parent stop

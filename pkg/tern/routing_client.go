@@ -223,6 +223,13 @@ func (c *RoutingClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ter
 	}, Client.Stop)
 }
 
+// Cancel terminates an in-progress schema change.
+func (c *RoutingClient) Cancel(ctx context.Context, req *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
+	return routeApply(ctx, c, req, "cancel", func(r *ternv1.CancelRequest, applyID, environment string) {
+		r.ApplyId, r.Environment = applyID, environment
+	}, Client.Cancel)
+}
+
 // Start resumes a stopped schema change.
 func (c *RoutingClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
 	return routeApply(ctx, c, req, "start", func(r *ternv1.StartRequest, applyID, environment string) {

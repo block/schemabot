@@ -328,6 +328,10 @@ func (c *LocalClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv
 	return c.requestStop(ctx, req, "")
 }
 
+func (c *LocalClient) Cancel(ctx context.Context, req *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
+	return nil, fmt.Errorf("cancel is not supported by local apply owners")
+}
+
 func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, caller string) (*ternv1.StopResponse, error) {
 	c.logger.Info("Stop requested", "database", c.config.Database, "type", c.config.Type, "apply_id", req.ApplyId)
 	apply, err := c.resolveStopApply(ctx, req)

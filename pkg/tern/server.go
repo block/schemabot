@@ -123,6 +123,17 @@ func (s *Server) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1.Sto
 	return resp, nil
 }
 
+func (s *Server) Cancel(ctx context.Context, req *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
+	if err := requireApplyID(req.ApplyId); err != nil {
+		return nil, err
+	}
+	resp, err := s.client.Cancel(ctx, req)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return resp, nil
+}
+
 func (s *Server) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
 	if err := requireApplyID(req.ApplyId); err != nil {
 		return nil, err

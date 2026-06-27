@@ -115,6 +115,10 @@ func (c *targetRouterRecordingClient) Stop(context.Context, *ternv1.StopRequest)
 	return &ternv1.StopResponse{Accepted: true}, nil
 }
 
+func (c *targetRouterRecordingClient) Cancel(context.Context, *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
+	return &ternv1.CancelResponse{Accepted: true}, nil
+}
+
 func (c *targetRouterRecordingClient) Start(context.Context, *ternv1.StartRequest) (*ternv1.StartResponse, error) {
 	return &ternv1.StartResponse{Accepted: true}, nil
 }

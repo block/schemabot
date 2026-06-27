@@ -9,6 +9,15 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 )
 
+func TestStop_UsesDeployRequestCancel(t *testing.T) {
+	e := &Engine{}
+
+	_, err := e.Stop(t.Context(), &engine.ControlRequest{})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no active schema change")
+}
+
 func TestStart_RejectsNonDeferredDeploy(t *testing.T) {
 	e := &Engine{}
 

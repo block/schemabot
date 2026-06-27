@@ -48,6 +48,9 @@ type Engine interface {
 	// Stop pauses a running schema change.
 	Stop(ctx context.Context, req *ControlRequest) (*ControlResult, error)
 
+	// Cancel terminates a running schema change permanently.
+	Cancel(ctx context.Context, req *ControlRequest) (*ControlResult, error)
+
 	// Start resumes a stopped schema change.
 	Start(ctx context.Context, req *ControlRequest) (*ControlResult, error)
 
@@ -383,6 +386,7 @@ const (
 	StateCompleted         State = "completed"
 	StateFailed            State = "failed"
 	StateStopped           State = "stopped"
+	StateCancelled         State = "cancelled"
 	StateReverted          State = "reverted"
 )
 
@@ -393,7 +397,7 @@ const MessageApplyingVSchema = "Applying VSchema changes"
 // IsTerminal returns true if this is a final state.
 func (s State) IsTerminal() bool {
 	switch s {
-	case StateCompleted, StateFailed, StateStopped, StateReverted:
+	case StateCompleted, StateFailed, StateStopped, StateCancelled, StateReverted:
 		return true
 	}
 	return false
@@ -413,6 +417,7 @@ type ControlOperation string
 
 const (
 	ControlStop       ControlOperation = "stop"
+	ControlCancel     ControlOperation = "cancel"
 	ControlStart      ControlOperation = "start"
 	ControlCutover    ControlOperation = "cutover"
 	ControlRevert     ControlOperation = "revert"

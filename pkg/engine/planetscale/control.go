@@ -13,9 +13,19 @@ import (
 
 var _ engine.ControlResumeValidator = (*Engine)(nil)
 
-// Stop cancels the deploy request. This is permanent.
+// Stop preserves the legacy deploy-request cancel behavior until callers move
+// to Cancel.
 func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	meta, client, err := e.controlClient(engine.ControlStop, req)
+	return e.cancelDeployRequest(ctx, engine.ControlStop, req)
+}
+
+// Cancel cancels the deploy request permanently.
+func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	return e.cancelDeployRequest(ctx, engine.ControlCancel, req)
+}
+
+func (e *Engine) cancelDeployRequest(ctx context.Context, operation engine.ControlOperation, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	meta, client, err := e.controlClient(operation, req)
 	if err != nil {
 		return nil, err
 	}

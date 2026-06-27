@@ -29,6 +29,7 @@ type Engine interface {
 
     // Control
     Stop(ctx, *ControlRequest) (*ControlResult, error)
+    Cancel(ctx, *ControlRequest) (*ControlResult, error)
     Start(ctx, *ControlRequest) (*ControlResult, error)
     Cutover(ctx, *ControlRequest) (*ControlResult, error)
     Revert(ctx, *ControlRequest) (*ControlResult, error)
@@ -43,7 +44,7 @@ type Engine interface {
 
 **Progress** returns the current state, per-table row copy metrics, and ETA.
 
-**Control operations** manage a running schema change: pause (`Stop`), resume (`Start`), trigger the final table swap (`Cutover`), adjust speed (`Volume`), or roll back (`Revert`/`SkipRevert`).
+**Control operations** manage a running schema change: pause (`Stop`), permanently abort (`Cancel`), resume (`Start`), trigger the final table swap (`Cutover`), adjust speed (`Volume`), or roll back (`Revert`/`SkipRevert`).
 
 ## State Machine
 
