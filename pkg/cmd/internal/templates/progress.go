@@ -832,7 +832,6 @@ func WriteStatusList(data StatusListData) {
 	maxDeployment := 10 // "DEPLOYMENT"
 	maxState := 5       // "STATE"
 	maxStarted := 7     // "STARTED"
-	maxDur := 8         // "DURATION"
 	for _, a := range data.Applies {
 		maxID = maxLen(maxID, len(a.ApplyID))
 		if data.ShowExternalID {
@@ -845,13 +844,12 @@ func WriteStatusList(data StatusListData) {
 		}
 		maxState = maxLen(maxState, len(state.Label(a.State)))
 		maxStarted = maxLen(maxStarted, len(formatStartedAt(a.StartedAt)))
-		maxDur = maxLen(maxDur, len(formatApplyDuration(a.StartedAt, a.CompletedAt)))
 	}
 
 	// Table header
 	switch {
 	case data.ShowExternalID && showDeployment:
-		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
+		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
 			ANSIDim,
 			maxID, "APPLY ID",
 			maxExternal, statusExternalIDHeader(data),
@@ -860,11 +858,10 @@ func WriteStatusList(data StatusListData) {
 			maxDeployment, "DEPLOYMENT",
 			maxState, "STATE",
 			maxStarted, "STARTED",
-			maxDur, "DURATION",
 			"CALLER",
 			ANSIReset)
 	case data.ShowExternalID:
-		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
+		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
 			ANSIDim,
 			maxID, "APPLY ID",
 			maxExternal, statusExternalIDHeader(data),
@@ -872,30 +869,27 @@ func WriteStatusList(data StatusListData) {
 			maxEnv, "ENV",
 			maxState, "STATE",
 			maxStarted, "STARTED",
-			maxDur, "DURATION",
 			"CALLER",
 			ANSIReset)
 	case showDeployment:
-		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
-			ANSIDim,
-			maxID, "APPLY ID",
-			maxDB, "DATABASE",
-			maxEnv, "ENV",
-			maxDeployment, "DEPLOYMENT",
-			maxState, "STATE",
-			maxStarted, "STARTED",
-			maxDur, "DURATION",
-			"CALLER",
-			ANSIReset)
-	default:
 		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
 			ANSIDim,
 			maxID, "APPLY ID",
 			maxDB, "DATABASE",
 			maxEnv, "ENV",
+			maxDeployment, "DEPLOYMENT",
 			maxState, "STATE",
 			maxStarted, "STARTED",
-			maxDur, "DURATION",
+			"CALLER",
+			ANSIReset)
+	default:
+		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
+			ANSIDim,
+			maxID, "APPLY ID",
+			maxDB, "DATABASE",
+			maxEnv, "ENV",
+			maxState, "STATE",
+			maxStarted, "STARTED",
 			"CALLER",
 			ANSIReset)
 	}
@@ -912,7 +906,7 @@ func WriteStatusList(data StatusListData) {
 
 		switch {
 		case data.ShowExternalID && showDeployment:
-			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %-*s  %s\n",
+			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 				maxID, a.ApplyID,
 				maxExternal, statusExternalID(data, a),
 				maxDB, a.Database,
@@ -920,36 +914,32 @@ func WriteStatusList(data StatusListData) {
 				maxDeployment, a.Deployment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
-				maxDur, formatApplyDuration(a.StartedAt, a.CompletedAt),
 				shortCaller(a.Caller))
 		case data.ShowExternalID:
-			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %-*s  %s\n",
+			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 				maxID, a.ApplyID,
 				maxExternal, statusExternalID(data, a),
 				maxDB, a.Database,
 				maxEnv, a.Environment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
-				maxDur, formatApplyDuration(a.StartedAt, a.CompletedAt),
 				shortCaller(a.Caller))
 		case showDeployment:
-			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %-*s  %s\n",
+			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 				maxID, a.ApplyID,
 				maxDB, a.Database,
 				maxEnv, a.Environment,
 				maxDeployment, a.Deployment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
-				maxDur, formatApplyDuration(a.StartedAt, a.CompletedAt),
 				shortCaller(a.Caller))
 		default:
-			fmt.Printf("  %-*s  %-*s  %-*s  %s  %-*s  %-*s  %s\n",
+			fmt.Printf("  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 				maxID, a.ApplyID,
 				maxDB, a.Database,
 				maxEnv, a.Environment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
-				maxDur, formatApplyDuration(a.StartedAt, a.CompletedAt),
 				shortCaller(a.Caller))
 		}
 	}

@@ -57,6 +57,8 @@ func TestWriteStatusListHasMoreFooter(t *testing.T) {
 
 	assert.Contains(t, output, "Recent schema changes")
 	assert.Contains(t, output, "apply-example")
+	assert.Contains(t, output, "STARTED")
+	assert.NotContains(t, output, "DURATION")
 	assert.Contains(t, output, "Showing the 20 most recent schema changes. Use --limit N to show more.")
 	assert.Contains(t, output, "Use 'schemabot status <apply_id>' to view details")
 }

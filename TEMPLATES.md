@@ -4635,10 +4635,10 @@ Volume: ██░░░░░░░░░ 2/11
 
 3 active schema changes
 
-  APPLY ID      DATABASE   ENV         STATE                STARTED         DURATION  CALLER
-  apply_abc123  orders-db  staging     Running              15 minutes ago  15m       
-  apply_def456  users-db   production  Waiting for cutover  45 minutes ago  45m       
-  apply_ghi789  analytics  staging     Stopped              2 hours ago     2h        
+  APPLY ID      DATABASE   ENV         STATE                STARTED         CALLER
+  apply_abc123  orders-db  staging     Running              15 minutes ago  
+  apply_def456  users-db   production  Waiting for cutover  45 minutes ago  
+  apply_ghi789  analytics  staging     Stopped              2 hours ago     
 
 Use 'schemabot status <apply_id>' to view details
 
@@ -4656,8 +4656,8 @@ No recent schema changes
 
 1 active schema change
 
-  APPLY ID              EXTERNAL OP ID         DATABASE   ENV         DEPLOYMENT  STATE                STARTED        DURATION  CALLER
-  apply-multi-a1b2c3d4  remote-op-us-east-001  orders-db  production  us-east     Waiting for cutover  8 minutes ago  8m        octocat
+  APPLY ID              EXTERNAL OP ID         DATABASE   ENV         DEPLOYMENT  STATE                STARTED        CALLER
+  apply-multi-a1b2c3d4  remote-op-us-east-001  orders-db  production  us-east     Waiting for cutover  8 minutes ago  octocat
 
 Use 'schemabot status <apply_id>' to view details
 
@@ -4665,8 +4665,8 @@ Multiple matching operations:
 
 1 active schema change
 
-  APPLY ID                EXTERNAL OP ID  DATABASE      ENV         DEPLOYMENT  STATE    STARTED        DURATION  CALLER
-  apply-sharded-d5e6f7g8  -               inventory-db  production  us-east     Running  4 minutes ago  4m        octocat
+  APPLY ID                EXTERNAL OP ID  DATABASE      ENV         DEPLOYMENT  STATE    STARTED        CALLER
+  apply-sharded-d5e6f7g8  -               inventory-db  production  us-east     Running  4 minutes ago  octocat
 
 Use 'schemabot status <apply_id>' to view details
 
