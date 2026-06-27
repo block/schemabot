@@ -299,13 +299,26 @@ func TestFetchSchemaFilesOptimizedSmallDirectory(t *testing.T) {
 func TestFetchSchemaFilesOptimizedFollowsSymlinkedNamespaces(t *testing.T) {
 	client, mux := setupRateLimitedTestGitHubServer(t)
 
+	// The Contents API directory listing returns symlink entries WITHOUT a
+	// target; the target is only populated when the symlink path is fetched
+	// directly (mirrored by the per-symlink handlers below).
 	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema", func(w http.ResponseWriter, _ *http.Request) {
 		entries := []gh.RepositoryContent{
 			{Type: new("file"), Name: new("schemabot.yaml"), Path: new("schema/schemabot.yaml")},
-			{Type: new("symlink"), Name: new("shard_001"), Path: new("schema/shard_001"), Target: new("../canonical/shard")},
-			{Type: new("symlink"), Name: new("shard_002"), Path: new("schema/shard_002"), Target: new("../canonical/shard")},
+			{Type: new("symlink"), Name: new("shard_001"), Path: new("schema/shard_001")},
+			{Type: new("symlink"), Name: new("shard_002"), Path: new("schema/shard_002")},
 		}
 		require.NoError(t, json.NewEncoder(w).Encode(entries))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema/shard_001", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.RepositoryContent{
+			Type: new("symlink"), Name: new("shard_001"), Path: new("schema/shard_001"), Target: new("../canonical/shard"),
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema/shard_002", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.RepositoryContent{
+			Type: new("symlink"), Name: new("shard_002"), Path: new("schema/shard_002"), Target: new("../canonical/shard"),
+		}))
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/contents/canonical/shard", func(w http.ResponseWriter, _ *http.Request) {
 		entries := []gh.RepositoryContent{

@@ -1447,6 +1447,18 @@ func (ic *InstallationClient) symlinkedNamespaceLocators(ctx context.Context, re
 	symlinkName := path.Base(entry.GetPath())
 	target := strings.TrimSpace(entry.GetTarget())
 	if target == "" {
+		// The Contents API does not populate a symlink's target in a directory
+		// listing — only when the symlink path is fetched directly. Resolve it
+		// with a follow-up fetch before giving up.
+		content, _, err := ic.fetchRepositoryContents(ctx, repo, entry.GetPath(), ref)
+		if err != nil {
+			return nil, fmt.Errorf("resolve schema namespace symlink %s target: %w", entry.GetPath(), err)
+		}
+		if content != nil {
+			target = strings.TrimSpace(content.GetTarget())
+		}
+	}
+	if target == "" {
 		return nil, fmt.Errorf("schema namespace symlink %s has empty target", entry.GetPath())
 	}
 	if strings.HasPrefix(target, "/") {
