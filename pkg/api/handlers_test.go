@@ -132,6 +132,23 @@ func (s *staticApplyOperationStore) ListByApply(_ context.Context, applyID int64
 	return operations, nil
 }
 
+func (s *staticApplyOperationStore) ListByApplies(_ context.Context, applyIDs []int64) ([]*storage.ApplyOperation, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	applyIDSet := make(map[int64]bool, len(applyIDs))
+	for _, applyID := range applyIDs {
+		applyIDSet[applyID] = true
+	}
+	operations := make([]*storage.ApplyOperation, 0, len(s.operations))
+	for _, op := range s.operations {
+		if applyIDSet[op.ApplyID] {
+			operations = append(operations, op)
+		}
+	}
+	return operations, nil
+}
+
 func (s *staticApplyOperationStore) GetEngineResumeState(_ context.Context, operationID int64) (*storage.EngineResumeState, error) {
 	if s.resumeStateErr != nil {
 		return nil, s.resumeStateErr
@@ -236,6 +253,9 @@ func (s *recentApplyStore) GetRecent(_ context.Context, filter storage.RecentApp
 	applies := make([]*storage.Apply, 0, len(s.applies))
 	for _, apply := range s.applies {
 		if filter.Environment != "" && apply.Environment != filter.Environment {
+			continue
+		}
+		if filter.Deployment != "" && apply.Deployment != filter.Deployment {
 			continue
 		}
 		if len(filter.States) > 0 && !state.IsState(apply.State, filter.States...) {
@@ -2691,7 +2711,7 @@ func TestProgressFromLocalStorageIncludesOperationProgressAndTableDeployment(t *
 			},
 		}},
 		operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{
-			{ID: opAID, ApplyID: apply.ID, Deployment: "deploy-a", OperationKind: storage.ApplyOperationKindWork, Target: "target-a", State: state.ApplyOperation.Running, StartedAt: &startedAt},
+			{ID: opAID, ApplyID: apply.ID, Deployment: "deploy-a", ExternalID: "remote-apply-a", ExternalOperationID: "remote-operation-a", OperationKind: storage.ApplyOperationKindWork, Target: "target-a", State: state.ApplyOperation.Running, StartedAt: &startedAt},
 			{ID: opBID, ApplyID: apply.ID, Deployment: "deploy-b", OperationKind: storage.ApplyOperationKindGroupFinalizer, Target: "target-b", State: state.ApplyOperation.Failed, ErrorMessage: "engine failed", StartedAt: &startedAt, CompletedAt: &completedAt},
 		}},
 	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
@@ -2701,6 +2721,8 @@ func TestProgressFromLocalStorageIncludesOperationProgressAndTableDeployment(t *
 	require.NoError(t, err)
 	require.Len(t, resp.Operations, 2)
 	assert.Equal(t, "deploy-a", resp.Operations[0].Deployment)
+	assert.Equal(t, "remote-apply-a", resp.Operations[0].ExternalID)
+	assert.Equal(t, "remote-operation-a", resp.Operations[0].ExternalOperationID)
 	assert.Equal(t, storage.ApplyOperationKindWork, resp.Operations[0].OperationKind)
 	assert.Equal(t, "target-a", resp.Operations[0].Target)
 	assert.Equal(t, state.ApplyOperation.Running, resp.Operations[0].State)
@@ -3208,6 +3230,136 @@ func TestHandleStatusLimitAndEnvironment(t *testing.T) {
 	assert.Equal(t, "apply-one", resp.Applies[0].ApplyID)
 	assert.Equal(t, "external-one", resp.Applies[0].ExternalID)
 	assert.Equal(t, "apply-two", resp.Applies[1].ApplyID)
+}
+
+func TestHandleStatusDeploymentFilterProjectsMatchingOperation(t *testing.T) {
+	now := time.Now().UTC()
+	startedAt := now.Add(-time.Minute)
+	applies := &recentApplyStore{
+		applies: []*storage.Apply{
+			{
+				ID:              101,
+				ApplyIdentifier: "apply-deployment",
+				ExternalID:      "parent-external",
+				Database:        "orders",
+				Environment:     "staging",
+				Deployment:      "deploy-a",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Running,
+				Caller:          "cli",
+				CreatedAt:       now,
+				UpdatedAt:       now,
+			},
+		},
+	}
+	operations := &staticApplyOperationStore{
+		operations: []*storage.ApplyOperation{
+			{
+				ID:                  202,
+				ApplyID:             101,
+				Deployment:          "deploy-a",
+				ExternalID:          "remote-apply-202",
+				ExternalOperationID: "remote-operation-202",
+				State:               state.Apply.Completed,
+				StartedAt:           &startedAt,
+				CreatedAt:           now,
+				UpdatedAt:           now,
+			},
+		},
+	}
+	stor := &mockStorageWithApplyStores{applies: applies, operations: operations}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(stor, testServerConfig(), nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?environment=staging&deployment=deploy-a", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp apitypes.StatusResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	require.Len(t, applies.filters, 1)
+	assert.Equal(t, "staging", applies.filters[0].Environment)
+	assert.Equal(t, "deploy-a", applies.filters[0].Deployment)
+	assert.Equal(t, 0, resp.ActiveCount)
+	require.Len(t, resp.Applies, 1)
+	assert.Equal(t, "apply-deployment", resp.Applies[0].ApplyID)
+	assert.Equal(t, "remote-apply-202", resp.Applies[0].ExternalID)
+	assert.Equal(t, "remote-operation-202", resp.Applies[0].ExternalOperationID)
+	assert.Equal(t, "deploy-a", resp.Applies[0].Deployment)
+	assert.Equal(t, state.Apply.Completed, resp.Applies[0].State)
+}
+
+func TestHandleStatusDeploymentFilterSummarizesMatchingOperations(t *testing.T) {
+	now := time.Now().UTC()
+	startedAt := now.Add(-2 * time.Minute)
+	completedAt := now.Add(-time.Minute)
+	applies := &recentApplyStore{
+		applies: []*storage.Apply{
+			{
+				ID:              101,
+				ApplyIdentifier: "apply-deployment",
+				ExternalID:      "parent-external",
+				Database:        "orders",
+				Environment:     "staging",
+				Deployment:      "deploy-a",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Completed,
+				Caller:          "cli",
+				CreatedAt:       now,
+				UpdatedAt:       now,
+			},
+		},
+	}
+	operations := &staticApplyOperationStore{
+		operations: []*storage.ApplyOperation{
+			{
+				ID:                  202,
+				ApplyID:             101,
+				Deployment:          "deploy-a",
+				ExternalOperationID: "remote-operation-202",
+				State:               state.Apply.Completed,
+				StartedAt:           &startedAt,
+				CompletedAt:         &completedAt,
+				CreatedAt:           now.Add(-2 * time.Minute),
+				UpdatedAt:           completedAt,
+			},
+			{
+				ID:                  203,
+				ApplyID:             101,
+				Deployment:          "deploy-a",
+				ExternalOperationID: "remote-operation-203",
+				State:               state.Apply.Running,
+				StartedAt:           &startedAt,
+				CreatedAt:           now.Add(-90 * time.Second),
+				UpdatedAt:           now,
+			},
+		},
+	}
+	stor := &mockStorageWithApplyStores{applies: applies, operations: operations}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(stor, testServerConfig(), nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?environment=staging&deployment=deploy-a", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp apitypes.StatusResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	assert.Equal(t, 1, resp.ActiveCount)
+	require.Len(t, resp.Applies, 1)
+	assert.Equal(t, "apply-deployment", resp.Applies[0].ApplyID)
+	assert.Empty(t, resp.Applies[0].ExternalID)
+	assert.Empty(t, resp.Applies[0].ExternalOperationID)
+	assert.Equal(t, "deploy-a", resp.Applies[0].Deployment)
+	assert.Equal(t, state.Apply.Running, resp.Applies[0].State)
 }
 
 func TestHandleStatusFailedFilter(t *testing.T) {

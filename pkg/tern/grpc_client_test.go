@@ -450,26 +450,27 @@ func TestGRPCClient_Close(t *testing.T) {
 // server defaults to STATE_COMPLETED.
 type capturingTernServer struct {
 	ternv1.UnimplementedTernServer
-	mu               sync.Mutex
-	applyReq         *ternv1.ApplyRequest
-	applyErr         error
-	remoteApplyID    string
-	stopApplyID      string
-	startApplyID     string
-	cutoverApplyID   string
-	progressApplyID  string
-	progressReq      *ternv1.ProgressRequest
-	progressState    ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
-	progressStateSet bool
-	progressStates   []ternv1.State
-	progressTables   []*ternv1.TableProgress
-	progressError    string
-	progressErr      error
-	startErr         error
-	cutoverErr       error
-	cutoverAccepted  bool
-	cutoverMessage   string
-	startCalled      bool // tracks whether Start was actually invoked
+	mu                sync.Mutex
+	applyReq          *ternv1.ApplyRequest
+	applyErr          error
+	remoteApplyID     string
+	remoteOperationID string
+	stopApplyID       string
+	startApplyID      string
+	cutoverApplyID    string
+	progressApplyID   string
+	progressReq       *ternv1.ProgressRequest
+	progressState     ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
+	progressStateSet  bool
+	progressStates    []ternv1.State
+	progressTables    []*ternv1.TableProgress
+	progressError     string
+	progressErr       error
+	startErr          error
+	cutoverErr        error
+	cutoverAccepted   bool
+	cutoverMessage    string
+	startCalled       bool // tracks whether Start was actually invoked
 }
 
 func (s *capturingTernServer) Apply(_ context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
@@ -479,12 +480,13 @@ func (s *capturingTernServer) Apply(_ context.Context, req *ternv1.ApplyRequest)
 	if applyID == "" {
 		applyID = "remote-apply-123"
 	}
+	operationID := s.remoteOperationID
 	err := s.applyErr
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	return &ternv1.ApplyResponse{Accepted: true, ApplyId: applyID}, nil
+	return &ternv1.ApplyResponse{Accepted: true, ApplyId: applyID, ApplyOperationId: operationID}, nil
 }
 
 func (s *capturingTernServer) Start(_ context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
@@ -689,7 +691,7 @@ type mockStorage struct {
 
 // mockApplyOperationStore is an in-memory ApplyOperationStore for the remote
 // drive tests. It backs the operation lookups (Get/ListByApply) and the per-op
-// remote resume id write (SaveEngineResumeState) that the fan-out drive uses.
+// remote identifier writes that the fan-out drive uses.
 type mockApplyOperationStore struct {
 	storage.ApplyOperationStore
 	ops          map[int64]*storage.ApplyOperation
@@ -709,6 +711,20 @@ func (m *mockApplyOperationStore) ListByApply(_ context.Context, applyID int64) 
 	var ops []*storage.ApplyOperation
 	for _, op := range m.ops {
 		if op != nil && op.ApplyID == applyID {
+			ops = append(ops, op)
+		}
+	}
+	return ops, nil
+}
+
+func (m *mockApplyOperationStore) ListByApplies(_ context.Context, applyIDs []int64) ([]*storage.ApplyOperation, error) {
+	applyIDSet := make(map[int64]bool, len(applyIDs))
+	for _, applyID := range applyIDs {
+		applyIDSet[applyID] = true
+	}
+	var ops []*storage.ApplyOperation
+	for _, op := range m.ops {
+		if op != nil && applyIDSet[op.ApplyID] {
 			ops = append(ops, op)
 		}
 	}
@@ -755,6 +771,30 @@ func (m *mockApplyOperationStore) MarkFailed(_ context.Context, id int64, errMsg
 	op.State = state.ApplyOperation.Failed
 	op.ErrorMessage = errMsg
 	op.CompletedAt = &now
+	return nil
+}
+
+func (m *mockApplyOperationStore) SaveExternalOperationID(_ context.Context, operationID int64, externalOperationID string) error {
+	if m.saveErr != nil {
+		return m.saveErr
+	}
+	op, ok := m.ops[operationID]
+	if !ok {
+		return storage.ErrApplyOperationNotFound
+	}
+	op.ExternalOperationID = externalOperationID
+	return nil
+}
+
+func (m *mockApplyOperationStore) SaveExternalID(_ context.Context, operationID int64, externalID string) error {
+	if m.saveErr != nil {
+		return m.saveErr
+	}
+	op, ok := m.ops[operationID]
+	if !ok {
+		return storage.ErrApplyOperationNotFound
+	}
+	op.ExternalID = externalID
 	return nil
 }
 
@@ -1309,11 +1349,14 @@ func TestGRPCClient_ResumeApplyOperationDispatchDoesNotDeferRollingCutover(t *te
 
 func TestGRPCClient_ResumeApplyOperationStoresRemoteIDOnOperationForMultiOpApply(t *testing.T) {
 	// On a multi-deployment apply, each deployment gets its own remote Tern apply
-	// id. Dispatching one operation must store its remote id on that operation's
-	// engine_resume_context and must NOT touch the parent applies.external_id,
-	// which has no single authoritative value across deployments.
+	// id and remote apply_operation id. Dispatching one operation must store the
+	// remote apply id on that operation's external_id, store the remote
+	// operation id separately for operator UX, and must NOT touch the parent
+	// applies.external_id, which has no single authoritative value across
+	// deployments.
 	server := &capturingTernServer{
-		remoteApplyID: "remote-op-west-1",
+		remoteApplyID:     "remote-op-west-1",
+		remoteOperationID: "remote-operation-west-1",
 		progressTables: []*ternv1.TableProgress{{
 			Namespace:       "default",
 			TableName:       "users",
@@ -1373,18 +1416,89 @@ func TestGRPCClient_ResumeApplyOperationStoresRemoteIDOnOperationForMultiOpApply
 
 	assert.Empty(t, applyStore.updates, "a multi-op drive must never write the parent applies row directly; parent state is owned by the projection CAS")
 	assert.Empty(t, apply.ExternalID, "multi-op dispatch must not write the parent apply external_id")
-	assert.Equal(t, "remote-op-west-1", operationStore.ops[operationID].EngineResumeContext,
+	assert.Equal(t, "remote-op-west-1", operationStore.ops[operationID].ExternalID,
 		"the remote apply id must be stored on the claimed operation")
-	assert.Empty(t, operationStore.ops[siblingID].EngineResumeContext,
+	assert.Empty(t, operationStore.ops[operationID].EngineResumeContext,
+		"new remote dispatches must not store data-plane apply ids in opaque engine resume context")
+	assert.Equal(t, "remote-operation-west-1", operationStore.ops[operationID].ExternalOperationID,
+		"the remote apply_operation id must be stored on the claimed operation")
+	assert.Empty(t, operationStore.ops[siblingID].ExternalID,
 		"the sibling operation's remote id must be untouched")
-	require.Len(t, operationStore.savedResumes, 1)
-	assert.Equal(t, operationID, operationStore.savedResumes[0].ApplyOperationID)
-	assert.Equal(t, "remote-op-west-1", operationStore.savedResumes[0].MigrationContext)
+	assert.Empty(t, operationStore.ops[siblingID].ExternalOperationID,
+		"the sibling operation's remote operation id must be untouched")
+	assert.Empty(t, operationStore.savedResumes)
 
 	req := server.getApplyRequest()
 	require.NotNil(t, req)
 	require.Len(t, req.DdlChanges, 1)
 	assert.Equal(t, "users", req.DdlChanges[0].TableName)
+}
+
+func TestGRPCClient_ResumeApplyOperationRefusesExternalOperationIDMismatch(t *testing.T) {
+	server := &capturingTernServer{
+		remoteApplyID:     "remote-op-west-1",
+		remoteOperationID: "remote-operation-west-2",
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-multi-op-mismatch",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "testdb-target"})
+	operationID := int64(42)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		DDL:              "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:        "alter",
+		Namespace:        "default",
+		State:            state.Task.Pending,
+	}
+	operationStore := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: {
+			ID:                  operationID,
+			ApplyID:             apply.ID,
+			Deployment:          "west",
+			State:               state.ApplyOperation.Pending,
+			ExternalOperationID: "remote-operation-west-1",
+		},
+		43: {ID: 43, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.Pending},
+	}}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks: &mockTaskStore{
+			tasks:           []*storage.Task{task},
+			getByApplyIDErr: errors.New("whole-apply task load must not be used for operation-scoped resume"),
+		},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-multi-op-mismatch",
+		}},
+		operations: operationStore,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already has remote apply_operation id")
+	assert.Equal(t, "remote-operation-west-1", operationStore.ops[operationID].ExternalOperationID)
 }
 
 func TestGRPCClient_ResumeApplyOperationStartsQueuedRemoteWithoutWritingParent(t *testing.T) {

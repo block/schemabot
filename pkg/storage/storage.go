@@ -350,6 +350,7 @@ type ApplyOperationWithTasks struct {
 type RecentAppliesFilter struct {
 	Limit       int
 	Environment string
+	Deployment  string
 	States      []string
 }
 
@@ -474,6 +475,10 @@ type ApplyOperationStore interface {
 	// ListByApply returns all child rows for an apply in (created_at, id) order.
 	ListByApply(ctx context.Context, applyID int64) ([]*ApplyOperation, error)
 
+	// ListByApplies returns all child rows for the requested applies in
+	// (apply_id, created_at, id) order.
+	ListByApplies(ctx context.Context, applyIDs []int64) ([]*ApplyOperation, error)
+
 	// UpdateState transitions a child row to a new state. Updates the state
 	// column only; for transitions that should also stamp started_at or
 	// completed_at, use MarkStarted / MarkCompleted / MarkFailed instead.
@@ -494,6 +499,14 @@ type ApplyOperationStore interface {
 	// completed_at nil (use UpdateState). Use MarkCompleted / MarkFailed for
 	// completed / failed.
 	MarkTerminal(ctx context.Context, id int64, newState string) error
+
+	// SaveExternalOperationID stores the remote data plane's apply_operation_id
+	// on the operation that owns the dispatch.
+	SaveExternalOperationID(ctx context.Context, operationID int64, externalOperationID string) error
+
+	// SaveExternalID stores the remote data plane's apply_id on the operation
+	// that owns the dispatch.
+	SaveExternalID(ctx context.Context, operationID int64, externalID string) error
 
 	// SaveEngineResumeState stores opaque engine resume state on the operation.
 	SaveEngineResumeState(ctx context.Context, operationID int64, resumeState *EngineResumeState) error

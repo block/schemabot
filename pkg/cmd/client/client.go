@@ -520,6 +520,7 @@ var (
 type StatusOptions struct {
 	Limit       int
 	Environment string
+	Deployment  string
 	Failed      bool
 }
 
@@ -534,6 +535,9 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 		}
 		if opts[0].Environment != "" {
 			values.Set("environment", opts[0].Environment)
+		}
+		if opts[0].Deployment != "" {
+			values.Set("deployment", opts[0].Deployment)
 		}
 		if opts[0].Failed {
 			values.Set("failed", "true")

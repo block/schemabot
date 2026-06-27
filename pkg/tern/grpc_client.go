@@ -965,9 +965,9 @@ func (c *GRPCClient) Health(ctx context.Context) error {
 // operation-scoped value restricts the drive to a single apply_operation (one
 // deployment) so a driver can advance one deployment independently of its
 // siblings; when the parent owns more than one operation it also routes the
-// remote apply id through that operation's engine_resume_context instead of the
-// shared parent external_id, so one deployment never reuses or overwrites
-// another deployment's remote apply id.
+// remote apply id through that operation's external_id instead of the shared
+// parent external_id, so one deployment never reuses or overwrites another
+// deployment's remote apply id.
 type applyTaskScope struct {
 	applyOperationID int64
 
@@ -991,9 +991,9 @@ func (s applyTaskScope) isOperationScoped() bool {
 }
 
 // usesOperationRemoteResume reports whether the remote apply id for this drive
-// lives on the claimed operation's engine_resume_context rather than the parent
-// applies.external_id. Only multi-operation drives do; single-operation and
-// whole-apply drives keep using the parent external_id.
+// lives on the claimed operation rather than the parent applies.external_id.
+// Only multi-operation drives do; single-operation and whole-apply drives keep
+// using the parent external_id.
 func (s applyTaskScope) usesOperationRemoteResume() bool {
 	return s.multiOperation && s.operation != nil
 }
@@ -1022,10 +1022,13 @@ func (s applyTaskScope) finalizerOperationScope() bool {
 
 // remoteApplyID resolves the remote Tern apply id sent on this drive's
 // Progress/Stop/Start/Cutover calls. Multi-operation drives read the claimed
-// operation's engine_resume_context (which may be empty before dispatch);
-// everything else reads the parent external_id.
+// operation's external_id (which may be empty before dispatch); everything
+// else reads the parent external_id.
 func (s applyTaskScope) remoteApplyID(apply *storage.Apply) string {
 	if s.usesOperationRemoteResume() {
+		if s.operation.ExternalID != "" {
+			return s.operation.ExternalID
+		}
 		return s.operation.EngineResumeContext
 	}
 	return apply.ExternalID
@@ -1114,10 +1117,10 @@ func remoteApplyIdempotencyKey(apply *storage.Apply, scope applyTaskScope) strin
 // persistRemoteApplyID stores the remote Tern apply id returned by dispatch.
 // Single-operation drives keep it on the parent applies.external_id (mutated in
 // place so the caller's Applies().Update persists it). Multi-operation drives
-// write it to the claimed operation's engine_resume_context and never touch the
-// parent external_id, refusing to overwrite a different existing id so one
-// deployment can't clobber another deployment's remote apply id.
-func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteID string) error {
+// write it to the claimed operation's external_id and never touch the parent
+// external_id, refusing to overwrite a different existing id so one deployment
+// can't clobber another deployment's remote apply id.
+func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteID, remoteOperationID string) error {
 	if remoteID == "" {
 		return fmt.Errorf("refusing to persist empty remote apply id for apply %s", apply.ApplyIdentifier)
 	}
@@ -1133,17 +1136,26 @@ func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Ap
 	if current.ApplyID != apply.ID {
 		return fmt.Errorf("apply_operation %d belongs to apply %d, not %s (%d)", op.ID, current.ApplyID, apply.ApplyIdentifier, apply.ID)
 	}
-	if current.EngineResumeContext != "" && current.EngineResumeContext != remoteID {
-		return fmt.Errorf("apply_operation %d already has remote apply id %q; refusing to overwrite with %q", op.ID, current.EngineResumeContext, remoteID)
+	currentRemoteID := current.ExternalID
+	if currentRemoteID == "" {
+		currentRemoteID = current.EngineResumeContext
 	}
-	if err := c.storage.ApplyOperations().SaveEngineResumeState(ctx, op.ID, &storage.EngineResumeState{
-		ApplyOperationID: op.ID,
-		MigrationContext: remoteID,
-		Metadata:         "{}",
-	}); err != nil {
+	if currentRemoteID != "" && currentRemoteID != remoteID {
+		return fmt.Errorf("apply_operation %d already has remote apply id %q; refusing to overwrite with %q", op.ID, currentRemoteID, remoteID)
+	}
+	if remoteOperationID != "" && current.ExternalOperationID != "" && current.ExternalOperationID != remoteOperationID {
+		return fmt.Errorf("apply_operation %d already has remote apply_operation id %q; refusing to overwrite with %q", op.ID, current.ExternalOperationID, remoteOperationID)
+	}
+	if err := c.storage.ApplyOperations().SaveExternalID(ctx, op.ID, remoteID); err != nil {
 		return fmt.Errorf("store remote apply id for apply_operation %d: %w", op.ID, err)
 	}
-	op.EngineResumeContext = remoteID
+	op.ExternalID = remoteID
+	if remoteOperationID != "" {
+		if err := c.storage.ApplyOperations().SaveExternalOperationID(ctx, op.ID, remoteOperationID); err != nil {
+			return fmt.Errorf("store remote apply_operation id for apply_operation %d: %w", op.ID, err)
+		}
+		op.ExternalOperationID = remoteOperationID
+	}
 	return nil
 }
 
@@ -1296,7 +1308,7 @@ func (c *GRPCClient) dispatchRemoteGroupFinalizer(ctx context.Context, apply *st
 			}
 			return fmt.Errorf("dispatch group_finalizer apply_operation %d (apply %s): %s", op.ID, apply.ApplyIdentifier, errMsg)
 		}
-		if err := c.persistRemoteApplyID(ctx, apply, scope, resp.ApplyId); err != nil {
+		if err := c.persistRemoteApplyID(ctx, apply, scope, resp.ApplyId, resp.ApplyOperationId); err != nil {
 			return fmt.Errorf("store remote apply id for group_finalizer apply_operation %d: %w", op.ID, err)
 		}
 	}
@@ -1986,7 +1998,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	// after this point can resume the exact remote operation instead of
 	// dispatching a duplicate. Multi-operation drives store it on the claimed
 	// operation row; single-operation drives mutate apply.ExternalID in place.
-	if err := c.persistRemoteApplyID(ctx, apply, scope, resp.ApplyId); err != nil {
+	if err := c.persistRemoteApplyID(ctx, apply, scope, resp.ApplyId, resp.ApplyOperationId); err != nil {
 		return fmt.Errorf("store remote apply id for %s: %w", apply.ApplyIdentifier, err)
 	}
 	apply.State = state.InitialActiveApplyState(apply.Engine)

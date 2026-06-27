@@ -15,15 +15,17 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 		State: state.Apply.Running,
 		Operations: []*apitypes.ProgressOperationResponse{
 			{
-				Deployment:    "deploy-a",
-				Target:        "target-a",
-				State:         "STATE_RUNNING",
-				CutoverPolicy: "barrier",
-				OnFailure:     "continue",
-				ErrorCode:     "engine_error_retryable",
-				ErrorMessage:  "retryable failure",
-				StartedAt:     "2026-06-16T10:00:00Z",
-				CompletedAt:   "2026-06-16T10:05:00Z",
+				Deployment:          "deploy-a",
+				ExternalID:          "remote-apply-a",
+				ExternalOperationID: "remote-operation-a",
+				Target:              "target-a",
+				State:               "STATE_RUNNING",
+				CutoverPolicy:       "barrier",
+				OnFailure:           "continue",
+				ErrorCode:           "engine_error_retryable",
+				ErrorMessage:        "retryable failure",
+				StartedAt:           "2026-06-16T10:00:00Z",
+				CompletedAt:         "2026-06-16T10:05:00Z",
 			},
 		},
 		Tables: []*apitypes.TableProgressResponse{
@@ -42,6 +44,8 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 
 	require.Len(t, data.Operations, 1)
 	assert.Equal(t, "deploy-a", data.Operations[0].Deployment)
+	assert.Equal(t, "remote-apply-a", data.Operations[0].ExternalID)
+	assert.Equal(t, "remote-operation-a", data.Operations[0].ExternalOperationID)
 	assert.Equal(t, "target-a", data.Operations[0].Target)
 	assert.Equal(t, state.Apply.Running, data.Operations[0].State)
 	assert.Equal(t, "barrier", data.Operations[0].CutoverPolicy)

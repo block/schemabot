@@ -768,18 +768,20 @@ func WriteStartNoWatch(applyID, database, environment string) {
 
 // ActiveApplyData contains data for a single apply in the status list.
 type ActiveApplyData struct {
-	ApplyID      string
-	ExternalID   string
-	Database     string
-	Environment  string
-	State        string
-	Engine       string
-	Caller       string
-	ErrorMessage string
-	StartedAt    string
-	CompletedAt  string
-	UpdatedAt    string
-	Volume       int
+	ApplyID             string
+	ExternalID          string
+	ExternalOperationID string
+	Database            string
+	Environment         string
+	Deployment          string
+	State               string
+	Engine              string
+	Caller              string
+	ErrorMessage        string
+	StartedAt           string
+	CompletedAt         string
+	UpdatedAt           string
+	Volume              int
 }
 
 // StatusListData contains data for rendering the status list.
@@ -790,6 +792,7 @@ type StatusListData struct {
 	HasMore        bool
 	FailuresOnly   bool
 	ShowExternalID bool
+	Deployment     string
 	Applies        []ActiveApplyData
 }
 
@@ -821,31 +824,50 @@ func WriteStatusList(data StatusListData) {
 	fmt.Println()
 
 	// Calculate column widths from data
-	maxID := 8        // "APPLY ID"
-	maxExternal := 11 // "EXTERNAL ID"
-	maxDB := 8        // "DATABASE"
-	maxEnv := 3       // "ENV"
-	maxState := 5     // "STATE"
-	maxStarted := 7   // "STARTED"
-	maxDur := 8       // "DURATION"
+	showDeployment := statusListShowsDeployment(data)
+	maxID := 8 // "APPLY ID"
+	maxExternal := len(statusExternalIDHeader(data))
+	maxDB := 8          // "DATABASE"
+	maxEnv := 3         // "ENV"
+	maxDeployment := 10 // "DEPLOYMENT"
+	maxState := 5       // "STATE"
+	maxStarted := 7     // "STARTED"
+	maxDur := 8         // "DURATION"
 	for _, a := range data.Applies {
 		maxID = maxLen(maxID, len(a.ApplyID))
 		if data.ShowExternalID {
-			maxExternal = maxLen(maxExternal, len(statusExternalID(a)))
+			maxExternal = maxLen(maxExternal, len(statusExternalID(data, a)))
 		}
 		maxDB = maxLen(maxDB, len(a.Database))
 		maxEnv = maxLen(maxEnv, len(a.Environment))
+		if showDeployment {
+			maxDeployment = maxLen(maxDeployment, len(a.Deployment))
+		}
 		maxState = maxLen(maxState, len(state.Label(a.State)))
 		maxStarted = maxLen(maxStarted, len(formatStartedAt(a.StartedAt)))
 		maxDur = maxLen(maxDur, len(formatApplyDuration(a.StartedAt, a.CompletedAt)))
 	}
 
 	// Table header
-	if data.ShowExternalID {
+	switch {
+	case data.ShowExternalID && showDeployment:
+		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
+			ANSIDim,
+			maxID, "APPLY ID",
+			maxExternal, statusExternalIDHeader(data),
+			maxDB, "DATABASE",
+			maxEnv, "ENV",
+			maxDeployment, "DEPLOYMENT",
+			maxState, "STATE",
+			maxStarted, "STARTED",
+			maxDur, "DURATION",
+			"CALLER",
+			ANSIReset)
+	case data.ShowExternalID:
 		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
 			ANSIDim,
 			maxID, "APPLY ID",
-			maxExternal, "EXTERNAL ID",
+			maxExternal, statusExternalIDHeader(data),
 			maxDB, "DATABASE",
 			maxEnv, "ENV",
 			maxState, "STATE",
@@ -853,7 +875,19 @@ func WriteStatusList(data StatusListData) {
 			maxDur, "DURATION",
 			"CALLER",
 			ANSIReset)
-	} else {
+	case showDeployment:
+		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
+			ANSIDim,
+			maxID, "APPLY ID",
+			maxDB, "DATABASE",
+			maxEnv, "ENV",
+			maxDeployment, "DEPLOYMENT",
+			maxState, "STATE",
+			maxStarted, "STARTED",
+			maxDur, "DURATION",
+			"CALLER",
+			ANSIReset)
+	default:
 		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
 			ANSIDim,
 			maxID, "APPLY ID",
@@ -876,17 +910,39 @@ func WriteStatusList(data StatusListData) {
 			coloredState = colorFn(padded)
 		}
 
-		if data.ShowExternalID {
+		switch {
+		case data.ShowExternalID && showDeployment:
+			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %-*s  %s\n",
+				maxID, a.ApplyID,
+				maxExternal, statusExternalID(data, a),
+				maxDB, a.Database,
+				maxEnv, a.Environment,
+				maxDeployment, a.Deployment,
+				coloredState,
+				maxStarted, formatStartedAt(a.StartedAt),
+				maxDur, formatApplyDuration(a.StartedAt, a.CompletedAt),
+				shortCaller(a.Caller))
+		case data.ShowExternalID:
 			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %-*s  %s\n",
 				maxID, a.ApplyID,
-				maxExternal, statusExternalID(a),
+				maxExternal, statusExternalID(data, a),
 				maxDB, a.Database,
 				maxEnv, a.Environment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
 				maxDur, formatApplyDuration(a.StartedAt, a.CompletedAt),
 				shortCaller(a.Caller))
-		} else {
+		case showDeployment:
+			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %-*s  %s\n",
+				maxID, a.ApplyID,
+				maxDB, a.Database,
+				maxEnv, a.Environment,
+				maxDeployment, a.Deployment,
+				coloredState,
+				maxStarted, formatStartedAt(a.StartedAt),
+				maxDur, formatApplyDuration(a.StartedAt, a.CompletedAt),
+				shortCaller(a.Caller))
+		default:
 			fmt.Printf("  %-*s  %-*s  %-*s  %s  %-*s  %-*s  %s\n",
 				maxID, a.ApplyID,
 				maxDB, a.Database,
@@ -946,11 +1002,36 @@ func writeFailedStatusList(data StatusListData) {
 	}
 }
 
-func statusExternalID(a ActiveApplyData) string {
+func statusExternalID(data StatusListData, a ActiveApplyData) string {
+	if a.ExternalOperationID != "" {
+		return a.ExternalOperationID
+	}
+	if data.Deployment != "" {
+		return "-"
+	}
 	if a.ExternalID == "" {
 		return "-"
 	}
 	return a.ExternalID
+}
+
+func statusExternalIDHeader(data StatusListData) string {
+	if data.Deployment != "" {
+		return "EXTERNAL OP ID"
+	}
+	return "EXTERNAL ID"
+}
+
+func statusListShowsDeployment(data StatusListData) bool {
+	if data.Deployment != "" {
+		return true
+	}
+	for _, apply := range data.Applies {
+		if apply.Deployment != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func statusFailureActor(a ActiveApplyData, showExternalID bool) string {
@@ -958,7 +1039,7 @@ func statusFailureActor(a ActiveApplyData, showExternalID bool) string {
 	if !showExternalID {
 		return caller
 	}
-	return caller + "; external_id=" + statusExternalID(a)
+	return caller + "; external_id=" + statusExternalID(StatusListData{}, a)
 }
 
 func formatFailureTimestamp(a ActiveApplyData) string {

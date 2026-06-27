@@ -1253,6 +1253,40 @@ func TestApplyStore_GetRecentLimitAndEnvironment(t *testing.T) {
 	assert.Equal(t, "apply_recent_staging_failed", applies[0].ApplyIdentifier)
 }
 
+func TestApplyStore_GetRecentDeploymentFilterMatchesParentAndOperation(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "recentdeploydb", "mysql", "staging")
+	createTestApplyWithStateEnvDeployment(t, store, lock, "apply_recent_parent_deployment", 214, state.Apply.Completed, "staging", "deploy-a")
+
+	operationMatch := createTestApplyWithStateEnvDeployment(t, store, lock, "apply_recent_operation_deployment", 215, state.Apply.Completed, "staging", "deploy-parent")
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:             operationMatch.ID,
+		Deployment:          "deploy-a",
+		OperationKey:        "",
+		OperationKind:       storage.ApplyOperationKindWork,
+		Target:              "target-a",
+		State:               state.Apply.Completed,
+		CutoverPolicy:       storage.CutoverPolicyRolling,
+		OnFailure:           storage.OnFailureHalt,
+		EngineResumeContext: "remote-operation-1",
+	})
+	require.NoError(t, err)
+
+	createTestApplyWithStateEnvDeployment(t, store, lock, "apply_recent_other_deployment", 216, state.Apply.Completed, "staging", "deploy-b")
+
+	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit:      10,
+		Deployment: "deploy-a",
+	})
+	require.NoError(t, err)
+	require.Len(t, applies, 2)
+	assert.Equal(t, "apply_recent_operation_deployment", applies[0].ApplyIdentifier)
+	assert.Equal(t, "apply_recent_parent_deployment", applies[1].ApplyIdentifier)
+}
+
 func TestApplyStore_Update(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -3037,6 +3071,11 @@ func createTestApplyWithEnv(t *testing.T, store *Storage, lock *storage.Lock, ap
 
 func createTestApplyWithStateAndEnv(t *testing.T, store *Storage, lock *storage.Lock, applyID string, planID int64, applyState, env string) *storage.Apply {
 	t.Helper()
+	return createTestApplyWithStateEnvDeployment(t, store, lock, applyID, planID, applyState, env, "")
+}
+
+func createTestApplyWithStateEnvDeployment(t *testing.T, store *Storage, lock *storage.Lock, applyID string, planID int64, applyState, env, deployment string) *storage.Apply {
+	t.Helper()
 	ctx := t.Context()
 
 	apply := &storage.Apply{
@@ -3048,6 +3087,7 @@ func createTestApplyWithStateAndEnv(t *testing.T, store *Storage, lock *storage.
 		Repository:      lock.Repository,
 		PullRequest:     lock.PullRequest,
 		Environment:     env,
+		Deployment:      deployment,
 		Engine:          storage.EngineForType(lock.DatabaseType),
 		State:           applyState,
 	}

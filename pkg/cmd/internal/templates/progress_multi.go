@@ -111,6 +111,12 @@ func writeDeploymentProgressSection(deployment presentation.Deployment, data Pro
 		fmt.Printf(" (%s)", target)
 	}
 	fmt.Println()
+	if externalOperationID := externalOperationIDForDeployment(data.Operations, deployment.Deployment); externalOperationID != "" {
+		fmt.Printf("  %sExternal operation ID: %s%s\n", ANSIDim, externalOperationID, ANSIReset)
+	}
+	if externalID := externalIDForDeployment(data.Operations, deployment.Deployment); externalID != "" {
+		fmt.Printf("  %sExternal apply ID: %s%s\n", ANSIDim, externalID, ANSIReset)
+	}
 
 	if deployment.Error != "" {
 		fmt.Printf("  %s%s%s\n", ANSIRed, deployment.Error, ANSIReset)
@@ -135,6 +141,24 @@ func targetForDeployment(ops []ProgressOperation, deployment string) string {
 	for _, op := range ops {
 		if op.Deployment == deployment {
 			return op.Target
+		}
+	}
+	return ""
+}
+
+func externalOperationIDForDeployment(ops []ProgressOperation, deployment string) string {
+	for _, op := range ops {
+		if op.Deployment == deployment && op.ExternalOperationID != "" {
+			return op.ExternalOperationID
+		}
+	}
+	return ""
+}
+
+func externalIDForDeployment(ops []ProgressOperation, deployment string) string {
+	for _, op := range ops {
+		if op.Deployment == deployment && op.ExternalID != "" {
+			return op.ExternalID
 		}
 	}
 	return ""

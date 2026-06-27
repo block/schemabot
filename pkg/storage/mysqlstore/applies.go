@@ -1062,6 +1062,14 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 		where = append(where, "environment = ?")
 		args = append(args, filter.Environment)
 	}
+	if filter.Deployment != "" {
+		where = append(where, `(deployment = ? OR EXISTS (
+			SELECT 1
+			FROM apply_operations ao
+			WHERE ao.apply_id = applies.id AND ao.deployment = ?
+		))`)
+		args = append(args, filter.Deployment, filter.Deployment)
+	}
 	if len(filter.States) > 0 {
 		where = append(where, fmt.Sprintf("state IN (%s)", placeholders(len(filter.States))))
 		args = append(args, stringArgs(filter.States)...)

@@ -93,6 +93,7 @@ import (
 	"log/slog"
 	"maps"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1700,7 +1701,11 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			"state", existing.State,
 		)
 		metrics.RecordRemoteApplyDedup(ctx, req.Database, req.Environment, "hit")
-		return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier}, nil
+		applyOperationID, err := c.applyResponseOperationID(ctx, existing)
+		if err != nil {
+			return nil, err
+		}
+		return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier, ApplyOperationId: applyOperationID}, nil
 	}
 
 	// Look up the plan, materializing it from the dispatch request when this
@@ -1760,7 +1765,11 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 				"state", existing.State,
 			)
 			metrics.RecordRemoteApplyDedup(ctx, req.Database, req.Environment, "conflict_race")
-			return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier}, nil
+			applyOperationID, err := c.applyResponseOperationID(ctx, existing)
+			if err != nil {
+				return nil, err
+			}
+			return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier, ApplyOperationId: applyOperationID}, nil
 		}
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
@@ -1897,7 +1906,11 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 				"state", existing.State,
 			)
 			metrics.RecordRemoteApplyDedup(ctx, req.Database, req.Environment, "create_race")
-			return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier}, nil
+			applyOperationID, err := c.applyResponseOperationID(ctx, existing)
+			if err != nil {
+				return nil, err
+			}
+			return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier, ApplyOperationId: applyOperationID}, nil
 		}
 		return nil, fmt.Errorf("create apply %s with tasks and operations: %w", applyIdentifier, err)
 	}
@@ -1929,9 +1942,31 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	c.startApplyExecution(applyCtx, cancelGeneration, cancelApply, apply, tasks, plan, options, false)
 
 	return &ternv1.ApplyResponse{
-		Accepted: true,
-		ApplyId:  apply.ApplyIdentifier,
+		Accepted:         true,
+		ApplyId:          apply.ApplyIdentifier,
+		ApplyOperationId: strconv.FormatInt(operations[0].ID, 10),
 	}, nil
+}
+
+func (c *LocalClient) applyResponseOperationID(ctx context.Context, apply *storage.Apply) (string, error) {
+	if apply == nil {
+		return "", fmt.Errorf("apply is required")
+	}
+	store := c.storage.ApplyOperations()
+	if store == nil {
+		return "", fmt.Errorf("apply operation store is not configured")
+	}
+	ops, err := store.ListByApply(ctx, apply.ID)
+	if err != nil {
+		return "", fmt.Errorf("list apply_operations for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if len(ops) != 1 {
+		c.logger.Debug("ApplyResponse omits apply_operation_id because apply has no single child operation",
+			"apply_id", apply.ApplyIdentifier,
+			"operation_count", len(ops))
+		return "", nil
+	}
+	return strconv.FormatInt(ops[0].ID, 10), nil
 }
 
 // getEngine returns the appropriate engine based on database type.

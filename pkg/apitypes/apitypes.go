@@ -434,10 +434,12 @@ type ProgressResponse struct {
 
 // ProgressOperationResponse represents progress for one deployment operation.
 type ProgressOperationResponse struct {
-	Deployment    string `json:"deployment"`
-	OperationKind string `json:"operation_kind,omitempty"`
-	Target        string `json:"target,omitempty"`
-	State         string `json:"state"`
+	Deployment          string `json:"deployment"`
+	ExternalID          string `json:"external_id,omitempty"`
+	ExternalOperationID string `json:"external_operation_id,omitempty"`
+	OperationKind       string `json:"operation_kind,omitempty"`
+	Target              string `json:"target,omitempty"`
+	State               string `json:"state"`
 	// CutoverPolicy is the rollout boundary policy for this deployment operation.
 	CutoverPolicy string `json:"cutover_policy,omitempty"`
 	// OnFailure is the rollout failure policy for this deployment operation.
@@ -509,18 +511,20 @@ type DatabaseHistoryResponse struct {
 
 // ActiveApplyResponse represents a schema change in the status list.
 type ActiveApplyResponse struct {
-	ApplyID      string `json:"apply_id"`
-	ExternalID   string `json:"external_id,omitempty"`
-	Database     string `json:"database"`
-	Environment  string `json:"environment"`
-	State        string `json:"state"`
-	Engine       string `json:"engine"`
-	Caller       string `json:"caller"`
-	ErrorMessage string `json:"error_message,omitempty"`
-	StartedAt    string `json:"started_at,omitempty"`
-	CompletedAt  string `json:"completed_at,omitempty"`
-	UpdatedAt    string `json:"updated_at"`
-	Volume       int    `json:"volume,omitempty"`
+	ApplyID             string `json:"apply_id"`
+	ExternalID          string `json:"external_id,omitempty"`
+	ExternalOperationID string `json:"external_operation_id,omitempty"`
+	Database            string `json:"database"`
+	Environment         string `json:"environment"`
+	Deployment          string `json:"deployment,omitempty"`
+	State               string `json:"state"`
+	Engine              string `json:"engine"`
+	Caller              string `json:"caller"`
+	ErrorMessage        string `json:"error_message,omitempty"`
+	StartedAt           string `json:"started_at,omitempty"`
+	CompletedAt         string `json:"completed_at,omitempty"`
+	UpdatedAt           string `json:"updated_at"`
+	Volume              int    `json:"volume,omitempty"`
 }
 
 // StatusResponse is the HTTP response for GET /api/status.

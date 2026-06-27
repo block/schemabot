@@ -34,15 +34,17 @@ type ProgressData struct {
 
 // ProgressOperation represents progress for one deployment operation.
 type ProgressOperation struct {
-	Deployment    string
-	Target        string
-	State         string
-	CutoverPolicy string
-	OnFailure     string
-	ErrorMessage  string
-	ErrorCode     string
-	StartedAt     string
-	CompletedAt   string
+	Deployment          string
+	ExternalID          string
+	ExternalOperationID string
+	Target              string
+	State               string
+	CutoverPolicy       string
+	OnFailure           string
+	ErrorMessage        string
+	ErrorCode           string
+	StartedAt           string
+	CompletedAt         string
 }
 
 // TableProgress represents progress for a single table schema change.
@@ -146,15 +148,17 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 
 	for _, op := range result.Operations {
 		data.Operations = append(data.Operations, ProgressOperation{
-			Deployment:    op.Deployment,
-			Target:        op.Target,
-			State:         state.NormalizeState(op.State),
-			CutoverPolicy: op.CutoverPolicy,
-			OnFailure:     op.OnFailure,
-			ErrorMessage:  op.ErrorMessage,
-			ErrorCode:     op.ErrorCode,
-			StartedAt:     op.StartedAt,
-			CompletedAt:   op.CompletedAt,
+			Deployment:          op.Deployment,
+			ExternalID:          op.ExternalID,
+			ExternalOperationID: op.ExternalOperationID,
+			Target:              op.Target,
+			State:               state.NormalizeState(op.State),
+			CutoverPolicy:       op.CutoverPolicy,
+			OnFailure:           op.OnFailure,
+			ErrorMessage:        op.ErrorMessage,
+			ErrorCode:           op.ErrorCode,
+			StartedAt:           op.StartedAt,
+			CompletedAt:         op.CompletedAt,
 		})
 	}
 

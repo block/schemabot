@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,7 +19,7 @@ import (
 )
 
 // applyOperationColumns lists all columns for SELECT queries.
-const applyOperationColumns = `id, apply_id, deployment, operation_key, operation_kind, target, state, error_message,
+const applyOperationColumns = `id, apply_id, deployment, operation_key, operation_kind, target, external_id, external_operation_id, state, error_message,
 	cutover_policy, on_failure, attempt, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
 	engine_resume_context, engine_resume_metadata, created_at, updated_at`
 
@@ -75,11 +76,11 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 
 	result, err := exec.ExecContext(ctx, `
 		INSERT INTO apply_operations (
-			apply_id, deployment, operation_key, operation_kind, target, state, error_message, cutover_policy, on_failure,
+			apply_id, deployment, operation_key, operation_kind, target, external_id, external_operation_id, state, error_message, cutover_policy, on_failure,
 			started_at, completed_at, engine_resume_context, engine_resume_metadata
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		ad.ApplyID, ad.Deployment, ad.OperationKey, operationKind, ad.Target, stateVal, nullString(ad.ErrorMessage), cutoverPolicy, onFailure,
+		ad.ApplyID, ad.Deployment, ad.OperationKey, operationKind, ad.Target, nullString(ad.ExternalID), nullString(ad.ExternalOperationID), stateVal, nullString(ad.ErrorMessage), cutoverPolicy, onFailure,
 		ad.StartedAt, ad.CompletedAt, nullString(ad.EngineResumeContext), nullString(ad.EngineResumeMetadata),
 	)
 	if err != nil {
@@ -142,6 +143,31 @@ func (s *applyOperationStore) ListByApply(ctx context.Context, applyID int64) ([
 	`, applyID)
 	if err != nil {
 		return nil, fmt.Errorf("query apply_operations for apply %d: %w", applyID, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	return scanApplyOperations(rows)
+}
+
+// ListByApplies returns all child rows for the requested applies in
+// (apply_id, created_at, id) order.
+func (s *applyOperationStore) ListByApplies(ctx context.Context, applyIDs []int64) ([]*storage.ApplyOperation, error) {
+	if len(applyIDs) == 0 {
+		return nil, nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(applyIDs)), ",")
+	args := make([]any, 0, len(applyIDs))
+	for _, applyID := range applyIDs {
+		args = append(args, applyID)
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+applyOperationColumns+`
+		FROM apply_operations
+		WHERE apply_id IN (`+placeholders+`)
+		ORDER BY apply_id, created_at, id
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query apply_operations for %d applies: %w", len(applyIDs), err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -441,6 +467,54 @@ func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg s
 func (s *applyOperationStore) MarkTerminal(ctx context.Context, id int64, newState string) error {
 	return s.execStateUpdate(ctx, id, fmt.Sprintf("mark apply_operation terminal (state=%s)", newState),
 		"ao.state = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())", newState)
+}
+
+// SaveExternalOperationID stores the remote data plane's apply_operation_id on
+// the operation row. It refuses empty IDs so callers do not convert a missing
+// remote field into an apparent successful correlation.
+func (s *applyOperationStore) SaveExternalOperationID(ctx context.Context, operationID int64, externalOperationID string) error {
+	if externalOperationID == "" {
+		return fmt.Errorf("save external operation id for apply_operation %d: external operation id is empty", operationID)
+	}
+	guard, err := operationWriteGuardFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	args := append([]any{externalOperationID, operationID}, guard.args()...)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_operations ao
+		`+guard.join()+`
+		SET ao.external_operation_id = ?
+		WHERE ao.id = ?`+guard.predicate()+`
+	`, args...)
+	if err != nil {
+		return fmt.Errorf("save external operation id for apply_operation %d: %w", operationID, err)
+	}
+	return s.checkUpdatedOrExists(ctx, result, operationID, guard, false)
+}
+
+// SaveExternalID stores the remote data plane's apply_id on the operation row.
+// It refuses empty IDs so callers do not convert a missing remote field into an
+// apparent successful correlation.
+func (s *applyOperationStore) SaveExternalID(ctx context.Context, operationID int64, externalID string) error {
+	if externalID == "" {
+		return fmt.Errorf("save external id for apply_operation %d: external id is empty", operationID)
+	}
+	guard, err := operationWriteGuardFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	args := append([]any{externalID, operationID}, guard.args()...)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_operations ao
+		`+guard.join()+`
+		SET ao.external_id = ?
+		WHERE ao.id = ?`+guard.predicate()+`
+	`, args...)
+	if err != nil {
+		return fmt.Errorf("save external id for apply_operation %d: %w", operationID, err)
+	}
+	return s.checkUpdatedOrExists(ctx, result, operationID, guard, false)
 }
 
 // SaveEngineResumeState stores opaque engine state on the operation that owns
@@ -1375,11 +1449,13 @@ func scanApplyOperations(rows *sql.Rows) ([]*storage.ApplyOperation, error) {
 func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	var ad storage.ApplyOperation
 	var errMsg sql.NullString
+	var externalID sql.NullString
+	var externalOperationID sql.NullString
 	var engineResumeContext, engineResumeMetadata sql.NullString
 	var startedAt, completedAt, leaseAcquiredAt sql.NullTime
 
 	if err := s.Scan(
-		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.OperationKey, &ad.OperationKind, &ad.Target, &ad.State, &errMsg,
+		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.OperationKey, &ad.OperationKind, &ad.Target, &externalID, &externalOperationID, &ad.State, &errMsg,
 		&ad.CutoverPolicy, &ad.OnFailure, &ad.Attempt, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
 		&engineResumeContext, &engineResumeMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {
@@ -1388,6 +1464,12 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 
 	if errMsg.Valid {
 		ad.ErrorMessage = errMsg.String
+	}
+	if externalID.Valid {
+		ad.ExternalID = externalID.String
+	}
+	if externalOperationID.Valid {
+		ad.ExternalOperationID = externalOperationID.String
 	}
 	if startedAt.Valid {
 		t := startedAt.Time

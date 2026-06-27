@@ -489,6 +489,8 @@ message ApplyResponse {
   string error_message = 2;
   // The apply identifier for tracking this schema change.
   string apply_id = 3;
+  // The apply_operation identifier for operation-scoped callers.
+  string apply_operation_id = 4;
 }
 
 // ProgressRequest requests detailed progress for an active schema change.

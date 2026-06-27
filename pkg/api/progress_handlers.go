@@ -217,14 +217,16 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 
 func progressOperationResponseFromStorage(op *storage.ApplyOperation) *apitypes.ProgressOperationResponse {
 	resp := &apitypes.ProgressOperationResponse{
-		Deployment:    op.Deployment,
-		OperationKind: op.OperationKind,
-		Target:        op.Target,
-		State:         op.State,
-		CutoverPolicy: op.CutoverPolicy,
-		OnFailure:     op.OnFailure,
-		ErrorCode:     deriveErrorCode(op.State, op.ErrorMessage),
-		ErrorMessage:  op.ErrorMessage,
+		Deployment:          op.Deployment,
+		ExternalID:          op.ExternalID,
+		ExternalOperationID: op.ExternalOperationID,
+		OperationKind:       op.OperationKind,
+		Target:              op.Target,
+		State:               op.State,
+		CutoverPolicy:       op.CutoverPolicy,
+		OnFailure:           op.OnFailure,
+		ErrorCode:           deriveErrorCode(op.State, op.ErrorMessage),
+		ErrorMessage:        op.ErrorMessage,
 	}
 	if op.StartedAt != nil {
 		resp.StartedAt = op.StartedAt.Format(time.RFC3339)
@@ -741,6 +743,7 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	filter := storage.RecentAppliesFilter{
 		Limit:       limit + 1,
 		Environment: r.URL.Query().Get("environment"),
+		Deployment:  r.URL.Query().Get("deployment"),
 	}
 	if failuresOnly {
 		filter.States = []string{state.Apply.Failed, state.Apply.FailedRetryable}
@@ -756,30 +759,96 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		applies = applies[:limit]
 	}
 
-	activeCount := 0
-	for _, apply := range applies {
-		if !failuresOnly && !state.IsTerminalApplyState(apply.State) {
-			activeCount++
-		}
-	}
-
 	resp := &apitypes.StatusResponse{
-		ActiveCount:  activeCount,
 		Limit:        limit,
 		MaxLimit:     maxStatusLimit,
 		HasMore:      hasMore,
 		FailuresOnly: failuresOnly,
 		Applies:      make([]*apitypes.ActiveApplyResponse, 0, len(applies)),
 	}
+	operationsByApply := map[int64][]*storage.ApplyOperation{}
+	if filter.Deployment != "" {
+		applyIDs := make([]int64, 0, len(applies))
+		for _, apply := range applies {
+			applyIDs = append(applyIDs, apply.ID)
+		}
+		ops, err := s.storage.ApplyOperations().ListByApplies(r.Context(), applyIDs)
+		if err != nil {
+			s.logger.Error("get deployment operations for status failed",
+				"environment", filter.Environment,
+				"deployment", filter.Deployment,
+				"apply_count", len(applies),
+				"error", err)
+			s.writeError(w, http.StatusInternalServerError, "failed to get deployment operations for status")
+			return
+		}
+		for _, op := range ops {
+			operationsByApply[op.ApplyID] = append(operationsByApply[op.ApplyID], op)
+		}
+	}
 
 	for _, apply := range applies {
-		resp.Applies = append(resp.Applies, activeApplyResponseFromStorage(apply))
+		var opSummary *storage.ApplyOperation
+		if filter.Deployment != "" {
+			opSummary = statusOperationForDeployment(apply, operationsByApply[apply.ID], filter.Deployment)
+		}
+		active := activeApplyResponseFromStorage(apply, opSummary, filter.Deployment)
+		if !failuresOnly && !state.IsTerminalApplyState(active.State) {
+			resp.ActiveCount++
+		}
+		resp.Applies = append(resp.Applies, active)
 	}
 
 	s.writeJSON(w, http.StatusOK, resp)
 }
 
-func activeApplyResponseFromStorage(apply *storage.Apply) *apitypes.ActiveApplyResponse {
+func statusOperationForDeployment(apply *storage.Apply, ops []*storage.ApplyOperation, deployment string) *storage.ApplyOperation {
+	if apply == nil {
+		return nil
+	}
+	if deployment == "" {
+		return nil
+	}
+	var matches []*storage.ApplyOperation
+	for _, op := range ops {
+		if op.Deployment != deployment {
+			continue
+		}
+		matches = append(matches, op)
+	}
+	if len(matches) == 0 {
+		return nil
+	}
+	if len(matches) == 1 {
+		return matches[0]
+	}
+	states := make([]string, 0, len(matches))
+	summary := &storage.ApplyOperation{
+		ApplyID:    apply.ID,
+		Deployment: deployment,
+		CreatedAt:  matches[0].CreatedAt,
+		UpdatedAt:  matches[0].UpdatedAt,
+	}
+	for _, op := range matches {
+		states = append(states, op.State)
+		if summary.StartedAt == nil || (op.StartedAt != nil && op.StartedAt.Before(*summary.StartedAt)) {
+			summary.StartedAt = op.StartedAt
+		}
+		if op.CompletedAt != nil && (summary.CompletedAt == nil || op.CompletedAt.After(*summary.CompletedAt)) {
+			summary.CompletedAt = op.CompletedAt
+		}
+		if op.UpdatedAt.After(summary.UpdatedAt) {
+			summary.UpdatedAt = op.UpdatedAt
+		}
+		if summary.ErrorMessage == "" && state.IsState(op.State, state.ApplyOperation.Failed) {
+			summary.ErrorMessage = op.ErrorMessage
+		}
+	}
+	summary.State = state.DeriveApplyState(states)
+	return summary
+}
+
+func activeApplyResponseFromStorage(apply *storage.Apply, op *storage.ApplyOperation, deployment string) *apitypes.ActiveApplyResponse {
 	caller := apply.Caller
 	if caller == "" {
 		caller = "cli"
@@ -793,6 +862,7 @@ func activeApplyResponseFromStorage(apply *storage.Apply) *apitypes.ActiveApplyR
 		ExternalID:   apply.ExternalID,
 		Database:     apply.Database,
 		Environment:  apply.Environment,
+		Deployment:   deployment,
 		State:        apply.State,
 		Engine:       apply.Engine,
 		Caller:       caller,
@@ -804,6 +874,20 @@ func activeApplyResponseFromStorage(apply *storage.Apply) *apitypes.ActiveApplyR
 	}
 	if apply.CompletedAt != nil {
 		active.CompletedAt = apply.CompletedAt.Format("2006-01-02T15:04:05Z07:00")
+	}
+	if op != nil {
+		active.Deployment = op.Deployment
+		active.ExternalID = op.ExternalID
+		active.ExternalOperationID = op.ExternalOperationID
+		active.State = op.State
+		active.ErrorMessage = op.ErrorMessage
+		active.UpdatedAt = op.UpdatedAt.Format("2006-01-02T15:04:05Z07:00")
+		if op.StartedAt != nil {
+			active.StartedAt = op.StartedAt.Format("2006-01-02T15:04:05Z07:00")
+		}
+		if op.CompletedAt != nil {
+			active.CompletedAt = op.CompletedAt.Format("2006-01-02T15:04:05Z07:00")
+		}
 	}
 	opts := storage.ParseApplyOptions(apply.Options)
 	if opts.Volume > 0 {

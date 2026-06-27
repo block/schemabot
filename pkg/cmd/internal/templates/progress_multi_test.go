@@ -18,7 +18,7 @@ func TestWriteProgressMultiDeploymentRendersAggregateAndSections(t *testing.T) {
 			State:       state.Apply.Running,
 			StartedAt:   "2026-06-16T10:00:00Z",
 			Operations: []ProgressOperation{
-				{Deployment: "region-a", Target: "orders-a", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+				{Deployment: "region-a", ExternalID: "remote-apply-region-a", ExternalOperationID: "remote-region-a", Target: "orders-a", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 				{Deployment: "region-b", Target: "orders-b", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt, ErrorMessage: "duplicate column name 'region'"},
 				{Deployment: "region-c", Target: "orders-c", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 			},
@@ -41,6 +41,8 @@ func TestWriteProgressMultiDeploymentRendersAggregateAndSections(t *testing.T) {
 	assert.Contains(t, output, "First failure: region-b — duplicate column name 'region'")
 	assert.Contains(t, output, "Next: review failure in region-b")
 	assertLess(t, output, "✅ region-a — completed", "❌ region-b — failed")
+	assert.Contains(t, output, "External operation ID: remote-region-a")
+	assert.Contains(t, output, "External apply ID: remote-apply-region-a")
 	assertLess(t, output, "❌ region-b — failed", "⏸ region-c — halted — region-b failed")
 	assert.Contains(t, output, "users_a")
 	assert.Contains(t, output, "users_b")

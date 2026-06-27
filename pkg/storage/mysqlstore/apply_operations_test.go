@@ -26,9 +26,11 @@ func TestApplyOperationStore_InsertAndGet(t *testing.T) {
 	apply := createTestApply(t, store, lock, "apply_md_insert", 1)
 
 	ad := &storage.ApplyOperation{
-		ApplyID:    apply.ID,
-		Deployment: "region-a",
-		Target:     "payments",
+		ApplyID:             apply.ID,
+		Deployment:          "region-a",
+		Target:              "payments",
+		ExternalID:          "remote-apply-a",
+		ExternalOperationID: "remote-operation-a",
 	}
 
 	id, err := store.ApplyOperations().Insert(ctx, ad)
@@ -43,6 +45,8 @@ func TestApplyOperationStore_InsertAndGet(t *testing.T) {
 	assert.Equal(t, apply.ID, got.ApplyID)
 	assert.Equal(t, "region-a", got.Deployment)
 	assert.Equal(t, "payments", got.Target)
+	assert.Equal(t, "remote-apply-a", got.ExternalID)
+	assert.Equal(t, "remote-operation-a", got.ExternalOperationID)
 	assert.Equal(t, state.ApplyOperation.Pending, got.State)
 	assert.Equal(t, storage.ApplyOperationKindWork, got.OperationKind)
 	assert.Equal(t, storage.CutoverPolicyRolling, got.CutoverPolicy, "an unset cutover_policy defaults to rolling")
@@ -53,6 +57,52 @@ func TestApplyOperationStore_InsertAndGet(t *testing.T) {
 	assert.Empty(t, got.EngineResumeMetadata)
 	assert.NotZero(t, got.CreatedAt)
 	assert.NotZero(t, got.UpdatedAt)
+}
+
+func TestApplyOperationStore_SaveExternalOperationID(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_save_external_operation", 1)
+
+	operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    apply.ID,
+		Deployment: "region-a",
+		Target:     "payments",
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.ApplyOperations().SaveExternalOperationID(ctx, operationID, "remote-operation-1"))
+
+	got, err := store.ApplyOperations().Get(ctx, operationID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "remote-operation-1", got.ExternalOperationID)
+}
+
+func TestApplyOperationStore_SaveExternalID(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_save_operation_external", 1)
+
+	operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    apply.ID,
+		Deployment: "region-a",
+		Target:     "payments",
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, operationID, "remote-apply-1"))
+
+	got, err := store.ApplyOperations().Get(ctx, operationID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "remote-apply-1", got.ExternalID)
 }
 
 func TestApplyOperationStore_OperationKindRoundTrip(t *testing.T) {

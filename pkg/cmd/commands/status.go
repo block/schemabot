@@ -14,6 +14,7 @@ type StatusCmd struct {
 	ApplyIDArg  string `arg:"" optional:"" help:"Apply ID to show details for" name:"apply_id"`
 	Database    string `short:"d" help:"Database name (show apply history)"`
 	Environment string `short:"e" help:"Environment filter"`
+	Deployment  string `help:"Deployment filter"`
 	Limit       int    `short:"n" help:"Maximum recent applies to show (default 20, max 1000)"`
 	Failed      bool   `help:"Show only failed recent applies" name:"failed"`
 	ExternalID  bool   `help:"Show external engine apply IDs" name:"external-id"`
@@ -44,6 +45,7 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 		result, loadErr = client.GetStatus(ep, client.StatusOptions{
 			Limit:       cmd.Limit,
 			Environment: cmd.Environment,
+			Deployment:  cmd.Deployment,
 			Failed:      cmd.Failed,
 		})
 		return loadErr
@@ -69,6 +71,7 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 		HasMore:        result.HasMore,
 		FailuresOnly:   result.FailuresOnly,
 		ShowExternalID: cmd.ExternalID,
+		Deployment:     cmd.Deployment,
 		Applies:        applies,
 	})
 
@@ -77,18 +80,20 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 
 func activeApplyDataFromResponse(a *apitypes.ActiveApplyResponse) templates.ActiveApplyData {
 	return templates.ActiveApplyData{
-		ApplyID:      a.ApplyID,
-		ExternalID:   a.ExternalID,
-		Database:     a.Database,
-		Environment:  a.Environment,
-		State:        a.State,
-		Engine:       a.Engine,
-		Caller:       a.Caller,
-		ErrorMessage: a.ErrorMessage,
-		StartedAt:    a.StartedAt,
-		CompletedAt:  a.CompletedAt,
-		UpdatedAt:    a.UpdatedAt,
-		Volume:       a.Volume,
+		ApplyID:             a.ApplyID,
+		ExternalID:          a.ExternalID,
+		ExternalOperationID: a.ExternalOperationID,
+		Database:            a.Database,
+		Environment:         a.Environment,
+		Deployment:          a.Deployment,
+		State:               a.State,
+		Engine:              a.Engine,
+		Caller:              a.Caller,
+		ErrorMessage:        a.ErrorMessage,
+		StartedAt:           a.StartedAt,
+		CompletedAt:         a.CompletedAt,
+		UpdatedAt:           a.UpdatedAt,
+		Volume:              a.Volume,
 	}
 }
 

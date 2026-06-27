@@ -5,6 +5,8 @@ CREATE TABLE `apply_operations` (
   `operation_key` varchar(255) NOT NULL DEFAULT '',
   `operation_kind` varchar(32) NOT NULL DEFAULT 'work',
   `target` varchar(255) NOT NULL DEFAULT '',
+  `external_id` varchar(255) DEFAULT NULL,
+  `external_operation_id` varchar(255) DEFAULT NULL,
   `engine_resume_context` varchar(255) DEFAULT NULL,
   `engine_resume_metadata` json DEFAULT NULL,
   `state` varchar(100) NOT NULL DEFAULT 'pending',

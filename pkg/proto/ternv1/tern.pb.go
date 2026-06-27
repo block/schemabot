@@ -1671,9 +1671,11 @@ type ApplyResponse struct {
 	Accepted     bool                   `protobuf:"varint,1,opt,name=accepted,proto3" json:"accepted,omitempty"`
 	ErrorMessage string                 `protobuf:"bytes,2,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
 	// The apply identifier for tracking this schema change.
-	ApplyId       string `protobuf:"bytes,3,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ApplyId string `protobuf:"bytes,3,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
+	// The apply_operation identifier for operation-scoped callers.
+	ApplyOperationId string `protobuf:"bytes,4,opt,name=apply_operation_id,json=applyOperationId,proto3" json:"apply_operation_id,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ApplyResponse) Reset() {
@@ -1723,6 +1725,13 @@ func (x *ApplyResponse) GetErrorMessage() string {
 func (x *ApplyResponse) GetApplyId() string {
 	if x != nil {
 		return x.ApplyId
+	}
+	return ""
+}
+
+func (x *ApplyResponse) GetApplyOperationId() string {
+	if x != nil {
+		return x.ApplyOperationId
 	}
 	return ""
 }
@@ -3115,11 +3124,12 @@ const file_tern_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aT\n" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
-	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01\"k\n" +
+	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01\"\x99\x01\n" +
 	"\rApplyResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12\x19\n" +
-	"\bapply_id\x18\x03 \x01(\tR\aapplyId\"N\n" +
+	"\bapply_id\x18\x03 \x01(\tR\aapplyId\x12,\n" +
+	"\x12apply_operation_id\x18\x04 \x01(\tR\x10applyOperationId\"N\n" +
 	"\x0fProgressRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
 	"\venvironment\x18\x02 \x01(\tR\venvironment\"\xa7\x02\n" +
