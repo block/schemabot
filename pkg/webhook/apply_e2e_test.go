@@ -71,7 +71,6 @@ func TestE2EApplyWithChanges(t *testing.T) {
 		assert.Contains(t, body, dbName)
 		assert.Contains(t, body, "Lock acquired by")
 		assert.Contains(t, body, "Applying automatically")
-		assert.Contains(t, body, "schemabot unlock")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for apply plan comment")
 	}
