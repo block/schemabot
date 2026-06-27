@@ -32,6 +32,7 @@ type CLI struct {
 	Progress   commands.ProgressCmd   `cmd:"" help:"Get schema change progress"`
 	Cutover    commands.CutoverCmd    `cmd:"" help:"Trigger cutover for a deferred schema change"`
 	Stop       commands.StopCmd       `cmd:"" help:"Stop an in-progress schema change"`
+	Cancel     commands.CancelCmd     `cmd:"" help:"Cancel a schema change permanently"`
 	Start      commands.StartCmd      `cmd:"" help:"Resume a stopped schema change"`
 	Volume     commands.VolumeCmd     `cmd:"" help:"Adjust schema change speed (1-11)"`
 	Revert     commands.RevertCmd     `cmd:"" help:"Revert a completed schema change during the revert window"`

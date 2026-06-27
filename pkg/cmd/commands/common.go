@@ -254,6 +254,11 @@ type stopResponseWrapper struct{ r *apitypes.StopResponse }
 func (w stopResponseWrapper) IsAccepted() bool        { return w.r.Accepted }
 func (w stopResponseWrapper) GetErrorMessage() string { return w.r.ErrorMessage }
 
+type cancelResponseWrapper struct{ r *apitypes.CancelResponse }
+
+func (w cancelResponseWrapper) IsAccepted() bool        { return w.r.Accepted }
+func (w cancelResponseWrapper) GetErrorMessage() string { return w.r.ErrorMessage }
+
 type startResponseWrapper struct{ r *apitypes.StartResponse }
 
 func (w startResponseWrapper) IsAccepted() bool        { return w.r.Accepted }

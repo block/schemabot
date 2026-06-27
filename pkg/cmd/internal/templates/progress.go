@@ -730,6 +730,30 @@ func WriteStopSuccess(data StopData) {
 	}
 }
 
+// CancelData contains data for rendering cancel command output.
+type CancelData struct {
+	Database       string
+	Environment    string
+	CancelledCount int
+	SkippedCount   int
+}
+
+// WriteCancelSuccess writes the cancel command success output.
+func WriteCancelSuccess(data CancelData) {
+	fmt.Printf("%s%s✖ Schema change cancelled%s\n", ANSIBold, ANSIRed, ANSIReset)
+	fmt.Println()
+	fmt.Printf("Database:    %s\n", data.Database)
+	fmt.Printf("Environment: %s\n", data.Environment)
+	if data.CancelledCount > 0 {
+		fmt.Printf("Cancelled:   %d table(s)\n", data.CancelledCount)
+	}
+	if data.SkippedCount > 0 {
+		fmt.Printf("Skipped:     %d table(s) (already terminal)\n", data.SkippedCount)
+	}
+	fmt.Println()
+	fmt.Printf("%sThis schema change cannot be resumed.%s\n", ANSIDim, ANSIReset)
+}
+
 // StartData contains data for rendering start command output.
 type StartData struct {
 	Database     string
