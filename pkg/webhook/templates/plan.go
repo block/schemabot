@@ -400,10 +400,13 @@ func writePlanDDLBlock(sb *strings.Builder, statements []string) {
 func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange) {
 	groups := groupKeyspaceShardsByStatements(shards)
 	if len(groups) <= 1 {
-		// A single group of changing shards shows the DDL once. A lone group of
-		// satisfied shards means nothing is changing, so render nothing rather
-		// than an empty code block.
+		// A single group of changing shards shows the DDL once, but still names the
+		// shards it applies to — a sharded plan must always show which shards are
+		// affected, even when the change is uniform across them. A lone group of
+		// satisfied shards means nothing is changing, so render nothing rather than
+		// an empty code block.
 		if len(groups) == 1 && !groups[0].Satisfied {
+			fmt.Fprintf(sb, "**%s**\n\n", planShardList(groups[0].Shards))
 			writePlanDDLBlock(sb, groups[0].Statements)
 		}
 		return

@@ -57,7 +57,7 @@ func TestRenderPlanComment_ShardedPartiallyApplied(t *testing.T) {
 }
 
 // A uniform sharded plan (every shard the same change) shows the DDL once with
-// no divergence header.
+// no divergence header — but still names which shards are affected.
 func TestRenderPlanComment_ShardedUniform(t *testing.T) {
 	stmt := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
 	out := RenderPlanComment(PlanCommentData{
@@ -73,6 +73,7 @@ func TestRenderPlanComment_ShardedUniform(t *testing.T) {
 	})
 
 	assert.NotContains(t, out, "diverge", "a uniform plan is not grouped")
+	assert.Contains(t, out, "**shards `-40`, `80-`**", "a uniform plan still names the affected shards")
 	assert.Equal(t, 1, strings.Count(out, "```sql"), "the shared DDL is shown once")
 }
 

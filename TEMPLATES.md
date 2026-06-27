@@ -5978,11 +5978,6 @@ schemabot apply -e production
 | `80-c0` | ⏳ waiting for -40 |
 | `c0-` | ⏳ waiting for -40 |
 
-`mutes`
-```sql
-ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
-```
-
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
 </details>
@@ -6009,11 +6004,6 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 | `40-80` | ⏸ halted — -40 failed |
 | `80-c0` | ⏸ halted — -40 failed |
 | `c0-` | ⏸ halted — -40 failed |
-
-`mutes`
-```sql
-ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
-```
 
 ---
 
@@ -6047,21 +6037,11 @@ Shards diverge — grouped by change:
 | `-40` | 🔄 running table copy |
 | `80-c0` | ⏳ waiting for -40 |
 
-`mutes`
-```sql
-ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
-```
-
 **shard `40-80`**
 
 | Shard | Status |
 | --- | --- |
 | `40-80` | ⏳ waiting for -40 |
-
-`mutes`
-```sql
-ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`), ADD COLUMN `reason` varchar(255);
-```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 </details>

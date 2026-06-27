@@ -1,11 +1,9 @@
 package templates
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/state"
 )
@@ -15,7 +13,8 @@ const mutesDDL = "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);"
 func mutesCell(shard string) ShardCell { return ShardCell{Shard: shard, Table: "mutes", DDL: mutesDDL} }
 
 // A uniform sharded apply (every shard the same single change) renders one
-// status table and shows the DDL once — no per-shard grouping.
+// status table and no per-shard grouping. The DDL is not repeated in the applied
+// comment — it is shown in the plan and apply-gate comments.
 func TestRenderShardedApplyComment_UniformSingleTable(t *testing.T) {
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
@@ -30,7 +29,7 @@ func TestRenderShardedApplyComment_UniformSingleTable(t *testing.T) {
 	assert.Contains(t, out, "**Shards**: 1 running table copy, 1 queued")
 	assert.Contains(t, out, "| Shard | Status |")
 	assert.NotContains(t, out, "grouped by change", "a uniform apply is not grouped")
-	assert.Equal(t, 1, strings.Count(out, "```sql"), "the shared DDL is shown exactly once")
+	assert.NotContains(t, out, "```sql", "the applied comment shows status only, not DDL")
 }
 
 // A failed shard's error is lifted to the top and shown in its status row.
@@ -72,9 +71,9 @@ func TestRenderShardedApplyComment_FailedRetryableSurfacesErrorAndStop(t *testin
 	assert.Contains(t, out, "schemabot stop apply-x")
 }
 
-// When shards diverge, they are grouped by change signature: each group lists
-// its shards' statuses next to the exact DDL it runs. The same table computing
-// to different DDL across shards yields two groups.
+// When shards diverge, they are still grouped by change signature so the applied
+// comment shows which shards moved together — but the DDL itself is not repeated
+// here (it lives in the plan and apply-gate comments).
 func TestRenderShardedApplyComment_DivergentGroupsByVariant(t *testing.T) {
 	const driftDDL = "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`), ADD COLUMN `reason` varchar(255);"
 	out := RenderShardedApplyComment(ShardedApplyData{
@@ -87,7 +86,7 @@ func TestRenderShardedApplyComment_DivergentGroupsByVariant(t *testing.T) {
 		},
 		Cells: []ShardCell{
 			mutesCell("-40"),
-			{Shard: "40-80", Table: "mutes", DDL: driftDDL},
+			{Shard: "40-80", Table: "mutes", DDL: driftDDL}, // different signature → its own group
 			mutesCell("80-c0"),
 		},
 	})
@@ -95,33 +94,12 @@ func TestRenderShardedApplyComment_DivergentGroupsByVariant(t *testing.T) {
 	assert.Contains(t, out, "Shards diverge — grouped by change:")
 	assert.Contains(t, out, "**shards `-40`, `80-c0`**", "shards sharing the standard change are one group")
 	assert.Contains(t, out, "**shard `40-80`**", "the drifted shard is its own group")
-	assert.Contains(t, out, driftDDL)
-	assert.Equal(t, 2, strings.Count(out, "```sql"), "one DDL block per group")
+	assert.NotContains(t, out, "```sql", "the applied comment shows status only, not DDL")
+	assert.NotContains(t, out, driftDDL, "the DDL is not repeated in the applied comment")
 }
 
-// A change whose DDL never reached the comment (incomplete change data) renders
-// a "DDL unavailable" note instead of an empty ```sql box that reads as a no-op.
-func TestRenderShardedApplyComment_EmptyDDLRendersUnavailable(t *testing.T) {
-	out := RenderShardedApplyComment(ShardedApplyData{
-		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
-		Shards: []ShardStatus{
-			{Shard: "-40", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
-			{Shard: "80-", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
-		},
-		Cells: []ShardCell{
-			{Shard: "-40", Table: "mutes", DDL: "   "}, // whitespace-only DDL is treated as missing
-			{Shard: "80-", Table: "mutes", DDL: ""},
-		},
-	})
-
-	assert.Contains(t, out, "`mutes` — _DDL unavailable_", "the missing DDL is called out")
-	assert.Equal(t, 0, strings.Count(out, "```sql"), "no blank SQL box for the missing DDL")
-}
-
-// A single-shard divergent group degrades cleanly: one group, no spurious
-// grouping header for a uniform apply (covered above) — here every shard shares
-// the same multi-table change set, so it is still one group.
+// A uniform multi-table change set is one group (no spurious "grouped by change"
+// header), and the applied comment shows status only — no DDL.
 func TestRenderShardedApplyComment_UniformMultiTableIsOneGroup(t *testing.T) {
 	blocks := func(shard string) ShardCell {
 		return ShardCell{Shard: shard, Table: "blocks", DDL: "ALTER TABLE `blocks` ADD INDEX `created_at`(`created_at`);"}
@@ -138,5 +116,5 @@ func TestRenderShardedApplyComment_UniformMultiTableIsOneGroup(t *testing.T) {
 
 	assert.NotContains(t, out, "grouped by change", "identical multi-table change sets are one group")
 	assert.Contains(t, out, "| Shard | Status |")
-	require.Equal(t, 2, strings.Count(out, "```sql"), "both tables' DDL shown once")
+	assert.NotContains(t, out, "```sql", "the applied comment shows status only, not DDL")
 }

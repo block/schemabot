@@ -88,18 +88,19 @@ func RenderShardedApplyComment(data ShardedApplyData) string {
 	writeShardFirstFailure(&sb, data.Shards)
 
 	fmt.Fprintf(&sb, "\n#### Keyspace `%s`\n", data.Keyspace)
+	// The applied comment shows shard status only. The DDL (what changes) is
+	// already shown in the plan and apply-gate comments, so repeating it here adds
+	// nothing — and rendering "DDL unavailable" when the apply path has no per-shard
+	// DDL is pure noise. Shards are still grouped by change so a divergent apply
+	// shows which shards moved together.
 	groups := groupShardsBySignature(data.Shards, data.Cells)
 	if len(groups) <= 1 {
 		writeShardStatusTable(&sb, data.Shards)
-		if len(groups) == 1 {
-			writeGroupDDL(&sb, groups[0].Changes)
-		}
 	} else {
 		sb.WriteString("\nShards diverge — grouped by change:\n")
 		for _, g := range groups {
 			fmt.Fprintf(&sb, "\n**%s**\n", shardList(g.Shards))
 			writeShardStatusTable(&sb, g.Shards)
-			writeGroupDDL(&sb, g.Changes)
 		}
 	}
 
@@ -243,20 +244,6 @@ func writeShardStatusTable(sb *strings.Builder, shards []ShardStatus) {
 	sb.WriteString("\n| Shard | Status |\n| --- | --- |\n")
 	for _, s := range shards {
 		fmt.Fprintf(sb, "| `%s` | %s |\n", s.Shard, shardStatusCell(s))
-	}
-}
-
-// writeGroupDDL writes a group's table changes, each DDL once.
-func writeGroupDDL(sb *strings.Builder, changes []ShardChange) {
-	for _, c := range changes {
-		// Guard against an empty DDL, which would render a blank ```sql box. The
-		// DDL should always be present; if it is missing the change data is
-		// incomplete, so say so rather than show an empty code block.
-		if strings.TrimSpace(c.DDL) == "" {
-			fmt.Fprintf(sb, "\n`%s` — _DDL unavailable_\n", c.Table)
-			continue
-		}
-		fmt.Fprintf(sb, "\n`%s`\n```sql\n%s\n```\n", c.Table, c.DDL)
 	}
 }
 
