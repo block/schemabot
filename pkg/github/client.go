@@ -23,7 +23,13 @@ import (
 	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit"
 	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit/github_secondary_ratelimit"
 	gh "github.com/google/go-github/v86/github"
+	"golang.org/x/sync/errgroup"
 )
+
+// schemaDiscoveryConcurrency bounds the parallel per-namespace directory
+// listings and symlink resolutions during schema discovery, matching the
+// concurrency used when fetching file contents.
+const schemaDiscoveryConcurrency = 10
 
 // GitHubClientFactory creates installation-scoped GitHub clients.
 // Production uses *Client (JWT auth via ghinstallation); tests use a fake with httptest.
@@ -1401,40 +1407,73 @@ func (ic *InstallationClient) schemaFileLocators(ctx context.Context, repo, ref,
 		return nil, err
 	}
 
+	// Flat files under the schema root need no extra fetch. Namespace entries
+	// (real directories or symlinks to directories) each require their own
+	// Contents API call(s) to enumerate; resolve them concurrently since a
+	// database can have many keyspaces and the calls are independent.
 	var locators []schemaFileLocator
+	var namespaceEntries []*gh.RepositoryContent
 	for _, entry := range rootEntries {
 		switch entry.GetType() {
 		case "file":
-			// Flat layout: a file directly under the schema root.
 			locators = append(locators, schemaFileLocator{fetchPath: entry.GetPath(), displayPath: entry.GetPath()})
-		case "dir":
-			subEntries, err := ic.fetchDirectoryContents(ctx, repo, entry.GetPath(), ref)
-			if err != nil {
-				return nil, fmt.Errorf("fetch schema namespace directory %s: %w", entry.GetPath(), err)
-			}
-			for _, sub := range subEntries {
-				if sub.GetType() != "file" {
-					ic.logger.Debug("skipping non-file entry in schema namespace directory",
-						"repo", repo, "ref", ref, "path", sub.GetPath(), "type", sub.GetType())
-					continue
-				}
-				locators = append(locators, schemaFileLocator{fetchPath: sub.GetPath(), displayPath: sub.GetPath()})
-			}
-		case "symlink":
-			symlinked, err := ic.symlinkedNamespaceLocators(ctx, repo, ref, schemaPath, entry)
-			if err != nil {
-				return nil, err
-			}
-			locators = append(locators, symlinked...)
+		case "dir", "symlink":
+			namespaceEntries = append(namespaceEntries, entry)
 		default:
 			ic.logger.Debug("skipping unsupported schema entry type",
 				"repo", repo, "ref", ref, "path", entry.GetPath(), "type", entry.GetType())
 		}
 	}
 
+	namespaceLocators := make([][]schemaFileLocator, len(namespaceEntries))
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(schemaDiscoveryConcurrency)
+	for i, entry := range namespaceEntries {
+		g.Go(func() error {
+			var nsLocators []schemaFileLocator
+			var err error
+			switch entry.GetType() {
+			case "dir":
+				nsLocators, err = ic.directoryFileLocators(gCtx, repo, ref, entry.GetPath())
+			case "symlink":
+				nsLocators, err = ic.symlinkedNamespaceLocators(gCtx, repo, ref, schemaPath, entry)
+			}
+			if err != nil {
+				return err
+			}
+			namespaceLocators[i] = nsLocators
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	for _, nsLocators := range namespaceLocators {
+		locators = append(locators, nsLocators...)
+	}
+
 	sort.Slice(locators, func(i, j int) bool {
 		return locators[i].displayPath < locators[j].displayPath
 	})
+	return locators, nil
+}
+
+// directoryFileLocators lists a real namespace directory and returns a locator
+// for each schema file directly inside it.
+func (ic *InstallationClient) directoryFileLocators(ctx context.Context, repo, ref, dirPath string) ([]schemaFileLocator, error) {
+	subEntries, err := ic.fetchDirectoryContents(ctx, repo, dirPath, ref)
+	if err != nil {
+		return nil, fmt.Errorf("fetch schema namespace directory %s: %w", dirPath, err)
+	}
+	locators := make([]schemaFileLocator, 0, len(subEntries))
+	for _, sub := range subEntries {
+		if sub.GetType() != "file" {
+			ic.logger.Debug("skipping non-file entry in schema namespace directory",
+				"repo", repo, "ref", ref, "path", sub.GetPath(), "type", sub.GetType())
+			continue
+		}
+		locators = append(locators, schemaFileLocator{fetchPath: sub.GetPath(), displayPath: sub.GetPath()})
+	}
 	return locators, nil
 }
 
