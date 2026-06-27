@@ -740,6 +740,8 @@ const (
 	ControlOperationStart ControlOperation = "start"
 	// ControlOperationStop stops an active apply.
 	ControlOperationStop ControlOperation = "stop"
+	// ControlOperationCancel terminates an active apply.
+	ControlOperationCancel ControlOperation = "cancel"
 	// ControlOperationCutover triggers deferred cutover.
 	ControlOperationCutover ControlOperation = "cutover"
 	// ControlOperationRelease releases a rollout paused after a failure under
@@ -1021,6 +1023,7 @@ const (
 	LogEventStateTransition     = "state_transition"
 	LogEventTaskUpdate          = "task_update"
 	LogEventStopRequested       = "stop_requested"
+	LogEventCancelRequested     = "cancel_requested"
 	LogEventStartRequested      = "start_requested"
 	LogEventDeployTriggered     = "deploy_triggered"
 	LogEventCutoverTriggered    = "cutover_triggered"

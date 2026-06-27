@@ -79,6 +79,13 @@ func (s *mockTernServer) Stop(ctx context.Context, req *ternv1.StopRequest) (*te
 	return &ternv1.StopResponse{Accepted: true}, nil
 }
 
+func (s *mockTernServer) Cancel(ctx context.Context, req *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
+	if req.ApplyId == "" {
+		return nil, status.Error(codes.InvalidArgument, "apply_id is required")
+	}
+	return &ternv1.CancelResponse{Accepted: true}, nil
+}
+
 func (s *mockTernServer) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
 	if req.ApplyId == "" {
 		return nil, status.Error(codes.InvalidArgument, "apply_id is required")
@@ -455,6 +462,7 @@ type capturingTernServer struct {
 	applyErr          error
 	remoteApplyID     string
 	remoteOperationID string
+	cancelApplyID     string
 	stopApplyID       string
 	startApplyID      string
 	cutoverApplyID    string
@@ -511,6 +519,13 @@ func (s *capturingTernServer) Stop(_ context.Context, req *ternv1.StopRequest) (
 	return &ternv1.StopResponse{Accepted: true}, nil
 }
 
+func (s *capturingTernServer) Cancel(_ context.Context, req *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
+	s.mu.Lock()
+	s.cancelApplyID = req.ApplyId
+	s.mu.Unlock()
+	return &ternv1.CancelResponse{Accepted: true}, nil
+}
+
 func (s *capturingTernServer) Cutover(_ context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
 	s.mu.Lock()
 	s.cutoverApplyID = req.ApplyId
@@ -561,6 +576,12 @@ func (s *capturingTernServer) getStopApplyID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.stopApplyID
+}
+
+func (s *capturingTernServer) getCancelApplyID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cancelApplyID
 }
 
 func (s *capturingTernServer) getCutoverApplyID() string {
@@ -1770,6 +1791,133 @@ func TestGRPCClient_ResumeApplyOperationStopReachingTerminalLeavesApplyStopPendi
 	stopReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
 	require.NoError(t, err)
 	assert.NotNil(t, stopReq, "the apply-level stop request must remain pending for sibling operations after one operation terminalizes")
+}
+
+func TestGRPCClient_ProcessPendingCancelControlRequestCompletesWholeApply(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_CANCELLED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "users",
+			Status:    state.Task.Cancelled,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-cancel",
+		ExternalID:      "remote-grpc-cancel",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             11,
+		TaskIdentifier: "task-users",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	storedApply := *apply
+	applyStore := &mockApplyStore{apply: &storedApply}
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, "remote-grpc-cancel", server.getCancelApplyID())
+	assert.Equal(t, state.Apply.Cancelled, applyStore.apply.State)
+	assert.Equal(t, state.Task.Cancelled, task.State)
+	assert.True(t, hasLogEvent(logs.logs, storage.LogEventCancelRequested))
+	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, cancelReq)
+}
+
+func TestGRPCClient_ProcessPendingCancelOperationLeavesApplyCancelPending(t *testing.T) {
+	// A multi-deployment apply has one durable cancel request shared by every
+	// deployment. One operation reaching a terminal remote state must not
+	// complete the apply-level cancel request while sibling deployments still
+	// need to observe it.
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_CANCELLED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "users",
+			Status:    state.Task.Cancelled,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-multi-op-cancel",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	operationID := int64(42)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		Namespace:        "default",
+		TableName:        "users",
+		State:            state.Task.Running,
+	}
+	operation := &storage.ApplyOperation{ID: operationID, ApplyID: apply.ID, Deployment: "west", State: state.ApplyOperation.Running, EngineResumeContext: "remote-op-west"}
+	operationStore := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: operation,
+		43:          {ID: 43, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.Running, EngineResumeContext: "remote-op-east"},
+	}}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	storedApply := *apply
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+		operations:      operationStore,
+	}
+	scope := applyTaskScope{applyOperationID: operationID, operation: operation, multiOperation: true}
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, scope)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, "remote-op-west", server.getCancelApplyID())
+	assert.Equal(t, state.Task.Cancelled, task.State)
+	assert.Equal(t, state.Apply.Running, apply.State)
+	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.NotNil(t, cancelReq)
 }
 
 func TestGRPCClient_ResumeApplyOperationStartLeavesApplyStartPending(t *testing.T) {
@@ -3398,6 +3546,15 @@ func TestTerminalTaskStateForApply(t *testing.T) {
 func hasLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 	for _, log := range logs {
 		if strings.Contains(log.Message, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasLogEvent(logs []*storage.ApplyLog, eventType string) bool {
+	for _, log := range logs {
+		if log.EventType == eventType {
 			return true
 		}
 	}

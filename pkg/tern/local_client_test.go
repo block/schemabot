@@ -345,6 +345,7 @@ func (s *exactProgressTaskStore) GetShardProgressByApplyOperationID(_ context.Co
 type fakeControlEngine struct {
 	engine.Engine
 	stopCount               int
+	cancelCount             int
 	startCount              int
 	cutoverCount            int
 	cutoverResult           *engine.ControlResult
@@ -391,6 +392,11 @@ func (e *fakeControlEngine) Progress(_ context.Context, req *engine.ProgressRequ
 
 func (e *fakeControlEngine) Stop(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.stopCount++
+	return &engine.ControlResult{Accepted: true}, nil
+}
+
+func (e *fakeControlEngine) Cancel(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	e.cancelCount++
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
@@ -1033,6 +1039,62 @@ func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
 	assert.True(t, hasLogMessageContaining(logs.logs, "Stop requested: 1 tasks stopped, 0 skipped (caller: cli:alice)"))
 }
 
+func TestLocalClient_ProcessPendingCancelControlRequest(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              123,
+		ApplyIdentifier: "apply-cancel-local",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             456,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cancel-local",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, 1, fakeEngine.cancelCount)
+	assert.Equal(t, 0, fakeEngine.stopCount)
+	assert.Equal(t, state.Task.Cancelled, task.State)
+	assert.Equal(t, state.Apply.Cancelled, apply.State)
+	require.NotNil(t, apply.CompletedAt)
+	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq)
+	assert.True(t, hasLogMessageContaining(logs.logs, "Cancel requested: 1 tasks cancelled, 0 skipped (caller: cli:alice)"))
+}
+
 func TestLocalClient_ProcessPendingStopControlRequestContinuesToQueuedStart(t *testing.T) {
 	// A stop and a start can race into the same operator claim: the apply is
 	// already stopped while a stop request is still pending, and a start request
@@ -1581,7 +1643,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequestFailsRejectedRequest(t *
 	assert.Equal(t, "not ready for cutover", controlRequests.requests[0].ErrorMessage)
 }
 
-func TestLocalClient_StopPreservesTerminalCancelledApply(t *testing.T) {
+func TestLocalClient_StopRejectsVitessCancelledApply(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              124,
 		ApplyIdentifier: "apply-cancelled-local",
@@ -1613,15 +1675,12 @@ func TestLocalClient_StopPreservesTerminalCancelledApply(t *testing.T) {
 		logger:            slog.Default(),
 	}
 
-	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{
+	_, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{
 		ApplyId:     apply.ApplyIdentifier,
 		Environment: apply.Environment,
 	}, "cli:second")
-	require.NoError(t, err)
-	require.NotNil(t, resp)
-	assert.True(t, resp.Accepted)
-	assert.Equal(t, int64(0), resp.StoppedCount)
-	assert.Equal(t, int64(1), resp.SkippedCount)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "stop not supported")
 	assert.Equal(t, 0, fakeEngine.stopCount)
 	assert.Equal(t, state.Apply.Cancelled, apply.State)
 }

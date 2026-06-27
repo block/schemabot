@@ -328,12 +328,17 @@ func (c *LocalClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv
 	return c.requestStop(ctx, req, "")
 }
 
+// Cancel terminates an in-progress schema change permanently.
 func (c *LocalClient) Cancel(ctx context.Context, req *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
-	return nil, fmt.Errorf("cancel is not supported by local apply owners")
+	return c.cancelOwnedApply(ctx, req, "")
 }
 
 func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, caller string) (*ternv1.StopResponse, error) {
 	c.logger.Info("Stop requested", "database", c.config.Database, "type", c.config.Type, "apply_id", req.ApplyId)
+	if c.config.Type == storage.DatabaseTypeVitess {
+		c.logger.Warn("stop rejected because this engine supports cancel instead", "database", c.config.Database, "type", c.config.Type, "apply_id", req.ApplyId)
+		return nil, fmt.Errorf("stop not supported for this schema change; use cancel to permanently cancel it")
+	}
 	apply, err := c.resolveStopApply(ctx, req)
 	if err != nil {
 		return nil, err
@@ -419,6 +424,10 @@ func (c *LocalClient) resolveStopApply(ctx context.Context, req *ternv1.StopRequ
 
 func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopRequest, caller string) (*ternv1.StopResponse, error) {
 	c.logger.Info("Stop requested", "database", c.config.Database, "type", c.config.Type, "apply_id", req.ApplyId)
+	if c.config.Type == storage.DatabaseTypeVitess {
+		c.logger.Warn("stop rejected because this engine supports cancel instead", "database", c.config.Database, "type", c.config.Type, "apply_id", req.ApplyId)
+		return nil, fmt.Errorf("stop not supported for this schema change; use cancel to permanently cancel it")
+	}
 	tasks, err := c.storage.Tasks().GetByDatabase(ctx, c.config.Database)
 	if err != nil {
 		return nil, fmt.Errorf("get tasks failed: %w", err)
@@ -478,8 +487,10 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 
 	if applyID > 0 && stoppedCount > 0 {
 		eventMsg := fmt.Sprintf("Stop requested: %d tasks stopped, %d skipped", stoppedCount, skippedCount)
+		eventType := storage.LogEventStopRequested
 		if terminalState == state.Task.Cancelled {
 			eventMsg = fmt.Sprintf("Cancel requested: %d tasks cancelled, %d skipped (deploy request cancelled)", stoppedCount, skippedCount)
+			eventType = storage.LogEventCancelRequested
 
 			// For Vitess: set the apply state to cancelled now. The apply
 			// goroutine will see a context cancellation error from the engine
@@ -495,7 +506,7 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 		if caller != "" {
 			eventMsg += callerApplyLogSuffix(caller)
 		}
-		c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+		c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, eventType, storage.LogSourceSchemaBot,
 			eventMsg, "", "")
 	}
 
@@ -525,6 +536,71 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 		Accepted:     stoppedCount > 0,
 		StoppedCount: stoppedCount,
 		SkippedCount: skippedCount,
+	}, nil
+}
+
+func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRequest, caller string) (*ternv1.CancelResponse, error) {
+	c.logger.Info("Cancel requested", "database", c.config.Database, "type", c.config.Type, "apply_id", req.ApplyId)
+	tasks, err := c.storage.Tasks().GetByDatabase(ctx, c.config.Database)
+	if err != nil {
+		return nil, fmt.Errorf("get tasks failed: %w", err)
+	}
+
+	var targetApplyID int64
+	var targetApply *storage.Apply
+	if req.ApplyId != "" {
+		apply, err := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
+		if err != nil {
+			return nil, fmt.Errorf("load apply %s before cancel: %w", req.ApplyId, err)
+		}
+		if apply == nil {
+			return nil, fmt.Errorf("load apply %s before cancel: %w", req.ApplyId, storage.ErrApplyNotFound)
+		}
+		targetApplyID = apply.ID
+		targetApply = apply
+	}
+
+	if revertTask := firstRevertWindowTask(tasks, targetApplyID); revertTask != nil {
+		applyIdentifier := c.resolveRevertWindowApplyIdentifier(ctx, &ternv1.StopRequest{ApplyId: req.ApplyId, Environment: req.Environment}, targetApply, revertTask)
+		c.logger.Warn("cancel rejected: schema change is in the revert window and has already cut over",
+			append(revertTask.LogAttrs(), "apply_id", applyIdentifier)...)
+		return nil, errors.New(revertWindowStopRejectionMessage(applyIdentifier))
+	}
+
+	eng := c.getEngine()
+	applyCancel := c.currentApplyCancel()
+	if err := c.cancelEngineForTasks(ctx, eng, tasks, targetApplyID); err != nil {
+		return nil, fmt.Errorf("engine cancel failed: %w", err)
+	}
+	c.cancelApplyHandle(applyCancel)
+
+	cancelledCount, skippedCount, applyID := c.markTasksWithState(ctx, tasks, targetApplyID, nil, state.Task.Cancelled)
+	if applyID > 0 && cancelledCount > 0 {
+		if err := c.markApplyCancelled(ctx, applyID); err != nil {
+			return nil, err
+		}
+		eventMsg := fmt.Sprintf("Cancel requested: %d tasks cancelled, %d skipped", cancelledCount, skippedCount)
+		if caller != "" {
+			eventMsg += callerApplyLogSuffix(caller)
+		}
+		c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
+			eventMsg, "", "")
+	}
+	if cancelledCount == 0 && skippedCount == 0 {
+		return nil, fmt.Errorf("no active schema change")
+	}
+	if cancelledCount == 0 && skippedCount > 0 && applyID > 0 {
+		if targetApply != nil && state.IsState(targetApply.State, state.Apply.Cancelled) {
+			return &ternv1.CancelResponse{Accepted: true, CancelledCount: 0, SkippedCount: skippedCount}, nil
+		}
+		if err := c.markApplyCancelled(ctx, applyID); err != nil {
+			return nil, err
+		}
+	}
+	return &ternv1.CancelResponse{
+		Accepted:       true,
+		CancelledCount: cancelledCount,
+		SkippedCount:   skippedCount,
 	}, nil
 }
 
@@ -625,6 +701,66 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		return true, fmt.Errorf("process pending stop for apply %s: storage did not reach a resolved stop state", apply.ApplyIdentifier)
 	}
 	return true, nil
+}
+
+func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
+	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCancel)
+	if err != nil {
+		return false, err
+	}
+	if controlReq == nil {
+		return false, nil
+	}
+	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
+		c.logger.Info("completing pending cancel request for terminal apply",
+			append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Pending cancel request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+	if revertWindow, err := c.applyHasRevertWindowTask(ctx, apply); err != nil {
+		return true, err
+	} else if revertWindow {
+		message := revertWindowStopRejectionMessage(apply.ApplyIdentifier)
+		c.logger.Warn("rejecting pending cancel request: schema change is in the revert window and has already cut over",
+			append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Pending cancel request rejected: %s%s", message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel, message); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+
+	cancelCtx := context.WithoutCancel(ctx)
+	resp, err := c.cancelOwnedApply(cancelCtx, &ternv1.CancelRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: apply.Environment,
+	}, controlRequestCaller(controlReq))
+	if err != nil {
+		return true, fmt.Errorf("process pending cancel for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if resp == nil || !resp.Accepted {
+		errorMessage := "not accepted"
+		if resp != nil && resp.ErrorMessage != "" {
+			errorMessage = resp.ErrorMessage
+		}
+		return true, fmt.Errorf("process pending cancel for apply %s: %s", apply.ApplyIdentifier, errorMessage)
+	}
+	if err := completePendingControlRequests(cancelCtx, c.storage, apply, storage.ControlOperationCancel); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func (c *LocalClient) processPendingCancelOrStopControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
+	if handled, err := c.processPendingCancelControlRequest(ctx, apply); handled || err != nil {
+		return handled, err
+	}
+	return c.processPendingStopControlRequest(ctx, apply)
 }
 
 // firstRevertWindowTask returns the first targeted task that is in the revert
@@ -770,6 +906,41 @@ func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine,
 	}
 	c.logger.Debug("no targeted task has live engine work to stop", "database", c.config.Database, "type", c.config.Type, "target_apply_id", targetApplyID)
 	return nil, nil
+}
+
+func (c *LocalClient) cancelEngineForTasks(ctx context.Context, eng engine.Engine, tasks []*storage.Task, targetApplyID int64) error {
+	if eng == nil {
+		c.logger.Error("cancelEngineForTasks: engine is nil")
+		return fmt.Errorf("no engine configured for type: %s", c.config.Type)
+	}
+	for _, task := range tasks {
+		if targetApplyID > 0 && task.ApplyID != targetApplyID {
+			continue
+		}
+		if state.IsTerminalTaskState(task.State) {
+			c.logger.Info("skipping terminal task in cancel", task.LogAttrs()...)
+			continue
+		}
+		if !hasLiveEngineWork(task.State) {
+			c.logger.Debug("skipping engine cancel for task with no live engine work",
+				task.LogAttrs()...)
+			continue
+		}
+		creds, err := c.credentialsForTask(task)
+		if err != nil {
+			return fmt.Errorf("resolve credentials for cancel task %s: %w", task.TaskIdentifier, err)
+		}
+		req, err := c.buildControlRequest(ctx, task, creds, eng, engine.ControlCancel)
+		if err != nil {
+			return fmt.Errorf("build cancel request for task %s: %w", task.TaskIdentifier, err)
+		}
+		if _, err := eng.Cancel(ctx, req); err != nil {
+			return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, err)
+		}
+		return nil
+	}
+	c.logger.Debug("no targeted task has live engine work to cancel", "database", c.config.Database, "type", c.config.Type, "target_apply_id", targetApplyID)
+	return nil
 }
 
 // snapshotEngineProgress captures per-table progress from the engine after stopping.

@@ -305,6 +305,7 @@ var knownPRCommandActorAuthCommands = map[string]bool{
 	"unlock":           true,
 	"cutover":          true,
 	"stop":             true,
+	"cancel":           true,
 	"start":            true,
 	"volume":           true,
 	"revert":           true,

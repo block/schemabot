@@ -149,6 +149,16 @@ func cleanupTables(t *testing.T, db *sql.DB) {
 	}
 }
 
+func tableExists(t *testing.T, db *sql.DB, tableName string) bool {
+	t.Helper()
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+		tableName,
+	).Scan(&count))
+	return count > 0
+}
+
 func TestEngine_Plan_AddColumn(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 
@@ -669,6 +679,46 @@ func TestEngine_FetchCurrentSchema(t *testing.T) {
 
 	assert.Len(t, schemas, 2)
 	assert.ElementsMatch(t, []string{"t1", "t2"}, tableSchemaNames(schemas))
+}
+
+// A cancelled Spirit schema change must remove resumability artifacts so a
+// later apply starts cleanly, while preserving the user's live base table.
+func TestEngine_CancelledArtifactCleanup(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	baseTable := "customers"
+	artifacts := []string{
+		utils.AuxTableName(baseTable, "_new"),
+		utils.AuxTableName(baseTable, "_old"),
+		utils.CheckpointTableName(baseTable),
+		"_spirit_sentinel",
+		"_spirit_checkpoint",
+	}
+
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY)", quoteIdentifier(baseTable)))
+	require.NoError(t, err)
+	for _, artifact := range artifacts {
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY)", quoteIdentifier(artifact)))
+		require.NoError(t, err, "create artifact %s", artifact)
+	}
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err)
+	eng := New(Config{})
+	err = eng.dropCancelledArtifacts(t.Context(), &runningMigration{
+		database: database,
+		tables:   []string{baseTable},
+		host:     host,
+		username: username,
+		password: password,
+	})
+	require.NoError(t, err)
+
+	assert.True(t, tableExists(t, db, baseTable))
+	for _, artifact := range artifacts {
+		assert.False(t, tableExists(t, db, artifact), "artifact should be dropped: %s", artifact)
+	}
 }
 
 // Archive tables are maintained outside declarative schema files, so a plan

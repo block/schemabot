@@ -290,7 +290,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 	var stoppedByUser bool
 
 	for i, task := range tasks {
-		if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
+		if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 			c.logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 				"apply_id", apply.ApplyIdentifier, "error", err)
 			return
@@ -1222,7 +1222,7 @@ func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.E
 // of tasks the caller has loaded. Callers choose whether tasks are scoped to the
 // whole apply or to a single operation.
 func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, options map[string]string, releaseAtCutoverBarrier bool, forceCutoverResume bool) error {
-	if handled, err := c.processPendingStopControlRequest(ctx, apply); handled || err != nil {
+	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); handled || err != nil {
 		return err
 	}
 

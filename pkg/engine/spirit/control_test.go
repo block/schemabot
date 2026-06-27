@@ -190,6 +190,25 @@ func TestVolumeToSpiritSettings_ThreadCap(t *testing.T) {
 	}
 }
 
+func TestCancelMarksRunningSchemaChangeCancelled(t *testing.T) {
+	eng := New(Config{})
+	cancelCalled := false
+	eng.runningMigration = &runningMigration{
+		database: "testdb",
+		tables:   []string{"users"},
+		state:    engine.StateRunning,
+		cancelFunc: func() {
+			cancelCalled = true
+		},
+	}
+
+	_, err := eng.Cancel(t.Context(), &engine.ControlRequest{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cleanup missing connection details")
+	assert.True(t, cancelCalled)
+	assert.Equal(t, engine.StateCancelled, eng.runningMigration.state)
+}
+
 func TestCPUScaledThreads(t *testing.T) {
 	t.Run("uses fallback when no CPU hint", func(t *testing.T) {
 		assert.Equal(t, 8, cpuScaledThreads(0, 16, 8))

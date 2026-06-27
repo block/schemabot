@@ -391,6 +391,15 @@ type StopResponse struct {
 	Status       string `json:"status,omitempty"`
 }
 
+// CancelResponse is the HTTP response for POST /api/cancel.
+type CancelResponse struct {
+	Accepted       bool   `json:"accepted"`
+	ErrorMessage   string `json:"error_message,omitempty"`
+	CancelledCount int64  `json:"cancelled_count"`
+	SkippedCount   int64  `json:"skipped_count"`
+	Status         string `json:"status,omitempty"`
+}
+
 // StartResponse is the HTTP response for POST /api/start.
 type StartResponse struct {
 	Accepted     bool   `json:"accepted"`

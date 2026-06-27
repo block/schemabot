@@ -585,6 +585,9 @@ type mockTernClient struct {
 	stopErr                  error
 	stopReq                  *ternv1.StopRequest // captured request
 	stopHook                 func()
+	cancelResp               *ternv1.CancelResponse
+	cancelErr                error
+	cancelReq                *ternv1.CancelRequest // captured request
 	startResp                *ternv1.StartResponse
 	startErr                 error
 	startReq                 *ternv1.StartRequest // captured request
@@ -659,7 +662,11 @@ func (m *mockTernClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*te
 	return nil, m.stopErr
 }
 func (m *mockTernClient) Cancel(ctx context.Context, req *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
-	return &ternv1.CancelResponse{}, nil
+	m.cancelReq = req
+	if m.cancelResp != nil {
+		return m.cancelResp, m.cancelErr
+	}
+	return nil, m.cancelErr
 }
 func (m *mockTernClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
 	m.startReq = req
@@ -4160,6 +4167,66 @@ func TestStopHandler(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, controlReq, "durable stop request must be queued for the operator")
 	})
+
+	t.Run("rejects planetscale stop before queuing durable intent", func(t *testing.T) {
+		mock := &mockTernClient{stopResp: &ternv1.StopResponse{Accepted: true, StoppedCount: 1}}
+		apply := activeTestApply("apply-planetscale-stop")
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		apply.Engine = storage.EnginePlanetScale
+		task := &storage.Task{ID: 31, TaskIdentifier: "task-planetscale-stop", ApplyID: apply.ID, State: state.Task.Running}
+		svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-planetscale-stop"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/stop", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), "use cancel")
+		assert.Nil(t, mock.stopReq)
+		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		assert.Nil(t, controlReq)
+	})
+}
+
+func TestCancelHandler(t *testing.T) {
+	mock := &mockTernClient{cancelResp: &ternv1.CancelResponse{Accepted: true, CancelledCount: 1}}
+	apply := activeTestApply("apply-cancel-abc123")
+	task := &storage.Task{
+		ID:             24,
+		TaskIdentifier: "task-cancel-abc123",
+		ApplyID:        apply.ID,
+		State:          state.Task.Running,
+	}
+	svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	body := `{"environment": "staging", "apply_id": "apply-cancel-abc123"}`
+	req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/cancel", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NotNil(t, mock.cancelReq, "handler should persist durable intent and issue immediate cancel")
+	assert.Equal(t, "apply-cancel-abc123", mock.cancelReq.ApplyId)
+	assert.Equal(t, "staging", mock.cancelReq.Environment)
+	controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, controlReq)
+
+	var resp apitypes.CancelResponse
+	err = json.NewDecoder(w.Body).Decode(&resp)
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(1), resp.CancelledCount)
+	assert.Empty(t, resp.Status)
 }
 
 func TestStartHandler(t *testing.T) {

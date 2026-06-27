@@ -7,7 +7,8 @@
 // deploy requests run inside Vitess itself — SchemaBot only orchestrates them via API.
 // This means:
 //   - Schema changes survive SchemaBot crashes (they continue in Vitess)
-//   - Stop permanently cancels the deploy request (no resume/checkpoint)
+//   - Cancel permanently cancels the deploy request (no resume/checkpoint)
+//   - Stop is not supported because cancellation is not resumable
 //   - Start is not supported — a cancelled deploy request cannot be restarted
 //   - Progress polls the deploy request status from PlanetScale's API
 //
@@ -25,7 +26,8 @@
 //	Plan     → Diff schema files against PlanetScale main branch schema
 //	Apply    → Create a deploy request and start it (tern client polls Progress to track to completion)
 //	Progress → Poll deploy request status (GET /deploy-requests/{number}) and check shard progress at the vtgate
-//	Stop     → Cancel the deploy request (permanent, maps to vtctldclient OnlineDDL cancel)
+//	Stop     → Not supported (deploy request cancellation is permanent)
+//	Cancel   → Cancel the deploy request (permanent, maps to vtctldclient OnlineDDL cancel)
 //	Start    → Not supported (cancelled deploys cannot resume)
 //	Cutover  → Complete the deploy request (maps to vtctldclient OnlineDDL complete)
 //	Revert   → Revert the deploy request during the revert window
@@ -62,8 +64,8 @@
 //	complete_pending_revert   → StateRevertWindow         Deployment complete (revert available)
 //	complete_error, error     → StateFailed               Deployment failed
 //	failed                    → StateFailed               Deployment failed
-//	in_progress_cancel        → StateStopped              Cancelling deploy...
-//	cancelled, complete_cancel→ StateStopped              Deployment cancelled
+//	in_progress_cancel        → StateCancelled            Cancelling deploy...
+//	cancelled, complete_cancel→ StateCancelled            Deployment cancelled
 //	in_progress_revert        → StateRunning              Revert in progress...
 //	in_progress_revert_vschema→ StateRunning              Reverting VSchema changes
 //	complete_revert           → StateReverted             Deployment reverted
@@ -765,9 +767,9 @@ func deployStateToEngineState(drState string) engine.State {
 	case deployState.CompleteError, deployState.Error, deployState.Failed, deployState.CompleteRevertError:
 		return engine.StateFailed
 	case deployState.InProgressCancel:
-		return engine.StateStopped
+		return engine.StateCancelled
 	case deployState.CompleteCancel, deployState.Cancelled:
-		return engine.StateStopped
+		return engine.StateCancelled
 	case deployState.InProgressRevert, deployState.InProgressRevertVSchema:
 		return engine.StateRunning
 	case deployState.CompleteRevert:

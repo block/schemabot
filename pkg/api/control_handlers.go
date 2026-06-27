@@ -296,16 +296,23 @@ func (s *Service) rejectControlIfStopPending(ctx context.Context, opName string,
 	if controlStore == nil {
 		return fmt.Errorf("control request store is not available")
 	}
-	controlReq, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationStop)
-	if err != nil {
-		return fmt.Errorf("load pending stop control request for apply %s before %s: %w", apply.ApplyIdentifier, opName, err)
+	for _, controlOp := range []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel} {
+		controlReq, err := controlStore.GetPending(ctx, apply.ID, controlOp)
+		if err != nil {
+			return fmt.Errorf("load pending %s control request for apply %s before %s: %w", controlOp, apply.ApplyIdentifier, opName, err)
+		}
+		if controlReq == nil {
+			continue
+		}
+		logEvent := storage.LogEventStopRequested
+		if controlOp == storage.ControlOperationCancel {
+			logEvent = storage.LogEventCancelRequested
+		}
+		s.logControlOperationForApply(ctx, apply, controlReq.RequestedBy, logEvent,
+			fmt.Sprintf("Pending %s request blocked %s", controlOp, opName))
+		return controlConflictf("schema change has a pending %s request; %s is blocked until %s is processed", controlOp, opName, controlOp)
 	}
-	if controlReq == nil {
-		return nil
-	}
-	s.logControlOperationForApply(ctx, apply, controlReq.RequestedBy, storage.LogEventStopRequested,
-		fmt.Sprintf("Pending stop request blocked %s", opName))
-	return controlConflictf("schema change has a pending stop request; %s is blocked until stop is processed", opName)
+	return nil
 }
 
 // decodeControlRequest decodes a control request (stop/start/cutover/volume),
@@ -720,6 +727,10 @@ func (s *Service) ExecuteStop(ctx context.Context, req apitypes.ControlRequest) 
 // err == nil; every error path returns a zero status, and callers must derive
 // the response status from the error (e.g. via writeControlError).
 func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) (*apitypes.StopResponse, int, error) {
+	if apply.Engine == storage.EnginePlanetScale {
+		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "stop is not supported for this schema change; use cancel to permanently cancel it")
+	}
 	resp, responseStatus, err := s.queueStopForApplyOwner(ctx, apply, caller)
 	if err != nil {
 		status := "error"
@@ -915,6 +926,198 @@ func (s *Service) completeImmediateStopRequestIfStopped(ctx context.Context, app
 
 func stopRequestCompletedByApplyState(applyState string) bool {
 	return state.IsState(applyState, state.Apply.Stopped, state.Apply.Cancelled) || state.IsTerminalApplyState(applyState)
+}
+
+type cancelControlRequestMetadata struct {
+	CancelledCount int64 `json:"cancelled_count,omitempty"`
+	SkippedCount   int64 `json:"skipped_count,omitempty"`
+}
+
+const cancelResponseStatusAlreadyRequested = apitypes.ControlStatusAlreadyRequested
+
+func (s *Service) handleCancel(w http.ResponseWriter, r *http.Request) {
+	var req apitypes.ControlRequest
+	client, apply, _, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	if !ok {
+		return
+	}
+	resp, httpStatus, err := s.executeCancelForApply(r.Context(), client, apply, req.Caller)
+	if err != nil {
+		s.writeControlError(w, "cancel", apply, err)
+		return
+	}
+	s.writeJSON(w, httpStatus, resp)
+}
+
+// ExecuteCancel records durable cancel intent for an apply. The apply owner is
+// responsible for consuming the request from the per-apply processing loop.
+func (s *Service) ExecuteCancel(ctx context.Context, req apitypes.ControlRequest) (*apitypes.CancelResponse, error) {
+	client, apply, _, err := s.controlTarget(ctx, "cancel", req.ApplyID, req.Environment)
+	if err != nil {
+		return nil, err
+	}
+	resp, _, err := s.executeCancelForApply(ctx, client, apply, req.Caller)
+	return resp, err
+}
+
+func (s *Service) executeCancelForApply(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) (*apitypes.CancelResponse, int, error) {
+	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
+		metrics.RecordControlOperation(ctx, "cancel", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, controlConflictf("schema change is already terminal (current state: %s)", apply.State)
+	}
+	resp, responseStatus, err := s.queueCancelForApplyOwner(ctx, apply, caller)
+	if err != nil {
+		status := "error"
+		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
+			status = "rejected"
+		}
+		metrics.RecordControlOperation(ctx, "cancel", apply.Database, apply.Deployment, apply.Environment, status)
+		return nil, 0, err
+	}
+	metrics.RecordControlOperation(ctx, "cancel", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
+	if resp.Accepted {
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCancelRequested, "Cancel requested by user")
+		s.tryImmediateCancel(ctx, client, apply, caller)
+		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+	}
+
+	httpResp := &apitypes.CancelResponse{
+		Accepted:       resp.Accepted,
+		ErrorMessage:   resp.ErrorMessage,
+		CancelledCount: resp.CancelledCount,
+		SkippedCount:   resp.SkippedCount,
+		Status:         responseStatus,
+	}
+	httpStatus := http.StatusOK
+	if responseStatus == cancelResponseStatusAlreadyRequested {
+		httpStatus = http.StatusAccepted
+	}
+	return httpResp, httpStatus, nil
+}
+
+func (s *Service) queueCancelForApplyOwner(ctx context.Context, apply *storage.Apply, caller string) (*ternv1.CancelResponse, string, error) {
+	if resp, responseStatus, found, err := s.pendingCancelResponseIfPresent(ctx, apply); err != nil || found {
+		return resp, responseStatus, err
+	}
+	tasks, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return nil, "", fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	cancelledCount, skippedCount := stopRequestCounts(tasks)
+	if cancelledCount == 0 && skippedCount == 0 {
+		return nil, "", controlConflictf("no active schema change for apply %s", apply.ApplyIdentifier)
+	}
+	controlReq, alreadyPending, err := s.createCancelControlRequest(ctx, apply, caller, cancelledCount, skippedCount)
+	if err != nil {
+		return nil, "", err
+	}
+	if alreadyPending {
+		resp, err := cancelResponseFromControlRequest(controlReq)
+		if err != nil {
+			return nil, "", err
+		}
+		return resp, cancelResponseStatusAlreadyRequested, nil
+	}
+	return &ternv1.CancelResponse{Accepted: true, CancelledCount: cancelledCount, SkippedCount: skippedCount}, "", nil
+}
+
+func (s *Service) createCancelControlRequest(ctx context.Context, apply *storage.Apply, caller string, cancelledCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
+	return s.createControlRequest(ctx, apply, storage.ControlOperationCancel, caller, cancelControlRequestMetadata{
+		CancelledCount: cancelledCount,
+		SkippedCount:   skippedCount,
+	})
+}
+
+func (s *Service) pendingCancelResponseIfPresent(ctx context.Context, apply *storage.Apply) (*ternv1.CancelResponse, string, bool, error) {
+	return pendingControlResponseIfPresent(ctx, s, apply, storage.ControlOperationCancel, cancelResponseStatusAlreadyRequested, cancelResponseFromControlRequest)
+}
+
+func cancelResponseFromControlRequest(controlReq *storage.ApplyControlRequest) (*ternv1.CancelResponse, error) {
+	resp := &ternv1.CancelResponse{}
+	if controlReq == nil {
+		return resp, nil
+	}
+	metadata, err := decodeControlRequestMetadata[cancelControlRequestMetadata](controlReq, storage.ControlOperationCancel)
+	if err != nil {
+		return nil, err
+	}
+	resp.CancelledCount = metadata.CancelledCount
+	resp.SkippedCount = metadata.SkippedCount
+	applyControlRequestStatus(controlReq, storage.ControlOperationCancel,
+		func() { resp.Accepted = true },
+		func(msg string) { resp.ErrorMessage = msg })
+	return resp, nil
+}
+
+func (s *Service) tryImmediateCancel(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) {
+	if multiOp, err := s.applyHasMultipleOperations(ctx, apply); err != nil {
+		s.logger.Warn("could not determine apply operation count; attempting single-deployment immediate cancel",
+			append(apply.LogAttrs(), "requested_by", caller, "error", err)...)
+	} else if multiOp {
+		s.logger.Info("immediate cancel skipped for multi-operation apply; operator will fan out the durable cancel request per operation",
+			append(apply.LogAttrs(), "requested_by", caller)...)
+		return
+	}
+	if client == nil {
+		s.logger.Warn("immediate cancel not attempted because Tern client is unavailable; durable cancel request remains pending for apply owner retry",
+			append(apply.LogAttrs(), "requested_by", caller)...)
+		return
+	}
+	ternApplyID := apply.ApplyIdentifier
+	if client.IsRemote() {
+		ternApplyID = apply.ExternalID
+	}
+	resp, err := client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: ternApplyID, Environment: apply.Environment})
+	if err != nil {
+		s.logger.Warn("immediate cancel failed; durable cancel request remains pending for apply owner retry",
+			append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller, "error", err)...)
+		return
+	}
+	if resp == nil || !resp.Accepted {
+		errorMessage := "not accepted"
+		if resp != nil && resp.ErrorMessage != "" {
+			errorMessage = resp.ErrorMessage
+		}
+		s.logger.Warn("immediate cancel was not accepted; durable cancel request remains pending for apply owner retry",
+			append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller, "error_message", errorMessage)...)
+		return
+	}
+	cancelCompleted, err := s.completeImmediateCancelRequestIfCancelled(ctx, apply, caller)
+	if err != nil {
+		s.logger.Warn("immediate cancel accepted but durable cancel request completion check failed; durable cancel request remains pending for apply owner retry",
+			append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller, "error", err)...)
+		return
+	}
+	if !cancelCompleted {
+		s.logger.Info("immediate cancel accepted; durable apply owner will reconcile final cancel state",
+			append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller, "cancelled_count", resp.CancelledCount, "skipped_count", resp.SkippedCount)...)
+		return
+	}
+	s.logger.Info("immediate cancel accepted and durable cancel request completed",
+		append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller, "cancelled_count", resp.CancelledCount, "skipped_count", resp.SkippedCount)...)
+}
+
+func (s *Service) completeImmediateCancelRequestIfCancelled(ctx context.Context, apply *storage.Apply, caller string) (bool, error) {
+	storedApply, err := s.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return false, fmt.Errorf("load apply %s after immediate cancel: %w", apply.ApplyIdentifier, err)
+	}
+	if storedApply == nil {
+		return false, fmt.Errorf("load apply %s after immediate cancel: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
+	}
+	if !state.IsState(storedApply.State, state.Apply.Cancelled) {
+		s.logger.Info("immediate cancel accepted but stored apply is not cancelled; durable cancel request remains pending for apply owner retry",
+			append(storedApply.LogAttrs(), "requested_by", caller)...)
+		return false, nil
+	}
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		return false, fmt.Errorf("control request store is not available")
+	}
+	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationCancel); err != nil {
+		return false, fmt.Errorf("complete pending cancel control request for apply %s after immediate cancel: %w", apply.ApplyIdentifier, err)
+	}
+	return true, nil
 }
 
 func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.Apply, caller string) (*ternv1.StopResponse, string, error) {

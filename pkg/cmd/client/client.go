@@ -318,6 +318,11 @@ func CallStopAPI(endpoint, environment, applyID string) (*apitypes.StopResponse,
 	return callControlAPI[apitypes.StopResponse](endpoint, "/api/stop", environment, applyID)
 }
 
+// CallCancelAPI calls the cancel API and returns the typed result.
+func CallCancelAPI(endpoint, environment, applyID string) (*apitypes.CancelResponse, error) {
+	return callControlAPI[apitypes.CancelResponse](endpoint, "/api/cancel", environment, applyID)
+}
+
 // CallStartAPI calls the start API and returns the typed result.
 func CallStartAPI(endpoint, environment, applyID string) (*apitypes.StartResponse, error) {
 	return callControlAPI[apitypes.StartResponse](endpoint, "/api/start", environment, applyID)

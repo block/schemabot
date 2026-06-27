@@ -76,7 +76,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		c.logger.Error("failed to set started_at", append(apply.LogAttrs(), "error", err)...)
 	}
-	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
+	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		c.logger.Warn("pending stop request processing failed before grouped engine apply; current apply owner will exit for operator retry",
 			append(apply.LogAttrs(), "error", err)...)
 		return
@@ -625,7 +625,7 @@ func applyQuiesceDecision(projectedApplyState string) (quiesce, retryablePause, 
 // wind-down runs only when the aggregate quiesces, not when a single operation
 // finishes ahead of its siblings.
 func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, ps *atomicPollState, options map[string]string, releaseAtCutoverBarrier bool) bool {
-	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
+	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		c.logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 			"apply_id", apply.ApplyIdentifier, "error", err)
 		return true
@@ -700,7 +700,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 	// Update all tasks with engine progress
 	c.syncAtomicTaskProgress(ctx, tasks, result, newState, now)
-	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
+	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		c.logger.Warn("pending stop request processing failed after progress sync; current apply owner will exit for operator retry",
 			"apply_id", apply.ApplyIdentifier, "error", err)
 		return true

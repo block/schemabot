@@ -125,8 +125,10 @@ type controlCaptureEngine struct {
 	engine.Engine
 	cutoverReq  *engine.ControlRequest
 	stopReq     *engine.ControlRequest
+	cancelReq   *engine.ControlRequest
 	progressReq *engine.ProgressRequest
 	stopErr     error
+	cancelErr   error
 	// onStop runs when Stop is invoked, before it returns. Used to observe
 	// storage state at the moment of the engine stop (e.g. to assert the engine
 	// is stopped before tasks are marked stopped/cancelled).
@@ -149,6 +151,17 @@ func (e *controlCaptureEngine) Stop(_ context.Context, req *engine.ControlReques
 	}
 	if e.stopErr != nil {
 		return nil, e.stopErr
+	}
+	return &engine.ControlResult{Accepted: true}, nil
+}
+
+func (e *controlCaptureEngine) Cancel(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	e.cancelReq = req
+	if e.onStop != nil {
+		e.onStop()
+	}
+	if e.cancelErr != nil {
+		return nil, e.cancelErr
 	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
@@ -598,10 +611,9 @@ func TestLocalClient_CutoverPassesEngineResumeState(t *testing.T) {
 	assert.Equal(t, resumeData.DeferredDeploy, metadata.DeferredDeploy)
 }
 
-// PlanetScale stop maps to permanent deploy-request cancellation. If the engine
-// cannot cancel the deploy request, LocalClient should return the error instead
-// of marking the apply cancelled locally.
-func TestLocalClient_StopReturnsVitessEngineStopError(t *testing.T) {
+// PlanetScale stop is unsupported because deploy-request cancellation is
+// permanent and belongs behind the cancel command.
+func TestLocalClient_StopRejectsVitessApply(t *testing.T) {
 	operationID := int64(99)
 	apply := &storage.Apply{ID: 42, ApplyIdentifier: "apply-vitess-control"}
 	task := &storage.Task{
@@ -617,14 +629,14 @@ func TestLocalClient_StopReturnsVitessEngineStopError(t *testing.T) {
 		MigrationContext: "ctx-123",
 		DeployRequestURL: "https://example.test/deploys/321",
 	})
-	stopErr := errors.New("cancel deploy request failed")
-	eng := &controlCaptureEngine{stopErr: stopErr}
+	eng := &controlCaptureEngine{}
 	client := newVitessControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
 
 	_, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
 
-	require.ErrorIs(t, err, stopErr)
-	require.NotNil(t, eng.stopReq, "stop should call the engine with deploy metadata")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "stop not supported")
+	assert.Nil(t, eng.stopReq, "unsupported stop must not call the engine")
 	assert.Equal(t, state.Task.Running, task.State)
 }
 
@@ -666,10 +678,10 @@ func TestLocalClient_StopRecoveringMySQLStopsEngineBeforeStorage(t *testing.T) {
 }
 
 // A PlanetScale waiting-for-deploy task has a created, startable deploy request.
-// Stop must cancel that deploy request via the engine before recording the
-// cancellation, otherwise the deploy stays startable from the PlanetScale UI
-// while SchemaBot reports it cancelled.
-func TestLocalClient_StopWaitingForDeployCancelsDeployRequest(t *testing.T) {
+// Cancel must cancel that deploy request via the engine before recording the
+// cancellation, otherwise the deploy stays startable outside SchemaBot while
+// SchemaBot reports it cancelled.
+func TestLocalClient_CancelWaitingForDeployCancelsDeployRequest(t *testing.T) {
 	operationID := int64(99)
 	apply := &storage.Apply{
 		ID:              42,
@@ -692,29 +704,28 @@ func TestLocalClient_StopWaitingForDeployCancelsDeployRequest(t *testing.T) {
 	}
 	resumeState := engineResumeStateFromPlanetScaleData(t, operationID, resumeData)
 	eng := &controlCaptureEngine{}
-	stateAtEngineStop := ""
-	eng.onStop = func() { stateAtEngineStop = task.State }
+	stateAtEngineCancel := ""
+	eng.onStop = func() { stateAtEngineCancel = task.State }
 	client := newVitessControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
 
-	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+	resp, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 	require.NoError(t, err)
 	assert.True(t, resp.Accepted)
-	require.NotNil(t, eng.stopReq, "stop must cancel the deploy request for a waiting-for-deploy task")
-	require.NotNil(t, eng.stopReq.ResumeState)
-	assert.Equal(t, resumeData.MigrationContext, eng.stopReq.ResumeState.MigrationContext)
-	assert.Equal(t, state.Task.WaitingForDeploy, stateAtEngineStop, "deploy request must be cancelled before the task is marked cancelled")
+	require.NotNil(t, eng.cancelReq, "cancel must cancel the deploy request for a waiting-for-deploy task")
+	require.NotNil(t, eng.cancelReq.ResumeState)
+	assert.Equal(t, resumeData.MigrationContext, eng.cancelReq.ResumeState.MigrationContext)
+	assert.Equal(t, state.Task.WaitingForDeploy, stateAtEngineCancel, "deploy request must be cancelled before the task is marked cancelled")
 	assert.Equal(t, state.Task.Cancelled, task.State)
 	assert.Equal(t, state.Apply.Cancelled, apply.State)
 }
 
 // A PlanetScale failed_retryable task paused after a transient failure (e.g.
 // repeated progress-poll errors) still has its created, startable deploy request
-// and persisted resume state. Stop is a terminal operator action, so it must
-// cancel that deploy request via the engine before recording the cancellation —
-// otherwise the deploy stays startable from the PlanetScale UI while SchemaBot
-// reports it cancelled.
-func TestLocalClient_StopFailedRetryableCancelsDeployRequest(t *testing.T) {
+// and persisted resume state. Cancel must cancel that deploy request via the
+// engine before recording the cancellation — otherwise the deploy stays
+// startable outside SchemaBot while SchemaBot reports it cancelled.
+func TestLocalClient_CancelFailedRetryableCancelsDeployRequest(t *testing.T) {
 	operationID := int64(99)
 	apply := &storage.Apply{
 		ID:              42,
@@ -737,18 +748,18 @@ func TestLocalClient_StopFailedRetryableCancelsDeployRequest(t *testing.T) {
 	}
 	resumeState := engineResumeStateFromPlanetScaleData(t, operationID, resumeData)
 	eng := &controlCaptureEngine{}
-	stateAtEngineStop := ""
-	eng.onStop = func() { stateAtEngineStop = task.State }
+	stateAtEngineCancel := ""
+	eng.onStop = func() { stateAtEngineCancel = task.State }
 	client := newVitessControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
 
-	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+	resp, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 	require.NoError(t, err)
 	assert.True(t, resp.Accepted)
-	require.NotNil(t, eng.stopReq, "stop must cancel the deploy request for a failed_retryable task")
-	require.NotNil(t, eng.stopReq.ResumeState)
-	assert.Equal(t, resumeData.MigrationContext, eng.stopReq.ResumeState.MigrationContext)
-	assert.Equal(t, state.Task.FailedRetryable, stateAtEngineStop, "deploy request must be cancelled before the task is marked cancelled")
+	require.NotNil(t, eng.cancelReq, "cancel must cancel the deploy request for a failed_retryable task")
+	require.NotNil(t, eng.cancelReq.ResumeState)
+	assert.Equal(t, resumeData.MigrationContext, eng.cancelReq.ResumeState.MigrationContext)
+	assert.Equal(t, state.Task.FailedRetryable, stateAtEngineCancel, "deploy request must be cancelled before the task is marked cancelled")
 	assert.Equal(t, state.Task.Cancelled, task.State)
 	assert.Equal(t, state.Apply.Cancelled, apply.State)
 }
@@ -784,8 +795,7 @@ func TestLocalClient_StopRejectsRevertWindow(t *testing.T) {
 	_, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
 
 	require.Error(t, err)
-	assert.ErrorContains(t, err, "schema change apply-vitess-revert-window is in the revert window and has already been applied")
-	assert.ErrorContains(t, err, "use revert to undo it or skip-revert to finalize it")
+	assert.ErrorContains(t, err, "stop not supported")
 	assert.NotContains(t, err.Error(), task.TaskIdentifier, "rejection must name the apply identifier, not the per-table task id")
 	assert.Nil(t, eng.stopReq, "stop must not touch the engine for a revert-window task")
 	assert.Equal(t, state.Task.RevertWindow, task.State, "revert-window task must not be marked cancelled by stop")

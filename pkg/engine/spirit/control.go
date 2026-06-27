@@ -89,8 +89,85 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	}, nil
 }
 
+// Cancel terminates a running schema change without preserving a checkpoint for
+// resume.
 func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("cancel is not supported for Spirit schema changes")
+	e.mu.Lock()
+	rm := e.runningMigration
+	if rm == nil {
+		e.mu.Unlock()
+		return nil, fmt.Errorf("no active schema change to cancel")
+	}
+	database := rm.database
+	tables := rm.tables
+	if rm.cancelFunc != nil {
+		rm.cancelFunc()
+	}
+	rm.state = engine.StateCancelled
+	e.mu.Unlock()
+
+	e.logger.Info("cancel requested, waiting for goroutine",
+		"database", database,
+		"tables", tables,
+	)
+	rm.wg.Wait()
+
+	e.logger.Info("schema change cancelled",
+		"database", database,
+		"tables", tables,
+	)
+	if err := e.dropCancelledArtifacts(context.WithoutCancel(ctx), rm); err != nil {
+		return nil, err
+	}
+	e.mu.Lock()
+	if e.runningMigration == rm {
+		e.runningMigration = nil
+	}
+	e.mu.Unlock()
+
+	return &engine.ControlResult{
+		Accepted: true,
+		Message:  "Cancelled",
+	}, nil
+}
+
+func (e *Engine) dropCancelledArtifacts(ctx context.Context, rm *runningMigration) error {
+	if rm == nil || rm.host == "" {
+		return fmt.Errorf("cancelled schema change cleanup missing connection details")
+	}
+	cfg := mysql.NewConfig()
+	cfg.User = rm.username
+	cfg.Passwd = rm.password
+	cfg.Net = "tcp"
+	cfg.Addr = rm.host
+	cfg.DBName = rm.database
+	cfg.InterpolateParams = true
+	db, err := mysqlconn.Open(cfg.FormatDSN())
+	if err != nil {
+		return fmt.Errorf("open database %s to clean up cancelled schema change artifacts: %w", rm.database, err)
+	}
+	defer utils.CloseAndLog(db)
+	if err := db.PingContext(ctx); err != nil {
+		return fmt.Errorf("connect to database %s to clean up cancelled schema change artifacts: %w", rm.database, err)
+	}
+	for _, tableName := range rm.tables {
+		for _, artifact := range []string{
+			utils.AuxTableName(tableName, "_new"),
+			utils.AuxTableName(tableName, "_old"),
+			utils.CheckpointTableName(tableName),
+		} {
+			if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", quoteIdentifier(rm.database), quoteIdentifier(artifact))); err != nil {
+				return fmt.Errorf("drop cancelled schema change artifact %s.%s: %w", rm.database, artifact, err)
+			}
+		}
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s._spirit_sentinel", quoteIdentifier(rm.database))); err != nil {
+		return fmt.Errorf("drop cancelled schema change sentinel for database %s: %w", rm.database, err)
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s._spirit_checkpoint", quoteIdentifier(rm.database))); err != nil {
+		return fmt.Errorf("drop cancelled schema change checkpoint for database %s: %w", rm.database, err)
+	}
+	return nil
 }
 
 // Start resumes a stopped schema change.

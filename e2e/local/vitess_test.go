@@ -88,17 +88,17 @@ func vitessApplyAndWait(t *testing.T, schemaDir, env string, extraArgs ...string
 	return out
 }
 
-func stopApplyAndWaitForCleanup(t *testing.T, endpoint, env, applyID string) {
+func cancelApplyAndWaitForCleanup(t *testing.T, endpoint, env, applyID string) {
 	t.Helper()
-	stopResult, err := client.CallStopAPI(endpoint, env, applyID)
-	require.NoError(t, err, "stop API call")
-	require.NotNil(t, stopResult, "stop response")
-	if !stopResult.Accepted {
+	cancelResult, err := client.CallCancelAPI(endpoint, env, applyID)
+	require.NoError(t, err, "cancel API call")
+	require.NotNil(t, cancelResult, "cancel response")
+	if !cancelResult.Accepted {
 		progress, progressErr := client.GetProgress(endpoint, applyID)
-		require.NoError(t, progressErr, "fetch progress after stop was not accepted")
+		require.NoError(t, progressErr, "fetch progress after cancel was not accepted")
 		require.True(t, state.IsTerminalApplyState(progress.State),
-			"stop should be accepted unless apply already reached a terminal state: response=%+v error=%v state=%q",
-			stopResult, err, progress.State)
+			"cancel should be accepted unless apply already reached a terminal state: response=%+v error=%v state=%q",
+			cancelResult, err, progress.State)
 		return
 	}
 	waitForApplyAnyState(t, endpoint, applyID, []string{state.Apply.Cancelled, state.Apply.Completed}, testutil.PollDeadline)
@@ -533,7 +533,7 @@ func TestVitess_Apply_AddIndex_Sharded(t *testing.T) {
 	require.NotEmpty(t, applyID, "expected apply ID in output")
 
 	waitForApplyState(t, endpoint, applyID, state.Apply.WaitingForCutover, testutil.PollDeadline)
-	stopApplyAndWaitForCleanup(t, endpoint, "staging", applyID)
+	cancelApplyAndWaitForCleanup(t, endpoint, "staging", applyID)
 
 	e2eutil.AssertContains(t, out, "ADD INDEX")
 	e2eutil.AssertContains(t, out, indexName)
@@ -658,9 +658,9 @@ func TestVitess_Apply_ShardProgress(t *testing.T) {
 	}
 	require.True(t, foundShards, "expected per-shard progress for 2-shard keyspace")
 
-	// The progress assertion only needs the copy phase. Stop the deferred apply
+	// The progress assertion only needs the copy phase. Cancel the deferred apply
 	// explicitly so cleanup does not overlap an active deploy request.
-	stopApplyAndWaitForCleanup(t, endpoint, "staging", applyID)
+	cancelApplyAndWaitForCleanup(t, endpoint, "staging", applyID)
 }
 
 func TestVitess_Apply_LogMode_Lifecycle(t *testing.T) {
@@ -1426,17 +1426,15 @@ func TestVitess_Apply_Cancel(t *testing.T) {
 
 	waitForApplyState(t, endpoint, applyID, state.Apply.WaitingForCutover, testutil.PollDeadline)
 
-	t.Logf("calling stop API: endpoint=%s applyID=%s", endpoint, applyID)
-	stopResult, err := client.CallStopAPI(endpoint, "staging", applyID)
-	require.NoError(t, err, "stop/cancel API call")
-	t.Logf("stop API returned: accepted=%v stopped=%d skipped=%d error=%q",
-		stopResult.Accepted, stopResult.StoppedCount, stopResult.SkippedCount, stopResult.ErrorMessage)
-	require.True(t, stopResult.Accepted, "stop should be accepted: %s", stopResult.ErrorMessage)
+	t.Logf("calling cancel API: endpoint=%s applyID=%s", endpoint, applyID)
+	cancelResult, err := client.CallCancelAPI(endpoint, "staging", applyID)
+	require.NoError(t, err, "cancel API call")
+	t.Logf("cancel API returned: accepted=%v cancelled=%d skipped=%d error=%q",
+		cancelResult.Accepted, cancelResult.CancelledCount, cancelResult.SkippedCount, cancelResult.ErrorMessage)
+	require.True(t, cancelResult.Accepted, "cancel should be accepted: %s", cancelResult.ErrorMessage)
 
-	// Verify it reaches cancelled state (not stopped)
 	waitForApplyState(t, endpoint, applyID, state.Apply.Cancelled, testutil.PollDeadline)
 
-	// Verify status shows cancelled
 	resp, err := client.GetProgress(endpoint, applyID)
 	require.NoError(t, err)
 	assert.Equal(t, state.Apply.Cancelled, resp.State)

@@ -58,6 +58,15 @@ func TestProgressState(t *testing.T) {
 			want:        engine.StateStopped,
 		},
 		{
+			name: "cancelled stays cancelled while the runner tears down",
+			rm: &runningMigration{
+				state:        engine.StateCancelled,
+				deferCutover: true,
+			},
+			spiritState: status.WaitingOnSentinelTable,
+			want:        engine.StateCancelled,
+		},
+		{
 			name: "closing runner does not imply completion",
 			rm: &runningMigration{
 				state: engine.StateRunning,

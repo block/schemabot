@@ -41,7 +41,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 	var stoppedByUser bool
 
 	for i, task := range tasks {
-		if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
+		if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 			c.logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 				"apply_id", apply.ApplyIdentifier, "error", err)
 			return
@@ -168,7 +168,7 @@ func sequentialEngineApplyRequest(task *storage.Task, options map[string]string,
 // runEngineTask calls the engine for a single DDL, marks the task running, and polls to completion.
 // Returns the outcome: taskContinue (completed), taskFailed, or taskStopped.
 func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, task *storage.Task, options map[string]string, creds *engine.Credentials) taskAction {
-	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
+	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		c.logger.Warn("pending stop request processing failed before sequential engine apply; current apply owner will exit for operator retry",
 			"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
 		return taskAbort
@@ -310,7 +310,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 		case <-ctx.Done():
 			return taskStopped
 		case <-ticker.C:
-			if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
+			if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 				c.logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 					"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
 				return taskAbort

@@ -685,6 +685,7 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 	handle("GET /api/history/{database}", s.handleDatabaseHistory)
 	handle("POST /api/cutover", s.handleCutover)
 	handle("POST /api/stop", s.handleStop)
+	handle("POST /api/cancel", s.handleCancel)
 	handle("POST /api/start", s.handleStart)
 	handle("POST /api/volume", s.handleVolume)
 	handle("POST /api/revert", s.handleRevert)

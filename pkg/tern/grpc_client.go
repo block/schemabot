@@ -581,12 +581,12 @@ func (c *GRPCClient) Cancel(ctx context.Context, req *ternv1.CancelRequest) (*te
 // apply-level stop early while sibling operations are still live.
 func logOperationDriveLeavesParentStop(apply *storage.Apply, scope applyTaskScope) {
 	slog.Info("operation-only drive leaving apply-level stop request for operator projection",
-		"apply_id", apply.ApplyIdentifier,
-		"apply_operation_id", scope.applyOperationID,
-		"remote_apply_id", scope.remoteApplyID(apply),
-		"database", apply.Database,
-		"environment", apply.Environment,
-		"state", apply.State)
+		append(apply.LogAttrs(), "apply_operation_id", scope.applyOperationID, "remote_apply_id", scope.remoteApplyID(apply))...)
+}
+
+func logOperationDriveLeavesParentCancel(apply *storage.Apply, scope applyTaskScope) {
+	slog.Info("operation-only drive leaving apply-level cancel request for operator projection",
+		append(apply.LogAttrs(), "apply_operation_id", scope.applyOperationID, "remote_apply_id", scope.remoteApplyID(apply))...)
 }
 
 func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
@@ -766,6 +766,83 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		"requested_by", controlRequestCaller(controlReq),
 		"remote_state", remoteState)
 	return false, nil
+}
+
+func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
+	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCancel)
+	if err != nil {
+		return false, err
+	}
+	if controlReq == nil {
+		return false, nil
+	}
+	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
+		if scope.suppressesDirectParentApplyWrites() {
+			logOperationDriveLeavesParentCancel(apply, scope)
+			return true, nil
+		}
+		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+	remoteID := scope.remoteApplyID(apply)
+	if remoteID == "" {
+		return true, fmt.Errorf("cancel gRPC apply %s: remote apply id is not available", apply.ApplyIdentifier)
+	}
+	resp, err := c.client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: remoteID, Environment: apply.Environment})
+	if err != nil {
+		return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
+	}
+	if resp == nil || !resp.Accepted {
+		errorMessage := "not accepted"
+		if resp != nil && resp.ErrorMessage != "" {
+			errorMessage = resp.ErrorMessage
+		}
+		return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: %s", apply.ApplyIdentifier, remoteID, errorMessage)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested,
+		fmt.Sprintf("Remote cancel accepted for apply %s%s", remoteID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{ApplyId: remoteID, Environment: apply.Environment})
+	if err != nil {
+		return true, fmt.Errorf("sync remote gRPC cancel for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
+	}
+	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
+		return true, fmt.Errorf("sync remote gRPC cancel for apply %s remote %s: no active schema change", apply.ApplyIdentifier, remoteID)
+	}
+	remoteState := ProtoStateToStorage(progress.State)
+	if remoteState == "" {
+		return true, fmt.Errorf("sync remote gRPC cancel for apply %s remote %s: unmapped remote state %s", apply.ApplyIdentifier, remoteID, remoteApplyStateDescription(progress.State))
+	}
+	now := time.Now()
+	priorState, priorStartedAt, priorUpdatedAt := apply.State, apply.StartedAt, apply.UpdatedAt
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
+	apply.UpdatedAt = now
+	if isTerminalProtoState(progress.State) {
+		if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
+			return true, err
+		}
+		if scope.suppressesDirectParentApplyWrites() {
+			apply.State, apply.StartedAt, apply.UpdatedAt = priorState, priorStartedAt, priorUpdatedAt
+			logOperationDriveLeavesParentCancel(apply, scope)
+			return true, nil
+		}
+		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+	if _, err := c.persistParentApply(ctx, apply, scope, "sync nonterminal gRPC cancel"); err != nil {
+		return true, fmt.Errorf("sync nonterminal remote gRPC cancel state for %s: %w", apply.ApplyIdentifier, err)
+	}
+	return false, nil
+}
+
+func (c *GRPCClient) processPendingCancelOrStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
+	if handled, err := c.processPendingCancelControlRequest(ctx, apply, scope); handled || err != nil {
+		return handled, err
+	}
+	return c.processPendingStopControlRequest(ctx, apply, scope)
 }
 
 func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, scope applyTaskScope) (bool, error) {
@@ -1348,7 +1425,7 @@ func (c *GRPCClient) dispatchRemoteGroupFinalizer(ctx context.Context, apply *st
 		if target == "" {
 			target = apply.Database
 		}
-		if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
+		if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
 			return err
 		}
 		resp, err := c.client.Apply(ctx, &ternv1.ApplyRequest{
@@ -1440,7 +1517,7 @@ func (c *GRPCClient) ResumeApplyOperationCutover(ctx context.Context, apply *sto
 		return fmt.Errorf("apply_operation %d (apply %s): no remote apply id for cutover drive", applyOperationID, apply.ApplyIdentifier)
 	}
 	// Honor a stop that raced in after the cutover claim before forcing the swap.
-	if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
+	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
 		return err
 	}
 	poll, err := c.triggerRemoteOperationCutover(ctx, apply, scope, remoteID)
@@ -1510,7 +1587,7 @@ func (c *GRPCClient) triggerRemoteOperationCutover(ctx context.Context, apply *s
 		return false, fmt.Errorf("preflight remote cutover for apply_operation %d (apply %s): remote is %s, not parked at the cutover barrier", scope.applyOperationID, apply.ApplyIdentifier, remoteState)
 	}
 	// Re-check a raced stop immediately before forcing the swap.
-	if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
+	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
 		return false, err
 	}
 	cutoverResp, err := c.client.Cutover(ctx, &ternv1.CutoverRequest{
@@ -1545,7 +1622,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 	if apply == nil {
 		return fmt.Errorf("apply is required")
 	}
-	if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
+	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
 		return err
 	}
 	if err := c.processPendingCutoverControlRequest(ctx, apply, scope); err != nil {
@@ -1574,7 +1651,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		}
 	}
 	if startRequested && state.IsState(apply.State, state.Apply.WaitingForDeploy) {
-		if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
+		if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
 			return err
 		}
 		if err := c.processPendingStartControlRequest(ctx, apply, scope); err != nil {
@@ -1584,7 +1661,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID != "" && state.IsState(apply.State, state.Apply.Pending) && !startRequested {
-		if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
+		if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
 			return err
 		}
 		_, err := c.client.Start(ctx, &ternv1.StartRequest{
@@ -1808,7 +1885,7 @@ func (c *GRPCClient) waitForPendingStopBeforeStart(ctx context.Context, apply *s
 			// Stop this operation's own remote work once, then defer: the
 			// operation-only drive must not spin waiting for a parent stop it
 			// will never complete.
-			handled, err := c.processPendingStopControlRequest(ctx, apply, scope)
+			handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope)
 			if err != nil {
 				return false, err
 			}
@@ -1844,7 +1921,7 @@ func (c *GRPCClient) waitForPendingStopBeforeStart(ctx context.Context, apply *s
 				"state", apply.State)
 			loggedWait = true
 		}
-		if _, err := c.processPendingStopControlRequest(ctx, apply, scope); err != nil {
+		if _, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); err != nil {
 			return false, err
 		}
 		select {
@@ -2016,7 +2093,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	if target == "" {
 		target = apply.Database
 	}
-	if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
+	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
 		return err
 	}
 
@@ -2872,7 +2949,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				return fmt.Errorf("heartbeat gRPC apply %s: %w", apply.ApplyIdentifier, err)
 			}
 		case <-ticker.C:
-			if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); err != nil {
+			if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); err != nil {
 				slog.Warn("pending gRPC stop request processing failed; current apply owner will exit for operator retry",
 					"apply_id", apply.ApplyIdentifier,
 					"external_id", apply.ExternalID,
