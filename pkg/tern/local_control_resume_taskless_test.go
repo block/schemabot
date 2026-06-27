@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"errors"
 	"log/slog"
 	"testing"
 
@@ -40,4 +41,27 @@ func TestResumeApply_TasklessNoOpCompletesNotFails(t *testing.T) {
 	assert.Equal(t, state.Apply.Completed, apply.State,
 		"a task-less no-op apply must complete on recovery, not be marked failed")
 	assert.NotEqual(t, state.Apply.Failed, apply.State)
+}
+
+// If persisting the no-op completion fails, recovery surfaces the error so it
+// retries — rather than reporting a completion that was never written.
+func TestResumeApply_TasklessNoOpUpdateErrorReturnsError(t *testing.T) {
+	apply := &storage.Apply{
+		ID: 1, PlanID: 7, ApplyIdentifier: "apply-noop",
+		Database: "cdb_resolute", DatabaseType: storage.DatabaseTypeStrata,
+		Environment: "production", State: state.Apply.Pending,
+	}
+	client := &LocalClient{
+		config: LocalConfig{Database: "cdb_resolute", Type: storage.DatabaseTypeStrata},
+		storage: &mockStorage{
+			applies: &mockApplyStore{apply: apply, updateErr: errors.New("db down")},
+			tasks:   &mockTaskStore{},
+			plans:   &mockPlanStore{plan: &storage.Plan{ID: 7, PlanIdentifier: "plan-noop"}},
+		},
+		logger: slog.Default(),
+	}
+
+	err := client.ResumeApply(t.Context(), apply)
+	require.Error(t, err, "a failed completion write must be surfaced, not swallowed as success")
+	assert.Contains(t, err.Error(), "complete task-less apply")
 }

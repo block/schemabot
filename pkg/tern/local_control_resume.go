@@ -1247,8 +1247,11 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		// plan is exempted above and re-driven below so its VSchema is applied.)
 		now := time.Now()
 		if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err == nil && freshApply != nil && state.IsTerminalApplyState(freshApply.State) {
-			// A concurrent drive already settled it — don't overwrite its verdict.
+			// A concurrent drive already settled it — adopt its verdict and still
+			// notify this recovery's observer so a registered waiter (e.g. the PR
+			// check/comment) sees the terminal state instead of hanging.
 			*apply = *freshApply
+			c.notifyTerminalObserver(apply, tasks)
 			return nil
 		}
 		c.logger.Info("no tasks found for apply during recovery; completing as a no-op",
@@ -1257,7 +1260,9 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		apply.CompletedAt = &now
 		apply.UpdatedAt = now
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
-			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Completed, "error", err)
+			// Don't report a completion the operator can't see: surface the error so
+			// recovery retries, and notify the observer only after a durable write.
+			return fmt.Errorf("complete task-less apply %s during recovery: %w", apply.ApplyIdentifier, err)
 		}
 		c.notifyTerminalObserver(apply, tasks)
 		return nil
