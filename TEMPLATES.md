@@ -722,6 +722,7 @@ schemabot apply -e staging --allow-unsafe
 | `schemabot apply-confirm -e <env>` | Confirm a downgraded locked plan |
 | `schemabot unlock` | Release lock and discard plan |
 | `schemabot stop <apply-id> -e <env>` | Stop an in-progress deployment |
+| `schemabot cancel <apply-id> -e <env>` | Permanently cancel an in-progress deployment |
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
 | `schemabot rollback <apply-id> -e <env>` | Generate a rollback plan |
@@ -750,6 +751,7 @@ That command wasn't recognized. Available commands:
 | `schemabot apply-confirm -e <env>` | Confirm a downgraded locked plan |
 | `schemabot unlock` | Release lock and discard plan |
 | `schemabot stop <apply-id> -e <env>` | Stop an in-progress deployment |
+| `schemabot cancel <apply-id> -e <env>` | Permanently cancel an in-progress deployment |
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
 | `schemabot rollback <apply-id> -e <env>` | Generate a rollback plan |
@@ -942,6 +944,7 @@ That command wasn't recognized. Available commands:
 | `schemabot apply-confirm -e <env>` | Confirm a downgraded locked plan |
 | `schemabot unlock` | Release lock and discard plan |
 | `schemabot stop <apply-id> -e <env>` | Stop an in-progress deployment |
+| `schemabot cancel <apply-id> -e <env>` | Permanently cancel an in-progress deployment |
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
 | `schemabot rollback <apply-id> -e <env>` | Generate a rollback plan |
@@ -2286,9 +2289,9 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-To stop this schema change:
+To cancel this schema change:
 ```
-schemabot stop apply-a1b2c3d4e5f6 -e staging
+schemabot cancel apply-a1b2c3d4e5f6 -e staging
 ```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
@@ -2327,9 +2330,9 @@ ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 ---
 
-To stop this schema change:
+To cancel this schema change:
 ```
-schemabot stop apply-a1b2c3d4e5f6 -e staging
+schemabot cancel apply-a1b2c3d4e5f6 -e staging
 ```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
@@ -2363,9 +2366,9 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 ---
 
-To stop this schema change:
+To cancel this schema change:
 ```
-schemabot stop apply-a1b2c3d4e5f6 -e staging
+schemabot cancel apply-a1b2c3d4e5f6 -e staging
 ```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_

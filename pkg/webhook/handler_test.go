@@ -457,6 +457,7 @@ func TestWebhookControlCommandMissingApplyID(t *testing.T) {
 		action  string
 	}{
 		{name: "stop", comment: "schemabot stop -e staging", action: "stop"},
+		{name: "cancel", comment: "schemabot cancel -e staging", action: "cancel"},
 		{name: "start", comment: "schemabot start -e staging", action: "start"},
 		{name: "cutover", comment: "schemabot cutover -e staging", action: "cutover"},
 	}

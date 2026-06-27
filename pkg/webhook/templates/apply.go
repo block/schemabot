@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -261,6 +262,22 @@ func writeDeployRequestLink(sb *strings.Builder, data ApplyStatusCommentData) {
 		return
 	}
 	fmt.Fprintf(sb, "\n🔗 **Deploy request**: %s\n", data.DeployRequestURL)
+}
+
+func stopOrCancelCommand(data ApplyStatusCommentData) string {
+	if strings.EqualFold(data.Engine, storage.EnginePlanetScale) {
+		return "cancel"
+	}
+	return "stop"
+}
+
+func writeStopOrCancelFooterAction(sb *strings.Builder, data ApplyStatusCommentData, stopPrefix, cancelPrefix string) {
+	command := stopOrCancelCommand(data)
+	prefix := stopPrefix
+	if command == "cancel" {
+		prefix = cancelPrefix
+	}
+	writeFooterAction(sb, prefix, fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment))
 }
 
 // writeCutoverSummary writes a readiness summary for cutover states,
@@ -795,18 +812,17 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Cutover in progress — typically completes within seconds.\n")
 	case state.Apply.Running, state.Apply.RunningDegraded:
-		writeFooterAction(sb, "To stop this schema change:", fmt.Sprintf("schemabot stop %s -e %s", data.ApplyID, data.Environment))
+		writeStopOrCancelFooterAction(sb, data, "To stop this schema change:", "To cancel this schema change:")
 	case state.Apply.PreparingBranch,
 		state.Apply.ApplyingBranchChanges,
 		state.Apply.ValidatingBranch,
 		state.Apply.CreatingDeployRequest,
 		state.Apply.ValidatingDeployRequest:
-		// PlanetScale's branch and deploy-request phases are active, stoppable
-		// work — the operator can halt the change before cutover just as during
-		// row copy.
-		writeFooterAction(sb, "To stop this schema change:", fmt.Sprintf("schemabot stop %s -e %s", data.ApplyID, data.Environment))
+		writeStopOrCancelFooterAction(sb, data, "To stop this schema change:", "To cancel this schema change:")
 	case state.Apply.FailedRetryable:
-		writeFooterAction(sb, "An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:", fmt.Sprintf("schemabot stop %s -e %s", data.ApplyID, data.Environment))
+		writeStopOrCancelFooterAction(sb, data,
+			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:",
+			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To cancel it:")
 	case state.Apply.Stopped:
 		writeFooterAction(sb, "Paused — to resume from where it stopped:", fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment))
 	case state.Apply.Cancelled:

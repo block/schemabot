@@ -226,6 +226,39 @@ func (h *Handler) handleStopCommand(repo string, pr int, installationID int64, r
 	}))
 }
 
+// handleCancelCommand handles the "schemabot cancel <apply-id> -e <env>" PR
+// comment command by recording durable cancel intent for the operator owner.
+func (h *Handler) handleCancelCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
+	ctx, cancel := h.commandContext(commandTimeout)
+	defer cancel()
+
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Cancel,
+		h.service.ExecuteCancel,
+		func(r *apitypes.CancelResponse) bool { return r.Accepted },
+		func(r *apitypes.CancelResponse) string { return r.ErrorMessage })
+	if resp == nil {
+		return
+	}
+
+	h.logger.Info("cancel PR command accepted",
+		"repo", repo,
+		"pr", pr,
+		"apply_id", result.ApplyID,
+		"environment", result.Environment,
+		"requested_by", requestedBy,
+		"status", resp.Status,
+		"cancelled_count", resp.CancelledCount,
+		"skipped_count", resp.SkippedCount)
+	h.postComment(repo, pr, installationID, templates.RenderCancelCommandAccepted(templates.CancelCommandAcceptedData{
+		ApplyID:        result.ApplyID,
+		Environment:    result.Environment,
+		RequestedBy:    requestedBy,
+		Status:         resp.Status,
+		CancelledCount: resp.CancelledCount,
+		SkippedCount:   resp.SkippedCount,
+	}))
+}
+
 // handleStartCommand handles the "schemabot start <apply-id> -e <env>" PR
 // comment command by recording durable start intent for the operator owner.
 func (h *Handler) handleStartCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {

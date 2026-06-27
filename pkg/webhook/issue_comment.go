@@ -294,6 +294,11 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.handleStopCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "stop started"})
+	case action.Cancel:
+		h.goSafe(repo, pr, installationID, func() {
+			h.handleCancelCommand(repo, pr, installationID, requestedBy, result)
+		})
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "cancel started"})
 	case action.Start:
 		h.goSafe(repo, pr, installationID, func() {
 			h.handleStartCommand(repo, pr, installationID, requestedBy, result)

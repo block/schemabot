@@ -492,8 +492,8 @@ func TestRenderApplyStatusComment_ValidatingDeployRequest(t *testing.T) {
 
 	assert.Contains(t, result, "## Schema Change In Progress")
 	assert.Contains(t, result, "**Status**: Validating Deploy Request")
-	assert.Contains(t, result, "To stop this schema change:")
-	assert.Contains(t, result, "schemabot stop apply-7aa13cf03496454b -e staging")
+	assert.Contains(t, result, "To cancel this schema change:")
+	assert.Contains(t, result, "schemabot cancel apply-7aa13cf03496454b -e staging")
 }
 
 // A PlanetScale apply links its deploy request so the operator can follow the

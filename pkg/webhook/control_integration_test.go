@@ -140,6 +140,71 @@ func TestE2EStopCommandRecordsDurableRequest(t *testing.T) {
 	assertReactionEventually(t, reactions)
 }
 
+// TestE2ECancelCommandRecordsDurableRequest verifies that a PR comment cancel
+// command records permanent cancel intent and preserves the caller in apply logs.
+func TestE2ECancelCommandRecordsDurableRequest(t *testing.T) {
+	ctx := t.Context()
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+
+	store := mysqlstore.New(schemabotDB)
+	applyIdentifier := "apply_cace1234"
+	database := "cancel_pr_comments_db"
+	cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+	t.Cleanup(func() {
+		cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+		utils.CloseAndLog(schemabotDB)
+	})
+	applyID := createStopCommandApply(t, store, applyIdentifier, database)
+
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+	reactions := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Content string `json:"content"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		reactions <- body.Content
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	service := apiServiceForStopCommandTest(t, store, database)
+	service.RegisterTernClient(database, "staging", &stopCommandTernClient{remote: true})
+	h := &Handler{
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
+	}
+
+	postCancelCommand(t, h, applyIdentifier, "alice")
+	comment := readComment(t, comments)
+	assert.Contains(t, comment, "Cancel Request Accepted")
+	assert.Contains(t, comment, "`"+applyIdentifier+"`")
+	assert.Contains(t, comment, "@alice")
+
+	controlReq, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, controlReq)
+	assert.Equal(t, "github:alice@octocat/hello-world#1", controlReq.RequestedBy)
+	assert.Equal(t, storage.ControlRequestPending, controlReq.Status)
+	logs, err := store.ApplyLogs().List(ctx, storage.ApplyLogFilter{ApplyID: applyID, Limit: 20})
+	require.NoError(t, err)
+	assert.True(t, applyLogContains(logs, "Cancel requested by user (caller: github:alice@octocat/hello-world#1)"))
+	assertReactionEventually(t, reactions)
+}
+
 // TestE2EStopCommandQueuesDeferredCutoverLocalApplyWithoutRunner verifies that
 // a PR comment stop command records durable stop intent when storage has an
 // active local schema change but this process does not own the Spirit runner.
@@ -636,6 +701,19 @@ func postStopCommand(t *testing.T, h *Handler, applyIdentifier, user string) {
 	assert.Contains(t, rr.Body.String(), "stop started")
 }
 
+func postCancelCommand(t *testing.T, h *Handler, applyIdentifier, user string) {
+	t.Helper()
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment:   "schemabot cancel " + applyIdentifier + " -e staging",
+		userLogin: user,
+		isPR:      true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "cancel started")
+}
+
 func postStartCommand(t *testing.T, h *Handler, applyIdentifier, user string) {
 	t.Helper()
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -694,10 +772,11 @@ func applyLogContains(logs []*storage.ApplyLog, want string) bool {
 
 type stopCommandTernClient struct {
 	tern.Client
-	mu        sync.Mutex
-	remote    bool
-	stopCalls int
-	onStop    func(context.Context, *ternv1.StopRequest) (*ternv1.StopResponse, error)
+	mu          sync.Mutex
+	remote      bool
+	stopCalls   int
+	cancelCalls int
+	onStop      func(context.Context, *ternv1.StopRequest) (*ternv1.StopResponse, error)
 }
 
 func (c *stopCommandTernClient) Plan(context.Context, *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
@@ -724,6 +803,13 @@ func (c *stopCommandTernClient) Stop(ctx context.Context, req *ternv1.StopReques
 		return c.onStop(ctx, req)
 	}
 	return &ternv1.StopResponse{Accepted: true, StoppedCount: 1}, nil
+}
+
+func (c *stopCommandTernClient) Cancel(context.Context, *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
+	c.mu.Lock()
+	c.cancelCalls++
+	c.mu.Unlock()
+	return &ternv1.CancelResponse{Accepted: true, CancelledCount: 1}, nil
 }
 
 func (c *stopCommandTernClient) Start(context.Context, *ternv1.StartRequest) (*ternv1.StartResponse, error) {

@@ -45,6 +45,16 @@ type StopCommandAcceptedData struct {
 	SkippedCount int64
 }
 
+// CancelCommandAcceptedData contains data for a PR comment cancel acknowledgement.
+type CancelCommandAcceptedData struct {
+	ApplyID        string
+	Environment    string
+	RequestedBy    string
+	Status         string
+	CancelledCount int64
+	SkippedCount   int64
+}
+
 // StartCommandAcceptedData contains data for a PR comment start acknowledgement.
 type StartCommandAcceptedData struct {
 	ApplyID      string
@@ -88,6 +98,27 @@ func RenderStopCommandAccepted(data StopCommandAcceptedData) string {
 	body += "\n" + statusLine + "\n"
 	if data.StoppedCount > 0 || data.SkippedCount > 0 {
 		body += fmt.Sprintf("\n**Tasks selected for stop**: %d stopped, %d skipped.\n", data.StoppedCount, data.SkippedCount)
+	}
+	return body
+}
+
+// RenderCancelCommandAccepted renders the acknowledgement posted when a PR
+// comment cancel command records durable cancel intent.
+func RenderCancelCommandAccepted(data CancelCommandAcceptedData) string {
+	statusLine := "Cancel request accepted. SchemaBot will permanently cancel this schema change; status remains available from the PR progress comment or CLI."
+	if data.Status == apitypes.ControlStatusAlreadyRequested {
+		statusLine = "Cancel was already requested. SchemaBot will keep the existing cancel request pending until the operator owner finishes it."
+	}
+
+	body := "## Cancel Request Accepted\n\n" +
+		fmt.Sprintf("**Apply**: `%s`\n", data.ApplyID) +
+		fmt.Sprintf("**Environment**: `%s`\n", data.Environment)
+	if data.RequestedBy != "" {
+		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
+	}
+	body += "\n" + statusLine + "\n"
+	if data.CancelledCount > 0 || data.SkippedCount > 0 {
+		body += fmt.Sprintf("\n**Tasks selected for cancel**: %d cancelled, %d skipped.\n", data.CancelledCount, data.SkippedCount)
 	}
 	return body
 }
