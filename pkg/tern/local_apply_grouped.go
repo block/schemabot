@@ -794,7 +794,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		if pending, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationSkipRevert); err != nil {
 			c.logger.Warn("could not load pending skip-revert control request", "apply_id", apply.ApplyIdentifier, "error", err)
 		} else if pending != nil {
-			c.logger.Info("skip-revert requested by user; closing revert window", "apply_id", apply.ApplyIdentifier)
+			c.logger.Info("skip-revert requested by user; closing revert window", "apply_id", apply.ApplyIdentifier, "requested_by", controlRequestCaller(pending))
 			if _, err := eng.SkipRevert(ctx, controlReq); err != nil {
 				// Leave the request pending so the next drive tick retries.
 				c.logger.Error("skip-revert (control request) failed; will retry", "error", err, "apply_id", apply.ApplyIdentifier)
@@ -805,7 +805,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 					c.logger.Warn("failed to complete skip-revert control request", "apply_id", apply.ApplyIdentifier, "error", err)
 				}
 				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
-					"Skip-revert triggered by user", state.Apply.RevertWindow, "")
+					fmt.Sprintf("Skip-revert triggered by user%s", callerApplyLogSuffix(controlRequestCaller(pending))), state.Apply.RevertWindow, "")
 			}
 		}
 	}

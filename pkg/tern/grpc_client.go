@@ -601,7 +601,10 @@ func (c *GRPCClient) processPendingSkipRevertControlRequest(ctx context.Context,
 		return fmt.Errorf("process pending skip-revert for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if !resp.Accepted {
-		message := fmt.Sprintf("skip-revert was not accepted: %s", resp.ErrorMessage)
+		message := "skip-revert was not accepted by the data plane"
+		if resp.ErrorMessage != "" {
+			message = fmt.Sprintf("skip-revert was not accepted: %s", resp.ErrorMessage)
+		}
 		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationSkipRevert, message)
 	}
 	if apply.Engine == storage.EnginePlanetScale {

@@ -5119,6 +5119,60 @@ func TestSkipRevertHandler(t *testing.T) {
 		assert.Contains(t, w.Body.String(), "apply_id is required")
 		assert.Nil(t, mock.skipRevertReq)
 	})
+
+	// Skip-revert is PlanetScale-only; a non-PlanetScale apply is rejected before
+	// any durable request is recorded, so it can't accumulate a stuck request.
+	t.Run("rejects a non-PlanetScale apply", func(t *testing.T) {
+		mock := &mockTernClient{skipRevertResp: &ternv1.SkipRevertResponse{Accepted: true}}
+		apply := activeTestApply("apply-skip-mysql")
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EngineSpirit
+		svc := newControlTestService(mock, apply)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/skip-revert", strings.NewReader(`{"environment":"staging","apply_id":"apply-skip-mysql"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), "only supported for PlanetScale")
+		assert.Nil(t, mock.skipRevertReq, "no engine call for a rejected non-PlanetScale apply")
+	})
+
+	// When a skip-revert request is already pending (e.g. the first immediate
+	// attempt failed and left it queued for the apply owner), a second request is
+	// accepted as already_requested and does not re-drive the engine.
+	t.Run("already pending does not re-drive the engine", func(t *testing.T) {
+		// The immediate attempt fails, so the durable request stays pending.
+		mock := &mockTernClient{skipRevertErr: fmt.Errorf("transient data-plane error")}
+		apply := activeTestApply("apply-skip-dup")
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EnginePlanetScale
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		svc := newControlTestService(mock, apply)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+		body := `{"environment":"staging","apply_id":"apply-skip-dup"}`
+
+		first := httptest.NewRecorder()
+		req1 := httptest.NewRequestWithContext(t.Context(), "POST", "/api/skip-revert", strings.NewReader(body))
+		req1.Header.Set("Content-Type", "application/json")
+		mux.ServeHTTP(first, req1)
+		require.Equal(t, http.StatusAccepted, first.Code, first.Body.String())
+		require.NotNil(t, mock.skipRevertReq, "first request attempts the engine and leaves the request pending")
+
+		mock.skipRevertReq = nil
+		second := httptest.NewRecorder()
+		req2 := httptest.NewRequestWithContext(t.Context(), "POST", "/api/skip-revert", strings.NewReader(body))
+		req2.Header.Set("Content-Type", "application/json")
+		mux.ServeHTTP(second, req2)
+
+		assert.Equal(t, http.StatusAccepted, second.Code, second.Body.String())
+		assert.Contains(t, second.Body.String(), apitypes.ControlStatusAlreadyRequested)
+		assert.Nil(t, mock.skipRevertReq, "a duplicate request must not re-drive the engine")
+	})
 }
 
 func TestDeriveErrorCode(t *testing.T) {

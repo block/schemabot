@@ -129,7 +129,7 @@ func RenderSkipRevertCommandAccepted(data SkipRevertCommandAcceptedData) string 
 	if data.RequestedBy != "" {
 		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
 	}
-	body += "\nSkip-revert request accepted. SchemaBot is closing the revert window — this schema change will become permanent. Status remains available from the PR progress comment or CLI.\n"
+	body += "\nSkip-revert requested. SchemaBot will close the revert window, making this schema change permanent; status remains available from the PR progress comment or CLI.\n"
 	return body
 }
 
