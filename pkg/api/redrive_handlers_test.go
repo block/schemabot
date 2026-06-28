@@ -25,7 +25,8 @@ func TestExecuteRedriveRedrivesFailedApplyWhenPlanStillMatches(t *testing.T) {
 	plans := newRedrivePlanStore(sourcePlan)
 	applies := &redriveApplyStore{apply: apply}
 	client := &mockTernClient{planResp: redrivePlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
-	svc := newRedriveTestService(t, client, plans, applies, redriveTestTask(apply, "users", state.Task.Failed))
+	locks := newRedriveLockStore()
+	svc := newRedriveTestService(t, client, plans, applies, locks, redriveTestTask(apply, "users", state.Task.Failed))
 
 	resp, err := svc.ExecuteRedrive(t.Context(), apitypes.ControlRequest{
 		Environment: "staging",
@@ -39,6 +40,8 @@ func TestExecuteRedriveRedrivesFailedApplyWhenPlanStillMatches(t *testing.T) {
 	assert.Equal(t, apply.ApplyIdentifier, resp.ApplyID)
 	assert.Equal(t, sourcePlan.PlanIdentifier, resp.PlanID)
 	assert.Equal(t, apply.ID, applies.redrivenApplyID)
+	assert.Equal(t, locks.lock.ID, applies.redriveLockID)
+	assert.Equal(t, "operator@example.com", locks.lock.Owner)
 	assert.Equal(t, sourcePlan.Database, client.planReq.Database)
 	assert.Equal(t, sourcePlan.Environment, client.planReq.Environment)
 }
@@ -49,7 +52,8 @@ func TestExecuteRedriveRejectsChangedPlanWithoutRedriving(t *testing.T) {
 	plans := newRedrivePlanStore(sourcePlan)
 	applies := &redriveApplyStore{apply: apply}
 	client := &mockTernClient{planResp: redrivePlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `phone` varchar(255)")}
-	svc := newRedriveTestService(t, client, plans, applies, redriveTestTask(apply, "users", state.Task.Failed))
+	locks := newRedriveLockStore()
+	svc := newRedriveTestService(t, client, plans, applies, locks, redriveTestTask(apply, "users", state.Task.Failed))
 
 	resp, err := svc.ExecuteRedrive(t.Context(), apitypes.ControlRequest{
 		Environment: "staging",
@@ -59,6 +63,7 @@ func TestExecuteRedriveRejectsChangedPlanWithoutRedriving(t *testing.T) {
 	require.ErrorIs(t, err, storage.ErrApplyNotRedrivable)
 	assert.Nil(t, resp)
 	assert.Zero(t, applies.redrivenApplyID)
+	assert.Nil(t, locks.lock)
 }
 
 func TestExecuteRedriveAcceptsRemainingWorkAfterCompletedTask(t *testing.T) {
@@ -74,7 +79,7 @@ func TestExecuteRedriveAcceptsRemainingWorkAfterCompletedTask(t *testing.T) {
 		Ddl:        "ALTER TABLE `orders` ADD COLUMN `status` varchar(32)",
 		ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
 	}})}
-	svc := newRedriveTestService(t, client, plans, applies,
+	svc := newRedriveTestService(t, client, plans, applies, newRedriveLockStore(),
 		redriveTestTask(apply, "users", state.Task.Completed),
 		redriveTestTask(apply, "orders", state.Task.Failed),
 	)
@@ -98,7 +103,7 @@ func TestExecuteRedriveRejectsFailedWorkOutsidePrimaryDeployment(t *testing.T) {
 	client := &mockTernClient{planResp: redrivePlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
 	completedOpID := int64(101)
 	failedOpID := int64(102)
-	svc := newRedriveTestService(t, client, plans, applies,
+	svc := newRedriveTestService(t, client, plans, applies, newRedriveLockStore(),
 		redriveTestOperation(completedOpID, apply.ID, sourcePlan.Deployment, state.ApplyOperation.Completed),
 		redriveTestOperation(failedOpID, apply.ID, "secondary", state.ApplyOperation.Failed),
 		redriveTestOperationTask(apply, completedOpID, "users", state.Task.Completed),
@@ -122,7 +127,7 @@ func TestExecuteRedriveRejectsCancelledApply(t *testing.T) {
 	plans := newRedrivePlanStore(sourcePlan)
 	applies := &redriveApplyStore{apply: apply}
 	client := &mockTernClient{planResp: redrivePlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
-	svc := newRedriveTestService(t, client, plans, applies)
+	svc := newRedriveTestService(t, client, plans, applies, newRedriveLockStore())
 
 	resp, err := svc.ExecuteRedrive(t.Context(), apitypes.ControlRequest{
 		Environment: "staging",
@@ -133,6 +138,50 @@ func TestExecuteRedriveRejectsCancelledApply(t *testing.T) {
 	assert.Nil(t, resp)
 	assert.Zero(t, applies.redrivenApplyID)
 	assert.Nil(t, client.planReq)
+}
+
+func TestExecuteRedriveRejectsLockHeldByAnotherOwner(t *testing.T) {
+	sourcePlan := redriveTestPlan("plan-source", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	apply := redriveTestApply("apply-redrive", sourcePlan)
+	plans := newRedrivePlanStore(sourcePlan)
+	applies := &redriveApplyStore{apply: apply}
+	client := &mockTernClient{planResp: redrivePlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
+	locks := newRedriveLockStore()
+	locks.lock = &storage.Lock{ID: 99, DatabaseName: sourcePlan.Database, DatabaseType: sourcePlan.DatabaseType, Owner: "other-owner"}
+	svc := newRedriveTestService(t, client, plans, applies, locks, redriveTestTask(apply, "users", state.Task.Failed))
+
+	resp, err := svc.ExecuteRedrive(t.Context(), apitypes.ControlRequest{
+		Environment: "staging",
+		ApplyID:     apply.ApplyIdentifier,
+		Caller:      "operator@example.com",
+	})
+	require.ErrorIs(t, err, storage.ErrLockHeld)
+	assert.Nil(t, resp)
+	assert.Zero(t, applies.redrivenApplyID)
+}
+
+func TestExecuteRedriveForceTakesOverLockHeldByAnotherOwner(t *testing.T) {
+	sourcePlan := redriveTestPlan("plan-source", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	apply := redriveTestApply("apply-redrive", sourcePlan)
+	plans := newRedrivePlanStore(sourcePlan)
+	applies := &redriveApplyStore{apply: apply}
+	client := &mockTernClient{planResp: redrivePlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
+	locks := newRedriveLockStore()
+	locks.lock = &storage.Lock{ID: 99, DatabaseName: sourcePlan.Database, DatabaseType: sourcePlan.DatabaseType, Owner: "other-owner"}
+	svc := newRedriveTestService(t, client, plans, applies, locks, redriveTestTask(apply, "users", state.Task.Failed))
+
+	resp, err := svc.ExecuteRedrive(t.Context(), apitypes.ControlRequest{
+		Environment: "staging",
+		ApplyID:     apply.ApplyIdentifier,
+		Caller:      "operator@example.com",
+		Force:       true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, apply.ID, applies.redrivenApplyID)
+	assert.Equal(t, "operator@example.com", locks.lock.Owner)
+	assert.NotEqual(t, int64(99), applies.redriveLockID)
 }
 
 func TestFilterPlanToRedrivableWorkDropsEmptyNamespaces(t *testing.T) {
@@ -165,7 +214,72 @@ func TestFilterPlanToRedrivableWorkDropsEmptyNamespaces(t *testing.T) {
 	assert.True(t, plansEquivalentForRedrive(filtered, freshPlan))
 }
 
-func newRedriveTestService(t *testing.T, client tern.Client, plans storage.PlanStore, applies storage.ApplyStore, rows ...any) *Service {
+func TestFilterPlanToRedrivableWorkKeepsNamespaceTableForShardTask(t *testing.T) {
+	tableChange := storage.TableChange{Table: "orders", DDL: "ALTER TABLE `orders` ADD COLUMN `status` varchar(32)", Operation: "alter"}
+	sourcePlan := &storage.Plan{
+		Database:     "testdb",
+		DatabaseType: storage.DatabaseTypeStrata,
+		Deployment:   DefaultDeployment,
+		Target:       "testdb",
+		Environment:  "staging",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {Tables: []storage.TableChange{tableChange}},
+		},
+		Shards: []storage.ShardPlan{{
+			Namespace: "commerce",
+			Shard:     "-80",
+			Changes:   []storage.TableChange{tableChange},
+		}},
+	}
+	freshPlan := &storage.Plan{
+		Database:     sourcePlan.Database,
+		DatabaseType: sourcePlan.DatabaseType,
+		Deployment:   sourcePlan.Deployment,
+		Target:       sourcePlan.Target,
+		Environment:  sourcePlan.Environment,
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {Tables: []storage.TableChange{tableChange}},
+		},
+		Shards: []storage.ShardPlan{{
+			Namespace: "commerce",
+			Shard:     "-80",
+			Changes:   []storage.TableChange{tableChange},
+		}},
+	}
+
+	failedShardTaskKey := redriveTaskKey{Namespace: "commerce", Shard: "-80", Table: "orders"}
+	filtered := filterPlanToRedrivableWork(sourcePlan, redriveWorkSelection{taskKeys: map[redriveTaskKey]bool{failedShardTaskKey: true}})
+
+	require.Contains(t, filtered.Namespaces, "commerce")
+	assert.Equal(t, []storage.TableChange{tableChange}, filtered.Namespaces["commerce"].Tables)
+	assert.True(t, plansEquivalentForRedrive(filtered, freshPlan))
+}
+
+func TestPlansEquivalentForRedriveNormalizesEmptyNamespacesAndArtifacts(t *testing.T) {
+	left := &storage.Plan{
+		Database:     "testdb",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		Deployment:   DefaultDeployment,
+		Target:       "testdb",
+		Environment:  "staging",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"empty":   {},
+			"routing": {Artifacts: map[string]string{}},
+		},
+	}
+	right := &storage.Plan{
+		Database:     left.Database,
+		DatabaseType: left.DatabaseType,
+		Deployment:   left.Deployment,
+		Target:       left.Target,
+		Environment:  left.Environment,
+		Namespaces:   map[string]*storage.NamespacePlanData{},
+	}
+
+	assert.True(t, plansEquivalentForRedrive(left, right))
+}
+
+func newRedriveTestService(t *testing.T, client tern.Client, plans storage.PlanStore, applies storage.ApplyStore, locks storage.LockStore, rows ...any) *Service {
 	t.Helper()
 	var tasks []*storage.Task
 	var operations []*storage.ApplyOperation
@@ -183,6 +297,7 @@ func newRedriveTestService(t *testing.T, client tern.Client, plans storage.PlanS
 	return New(&mockStorageWithApplyStores{
 		plans:      plans,
 		applies:    applies,
+		locks:      locks,
 		tasks:      &capturingTaskStore{tasks: tasks},
 		applyLogs:  &noopApplyLogStore{},
 		operations: &staticApplyOperationStore{operations: operations},
@@ -336,6 +451,7 @@ type redriveApplyStore struct {
 	storage.ApplyStore
 	apply           *storage.Apply
 	redrivenApplyID int64
+	redriveLockID   int64
 }
 
 func (s *redriveApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
@@ -345,7 +461,7 @@ func (s *redriveApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentif
 	return nil, nil
 }
 
-func (s *redriveApplyStore) RedriveFailed(_ context.Context, applyID int64) (*storage.Apply, error) {
+func (s *redriveApplyStore) RedriveFailed(_ context.Context, applyID int64, lockID int64) (*storage.Apply, error) {
 	if s.apply == nil || s.apply.ID != applyID {
 		return nil, storage.ErrApplyNotFound
 	}
@@ -353,8 +469,60 @@ func (s *redriveApplyStore) RedriveFailed(_ context.Context, applyID int64) (*st
 		return nil, fmt.Errorf("apply %s is %s: %w", s.apply.ApplyIdentifier, s.apply.State, storage.ErrApplyNotRedrivable)
 	}
 	s.redrivenApplyID = applyID
+	s.redriveLockID = lockID
 	redriven := *s.apply
+	redriven.LockID = lockID
 	redriven.State = state.Apply.FailedRetryable
 	redriven.CompletedAt = nil
 	return &redriven, nil
+}
+
+type redriveLockStore struct {
+	storage.LockStore
+	lock   *storage.Lock
+	nextID int64
+}
+
+func newRedriveLockStore() *redriveLockStore {
+	return &redriveLockStore{nextID: 1}
+}
+
+func (s *redriveLockStore) Acquire(_ context.Context, lock *storage.Lock) error {
+	if s.lock != nil {
+		if s.lock.Owner != lock.Owner {
+			return storage.ErrLockHeld
+		}
+		return nil
+	}
+	stored := *lock
+	stored.ID = s.nextID
+	s.nextID++
+	s.lock = &stored
+	return nil
+}
+
+func (s *redriveLockStore) Get(_ context.Context, database, dbType string) (*storage.Lock, error) {
+	if s.lock != nil && s.lock.DatabaseName == database && s.lock.DatabaseType == dbType {
+		return s.lock, nil
+	}
+	return nil, nil
+}
+
+func (s *redriveLockStore) ForceRelease(_ context.Context, database, dbType string) error {
+	if s.lock == nil || s.lock.DatabaseName != database || s.lock.DatabaseType != dbType {
+		return storage.ErrLockNotFound
+	}
+	s.lock = nil
+	return nil
+}
+
+func (s *redriveLockStore) Release(_ context.Context, database, dbType, owner string) error {
+	if s.lock == nil || s.lock.DatabaseName != database || s.lock.DatabaseType != dbType {
+		return storage.ErrLockNotFound
+	}
+	if s.lock.Owner != owner {
+		return storage.ErrLockNotOwned
+	}
+	s.lock = nil
+	return nil
 }

@@ -2689,10 +2689,11 @@ func TestApplyStore_RedriveFailed(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	redriven, err := store.Applies().RedriveFailed(ctx, apply.ID)
+	redriven, err := store.Applies().RedriveFailed(ctx, apply.ID, lock.ID)
 	require.NoError(t, err)
 	require.NotNil(t, redriven)
 	assert.Equal(t, state.Apply.FailedRetryable, redriven.State)
+	assert.Equal(t, lock.ID, redriven.LockID)
 	assert.Zero(t, redriven.Attempt)
 	assert.Empty(t, redriven.ErrorMessage)
 	assert.Nil(t, redriven.CompletedAt)
@@ -2724,6 +2725,33 @@ func TestApplyStore_RedriveFailed(t *testing.T) {
 	assert.NotNil(t, completedOp.CompletedAt)
 }
 
+func TestApplyStore_RedriveFailedRejectsActiveApplyForDatabase(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_redrive_active_database", 523, state.Apply.Failed, "staging")
+	now := time.Now()
+	apply.Deployment = "region-a"
+	apply.CompletedAt = &now
+	require.NoError(t, store.Applies().Update(ctx, apply))
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET deployment = ?, completed_at = ? WHERE id = ?`, apply.Deployment, now, apply.ID)
+	require.NoError(t, err)
+
+	active := createTestApplyWithStateEnvDeployment(t, store, lock, "apply_redrive_active_database_blocker", 524, state.Apply.Running, "production", "region-b")
+	require.NotNil(t, active)
+
+	redriven, err := store.Applies().RedriveFailed(ctx, apply.ID, lock.ID)
+	require.ErrorIs(t, err, storage.ErrActiveApplyExists)
+	assert.Nil(t, redriven)
+
+	reloaded, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, reloaded)
+	assert.Equal(t, state.Apply.Failed, reloaded.State)
+}
+
 func TestApplyStore_RedriveFailedRejectsOldFailure(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -2738,7 +2766,7 @@ func TestApplyStore_RedriveFailedRejectsOldFailure(t *testing.T) {
 	_, err := testDB.ExecContext(ctx, `UPDATE applies SET deployment = ?, completed_at = ? WHERE id = ?`, apply.Deployment, completedAt, apply.ID)
 	require.NoError(t, err)
 
-	redriven, err := store.Applies().RedriveFailed(ctx, apply.ID)
+	redriven, err := store.Applies().RedriveFailed(ctx, apply.ID, lock.ID)
 	require.ErrorIs(t, err, storage.ErrApplyNotRedrivable)
 	assert.Nil(t, redriven)
 }
@@ -2788,7 +2816,7 @@ func TestApplyStore_RedriveFailedRejectsNonRedrivableOperation(t *testing.T) {
 			})
 			require.NoError(t, err)
 
-			redriven, err := store.Applies().RedriveFailed(ctx, apply.ID)
+			redriven, err := store.Applies().RedriveFailed(ctx, apply.ID, lock.ID)
 			require.ErrorIs(t, err, storage.ErrApplyNotRedrivable)
 			assert.Nil(t, redriven)
 

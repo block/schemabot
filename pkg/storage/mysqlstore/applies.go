@@ -368,6 +368,33 @@ func checkNoActiveApplyForTargets(ctx context.Context, tx *sql.Tx, database, dbT
 	return fmt.Errorf("active apply exists for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, storage.ErrActiveApplyExists)
 }
 
+func checkNoActiveApplyForDatabase(ctx context.Context, tx *sql.Tx, database, dbType string, excludeApplyID int64) error {
+	statePredicate, stateArgs := nonTerminalApplyStatePredicate("state")
+	query := fmt.Sprintf(`
+		SELECT 1 FROM applies
+		WHERE database_name = ?
+		AND database_type = ?
+		AND %s
+	`, statePredicate)
+	args := []any{database, dbType}
+	args = append(args, stateArgs...)
+	if excludeApplyID > 0 {
+		query += " AND id != ?"
+		args = append(args, excludeApplyID)
+	}
+	query += " LIMIT 1"
+
+	var exists int
+	err := tx.QueryRowContext(ctx, query, args...).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("check active applies for %s/%s: %w", database, dbType, err)
+	}
+	return fmt.Errorf("active apply exists for %s/%s: %w", database, dbType, storage.ErrActiveApplyExists)
+}
+
 func applyLeaseFromContext(ctx context.Context, applyID int64) (storage.ApplyLease, bool, error) {
 	lease, ok := storage.ApplyLeaseFromContext(ctx)
 	if !ok {
@@ -1765,7 +1792,11 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 // RedriveFailed transitions a recent permanently failed apply back onto the
 // retryable recovery path so operator drivers can claim and drive the
 // remaining failed work.
-func (s *applyStore) RedriveFailed(ctx context.Context, applyID int64) (*storage.Apply, error) {
+func (s *applyStore) RedriveFailed(ctx context.Context, applyID int64, lockID int64) (*storage.Apply, error) {
+	if lockID == 0 {
+		return nil, fmt.Errorf("redrive failed apply %d requires a lock: %w", applyID, storage.ErrApplyNotRedrivable)
+	}
+
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("begin redrive failed apply %d transaction: %w", applyID, err)
@@ -1804,6 +1835,9 @@ func (s *applyStore) RedriveFailed(ctx context.Context, applyID int64) (*storage
 	}
 	if !hasApplyTarget(database, dbType, environment) || deployment == "" {
 		return nil, fmt.Errorf("apply %s is missing target metadata for redrive: %w", apply.ApplyIdentifier, storage.ErrApplyNotRedrivable)
+	}
+	if err := checkNoActiveApplyForDatabase(ctx, tx, database, dbType, apply.ID); err != nil {
+		return nil, err
 	}
 
 	conn, lockName, err := acquireApplyTargetLockConn(ctx, s.db, database, dbType, environment)
@@ -1846,10 +1880,10 @@ func (s *applyStore) RedriveFailed(ctx context.Context, applyID int64) (*storage
 
 	result, err := tx.ExecContext(ctx, `
 		UPDATE applies
-		SET state = ?, error_message = '', attempt = 0, completed_at = NULL, updated_at = NOW(),
+		SET lock_id = ?, state = ?, error_message = '', attempt = 0, completed_at = NULL, updated_at = NOW(),
 		    lease_owner = '', lease_token = '', lease_acquired_at = NULL
 		WHERE id = ? AND state = ?
-	`, state.Apply.FailedRetryable, apply.ID, state.Apply.Failed)
+	`, lockID, state.Apply.FailedRetryable, apply.ID, state.Apply.Failed)
 	if err != nil {
 		return nil, fmt.Errorf("mark apply %s retryable for redrive: %w", apply.ApplyIdentifier, err)
 	}
@@ -1866,6 +1900,7 @@ func (s *applyStore) RedriveFailed(ctx context.Context, applyID int64) (*storage
 	}
 
 	apply.State = state.Apply.FailedRetryable
+	apply.LockID = lockID
 	apply.ErrorMessage = ""
 	apply.Attempt = 0
 	apply.CompletedAt = nil

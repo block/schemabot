@@ -35,7 +35,7 @@ func (s *Service) handleRedrive(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, storage.ErrApplyNotFound):
 			status = http.StatusNotFound
-		case errors.Is(err, storage.ErrApplyNotRedrivable), errors.Is(err, storage.ErrActiveApplyExists):
+		case errors.Is(err, storage.ErrApplyNotRedrivable), errors.Is(err, storage.ErrActiveApplyExists), errors.Is(err, storage.ErrLockHeld):
 			status = http.StatusConflict
 		}
 		if status >= http.StatusInternalServerError {
@@ -86,6 +86,17 @@ func (s *Service) ExecuteRedrive(ctx context.Context, req apitypes.ControlReques
 		return nil, fmt.Errorf("plan %d not found for redrive apply %s: %w", apply.PlanID, apply.ApplyIdentifier, storage.ErrPlanNotFound)
 	}
 
+	lock, releaseLockOnReject, err := s.acquireRedriveLock(ctx, req, sourcePlan, apply)
+	if err != nil {
+		return nil, err
+	}
+	redriveAccepted := false
+	defer func() {
+		if !redriveAccepted && releaseLockOnReject {
+			s.releaseRedriveLockAfterReject(ctx, req, sourcePlan, apply)
+		}
+	}()
+
 	freshPlanResp, err := s.ExecutePlan(ctx, redrivePlanRequest(sourcePlan))
 	if err != nil {
 		return nil, fmt.Errorf("re-plan apply %s for redrive: %w", apply.ApplyIdentifier, err)
@@ -103,33 +114,26 @@ func (s *Service) ExecuteRedrive(ctx context.Context, req apitypes.ControlReques
 		return nil, err
 	}
 	if !plansEquivalentForRedrive(expectedPlan, freshPlan) {
-		s.logger.Warn("redrive rejected because re-plan changed",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"database_type", apply.DatabaseType,
-			"deployment", apply.Deployment,
-			"environment", apply.Environment,
+		s.logger.Warn("redrive rejected because re-plan changed", append(apply.LogAttrs(),
 			"source_plan_id", sourcePlan.PlanIdentifier,
 			"fresh_plan_id", freshPlan.PlanIdentifier,
-			"requested_by", req.Caller)
+			"requested_by", req.Caller,
+		)...)
 		return nil, fmt.Errorf("re-plan for apply %s changed from stored plan %s to fresh plan %s; create a new apply instead: %w",
 			apply.ApplyIdentifier, sourcePlan.PlanIdentifier, freshPlan.PlanIdentifier, storage.ErrApplyNotRedrivable)
 	}
 
-	redriven, err := s.storage.Applies().RedriveFailed(ctx, apply.ID)
+	redriven, err := s.storage.Applies().RedriveFailed(ctx, apply.ID, lock.ID)
 	if err != nil {
 		return nil, fmt.Errorf("redrive failed apply %s: %w", apply.ApplyIdentifier, err)
 	}
+	redriveAccepted = true
 	s.logControlOperationForApply(ctx, redriven, req.Caller, storage.LogEventInfo, "Redrive requested by user")
-	s.logger.Info("redrive accepted for failed apply",
-		"apply_id", redriven.ApplyIdentifier,
-		"database", redriven.Database,
-		"database_type", redriven.DatabaseType,
-		"deployment", redriven.Deployment,
-		"environment", redriven.Environment,
+	s.logger.Info("redrive accepted for failed apply", append(redriven.LogAttrs(),
 		"source_plan_id", sourcePlan.PlanIdentifier,
 		"fresh_plan_id", freshPlan.PlanIdentifier,
-		"requested_by", req.Caller)
+		"requested_by", req.Caller,
+	)...)
 	s.wakeOperator(redriven.ApplyIdentifier, redriven.Database, redriven.Environment)
 	return &apitypes.RedriveResponse{
 		Accepted: true,
@@ -138,6 +142,59 @@ func (s *Service) ExecuteRedrive(ctx context.Context, req apitypes.ControlReques
 		PlanID:   sourcePlan.PlanIdentifier,
 		Message:  "Stored plan still matches; the failed apply was queued for redrive.",
 	}, nil
+}
+
+func (s *Service) acquireRedriveLock(ctx context.Context, req apitypes.ControlRequest, plan *storage.Plan, apply *storage.Apply) (*storage.Lock, bool, error) {
+	if req.Caller == "" {
+		return nil, false, controlHTTPErrorf(http.StatusBadRequest, "caller is required")
+	}
+	existing, err := s.storage.Locks().Get(ctx, plan.Database, plan.DatabaseType)
+	if err != nil {
+		return nil, false, fmt.Errorf("load redrive lock for %s/%s before acquire: %w", plan.Database, plan.DatabaseType, err)
+	}
+	releaseOnReject := existing == nil || existing.Owner != req.Caller
+	lock := &storage.Lock{
+		DatabaseName: plan.Database,
+		DatabaseType: plan.DatabaseType,
+		Repository:   plan.Repository,
+		PullRequest:  plan.PullRequest,
+		Owner:        req.Caller,
+	}
+	if err := s.storage.Locks().Acquire(ctx, lock); err != nil {
+		if errors.Is(err, storage.ErrLockHeld) {
+			if !req.Force {
+				return nil, false, fmt.Errorf("redrive lock for %s/%s is held by another owner; retry with force to take over the lock: %w", plan.Database, plan.DatabaseType, err)
+			}
+			s.logger.Warn("redrive force releasing database lock", append(apply.LogAttrs(), "requested_by", req.Caller)...)
+			if releaseErr := s.storage.Locks().ForceRelease(ctx, plan.Database, plan.DatabaseType); releaseErr != nil {
+				return nil, false, fmt.Errorf("force release redrive lock for %s/%s owner %s: %w", plan.Database, plan.DatabaseType, req.Caller, releaseErr)
+			}
+			if acquireErr := s.storage.Locks().Acquire(ctx, lock); acquireErr != nil {
+				return nil, false, fmt.Errorf("acquire redrive lock for %s/%s owner %s after force release: %w", plan.Database, plan.DatabaseType, req.Caller, acquireErr)
+			}
+		} else {
+			return nil, false, fmt.Errorf("acquire redrive lock for %s/%s owner %s: %w", plan.Database, plan.DatabaseType, req.Caller, err)
+		}
+	}
+	acquired, err := s.storage.Locks().Get(ctx, plan.Database, plan.DatabaseType)
+	if err != nil {
+		return nil, false, fmt.Errorf("load acquired redrive lock for %s/%s: %w", plan.Database, plan.DatabaseType, err)
+	}
+	if acquired == nil || acquired.Owner != req.Caller {
+		return nil, false, fmt.Errorf("redrive lock for %s/%s was not acquired by %s: %w", plan.Database, plan.DatabaseType, req.Caller, storage.ErrLockHeld)
+	}
+	return acquired, releaseOnReject, nil
+}
+
+func (s *Service) releaseRedriveLockAfterReject(ctx context.Context, req apitypes.ControlRequest, plan *storage.Plan, apply *storage.Apply) {
+	if err := s.storage.Locks().Release(ctx, plan.Database, plan.DatabaseType, req.Caller); err != nil {
+		s.logger.Warn("redrive rejected after acquiring database lock; lock release failed", append(apply.LogAttrs(),
+			"requested_by", req.Caller,
+			"error", err,
+		)...)
+		return
+	}
+	s.logger.Info("redrive rejected after acquiring database lock; lock released", append(apply.LogAttrs(), "requested_by", req.Caller)...)
 }
 
 func validateRedriveCandidate(apply *storage.Apply) error {
@@ -280,11 +337,20 @@ func filterRedrivableNamespaceWork(namespace string, nsData *storage.NamespacePl
 		filtered.Artifacts = copyStringMap(nsData.Artifacts)
 	}
 	for _, change := range nsData.Tables {
-		if selection.taskKeys[redriveTaskKey{Namespace: namespace, Table: change.Table}] {
+		if selection.includesTable(namespace, change.Table) {
 			filtered.Tables = append(filtered.Tables, change)
 		}
 	}
 	return filtered
+}
+
+func (s redriveWorkSelection) includesTable(namespace, table string) bool {
+	for key := range s.taskKeys {
+		if key.Namespace == namespace && key.Table == table {
+			return true
+		}
+	}
+	return false
 }
 
 func redriveFinalizerNamespace(operationKey string) (string, bool) {
@@ -367,6 +433,10 @@ func redrivePlanFingerprintFor(plan *storage.Plan) redrivePlanFingerprint {
 			continue
 		}
 		tables := append([]storage.TableChange(nil), nsData.Tables...)
+		artifacts := copyStringMap(nsData.Artifacts)
+		if len(tables) == 0 && len(artifacts) == 0 {
+			continue
+		}
 		sort.Slice(tables, func(i, j int) bool {
 			if tables[i].Table != tables[j].Table {
 				return tables[i].Table < tables[j].Table
@@ -376,7 +446,7 @@ func redrivePlanFingerprintFor(plan *storage.Plan) redrivePlanFingerprint {
 			}
 			return tables[i].DDL < tables[j].DDL
 		})
-		namespaces[namespace] = redriveNamespaceFingerprint{Tables: tables, Artifacts: nsData.Artifacts}
+		namespaces[namespace] = redriveNamespaceFingerprint{Tables: tables, Artifacts: artifacts}
 	}
 
 	shards := make([]storage.ShardPlan, 0, len(plan.Shards))

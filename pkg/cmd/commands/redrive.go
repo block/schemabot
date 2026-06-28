@@ -10,6 +10,7 @@ import (
 // RedriveCmd re-plans and redrives a recent failed schema change.
 type RedriveCmd struct {
 	ControlFlags
+	Force bool `help:"Force redrive by taking over an existing database lock"`
 	Watch bool `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
 }
 
@@ -26,7 +27,7 @@ func (cmd *RedriveCmd) Run(g *Globals) error {
 	var redriveResult *apitypes.RedriveResponse
 	err = withLoading("Re-planning failed schema change...", true, func() error {
 		var redriveErr error
-		redriveResult, redriveErr = client.CallRedriveAPI(ep, cmd.Environment, cmd.ApplyID)
+		redriveResult, redriveErr = client.CallRedriveAPI(ep, cmd.Environment, cmd.ApplyID, cmd.Force)
 		return redriveErr
 	})
 	if err != nil {

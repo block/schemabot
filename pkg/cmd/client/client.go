@@ -166,7 +166,13 @@ func CallApplyAPI(endpoint, planID, environment, caller string, options map[stri
 // typed response. Control operations share the same ControlRequest body and
 // differ only by endpoint path and response type.
 func callControlAPI[Resp any](endpoint, path, environment, applyID string) (*Resp, error) {
-	req := apitypes.ControlRequest{Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()}
+	return callControlAPIWithRequest[Resp](endpoint, path, apitypes.ControlRequest{Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()})
+}
+
+func callControlAPIWithRequest[Resp any](endpoint, path string, req apitypes.ControlRequest) (*Resp, error) {
+	if req.Caller == "" {
+		req.Caller = GenerateCLIOwner()
+	}
 	var result Resp
 	if err := doPostInto(endpoint, path, req, &result); err != nil {
 		return nil, err
@@ -324,8 +330,13 @@ func CallStartAPI(endpoint, environment, applyID string) (*apitypes.StartRespons
 }
 
 // CallRedriveAPI calls the redrive API and returns the typed result.
-func CallRedriveAPI(endpoint, environment, applyID string) (*apitypes.RedriveResponse, error) {
-	return callControlAPI[apitypes.RedriveResponse](endpoint, "/api/redrive", environment, applyID)
+func CallRedriveAPI(endpoint, environment, applyID string, force bool) (*apitypes.RedriveResponse, error) {
+	return callControlAPIWithRequest[apitypes.RedriveResponse](endpoint, "/api/redrive", apitypes.ControlRequest{
+		Environment: environment,
+		ApplyID:     applyID,
+		Caller:      GenerateCLIOwner(),
+		Force:       force,
+	})
 }
 
 // CallVolumeAPI calls the volume API and returns the typed result.
