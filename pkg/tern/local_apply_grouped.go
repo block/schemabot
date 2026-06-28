@@ -146,7 +146,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 
 	if isTasklessVSchemaOnlyPlan(tasks, plan) {
 		if completeErr := c.completeTasklessGroupedApply(ctx, apply, result.Message); completeErr != nil {
-			c.logger.Error("failed to complete task-less grouped apply", "apply_id", apply.ApplyIdentifier, "error", completeErr)
+			c.logger.Error("failed to complete task-less grouped apply", append(apply.LogAttrs(), "error", completeErr)...)
 		}
 		return
 	}
@@ -748,7 +748,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Waiting for deploy timed out after %s, cancelling", waitingForManualActionTimeout), "", "")
 		if _, err := eng.Stop(ctx, controlReq); err != nil {
-			c.logger.Error("timeout stop failed", "error", err, "apply_id", apply.ApplyIdentifier)
+			c.logger.Error("timeout stop failed", append(apply.LogAttrs(), "error", err)...)
 		}
 	}
 
@@ -763,7 +763,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Waiting for cutover timed out after %s, cancelling", waitingForManualActionTimeout), "", "")
 		if _, err := eng.Stop(ctx, controlReq); err != nil {
-			c.logger.Error("timeout stop failed", "error", err, "apply_id", apply.ApplyIdentifier)
+			c.logger.Error("timeout stop failed", append(apply.LogAttrs(), "error", err)...)
 		}
 	}
 
@@ -776,7 +776,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			"Auto-skipping revert window (--skip-revert)", "", "")
 		_, err := eng.SkipRevert(ctx, controlReq)
 		if err != nil {
-			c.logger.Error("auto-skip revert failed", "error", err, "apply_id", apply.ApplyIdentifier)
+			c.logger.Error("auto-skip revert failed", append(apply.LogAttrs(), "error", err)...)
 		} else {
 			c.logger.Info("skip-revert triggered", "apply_id", apply.ApplyIdentifier, "reason", "--skip-revert")
 			c.markRevertSkipped(ctx, apply)
@@ -795,7 +795,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 				"Revert window expired, finalizing", "", "")
 			if _, err := eng.SkipRevert(ctx, controlReq); err != nil {
-				c.logger.Error("revert window timeout skip failed", "error", err, "apply_id", apply.ApplyIdentifier)
+				c.logger.Error("revert window timeout skip failed", append(apply.LogAttrs(), "error", err)...)
 			} else {
 				c.markRevertSkipped(ctx, apply)
 				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
@@ -901,7 +901,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		ensureApplyFailureMessage(apply, tasks)
 		swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, apply.State, apply.ErrorMessage, apply.StartedAt, apply.CompletedAt)
 		if err != nil {
-			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+			c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
 		} else if !swapped {
 			// Another drive advanced the apply between our reload and write; it
 			// owns the terminal transition and its side-effects. Skip ours.
@@ -950,7 +950,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 	swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, apply.State, apply.ErrorMessage, apply.StartedAt, apply.CompletedAt)
 	if err != nil {
-		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+		c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
 	} else if !swapped {
 		// Another drive advanced the apply between our reload and write; our
 		// progress projection is stale. Skip the observer update and let the next
@@ -1001,7 +1001,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 // finalization is in progress.
 func (c *LocalClient) markRevertSkipped(ctx context.Context, apply *storage.Apply) {
 	if err := c.storage.Applies().SetRevertSkipped(ctx, apply.ID, time.Now()); err != nil {
-		c.logger.Warn("failed to record skip-revert on apply", "apply_id", apply.ApplyIdentifier, "error", err)
+		c.logger.Warn("failed to record skip-revert on apply", append(apply.LogAttrs(), "error", err)...)
 	}
 }
 

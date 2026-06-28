@@ -428,7 +428,7 @@ func applyEventStateTransition(apply *storage.Apply, event engine.ApplyEvent, up
 	apply.State = newState
 	apply.UpdatedAt = time.Now()
 	if err := updateFn(apply); err != nil {
-		logger.Error("failed to update apply phase", "apply_id", apply.ApplyIdentifier, "state", newState, "error", err)
+		logger.Error("failed to update apply phase", append(apply.LogAttrs(), "error", err)...)
 		apply.State = oldState
 		return ""
 	}

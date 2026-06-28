@@ -39,7 +39,7 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 	apply.CompletedAt = &now
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Failed, "error", err)
+		c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
 	}
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 }
@@ -73,7 +73,7 @@ func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *st
 	apply.CompletedAt = nil
 	apply.UpdatedAt = time.Now()
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.FailedRetryable, "error", err)
+		c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
 	}
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 	if obs := c.getObserver(apply.ID); obs != nil {

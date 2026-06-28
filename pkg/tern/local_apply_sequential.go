@@ -277,10 +277,7 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 				if err := c.storage.Applies().Heartbeat(hbCtx, apply.ID); err != nil {
 					if errors.Is(err, storage.ErrApplyLeaseLost) {
 						c.logger.Warn("heartbeat failed because apply lease was lost; local driver will stop executing and writing apply state",
-							"apply_id", apply.ApplyIdentifier,
-							"database", apply.Database,
-							"environment", apply.Environment,
-							"error", err)
+							append(apply.LogAttrs(), "error", err)...)
 						metrics.RecordOperatorResumeFailure(hbCtx, apply.Database, apply.Deployment, apply.Environment, "lease_lost")
 						for _, cancel := range cancelApply {
 							if cancel != nil {
@@ -290,7 +287,7 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 						cancel()
 						return
 					}
-					c.logger.Warn("heartbeat failed", "apply_id", apply.ApplyIdentifier, "error", err)
+					c.logger.Warn("heartbeat failed", append(apply.LogAttrs(), "error", err)...)
 				}
 			}
 		}
@@ -499,12 +496,12 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 	}
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+		c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
 	}
 	if state.IsTerminalApplyState(apply.State) {
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 			c.logger.Warn("failed to complete pending stop request after sequential finalization",
-				"apply_id", apply.ApplyIdentifier, "error", err)
+				append(apply.LogAttrs(), "error", err)...)
 			return
 		}
 	}

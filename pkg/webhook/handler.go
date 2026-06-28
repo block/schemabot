@@ -347,7 +347,7 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 	for _, apply := range applies {
 		tasks, err := h.service.Storage().Tasks().GetByApplyID(ctx, apply.ID)
 		if err != nil {
-			h.logger.Error("failed to load tasks for missing summary reconciliation", "apply_id", apply.ApplyIdentifier, "error", err)
+			h.logger.Error("failed to load tasks for missing summary reconciliation", append(apply.LogAttrs(), "error", err)...)
 			continue
 		}
 

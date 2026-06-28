@@ -253,7 +253,7 @@ func (s *Service) logControlOperation(r *http.Request, applyID, caller, eventTyp
 func (s *Service) logControlOperationForApply(ctx context.Context, apply *storage.Apply, caller, eventType, message string) {
 	logStore := s.storage.ApplyLogs()
 	if logStore == nil {
-		s.logger.Error("apply log store not available for control operation log", "apply_id", apply.ApplyIdentifier, "event", eventType)
+		s.logger.Error("apply log store not available for control operation log", append(apply.LogAttrs(), "event", eventType)...)
 		return
 	}
 	logMessage := fmt.Sprintf("%s (caller: %s)", message, controlOperationCaller(caller))
@@ -1644,7 +1644,7 @@ func (s *Service) handleSkipRevert(w http.ResponseWriter, r *http.Request) {
 	// Record skip-revert on the apply for progress visibility.
 	if resp.Accepted && apply.Engine == storage.EnginePlanetScale {
 		if err := s.storage.Applies().SetRevertSkipped(r.Context(), apply.ID, time.Now()); err != nil {
-			s.logger.Error("failed to record skip-revert on apply", "apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier, "error", err)
+			s.logger.Error("failed to record skip-revert on apply", append(apply.LogAttrs(), "error", err)...)
 		}
 	}
 	if resp.Accepted {

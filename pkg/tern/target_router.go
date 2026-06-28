@@ -363,7 +363,7 @@ func (r *TargetRouter) SetObserver(applyID int64, observer ProgressObserver) {
 	}
 	client, err := r.clientForStoredApply(context.Background(), apply)
 	if err != nil {
-		r.logger.Warn("target router: failed to resolve apply target for observer attachment", "apply_id", applyID, "apply_identifier", apply.ApplyIdentifier, "error", err)
+		r.logger.Warn("target router: failed to resolve apply target for observer attachment", append(apply.LogAttrs(), "error", err)...)
 		return
 	}
 	client.SetObserver(applyID, observer)
