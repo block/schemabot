@@ -5,11 +5,12 @@
 // expand/collapse are computed once and rendered identically everywhere.
 //
 // The derivation adds no persisted state. Labels such as "halted",
-// "ready for cutover — waiting for <deployment>", and "queued — next in order"
-// exist only here; they are projections of (operation state, earlier-sibling
-// states, resolved order, cutover_policy, halt_on_failure). The ordering
-// context is derived from the same gate FindNextApplyOperation evaluates, so the
-// presentation never contradicts what the operator will actually claim next.
+// "paused — <deployment> failed; release or stop", "ready for cutover — waiting
+// for <deployment>", and "queued — next in order" exist only here; they are
+// projections of (operation state, earlier-sibling states, resolved order,
+// cutover_policy, on_failure, release latch). The ordering context is derived
+// from the same gate FindNextApplyOperation evaluates, so the presentation never
+// contradicts what the operator will actually claim next.
 //
 // Vocabulary is deployment-facing only — the model never exposes the internal
 // "apply_operation" term.
@@ -49,19 +50,42 @@ type Operation struct {
 	// are mutually exclusive: the caller derives each from the same stored policy.
 	Parallel bool
 
-	// HaltOnFailure is the resolved halt-on-failure policy (the caller derefs the
-	// stored *bool, treating nil as true — the safe default). When false, a
-	// terminal-failed earlier sibling no longer blocks later deployments.
-	HaltOnFailure bool
-
 	// ContinueOnFailure is true only when the operation's on_failure policy is
-	// exactly "continue". The aggregate projection uses it to hold a rollout
-	// running_degraded past a continuable sibling failure; halt, pause, empty,
-	// and any unrecognized value must be false so the projection fails closed.
+	// exactly "continue". A terminal-failed earlier sibling no longer blocks
+	// later deployments and the aggregate is held running_degraded past the
+	// failure; halt, pause, empty, and any unrecognized value must be false so
+	// the projection fails closed.
 	ContinueOnFailure bool
+
+	// PauseOnFailure is true only when the operation's on_failure policy is
+	// exactly "pause". A terminal-failed earlier sibling holds later deployments
+	// for a human (rendered paused) until the rollout is released; once released
+	// the failure is treated like continue (see Released).
+	PauseOnFailure bool
+
+	// Released is true when a release control request has latched the apply open
+	// (the caller resolves it from storage.ApplyControlRequest.ReleasesPausedRollout
+	// at the boundary). It only has meaning alongside PauseOnFailure: a released
+	// pause behaves like continue, so the held siblings proceed and the aggregate
+	// runs degraded instead of paused. A failed release does not latch, so it
+	// leaves Released false (fail-closed).
+	Released bool
 
 	// Error is the operation's error detail, set when State is failed.
 	Error string
+}
+
+// continuesPastFailure reports whether a terminal-failed earlier sibling stops
+// blocking this deployment: on_failure=continue, or on_failure=pause once the
+// rollout is released. Mirrors the claim predicate's released-failure exemption.
+func (o Operation) continuesPastFailure() bool {
+	return o.ContinueOnFailure || (o.PauseOnFailure && o.Released)
+}
+
+// pausesOnFailure reports whether a terminal-failed earlier sibling holds this
+// deployment paused for a human: on_failure=pause and not yet released.
+func (o Operation) pausesOnFailure() bool {
+	return o.PauseOnFailure && !o.Released
 }
 
 // PresentationState is the semantic, render-time status of one deployment. It is
@@ -82,6 +106,7 @@ const (
 	StateQueuedNext
 	StateWaiting
 	StateHalted
+	StatePaused
 	StateFailed
 	StateRetrying
 	StateStopped
@@ -201,7 +226,8 @@ func Derive(ops []Operation) Apply {
 	for i, op := range ops {
 		children[i] = state.RolloutChild{
 			State:             op.State,
-			ContinueOnFailure: op.ContinueOnFailure,
+			ContinueOnFailure: op.continuesPastFailure(),
+			PauseOnFailure:    op.pausesOnFailure(),
 		}
 	}
 
@@ -287,12 +313,16 @@ func derivePending(d *Deployment, ops []Operation, i int) {
 		d.set(StateQueuedNext, "queued — next in order", "⏳", false)
 		return
 	}
-	if h := haltingBlocker(ops, i); h != nil {
+	if h, paused := blockingSibling(ops, i); h != nil {
+		if paused {
+			d.set(StatePaused, fmt.Sprintf("paused — %s failed; release or stop", h.Deployment), "⏸", true)
+			return
+		}
 		d.set(StateHalted, fmt.Sprintf("halted — %s %s", h.Deployment, haltedReason(h.State)), "⏸", true)
 		return
 	}
 	for j := range i {
-		if blocksPending(ops[j].State, op.Barrier, op.HaltOnFailure) {
+		if blocksPending(ops[j].State, op.Barrier, op.continuesPastFailure()) {
 			d.set(StateWaiting, fmt.Sprintf("waiting for %s", ops[j].Deployment), "⏳", false)
 			return
 		}
@@ -306,7 +336,7 @@ func derivePending(d *Deployment, ops []Operation, i int) {
 func deriveWaitingForCutover(d *Deployment, ops []Operation, i int) {
 	op := ops[i]
 	for j := range i {
-		if blocksCutover(ops[j].State, op.HaltOnFailure) {
+		if blocksCutover(ops[j].State, op.continuesPastFailure()) {
 			d.set(StateReadyForCutoverWaiting, fmt.Sprintf("ready for cutover — waiting for %s", ops[j].Deployment), "🟡", true)
 			return
 		}
@@ -314,30 +344,33 @@ func deriveWaitingForCutover(d *Deployment, ops []Operation, i int) {
 	d.set(StateReadyForCutoverNext, "ready for cutover — next in order", "🟢", true)
 }
 
-// haltingBlocker returns the earliest earlier sibling that halts the rollout for
-// a pending operation: a terminal-failed sibling (only when halt_on_failure is
-// on) or a cancelled/reverted sibling (which halt regardless, matching the
-// predicate's lack of an exemption for them).
-func haltingBlocker(ops []Operation, i int) *Operation {
-	halt := ops[i].HaltOnFailure
+// blockingSibling returns the earliest earlier sibling that holds the rollout
+// for a pending operation, and whether the hold is a human-gated pause rather
+// than a halt. A terminal-failed sibling holds unless the policy continues past
+// it (continue, or a released pause); when it does hold under on_failure=pause
+// the hold is a pause (paused=true). A cancelled/reverted sibling always halts,
+// matching the predicate's lack of an exemption for them.
+func blockingSibling(ops []Operation, i int) (blocker *Operation, paused bool) {
+	op := ops[i]
 	for j := range i {
 		switch ops[j].State {
 		case state.ApplyOperation.Failed:
-			if halt {
-				return &ops[j]
+			if op.continuesPastFailure() {
+				continue
 			}
+			return &ops[j], op.pausesOnFailure()
 		case state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted:
-			return &ops[j]
+			return &ops[j], false
 		}
 	}
-	return nil
+	return nil, false
 }
 
 // blocksPending reports whether an earlier sibling in earlierState blocks a
 // pending operation from being claimed. It mirrors the SQL sibling gate in
 // FindNextApplyOperation exactly: the cutover_policy branch selects the
-// non-blocking set, then the halt_on_failure exemption is applied.
-func blocksPending(earlierState string, barrier, halt bool) bool {
+// non-blocking set, then the released-failure exemption is applied.
+func blocksPending(earlierState string, barrier, continuesPastFailure bool) bool {
 	var policyBlocks bool
 	if barrier {
 		policyBlocks = !isBarrierNonBlocking(earlierState)
@@ -347,9 +380,9 @@ func blocksPending(earlierState string, barrier, halt bool) bool {
 	if !policyBlocks {
 		return false
 	}
-	// halt_on_failure exemption: a terminal-failed earlier sibling stops blocking
-	// when the policy is off.
-	if !halt && earlierState == state.ApplyOperation.Failed {
+	// Released-failure exemption: a terminal-failed earlier sibling stops
+	// blocking when the policy continues past it (continue, or a released pause).
+	if continuesPastFailure && earlierState == state.ApplyOperation.Failed {
 		return false
 	}
 	return true
@@ -374,13 +407,13 @@ func isBarrierNonBlocking(s string) bool {
 
 // blocksCutover reports whether an earlier sibling in earlierState blocks a
 // later deployment's ordered cutover. Cutover is strictly ordered: an earlier
-// sibling blocks until it is completed, except a terminal-failed sibling under
-// halt_on_failure=false, which the rollout is configured to continue past.
-func blocksCutover(earlierState string, halt bool) bool {
+// sibling blocks until it is completed, except a terminal-failed sibling the
+// rollout is configured to continue past (continue, or a released pause).
+func blocksCutover(earlierState string, continuesPastFailure bool) bool {
 	if earlierState == state.ApplyOperation.Completed {
 		return false
 	}
-	if earlierState == state.ApplyOperation.Failed && !halt {
+	if earlierState == state.ApplyOperation.Failed && continuesPastFailure {
 		return false
 	}
 	return true
@@ -410,6 +443,8 @@ func aggregateLabel(s string) string {
 		return "running"
 	case state.Apply.RunningDegraded:
 		return "running (degraded)"
+	case state.Apply.Paused:
+		return "paused"
 	case state.Apply.WaitingForDeploy:
 		return "waiting for deploy"
 	case state.Apply.WaitingForCutover:
@@ -474,6 +509,7 @@ var summaryCategoryOrder = []struct {
 	{"waiting", []PresentationState{StateWaiting}},
 	{"queued", []PresentationState{StateQueuedNext}},
 	{"halted", []PresentationState{StateHalted}},
+	{"paused", []PresentationState{StatePaused}},
 	{"failed", []PresentationState{StateFailed}},
 	{"retrying", []PresentationState{StateRetrying}},
 	{"stopped", []PresentationState{StateStopped}},

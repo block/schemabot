@@ -1115,10 +1115,10 @@ func sampleDeploymentDetail(database, applyState string, tables []TableProgressD
 // mid-flight: one deployment parked ready for cutover, one copying, two queued.
 func PreviewCommentMultiDeploymentApplyInProgress() string {
 	model := presentation.Derive([]presentation.Operation{
-		{Deployment: "eu", State: state.ApplyOperation.WaitingForCutover, Barrier: true, HaltOnFailure: true},
-		{Deployment: "us", State: state.ApplyOperation.Running, Barrier: true, HaltOnFailure: true},
-		{Deployment: "au", State: state.ApplyOperation.Pending, Barrier: true, HaltOnFailure: true},
-		{Deployment: "ca", State: state.ApplyOperation.Pending, Barrier: true, HaltOnFailure: true},
+		{Deployment: "eu", State: state.ApplyOperation.WaitingForCutover, Barrier: true},
+		{Deployment: "us", State: state.ApplyOperation.Running, Barrier: true},
+		{Deployment: "au", State: state.ApplyOperation.Pending, Barrier: true},
+		{Deployment: "ca", State: state.ApplyOperation.Pending, Barrier: true},
 	})
 
 	euTables := sampleApplyTables()
@@ -1153,10 +1153,10 @@ func PreviewCommentMultiDeploymentApplyInProgress() string {
 // deployments are halted, and the aggregate is failed with retry as next action.
 func PreviewCommentMultiDeploymentApplyFailed() string {
 	model := presentation.Derive([]presentation.Operation{
-		{Deployment: "eu", State: state.ApplyOperation.Completed, HaltOnFailure: true},
-		{Deployment: "us", State: state.ApplyOperation.Failed, HaltOnFailure: true, Error: PreviewErrorMiddleFailed},
-		{Deployment: "au", State: state.ApplyOperation.Pending, HaltOnFailure: true},
-		{Deployment: "ca", State: state.ApplyOperation.Pending, HaltOnFailure: true},
+		{Deployment: "eu", State: state.ApplyOperation.Completed},
+		{Deployment: "us", State: state.ApplyOperation.Failed, Error: PreviewErrorMiddleFailed},
+		{Deployment: "au", State: state.ApplyOperation.Pending},
+		{Deployment: "ca", State: state.ApplyOperation.Pending},
 	})
 
 	euTables := sampleApplyTables()
@@ -1191,9 +1191,9 @@ func PreviewCommentMultiDeploymentApplyFailed() string {
 // across all deployments — aggregate applied, no pending operator action.
 func PreviewCommentMultiDeploymentApplyCompleted() string {
 	model := presentation.Derive([]presentation.Operation{
-		{Deployment: "eu", State: state.ApplyOperation.Completed, HaltOnFailure: true},
-		{Deployment: "us", State: state.ApplyOperation.Completed, HaltOnFailure: true},
-		{Deployment: "au", State: state.ApplyOperation.Completed, HaltOnFailure: true},
+		{Deployment: "eu", State: state.ApplyOperation.Completed},
+		{Deployment: "us", State: state.ApplyOperation.Completed},
+		{Deployment: "au", State: state.ApplyOperation.Completed},
 	})
 
 	completedTables := func() []TableProgressData {
@@ -1224,9 +1224,9 @@ func PreviewCommentMultiDeploymentApplyCompleted() string {
 // deployment's terminal summary in its section.
 func PreviewCommentMultiDeploymentApplySummaryCompleted() string {
 	model := presentation.Derive([]presentation.Operation{
-		{Deployment: "eu", State: state.ApplyOperation.Completed, HaltOnFailure: true},
-		{Deployment: "us", State: state.ApplyOperation.Completed, HaltOnFailure: true},
-		{Deployment: "au", State: state.ApplyOperation.Completed, HaltOnFailure: true},
+		{Deployment: "eu", State: state.ApplyOperation.Completed},
+		{Deployment: "us", State: state.ApplyOperation.Completed},
+		{Deployment: "au", State: state.ApplyOperation.Completed},
 	})
 
 	completedTables := func() []TableProgressData {
@@ -1258,10 +1258,10 @@ func PreviewCommentMultiDeploymentApplySummaryCompleted() string {
 // error and retry guidance, and later deployments are halted.
 func PreviewCommentMultiDeploymentApplySummaryFailed() string {
 	model := presentation.Derive([]presentation.Operation{
-		{Deployment: "eu", State: state.ApplyOperation.Completed, HaltOnFailure: true},
-		{Deployment: "us", State: state.ApplyOperation.Failed, HaltOnFailure: true, Error: PreviewErrorMiddleFailed},
-		{Deployment: "au", State: state.ApplyOperation.Pending, HaltOnFailure: true},
-		{Deployment: "ca", State: state.ApplyOperation.Pending, HaltOnFailure: true},
+		{Deployment: "eu", State: state.ApplyOperation.Completed},
+		{Deployment: "us", State: state.ApplyOperation.Failed, Error: PreviewErrorMiddleFailed},
+		{Deployment: "au", State: state.ApplyOperation.Pending},
+		{Deployment: "ca", State: state.ApplyOperation.Pending},
 	})
 
 	euTables := sampleApplyTables()

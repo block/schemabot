@@ -154,24 +154,31 @@ func TestBuildDeploymentDetail_UsesOperationStateAndError(t *testing.T) {
 }
 
 // The storage→presentation boundary resolves the rollout policies: barrier flips
-// the Barrier flag, and on_failure becomes the complementary HaltOnFailure /
-// ContinueOnFailure pair — continue only when on_failure is exactly "continue",
-// so an unset value resolves to halting (the safe default).
+// the Barrier flag, and on_failure becomes the ContinueOnFailure / PauseOnFailure
+// pair — each true only when on_failure is exactly that value, so an unset value
+// leaves both false (halt, the safe default).
 func TestApplyOperationToPresentation_ResolvesPolicies(t *testing.T) {
-	barrier := applyOperationToPresentation(&storage.ApplyOperation{
+	halting := applyOperationToPresentation(&storage.ApplyOperation{
 		Deployment: "eu", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier,
 	})
-	assert.True(t, barrier.Barrier)
-	assert.True(t, barrier.HaltOnFailure, "unset on_failure resolves to halting")
-	assert.False(t, barrier.ContinueOnFailure, "unset on_failure does not continue")
+	assert.True(t, halting.Barrier)
+	assert.False(t, halting.ContinueOnFailure, "unset on_failure does not continue")
+	assert.False(t, halting.PauseOnFailure, "unset on_failure does not pause")
 
 	rolling := applyOperationToPresentation(&storage.ApplyOperation{
 		Deployment: "us", State: state.ApplyOperation.Running,
 		CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureContinue,
 	})
 	assert.False(t, rolling.Barrier)
-	assert.False(t, rolling.HaltOnFailure)
 	assert.True(t, rolling.ContinueOnFailure)
+	assert.False(t, rolling.PauseOnFailure)
+
+	paused := applyOperationToPresentation(&storage.ApplyOperation{
+		Deployment: "au", State: state.ApplyOperation.Running,
+		CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailurePause,
+	})
+	assert.True(t, paused.PauseOnFailure)
+	assert.False(t, paused.ContinueOnFailure)
 }
 
 // Tasks without an apply_operation_id (legacy rows) are not attributable to a

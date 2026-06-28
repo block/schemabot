@@ -33,10 +33,10 @@ func PreviewCommentShardedApplyInProgress() string {
 		State: state.Apply.Running, Environment: "production", Database: "cdb_resolute",
 		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
 		Shards: previewShardStatuses([]presentation.Operation{
-			{Deployment: "-40", State: state.ApplyOperation.Running, HaltOnFailure: true},
-			{Deployment: "40-80", State: state.ApplyOperation.Pending, HaltOnFailure: true},
-			{Deployment: "80-c0", State: state.ApplyOperation.Pending, HaltOnFailure: true},
-			{Deployment: "c0-", State: state.ApplyOperation.Pending, HaltOnFailure: true},
+			{Deployment: "-40", State: state.ApplyOperation.Running},
+			{Deployment: "40-80", State: state.ApplyOperation.Pending},
+			{Deployment: "80-c0", State: state.ApplyOperation.Pending},
+			{Deployment: "c0-", State: state.ApplyOperation.Pending},
 		}),
 		Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
 	})
@@ -49,10 +49,10 @@ func PreviewCommentShardedApplyFailed() string {
 		State: state.Apply.Failed, Environment: "production", Database: "cdb_resolute",
 		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
 		Shards: previewShardStatuses([]presentation.Operation{
-			{Deployment: "-40", State: state.ApplyOperation.Failed, HaltOnFailure: true, Error: "resolve shard primary for `-40`: context deadline exceeded"},
-			{Deployment: "40-80", State: state.ApplyOperation.Pending, HaltOnFailure: true},
-			{Deployment: "80-c0", State: state.ApplyOperation.Pending, HaltOnFailure: true},
-			{Deployment: "c0-", State: state.ApplyOperation.Pending, HaltOnFailure: true},
+			{Deployment: "-40", State: state.ApplyOperation.Failed, Error: "resolve shard primary for `-40`: context deadline exceeded"},
+			{Deployment: "40-80", State: state.ApplyOperation.Pending},
+			{Deployment: "80-c0", State: state.ApplyOperation.Pending},
+			{Deployment: "c0-", State: state.ApplyOperation.Pending},
 		}),
 		Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
 	})
@@ -65,9 +65,9 @@ func PreviewCommentShardedApplyDivergent() string {
 		State: state.Apply.Running, Environment: "production", Database: "cdb_resolute",
 		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
 		Shards: previewShardStatuses([]presentation.Operation{
-			{Deployment: "-40", State: state.ApplyOperation.Running, HaltOnFailure: true},
-			{Deployment: "40-80", State: state.ApplyOperation.Pending, HaltOnFailure: true},
-			{Deployment: "80-c0", State: state.ApplyOperation.Pending, HaltOnFailure: true},
+			{Deployment: "-40", State: state.ApplyOperation.Running},
+			{Deployment: "40-80", State: state.ApplyOperation.Pending},
+			{Deployment: "80-c0", State: state.ApplyOperation.Pending},
 		}),
 		Cells: []ShardCell{
 			previewMutesCell("-40"),

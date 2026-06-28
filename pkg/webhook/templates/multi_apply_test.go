@@ -12,15 +12,15 @@ import (
 var so = state.ApplyOperation
 
 func barrierOp(dep, st string) presentation.Operation {
-	return presentation.Operation{Deployment: dep, State: st, Barrier: true, HaltOnFailure: true}
+	return presentation.Operation{Deployment: dep, State: st, Barrier: true}
 }
 
 func rollingOp(dep, st string) presentation.Operation {
-	return presentation.Operation{Deployment: dep, State: st, HaltOnFailure: true}
+	return presentation.Operation{Deployment: dep, State: st}
 }
 
 func continuingOp(dep, st string) presentation.Operation {
-	return presentation.Operation{Deployment: dep, State: st, HaltOnFailure: false, ContinueOnFailure: true}
+	return presentation.Operation{Deployment: dep, State: st, ContinueOnFailure: true}
 }
 
 // A barrier rollout mid-flight (one deployment parked ready for cutover, one
@@ -157,7 +157,7 @@ func TestRenderMultiDeploymentApplyComment_StartedAtUsesApplyStart(t *testing.T)
 // firstFailingOp builds a rolling, continue-policy operation carrying an error,
 // so a fan-out can fail one deployment and keep going.
 func firstFailingOp(dep, st, errMsg string) presentation.Operation {
-	return presentation.Operation{Deployment: dep, State: st, HaltOnFailure: false, ContinueOnFailure: true, Error: errMsg}
+	return presentation.Operation{Deployment: dep, State: st, ContinueOnFailure: true, Error: errMsg}
 }
 
 // A failed deployment's reason is lifted to the aggregate header so an operator
@@ -207,7 +207,7 @@ func TestRenderMultiDeploymentApplyComment_NoFirstFailureWhenHealthy(t *testing.
 func TestRenderMultiDeploymentApplySummaryComment_FirstFailureSurfacesError(t *testing.T) {
 	model := presentation.Derive([]presentation.Operation{
 		rollingOp("eu", so.Completed),
-		{Deployment: "us", State: so.Failed, HaltOnFailure: true, Error: "boom <script>"},
+		{Deployment: "us", State: so.Failed, Error: "boom <script>"},
 		rollingOp("au", so.Pending),
 	})
 	out := RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
@@ -224,7 +224,7 @@ func TestRenderMultiDeploymentApplySummaryComment_FirstFailureSurfacesError(t *t
 // an escaped Markdown code span would.
 func TestRenderMultiDeploymentApplyComment_FirstFailureEscapesName(t *testing.T) {
 	model := presentation.Derive([]presentation.Operation{
-		{Deployment: "us&ca", State: so.Failed, HaltOnFailure: true, Error: "boom"},
+		{Deployment: "us&ca", State: so.Failed, Error: "boom"},
 	})
 	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
 		Model:       model,

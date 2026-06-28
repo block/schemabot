@@ -11,29 +11,39 @@ import (
 // so is the shared operation/apply state vocabulary (state.ApplyOperation == state.Apply).
 var so = state.ApplyOperation
 
-// rolling builds a rolling, halt-on-failure operation (the conservative defaults).
+// rolling builds a rolling, halt-on-failure operation (the conservative
+// defaults: both policy flags false).
 func rolling(dep, st string) Operation {
-	return Operation{Deployment: dep, State: st, Barrier: false, HaltOnFailure: true}
+	return Operation{Deployment: dep, State: st, Barrier: false}
 }
 
 // barrier builds a barrier, halt-on-failure operation.
 func barrier(dep, st string) Operation {
-	return Operation{Deployment: dep, State: st, Barrier: true, HaltOnFailure: true}
+	return Operation{Deployment: dep, State: st, Barrier: true}
 }
 
 // parallel builds a parallel, halt-on-failure operation. Under parallel the copy
 // phase has no earlier-sibling gate, so a pending parallel operation is never
 // shown waiting for or halted by an earlier sibling.
 func parallel(dep, st string) Operation {
-	return Operation{Deployment: dep, State: st, Parallel: true, HaltOnFailure: true}
+	return Operation{Deployment: dep, State: st, Parallel: true}
 }
 
-// continuing builds a rolling, on_failure=continue operation. HaltOnFailure and
-// ContinueOnFailure are exact complements at the real boundary mappers (both
-// derive from the same on_failure value), so a continue operation sets
-// HaltOnFailure false and ContinueOnFailure true together.
+// continuing builds a rolling, on_failure=continue operation.
 func continuing(dep, st string) Operation {
-	return Operation{Deployment: dep, State: st, HaltOnFailure: false, ContinueOnFailure: true}
+	return Operation{Deployment: dep, State: st, ContinueOnFailure: true}
+}
+
+// pausing builds a rolling, on_failure=pause operation with no release latch: a
+// terminal-failed earlier sibling holds it paused for a human.
+func pausing(dep, st string) Operation {
+	return Operation{Deployment: dep, State: st, PauseOnFailure: true}
+}
+
+// released builds a rolling, on_failure=pause operation whose apply has been
+// released: a terminal-failed earlier sibling is treated like continue.
+func released(dep, st string) Operation {
+	return Operation{Deployment: dep, State: st, PauseOnFailure: true, Released: true}
 }
 
 // TestDerive_Empty: an apply with no operations rolls up to pending with no
@@ -174,6 +184,30 @@ func TestDerivePending_Ordering(t *testing.T) {
 			label: "queued — next in order",
 		},
 		{
+			name:  "pause: earlier failed holds the rollout paused for a human",
+			ops:   []Operation{pausing("eu", so.Failed), pausing("us", so.Pending)},
+			want:  StatePaused,
+			label: "paused — eu failed; release or stop",
+		},
+		{
+			name:  "released pause: earlier failed no longer blocks, like continue",
+			ops:   []Operation{released("eu", so.Failed), released("us", so.Pending)},
+			want:  StateQueuedNext,
+			label: "queued — next in order",
+		},
+		{
+			name:  "pause: earlier cancelled halts rather than pauses",
+			ops:   []Operation{pausing("eu", so.Cancelled), pausing("us", so.Pending)},
+			want:  StateHalted,
+			label: "halted — eu cancelled",
+		},
+		{
+			name:  "pause naming picks the failed sibling over an in-flight one",
+			ops:   []Operation{pausing("eu", so.Failed), pausing("us", so.Running), pausing("au", so.Pending)},
+			want:  StatePaused,
+			label: "paused — eu failed; release or stop",
+		},
+		{
 			name:  "cancelled earlier halts regardless of halt flag",
 			ops:   []Operation{continuing("eu", so.Cancelled), continuing("us", so.Pending)},
 			want:  StateHalted,
@@ -235,6 +269,24 @@ func TestDeriveWaitingForCutover_Ordering(t *testing.T) {
 			ops: []Operation{
 				continuing("eu", so.Failed),
 				continuing("us", so.WaitingForCutover),
+			},
+			want:  StateReadyForCutoverNext,
+			label: "ready for cutover — next in order",
+		},
+		{
+			name: "pause: earlier failed still blocks cutover until released",
+			ops: []Operation{
+				pausing("eu", so.Failed),
+				pausing("us", so.WaitingForCutover),
+			},
+			want:  StateReadyForCutoverWaiting,
+			label: "ready for cutover — waiting for eu",
+		},
+		{
+			name: "released pause: earlier failed no longer blocks cutover",
+			ops: []Operation{
+				released("eu", so.Failed),
+				released("us", so.WaitingForCutover),
 			},
 			want:  StateReadyForCutoverNext,
 			label: "ready for cutover — next in order",
@@ -338,7 +390,7 @@ func TestDerive_StoppedAggregateNextAction(t *testing.T) {
 // error detail for the renderer.
 func TestDerive_FailedDeploymentCarriesError(t *testing.T) {
 	got := Derive([]Operation{
-		{Deployment: "eu", State: so.Failed, HaltOnFailure: true, Error: "lock wait timeout"},
+		{Deployment: "eu", State: so.Failed, Error: "lock wait timeout"},
 	})
 	require.Len(t, got.Deployments, 1)
 	assert.Equal(t, "lock wait timeout", got.Deployments[0].Error)
@@ -361,8 +413,8 @@ func TestDerive_FirstFailureNoneWhenHealthy(t *testing.T) {
 func TestDerive_FirstFailurePicksEarliestInOrder(t *testing.T) {
 	got := Derive([]Operation{
 		continuing("eu", so.Completed),
-		{Deployment: "us", State: so.Failed, HaltOnFailure: false, ContinueOnFailure: true, Error: "first boom"},
-		{Deployment: "au", State: so.Failed, HaltOnFailure: false, ContinueOnFailure: true, Error: "second boom"},
+		{Deployment: "us", State: so.Failed, ContinueOnFailure: true, Error: "first boom"},
+		{Deployment: "au", State: so.Failed, ContinueOnFailure: true, Error: "second boom"},
 	})
 	require.NotNil(t, got.FirstFailure)
 	assert.Equal(t, "us", got.FirstFailure.Deployment)
@@ -376,7 +428,7 @@ func TestDerive_FirstFailurePicksEarliestInOrder(t *testing.T) {
 // waiting for the terminal summary.
 func TestDerive_FirstFailureWhileSiblingStillRunning(t *testing.T) {
 	got := Derive([]Operation{
-		{Deployment: "eu", State: so.Failed, HaltOnFailure: false, ContinueOnFailure: true, Error: "boom"},
+		{Deployment: "eu", State: so.Failed, ContinueOnFailure: true, Error: "boom"},
 		continuing("us", so.Running),
 	})
 	assert.Equal(t, state.Apply.RunningDegraded, got.State)
@@ -397,6 +449,38 @@ func TestDerive_HaltFailureWithRunningSiblingStaysFailed(t *testing.T) {
 	})
 	assert.Equal(t, state.Apply.Failed, got.State)
 	assert.Equal(t, "failed", got.Label)
+}
+
+// TestDerive_PauseFailureWithPendingSiblingHoldsPaused: under on_failure pause an
+// earlier failure with later work still to run holds the aggregate paused for a
+// human, and the first failure is surfaced eagerly. The held sibling renders
+// paused with the release-or-stop label.
+func TestDerive_PauseFailureWithPendingSiblingHoldsPaused(t *testing.T) {
+	got := Derive([]Operation{
+		{Deployment: "eu", State: so.Failed, PauseOnFailure: true, Error: "boom"},
+		pausing("us", so.Pending),
+	})
+	assert.Equal(t, state.Apply.Paused, got.State)
+	assert.Equal(t, "paused", got.Label)
+	assert.Equal(t, StatePaused, got.Deployments[1].Presentation)
+	assert.Equal(t, "paused — eu failed; release or stop", got.Deployments[1].Label)
+	require.NotNil(t, got.FirstFailure)
+	assert.Equal(t, "eu", got.FirstFailure.Deployment)
+}
+
+// TestDerive_ReleasedPauseRunsDegradedLikeContinue: once an apply is released a
+// pause failure behaves like continue — the held siblings proceed and the
+// aggregate runs degraded rather than paused.
+func TestDerive_ReleasedPauseRunsDegradedLikeContinue(t *testing.T) {
+	got := Derive([]Operation{
+		{Deployment: "eu", State: so.Failed, PauseOnFailure: true, Released: true, Error: "boom"},
+		released("us", so.Running),
+	})
+	assert.Equal(t, state.Apply.RunningDegraded, got.State)
+	assert.Equal(t, "running (degraded)", got.Label)
+	assert.Equal(t, StateRunningCopy, got.Deployments[1].Presentation)
+	require.NotNil(t, got.FirstFailure)
+	assert.Equal(t, "eu", got.FirstFailure.Deployment)
 }
 
 // TestDerive_FirstFailureExcludesRetrying: a failed_retryable deployment is

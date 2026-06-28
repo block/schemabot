@@ -153,8 +153,8 @@ func shardStatuses(shardOrder []string, opsByShard map[string][]*storage.ApplyOp
 			State:             st,
 			Barrier:           first.CutoverPolicy == storage.CutoverPolicyBarrier,
 			Parallel:          first.CutoverPolicy == storage.CutoverPolicyParallel,
-			HaltOnFailure:     first.OnFailure != storage.OnFailureContinue,
 			ContinueOnFailure: first.OnFailure == storage.OnFailureContinue,
+			PauseOnFailure:    first.OnFailure == storage.OnFailurePause,
 			Error:             errMsg,
 		})
 	}

@@ -33,8 +33,8 @@ func progressOperationsForPresentation(ops []ProgressOperation) []presentation.O
 			State:             op.State,
 			Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
 			Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
-			HaltOnFailure:     op.OnFailure != storage.OnFailureContinue,
 			ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
+			PauseOnFailure:    op.OnFailure == storage.OnFailurePause,
 			Error:             op.ErrorMessage,
 		})
 	}
