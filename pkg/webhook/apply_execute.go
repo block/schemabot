@@ -134,7 +134,7 @@ func (h *Handler) executeApply(
 			updated, err := h.updateCheckRecordForApplyResult(context.Background(), repo, pr, apply)
 			if err != nil {
 				h.logger.Error("observer: failed to update check record",
-					append(apply.LogAttrs(), "repo", repo, "pr", pr, "error", err)...)
+					append(apply.LogAttrs(), "error", err)...)
 				return
 			}
 			if !updated {
@@ -145,7 +145,7 @@ func (h *Handler) executeApply(
 			ghInstClient, err := factory.ForInstallation(installationID)
 			if err != nil {
 				h.logger.Error("observer: failed to create GitHub client",
-					append(apply.LogAttrs(), "repo", repo, "pr", pr,
+					append(apply.LogAttrs(),
 						"installation_id", installationID, "error", err)...)
 				return
 			}

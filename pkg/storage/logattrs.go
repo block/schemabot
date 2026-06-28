@@ -10,9 +10,9 @@ package storage
 //
 // apply_id is the searchable string identifier; the internal numeric row ID is
 // deliberately not logged so it can't be confused with the user-facing id.
-// external_id (the remote data plane's identifier for this apply) and caller (who
-// initiated the apply) are included only when set, so operators can correlate to
-// the data plane and to who triggered the change during triage.
+// repo, pr, external_id (the remote data plane's identifier for this apply), and
+// caller (who initiated the apply) are included only when set, so operators can
+// tie the apply to its PR, correlate to the data plane, and see who triggered it.
 func (a *Apply) LogAttrs() []any {
 	if a == nil {
 		return nil
@@ -24,6 +24,12 @@ func (a *Apply) LogAttrs() []any {
 		"environment", a.Environment,
 		"deployment", a.Deployment,
 		"state", a.State,
+	}
+	if a.Repository != "" {
+		attrs = append(attrs, "repo", a.Repository)
+	}
+	if a.PullRequest > 0 {
+		attrs = append(attrs, "pr", a.PullRequest)
 	}
 	if a.ExternalID != "" {
 		attrs = append(attrs, "external_id", a.ExternalID)
