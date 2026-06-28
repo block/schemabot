@@ -43,7 +43,7 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 			continue
 		}
 
-		return fmt.Errorf("schema change already in progress for this database")
+		return fmt.Errorf("schema change already in progress for database %q (plan %s): blocking task %s", plan.Database, plan.PlanIdentifier, blockingTaskID)
 	}
 	return nil
 }
@@ -89,7 +89,7 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, database string) bool {
 	eng := c.getEngine()
 	if eng == nil {
-		c.logger.Error("tryResolveStaleTask: engine is nil", "database", database)
+		c.logger.Error("tryResolveStaleTask: engine is nil", t.LogAttrs()...)
 		return false
 	}
 
@@ -99,7 +99,7 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 	})
 	if err != nil {
 		// result may be nil when err is non-nil, so it must not be dereferenced here.
-		c.logger.Warn("conflict check: engine progress failed", "task_id", t.TaskIdentifier, "err", err)
+		c.logger.Warn("conflict check: engine progress failed", append(t.LogAttrs(), "err", err)...)
 		return false
 	}
 	c.logger.Debug("conflict check: engine progress", "task_id", t.TaskIdentifier, "engine_state", result.State, "message", result.Message)
@@ -157,7 +157,7 @@ func (c *LocalClient) logApplyEvent(ctx context.Context, applyID int64, taskID *
 		CreatedAt: time.Now(),
 	}
 	if err := c.storage.ApplyLogs().Append(ctx, log); err != nil {
-		c.logger.Warn("failed to log apply event", "error", err, "event", eventType, "message", message)
+		c.logger.Warn("failed to log apply event", "apply_id", applyID, "error", err, "event", eventType, "message", message)
 	}
 }
 
@@ -208,7 +208,7 @@ func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Tas
 	task.State = newState
 	task.UpdatedAt = time.Now()
 	if err := c.storage.Tasks().Update(ctx, task); err != nil {
-		c.logger.Error("failed to update task state", "task_id", task.TaskIdentifier, "state", newState, "error", err)
+		c.logger.Error("failed to update task state", append(task.LogAttrs(), "error", err)...)
 	}
 	if logMsg != "" && applyID > 0 {
 		taskID := task.ID
@@ -225,7 +225,7 @@ func (c *LocalClient) markTasksRunning(ctx context.Context, tasks []*storage.Tas
 		task.StartedAt = &now
 		task.UpdatedAt = now
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			c.logger.Error("failed to update task state", "task_id", task.TaskIdentifier, "state", state.Task.Running, "error", err)
+			c.logger.Error("failed to update task state", append(task.LogAttrs(), "error", err)...)
 		}
 	}
 }
@@ -236,7 +236,7 @@ func (c *LocalClient) runWithRecovery(ctx context.Context, apply *storage.Apply,
 	defer func() {
 		if r := recover(); r != nil {
 			errMsg := fmt.Sprintf("panic in apply goroutine: %v", r)
-			c.logger.Error(errMsg, "apply_id", apply.ApplyIdentifier)
+			c.logger.Error(errMsg, apply.LogAttrs()...)
 			c.failApplyWithTasks(ctx, apply, tasks, errMsg)
 		}
 	}()

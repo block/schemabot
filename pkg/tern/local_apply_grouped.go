@@ -74,11 +74,11 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	apply.StartedAt = &now
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		c.logger.Error("failed to set started_at", "apply_id", apply.ApplyIdentifier, "error", err)
+		c.logger.Error("failed to set started_at", append(apply.LogAttrs(), "error", err)...)
 	}
 	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
 		c.logger.Warn("pending stop request processing failed before grouped engine apply; current apply owner will exit for operator retry",
-			"apply_id", apply.ApplyIdentifier, "error", err)
+			append(apply.LogAttrs(), "error", err)...)
 		return
 	} else if handled {
 		return
@@ -110,7 +110,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 				return
 			}
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, rs); saveErr != nil {
-				c.logger.Warn("OnStateChange: failed to persist opaque resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
+				c.logger.Warn("OnStateChange: failed to persist opaque resume state", append(apply.LogAttrs(), "error", saveErr)...)
 			}
 		},
 	})
@@ -124,9 +124,9 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 			c.failApplyWithTasks(ctx, apply, tasks, err.Error())
 		}
 		if newState == state.Apply.FailedRetryable {
-			c.logger.Warn("apply paused for operator retry", "mode", mode, "error", err, "apply_id", apply.ApplyIdentifier)
+			c.logger.Warn("apply paused for operator retry", append(apply.LogAttrs(), "mode", mode, "error", err)...)
 		} else {
-			c.logger.Error("apply failed", "mode", mode, "error", err, "apply_id", apply.ApplyIdentifier)
+			c.logger.Error("apply failed", append(apply.LogAttrs(), "mode", mode, "error", err)...)
 		}
 		logLevel := storage.LogLevelError
 		if newState == state.Apply.FailedRetryable {
@@ -160,7 +160,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		resumeState = result.ResumeState
 		if c.config.Type == storage.DatabaseTypeVitess {
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, resumeState); saveErr != nil {
-				c.logger.Error("failed to save opaque engine resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
+				c.logger.Error("failed to save opaque engine resume state", append(apply.LogAttrs(), "error", saveErr)...)
 				c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state: %v", saveErr))
 				return
 			}
@@ -186,7 +186,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	}
 	apply.UpdatedAt = time.Now()
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
+		c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
 	}
 	c.logger.Info("apply started", "mode", mode, "apply_id", apply.ApplyIdentifier, "task_count", len(tasks))
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
@@ -643,13 +643,13 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		var permanent *engine.PermanentError
 		if errors.As(err, &permanent) {
 			c.logger.Error("progress check failed with permanent error",
-				"error", err, "apply_id", apply.ApplyIdentifier)
+				append(apply.LogAttrs(), "error", err)...)
 			c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed: %v", err))
 			return true
 		}
 		ps.consecutiveErrors++
 		c.logger.Warn("progress check failed",
-			"error", err, "apply_id", apply.ApplyIdentifier, "consecutive_errors", ps.consecutiveErrors)
+			append(apply.LogAttrs(), "error", err, "consecutive_errors", ps.consecutiveErrors)...)
 		if ps.consecutiveErrors >= 10 {
 			if c.shouldRetryEngineError(err) {
 				c.logger.Warn("progress polling failed repeatedly, pausing apply for operator retry",
@@ -673,7 +673,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		if c.config.Type == storage.DatabaseTypeVitess {
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, resumeState); saveErr != nil {
 				c.logger.Error("failed to save Vitess engine resume state from progress polling",
-					"apply_id", apply.ApplyIdentifier, "error", saveErr)
+					append(apply.LogAttrs(), "error", saveErr)...)
 				c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state from progress polling: %v", saveErr))
 				return true
 			}
@@ -726,7 +726,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventDeployTriggered, storage.LogSourceSchemaBot,
 			"Auto-triggering deploy (defer_deploy not set)", "", "")
 		if _, err := eng.Start(ctx, controlReq); err != nil {
-			c.logger.Error("auto-deploy failed", "error", err, "apply_id", apply.ApplyIdentifier)
+			c.logger.Error("auto-deploy failed", append(apply.LogAttrs(), "error", err)...)
 		}
 	}
 
@@ -736,7 +736,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
 			"Auto-triggering cutover (defer_cutover not set)", "", "")
 		if _, err := eng.Cutover(ctx, controlReq); err != nil {
-			c.logger.Error("auto-cutover failed", "error", err, "apply_id", apply.ApplyIdentifier)
+			c.logger.Error("auto-cutover failed", append(apply.LogAttrs(), "error", err)...)
 		}
 	}
 
@@ -848,12 +848,12 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	apply.UpdatedAt = now
 	freshApply, err := c.storage.Applies().Get(ctx, apply.ID)
 	if err != nil {
-		c.logger.Error("failed to reload apply before progress state update", "apply_id", apply.ApplyIdentifier, "error", err)
+		c.logger.Error("failed to reload apply before progress state update", append(apply.LogAttrs(), "error", err)...)
 		return true
 	}
 	if freshApply == nil {
 		c.logger.Warn("apply row missing before progress state update; yielding",
-			"apply_id", apply.ApplyIdentifier, "apply_db_id", apply.ID)
+			append(apply.LogAttrs(), "apply_db_id", apply.ID)...)
 		return true
 	}
 	if state.IsTerminalApplyState(freshApply.State) {
@@ -1189,7 +1189,7 @@ func (c *LocalClient) writeShardProgress(ctx context.Context, table *storage.Tas
 		}
 		c.logger.Error("operator: failed to persist shard progress",
 			"apply_id", table.ApplyID, "apply_operation_id", operationID,
-			"database", table.Database, "environment", table.Environment,
+			"database", table.Database, "database_type", table.DatabaseType, "environment", table.Environment,
 			"namespace", table.Namespace, "table", table.TableName, "shard", sh.Shard,
 			"error", err)
 	}

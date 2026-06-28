@@ -142,7 +142,7 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 			// Serve returns ErrServerStopped on GracefulStop during normal
 			// shutdown; that is expected, not an error worth alerting on.
 			if err := grpcServer.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
-				srv.logger.Error("gRPC server error", "error", err)
+				srv.logger.Error("gRPC server error", "port", grpcPort, "error", err)
 			}
 		}()
 		defer grpcServer.GracefulStop()
@@ -587,7 +587,7 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			if _, err := w.Write([]byte(`{"error":"GitHub App credentials not available — webhook endpoint is disabled"}`)); err != nil {
-				logger.Error("failed to write disabled webhook response", "error", err)
+				logger.Error("failed to write disabled webhook response", "method", r.Method, "path", r.URL.Path, "error", err)
 			}
 		})}, nil
 	}

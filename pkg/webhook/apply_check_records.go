@@ -101,13 +101,15 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 func (h *Handler) updateCheckRunAfterUnlock(ctx context.Context, repo string, pr int, lock *storage.Lock, installationID int64) {
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
-		h.logger.Error("failed to create GitHub client for check run update", "error", err)
+		h.logger.Error("failed to create GitHub client for check run update",
+			"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
 		return
 	}
 
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
-		h.logger.Error("failed to fetch PR for check run update", "error", err)
+		h.logger.Error("failed to fetch PR for check run update",
+			"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
 		return
 	}
 
@@ -124,6 +126,7 @@ func (h *Handler) updateCheckRunAfterUnlock(ctx context.Context, repo string, pr
 	}
 
 	if _, err := client.CreateCheckRun(ctx, repo, prInfo.HeadSHA, opts); err != nil {
-		h.logger.Error("failed to update check run after unlock", "error", err)
+		h.logger.Error("failed to update check run after unlock",
+			"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "head_sha", prInfo.HeadSHA, "error", err)
 	}
 }

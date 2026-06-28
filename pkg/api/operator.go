@@ -236,11 +236,9 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int) {
 	lease := apply.Lease()
 	if !lease.Valid() {
 		s.logger.Error("operator: claimed apply without a valid lease token; operator will not resume it",
-			"driver", driverID,
-			"lease_owner", owner,
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment)
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"lease_owner", owner)...)
 		metrics.RecordOperatorClaimFailure(ctx, "missing_lease_token")
 		return
 	}
@@ -279,11 +277,9 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 	opLease := op.Lease()
 	if !opLease.Valid() {
 		s.logger.Error("operator: claimed apply_operation without a valid operation lease token; operation will not be driven",
-			"driver", driverID,
-			"lease_owner", owner,
-			"apply_operation_id", op.ID,
-			"apply_db_id", op.ApplyID,
-			"deployment", op.Deployment)
+			append(op.LogAttrs(),
+				"driver", driverID,
+				"lease_owner", owner)...)
 		metrics.RecordOperatorClaimFailure(ctx, "missing_operation_lease_token")
 		return
 	}
@@ -295,15 +291,15 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 	ops, err := s.storage.ApplyOperations().ListByApply(ctx, op.ApplyID)
 	if err != nil {
 		s.logger.Error("operator: failed to list operations for claimed apply; operation will not be driven",
-			"driver", driverID, "lease_owner", owner, "apply_operation_id", op.ID,
-			"apply_db_id", op.ApplyID, "deployment", op.Deployment, "error", err)
+			append(op.LogAttrs(),
+				"driver", driverID, "lease_owner", owner, "error", err)...)
 		metrics.RecordOperatorClaimFailure(ctx, "operation_set_list_error")
 		return
 	}
 	if !operationSetContainsID(ops, op.ID) {
 		s.logger.Error("operator: claimed operation is not part of its apply's operation set; operation will not be driven",
-			"driver", driverID, "lease_owner", owner, "apply_operation_id", op.ID,
-			"apply_db_id", op.ApplyID, "deployment", op.Deployment, "operation_count", len(ops))
+			append(op.LogAttrs(),
+				"driver", driverID, "lease_owner", owner, "operation_count", len(ops))...)
 		metrics.RecordOperatorClaimFailure(ctx, "operation_set_missing")
 		return
 	}
@@ -314,8 +310,8 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 	hasTasks, err := s.claimedOperationHasTasks(ctx, op)
 	if err != nil {
 		s.logger.Error("operator: failed to inspect claimed operation tasks; operation will not be driven",
-			"driver", driverID, "lease_owner", owner, "apply_operation_id", op.ID,
-			"apply_db_id", op.ApplyID, "deployment", op.Deployment, "error", err)
+			append(op.LogAttrs(),
+				"driver", driverID, "lease_owner", owner, "error", err)...)
 		metrics.RecordOperatorClaimFailure(ctx, "operation_task_inspect_error")
 		return
 	}
@@ -366,12 +362,10 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	apply, err := s.storage.Applies().ClaimApplyByID(ctx, op.ApplyID, owner)
 	if err != nil {
 		s.logger.Error("operator: failed to claim parent apply for operation",
-			"driver", driverID,
-			"lease_owner", owner,
-			"apply_operation_id", op.ID,
-			"apply_db_id", op.ApplyID,
-			"deployment", op.Deployment,
-			"error", err)
+			append(op.LogAttrs(),
+				"driver", driverID,
+				"lease_owner", owner,
+				"error", err)...)
 		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_claim_error")
 		return
 	}
@@ -469,8 +463,8 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	marked, err := s.markOperationFromOwnResult(operationLeaseCtx, driverID, op)
 	if err != nil {
 		s.logger.Error("operator: failed to update apply_operation from its tasks; derived apply state not updated",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID, "error", err)...)
 		return
 	}
 	if !marked {
@@ -485,8 +479,8 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	// a terminal verdict so the rollout (and the stop request) can resolve.
 	if err := s.stopPendingOperationsForPendingStop(applyLeaseCtx, driverID, apply); err != nil {
 		s.logger.Error("operator: failed to stop pending sibling operations for pending stop request; derived apply state not updated",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID, "error", err)...)
 		return
 	}
 
@@ -498,26 +492,24 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	finalApply, err := s.storage.Applies().Get(applyLeaseCtx, apply.ID)
 	if err != nil {
 		s.logger.Error("operator: failed to reload parent apply after resume; derived apply state not updated",
-			"driver", driverID,
-			"apply_operation_id", op.ID,
-			"apply_id", apply.ApplyIdentifier,
-			"deployment", op.Deployment,
-			"error", err)
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"apply_operation_id", op.ID,
+				"error", err)...)
 		return
 	}
 	if finalApply == nil {
 		s.logger.Error("operator: parent apply not found after resume; derived apply state not updated",
-			"driver", driverID,
-			"apply_operation_id", op.ID,
-			"apply_id", apply.ApplyIdentifier,
-			"deployment", op.Deployment)
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"apply_operation_id", op.ID)...)
 		return
 	}
 
 	if _, err := s.updateApplyStateFromOperations(applyLeaseCtx, driverID, finalApply, allowLeaseScopedFailedReopen); err != nil {
 		s.logger.Error("operator: failed to update derived apply state from apply_operations",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
-			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
+			append(finalApply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID, "error", err)...)
 		return
 	}
 
@@ -526,8 +518,8 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	// has stopped.
 	if err := s.completePendingStopIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID); err != nil {
 		s.logger.Error("operator: failed to complete pending stop request for resolved apply",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
-			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
+			append(finalApply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID, "error", err)...)
 		return
 	}
 }
@@ -558,15 +550,15 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 	apply, err := s.storage.Applies().Get(operationLeaseCtx, op.ApplyID)
 	if err != nil {
 		s.logger.Error("operator: failed to load parent apply for operation drive; operation will not be driven",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_db_id", op.ApplyID,
-			"deployment", op.Deployment, "error", err)
+			append(op.LogAttrs(),
+				"driver", driverID, "error", err)...)
 		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_load_error")
 		return
 	}
 	if apply == nil {
 		s.logger.Error("operator: parent apply not found for claimed operation; operation will not be driven",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_db_id", op.ApplyID,
-			"deployment", op.Deployment)
+			append(op.LogAttrs(),
+				"driver", driverID)...)
 		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_missing")
 		return
 	}
@@ -579,8 +571,8 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 	// empty deployment is a corrupt row with no routing key, so fail closed.
 	if op.Deployment == "" {
 		s.logger.Error("operator: claimed operation is missing deployment metadata; operation will not be driven",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-			"database", apply.Database, "environment", apply.Environment)
+			append(apply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID)...)
 		metrics.RecordOperatorClaimFailure(ctx, "missing_operation_deployment")
 		return
 	}
@@ -592,8 +584,9 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 	// drive. The op lease authorizes the derived-state CAS.
 	if _, err := s.updateApplyStateFromOperations(operationLeaseCtx, driverID, apply, allowLeaseScopedFailedReopen); err != nil {
 		s.logger.Error("operator: failed to project parent running before operation drive; operation will not be driven",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-			"database", apply.Database, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment, "error", err)...)
 		return
 	}
 
@@ -623,8 +616,9 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 		failApply := apply
 		if reloaded, reloadErr := s.storage.Applies().Get(operationLeaseCtx, apply.ID); reloadErr != nil {
 			s.logger.Error("operator: failed to reload parent apply before failing task-less operation; using pre-drive apply state",
-				"driver", driverID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-				"database", apply.Database, "environment", apply.Environment, "error", reloadErr)
+				append(apply.LogAttrs(),
+					"driver", driverID, "apply_operation_id", op.ID,
+					"operation_deployment", op.Deployment, "error", reloadErr)...)
 		} else if reloaded != nil {
 			failApply = reloaded
 		}
@@ -643,8 +637,9 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 	marked, err := s.markOperationFromOwnResult(operationLeaseCtx, driverID, op)
 	if err != nil {
 		s.logger.Error("operator: failed to update apply_operation from its tasks; derived apply state not updated",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment, "error", err)...)
 		return
 	}
 	if !marked {
@@ -656,8 +651,9 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 	// by this operation's own lease (the 6a op-lease branch).
 	if err := s.stopPendingOperationsForPendingStop(operationLeaseCtx, driverID, apply); err != nil {
 		s.logger.Error("operator: failed to stop pending sibling operations for pending stop request; derived apply state not updated",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment, "error", err)...)
 		return
 	}
 
@@ -666,22 +662,25 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 	finalApply, err := s.storage.Applies().Get(operationLeaseCtx, apply.ID)
 	if err != nil {
 		s.logger.Error("operator: failed to reload parent apply after operation drive; derived apply state not updated",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-			"deployment", op.Deployment, "error", err)
+			append(apply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment, "error", err)...)
 		return
 	}
 	if finalApply == nil {
 		s.logger.Error("operator: parent apply not found after operation drive; derived apply state not updated",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-			"deployment", op.Deployment)
+			append(apply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment)...)
 		return
 	}
 
 	result, err := s.updateApplyStateFromOperations(operationLeaseCtx, driverID, finalApply, allowLeaseScopedFailedReopen)
 	if err != nil {
 		s.logger.Error("operator: failed to update derived apply state from apply_operations",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
-			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
+			append(finalApply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment, "error", err)...)
 		return
 	}
 
@@ -693,8 +692,9 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 
 	if err := s.completePendingStopIfApplyResolved(operationLeaseCtx, driverID, finalApply.ID); err != nil {
 		s.logger.Error("operator: failed to complete pending stop request for resolved apply",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
-			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
+			append(finalApply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment, "error", err)...)
 		return
 	}
 }
@@ -729,8 +729,8 @@ func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int
 	opLease := op.Lease()
 	if !opLease.Valid() {
 		s.logger.Error("operator: claimed apply_operation cutover without a valid operation lease token; operation will not be driven",
-			"driver", driverID, "lease_owner", owner, "apply_operation_id", op.ID,
-			"apply_db_id", op.ApplyID, "deployment", op.Deployment)
+			append(op.LogAttrs(),
+				"driver", driverID, "lease_owner", owner)...)
 		metrics.RecordOperatorClaimFailure(ctx, "missing_operation_cutover_lease_token")
 		return true
 	}
@@ -742,15 +742,15 @@ func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int
 	ops, err := s.storage.ApplyOperations().ListByApply(ctx, op.ApplyID)
 	if err != nil {
 		s.logger.Error("operator: failed to list operations for claimed cutover; operation will not be driven",
-			"driver", driverID, "lease_owner", owner, "apply_operation_id", op.ID,
-			"apply_db_id", op.ApplyID, "deployment", op.Deployment, "error", err)
+			append(op.LogAttrs(),
+				"driver", driverID, "lease_owner", owner, "error", err)...)
 		metrics.RecordOperatorClaimFailure(ctx, "operation_cutover_set_list_error")
 		return true
 	}
 	if len(ops) <= 1 || !operationSetContainsID(ops, op.ID) {
 		s.logger.Error("operator: claimed cutover operation is not part of a multi-operation apply set; operation will not be driven",
-			"driver", driverID, "lease_owner", owner, "apply_operation_id", op.ID,
-			"apply_db_id", op.ApplyID, "deployment", op.Deployment, "operation_count", len(ops))
+			append(op.LogAttrs(),
+				"driver", driverID, "lease_owner", owner, "operation_count", len(ops))...)
 		metrics.RecordOperatorClaimFailure(ctx, "operation_cutover_set_invalid")
 		return true
 	}
@@ -829,8 +829,8 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 	// stop).
 	if err := s.markPendingOperationsStopped(applyLeaseCtx, driverID, apply); err != nil {
 		s.logger.Error("operator: failed to stop pending sibling operations during stop reconciliation",
-			"driver", driverID, "apply_id", apply.ApplyIdentifier,
-			"database", apply.Database, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"driver", driverID, "error", err)...)
 		return true
 	}
 
@@ -863,8 +863,8 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 
 	if err := s.completePendingStopIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID); err != nil {
 		s.logger.Error("operator: failed to complete pending stop request after stop reconciliation",
-			"driver", driverID, "apply_id", finalApply.ApplyIdentifier,
-			"database", finalApply.Database, "environment", finalApply.Environment, "error", err)
+			append(finalApply.LogAttrs(),
+				"driver", driverID, "error", err)...)
 		return true
 	}
 	return true
@@ -950,20 +950,16 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, 
 	parent, err := s.storage.Applies().Get(ctx, op.ApplyID)
 	if err != nil {
 		s.logger.Error("operator: failed to load unclaimable parent apply; operation will be retried",
-			"driver", driverID,
-			"apply_operation_id", op.ID,
-			"apply_db_id", op.ApplyID,
-			"deployment", op.Deployment,
-			"error", err)
+			append(op.LogAttrs(),
+				"driver", driverID,
+				"error", err)...)
 		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
 		return
 	}
 	if parent == nil {
 		s.logger.Error("operator: parent apply not found for claimed operation; operation will be retried",
-			"driver", driverID,
-			"apply_operation_id", op.ID,
-			"apply_db_id", op.ApplyID,
-			"deployment", op.Deployment)
+			append(op.LogAttrs(),
+				"driver", driverID)...)
 		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
 		return
 	}
@@ -972,12 +968,10 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, 
 		return
 	}
 	s.logger.Warn("operator: parent apply not claimable for operation; operation will be retried",
-		"driver", driverID,
-		"apply_operation_id", op.ID,
-		"apply_id", parent.ApplyIdentifier,
-		"deployment", op.Deployment,
-		"environment", parent.Environment,
-		"state", parent.State)
+		append(parent.LogAttrs(),
+			"driver", driverID,
+			"apply_operation_id", op.ID,
+			"operation_deployment", op.Deployment)...)
 	metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
 }
 
@@ -992,8 +986,9 @@ func (s *Service) reconcileClaimedOperationFromTerminalParent(ctx context.Contex
 	marked, err := s.markOperationFromApplyState(ctx, driverID, op, parent)
 	if err != nil {
 		s.logger.Error("operator: failed to reconcile apply_operation from terminal parent; derived apply state not updated",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_id", parent.ApplyIdentifier,
-			"deployment", op.Deployment, "environment", parent.Environment, "state", parent.State, "error", err)
+			append(parent.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment, "error", err)...)
 		return
 	}
 	if !marked {
@@ -1001,8 +996,9 @@ func (s *Service) reconcileClaimedOperationFromTerminalParent(ctx context.Contex
 	}
 	if _, err := s.updateApplyStateFromOperations(ctx, driverID, parent, rejectFailedApplyReopen); err != nil {
 		s.logger.Error("operator: failed to update derived apply state for terminal parent",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_id", parent.ApplyIdentifier,
-			"deployment", op.Deployment, "environment", parent.Environment, "error", err)
+			append(parent.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment, "error", err)...)
 		return
 	}
 }
@@ -1019,15 +1015,17 @@ func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, dri
 	const reason = "operation has no tasks; invalid or stale claim"
 	if err := s.storage.ApplyOperations().MarkFailed(opCtx, op.ID, reason); err != nil {
 		s.logger.Error("operator: failed to mark task-less apply_operation failed; operation will be retried",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment, "error", err)...)
 		return
 	}
 	result, err := s.updateApplyStateFromOperations(applyCtx, driverID, apply, allowLeaseScopedFailedReopen)
 	if err != nil {
 		s.logger.Error("operator: failed to update derived apply state after failing task-less operation",
-			"driver", driverID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment, "error", err)...)
 		return
 	}
 
@@ -1732,26 +1730,26 @@ func (s *Service) publishTerminalSummaryIfWon(ctx context.Context, driverID int,
 	terminalApply, err := s.storage.Applies().Get(ctx, apply.ID)
 	if err != nil {
 		s.logger.Error("operator: failed to reload terminal apply for aggregate summary; summary not published",
-			"driver", driverID, "apply_id", apply.ApplyIdentifier,
-			"database", apply.Database, "environment", apply.Environment,
-			"derived_state", result.DerivedState, "operation_count", result.OperationCount, "error", err)
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"derived_state", result.DerivedState, "operation_count", result.OperationCount, "error", err)...)
 		metrics.RecordOperatorTerminalSummaryFailure(ctx, "reload_apply_error")
 		return
 	}
 	if terminalApply == nil {
 		s.logger.Error("operator: terminal apply not found while publishing aggregate summary; summary not published",
-			"driver", driverID, "apply_id", apply.ApplyIdentifier,
-			"database", apply.Database, "environment", apply.Environment,
-			"derived_state", result.DerivedState, "operation_count", result.OperationCount)
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"derived_state", result.DerivedState, "operation_count", result.OperationCount)...)
 		metrics.RecordOperatorTerminalSummaryFailure(ctx, "apply_missing")
 		return
 	}
 	if !state.IsTerminalApplyState(terminalApply.State) {
 		s.logger.Error("operator: reloaded apply is no longer terminal while publishing aggregate summary; summary not published",
-			"driver", driverID, "apply_id", terminalApply.ApplyIdentifier,
-			"database", terminalApply.Database, "environment", terminalApply.Environment,
-			"reloaded_state", terminalApply.State, "derived_state", result.DerivedState,
-			"operation_count", result.OperationCount)
+			append(terminalApply.LogAttrs(),
+				"driver", driverID,
+				"reloaded_state", terminalApply.State, "derived_state", result.DerivedState,
+				"operation_count", result.OperationCount)...)
 		metrics.RecordOperatorTerminalSummaryFailure(ctx, "apply_not_terminal_after_cas")
 		return
 	}
@@ -1761,18 +1759,18 @@ func (s *Service) publishTerminalSummaryIfWon(ctx context.Context, driverID int,
 	tasks, err := s.storage.Tasks().GetByApplyID(ctx, terminalApply.ID)
 	if err != nil {
 		s.logger.Error("operator: failed to reload tasks for aggregate terminal summary; summary not published",
-			"driver", driverID, "apply_id", terminalApply.ApplyIdentifier,
-			"database", terminalApply.Database, "environment", terminalApply.Environment,
-			"derived_state", result.DerivedState, "operation_count", result.OperationCount, "error", err)
+			append(terminalApply.LogAttrs(),
+				"driver", driverID,
+				"derived_state", result.DerivedState, "operation_count", result.OperationCount, "error", err)...)
 		metrics.RecordOperatorTerminalSummaryFailure(ctx, "reload_tasks_error")
 		return
 	}
 
 	if err := s.OnApplyTerminalSummary(ctx, terminalApply, tasks); err != nil {
 		s.logger.Error("operator: aggregate terminal summary publish failed; parent state stays terminal, summary left for reconciliation",
-			"driver", driverID, "apply_id", terminalApply.ApplyIdentifier,
-			"database", terminalApply.Database, "environment", terminalApply.Environment,
-			"derived_state", result.DerivedState, "operation_count", result.OperationCount, "error", err)
+			append(terminalApply.LogAttrs(),
+				"driver", driverID,
+				"derived_state", result.DerivedState, "operation_count", result.OperationCount, "error", err)...)
 		metrics.RecordOperatorTerminalSummaryFailure(ctx, "callback_error")
 		return
 	}

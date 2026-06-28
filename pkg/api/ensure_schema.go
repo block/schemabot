@@ -198,6 +198,7 @@ func EnsureSchema(dsn string, logger *slog.Logger) error {
 			// log search. Include the DDL count and the underlying message so a
 			// failed bootstrap is triageable from the message line alone.
 			logger.Error("storage schema change failed; SchemaBot storage will not initialize",
+				"database", "schemabot",
 				"ddl_count", len(tableChanges),
 				"error", progress.ErrorMessage,
 			)
@@ -229,6 +230,7 @@ func EnsureSchema(dsn string, logger *slog.Logger) error {
 // online DDL) instead of surfacing a bare "context canceled" from the driver.
 func ensureSchemaTimeoutError(ctx context.Context, ddlCount int, logger *slog.Logger) error {
 	logger.Error("storage schema change did not complete before EnsureSchemaTimeout; SchemaBot storage will not initialize",
+		"database", "schemabot",
 		"timeout", EnsureSchemaTimeout,
 		"ddl_count", ddlCount,
 	)

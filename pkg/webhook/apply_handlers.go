@@ -21,7 +21,7 @@ import (
 func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) {
 	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
-		h.logger.Error("apply: failed to bootstrap command", "error", err)
+		h.logger.Error("apply: failed to bootstrap command", "repo", repo, "pr", pr, "database", databaseName, "environment", environment, "error", err)
 		return
 	}
 	defer cancel()
@@ -66,7 +66,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	// Tier 2: PR checks gate — block if non-SchemaBot checks are not passing
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
-		h.logger.Error("failed to fetch PR for checks gate", "error", err)
+		h.logger.Error("failed to fetch PR for checks gate", "repo", repo, "pr", pr, "database", schemaResult.Database, "database_type", schemaResult.Type, "environment", environment, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to fetch PR info: "+err.Error())
 		return
 	}
@@ -87,7 +87,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	// Check for existing lock
 	existingLock, err := h.service.Storage().Locks().Get(ctx, database, dbType)
 	if err != nil {
-		h.logger.Error("failed to check lock", "error", err)
+		h.logger.Error("failed to check lock", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to check lock status: "+err.Error())
 		return
 	}
@@ -136,7 +136,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		relErr := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner)
 		if relErr != nil && !errors.Is(relErr, storage.ErrLockNotFound) && !errors.Is(relErr, storage.ErrLockNotOwned) {
 			h.logger.Error("failed to release stale lock",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "error", relErr)
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", relErr)
 		}
 	}
 
@@ -214,7 +214,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	prInfo, prErr := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if prErr != nil {
 		h.logger.Error("failed to fetch PR for stale-schema check, releasing lock",
-			"repo", repo, "pr", pr, "database", database, "error", prErr)
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", prErr)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to verify PR HEAD before apply: "+prErr.Error())
 		relErr := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner)
 		if relErr != nil && !errors.Is(relErr, storage.ErrLockNotFound) && !errors.Is(relErr, storage.ErrLockNotOwned) {
@@ -337,7 +337,7 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	// against a stale HeadSHA if a new commit landed during this delivery.
 	confirmPRInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
-		h.logger.Error("failed to fetch PR for checks gate", "error", err)
+		h.logger.Error("failed to fetch PR for checks gate", "repo", repo, "pr", pr, "database", schemaResult.Database, "database_type", schemaResult.Type, "environment", environment, "error", err)
 		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Failed to fetch PR info: "+err.Error())
 		return
 	}
@@ -373,7 +373,7 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	// Check lock ownership
 	existingLock, err := h.service.Storage().Locks().Get(ctx, database, dbType)
 	if err != nil {
-		h.logger.Error("failed to check lock", "error", err)
+		h.logger.Error("failed to check lock", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
 		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Failed to check lock status: "+err.Error())
 		return
 	}

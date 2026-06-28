@@ -45,7 +45,7 @@ func (h *Handler) executeApply(
 
 	planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)
 	if err != nil {
-		h.logger.Error("plan execution failed on confirm", "repo", repo, "pr", pr, "error", err)
+		h.logger.Error("plan execution failed on confirm", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
 		return
 	}
@@ -115,7 +115,7 @@ func (h *Handler) executeApply(
 	factory, factoryErr := h.factoryForRepo(repo)
 	if factoryErr != nil {
 		h.logger.Error("apply blocked: cannot resolve GitHub App client for repo",
-			"repo", repo, "pr", pr, "database", database, "environment", environment, "error", factoryErr)
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", factoryErr)
 		return
 	}
 
@@ -134,8 +134,7 @@ func (h *Handler) executeApply(
 			updated, err := h.updateCheckRecordForApplyResult(context.Background(), repo, pr, apply)
 			if err != nil {
 				h.logger.Error("observer: failed to update check record",
-					"repo", repo, "pr", pr, "database", apply.Database,
-					"environment", apply.Environment, "apply_id", apply.ID, "error", err)
+					append(apply.LogAttrs(), "repo", repo, "pr", pr, "apply_db_id", apply.ID, "error", err)...)
 				return
 			}
 			if !updated {
@@ -146,8 +145,8 @@ func (h *Handler) executeApply(
 			ghInstClient, err := factory.ForInstallation(installationID)
 			if err != nil {
 				h.logger.Error("observer: failed to create GitHub client",
-					"repo", repo, "pr", pr, "apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
-					"installation_id", installationID, "error", err)
+					append(apply.LogAttrs(), "repo", repo, "pr", pr, "apply_db_id", apply.ID,
+						"installation_id", installationID, "error", err)...)
 				return
 			}
 			checkRecord, err := h.service.Storage().Checks().Get(context.Background(), repo, pr, apply.Environment, apply.DatabaseType, apply.Database)
@@ -182,7 +181,7 @@ func (h *Handler) executeApply(
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
 		h.service.SetPendingObserver(database, "", environment, nil)
-		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "error", err)
+		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to execute apply: "+err.Error())
 		return
 	}
@@ -200,7 +199,8 @@ func (h *Handler) executeApply(
 		h.service.SetPendingObserver(database, "", environment, nil)
 		h.logger.Error("accepted apply did not return an apply id",
 			"repo", repo, "pr", pr, "database", database,
-			"database_type", schemaResult.Type, "environment", environment)
+			"database_type", schemaResult.Type, "environment", environment,
+			"apply_db_id", applyID, "apply_id", applyResp.ApplyID)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot did not receive a stored apply ID. SchemaBot cannot safely track progress or update required status checks. An operator must reconcile the apply state before retrying.")
 		return
 	}
