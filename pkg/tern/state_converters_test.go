@@ -66,11 +66,11 @@ func TestPSDisplayMetadata(t *testing.T) {
 }
 
 // The display map a data-plane progress poll returns round-trips through
-// EngineDisplayMetadataStorageBlob back into the same display fields when read
+// PSDisplayMetadataStorageBlob back into the same display fields when read
 // via PSDisplayMetadata — the path the control plane uses to mirror a remote
 // apply's deploy-request URL and VSchema status onto its operation so the PR
 // comment can render them.
-func TestEngineDisplayMetadataStorageBlobRoundTrip(t *testing.T) {
+func TestPSDisplayMetadataStorageBlobRoundTrip(t *testing.T) {
 	encodedVSchema, err := apitypes.EncodeVSchemaChanges([]apitypes.VSchemaChange{
 		{Namespace: "commerce_sharded", Status: "applied", Diff: `+ "xxhash": {}`},
 	})
@@ -82,7 +82,7 @@ func TestEngineDisplayMetadataStorageBlobRoundTrip(t *testing.T) {
 		apitypes.VSchemaChangesMetadataKey: encodedVSchema,
 	}
 
-	blob, err := EngineDisplayMetadataStorageBlob(display)
+	blob, err := PSDisplayMetadataStorageBlob(display)
 	require.NoError(t, err)
 	require.NotEmpty(t, blob)
 
@@ -101,12 +101,12 @@ func TestEngineDisplayMetadataStorageBlobRoundTrip(t *testing.T) {
 
 // A display map with nothing worth storing yields an empty blob, so the caller
 // leaves the operation's metadata untouched rather than clobbering it with "{}".
-func TestEngineDisplayMetadataStorageBlobEmpty(t *testing.T) {
-	blob, err := EngineDisplayMetadataStorageBlob(nil)
+func TestPSDisplayMetadataStorageBlobEmpty(t *testing.T) {
+	blob, err := PSDisplayMetadataStorageBlob(nil)
 	require.NoError(t, err)
 	assert.Empty(t, blob)
 
-	blob, err = EngineDisplayMetadataStorageBlob(map[string]string{"volume": "2"})
+	blob, err = PSDisplayMetadataStorageBlob(map[string]string{"volume": "2"})
 	require.NoError(t, err)
 	assert.Empty(t, blob)
 }

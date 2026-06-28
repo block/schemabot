@@ -364,7 +364,7 @@ func PSDisplayMetadata(resumeStateMetadata string) (map[string]string, error) {
 	return m, nil
 }
 
-// EngineDisplayMetadataStorageBlob converts a progress response's display
+// PSDisplayMetadataStorageBlob converts a progress response's display
 // metadata — the map a data-plane progress poll returns (deploy_request_url, the
 // encoded VSchema status, instant/deferred flags) — back into the stored
 // psMetadataForStorage JSON that the PR comment's display projection
@@ -373,7 +373,7 @@ func PSDisplayMetadata(resumeStateMetadata string) (map[string]string, error) {
 // the control-plane operation; mirroring these display fields is how the comment
 // surfaces the deploy-request link and VSchema status. Returns "" when there is
 // nothing worth storing, so callers leave the operation's metadata untouched.
-func EngineDisplayMetadataStorageBlob(md map[string]string) (string, error) {
+func PSDisplayMetadataStorageBlob(md map[string]string) (string, error) {
 	if len(md) == 0 {
 		return "", nil
 	}

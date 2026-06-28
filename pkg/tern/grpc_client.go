@@ -1179,7 +1179,7 @@ func (c *GRPCClient) mirrorRemoteDisplayMetadata(ctx context.Context, apply *sto
 	if c.storage == nil || apply == nil || apply.Engine != storage.EnginePlanetScale {
 		return lastBlob
 	}
-	blob, err := EngineDisplayMetadataStorageBlob(md)
+	blob, err := PSDisplayMetadataStorageBlob(md)
 	if err != nil {
 		slog.Warn("comment may omit engine display metadata: failed to encode remote display metadata",
 			"apply_id", apply.ApplyIdentifier, "error", err)
@@ -1188,46 +1188,46 @@ func (c *GRPCClient) mirrorRemoteDisplayMetadata(ctx context.Context, apply *sto
 	if blob == "" || blob == lastBlob {
 		return lastBlob
 	}
-	opID, err := c.operationIDForDisplayMirror(ctx, apply, scope)
-	if err != nil {
-		slog.Warn("comment may omit engine display metadata: could not resolve apply_operation",
+	// Load the operation so the write can preserve its engine_resume_context (the
+	// remote apply id for a multi-operation drive). SaveEngineResumeState writes
+	// both columns, so if we cannot read the current context we must not write:
+	// clobbering the remote apply id to empty would break resuming the remote
+	// apply after a restart. The mirror is best-effort — skip and retry next poll.
+	op, err := c.operationForDisplayMirror(ctx, apply, scope)
+	if err != nil || op == nil {
+		slog.Warn("comment may omit engine display metadata: could not load apply_operation to preserve resume context",
 			"apply_id", apply.ApplyIdentifier, "error", err)
 		return lastBlob
 	}
-	// Preserve the operation's engine_resume_context (the remote apply id for a
-	// multi-operation drive); SaveEngineResumeState writes both columns.
-	resumeContext := ""
-	if cur, getErr := c.storage.ApplyOperations().Get(ctx, opID); getErr == nil && cur != nil {
-		resumeContext = cur.EngineResumeContext
-	}
-	if err := c.storage.ApplyOperations().SaveEngineResumeState(ctx, opID, &storage.EngineResumeState{
-		ApplyOperationID: opID,
-		MigrationContext: resumeContext,
+	if err := c.storage.ApplyOperations().SaveEngineResumeState(ctx, op.ID, &storage.EngineResumeState{
+		ApplyOperationID: op.ID,
+		MigrationContext: op.EngineResumeContext,
 		Metadata:         blob,
 	}); err != nil {
 		slog.Warn("comment may omit engine display metadata: failed to persist to control-plane operation",
-			"apply_id", apply.ApplyIdentifier, "apply_operation_id", opID, "error", err)
+			"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
 		return lastBlob
 	}
 	return blob
 }
 
-// operationIDForDisplayMirror resolves the apply_operation whose
+// operationForDisplayMirror loads the apply_operation whose
 // engine_resume_metadata should carry the display projection. An
-// operation-scoped drive already knows its operation; a whole-apply
-// (single-operation) drive resolves the apply's sole operation.
-func (c *GRPCClient) operationIDForDisplayMirror(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (int64, error) {
+// operation-scoped drive already knows its operation id; a whole-apply
+// (single-operation) drive resolves the apply's sole operation. The loaded row
+// carries the current engine_resume_context the mirror must preserve.
+func (c *GRPCClient) operationForDisplayMirror(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (*storage.ApplyOperation, error) {
 	if scope.applyOperationID > 0 {
-		return scope.applyOperationID, nil
+		return c.storage.ApplyOperations().Get(ctx, scope.applyOperationID)
 	}
 	ops, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
-		return 0, fmt.Errorf("list apply operations for apply %s: %w", apply.ApplyIdentifier, err)
+		return nil, fmt.Errorf("list apply operations for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if len(ops) != 1 {
-		return 0, fmt.Errorf("apply %s has %d operations; need an operation scope to mirror display metadata", apply.ApplyIdentifier, len(ops))
+		return nil, fmt.Errorf("apply %s has %d operations; need an operation scope to mirror display metadata", apply.ApplyIdentifier, len(ops))
 	}
-	return ops[0].ID, nil
+	return ops[0], nil
 }
 
 // loadApplyTasks loads the task rows the remote drive operates on, scoped either

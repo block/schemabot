@@ -868,6 +868,20 @@ func TestGRPCClientMirrorsRemoteDisplayMetadata(t *testing.T) {
 		assert.Empty(t, client.mirrorRemoteDisplayMetadata(t.Context(), apply, wholeApplyTaskScope(), display, ""))
 		assert.Empty(t, ops.savedResumes)
 	})
+
+	// If the operation can't be loaded, the mirror must skip the write rather than
+	// persist with an empty context — clobbering the remote apply id would break
+	// resuming the remote apply.
+	t.Run("skips the write when the operation cannot be loaded", func(t *testing.T) {
+		ops := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{}} // op 7 absent
+		client := &GRPCClient{storage: &mockStorage{operations: ops}}
+		apply := &storage.Apply{ID: 100, ApplyIdentifier: "apply-x", Engine: storage.EnginePlanetScale}
+		scope := applyTaskScope{applyOperationID: 7, multiOperation: true}
+
+		blob := client.mirrorRemoteDisplayMetadata(t.Context(), apply, scope, display, "")
+		assert.Empty(t, blob, "a failed operation load returns the unchanged lastBlob")
+		assert.Empty(t, ops.savedResumes, "no write when the context can't be preserved")
+	})
 }
 
 func (m *mockStorage) Applies() storage.ApplyStore {
