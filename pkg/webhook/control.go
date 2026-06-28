@@ -287,3 +287,28 @@ func (h *Handler) handleCutoverCommand(repo string, pr int, installationID int64
 		Status:      resp.Status,
 	}))
 }
+
+func (h *Handler) handleSkipRevertCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
+	ctx, cancel := h.commandContext(commandTimeout)
+	defer cancel()
+
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.SkipRevert,
+		h.service.ExecuteSkipRevert,
+		func(r *apitypes.ControlResponse) bool { return r.Accepted },
+		func(r *apitypes.ControlResponse) string { return r.ErrorMessage })
+	if resp == nil {
+		return
+	}
+
+	h.logger.Info("skip-revert PR command accepted",
+		"repo", repo,
+		"pr", pr,
+		"apply_id", result.ApplyID,
+		"environment", result.Environment,
+		"requested_by", requestedBy)
+	h.postComment(repo, pr, installationID, templates.RenderSkipRevertCommandAccepted(templates.SkipRevertCommandAcceptedData{
+		ApplyID:     result.ApplyID,
+		Environment: result.Environment,
+		RequestedBy: requestedBy,
+	}))
+}

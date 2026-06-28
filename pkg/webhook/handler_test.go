@@ -606,13 +606,14 @@ func TestWebhookEyesReaction(t *testing.T) {
 func TestWebhookPhase2CommandNotYetAvailable(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 
-	// Test remaining Phase 2 commands (apply, apply-confirm, unlock, stop, start, and cutover are now implemented)
+	// revert is the only remaining Phase 2 command not yet available via PR
+	// comments (apply, apply-confirm, unlock, stop, start, cutover, and skip-revert
+	// are now implemented).
 	cmds := []struct {
 		comment string
 		action  string
 	}{
 		{"schemabot revert -e staging", "revert"},
-		{"schemabot skip-revert -e staging", "skip-revert"},
 	}
 
 	for _, cmd := range cmds {

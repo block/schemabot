@@ -744,6 +744,12 @@ const (
 	ControlOperationCancel ControlOperation = "cancel"
 	// ControlOperationCutover triggers deferred cutover.
 	ControlOperationCutover ControlOperation = "cutover"
+	// ControlOperationSkipRevert closes the revert window, making a PlanetScale
+	// schema change permanent. Durable so a comment-driven skip-revert survives
+	// the API process dying before the engine call lands, and so the apply owner
+	// (which for a remote apply is the data-plane operator, not the webhook pod)
+	// drives it to completion.
+	ControlOperationSkipRevert ControlOperation = "skip_revert"
 	// ControlOperationRelease releases a rollout paused after a failure under
 	// on_failure 'pause', letting the held later deployments proceed (like
 	// 'continue'). It is a one-way latch and is deliberately distinct from

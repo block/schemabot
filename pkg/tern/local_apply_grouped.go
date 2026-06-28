@@ -786,6 +786,30 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		ps.revertSkipped = true
 	}
 
+	// A durable skip-revert control request (the interactive "skip now" command,
+	// vs the upfront --skip-revert flag above) was queued; honor it. This is the
+	// apply owner's retry path: the API's immediate skip attempt may have failed
+	// or its process may have died, leaving the request pending for the drive.
+	if result.State == engine.StateRevertWindow && !ps.revertSkipped {
+		if pending, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationSkipRevert); err != nil {
+			c.logger.Warn("could not load pending skip-revert control request", "apply_id", apply.ApplyIdentifier, "error", err)
+		} else if pending != nil {
+			c.logger.Info("skip-revert requested by user; closing revert window", "apply_id", apply.ApplyIdentifier)
+			if _, err := eng.SkipRevert(ctx, controlReq); err != nil {
+				// Leave the request pending so the next drive tick retries.
+				c.logger.Error("skip-revert (control request) failed; will retry", "error", err, "apply_id", apply.ApplyIdentifier)
+			} else {
+				c.markRevertSkipped(ctx, apply)
+				ps.revertSkipped = true
+				if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationSkipRevert); err != nil {
+					c.logger.Warn("failed to complete skip-revert control request", "apply_id", apply.ApplyIdentifier, "error", err)
+				}
+				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
+					"Skip-revert triggered by user", state.Apply.RevertWindow, "")
+			}
+		}
+	}
+
 	// Revert window enabled (default): auto-skip based on deployed_at + configured duration.
 	// Falls back to stateEnteredAt if deployed_at is unavailable.
 	if result.State == engine.StateRevertWindow && !opts.SkipRevert && !ps.revertSkipped {

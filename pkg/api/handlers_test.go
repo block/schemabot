@@ -204,6 +204,9 @@ func (s *staticApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifi
 func (s *staticApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
 	return s.apply, s.err
 }
+func (s *staticApplyStore) SetRevertSkipped(context.Context, int64, time.Time) error {
+	return nil
+}
 func (s *staticApplyStore) GetByDatabase(_ context.Context, database, dbType, environment string) ([]*storage.Apply, error) {
 	if s.err != nil {
 		return nil, s.err
@@ -5079,7 +5082,12 @@ func TestSkipRevertHandler(t *testing.T) {
 		mock := &mockTernClient{
 			skipRevertResp: &ternv1.SkipRevertResponse{Accepted: true},
 		}
-		svc := newControlTestService(mock, activeTestApply("apply-skip456"))
+		// Skip-revert is only accepted while the apply is in its revert window.
+		apply := activeTestApply("apply-skip456")
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EnginePlanetScale
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		svc := newControlTestService(mock, apply)
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 

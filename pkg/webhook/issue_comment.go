@@ -304,8 +304,13 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.handleCutoverCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "cutover started"})
+	case action.SkipRevert:
+		h.goSafe(repo, pr, installationID, func() {
+			h.handleSkipRevertCommand(repo, pr, installationID, requestedBy, result)
+		})
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "skip-revert started"})
 	// Phase 2 commands — acknowledge but not yet implemented
-	case action.Revert, action.SkipRevert:
+	case action.Revert:
 		h.postComment(repo, pr, installationID,
 			templates.RenderCommandNotYetAvailable(result.Action, result.Environment))
 		h.writeJSON(w, http.StatusOK, map[string]string{
