@@ -7,11 +7,16 @@ package storage
 //	logger.Error("failed to drive apply", append(apply.LogAttrs(), "error", err)...)
 //
 // A nil receiver returns nil so callers on not-found paths can log safely.
+//
+// apply_id is the searchable string identifier; the internal numeric row ID is
+// deliberately not logged so it can't be confused with the user-facing id.
+// external_id (the remote data plane's identifier for this apply) is included
+// only when set, so operators can correlate to the data plane during triage.
 func (a *Apply) LogAttrs() []any {
 	if a == nil {
 		return nil
 	}
-	return []any{
+	attrs := []any{
 		"apply_id", a.ApplyIdentifier,
 		"database", a.Database,
 		"database_type", a.DatabaseType,
@@ -19,6 +24,10 @@ func (a *Apply) LogAttrs() []any {
 		"deployment", a.Deployment,
 		"state", a.State,
 	}
+	if a.ExternalID != "" {
+		attrs = append(attrs, "external_id", a.ExternalID)
+	}
+	return attrs
 }
 
 // LogAttrs returns the canonical triage attributes for an apply_operation. The
@@ -26,17 +35,24 @@ func (a *Apply) LogAttrs() []any {
 // the operation is in scope these identifiers (plus deployment and kind) are what
 // pin down the stuck operation; once the parent apply is loaded, prefer
 // Apply.LogAttrs for the database/environment context. A nil receiver returns nil.
+//
+// deployment here is the operation's own (authoritative routing) deployment.
+// external_id (the remote data plane's identifier for this operation) is included
+// only when set.
 func (op *ApplyOperation) LogAttrs() []any {
 	if op == nil {
 		return nil
 	}
-	return []any{
+	attrs := []any{
 		"apply_operation_id", op.ID,
-		"apply_db_id", op.ApplyID,
 		"deployment", op.Deployment,
 		"operation_kind", op.OperationKind,
 		"state", op.State,
 	}
+	if op.ExternalID != "" {
+		attrs = append(attrs, "external_id", op.ExternalID)
+	}
+	return attrs
 }
 
 // LogAttrs returns the canonical triage attributes for a task: which task, on
@@ -48,7 +64,6 @@ func (t *Task) LogAttrs() []any {
 	}
 	return []any{
 		"task_id", t.TaskIdentifier,
-		"apply_db_id", t.ApplyID,
 		"database", t.Database,
 		"database_type", t.DatabaseType,
 		"environment", t.Environment,

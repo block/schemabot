@@ -464,7 +464,7 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	if err != nil {
 		s.logger.Error("operator: failed to update apply_operation from its tasks; derived apply state not updated",
 			append(apply.LogAttrs(),
-				"driver", driverID, "apply_operation_id", op.ID, "error", err)...)
+				"driver", driverID, "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "error", err)...)
 		return
 	}
 	if !marked {
@@ -480,7 +480,7 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	if err := s.stopPendingOperationsForPendingStop(applyLeaseCtx, driverID, apply); err != nil {
 		s.logger.Error("operator: failed to stop pending sibling operations for pending stop request; derived apply state not updated",
 			append(apply.LogAttrs(),
-				"driver", driverID, "apply_operation_id", op.ID, "error", err)...)
+				"driver", driverID, "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "error", err)...)
 		return
 	}
 
@@ -495,6 +495,7 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 			append(apply.LogAttrs(),
 				"driver", driverID,
 				"apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment,
 				"error", err)...)
 		return
 	}
@@ -502,14 +503,15 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 		s.logger.Error("operator: parent apply not found after resume; derived apply state not updated",
 			append(apply.LogAttrs(),
 				"driver", driverID,
-				"apply_operation_id", op.ID)...)
+				"apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment)...)
 		return
 	}
 
 	if _, err := s.updateApplyStateFromOperations(applyLeaseCtx, driverID, finalApply, allowLeaseScopedFailedReopen); err != nil {
 		s.logger.Error("operator: failed to update derived apply state from apply_operations",
 			append(finalApply.LogAttrs(),
-				"driver", driverID, "apply_operation_id", op.ID, "error", err)...)
+				"driver", driverID, "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "error", err)...)
 		return
 	}
 
@@ -519,7 +521,7 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	if err := s.completePendingStopIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID); err != nil {
 		s.logger.Error("operator: failed to complete pending stop request for resolved apply",
 			append(finalApply.LogAttrs(),
-				"driver", driverID, "apply_operation_id", op.ID, "error", err)...)
+				"driver", driverID, "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "error", err)...)
 		return
 	}
 }

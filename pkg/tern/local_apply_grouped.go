@@ -853,7 +853,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	}
 	if freshApply == nil {
 		c.logger.Warn("apply row missing before progress state update; yielding",
-			append(apply.LogAttrs(), "apply_db_id", apply.ID)...)
+			apply.LogAttrs()...)
 		return true
 	}
 	if state.IsTerminalApplyState(freshApply.State) {

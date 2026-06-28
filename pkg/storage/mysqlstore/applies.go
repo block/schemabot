@@ -1574,7 +1574,6 @@ func refuseStoppedClaimForActiveTarget(ctx context.Context, tx *sql.Tx, apply *s
 	}
 	slog.WarnContext(ctx, "claim refused: another active apply exists for target; failing pending start control request",
 		"apply_id", apply.ApplyIdentifier,
-		"apply_db_id", apply.ID,
 		"database", database,
 		"database_type", dbType,
 		"environment", environment,

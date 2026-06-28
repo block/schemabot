@@ -134,7 +134,7 @@ func (h *Handler) executeApply(
 			updated, err := h.updateCheckRecordForApplyResult(context.Background(), repo, pr, apply)
 			if err != nil {
 				h.logger.Error("observer: failed to update check record",
-					append(apply.LogAttrs(), "repo", repo, "pr", pr, "apply_db_id", apply.ID, "error", err)...)
+					append(apply.LogAttrs(), "repo", repo, "pr", pr, "error", err)...)
 				return
 			}
 			if !updated {
@@ -145,7 +145,7 @@ func (h *Handler) executeApply(
 			ghInstClient, err := factory.ForInstallation(installationID)
 			if err != nil {
 				h.logger.Error("observer: failed to create GitHub client",
-					append(apply.LogAttrs(), "repo", repo, "pr", pr, "apply_db_id", apply.ID,
+					append(apply.LogAttrs(), "repo", repo, "pr", pr,
 						"installation_id", installationID, "error", err)...)
 				return
 			}
@@ -200,7 +200,7 @@ func (h *Handler) executeApply(
 		h.logger.Error("accepted apply did not return an apply id",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", schemaResult.Type, "environment", environment,
-			"apply_db_id", applyID, "apply_id", applyResp.ApplyID)
+			"apply_id", applyResp.ApplyID)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot did not receive a stored apply ID. SchemaBot cannot safely track progress or update required status checks. An operator must reconcile the apply state before retrying.")
 		return
 	}

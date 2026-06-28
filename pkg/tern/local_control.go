@@ -673,12 +673,12 @@ func (c *LocalClient) resolveRevertWindowApplyIdentifier(ctx context.Context, re
 	apply, err := c.storage.Applies().Get(ctx, revertTask.ApplyID)
 	if err != nil {
 		c.logger.Warn("could not load apply to resolve revert-window stop identifier; using task identifier",
-			"apply_db_id", revertTask.ApplyID, "task_id", revertTask.TaskIdentifier, "error", err)
+			"task_id", revertTask.TaskIdentifier, "error", err)
 		return revertTask.TaskIdentifier
 	}
 	if apply == nil {
 		c.logger.Warn("apply not found while resolving revert-window stop identifier; using task identifier",
-			"apply_db_id", revertTask.ApplyID, "task_id", revertTask.TaskIdentifier)
+			"task_id", revertTask.TaskIdentifier)
 		return revertTask.TaskIdentifier
 	}
 	return apply.ApplyIdentifier

@@ -2317,7 +2317,6 @@ func (c *GRPCClient) completeApplyStartRequestForScope(ctx context.Context, appl
 	if scope.usesOperationRemoteResume() {
 		slog.Debug("skipping apply-level start request completion during multi-operation drive; shared start request is owned by the rollout projection",
 			"apply_id", apply.ApplyIdentifier,
-			"apply_db_id", apply.ID,
 			"apply_operation_id", scope.applyOperationID,
 			"deployment", scope.operation.Deployment,
 			"environment", apply.Environment)
@@ -2335,7 +2334,6 @@ func (c *GRPCClient) persistParentApply(ctx context.Context, apply *storage.Appl
 	if scope.suppressesDirectParentApplyWrites() {
 		slog.Debug("skipping direct parent apply write during multi-operation drive; parent state is owned by the rollout projection",
 			"apply_id", apply.ApplyIdentifier,
-			"apply_db_id", apply.ID,
 			"apply_operation_id", scope.applyOperationID,
 			"deployment", scope.operation.Deployment,
 			"environment", apply.Environment,
@@ -2431,7 +2429,6 @@ func (c *GRPCClient) markRemoteApplyFailedWithOptions(ctx context.Context, remot
 		}
 		slog.Debug("recorded operation task failures during multi-operation drive; parent failure is owned by the rollout projection",
 			"apply_id", storedApply.ApplyIdentifier,
-			"apply_db_id", storedApply.ID,
 			"apply_operation_id", scope.applyOperationID,
 			"deployment", scope.operation.Deployment,
 			"environment", storedApply.Environment,
@@ -2553,7 +2550,6 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 		}
 		slog.Debug("skipping parent terminal write during multi-operation drive; operation tasks are resolved and parent state is owned by the rollout projection",
 			"apply_id", storedApply.ApplyIdentifier,
-			"apply_db_id", storedApply.ID,
 			"apply_operation_id", scope.applyOperationID,
 			"deployment", scope.operation.Deployment,
 			"environment", storedApply.Environment,

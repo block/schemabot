@@ -275,7 +275,6 @@ func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *stora
 		// Serve progress without the enrichment and log the storage uncertainty.
 		s.logger.Warn("progress response will omit per-deployment operations",
 			"apply_id", apply.ApplyIdentifier,
-			"apply_db_id", apply.ID,
 			"database", apply.Database,
 			"environment", apply.Environment,
 			"error", err)

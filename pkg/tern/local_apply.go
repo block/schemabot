@@ -157,7 +157,7 @@ func (c *LocalClient) logApplyEvent(ctx context.Context, applyID int64, taskID *
 		CreatedAt: time.Now(),
 	}
 	if err := c.storage.ApplyLogs().Append(ctx, log); err != nil {
-		c.logger.Warn("failed to log apply event", "apply_id", applyID, "error", err, "event", eventType, "message", message)
+		c.logger.Warn("failed to log apply event", "error", err, "event", eventType, "message", message)
 	}
 }
 
