@@ -77,6 +77,31 @@ func TestWriteProgressMultiDeploymentContinueFailureShowsRunningDegraded(t *test
 	assert.NotContains(t, output, "Next: review failure")
 }
 
+// Under on_failure pause a failed deployment with a held sibling renders the
+// paused "release or stop" guidance; once the apply-level release latch is set
+// (Released), the same rollout renders running degraded instead — the CLI
+// applies the latch so it matches what the operator will claim next.
+func TestWriteProgressMultiDeploymentReleasedPauseRendersDegradedNotPaused(t *testing.T) {
+	data := ProgressData{
+		ApplyID:     "apply-paused",
+		Environment: "production",
+		State:       state.Apply.Paused,
+		Operations: []ProgressOperation{
+			{Deployment: "region-a", Target: "orders-a", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailurePause, ErrorMessage: "duplicate column name 'region'"},
+			{Deployment: "region-b", Target: "orders-b", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailurePause},
+		},
+	}
+
+	paused := captureStdout(t, func() { WriteProgress(data) })
+	assert.Contains(t, paused, "paused — region-a failed; release or stop")
+
+	data.State = state.Apply.RunningDegraded
+	data.Released = true
+	released := captureStdout(t, func() { WriteProgress(data) })
+	assert.NotContains(t, released, "paused — region-a failed; release or stop")
+	assert.Contains(t, released, "running (degraded)")
+}
+
 func TestWriteProgressSingleDeploymentDoesNotRenderMultiDeploymentAggregate(t *testing.T) {
 	data := ProgressData{
 		ApplyID:     "apply-single",

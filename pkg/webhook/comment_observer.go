@@ -408,7 +408,7 @@ func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*stor
 			"apply_id", o.applyID, "error", opsErr)
 		return formatProgressComment(apply, tasks, shardsByTable)
 	}
-	return formatApplyStatusComment(apply, ops, tasks, o.resolveDisplay(apply, ops), shardsByTable)
+	return formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable)
 }
 
 // resolveDisplay projects the apply's per-operation engine display state (VSchema
@@ -419,6 +419,16 @@ func (o *CommentObserver) resolveDisplay(apply *storage.Apply, ops []*storage.Ap
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return resolveDisplayByOperation(ctx, o.stor, apply, ops)
+}
+
+// resolveReleased reports whether the apply's paused rollout has been released
+// open, for comment rendering. It uses a short, independent deadline so a slow
+// storage read degrades to an unreleased (paused) render rather than blocking
+// the update.
+func (o *CommentObserver) resolveReleased(apply *storage.Apply, ops []*storage.ApplyOperation) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return releasedForApply(ctx, o.stor, apply, ops, o.logger)
 }
 
 // formatTerminalSummaryComment renders the apply's terminal summary comment,
@@ -447,7 +457,7 @@ func (o *CommentObserver) summaryCommentFromOps(apply *storage.Apply, ops []*sto
 			"apply_id", o.applyID, "error", opsErr)
 		return formatSummaryComment(apply, tasks, shardsByTable)
 	}
-	return formatApplySummaryComment(apply, ops, tasks, o.resolveDisplay(apply, ops), shardsByTable)
+	return formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable)
 }
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {

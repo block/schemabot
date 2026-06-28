@@ -30,6 +30,10 @@ type ProgressData struct {
 	Tables         []TableProgress
 	Options        map[string]string // Apply options (defer_cutover, skip_revert, etc.)
 	Metadata       map[string]string // Engine metadata (e.g., deploy_request_url, branch_name)
+	// Released is true when an operator has released a paused rollout open, so a
+	// deployment that failed under on_failure=pause no longer holds later
+	// deployments. Apply-level: it applies to every operation of the apply.
+	Released bool
 }
 
 // ProgressOperation represents progress for one deployment operation.
@@ -144,6 +148,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		CompletedAt:  result.CompletedAt,
 		Options:      result.Options,
 		Metadata:     result.Metadata,
+		Released:     result.Released,
 	}
 
 	for _, op := range result.Operations {

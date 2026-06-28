@@ -13,7 +13,7 @@ import (
 )
 
 func writeMultiDeploymentProgress(data ProgressData) {
-	model := presentation.Derive(progressOperationsForPresentation(data.Operations))
+	model := presentation.Derive(progressOperationsForPresentation(data.Operations, data.Released))
 
 	writeMultiDeploymentHeader(data, model)
 	writeMultiDeploymentFirstFailure(model.FirstFailure)
@@ -25,7 +25,11 @@ func writeMultiDeploymentProgress(data ProgressData) {
 	}
 }
 
-func progressOperationsForPresentation(ops []ProgressOperation) []presentation.Operation {
+// progressOperationsForPresentation maps the parsed progress operations to the
+// surface-neutral presentation inputs. released is the apply-level release latch
+// (from ProgressData.Released): a released pause behaves like continue, so the
+// held siblings proceed and the aggregate runs degraded instead of paused.
+func progressOperationsForPresentation(ops []ProgressOperation, released bool) []presentation.Operation {
 	presentationOps := make([]presentation.Operation, 0, len(ops))
 	for _, op := range ops {
 		presentationOps = append(presentationOps, presentation.Operation{
@@ -35,6 +39,7 @@ func progressOperationsForPresentation(ops []ProgressOperation) []presentation.O
 			Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
 			ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
 			PauseOnFailure:    op.OnFailure == storage.OnFailurePause,
+			Released:          released,
 			Error:             op.ErrorMessage,
 		})
 	}

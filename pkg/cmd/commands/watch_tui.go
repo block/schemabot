@@ -35,6 +35,7 @@ type WatchModel struct {
 	state         string
 	tables        []tableProgress
 	operations    []templates.ProgressOperation
+	released      bool // apply-level release latch: a released pause runs degraded, not paused
 	errorMsg      string
 	currentVolume int // Current volume (1-11)
 
@@ -110,6 +111,7 @@ type progressMsg struct {
 	state       string
 	tables      []tableProgress
 	operations  []templates.ProgressOperation
+	released    bool   // apply-level release latch: a released pause runs degraded, not paused
 	errorMsg    string // Human-readable error message
 	failed      bool   // true when the API call didn't return usable progress data
 	retryable   bool   // when failed, whether the TUI should keep polling
@@ -244,6 +246,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.tables = msg.tables
 		}
 		m.operations = msg.operations
+		m.released = msg.released
 		m.errorMsg = msg.errorMsg
 
 		// Timeout skip-revert if state hasn't transitioned after 10s.

@@ -22,7 +22,7 @@ func TestFormatApplyStatusComment_ShardedAttributionFromCaller(t *testing.T) {
 	oid := int64(1)
 	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: "-40", DDL: "ALTER TABLE `mutes` ADD INDEX a"}}
 
-	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, tasks, nil, nil)
+	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil)
 
 	assert.Contains(t, out, "by @morgo at", "attribution shows the clean username")
 	assert.NotContains(t, out, "github:", "the raw structured caller is not rendered")
@@ -100,7 +100,7 @@ func TestFormatApplyStatusComment_ShardedFailedSurfacesError(t *testing.T) {
 	}
 	tasks := []*storage.Task{task(1, 1, "-40"), task(2, 2, "40-80"), task(3, 3, "80-c0"), task(4, 4, "c0-")}
 
-	out := formatApplyStatusComment(apply, ops, tasks, nil, nil)
+	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil)
 
 	assert.Contains(t, out, "❌ Schema Change Failed", "uses the shard-unit failed headline")
 	assert.Contains(t, out, "**Shards**:", "counts shards, not deployments")
@@ -127,7 +127,7 @@ func TestFormatApplyStatusComment_ShardedFailureFallsBackToTaskError(t *testing.
 	oid := int64(1)
 	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: "-40", DDL: "ALTER ...", ErrorMessage: gotZero}}
 
-	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, tasks, nil, nil)
+	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil)
 
 	assert.Contains(t, out, gotZero, "the task error is surfaced when the operation row has none")
 }
@@ -150,7 +150,7 @@ func TestBuildShardedApplyData_DivergentGroupsByTable(t *testing.T) {
 	}
 	tasks := []*storage.Task{tk(1, 1, "mutes"), tk(2, 2, "mutes"), tk(3, 3, "blocks")}
 
-	data := buildShardedApplyData(apply, ops, tasks)
+	data := buildShardedApplyData(apply, ops, false, tasks)
 
 	assert.Equal(t, "ks", data.Keyspace)
 	require.Len(t, data.Cells, 3)
@@ -173,7 +173,7 @@ func TestBuildShardedApplyData_JoinsMultiTaskDDL(t *testing.T) {
 		{ID: 3, ApplyID: 1, ApplyOperationID: &oid, Namespace: "ks", TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX b"},
 	}
 
-	data := buildShardedApplyData(apply, []*storage.ApplyOperation{op}, tasks)
+	data := buildShardedApplyData(apply, []*storage.ApplyOperation{op}, false, tasks)
 
 	require.Len(t, data.Cells, 1)
 	assert.Equal(t, "ALTER TABLE `mutes` ADD INDEX a\nALTER TABLE `mutes` ADD INDEX b", data.Cells[0].DDL,

@@ -439,6 +439,11 @@ type ProgressResponse struct {
 	Volume       int32                        `json:"volume,omitempty"`   // Current volume setting (1-11)
 	Options      map[string]string            `json:"options,omitempty"`  // Apply options (defer_cutover, skip_revert, etc.)
 	Metadata     map[string]string            `json:"metadata,omitempty"` // Engine-specific data
+	// Released is true when an operator has released a paused rollout open via a
+	// release control request, so a deployment that failed under
+	// on_failure=pause no longer holds later deployments — the rollout proceeds
+	// like continue. Apply-level: it applies to every operation of the apply.
+	Released bool `json:"released,omitempty"`
 }
 
 // ProgressOperationResponse represents progress for one deployment operation.

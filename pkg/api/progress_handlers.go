@@ -237,16 +237,30 @@ func progressOperationResponseFromStorage(op *storage.ApplyOperation) *apitypes.
 	return resp
 }
 
-func (s *Service) progressOperationsForApply(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]string, error) {
+func (s *Service) progressOperationsForApply(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]string, []*storage.ApplyOperation, error) {
 	if apply == nil {
-		return nil, nil, fmt.Errorf("apply is required")
+		return nil, nil, nil, fmt.Errorf("apply is required")
 	}
 	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("list apply operations for apply %d (%s): %w", apply.ID, apply.ApplyIdentifier, err)
+		return nil, nil, nil, fmt.Errorf("list apply operations for apply %d (%s): %w", apply.ID, apply.ApplyIdentifier, err)
 	}
 	responses, deploymentByOperationID := progressOperationsFromRows(ops)
-	return responses, deploymentByOperationID, nil
+	return responses, deploymentByOperationID, ops, nil
+}
+
+// resolveReleaseLatch best-effort reports whether a paused rollout has been
+// released open, for progress enrichment. Release state is observability, not
+// an apply safety gate, so a latch read failure is logged and treated as
+// unreleased (fail-closed) rather than failing the progress response.
+func (s *Service) resolveReleaseLatch(ctx context.Context, apply *storage.Apply, ops []*storage.ApplyOperation) bool {
+	released, err := storage.ReleaseLatched(ctx, s.storage, apply.ID, ops)
+	if err != nil {
+		s.logger.Warn("progress response will treat rollout as unreleased: failed to load release latch",
+			"apply_id", apply.ApplyIdentifier, "database", apply.Database, "environment", apply.Environment, "error", err)
+		return false
+	}
+	return released
 }
 
 // progressOperationsFromRows projects already-fetched operation rows into the
@@ -264,12 +278,12 @@ func progressOperationsFromRows(ops []*storage.ApplyOperation) ([]*apitypes.Prog
 	return responses, deploymentByOperationID
 }
 
-func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]string) {
+func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]string, bool) {
 	if apply == nil {
 		s.logger.Warn("progress response will omit per-deployment operations: apply is nil")
-		return nil, nil
+		return nil, nil, false
 	}
-	operations, deploymentByOperationID, err := s.progressOperationsForApply(ctx, apply)
+	operations, deploymentByOperationID, ops, err := s.progressOperationsForApply(ctx, apply)
 	if err != nil {
 		// Operation rows are observability enrichment, not an apply safety gate.
 		// Serve progress without the enrichment and log the storage uncertainty.
@@ -278,9 +292,9 @@ func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *stora
 			"database", apply.Database,
 			"environment", apply.Environment,
 			"error", err)
-		return nil, nil
+		return nil, nil, false
 	}
-	return operations, deploymentByOperationID
+	return operations, deploymentByOperationID, s.resolveReleaseLatch(ctx, apply, ops)
 }
 
 // handleProgressByApplyID handles GET /api/progress/apply/{apply_id} requests.
@@ -392,6 +406,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// a storage error (already logged) just omits the per-deployment breakdown.
 	if opsErr == nil {
 		httpResp.Operations, _ = progressOperationsFromRows(ops)
+		httpResp.Released = s.resolveReleaseLatch(r.Context(), apply, ops)
 	}
 	httpResp.ApplyID = apply.ApplyIdentifier
 	httpResp.Database = apply.Database
@@ -983,8 +998,9 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	}
 	overlayApplyOptions(httpResp, apply)
 	setRevertSkippedMetadata(httpResp, apply)
-	operations, deploymentByOperationID := s.bestEffortProgressOperations(ctx, apply)
+	operations, deploymentByOperationID, released := s.bestEffortProgressOperations(ctx, apply)
 	httpResp.Operations = operations
+	httpResp.Released = released
 	s.overlayStoredDisplayMetadata(ctx, httpResp, apply, deploymentByOperationID)
 
 	for _, task := range tasks {

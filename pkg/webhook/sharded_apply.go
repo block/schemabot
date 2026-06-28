@@ -76,7 +76,7 @@ func isShardedApply(ops []*storage.ApplyOperation) bool {
 // ("waiting for `-40`", "halted — `-40` failed") reference shards. Finalizer
 // (VSchema) operations are not shard work and are omitted from the shard view;
 // their outcome is still reflected in the aggregate headline state.
-func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task) templates.ShardedApplyData {
+func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task) templates.ShardedApplyData {
 	tasksByOp := groupTasksByOperation(tasks)
 	// Tasks arrive in created_at DESC order with no id tiebreaker. Sort each
 	// operation's tasks by id so the joined DDL (and the change signature derived
@@ -126,7 +126,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		Keyspace:    keyspace,
 		ApplyID:     apply.ApplyIdentifier,
 		RequestedBy: actorFromCaller(apply.Caller),
-		Shards:      shardStatuses(shardOrder, opsByShard, tasksByOp),
+		Shards:      shardStatuses(shardOrder, opsByShard, released, tasksByOp),
 		Cells:       cells,
 	}
 	if apply.StartedAt != nil {
@@ -142,7 +142,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 // aggregated to a single representative state, then the shards are projected
 // together through pkg/presentation (shard name as identity) so ordering labels
 // reference sibling shards.
-func shardStatuses(shardOrder []string, opsByShard map[string][]*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task) []templates.ShardStatus {
+func shardStatuses(shardOrder []string, opsByShard map[string][]*storage.ApplyOperation, released bool, tasksByOp map[int64][]*storage.Task) []templates.ShardStatus {
 	inputs := make([]presentation.Operation, 0, len(shardOrder))
 	for _, shard := range shardOrder {
 		shardOps := opsByShard[shard]
@@ -155,6 +155,7 @@ func shardStatuses(shardOrder []string, opsByShard map[string][]*storage.ApplyOp
 			Parallel:          first.CutoverPolicy == storage.CutoverPolicyParallel,
 			ContinueOnFailure: first.OnFailure == storage.OnFailureContinue,
 			PauseOnFailure:    first.OnFailure == storage.OnFailurePause,
+			Released:          released,
 			Error:             errMsg,
 		})
 	}

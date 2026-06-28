@@ -226,6 +226,7 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 	msg := progressMsg{
 		state:       data.State,
 		operations:  data.Operations,
+		released:    data.Released,
 		errorMsg:    data.ErrorMessage,
 		volume:      int(result.Volume),
 		applyID:     result.ApplyID,

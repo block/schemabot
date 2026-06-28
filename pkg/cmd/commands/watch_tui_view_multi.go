@@ -13,7 +13,7 @@ import (
 )
 
 func (m WatchModel) multiDeploymentProgressView() string {
-	model := presentation.Derive(tuiOperationsForPresentation(m.operations))
+	model := presentation.Derive(tuiOperationsForPresentation(m.operations, m.released))
 
 	var b strings.Builder
 	m.writeMultiDeploymentHeader(&b, model)
@@ -26,7 +26,11 @@ func (m WatchModel) multiDeploymentProgressView() string {
 	return b.String()
 }
 
-func tuiOperationsForPresentation(ops []templates.ProgressOperation) []presentation.Operation {
+// tuiOperationsForPresentation maps the watch model's progress operations to the
+// surface-neutral presentation inputs. released is the apply-level release latch:
+// a released pause behaves like continue, so the held siblings proceed and the
+// aggregate runs degraded instead of paused.
+func tuiOperationsForPresentation(ops []templates.ProgressOperation, released bool) []presentation.Operation {
 	presentationOps := make([]presentation.Operation, 0, len(ops))
 	for _, op := range ops {
 		presentationOps = append(presentationOps, presentation.Operation{
@@ -36,6 +40,7 @@ func tuiOperationsForPresentation(ops []templates.ProgressOperation) []presentat
 			Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
 			ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
 			PauseOnFailure:    op.OnFailure == storage.OnFailurePause,
+			Released:          released,
 			Error:             op.ErrorMessage,
 		})
 	}
