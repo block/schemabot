@@ -37,8 +37,9 @@ func (a *Apply) LogAttrs() []any {
 // Apply.LogAttrs for the database/environment context. A nil receiver returns nil.
 //
 // deployment here is the operation's own (authoritative routing) deployment.
-// external_id (the remote data plane's identifier for this operation) is included
-// only when set.
+// external_id (the remote data plane's apply identifier for this operation) and
+// external_operation_id (the remote data plane's operation handle) are included
+// only when set, so operators can correlate a stuck operation to the data plane.
 func (op *ApplyOperation) LogAttrs() []any {
 	if op == nil {
 		return nil
@@ -51,6 +52,9 @@ func (op *ApplyOperation) LogAttrs() []any {
 	}
 	if op.ExternalID != "" {
 		attrs = append(attrs, "external_id", op.ExternalID)
+	}
+	if op.ExternalOperationID != "" {
+		attrs = append(attrs, "external_operation_id", op.ExternalOperationID)
 	}
 	return attrs
 }
