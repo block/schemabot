@@ -600,14 +600,14 @@ type ApplyOperation struct {
 	// semantics. Empty for legacy / single-deployment shapes.
 	Target string
 
-	// ExternalID is the remote data plane's apply_id for this operation. It is
-	// scoped to the operation because a multi-operation parent apply has no
-	// single authoritative remote apply id.
+	// ExternalID is the remote data plane's stable apply identifier for this
+	// operation. It is scoped to the operation because a multi-operation parent
+	// apply has no single authoritative remote apply identifier.
 	ExternalID string
 
-	// ExternalOperationID is the remote data plane's apply_operation_id for this
-	// operation. Empty for local applies and for remote data planes that do not
-	// return operation IDs.
+	// ExternalOperationID is the remote data plane's numeric operation row ID for
+	// this operation. Empty for local applies and for remote data planes that do
+	// not return operation IDs.
 	ExternalOperationID string
 
 	// State is the per-operation state machine value. See state.ApplyOperation.

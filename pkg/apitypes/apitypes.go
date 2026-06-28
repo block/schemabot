@@ -434,8 +434,10 @@ type ProgressResponse struct {
 
 // ProgressOperationResponse represents progress for one deployment operation.
 type ProgressOperationResponse struct {
-	Deployment          string `json:"deployment"`
-	ExternalID          string `json:"external_id,omitempty"`
+	Deployment string `json:"deployment"`
+	// ExternalID is the remote data plane's stable apply identifier.
+	ExternalID string `json:"external_id,omitempty"`
+	// ExternalOperationID is the remote data plane's numeric operation row ID.
 	ExternalOperationID string `json:"external_operation_id,omitempty"`
 	OperationKind       string `json:"operation_kind,omitempty"`
 	Target              string `json:"target,omitempty"`
@@ -511,8 +513,10 @@ type DatabaseHistoryResponse struct {
 
 // ActiveApplyResponse represents a schema change in the status list.
 type ActiveApplyResponse struct {
-	ApplyID             string `json:"apply_id"`
-	ExternalID          string `json:"external_id,omitempty"`
+	ApplyID string `json:"apply_id"`
+	// ExternalID is the remote data plane's stable apply identifier.
+	ExternalID string `json:"external_id,omitempty"`
+	// ExternalOperationID is the remote data plane's numeric operation row ID.
 	ExternalOperationID string `json:"external_operation_id,omitempty"`
 	Database            string `json:"database"`
 	Environment         string `json:"environment"`
