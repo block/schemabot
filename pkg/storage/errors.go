@@ -29,6 +29,9 @@ var (
 	// for the same database, type, and environment.
 	ErrActiveApplyExists = errors.New("active apply already exists")
 
+	// ErrApplyNotRedrivable is returned when a failed apply cannot be redriven.
+	ErrApplyNotRedrivable = errors.New("apply is not redrivable")
+
 	// ErrApplyLeaseLost is returned when an operator-owned write no longer
 	// matches the apply lease token stored by the latest operator claimant.
 	ErrApplyLeaseLost = errors.New("apply lease lost")

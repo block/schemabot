@@ -323,6 +323,11 @@ func CallStartAPI(endpoint, environment, applyID string) (*apitypes.StartRespons
 	return callControlAPI[apitypes.StartResponse](endpoint, "/api/start", environment, applyID)
 }
 
+// CallRedriveAPI calls the redrive API and returns the typed result.
+func CallRedriveAPI(endpoint, environment, applyID string) (*apitypes.RedriveResponse, error) {
+	return callControlAPI[apitypes.RedriveResponse](endpoint, "/api/redrive", environment, applyID)
+}
+
 // CallVolumeAPI calls the volume API and returns the typed result.
 func CallVolumeAPI(endpoint, environment, applyID string, volume int) (*apitypes.VolumeResponse, error) {
 	req := apitypes.VolumeRequest{Environment: environment, Volume: int32(volume), ApplyID: applyID}
