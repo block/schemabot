@@ -107,7 +107,7 @@ Before handing a PR to the user, review it the way an operator will experience i
 - **Check Run vs stored check state.** Use precise terms. A GitHub Check Run is the visible object on the PR commit. Stored check state is SchemaBot's database record used to decide what Check Run to create or update. Comments, logs, tests, and docs should make clear which one is being changed.
 - **TOCTOU review.** For async flows, webhooks, reconciliation, and background watchers, ask what happens if the latest commit on the PR branch changes, another pod writes first, an apply starts or finishes concurrently, or a rollback changes the target schema. Use conditional storage updates, ownership identifiers, and final state reloads where stale workers could otherwise overwrite newer state.
 - **Started applies remain authoritative.** Once an apply has started, a later PR commit that removes the schema change must not make the aggregate check pass by cleanup alone. Example: commit A adds a column and starts an apply; commit B removes that column before the apply finishes. The stored state must continue to block merge until an operator reconciles the target environment.
-- **Logs must answer the triage question.** Error and warning logs on critical paths should include the identifiers an operator needs: repo, PR, head SHA when relevant, environment, database type, database, apply ID or identifier, check ID or Check Run ID, and the operation being attempted.
+- **Logs must answer the triage question.** Error and warning logs on critical paths should include the identifiers an operator needs: repo, PR, head SHA when relevant, environment, database type, database, apply ID or identifier, check ID or Check Run ID, and the operation being attempted. For apply/operation/task logs, build these with the `LogAttrs()` helpers (see *Go Style → Logging*) rather than hand-listing identifiers.
 - **Metrics should be actionable.** Add counters for rare or dangerous branches that operators can investigate, such as ownership misses, stale cleanup blocking, or status-check update failures. If a metric spikes, the expected operator action should be obvious from the metric name, attributes, and nearby code comments or docs.
 - **Readability is a review gate.** Extract named helpers for compound state predicates, separate error handling from state decisions, and keep comments focused on invariants and operator-facing behavior. Avoid clever SQL, dense boolean expressions, and control flow that requires reconstructing the state machine in your head.
 - **Tests must prove documented behavior.** If a PR summary or docs mention an edge case, add focused tests for it or explicitly call out why it cannot be tested in this layer. Prefer integration-style webhook/storage tests for check-run lifecycle behavior.
@@ -198,6 +198,16 @@ All SQL statements processed by SchemaBot **must be parseable by the TiDB parser
   - Use `state.Apply.Stopped`, `state.Apply.Running`, etc. for apply states.
   - Use `state.IsState(s, state.Apply.Stopped)` for case-insensitive, normalized comparison (handles proto prefixes like `STATE_STOPPED`).
   - Use `state.IsTerminalApplyState(s)` to check if a state is terminal.
+
+### Logging
+
+- **Use the `LogAttrs()` helpers for apply/operation/task logs.** When a `*storage.Apply`, `*storage.ApplyOperation`, or `*storage.Task` is in scope, build the triage attributes with its `LogAttrs()` method instead of hand-listing identifiers:
+  ```go
+  logger.Error("failed to drive apply", append(apply.LogAttrs(), "error", err)...)
+  ```
+  The helpers (`pkg/storage/logattrs.go`) return the canonical triage set — apply/operation/task identifier, database, database type, environment, deployment, state, and (when set) repo, pr, external id(s), caller. This keeps key names consistent and lets a failed or stalled apply be triaged from logs alone. Append call-specific attrs (`"error", err`, etc.) after the spread, and don't repeat identifiers the helper already provides (avoid duplicate keys).
+- **Never log the internal numeric row ID** (`apply.ID`, `op.ApplyID`, `task.ApplyID`) — it is confusable with the user-facing string identifier and is not a useful triage handle. Log the string identifier (`apply_id` = `ApplyIdentifier`), which the helpers already do. When only an `apply_operation` is in scope (parent apply not loaded), `ApplyOperation.LogAttrs()` is sufficient on its own.
+- **The operation's own deployment is the routing key.** When a log is scoped to an `apply_operation` but uses the parent `Apply.LogAttrs()` (whose `deployment` is the apply's), also add `"operation_deployment", op.Deployment` — the two can differ.
 
 ### Imports
 
