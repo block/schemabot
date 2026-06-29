@@ -9,6 +9,7 @@ const (
 	Unlock          = "unlock"
 	Stop            = "stop"
 	Start           = "start"
+	Release         = "release"
 	Cutover         = "cutover"
 	Revert          = "revert"
 	SkipRevert      = "skip-revert"

@@ -1025,6 +1025,7 @@ const (
 	LogEventStopRequested       = "stop_requested"
 	LogEventCancelRequested     = "cancel_requested"
 	LogEventStartRequested      = "start_requested"
+	LogEventReleaseRequested    = "release_requested"
 	LogEventDeployTriggered     = "deploy_triggered"
 	LogEventCutoverTriggered    = "cutover_triggered"
 	LogEventSkipRevertTriggered = "skip_revert_triggered"

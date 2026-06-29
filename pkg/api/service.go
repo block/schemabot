@@ -687,6 +687,7 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 	handle("POST /api/stop", s.handleStop)
 	handle("POST /api/cancel", s.handleCancel)
 	handle("POST /api/start", s.handleStart)
+	handle("POST /api/release", s.handleRelease)
 	handle("POST /api/volume", s.handleVolume)
 	handle("POST /api/revert", s.handleRevert)
 	handle("POST /api/skip-revert", s.handleSkipRevert)

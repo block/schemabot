@@ -723,6 +723,7 @@ schemabot apply -e staging --allow-unsafe
 | `schemabot unlock` | Release lock and discard plan |
 | `schemabot stop <apply-id> -e <env>` | Stop an in-progress deployment |
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
+| `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
 | `schemabot rollback <apply-id> -e <env>` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env>` | Execute a rollback |
@@ -751,6 +752,7 @@ That command wasn't recognized. Available commands:
 | `schemabot unlock` | Release lock and discard plan |
 | `schemabot stop <apply-id> -e <env>` | Stop an in-progress deployment |
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
+| `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
 | `schemabot rollback <apply-id> -e <env>` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env>` | Execute a rollback |
@@ -943,6 +945,7 @@ That command wasn't recognized. Available commands:
 | `schemabot unlock` | Release lock and discard plan |
 | `schemabot stop <apply-id> -e <env>` | Stop an in-progress deployment |
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
+| `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
 | `schemabot rollback <apply-id> -e <env>` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env>` | Execute a rollback |
