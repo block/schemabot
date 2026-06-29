@@ -88,6 +88,11 @@ func (s *Service) ExecuteReapply(ctx context.Context, req apitypes.ControlReques
 	if req.Environment == "" {
 		return nil, controlHTTPErrorf(http.StatusBadRequest, "environment is required")
 	}
+	// caller owns the lock acquired below, so require it up front — before any
+	// apply/plan reads — rather than failing deep inside lock acquisition.
+	if req.Caller == "" {
+		return nil, controlHTTPErrorf(http.StatusBadRequest, "caller is required")
+	}
 	if s.storage == nil {
 		return nil, fmt.Errorf("storage is not available")
 	}
@@ -188,9 +193,6 @@ func (s *Service) executeReapplyForApply(ctx context.Context, req apitypes.Contr
 }
 
 func (s *Service) acquireReapplyLock(ctx context.Context, req apitypes.ControlRequest, plan *storage.Plan, apply *storage.Apply) (*storage.Lock, bool, error) {
-	if req.Caller == "" {
-		return nil, false, controlHTTPErrorf(http.StatusBadRequest, "caller is required")
-	}
 	existing, err := s.storage.Locks().Get(ctx, plan.Database, plan.DatabaseType)
 	if err != nil {
 		return nil, false, fmt.Errorf("load reapply lock for %s/%s before acquire: %w", plan.Database, plan.DatabaseType, err)
@@ -209,6 +211,10 @@ func (s *Service) acquireReapplyLock(ctx context.Context, req apitypes.ControlRe
 				return nil, false, fmt.Errorf("reapply lock for %s/%s is held by another owner; retry with force to take over the lock: %w", plan.Database, plan.DatabaseType, err)
 			}
 			s.logger.Warn("reapply force releasing database lock", append(apply.LogAttrs(), "requested_by", req.Caller)...)
+			// Release-then-acquire is intentionally non-atomic and fails closed: if a
+			// third caller wins the lock in the gap, the re-Acquire below returns
+			// ErrLockHeld and the reapply is rejected. Force never proceeds without
+			// holding the lock.
 			if releaseErr := s.storage.Locks().ForceRelease(ctx, plan.Database, plan.DatabaseType); releaseErr != nil {
 				return nil, false, fmt.Errorf("force release reapply lock for %s/%s owner %s: %w", plan.Database, plan.DatabaseType, req.Caller, releaseErr)
 			}
