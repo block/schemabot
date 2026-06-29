@@ -16,14 +16,16 @@ import (
 
 // releaseTestControlStore is a minimal ControlRequestStore for release handler
 // tests: GetPending returns the configured pending stop/cancel request,
-// RequestPending records new release requests (or reports an existing release
-// latch as already pending), and GetByOperation is unused here.
+// GetByOperation returns the configured release latch (status-agnostic), and
+// RequestPending records new release requests (optionally simulating the
+// concurrent-first-request race via requestPendingRace).
 type releaseTestControlStore struct {
 	storage.ControlRequestStore
-	pendingStop     *storage.ApplyControlRequest
-	pendingCancel   *storage.ApplyControlRequest
-	existingRelease *storage.ApplyControlRequest
-	requested       []*storage.ApplyControlRequest
+	pendingStop        *storage.ApplyControlRequest
+	pendingCancel      *storage.ApplyControlRequest
+	releaseLatch       *storage.ApplyControlRequest
+	requestPendingRace bool
+	requested          []*storage.ApplyControlRequest
 }
 
 func (s *releaseTestControlStore) GetPending(_ context.Context, _ int64, op storage.ControlOperation) (*storage.ApplyControlRequest, error) {
@@ -36,12 +38,16 @@ func (s *releaseTestControlStore) GetPending(_ context.Context, _ int64, op stor
 	return nil, nil
 }
 
-func (s *releaseTestControlStore) RequestPending(_ context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
-	if s.existingRelease != nil {
-		return s.existingRelease, true, nil
+func (s *releaseTestControlStore) GetByOperation(_ context.Context, _ int64, op storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	if op == storage.ControlOperationRelease {
+		return s.releaseLatch, nil
 	}
+	return nil, nil
+}
+
+func (s *releaseTestControlStore) RequestPending(_ context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
 	s.requested = append(s.requested, req)
-	return req, false, nil
+	return req, s.requestPendingRace, nil
 }
 
 type releaseTestStorage struct {
@@ -91,8 +97,8 @@ func TestExecuteReleaseForApply(t *testing.T) {
 		assert.Equal(t, "alice", control.requested[0].RequestedBy)
 	})
 
-	t.Run("reports already_requested when a release is already latched", func(t *testing.T) {
-		control := &releaseTestControlStore{existingRelease: &storage.ApplyControlRequest{
+	t.Run("is idempotent when a pending release already latches the rollout", func(t *testing.T) {
+		control := &releaseTestControlStore{releaseLatch: &storage.ApplyControlRequest{
 			Operation: storage.ControlOperationRelease, Status: storage.ControlRequestPending,
 		}}
 		svc := newReleaseTestService(pauseRolloutOps(), control)
@@ -103,6 +109,46 @@ func TestExecuteReleaseForApply(t *testing.T) {
 		assert.Equal(t, releaseResponseStatusAlreadyRequested, resp.Status)
 		assert.Equal(t, http.StatusAccepted, httpStatus)
 		assert.Empty(t, control.requested, "an already-latched release records no new request")
+	})
+
+	t.Run("is idempotent and does not rewind a completed release latch", func(t *testing.T) {
+		control := &releaseTestControlStore{releaseLatch: &storage.ApplyControlRequest{
+			Operation: storage.ControlOperationRelease, Status: storage.ControlRequestCompleted,
+		}}
+		svc := newReleaseTestService(pauseRolloutOps(), control)
+
+		resp, httpStatus, err := svc.executeReleaseForApply(t.Context(), pausedApply(), "bob")
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted)
+		assert.Equal(t, releaseResponseStatusAlreadyRequested, resp.Status)
+		assert.Equal(t, http.StatusAccepted, httpStatus)
+		assert.Empty(t, control.requested, "a completed release latch must not be reset to pending")
+	})
+
+	t.Run("records a fresh request when the prior release failed", func(t *testing.T) {
+		control := &releaseTestControlStore{releaseLatch: &storage.ApplyControlRequest{
+			Operation: storage.ControlOperationRelease, Status: storage.ControlRequestFailed,
+		}}
+		svc := newReleaseTestService(pauseRolloutOps(), control)
+
+		resp, httpStatus, err := svc.executeReleaseForApply(t.Context(), pausedApply(), "alice")
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted)
+		assert.Empty(t, resp.Status, "a failed release does not latch, so a retry is a fresh request")
+		assert.Equal(t, http.StatusOK, httpStatus)
+		require.Len(t, control.requested, 1, "a failed release latch is retried via a new pending request")
+	})
+
+	t.Run("reports already_requested on the concurrent-first-request race", func(t *testing.T) {
+		control := &releaseTestControlStore{requestPendingRace: true}
+		svc := newReleaseTestService(pauseRolloutOps(), control)
+
+		resp, httpStatus, err := svc.executeReleaseForApply(t.Context(), pausedApply(), "alice")
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted)
+		assert.Equal(t, releaseResponseStatusAlreadyRequested, resp.Status)
+		assert.Equal(t, http.StatusAccepted, httpStatus)
+		require.Len(t, control.requested, 1, "the race still goes through RequestPending")
 	})
 
 	t.Run("rejects an apply that is not paused", func(t *testing.T) {
