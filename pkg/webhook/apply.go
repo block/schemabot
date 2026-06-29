@@ -30,6 +30,7 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display 
 		ErrorMessage:     apply.ErrorMessage,
 		VSchemaChanges:   display.VSchema,
 		DeployRequestURL: display.DeployRequestURL,
+		RevertExpiresAt:  display.RevertExpiresAt,
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)
@@ -47,6 +48,10 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display 
 type operationDisplay struct {
 	VSchema          []apitypes.VSchemaChange
 	DeployRequestURL string
+	// RevertExpiresAt is the RFC3339 deadline when the revert window closes
+	// (PlanetScale only), surfaced so the comment can show time remaining. Empty
+	// outside the revert window.
+	RevertExpiresAt string
 }
 
 // resolveDisplayByOperation projects each operation's engine display state
@@ -84,8 +89,8 @@ func resolveDisplayByOperation(ctx context.Context, stor storage.Storage, apply 
 			slog.Warn("comment will omit VSchema status: failed to parse VSchema changes",
 				"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
 		}
-		od := operationDisplay{VSchema: changes, DeployRequestURL: display["deploy_request_url"]}
-		if len(od.VSchema) == 0 && od.DeployRequestURL == "" {
+		od := operationDisplay{VSchema: changes, DeployRequestURL: display["deploy_request_url"], RevertExpiresAt: display["revert_expires_at"]}
+		if len(od.VSchema) == 0 && od.DeployRequestURL == "" && od.RevertExpiresAt == "" {
 			continue
 		}
 		if byOp == nil {

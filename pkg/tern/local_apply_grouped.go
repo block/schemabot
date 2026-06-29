@@ -674,6 +674,20 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// updated metadata like deploy request URL or migration context).
 	if result.ResumeState != nil && resumeState != nil {
 		*resumeState = *result.ResumeState
+		// Persist the revert-window deadline so the PR comment and CLI can show
+		// time remaining. revertWindowDeadline derives it from the engine's
+		// deployed_at plus the configured window; merge it in key-preserving so
+		// engine fields the storage struct does not model survive the rewrite.
+		if result.State == engine.StateRevertWindow {
+			if deadline := c.revertWindowDeadline(result.ResumeState, ps.stateEnteredAt); !deadline.IsZero() {
+				if merged, err := setRevertExpiresAtMetadata(resumeState.Metadata, deadline); err != nil {
+					c.logger.Warn("failed to stamp revert_expires_at into resume metadata; comment will omit revert deadline",
+						append(apply.LogAttrs(), "error", err)...)
+				} else {
+					resumeState.Metadata = merged
+				}
+			}
+		}
 		if c.config.Type == storage.DatabaseTypeVitess {
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, resumeState); saveErr != nil {
 				c.logger.Error("failed to save Vitess engine resume state from progress polling",

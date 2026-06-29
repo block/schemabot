@@ -1787,3 +1787,29 @@ func TestRenderApplyStatusComment_SkippingRevert(t *testing.T) {
 	assert.NotContains(t, result, "schemabot revert apply-abc123 -e staging")
 	assert.NotContains(t, result, "schemabot skip-revert apply-abc123 -e staging")
 }
+
+// In the revert window the comment shows how long the operator has to revert or
+// skip before the change becomes permanent. A future deadline renders a
+// countdown; an absent or past-due deadline renders none rather than a stale or
+// negative value.
+func TestRenderApplyStatusComment_RevertWindowDeadline(t *testing.T) {
+	base := ApplyStatusCommentData{
+		ApplyID:     "apply-abc123",
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.RevertWindow,
+		Tables:      []TableProgressData{{TableName: "users", Status: state.Task.RevertWindow}},
+	}
+
+	withDeadline := base
+	withDeadline.RevertExpiresAt = time.Now().Add(20 * time.Minute).UTC().Format(time.RFC3339)
+	assert.Contains(t, RenderApplyStatusComment(withDeadline), "Revert window closes in")
+
+	// No deadline → no countdown line.
+	assert.NotContains(t, RenderApplyStatusComment(base), "Revert window closes in")
+
+	// Past-due deadline → no countdown line (never show a negative countdown).
+	pastDue := base
+	pastDue.RevertExpiresAt = time.Now().Add(-1 * time.Minute).UTC().Format(time.RFC3339)
+	assert.NotContains(t, RenderApplyStatusComment(pastDue), "Revert window closes in")
+}

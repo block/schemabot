@@ -75,6 +75,12 @@ type ApplyStatusCommentData struct {
 	// request's own progress, which the comment does not otherwise surface. Empty
 	// for engines without a deploy request or before one is created.
 	DeployRequestURL string
+
+	// RevertExpiresAt is the RFC3339 deadline when the revert window closes
+	// (PlanetScale only). When set and the apply is in its revert window, the
+	// comment shows the time remaining before the change becomes permanent.
+	// Empty outside the revert window or for engines without one.
+	RevertExpiresAt string
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -97,6 +103,12 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	// Deploy-request link (PlanetScale) — the operator's entry point into the
 	// deploy request's own progress, which the comment does not otherwise surface.
 	writeDeployRequestLink(&sb, data)
+
+	// Revert-window countdown (PlanetScale) — how long until the change becomes
+	// permanent, so the operator knows the window to revert or skip.
+	if state.IsState(data.State, state.Apply.RevertWindow) {
+		writeRevertWindowDeadline(&sb, data.RevertExpiresAt)
+	}
 
 	// Cutover readiness summary
 	if data.State == state.Apply.WaitingForCutover || data.State == state.Apply.CuttingOver {
@@ -280,6 +292,25 @@ func writeStopOrCancelFooterAction(sb *strings.Builder, data ApplyStatusCommentD
 		prefix = cancelPrefix
 	}
 	writeFooterAction(sb, prefix, fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment))
+}
+
+// writeRevertWindowDeadline writes the time remaining before the revert window
+// closes, when a deadline is known and still in the future. An unset or
+// past-due deadline renders nothing so the comment never shows a stale or
+// negative countdown.
+func writeRevertWindowDeadline(sb *strings.Builder, revertExpiresAt string) {
+	if revertExpiresAt == "" {
+		return
+	}
+	expires, err := time.Parse(time.RFC3339, revertExpiresAt)
+	if err != nil {
+		return
+	}
+	remaining := time.Until(expires)
+	if remaining <= 0 {
+		return
+	}
+	fmt.Fprintf(sb, "\n⏳ **Revert window closes in**: %s\n", formatDuration(remaining))
 }
 
 // writeCutoverSummary writes a readiness summary for cutover states,
@@ -1278,6 +1309,9 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 		ErrorMessage: resp.ErrorMessage,
 		StartedAt:    resp.StartedAt,
 		CompletedAt:  resp.CompletedAt,
+	}
+	if resp.Metadata != nil {
+		data.RevertExpiresAt = resp.Metadata["revert_expires_at"]
 	}
 
 	if changes, err := apitypes.ParseVSchemaChanges(resp.Metadata); err != nil {

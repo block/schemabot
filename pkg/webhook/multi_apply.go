@@ -160,6 +160,7 @@ func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tas
 		Tables:           tableProgressFromTasks(apply.Database, tasks, shardsByTable),
 		VSchemaChanges:   display.VSchema,
 		DeployRequestURL: display.DeployRequestURL,
+		RevertExpiresAt:  display.RevertExpiresAt,
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)
