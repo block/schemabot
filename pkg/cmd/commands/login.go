@@ -42,8 +42,17 @@ func (cmd *LoginCmd) Run(g *Globals) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
+	// Log in against an already-configured profile: the token is bound to the
+	// profile's endpoint, so refuse to cache one on a missing or endpoint-less
+	// profile (which would otherwise create a dangling, unusable entry).
 	profileName := client.ResolveProfileName(cfg, g.Profile)
-	profile := cfg.Profiles[profileName]
+	profile, ok := cfg.Profiles[profileName]
+	if !ok {
+		return fmt.Errorf("profile %q is not configured; run `schemabot configure` to set its endpoint before logging in", profileName)
+	}
+	if profile.Endpoint == "" {
+		return fmt.Errorf("profile %q has no endpoint; run `schemabot configure` to set it before logging in", profileName)
+	}
 
 	loginCfg, err := resolveLoginConfig(cmd.Issuer, cmd.ClientID, cmd.RedirectPort, &profile)
 	if err != nil {
@@ -73,9 +82,6 @@ func (cmd *LoginCmd) Run(g *Globals) error {
 	// configured to accept.
 	profile.Token = result.IDToken
 	cfg.Profiles[profileName] = profile
-	if cfg.DefaultProfile == "" {
-		cfg.DefaultProfile = profileName
-	}
 	if err := client.SaveConfig(cfg); err != nil {
 		return fmt.Errorf("save token to profile %q: %w", profileName, err)
 	}
@@ -145,11 +151,16 @@ func openBrowser(url string) error {
 	default:
 		name, args = "xdg-open", []string{url}
 	}
-	// Background, not the login context: the launcher forks the browser and
-	// returns immediately, so the launch must not be killed when the login flow's
-	// deadline fires.
-	if err := exec.CommandContext(context.Background(), name, args...).Start(); err != nil {
+	// Background, not the login context: the launcher hands off to the browser
+	// and exits, so the launch must not be killed when the login deadline fires.
+	launcher := exec.CommandContext(context.Background(), name, args...)
+	if err := launcher.Start(); err != nil {
 		return fmt.Errorf("launch browser via %s: %w", name, err)
+	}
+	// The launcher exits as soon as it dispatches to the browser; we don't need
+	// its result, so release the process handle rather than waiting on it.
+	if err := launcher.Process.Release(); err != nil {
+		return fmt.Errorf("release browser launcher process: %w", err)
 	}
 	return nil
 }

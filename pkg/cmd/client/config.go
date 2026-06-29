@@ -150,10 +150,6 @@ func SaveConfig(cfg *Config) error {
 	return nil
 }
 
-// GetProfile returns the profile to use based on:
-// 1. Explicit profile flag
-// 2. SCHEMABOT_PROFILE environment variable
-// 3. Default profile from config
 // ResolveProfileName returns the active profile name using the standard
 // precedence: the --profile flag, then SCHEMABOT_PROFILE, then the configured
 // default profile, then "default". It does not check that the profile exists.
@@ -170,6 +166,10 @@ func ResolveProfileName(cfg *Config, profileFlag string) string {
 	return "default"
 }
 
+// GetProfile loads and returns the resolved profile (see ResolveProfileName for
+// the name precedence, which includes the final fallback to "default"). An
+// explicitly requested profile (via --profile or SCHEMABOT_PROFILE) that does
+// not exist is an error; an unrequested missing profile yields an empty Profile.
 func GetProfile(profileFlag string) (*Profile, error) {
 	cfg, err := LoadConfig()
 	if err != nil {

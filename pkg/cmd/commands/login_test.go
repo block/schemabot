@@ -119,3 +119,27 @@ func TestLoginCmdRunMissingOIDCErrors(t *testing.T) {
 	assert.Contains(t, err.Error(), "OIDC")
 	assert.False(t, browserOpened)
 }
+
+// Logging in against a profile that does not exist fails clearly instead of
+// caching a token on a dangling profile with no endpoint.
+func TestLoginCmdRunUnknownProfileErrors(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SCHEMABOT_PROFILE", "")
+	require.NoError(t, client.SaveConfig(&client.Config{
+		Profiles: map[string]client.Profile{"other": {Endpoint: "https://other.example"}},
+	}))
+
+	browserOpened := false
+	cmd := &LoginCmd{
+		loginFn: func(context.Context, client.LoginConfig, client.BrowserOpener) (*client.LoginResult, error) {
+			t.Fatal("login should not be attempted for an unconfigured profile")
+			return nil, nil
+		},
+		openBrowser: func(string) error { browserOpened = true; return nil },
+	}
+
+	err := cmd.Run(&Globals{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not configured")
+	assert.False(t, browserOpened)
+}
