@@ -13,6 +13,7 @@
 - [Internal Records](#internal-records)
 - [Lifecycle](#lifecycle)
   - [Pull Request Events](#pull-request-events)
+  - [Merge Queue Events](#merge-queue-events)
   - [Auto-Plan](#auto-plan)
   - [Apply](#apply)
   - [Rollback](#rollback)
@@ -330,6 +331,27 @@ SchemaBot listens to these GitHub `pull_request` webhook actions:
 | `closed` | PR was closed or merged. | Release locks held by the PR and delete internal check records. In-flight applies continue in Tern. |
 
 Other `pull_request` actions are ignored by the check-run lifecycle.
+
+### Merge Queue Events
+
+When a repository uses a GitHub merge queue, branch protection re-evaluates the
+required checks against the queue's synthetic merge-group head commit — a new
+commit that combines the queued pull requests — not the PR head SHA. SchemaBot
+only publishes its checks on PR head SHAs, so without handling `merge_group` the
+required SchemaBot check would never appear on the merge-group commit and the
+queue entry would block indefinitely.
+
+| Action | Meaning | SchemaBot behavior |
+| --- | --- | --- |
+| `checks_requested` | A PR entered the merge queue; GitHub asks for checks on the merge-group head SHA. | Publish a passing aggregate check on the merge-group head SHA — one per gated environment, using the same check names as the PR-head aggregates. |
+| `destroyed` | A PR left the merge queue. | Ignored; no check is needed on any commit. |
+
+Publishing a passing check is safe because SchemaBot applies and gates schema
+changes *before* a PR can enter the queue: branch protection already required
+the PR-head check to pass, so the merge group sits strictly downstream of an
+already-completed, already-gated apply. A repository SchemaBot does not manage,
+or one with check publishing disabled, gets no merge-group check because its
+check is not required there.
 
 ### Auto-Plan
 
