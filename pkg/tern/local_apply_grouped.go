@@ -583,7 +583,11 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	ps := &atomicPollState{lastProgressLog: time.Now()}
+	// Seed revertSkipped from the durable signal so a driver that picks this apply
+	// up after a restart treats skip-revert as already accepted: it won't re-attempt
+	// SkipRevert, and it keeps surfacing skipping_revert while finalization is in
+	// flight rather than falling back to revert_window.
+	ps := &atomicPollState{lastProgressLog: time.Now(), revertSkipped: apply.RevertSkippedAt != nil}
 
 	for {
 		select {
