@@ -174,7 +174,7 @@ func (ic *InstallationClient) FindConfigByDatabaseName(ctx context.Context, repo
 		return nil, "", fmt.Errorf("fetch PR files: %w", err)
 	}
 
-	prConfigs, err := ic.findAllConfigsForPRFiles(ctx, repo, prInfo.HeadSHA, files)
+	prConfigs, err := ic.FindConfigsForPRFiles(ctx, repo, prInfo.HeadSHA, files)
 	if err != nil {
 		return nil, "", fmt.Errorf("find configs for PR: %w", err)
 	}
@@ -246,7 +246,7 @@ func (ic *InstallationClient) FindConfigForPR(ctx context.Context, repo string, 
 
 	var schemaFiles []string
 	for _, file := range files {
-		if isSchemaFile(file.Filename) {
+		if IsSchemaFile(file.Filename) {
 			schemaFiles = append(schemaFiles, file.Filename)
 		}
 	}
@@ -318,10 +318,14 @@ func (ic *InstallationClient) FindAllConfigsForPR(ctx context.Context, repo stri
 	if err != nil {
 		return nil, fmt.Errorf("fetch PR files: %w", err)
 	}
-	return ic.findAllConfigsForPRFiles(ctx, repo, prInfo.HeadSHA, files)
+	return ic.FindConfigsForPRFiles(ctx, repo, prInfo.HeadSHA, files)
 }
 
-func (ic *InstallationClient) findAllConfigsForPRFiles(ctx context.Context, repo, ref string, files []PRFile) ([]DiscoveredConfig, error) {
+// FindConfigsForPRFiles discovers the schemabot.yaml configs that manage the
+// given already-fetched PR files at ref. Callers that have the changed files in
+// hand use this directly to avoid re-listing them; FindAllConfigsForPR is the
+// convenience wrapper that fetches the files first.
+func (ic *InstallationClient) FindConfigsForPRFiles(ctx context.Context, repo, ref string, files []PRFile) ([]DiscoveredConfig, error) {
 	configsByPath := make(map[string]DiscoveredConfig)
 	for _, file := range files {
 		if !isConfigFile(file.Filename) {
@@ -390,7 +394,9 @@ func (ic *InstallationClient) FindConfigInRepo(ctx context.Context, repo string,
 	return nil, "", result.InvalidConfigs, fmt.Errorf("%w: %s", ErrMultipleConfigs, strings.Join(databases, ", "))
 }
 
-func isSchemaFile(filename string) bool {
+// IsSchemaFile reports whether filename is a SchemaBot-managed schema file
+// (a .sql DDL file or a vschema.json).
+func IsSchemaFile(filename string) bool {
 	return strings.HasSuffix(filename, ".sql") || strings.HasSuffix(filename, "vschema.json")
 }
 
@@ -406,7 +412,7 @@ func HasSchemaInputFiles(files []PRFile) bool {
 }
 
 func isSchemaInputFile(filename string) bool {
-	return isSchemaFile(filename) || isConfigFile(filename)
+	return IsSchemaFile(filename) || isConfigFile(filename)
 }
 
 func isConfigFile(filename string) bool {
@@ -420,7 +426,7 @@ func isRemovedPRFile(status string) bool {
 func filterSchemaFiles(files []string) []string {
 	var result []string
 	for _, file := range files {
-		if isSchemaFile(file) {
+		if IsSchemaFile(file) {
 			result = append(result, file)
 		}
 	}

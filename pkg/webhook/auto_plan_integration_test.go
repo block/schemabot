@@ -903,3 +903,138 @@ func TestE2EAutoPlanFailsWhenConfiguredEnvironmentsAreNotAllowed(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 	}
 }
+
+// A PR that changes schema files under a directory the server config manages
+// (databases.<db>.allowed_dirs) but contains no schemabot.yaml must fail closed:
+// dropping or omitting the config cannot silently land DDL ungated. SchemaBot
+// publishes a blocking aggregate instead of a passing one. To offboard a
+// directory an operator removes it from allowed_dirs in the server config.
+func TestE2EAutoPlanManagedDirMissingConfigBlocks(t *testing.T) {
+	dbName := "webhook_autoplan_managed_dir_missing_config"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+	// Empty schemabotConfig: the schema directory is server-managed via
+	// allowed_dirs, but no schemabot.yaml resolves for it (as if removed).
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, "", dbName)
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "schema change under managed directory has no config")
+
+	var aggregateCheck checkRunCapture
+	select {
+	case aggregateCheck = <-result.checkRuns:
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for managed-dir-missing-config aggregate check run")
+	}
+	assert.Equal(t, aggregateCheckName, aggregateCheck.Name)
+	assert.Equal(t, "completed", aggregateCheck.Status)
+	assert.Equal(t, "failure", aggregateCheck.Conclusion)
+	require.NotNil(t, aggregateCheck.Output)
+	assert.Contains(t, aggregateCheck.Output.Summary, "schemabot.yaml")
+	assert.Contains(t, aggregateCheck.Output.Summary, "allowed_dirs")
+
+	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, check, "managed-dir-missing-config auto-plan must store a failing aggregate check")
+	assert.Equal(t, "abc123", check.HeadSHA)
+	assert.Equal(t, "completed", check.Status)
+	assert.Equal(t, "failure", check.Conclusion)
+	assert.Equal(t, "managed_dir_missing_config", check.BlockingReason)
+
+	plans, err := svc.Storage().Plans().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, plan := range plans {
+		assert.NotEqual(t, dbName, plan.Database, "a blocked auto-plan must not store a plan for the managed database")
+	}
+}
+
+// Moving a managed schema directory in one PR — the schemabot.yaml and its
+// schema files relocate together — must not be mistaken for an unmanaged schema
+// change. The destination files stay covered by the moved config, so auto-plan
+// proceeds normally instead of failing closed. Both the old and new directories
+// are in allowed_dirs, as for an operator-gated move.
+func TestE2EAutoPlanSchemaDirMoveNotBlocked(t *testing.T) {
+	dbName := "webhook_autoplan_schema_dir_move"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema", "old/schema"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+	// The PR relocates the config and schema file out of old/schema; the moved
+	// config lands at schema/schemabot.yaml (served by the helper) and covers the
+	// new schema/<db>/users.sql.
+	prFiles := []*gh.CommitFile{
+		{Filename: new("old/schema/schemabot.yaml"), Status: new("removed")},
+		{Filename: new("old/schema/users.sql"), Status: new("removed")},
+		{Filename: new("schema/schemabot.yaml"), Status: new("added")},
+		{Filename: new("schema/" + dbName + "/users.sql"), Status: new("added")},
+	}
+	result := setupFakeGitHubForPlanWithPRFiles(t, mux, schemaFiles, schemabotConfig, dbName, prFiles)
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	// A normal plan-with-changes check, not a fail-closed failure, proves the
+	// move was not mistaken for an unmanaged schema change.
+	select {
+	case cr := <-result.checkRuns:
+		assert.Contains(t, cr.Name, "SchemaBot")
+		assert.Equal(t, "action_required", cr.Conclusion)
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for check run")
+	}
+
+	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	if check != nil {
+		assert.NotEqual(t, "managed_dir_missing_config", check.BlockingReason, "a clean move must not be blocked as a missing-config change")
+	}
+}

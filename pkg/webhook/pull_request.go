@@ -142,13 +142,32 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 }
 
 func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string) string {
+	// Fetch the changed files once so the same list drives both config discovery
+	// and the server-managed-directory safety check below.
+	files, err := client.FetchPRFiles(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("failed to fetch PR files for auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "error", err)
+		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+		return "config discovery failed"
+	}
+
 	// Discover all configs matching changed schema files in this PR
-	configs, err := client.FindAllConfigsForPR(ctx, repo, pr)
+	configs, err := client.FindConfigsForPRFiles(ctx, repo, headSHA, files)
 	if err != nil {
 		h.logger.Error("failed to discover configs for PR", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
 		return "config discovery failed"
 	}
+
+	// Fail closed when the PR changes schema files under a directory the server
+	// config manages but no schemabot.yaml resolves for them — e.g. the PR
+	// removed the config while keeping schema changes. Dropping the config must
+	// not silently unmanage a server-owned schema directory.
+	if unmanaged := h.unmanagedServerManagedSchemaChanges(repo, files, configs); len(unmanaged) > 0 {
+		h.failClosedOnUnmanagedSchemaDir(ctx, client, repo, pr, headSHA, source, unmanaged)
+		return "schema change under managed directory has no config"
+	}
+
 	configs = h.filterManagedDiscoveredConfigs(ctx, repo, pr, headSHA, source, configs)
 
 	// Collect database names from discovered configs
