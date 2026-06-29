@@ -44,13 +44,17 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		return
 	}
 
+	// Repo-level webhook deliveries carry no installation id in the payload; the
+	// dispatcher resolves it and stashes it on the context.
+	installationID := h.effectiveInstallationID(ctx, payload.Installation.ID)
+
 	// Route PR actions
 	switch payload.Action {
 	case "opened", "synchronize", "reopened":
 		// proceed to auto-plan below
 	case "closed":
-		h.goSafe(payload.Repository.FullName, payload.PullRequest.Number, payload.Installation.ID, func() {
-			h.handlePRClosed(payload.Repository.FullName, payload.PullRequest.Number, payload.Installation.ID)
+		h.goSafe(payload.Repository.FullName, payload.PullRequest.Number, installationID, func() {
+			h.handlePRClosed(payload.Repository.FullName, payload.PullRequest.Number, installationID)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "PR close cleanup started"})
 		return
@@ -61,7 +65,6 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		return
 	}
 
-	installationID := payload.Installation.ID
 	if installationID == 0 {
 		h.writeError(w, http.StatusBadRequest, "missing installation ID in webhook payload")
 		return

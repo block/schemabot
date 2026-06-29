@@ -247,6 +247,16 @@ type GitHubConfig struct {
 	// Supports secret references: env:VAR, file:/path, secretsmanager:name#key.
 	WebhookSecret string `yaml:"webhook-secret"`
 
+	// RepoWebhookSecret is the HMAC secret for validating repository-level
+	// webhook deliveries (registered directly on a repo, as opposed to the
+	// App's own webhook). When set, the handler additionally accepts
+	// repository-targeted deliveries verified against this secret and resolves
+	// the App's installation per repo, since such deliveries carry no
+	// installation id in the payload. Leave empty to disable repo-webhook
+	// dispatch (the default). Supports secret references: env:VAR, file:/path,
+	// secretsmanager:name#key.
+	RepoWebhookSecret string `yaml:"repo-webhook-secret,omitempty"`
+
 	// CheckName is the base name for aggregate GitHub Check Runs published by
 	// this App. Environment-scoped deployments append the environment in
 	// parentheses, for example "SchemaBot (staging)".
@@ -329,6 +339,13 @@ func (g *GitHubConfig) ResolvePrivateKey() (string, error) {
 // ResolveWebhookSecret resolves the webhook secret value using the secrets resolver.
 func (g *GitHubConfig) ResolveWebhookSecret() (string, error) {
 	return secrets.Resolve(g.WebhookSecret, "")
+}
+
+// ResolveRepoWebhookSecret resolves the repository-level webhook HMAC secret,
+// supporting env:/file:/secretsmanager: references. Empty when repo-webhook
+// dispatch is not configured.
+func (g *GitHubConfig) ResolveRepoWebhookSecret() (string, error) {
+	return secrets.Resolve(g.RepoWebhookSecret, "")
 }
 
 // GitHubAppConfig is one entry in ServerConfig.Apps. It carries the same

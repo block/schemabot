@@ -60,7 +60,7 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 
 	repo := payload.Repository.FullName
 	headSHA := payload.MergeGroup.HeadSHA
-	installationID := payload.Installation.ID
+	installationID := h.effectiveInstallationID(ctx, payload.Installation.ID)
 	if installationID == 0 {
 		h.writeError(w, http.StatusBadRequest, "missing installation ID in merge_group payload")
 		return

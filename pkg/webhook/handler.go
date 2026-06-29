@@ -65,6 +65,7 @@ const (
 	headerDeliveryID     = "X-GitHub-Delivery"
 	headerSignature256   = "X-Hub-Signature-256"
 	hookTargetTypeApp    = "integration"
+	hookTargetTypeRepo   = "repository"
 	maxWebhookBodyBytes  = 10 << 20
 )
 
@@ -92,29 +93,52 @@ type Handler struct {
 	// single-secret behavior.
 	webhookAppByID map[int64]string
 
+	// repoWebhookSecret, when non-empty, enables repository-level webhook
+	// dispatch: deliveries with target type "repository" are HMAC-verified
+	// against this secret and their App installation is resolved per repo
+	// (such deliveries carry no installation id in the payload). Empty
+	// disables repo-webhook dispatch and leaves the App-webhook paths
+	// (single- and multi-App) unchanged.
+	repoWebhookSecret []byte
+
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
 	priorEnvCheckRetryInterval time.Duration
+}
+
+// HandlerOption configures optional Handler behavior at construction. Options
+// are variadic and backward-compatible: existing callers that pass none are
+// unaffected.
+type HandlerOption func(*Handler)
+
+// WithRepoWebhookSecret enables repository-level webhook dispatch by setting the
+// HMAC secret used to verify repository-targeted deliveries. Empty is a no-op.
+func WithRepoWebhookSecret(secret []byte) HandlerOption {
+	return func(h *Handler) {
+		if len(secret) > 0 {
+			h.repoWebhookSecret = secret
+		}
+	}
 }
 
 // NewHandler creates a new webhook handler for the legacy single-App
 // configuration. The provided factory is registered in the internal
 // ClientSet under the "default" App name so per-repo client resolution
 // works uniformly with the multi-App path used by NewHandlerWithDispatch.
-func NewHandler(service *api.Service, ghClient github.GitHubClientFactory, webhookSecret []byte, logger *slog.Logger) *Handler {
-	return NewHandlerWithClientSet(service, github.NewSingleClientSet(defaultAppName, ghClient), webhookSecret, logger)
+func NewHandler(service *api.Service, ghClient github.GitHubClientFactory, webhookSecret []byte, logger *slog.Logger, opts ...HandlerOption) *Handler {
+	return NewHandlerWithClientSet(service, github.NewSingleClientSet(defaultAppName, ghClient), webhookSecret, logger, opts...)
 }
 
 // NewHandlerWithClientSet creates a new webhook handler from an
 // already-built single-App ClientSet. The provided webhook secret is
 // associated with the defaultAppName entry and verified directly on every
 // request (legacy single-secret mode).
-func NewHandlerWithClientSet(service *api.Service, ghClients github.ClientSet, webhookSecret []byte, logger *slog.Logger) *Handler {
+func NewHandlerWithClientSet(service *api.Service, ghClients github.ClientSet, webhookSecret []byte, logger *slog.Logger, opts ...HandlerOption) *Handler {
 	secrets := map[string][]byte{}
 	if len(webhookSecret) > 0 {
 		secrets[defaultAppName] = webhookSecret
 	}
-	return NewHandlerWithDispatch(service, ghClients, secrets, nil, logger)
+	return NewHandlerWithDispatch(service, ghClients, secrets, nil, logger, opts...)
 }
 
 // NewHandlerWithDispatch creates a new webhook handler with header-keyed
@@ -126,7 +150,7 @@ func NewHandlerWithClientSet(service *api.Service, ghClients github.ClientSet, w
 // handler will require the header, reject unknown App IDs, and HMAC-verify
 // against the resolved App's secret only. Pass an empty/nil webhookAppByID
 // for legacy single-secret behavior (used internally by NewHandler).
-func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, webhookSecretsByApp map[string][]byte, webhookAppByID map[int64]string, logger *slog.Logger) *Handler {
+func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, webhookSecretsByApp map[string][]byte, webhookAppByID map[int64]string, logger *slog.Logger, opts ...HandlerOption) *Handler {
 	h := &Handler{
 		service:                    service,
 		ghClients:                  ghClients,
@@ -135,6 +159,9 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 		logger:                     logger,
 		priorEnvCheckMaxAttempts:   defaultPriorEnvCheckMaxAttempts,
 		priorEnvCheckRetryInterval: defaultPriorEnvCheckRetryInterval,
+	}
+	for _, opt := range opts {
+		opt(h)
 	}
 
 	// Register recovery callback so the operator can attach comment observers
@@ -418,19 +445,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Cross-check that the App that signed the webhook is the App that
 	// owns this repository in config. A signed delivery for a repo owned
 	// by a different App is a config drift or hostile install — fail
-	// closed before any handler runs.
-	if err := h.verifySignedAppOwnsRepo(repo, appName); err != nil {
-		h.logger.Warn("webhook rejected: signing App does not own repo",
-			"app_name", appName,
-			"app_id", appID,
-			"delivery_id", r.Header.Get(headerDeliveryID),
-			"event", eventType,
-			"action", action,
-			"repo", repo,
-			"error", err)
-		metrics.RecordWebhookEvent(r.Context(), metricAppName(appName), eventType, action, repo, "app_repo_mismatch")
-		h.writeError(w, http.StatusUnauthorized, "invalid webhook dispatch")
-		return
+	// closed before any handler runs. Repo-level webhook deliveries are
+	// attributed to the single shared App rather than a per-repo App, so this
+	// per-repo-App ownership check does not apply to them; the repo allowlist
+	// (enforced per handler) is the authorization boundary in that mode.
+	if !h.repoWebhookTargeted(r) {
+		if err := h.verifySignedAppOwnsRepo(repo, appName); err != nil {
+			h.logger.Warn("webhook rejected: signing App does not own repo",
+				"app_name", appName,
+				"app_id", appID,
+				"delivery_id", r.Header.Get(headerDeliveryID),
+				"event", eventType,
+				"action", action,
+				"repo", repo,
+				"error", err)
+			metrics.RecordWebhookEvent(r.Context(), metricAppName(appName), eventType, action, repo, "app_repo_mismatch")
+			h.writeError(w, http.StatusUnauthorized, "invalid webhook dispatch")
+			return
+		}
 	}
 
 	ctx, span := otel.Tracer("schemabot").Start(r.Context(), "webhook",
@@ -452,12 +484,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	metricApp := metricAppName(appName)
 
+	// Repo-level webhook deliveries carry no installation id in the payload, so
+	// resolve the shared App's installation for the repo and stash it on the
+	// context for downstream handlers. Only for repos this deployment manages;
+	// others are rejected by the per-handler allowlist anyway. Fail closed (500)
+	// so GitHub redelivers if resolution fails transiently.
+	if h.repoWebhookTargeted(r) && repo != "" && h.isRepoAllowed(repo) {
+		installationID, err := h.resolveRepoWebhookInstallation(ctx, repo)
+		if err != nil {
+			h.logger.Error("failed to resolve installation for repo-level webhook",
+				"repo", repo, "event", eventType, "action", action,
+				"delivery_id", r.Header.Get(headerDeliveryID), "error", err)
+			metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "installation_resolution_failed")
+			h.writeError(w, http.StatusInternalServerError, "failed to resolve installation for repository webhook")
+			return
+		}
+		ctx = withResolvedInstallationID(ctx, installationID)
+	}
+
 	switch eventType {
 	case "issue_comment":
 		h.handleIssueComment(ctx, metricApp, w, body)
 		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
 	case "check_run":
-		h.handleCheckRun(w, body)
+		h.handleCheckRun(ctx, w, body)
 		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
 	case "pull_request":
 		h.handlePullRequest(ctx, metricApp, w, body)
@@ -493,6 +543,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // configured secret (when set) and reports the App name as defaultAppName.
 func (h *Handler) authenticateWebhook(r *http.Request, body []byte) (appName string, appID int64, status string, ok bool) {
 	signature := r.Header.Get(headerSignature256)
+
+	// Repository-level webhook dispatch: when configured, a delivery whose
+	// target type is "repository" is verified against the repo-webhook secret.
+	// The shared App provides API identity (its installation is resolved per
+	// repo downstream); events are delivered by repo webhooks, not the App
+	// webhook. Falls through to App-webhook handling for "integration"
+	// deliveries so a deployment can run both during the cutover.
+	if h.repoWebhookTargeted(r) {
+		if !verifyHMAC(signature, body, h.repoWebhookSecret) {
+			return defaultAppName, 0, "invalid_signature", false
+		}
+		return defaultAppName, 0, "", true
+	}
 
 	if len(h.webhookAppByID) > 0 {
 		targetType := r.Header.Get(headerHookTargetType)
@@ -557,6 +620,63 @@ func (h *Handler) verifySignedAppOwnsRepo(repo, signedAppName string) error {
 		return fmt.Errorf("repo %q is configured to be owned by app %q but webhook was signed by app %q", repo, expected.Name, signedAppName)
 	}
 	return nil
+}
+
+// repoWebhookTargeted reports whether this delivery is a repository-level
+// webhook that repo-webhook dispatch should handle: repo-webhook mode is
+// configured and the delivery carries the "repository" hook target type.
+func (h *Handler) repoWebhookTargeted(r *http.Request) bool {
+	return len(h.repoWebhookSecret) > 0 &&
+		strings.EqualFold(r.Header.Get(headerHookTargetType), hookTargetTypeRepo)
+}
+
+// installationIDContextKey carries an installation id resolved out of band
+// (repo-webhook dispatch, whose deliveries omit the payload installation id).
+type installationIDContextKey struct{}
+
+// withResolvedInstallationID returns a context carrying an out-of-band-resolved
+// installation id for downstream handlers.
+func withResolvedInstallationID(ctx context.Context, id int64) context.Context {
+	return context.WithValue(ctx, installationIDContextKey{}, id)
+}
+
+// effectiveInstallationID returns the payload-supplied installation id when
+// present, otherwise the id resolved out of band and stashed on the context by
+// repo-webhook dispatch. Returns 0 when neither is available, which callers
+// already treat as a missing-installation error.
+func (h *Handler) effectiveInstallationID(ctx context.Context, payloadID int64) int64 {
+	if payloadID != 0 {
+		return payloadID
+	}
+	if id, ok := ctx.Value(installationIDContextKey{}).(int64); ok {
+		return id
+	}
+	return 0
+}
+
+// isRepoAllowed reports whether the repository is permitted by config. Mirrors
+// the per-handler allowlist check so repo-webhook dispatch can skip installation
+// resolution for repos this deployment does not manage.
+func (h *Handler) isRepoAllowed(repo string) bool {
+	return h.service == nil || h.service.Config().IsRepoAllowed(repo)
+}
+
+// resolveRepoWebhookInstallation resolves the shared App's installation id for
+// repo so a repo-level webhook delivery (which carries no installation id) can
+// mint an installation client downstream.
+func (h *Handler) resolveRepoWebhookInstallation(ctx context.Context, repo string) (int64, error) {
+	factory, err := h.factoryForRepo(repo)
+	if err != nil {
+		return 0, fmt.Errorf("resolve client factory for repo %s: %w", repo, err)
+	}
+	id, err := factory.InstallationIDForRepo(ctx, repo)
+	if err != nil {
+		return 0, fmt.Errorf("resolve installation for repo %s: %w", repo, err)
+	}
+	if id == 0 {
+		return 0, fmt.Errorf("resolved installation id 0 for repo %s", repo)
+	}
+	return id, nil
 }
 
 // metricAppName normalizes the App name for the webhook events counter so

@@ -604,12 +604,19 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		return webhookRuntime{}, fmt.Errorf("GitHub App is configured but webhook secret is empty — set github.webhook-secret to secure the /webhook endpoint")
 	}
 
+	repoWebhookSecret, err := serverConfig.GitHub.ResolveRepoWebhookSecret()
+	if err != nil {
+		return webhookRuntime{}, fmt.Errorf("resolve GitHub repo-webhook secret: %w", err)
+	}
+
 	appID := serverConfig.GitHub.ResolveAppID()
 	ghClient := ghclient.NewClient(appID, []byte(ghPrivateKey), logger,
 		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs))
-	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger)
+	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger,
+		webhook.WithRepoWebhookSecret([]byte(repoWebhookSecret)))
 	logger.Info("GitHub webhook endpoint registered",
-		"app_id", appID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs)
+		"app_id", appID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs,
+		"repo_webhook_dispatch", repoWebhookSecret != "")
 	return webhookRuntime{
 		handler:                         handler,
 		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,

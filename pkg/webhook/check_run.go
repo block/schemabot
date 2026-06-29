@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 )
@@ -23,7 +24,7 @@ type checkRunPayload struct {
 	} `json:"installation"`
 }
 
-func (h *Handler) handleCheckRun(w http.ResponseWriter, body []byte) {
+func (h *Handler) handleCheckRun(ctx context.Context, w http.ResponseWriter, body []byte) {
 	var payload checkRunPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid check_run payload")
@@ -40,7 +41,7 @@ func (h *Handler) handleCheckRun(w http.ResponseWriter, body []byte) {
 		return
 	}
 
-	installationID := payload.Installation.ID
+	installationID := h.effectiveInstallationID(ctx, payload.Installation.ID)
 	if installationID == 0 {
 		h.writeError(w, http.StatusBadRequest, "missing installation ID in webhook payload")
 		return

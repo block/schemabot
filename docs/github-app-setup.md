@@ -281,6 +281,18 @@ If `webhook-secret` is set in the config, SchemaBot validates the `X-Hub-Signatu
 
 If the secret is not set, signature validation is skipped (useful for local development).
 
+## Repository-level Webhooks (optional)
+
+A single deployment can also accept deliveries from a **repository-level webhook** (a webhook configured directly on a repo, rather than on the GitHub App). This lets several SchemaBot deployments that share one GitHub App all receive the same repo's events. Set a separate secret for these deliveries:
+
+```yaml
+github:
+  webhook-secret: "env:GITHUB_WEBHOOK_SECRET"           # App-installed deliveries
+  repo-webhook-secret: "env:GITHUB_REPO_WEBHOOK_SECRET" # repository-level deliveries
+```
+
+When `repo-webhook-secret` is set, deliveries whose `X-GitHub-Hook-Installation-Target-Type` header is `repository` are HMAC-verified against this secret. Such deliveries carry no installation id in their payload, so SchemaBot resolves the App's installation for the repo via the App JWT and caches it. Leave `repo-webhook-secret` unset to disable this path; App-installed deliveries are unaffected either way.
+
 ## Troubleshooting
 
 **Webhook not receiving events**: Check that the webhook URL is reachable from GitHub. Use the **Recent Deliveries** tab on your GitHub App's settings page to see delivery attempts and response codes.

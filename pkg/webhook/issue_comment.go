@@ -68,10 +68,13 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
-	var installationID int64
+	var payloadInstallationID int64
 	if payload.Installation != nil {
-		installationID = payload.Installation.ID
+		payloadInstallationID = payload.Installation.ID
 	}
+	// Repo-level webhook deliveries carry no installation id in the payload; the
+	// dispatcher resolves it and stashes it on the context.
+	installationID := h.effectiveInstallationID(ctx, payloadInstallationID)
 
 	repo := payload.Repository.FullName
 	pr := payload.Issue.Number
