@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.14
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.41.1
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3
-	github.com/block/spirit v0.15.2-0.20260625160741-3bd8ca93a47b
+	github.com/block/spirit v0.15.2-0.20260629112820-8f451ff83766
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
