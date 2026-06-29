@@ -123,6 +123,46 @@ repos:
 	assert.False(t, cfg.AreChecksEnabled("org/repo"))
 }
 
+// Deployed configs predating the driver rename still set the deprecated
+// scheduler_workers / operator_workers keys. The strict YAML decoder
+// (KnownFields(true)) must accept them so the server loads instead of
+// crashlooping, and the value must fold into drivers so operator intent is
+// preserved.
+func TestLoadServerConfigFromFile_DeprecatedDriverKeys(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+	}{
+		{name: "scheduler_workers", key: "scheduler_workers"},
+		{name: "operator_workers", key: "operator_workers"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.yaml")
+			content := tc.key + `: 4
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        target: testapp-staging
+        deployment: default
+tern_deployments:
+  default:
+    staging: "tern-staging:9090"
+`
+			require.NoError(t, os.WriteFile(configPath, []byte(content), 0644), "write config file")
+
+			cfg, err := LoadServerConfigFromFile(configPath)
+			require.NoError(t, err, "deprecated %s must not crashloop the loader", tc.key)
+			assert.Equal(t, 4, cfg.Drivers, "deprecated %s must fold into drivers", tc.key)
+			assert.Equal(t, 0, cfg.OperatorWorkers)
+			assert.Equal(t, 0, cfg.SchedulerWorkers)
+		})
+	}
+}
+
 func TestLoadServerConfigFromFile_DSNFrom(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")

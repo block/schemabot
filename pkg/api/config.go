@@ -108,6 +108,23 @@ type ServerConfig struct {
 	// SKIP LOCKED to prevent races. Defaults to DefaultDrivers.
 	Drivers int `yaml:"drivers"`
 
+	// OperatorWorkers is the deprecated alias for Drivers. It is kept so existing
+	// config files that still set operator_workers continue to load (the YAML
+	// decoder runs with KnownFields(true) and would otherwise reject the unknown
+	// key, crashlooping the server). Validate() folds it into Drivers when the
+	// new key is unset and logs a deprecation warning. Remove once deployed
+	// configs no longer set this key.
+	//
+	// Deprecated: use drivers.
+	OperatorWorkers int `yaml:"operator_workers,omitempty"`
+
+	// SchedulerWorkers is the original deprecated alias for Drivers, predating
+	// operator_workers. It is kept for the same KnownFields(true) reason and is
+	// folded into Drivers by Validate() with a deprecation warning.
+	//
+	// Deprecated: use drivers.
+	SchedulerWorkers int `yaml:"scheduler_workers,omitempty"`
+
 	// OperatorClaimOperations switches drivers to claim work at the
 	// apply_operations (per-deployment) level via FindNextApplyOperation instead
 	// of the apply level via FindNextApply. While every apply still owns exactly
@@ -737,8 +754,44 @@ func LoadServerConfigFromFile(path string) (*ServerConfig, error) {
 	return &config, nil
 }
 
+// resolveDeprecatedDrivers folds the deprecated operator_workers and
+// scheduler_workers keys into drivers. When only a deprecated key is set it is
+// honored and a deprecation warning is logged; setting more than one of the
+// three keys is rejected so the effective value is never ambiguous.
+func (c *ServerConfig) resolveDeprecatedDrivers() error {
+	set := 0
+	if c.Drivers != 0 {
+		set++
+	}
+	if c.OperatorWorkers != 0 {
+		set++
+	}
+	if c.SchedulerWorkers != 0 {
+		set++
+	}
+	if set > 1 {
+		return fmt.Errorf("set only one of drivers, operator_workers, or scheduler_workers (operator_workers and scheduler_workers are deprecated)")
+	}
+
+	if c.OperatorWorkers != 0 {
+		slog.Warn("operator_workers is deprecated; use drivers", "operator_workers", c.OperatorWorkers)
+		c.Drivers = c.OperatorWorkers
+		c.OperatorWorkers = 0
+	}
+	if c.SchedulerWorkers != 0 {
+		slog.Warn("scheduler_workers is deprecated; use drivers", "scheduler_workers", c.SchedulerWorkers)
+		c.Drivers = c.SchedulerWorkers
+		c.SchedulerWorkers = 0
+	}
+	return nil
+}
+
 // Validate checks the configuration for required fields and consistency.
 func (c *ServerConfig) Validate() error {
+	if err := c.resolveDeprecatedDrivers(); err != nil {
+		return err
+	}
+
 	// The database registry is required for the control plane and for a
 	// single-database data plane. A data plane configured with a target_resolver
 	// resolves opaque targets dynamically and has no database registry, so it is

@@ -271,6 +271,8 @@ Increase `drivers` when one SchemaBot server should make operator progress acros
 
 A driver claim means selecting one stale apply and refreshing its heartbeat in the same storage transaction. That heartbeat refresh is the driver's lease while it reloads state and drives the apply to a terminal state.
 
+> **Deprecated:** the previous `operator_workers` and `scheduler_workers` keys still work as aliases for `drivers` and are honored with a deprecation warning. Set only one of the three. The aliases will be removed once deployed configs no longer set them.
+
 ## Pending Drops
 
 For MySQL databases executed by the Spirit engine, `DROP TABLE` statements are
