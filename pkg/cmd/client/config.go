@@ -24,6 +24,20 @@ type Profile struct {
 	// `schemabot login`. Scoping it to a profile keeps a token bound to the
 	// server it was issued for, so it is never sent to a different endpoint.
 	Token string `yaml:"token,omitempty"`
+	// OIDC holds the public-client settings `schemabot login` uses to run the
+	// browser auth-code flow for this profile's server. Optional; absent until a
+	// server has OIDC enabled.
+	OIDC *OIDCLogin `yaml:"oidc,omitempty"`
+}
+
+// OIDCLogin holds the OIDC public-client settings for `schemabot login`. The
+// values mirror the server's OIDC provider registration: the issuer URL, the
+// CLI public client ID, and the loopback port of the redirect URI registered
+// for that client.
+type OIDCLogin struct {
+	Issuer       string `yaml:"issuer"`
+	ClientID     string `yaml:"client_id"`
+	RedirectPort int    `yaml:"redirect_port,omitempty"`
 }
 
 // ConfigPath returns the path to the config file (~/.schemabot/config.yaml).
@@ -140,27 +154,32 @@ func SaveConfig(cfg *Config) error {
 // 1. Explicit profile flag
 // 2. SCHEMABOT_PROFILE environment variable
 // 3. Default profile from config
+// ResolveProfileName returns the active profile name using the standard
+// precedence: the --profile flag, then SCHEMABOT_PROFILE, then the configured
+// default profile, then "default". It does not check that the profile exists.
+func ResolveProfileName(cfg *Config, profileFlag string) string {
+	if profileFlag != "" {
+		return profileFlag
+	}
+	if env := os.Getenv("SCHEMABOT_PROFILE"); env != "" {
+		return env
+	}
+	if cfg.DefaultProfile != "" {
+		return cfg.DefaultProfile
+	}
+	return "default"
+}
+
 func GetProfile(profileFlag string) (*Profile, error) {
 	cfg, err := LoadConfig()
 	if err != nil {
 		return nil, err
 	}
 
-	// Determine which profile to use.
-	// Track whether the user explicitly requested a profile (flag or env),
-	// so we can error if it doesn't exist instead of silently falling back.
-	profileName := profileFlag
-	explicit := profileFlag != ""
-	if profileName == "" {
-		profileName = os.Getenv("SCHEMABOT_PROFILE")
-		explicit = profileName != ""
-	}
-	if profileName == "" {
-		profileName = cfg.DefaultProfile
-	}
-	if profileName == "" {
-		profileName = "default"
-	}
+	// Track whether the user explicitly requested a profile (flag or env), so we
+	// can error if it doesn't exist instead of silently falling back.
+	explicit := profileFlag != "" || os.Getenv("SCHEMABOT_PROFILE") != ""
+	profileName := ResolveProfileName(cfg, profileFlag)
 
 	profile, ok := cfg.Profiles[profileName]
 	if !ok {

@@ -45,6 +45,7 @@ type CLI struct {
 	Preview    commands.PreviewCmd    `cmd:"" help:"Preview CLI output templates (for development)"`
 	FixLint    commands.FixLintCmd    `cmd:"" name:"fix-lint" help:"Auto-fix lint issues in schema files"`
 	Configure  commands.ConfigureCmd  `cmd:"" help:"Configure CLI settings (endpoint, profiles)"`
+	Login      commands.LoginCmd      `cmd:"" help:"Log in via OIDC and cache a token for the active profile"`
 	Settings   commands.SettingsCmd   `cmd:"" help:"View or update schema change settings"`
 	Serve      commands.ServeCmd      `cmd:"" help:"Start the SchemaBot HTTP API server"`
 }
