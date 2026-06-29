@@ -1,0 +1,371 @@
+//go:build integration
+
+// Stale check cleanup, reconciliation, and PR-close webhook integration tests.
+
+package webhook
+
+import (
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"testing"
+	"time"
+
+	gh "github.com/google/go-github/v86/github"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
+)
+
+// TestE2EPRCloseCleanup verifies PR-close cleanup against real storage. While
+// the PR has a running apply, closing it retains the database lock (so no other
+// PR can start a concurrent apply on the same database) and retains stored
+// check state (so a close-and-reopen cannot turn in-flight apply state into a
+// passing check). Once the apply reaches a terminal state, closing the PR
+// releases the lock and deletes the stored check state.
+func TestE2EPRCloseCleanup(t *testing.T) {
+	dbName := "webhook_pr_close"
+	svc := setupE2EService(t, dbName)
+
+	// Seed a lock and check record for this PR
+	err := svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName: dbName,
+		DatabaseType: "mysql",
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		Owner:        "octocat/hello-world#1",
+	})
+	require.NoError(t, err)
+
+	err = svc.Storage().Checks().Upsert(t.Context(), &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   42,
+		HasChanges:   true,
+		Status:       "completed",
+		Conclusion:   "action_required",
+	})
+	require.NoError(t, err)
+
+	applyID, err := svc.Storage().Applies().Create(t.Context(), &storage.Apply{
+		ApplyIdentifier: "apply-close-running",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Running,
+		Engine:          "spirit",
+	})
+	require.NoError(t, err)
+
+	h := NewHandler(svc, nil, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	// Close the PR while the apply is running. The handler is invoked directly
+	// (not through the async webhook goroutine) so the retention assertions
+	// below observe a finished cleanup pass.
+	h.handlePRClosed("octocat/hello-world", 1, 12345)
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock, "lock must be retained while the apply is running")
+	assert.Equal(t, "octocat/hello-world#1", lock.Owner)
+
+	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check, "stored check state must be retained while the apply is running")
+	assert.Equal(t, "action_required", check.Conclusion)
+
+	// Finish the apply, then close the PR again through the webhook path.
+	apply, err := svc.Storage().Applies().Get(t.Context(), applyID)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	apply.State = state.Apply.Completed
+	require.NoError(t, svc.Storage().Applies().Update(t.Context(), apply))
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "closed"}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "PR close cleanup started")
+
+	// Poll until lock is released (cleanup runs async)
+	require.Eventually(t, func() bool {
+		lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+		return err == nil && lock == nil
+	}, 5*time.Second, 100*time.Millisecond, "lock should be released on PR close once the apply is terminal")
+
+	// Poll until check is deleted
+	require.Eventually(t, func() bool {
+		check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+		return err == nil && check == nil
+	}, 5*time.Second, 100*time.Millisecond, "check should be deleted on PR close once the apply is terminal")
+}
+
+// TestE2EStaleCheckCleanup verifies that checks for databases no longer in the PR
+// are marked as success on synchronize.
+func TestE2EStaleCheckCleanup(t *testing.T) {
+	dbName := "webhook_stale_check"
+	svc := setupE2EService(t, dbName)
+
+	// Seed a check for a database that WON'T be in the next auto-plan
+	err := svc.Storage().Checks().Upsert(t.Context(), &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "old-sha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "removed_database",
+		CheckRunID:   42,
+		HasChanges:   true,
+		Status:       "completed",
+		Conclusion:   "action_required",
+	})
+	require.NoError(t, err)
+
+	// Also seed a check for the database that WILL be in the auto-plan
+	err = svc.Storage().Checks().Upsert(t.Context(), &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "old-sha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   43,
+		HasChanges:   true,
+		Status:       "completed",
+		Conclusion:   "action_required",
+	})
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	h := newE2EHandler(t, svc, client)
+
+	// Send synchronize event (simulates new commits pushed)
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "synchronize"}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// The stale check (removed_database) should be updated to success
+	require.Eventually(t, func() bool {
+		check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", "removed_database")
+		if err != nil || check == nil {
+			return false
+		}
+		return check.Conclusion == "success"
+	}, 10*time.Second, 200*time.Millisecond, "stale check should be updated to success")
+
+	// The active check (dbName) should still exist (may be updated by auto-plan)
+	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check, "active check should still exist")
+}
+
+// TestE2EReconcileStaleInProgressCheck verifies that when a check is stuck at
+// "in_progress" from a crashed apply, the next plan or apply command reconciles
+// it to the apply's terminal state. This prevents branch protection from being
+// blocked indefinitely after a server crash mid-apply.
+func TestE2EReconcileStaleInProgressCheck(t *testing.T) {
+	dbName := "webhook_stale_inprogress"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// Seed a completed apply (simulates an apply that finished but the goroutine died)
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-stale-test",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Completed,
+		Engine:          "spirit",
+	}
+	applyID, err := svc.Storage().Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	// Seed a check stuck at "in_progress" (the goroutine died before updating it)
+	err = svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha999",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   42,
+		ApplyID:      applyID,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+		Conclusion:   "",
+	})
+	require.NoError(t, err)
+
+	// Seed an aggregate also stuck at in_progress
+	err = svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha999",
+		Environment:  aggregateSentinel,
+		DatabaseType: aggregateSentinel,
+		DatabaseName: aggregateSentinel,
+		CheckRunID:   100,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+		Conclusion:   "",
+	})
+	require.NoError(t, err)
+
+	// Set up fake GitHub
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	result := setupFakeGitHubForPlan(t, mux, nil, "", dbName)
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+
+	require.NoError(t, h.reconcileStaleChecks(ctx, installClient, "octocat/hello-world", 1))
+
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionSuccess, check.Conclusion)
+	assert.Equal(t, applyID, check.ApplyID)
+
+	select {
+	case checkRun := <-result.checkRuns:
+		assert.Equal(t, aggregateCheckName, checkRun.Name)
+		assert.Equal(t, "abc123", checkRun.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, checkRun.Status)
+		assert.Equal(t, checkConclusionSuccess, checkRun.Conclusion)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for aggregate check run")
+	}
+
+	aggregate, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, aggregate)
+	assert.Equal(t, "abc123", aggregate.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, aggregate.Status)
+	assert.Equal(t, checkConclusionSuccess, aggregate.Conclusion)
+}
+
+// TestE2EReconcileStaleInProgressCheckFailure verifies startup/webhook
+// reconciliation for a check that is still in_progress even though its apply
+// already failed. Reconciliation must publish the failure instead of leaving
+// branch protection pending forever.
+func TestE2EReconcileStaleInProgressCheckFailure(t *testing.T) {
+	dbName := "webhook_stale_inprogress_failed"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// Seed the terminal apply. This models a driver that reached a failed apply
+	// state, then crashed before it updated GitHub check state.
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-stale-failed",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Failed,
+		Engine:          "spirit",
+	}
+	applyID, err := svc.Storage().Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	// The stored per-database and aggregate check state still say in_progress.
+	// The per-database row points at the failed apply that reconciliation should
+	// use as the source of truth.
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha999",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   42,
+		ApplyID:      applyID,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+		Conclusion:   "",
+	}))
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha999",
+		Environment:  aggregateSentinel,
+		DatabaseType: aggregateSentinel,
+		DatabaseName: aggregateSentinel,
+		CheckRunID:   100,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+		Conclusion:   "",
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// Fake GitHub provides current PR metadata so reconciliation can safely
+	// update the aggregate check on the current commit SHA.
+	result := setupFakeGitHubForPlan(t, mux, nil, "", dbName)
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+
+	require.NoError(t, h.reconcileStaleChecks(ctx, installClient, "octocat/hello-world", 1))
+
+	// Reconciliation should copy the failed apply result into the stored
+	// per-database check while preserving ownership by the original apply.
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionFailure, check.Conclusion)
+	assert.Equal(t, applyID, check.ApplyID)
+
+	select {
+	case checkRun := <-result.checkRuns:
+		assert.Equal(t, aggregateCheckName, checkRun.Name)
+		assert.Equal(t, "abc123", checkRun.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, checkRun.Status)
+		assert.Equal(t, checkConclusionFailure, checkRun.Conclusion)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for failing aggregate check run")
+	}
+}
