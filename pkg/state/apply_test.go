@@ -504,6 +504,11 @@ func TestDeriveRolloutApplyState_PausePolicy(t *testing.T) {
 			want:     Apply.Failed,
 		},
 		{
+			name:     "pause failure with later sibling stopped (stop chosen over release) settles failed",
+			children: []RolloutChild{rcPause(Apply.Failed), rcPause(Apply.Stopped)},
+			want:     Apply.Failed,
+		},
+		{
 			name:     "single pause failure with nothing to hold settles failed",
 			children: []RolloutChild{rcPause(Apply.Failed)},
 			want:     Apply.Failed,

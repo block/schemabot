@@ -1720,6 +1720,8 @@ func startNotAllowedForState(apply *storage.Apply) error {
 		return controlConflictf("schema change is cutting over; start is not allowed")
 	case state.IsState(apply.State, state.Apply.RevertWindow):
 		return controlConflictf("schema change is in revert window; use revert or skip-revert instead of start")
+	case state.IsState(apply.State, state.Apply.Paused):
+		return controlConflictf("schema change is paused after a failed deployment; use release to continue the remaining deployments or stop to abandon them")
 	case state.IsState(apply.State, state.Apply.FailedRetryable):
 		return controlConflictf("schema change is waiting for operator retry; start is not allowed")
 	case state.IsState(apply.State, state.Apply.Failed):

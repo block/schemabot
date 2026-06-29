@@ -3257,6 +3257,51 @@ func TestApplyStore_FindNextApplyForStopReconciliation_ClaimsStrandedContinueApp
 	assert.Equal(t, state.Apply.Running, claimed.State, "reconciliation claim refreshes the lease without changing apply state")
 }
 
+// TestApplyStore_FindNextApplyForStopReconciliation_ClaimsStrandedPausedApply
+// verifies the trigger also covers on_failure "pause": a rollout held paused by
+// a failed earlier sibling (no release) with a pending stop and a pending
+// sibling is claimed here so the operator can stop the held siblings and settle
+// the apply failed. paused is deliberately absent from claimableApplyStates, so
+// without paused in the reconciliation parent eligibility a stopped paused apply
+// would strand its pending siblings forever.
+func TestApplyStore_FindNextApplyForStopReconciliation_ClaimsStrandedPausedApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stop_recon_paused", 1, state.Apply.Paused, "staging")
+
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed, OnFailure: storage.OnFailurePause,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", OnFailure: storage.OnFailurePause,
+	})
+	require.NoError(t, err)
+	// Backdate the failed row so it can't be mistaken for a fresh active op.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failedID)
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a paused apply with a pending stop and pending siblings must be claimable for reconciliation")
+	assert.Equal(t, apply.ID, claimed.ID)
+	assert.Equal(t, "test-operator", claimed.LeaseOwner, "claim rotates the lease owner")
+	assert.Equal(t, state.Apply.Paused, claimed.State, "reconciliation claim refreshes the lease without changing apply state")
+}
+
 // TestApplyStore_FindNextApplyForStopReconciliation_SkipsApplyWithActiveOp
 // verifies the trigger defers to the operation-claim path whenever any operation
 // is active — whether freshly heartbeating or stale-and-crashed. That path drives

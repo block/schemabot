@@ -1318,14 +1318,19 @@ func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, own
 	}
 	defer rollbackTx(ctx, tx, "claim apply for stop reconciliation")
 
-	// Parent eligibility: pending plus the active recovery-claimable states
-	// (claimableApplyStates); the resumable failed_retryable and stopped states
-	// are excluded because they have their own resume paths. pending is included
-	// so a stop requested before the first operation is ever claimed is not
-	// stranded — the claim gate refuses the pending ops, so reconciliation must
-	// own them; persistApplyClaim transitions a pending apply to running for the
-	// claim.
-	parentStates := append([]string{state.Apply.Pending}, claimableApplyStates()...)
+	// Parent eligibility: pending and paused plus the active recovery-claimable
+	// states (claimableApplyStates); the resumable failed_retryable and stopped
+	// states are excluded because they have their own resume paths. pending is
+	// included so a stop requested before the first operation is ever claimed is
+	// not stranded — the claim gate refuses the pending ops, so reconciliation
+	// must own them; persistApplyClaim transitions a pending apply to running for
+	// the claim. paused is included so an on_failure='pause' rollout that an
+	// operator stops (rather than releases) is terminalized: paused holds the
+	// later siblings pending behind the failed one, and paused is deliberately
+	// absent from claimableApplyStates (it needs an explicit human decision, not
+	// stale-heartbeat recovery), so without it here a stopped paused apply would
+	// strand its pending siblings forever.
+	parentStates := append([]string{state.Apply.Pending, state.Apply.Paused}, claimableApplyStates()...)
 	parentStatePlaceholders := placeholders(len(parentStates))
 
 	// A child operation in any of these states is being driven, or is a crashed
