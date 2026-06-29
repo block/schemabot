@@ -2,6 +2,8 @@ package commands
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -28,6 +30,7 @@ type LoginCmd struct {
 	Issuer       string `help:"OIDC issuer URL (overrides the profile's oidc.issuer)"`
 	ClientID     string `name:"client-id" help:"OIDC public client ID for the CLI (overrides the profile's oidc.client_id)"`
 	RedirectPort int    `name:"redirect-port" help:"Loopback port for the OIDC redirect URI (overrides the profile's oidc.redirect_port)"`
+	NoBrowser    bool   `name:"no-browser" help:"Print the login URL instead of opening a browser (for headless or remote sessions)"`
 
 	// Test seams: nil in production, where they default to the real
 	// implementations below.
@@ -61,7 +64,10 @@ func (cmd *LoginCmd) Run(g *Globals) error {
 
 	open := cmd.openBrowser
 	if open == nil {
-		open = openBrowser
+		open = launchBrowser
+		if cmd.NoBrowser {
+			open = printAuthURL
+		}
 	}
 	loginFn := cmd.loginFn
 	if loginFn == nil {
@@ -71,7 +77,6 @@ func (cmd *LoginCmd) Run(g *Globals) error {
 	ctx, cancel := context.WithTimeout(context.Background(), loginTimeout)
 	defer cancel()
 
-	fmt.Fprintf(os.Stderr, "Opening your browser to log in to %s…\n", loginCfg.Issuer)
 	result, err := loginFn(ctx, loginCfg, open)
 	if err != nil {
 		return fmt.Errorf("log in to %s: %w", loginCfg.Issuer, err)
@@ -86,7 +91,11 @@ func (cmd *LoginCmd) Run(g *Globals) error {
 		return fmt.Errorf("save token to profile %q: %w", profileName, err)
 	}
 
-	fmt.Printf("Logged in. Token cached for profile %q.\n", profileName)
+	if who := userFromIDToken(result.IDToken); who != "" {
+		fmt.Printf("Logged in as %s. Token cached for profile %q.\n", who, profileName)
+	} else {
+		fmt.Printf("Logged in. Token cached for profile %q.\n", profileName)
+	}
 	return nil
 }
 
@@ -135,11 +144,19 @@ func resolveLoginConfig(flagIssuer, flagClientID string, flagRedirectPort int, p
 	}, nil
 }
 
-// openBrowser opens the system browser at the authorization URL and also prints
-// it, so the user can complete login by pasting the URL if the browser does not
-// launch (e.g. over SSH).
-func openBrowser(url string) error {
-	fmt.Fprintf(os.Stderr, "If your browser does not open, visit this URL to continue:\n  %s\n", url)
+// printAuthURL prints the authorization URL for the user to open manually. It is
+// the --no-browser opener and the fallback the launcher reuses, so the user can
+// always complete login by pasting the URL (e.g. on a headless or remote host).
+func printAuthURL(url string) error {
+	fmt.Fprintf(os.Stderr, "Open this URL in your browser to log in:\n\n  %s\n\n", url)
+	return nil
+}
+
+// launchBrowser prints the authorization URL and opens it in the system browser.
+func launchBrowser(url string) error {
+	if err := printAuthURL(url); err != nil {
+		return err
+	}
 
 	var name string
 	var args []string
@@ -163,4 +180,35 @@ func openBrowser(url string) error {
 		return fmt.Errorf("release browser launcher process: %w", err)
 	}
 	return nil
+}
+
+// userFromIDToken extracts a human-readable identifier from the ID token for the
+// "logged in as" confirmation. It is best-effort and display-only — the server
+// verifies the token — so an unparseable token yields an empty string and the
+// caller simply omits the name.
+func userFromIDToken(idToken string) string {
+	parts := strings.Split(idToken, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Email string `json:"email"`
+		Name  string `json:"name"`
+		Sub   string `json:"sub"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	switch {
+	case claims.Email != "":
+		return claims.Email
+	case claims.Name != "":
+		return claims.Name
+	default:
+		return claims.Sub
+	}
 }

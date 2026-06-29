@@ -2,12 +2,39 @@ package commands
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"testing"
 
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// fakeIDToken builds a syntactically valid (unsigned) JWT carrying the given
+// claims, for exercising display-only claim parsing.
+func fakeIDToken(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload, err := json.Marshal(claims)
+	require.NoError(t, err)
+	return header + "." + base64.RawURLEncoding.EncodeToString(payload) + "."
+}
+
+func TestUserFromIDToken(t *testing.T) {
+	t.Run("prefers email", func(t *testing.T) {
+		tok := fakeIDToken(t, map[string]any{"email": "dev@example.com", "name": "Dev", "sub": "abc"})
+		assert.Equal(t, "dev@example.com", userFromIDToken(tok))
+	})
+	t.Run("falls back to name then sub", func(t *testing.T) {
+		assert.Equal(t, "Dev", userFromIDToken(fakeIDToken(t, map[string]any{"name": "Dev", "sub": "abc"})))
+		assert.Equal(t, "abc", userFromIDToken(fakeIDToken(t, map[string]any{"sub": "abc"})))
+	})
+	t.Run("malformed token yields empty", func(t *testing.T) {
+		assert.Empty(t, userFromIDToken("not-a-jwt"))
+		assert.Empty(t, userFromIDToken(""))
+	})
+}
 
 func TestResolveLoginConfig(t *testing.T) {
 	t.Run("flags override profile", func(t *testing.T) {
@@ -75,11 +102,12 @@ func TestLoginCmdRunCachesToken(t *testing.T) {
 	}
 	require.NoError(t, client.SaveConfig(seed))
 
+	idToken := fakeIDToken(t, map[string]any{"email": "dev@example.com"})
 	var gotCfg client.LoginConfig
 	cmd := &LoginCmd{
 		loginFn: func(_ context.Context, lc client.LoginConfig, _ client.BrowserOpener) (*client.LoginResult, error) {
 			gotCfg = lc
-			return &client.LoginResult{IDToken: "jwt-xyz"}, nil
+			return &client.LoginResult{IDToken: idToken}, nil
 		},
 		openBrowser: func(string) error { return nil },
 	}
@@ -92,7 +120,7 @@ func TestLoginCmdRunCachesToken(t *testing.T) {
 
 	reloaded, err := client.LoadConfig()
 	require.NoError(t, err)
-	assert.Equal(t, "jwt-xyz", reloaded.Profiles["default"].Token)
+	assert.Equal(t, idToken, reloaded.Profiles["default"].Token)
 }
 
 // Without OIDC settings on the profile and no flags, login fails with a clear
