@@ -1826,8 +1826,8 @@ func (s *applyStore) ReapplyFailed(ctx context.Context, applyID int64) (*storage
 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE tasks t
-		LEFT JOIN apply_operations ao ON ao.id = t.apply_operation_id
-		SET t.state = ?, t.error_message = '', t.completed_at = NULL, t.updated_at = NOW()
+		LEFT JOIN apply_operations ao ON ao.id = t.apply_operation_id AND ao.apply_id = t.apply_id
+		SET t.state = ?, t.error_message = NULL, t.completed_at = NULL, t.updated_at = NOW()
 		WHERE t.apply_id = ?
 			AND t.state IN (?, ?)
 			AND (t.apply_operation_id IS NULL OR ao.state = ?)
@@ -1837,7 +1837,7 @@ func (s *applyStore) ReapplyFailed(ctx context.Context, applyID int64) (*storage
 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE apply_operations
-		SET state = ?, error_message = '', completed_at = NULL, updated_at = NOW(),
+		SET state = ?, error_message = NULL, completed_at = NULL, updated_at = NOW(),
 		    lease_owner = '', lease_token = '', lease_acquired_at = NULL
 		WHERE apply_id = ? AND state = ?
 	`, state.ApplyOperation.FailedRetryable, apply.ID, state.ApplyOperation.Failed); err != nil {
