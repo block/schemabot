@@ -1,6 +1,7 @@
 package github
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -10,6 +11,8 @@ import (
 type stubFactory struct{}
 
 func (stubFactory) ForInstallation(int64) (*InstallationClient, error) { return nil, nil }
+
+func (stubFactory) InstallationIDForRepo(context.Context, string) (int64, error) { return 0, nil }
 
 func TestClientSet_For(t *testing.T) {
 	t.Run("returns registered factory", func(t *testing.T) {

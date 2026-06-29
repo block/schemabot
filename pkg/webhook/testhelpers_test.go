@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,10 +21,26 @@ import (
 // fakeClientFactory returns a pre-built InstallationClient for any installation ID.
 type fakeClientFactory struct {
 	client *ghclient.InstallationClient
+	// repoInstallationID is returned by InstallationIDForRepo. Zero defaults to
+	// 12345 so repo-webhook dispatch tests resolve a non-zero installation id.
+	repoInstallationID int64
+	// installIDErr, when set, makes InstallationIDForRepo fail — used to
+	// exercise the fail-closed path of repo-webhook dispatch.
+	installIDErr error
 }
 
 func (f *fakeClientFactory) ForInstallation(_ int64) (*ghclient.InstallationClient, error) {
 	return f.client, nil
+}
+
+func (f *fakeClientFactory) InstallationIDForRepo(_ context.Context, _ string) (int64, error) {
+	if f.installIDErr != nil {
+		return 0, f.installIDErr
+	}
+	if f.repoInstallationID != 0 {
+		return f.repoInstallationID, nil
+	}
+	return 12345, nil
 }
 
 // setupGitHubServer creates an httptest server and a go-github client pointed at it.

@@ -35,6 +35,9 @@ const schemaDiscoveryConcurrency = 10
 // Production uses *Client (JWT auth via ghinstallation); tests use a fake with httptest.
 type GitHubClientFactory interface {
 	ForInstallation(installationID int64) (*InstallationClient, error)
+	// InstallationIDForRepo resolves the App's installation id for a repo,
+	// needed for repo-level webhook deliveries that carry no installation id.
+	InstallationIDForRepo(ctx context.Context, repo string) (int64, error)
 }
 
 // Client handles GitHub App-level operations and creates per-installation clients.
@@ -69,6 +72,14 @@ type Client struct {
 	// every call.
 	installationsMu sync.Mutex
 	installations   map[int64]*InstallationClient
+
+	// repoInstallations caches the App's installation id for a repository,
+	// resolved via the App JWT. Repo-level webhook deliveries (unlike
+	// App-installed webhook deliveries) carry no installation id in the
+	// payload, so repo-webhook dispatch must look it up. A GitHub App installs
+	// once per account/org, so the id is stable per repo and safe to memoise.
+	repoInstallationsMu sync.Mutex
+	repoInstallations   map[string]int64
 
 	// checkStatusSingleflight coalesces concurrent GetPRCheckStatuses
 	// calls for the same (repo, sha) into a single upstream request via
@@ -132,6 +143,7 @@ func NewClient(appID int64, privateKey []byte, logger *slog.Logger, opts ...Clie
 		privateKey:              privateKey,
 		logger:                  logger,
 		installations:           make(map[int64]*InstallationClient),
+		repoInstallations:       make(map[string]int64),
 		checkStatusSingleflight: NewCheckStatusSingleflight(),
 	}
 	for _, opt := range opts {
@@ -237,6 +249,48 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 	c.logger.Info("constructed installation client",
 		"installation_id", installationID, "app_slug", slug)
 	return ic, nil
+}
+
+// InstallationIDForRepo resolves this App's installation id for repo (in
+// "owner/name" form) via the App JWT, caching the result. Repo-level webhook
+// deliveries carry no installation id in the payload — only App-installed
+// webhook deliveries do — so repo-webhook dispatch uses this to obtain the id
+// needed to mint an installation client for API calls.
+func (c *Client) InstallationIDForRepo(ctx context.Context, repo string) (int64, error) {
+	c.repoInstallationsMu.Lock()
+	if id, ok := c.repoInstallations[repo]; ok {
+		c.repoInstallationsMu.Unlock()
+		return id, nil
+	}
+	c.repoInstallationsMu.Unlock()
+
+	owner, name := splitRepo(repo)
+	if owner == "" || name == "" {
+		return 0, fmt.Errorf("resolve installation for %q: repository must be in owner/name form", repo)
+	}
+
+	appBaseTransport := newGitHubRateLimitTransport(newGitHubMetricsTransport(http.DefaultTransport, 0, c.loadAppSlug))
+	appTransport, err := ghinstallation.NewAppsTransport(appBaseTransport, c.appID, c.privateKey)
+	if err != nil {
+		return 0, fmt.Errorf("create app transport to resolve installation for %s: %w", repo, err)
+	}
+	appClient := gh.NewClient(&http.Client{Transport: appTransport, Timeout: 10 * time.Second})
+	appClient.DisableRateLimitCheck = true
+
+	installation, _, err := appClient.Apps.FindRepositoryInstallation(ctx, owner, name)
+	if err != nil {
+		return 0, fmt.Errorf("find installation for %s: %w", repo, err)
+	}
+	id := installation.GetID()
+	if id == 0 {
+		return 0, fmt.Errorf("find installation for %s: GitHub returned installation id 0", repo)
+	}
+
+	c.repoInstallationsMu.Lock()
+	c.repoInstallations[repo] = id
+	c.repoInstallationsMu.Unlock()
+	c.logger.Info("resolved GitHub App installation for repo", "repo", repo, "installation_id", id)
+	return id, nil
 }
 
 // NewInstallationClient creates an InstallationClient from a pre-configured go-github client.
