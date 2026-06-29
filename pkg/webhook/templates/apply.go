@@ -306,7 +306,8 @@ func writeRevertWindowDeadline(sb *strings.Builder, revertExpiresAt string) {
 	if err != nil {
 		return
 	}
-	remaining := time.Until(expires)
+	// NowFunc (not time.Now) so previews and tests render a deterministic countdown.
+	remaining := expires.Sub(NowFunc())
 	if remaining <= 0 {
 		return
 	}

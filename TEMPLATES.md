@@ -2666,6 +2666,98 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="revert-window"></a><strong>Revert Window</strong></summary>
+
+
+## Schema Change Applied (Pending Revert) — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Revert window
+
+⏳ **Revert window closes in**: 28m 30s
+
+### Table Progress
+
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+---
+
+To revert:
+```
+schemabot revert apply-a1b2c3d4e5f6 -e staging
+```
+
+To skip revert and keep changes:
+```
+schemabot skip-revert apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="skipping-revert"></a><strong>Skipping Revert</strong></summary>
+
+
+## Skipping Revert — Finalizing — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Skipping revert
+
+### Table Progress
+
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+---
+
+Skip-revert was requested — closing the revert window and making this schema change permanent. This can no longer be reverted.
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="start-command-accepted"></a><strong>Start Command Accepted</strong></summary>
 
 
