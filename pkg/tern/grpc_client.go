@@ -1617,9 +1617,10 @@ func (c *GRPCClient) triggerRemoteOperationCutover(ctx context.Context, apply *s
 		return false, c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now, scope)
 	}
 	switch {
-	case state.IsState(remoteState, state.Apply.CuttingOver), state.IsState(remoteState, state.Apply.RevertWindow):
-		// A prior driver already started the swap, or the engine is in the
-		// post-cutover revert window. Do not re-send Cutover; poll to terminal.
+	case state.IsState(remoteState, state.Apply.CuttingOver), state.IsState(remoteState, state.Apply.RevertWindow), state.IsState(remoteState, state.Apply.SkippingRevert):
+		// A prior driver already started the swap, the engine is in the post-cutover
+		// revert window, or skip-revert is finalizing. Do not re-send Cutover; poll
+		// to terminal.
 		apply.State = remoteState
 		return true, nil
 	case state.IsState(remoteState, state.Apply.WaitingForCutover):
@@ -2954,6 +2955,8 @@ func applyProgressRank(applyState string) int {
 		return 9
 	case state.Apply.RevertWindow:
 		return 10
+	case state.Apply.SkippingRevert:
+		return 11
 	default:
 		return 0
 	}

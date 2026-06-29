@@ -552,6 +552,15 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
+	case state.Apply.SkippingRevert:
+		bar := ui.ProgressBarWaitingCutover() // yellow — complete, revert window closing
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ✓ Complete (finalizing)\n", t.TableName, bar)
+		if t.DDL != "" {
+			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		b.WriteString("\n")
+		b.WriteString(FormatShardProgress(t.Shards))
+		return b.String()
 	case state.Apply.Cancelled:
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
 			cancelledPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
@@ -1199,6 +1208,8 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSIRed)
 	case state.Apply.RevertWindow:
 		return colorWrap(ANSIYellow)
+	case state.Apply.SkippingRevert:
+		return colorWrap(ANSICyan)
 	default:
 		return nil
 	}

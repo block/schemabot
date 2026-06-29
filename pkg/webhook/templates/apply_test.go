@@ -1725,3 +1725,26 @@ func TestRenderApplyStatusComment_RevertWindow(t *testing.T) {
 	assert.Contains(t, result, "schemabot revert apply-abc123 -e staging")
 	assert.Contains(t, result, "schemabot skip-revert apply-abc123 -e staging")
 }
+
+// Once skip-revert is accepted the apply moves from revert_window to
+// skipping_revert while PlanetScale discards the staged revert. The comment must
+// show finalization is underway and stop offering revert/skip-revert, since the
+// change can no longer be reverted.
+func TestRenderApplyStatusComment_SkippingRevert(t *testing.T) {
+	data := ApplyStatusCommentData{
+		ApplyID:     "apply-abc123",
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.SkippingRevert,
+		Tables: []TableProgressData{
+			{TableName: "users", Status: state.Task.RevertWindow},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "Skipping Revert — Finalizing")
+	assert.Contains(t, result, "can no longer be reverted")
+	assert.NotContains(t, result, "schemabot revert apply-abc123 -e staging")
+	assert.NotContains(t, result, "schemabot skip-revert apply-abc123 -e staging")
+}

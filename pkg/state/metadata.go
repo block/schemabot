@@ -66,6 +66,9 @@ var applyMetadata = map[string]ApplyStateInfo{
 	Apply.RevertWindow: {
 		Label: "Revert window",
 	},
+	Apply.SkippingRevert: {
+		Label: "Skipping revert",
+	},
 	Apply.Completed: {
 		Label:    "Completed",
 		Terminal: true,

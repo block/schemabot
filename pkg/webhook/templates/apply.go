@@ -156,6 +156,8 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 		writeEnvironmentTitle(sb, "Schema Change In Progress", data.Environment)
 	case state.Apply.RevertWindow:
 		writeEnvironmentTitle(sb, "Schema Change Applied (Pending Revert)", data.Environment)
+	case state.Apply.SkippingRevert:
+		writeEnvironmentTitle(sb, "Skipping Revert — Finalizing", data.Environment)
 	case state.Apply.Completed:
 		writeEnvironmentTitle(sb, "✅ Schema Change Applied", data.Environment)
 	case state.Apply.Failed:
@@ -817,6 +819,9 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.RevertWindow:
 		writeFooterAction(sb, "To revert:", fmt.Sprintf("schemabot revert %s -e %s", data.ApplyID, data.Environment))
 		fmt.Fprintf(sb, "\nTo skip revert and keep changes:\n```\nschemabot skip-revert %s -e %s\n```\n", data.ApplyID, data.Environment)
+	case state.Apply.SkippingRevert:
+		sb.WriteString("\n---\n\n")
+		sb.WriteString("Skip-revert was requested — closing the revert window and making this schema change permanent. This can no longer be reverted.\n")
 	}
 }
 
