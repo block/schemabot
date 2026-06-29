@@ -1097,6 +1097,7 @@ func PreviewCommentApplyRevertWindow() string {
 	}
 	data := sampleApplyData(state.Apply.RevertWindow, tables)
 	data.Engine = "PlanetScale"
+	data.DeployRequestURL = "https://app.planetscale.com/acme/myapp/deploy-requests/42"
 	data.RevertExpiresAt = NowFunc().Add(28*time.Minute + 30*time.Second).UTC().Format(time.RFC3339)
 	return RenderApplyStatusComment(data)
 }
@@ -1111,6 +1112,7 @@ func PreviewCommentApplySkippingRevert() string {
 	}
 	data := sampleApplyData(state.Apply.SkippingRevert, tables)
 	data.Engine = "PlanetScale"
+	data.DeployRequestURL = "https://app.planetscale.com/acme/myapp/deploy-requests/42"
 	return RenderApplyStatusComment(data)
 }
 

@@ -2677,6 +2677,8 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Status**: Revert window
 
+🔗 **Deploy request**: https://app.planetscale.com/acme/myapp/deploy-requests/42
+
 ⏳ **Revert window closes in**: 28m 30s
 
 ### Table Progress
@@ -2727,6 +2729,8 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **Status**: Skipping revert
+
+🔗 **Deploy request**: https://app.planetscale.com/acme/myapp/deploy-requests/42
 
 ### Table Progress
 
