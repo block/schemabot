@@ -27,7 +27,8 @@ func TestExecuteReapplyReappliesFailedApplyWhenPlanStillMatches(t *testing.T) {
 	plans := newReapplyPlanStore(sourcePlan)
 	applies := &reapplyApplyStore{apply: apply}
 	client := &mockTernClient{planResp: reapplyPlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
-	svc := newReapplyTestService(t, client, plans, applies, reapplyTestTask(apply, "users", state.Task.Failed))
+	locks := newReapplyLockStore()
+	svc := newReapplyTestService(t, client, plans, applies, locks, reapplyTestTask(apply, "users", state.Task.Failed))
 
 	resp, err := svc.ExecuteReapply(t.Context(), apitypes.ControlRequest{
 		Environment: "staging",
@@ -41,6 +42,8 @@ func TestExecuteReapplyReappliesFailedApplyWhenPlanStillMatches(t *testing.T) {
 	assert.Equal(t, apply.ApplyIdentifier, resp.ApplyID)
 	assert.Equal(t, sourcePlan.PlanIdentifier, resp.PlanID)
 	assert.Equal(t, apply.ID, applies.reappliedApplyID)
+	assert.Equal(t, locks.lock.ID, applies.reapplyLockID)
+	assert.Equal(t, "operator@example.com", locks.lock.Owner)
 	assert.Equal(t, sourcePlan.Database, client.planReq.Database)
 	assert.Equal(t, sourcePlan.Environment, client.planReq.Environment)
 }
@@ -76,7 +79,8 @@ func TestExecuteReapplyRejectsChangedPlanWithoutReapplying(t *testing.T) {
 	plans := newReapplyPlanStore(sourcePlan)
 	applies := &reapplyApplyStore{apply: apply}
 	client := &mockTernClient{planResp: reapplyPlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `phone` varchar(255)")}
-	svc := newReapplyTestService(t, client, plans, applies, reapplyTestTask(apply, "users", state.Task.Failed))
+	locks := newReapplyLockStore()
+	svc := newReapplyTestService(t, client, plans, applies, locks, reapplyTestTask(apply, "users", state.Task.Failed))
 
 	resp, err := svc.ExecuteReapply(t.Context(), apitypes.ControlRequest{
 		Environment: "staging",
@@ -86,6 +90,7 @@ func TestExecuteReapplyRejectsChangedPlanWithoutReapplying(t *testing.T) {
 	require.ErrorIs(t, err, storage.ErrApplyNotReappliable)
 	assert.Nil(t, resp)
 	assert.Zero(t, applies.reappliedApplyID)
+	assert.Nil(t, locks.lock)
 }
 
 func TestExecuteReapplyAcceptsRemainingWorkAfterCompletedTask(t *testing.T) {
@@ -101,7 +106,7 @@ func TestExecuteReapplyAcceptsRemainingWorkAfterCompletedTask(t *testing.T) {
 		Ddl:        "ALTER TABLE `orders` ADD COLUMN `status` varchar(32)",
 		ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
 	}})}
-	svc := newReapplyTestService(t, client, plans, applies,
+	svc := newReapplyTestService(t, client, plans, applies, newReapplyLockStore(),
 		reapplyTestTask(apply, "users", state.Task.Completed),
 		reapplyTestTask(apply, "orders", state.Task.Failed),
 	)
@@ -125,7 +130,7 @@ func TestExecuteReapplyRejectsFailedWorkOutsidePrimaryDeployment(t *testing.T) {
 	client := &mockTernClient{planResp: reapplyPlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
 	completedOpID := int64(101)
 	failedOpID := int64(102)
-	svc := newReapplyTestService(t, client, plans, applies,
+	svc := newReapplyTestService(t, client, plans, applies, newReapplyLockStore(),
 		reapplyTestOperation(completedOpID, apply.ID, sourcePlan.Deployment, state.ApplyOperation.Completed),
 		reapplyTestOperation(failedOpID, apply.ID, "secondary", state.ApplyOperation.Failed),
 		reapplyTestOperationTask(apply, completedOpID, "users", state.Task.Completed),
@@ -198,7 +203,7 @@ func TestExecuteReapplyRejectsCancelledApply(t *testing.T) {
 	plans := newReapplyPlanStore(sourcePlan)
 	applies := &reapplyApplyStore{apply: apply}
 	client := &mockTernClient{planResp: reapplyPlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
-	svc := newReapplyTestService(t, client, plans, applies)
+	svc := newReapplyTestService(t, client, plans, applies, newReapplyLockStore())
 
 	resp, err := svc.ExecuteReapply(t.Context(), apitypes.ControlRequest{
 		Environment: "staging",
@@ -209,6 +214,50 @@ func TestExecuteReapplyRejectsCancelledApply(t *testing.T) {
 	assert.Nil(t, resp)
 	assert.Zero(t, applies.reappliedApplyID)
 	assert.Nil(t, client.planReq)
+}
+
+func TestExecuteReapplyRejectsLockHeldByAnotherOwner(t *testing.T) {
+	sourcePlan := reapplyTestPlan("plan-source", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	apply := reapplyTestApply("apply-reapply", sourcePlan)
+	plans := newReapplyPlanStore(sourcePlan)
+	applies := &reapplyApplyStore{apply: apply}
+	client := &mockTernClient{planResp: reapplyPlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
+	locks := newReapplyLockStore()
+	locks.lock = &storage.Lock{ID: 99, DatabaseName: sourcePlan.Database, DatabaseType: sourcePlan.DatabaseType, Owner: "other-owner"}
+	svc := newReapplyTestService(t, client, plans, applies, locks, reapplyTestTask(apply, "users", state.Task.Failed))
+
+	resp, err := svc.ExecuteReapply(t.Context(), apitypes.ControlRequest{
+		Environment: "staging",
+		ApplyID:     apply.ApplyIdentifier,
+		Caller:      "operator@example.com",
+	})
+	require.ErrorIs(t, err, storage.ErrLockHeld)
+	assert.Nil(t, resp)
+	assert.Zero(t, applies.reappliedApplyID)
+}
+
+func TestExecuteReapplyForceTakesOverLockHeldByAnotherOwner(t *testing.T) {
+	sourcePlan := reapplyTestPlan("plan-source", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	apply := reapplyTestApply("apply-reapply", sourcePlan)
+	plans := newReapplyPlanStore(sourcePlan)
+	applies := &reapplyApplyStore{apply: apply}
+	client := &mockTernClient{planResp: reapplyPlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
+	locks := newReapplyLockStore()
+	locks.lock = &storage.Lock{ID: 99, DatabaseName: sourcePlan.Database, DatabaseType: sourcePlan.DatabaseType, Owner: "other-owner"}
+	svc := newReapplyTestService(t, client, plans, applies, locks, reapplyTestTask(apply, "users", state.Task.Failed))
+
+	resp, err := svc.ExecuteReapply(t.Context(), apitypes.ControlRequest{
+		Environment: "staging",
+		ApplyID:     apply.ApplyIdentifier,
+		Caller:      "operator@example.com",
+		Force:       true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, apply.ID, applies.reappliedApplyID)
+	assert.Equal(t, "operator@example.com", locks.lock.Owner)
+	assert.NotEqual(t, int64(99), applies.reapplyLockID)
 }
 
 func TestFilterPlanToReappliableWorkDropsEmptyNamespaces(t *testing.T) {
@@ -254,7 +303,7 @@ func TestExecuteReapplyRejectsTaskWithMissingOperationRow(t *testing.T) {
 	applies := &reapplyApplyStore{apply: apply}
 	client := &mockTernClient{planResp: reapplyPlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
 	// The failed task references operation 999, which is never registered.
-	svc := newReapplyTestService(t, client, plans, applies,
+	svc := newReapplyTestService(t, client, plans, applies, newReapplyLockStore(),
 		reapplyTestOperationTask(apply, 999, "users", state.Task.Failed),
 	)
 
@@ -294,7 +343,76 @@ func TestPlansEquivalentForReapplyTreatsNilAndEmptyArtifactsEqual(t *testing.T) 
 	assert.True(t, equivalent)
 }
 
-func newReapplyTestService(t *testing.T, client tern.Client, plans storage.PlanStore, applies storage.ApplyStore, rows ...any) *Service {
+func TestFilterPlanToReappliableWorkKeepsNamespaceTableForShardTask(t *testing.T) {
+	tableChange := storage.TableChange{Table: "orders", DDL: "ALTER TABLE `orders` ADD COLUMN `status` varchar(32)", Operation: "alter"}
+	sourcePlan := &storage.Plan{
+		Database:     "testdb",
+		DatabaseType: storage.DatabaseTypeStrata,
+		Deployment:   DefaultDeployment,
+		Target:       "testdb",
+		Environment:  "staging",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {Tables: []storage.TableChange{tableChange}},
+		},
+		Shards: []storage.ShardPlan{{
+			Namespace: "commerce",
+			Shard:     "-80",
+			Changes:   []storage.TableChange{tableChange},
+		}},
+	}
+	freshPlan := &storage.Plan{
+		Database:     sourcePlan.Database,
+		DatabaseType: sourcePlan.DatabaseType,
+		Deployment:   sourcePlan.Deployment,
+		Target:       sourcePlan.Target,
+		Environment:  sourcePlan.Environment,
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {Tables: []storage.TableChange{tableChange}},
+		},
+		Shards: []storage.ShardPlan{{
+			Namespace: "commerce",
+			Shard:     "-80",
+			Changes:   []storage.TableChange{tableChange},
+		}},
+	}
+
+	failedShardTaskKey := reapplyTaskKey{Namespace: "commerce", Shard: "-80", Table: "orders"}
+	filtered := filterPlanToReappliableWork(sourcePlan, reapplyWorkSelection{taskKeys: map[reapplyTaskKey]bool{failedShardTaskKey: true}})
+
+	require.Contains(t, filtered.Namespaces, "commerce")
+	assert.Equal(t, []storage.TableChange{tableChange}, filtered.Namespaces["commerce"].Tables)
+	equivalent, err := plansEquivalentForReapply(filtered, freshPlan)
+	require.NoError(t, err)
+	assert.True(t, equivalent)
+}
+
+func TestPlansEquivalentForReapplyNormalizesEmptyNamespacesAndArtifacts(t *testing.T) {
+	left := &storage.Plan{
+		Database:     "testdb",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		Deployment:   DefaultDeployment,
+		Target:       "testdb",
+		Environment:  "staging",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"empty":   {},
+			"routing": {Artifacts: map[string]string{}},
+		},
+	}
+	right := &storage.Plan{
+		Database:     left.Database,
+		DatabaseType: left.DatabaseType,
+		Deployment:   left.Deployment,
+		Target:       left.Target,
+		Environment:  left.Environment,
+		Namespaces:   map[string]*storage.NamespacePlanData{},
+	}
+
+	equivalent, err := plansEquivalentForReapply(left, right)
+	require.NoError(t, err)
+	assert.True(t, equivalent)
+}
+
+func newReapplyTestService(t *testing.T, client tern.Client, plans storage.PlanStore, applies storage.ApplyStore, locks storage.LockStore, rows ...any) *Service {
 	t.Helper()
 	var tasks []*storage.Task
 	var operations []*storage.ApplyOperation
@@ -315,6 +433,7 @@ func newReapplyTestService(t *testing.T, client tern.Client, plans storage.PlanS
 	return New(&mockStorageWithApplyStores{
 		plans:      plans,
 		applies:    applies,
+		locks:      locks,
 		tasks:      &capturingTaskStore{tasks: tasks},
 		applyLogs:  logStore,
 		operations: &staticApplyOperationStore{operations: operations},
@@ -468,6 +587,7 @@ type reapplyApplyStore struct {
 	storage.ApplyStore
 	apply            *storage.Apply
 	reappliedApplyID int64
+	reapplyLockID    int64
 }
 
 func (s *reapplyApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
@@ -477,7 +597,7 @@ func (s *reapplyApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentif
 	return nil, nil
 }
 
-func (s *reapplyApplyStore) ReapplyFailed(_ context.Context, applyID int64) (*storage.Apply, error) {
+func (s *reapplyApplyStore) ReapplyFailed(_ context.Context, applyID int64, lockID int64) (*storage.Apply, error) {
 	if s.apply == nil || s.apply.ID != applyID {
 		return nil, storage.ErrApplyNotFound
 	}
@@ -485,8 +605,60 @@ func (s *reapplyApplyStore) ReapplyFailed(_ context.Context, applyID int64) (*st
 		return nil, fmt.Errorf("apply %s is %s: %w", s.apply.ApplyIdentifier, s.apply.State, storage.ErrApplyNotReappliable)
 	}
 	s.reappliedApplyID = applyID
+	s.reapplyLockID = lockID
 	reapplied := *s.apply
+	reapplied.LockID = lockID
 	reapplied.State = state.Apply.FailedRetryable
 	reapplied.CompletedAt = nil
 	return &reapplied, nil
+}
+
+type reapplyLockStore struct {
+	storage.LockStore
+	lock   *storage.Lock
+	nextID int64
+}
+
+func newReapplyLockStore() *reapplyLockStore {
+	return &reapplyLockStore{nextID: 1}
+}
+
+func (s *reapplyLockStore) Acquire(_ context.Context, lock *storage.Lock) error {
+	if s.lock != nil {
+		if s.lock.Owner != lock.Owner {
+			return storage.ErrLockHeld
+		}
+		return nil
+	}
+	stored := *lock
+	stored.ID = s.nextID
+	s.nextID++
+	s.lock = &stored
+	return nil
+}
+
+func (s *reapplyLockStore) Get(_ context.Context, database, dbType string) (*storage.Lock, error) {
+	if s.lock != nil && s.lock.DatabaseName == database && s.lock.DatabaseType == dbType {
+		return s.lock, nil
+	}
+	return nil, nil
+}
+
+func (s *reapplyLockStore) ForceRelease(_ context.Context, database, dbType string) error {
+	if s.lock == nil || s.lock.DatabaseName != database || s.lock.DatabaseType != dbType {
+		return storage.ErrLockNotFound
+	}
+	s.lock = nil
+	return nil
+}
+
+func (s *reapplyLockStore) Release(_ context.Context, database, dbType, owner string) error {
+	if s.lock == nil || s.lock.DatabaseName != database || s.lock.DatabaseType != dbType {
+		return storage.ErrLockNotFound
+	}
+	if s.lock.Owner != owner {
+		return storage.ErrLockNotOwned
+	}
+	s.lock = nil
+	return nil
 }

@@ -465,10 +465,11 @@ type ApplyStore interface {
 	// ReapplyFailed transitions a recent permanently failed apply back onto the
 	// retryable recovery path. Completed work remains completed; failed tasks and
 	// operation rows become failed_retryable so operator drivers can claim and
-	// drive only the remaining work. The transition re-checks active-apply
-	// exclusivity under the apply target lock because it makes a terminal apply
-	// active again.
-	ReapplyFailed(ctx context.Context, applyID int64) (*Apply, error)
+	// drive only the remaining work. The caller must pass the logical lock row it
+	// owns for the target; the transition stores that lock_id and re-checks
+	// active-apply exclusivity under the apply target lock because it makes a
+	// terminal apply active again.
+	ReapplyFailed(ctx context.Context, applyID int64, lockID int64) (*Apply, error)
 
 	// FindMissingSummaryComment returns GitHub-backed applies that recently
 	// reached a terminal state (including stopped, judged by updated_at since a

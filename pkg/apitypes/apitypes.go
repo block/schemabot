@@ -413,6 +413,7 @@ type ControlRequest struct {
 	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id"`
 	Caller      string `json:"caller,omitempty"`
+	Force       bool   `json:"force,omitempty"`
 }
 
 // VolumeRequest is the HTTP request body for POST /api/volume.

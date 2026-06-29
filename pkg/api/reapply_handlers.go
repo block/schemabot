@@ -58,7 +58,7 @@ func reapplyHTTPStatus(err error) int {
 	switch {
 	case errors.Is(err, storage.ErrApplyNotFound):
 		return http.StatusNotFound
-	case errors.Is(err, storage.ErrApplyNotReappliable), errors.Is(err, storage.ErrActiveApplyExists):
+	case errors.Is(err, storage.ErrApplyNotReappliable), errors.Is(err, storage.ErrActiveApplyExists), errors.Is(err, storage.ErrLockHeld):
 		return http.StatusConflict
 	}
 	return controlOperationHTTPStatus(err)
@@ -125,6 +125,17 @@ func (s *Service) executeReapplyForApply(ctx context.Context, req apitypes.Contr
 		return nil, fmt.Errorf("plan %d not found for reapply apply %s: %w", apply.PlanID, apply.ApplyIdentifier, storage.ErrPlanNotFound)
 	}
 
+	lock, releaseLockOnReject, err := s.acquireReapplyLock(ctx, req, sourcePlan, apply)
+	if err != nil {
+		return nil, err
+	}
+	reapplyAccepted := false
+	defer func() {
+		if !reapplyAccepted && releaseLockOnReject {
+			s.releaseReapplyLockAfterReject(ctx, req, sourcePlan, apply)
+		}
+	}()
+
 	freshPlanResp, err := s.ExecutePlan(ctx, reapplyPlanRequest(sourcePlan))
 	if err != nil {
 		return nil, fmt.Errorf("re-plan apply %s for reapply: %w", apply.ApplyIdentifier, err)
@@ -155,10 +166,11 @@ func (s *Service) executeReapplyForApply(ctx context.Context, req apitypes.Contr
 			apply.ApplyIdentifier, sourcePlan.PlanIdentifier, freshPlan.PlanIdentifier, storage.ErrApplyNotReappliable)
 	}
 
-	reapplied, err := s.storage.Applies().ReapplyFailed(ctx, apply.ID)
+	reapplied, err := s.storage.Applies().ReapplyFailed(ctx, apply.ID, lock.ID)
 	if err != nil {
 		return nil, fmt.Errorf("reapply failed apply %s: %w", apply.ApplyIdentifier, err)
 	}
+	reapplyAccepted = true
 	s.logControlOperationForApply(ctx, reapplied, caller, storage.LogEventInfo, "Reapply requested by user")
 	s.logger.Info("reapply accepted for failed apply",
 		append(reapplied.LogAttrs(),
@@ -173,6 +185,59 @@ func (s *Service) executeReapplyForApply(ctx context.Context, req apitypes.Contr
 		PlanID:   sourcePlan.PlanIdentifier,
 		Message:  "Stored plan still matches; the failed apply was queued for reapply.",
 	}, nil
+}
+
+func (s *Service) acquireReapplyLock(ctx context.Context, req apitypes.ControlRequest, plan *storage.Plan, apply *storage.Apply) (*storage.Lock, bool, error) {
+	if req.Caller == "" {
+		return nil, false, controlHTTPErrorf(http.StatusBadRequest, "caller is required")
+	}
+	existing, err := s.storage.Locks().Get(ctx, plan.Database, plan.DatabaseType)
+	if err != nil {
+		return nil, false, fmt.Errorf("load reapply lock for %s/%s before acquire: %w", plan.Database, plan.DatabaseType, err)
+	}
+	releaseOnReject := existing == nil || existing.Owner != req.Caller
+	lock := &storage.Lock{
+		DatabaseName: plan.Database,
+		DatabaseType: plan.DatabaseType,
+		Repository:   plan.Repository,
+		PullRequest:  plan.PullRequest,
+		Owner:        req.Caller,
+	}
+	if err := s.storage.Locks().Acquire(ctx, lock); err != nil {
+		if errors.Is(err, storage.ErrLockHeld) {
+			if !req.Force {
+				return nil, false, fmt.Errorf("reapply lock for %s/%s is held by another owner; retry with force to take over the lock: %w", plan.Database, plan.DatabaseType, err)
+			}
+			s.logger.Warn("reapply force releasing database lock", append(apply.LogAttrs(), "requested_by", req.Caller)...)
+			if releaseErr := s.storage.Locks().ForceRelease(ctx, plan.Database, plan.DatabaseType); releaseErr != nil {
+				return nil, false, fmt.Errorf("force release reapply lock for %s/%s owner %s: %w", plan.Database, plan.DatabaseType, req.Caller, releaseErr)
+			}
+			if acquireErr := s.storage.Locks().Acquire(ctx, lock); acquireErr != nil {
+				return nil, false, fmt.Errorf("acquire reapply lock for %s/%s owner %s after force release: %w", plan.Database, plan.DatabaseType, req.Caller, acquireErr)
+			}
+		} else {
+			return nil, false, fmt.Errorf("acquire reapply lock for %s/%s owner %s: %w", plan.Database, plan.DatabaseType, req.Caller, err)
+		}
+	}
+	acquired, err := s.storage.Locks().Get(ctx, plan.Database, plan.DatabaseType)
+	if err != nil {
+		return nil, false, fmt.Errorf("load acquired reapply lock for %s/%s: %w", plan.Database, plan.DatabaseType, err)
+	}
+	if acquired == nil || acquired.Owner != req.Caller {
+		return nil, false, fmt.Errorf("reapply lock for %s/%s was not acquired by %s: %w", plan.Database, plan.DatabaseType, req.Caller, storage.ErrLockHeld)
+	}
+	return acquired, releaseOnReject, nil
+}
+
+func (s *Service) releaseReapplyLockAfterReject(ctx context.Context, req apitypes.ControlRequest, plan *storage.Plan, apply *storage.Apply) {
+	if err := s.storage.Locks().Release(ctx, plan.Database, plan.DatabaseType, req.Caller); err != nil {
+		s.logger.Warn("reapply rejected after acquiring database lock; lock release failed", append(apply.LogAttrs(),
+			"requested_by", req.Caller,
+			"error", err,
+		)...)
+		return
+	}
+	s.logger.Info("reapply rejected after acquiring database lock; lock released", append(apply.LogAttrs(), "requested_by", req.Caller)...)
 }
 
 func validateReapplyCandidate(apply *storage.Apply) error {
@@ -326,11 +391,20 @@ func filterReappliableNamespaceWork(namespace string, nsData *storage.NamespaceP
 		filtered.Artifacts = copyStringMap(nsData.Artifacts)
 	}
 	for _, change := range nsData.Tables {
-		if selection.taskKeys[reapplyTaskKey{Namespace: namespace, Table: change.Table}] {
+		if selection.includesTable(namespace, change.Table) {
 			filtered.Tables = append(filtered.Tables, change)
 		}
 	}
 	return filtered
+}
+
+func (s reapplyWorkSelection) includesTable(namespace, table string) bool {
+	for key := range s.taskKeys {
+		if key.Namespace == namespace && key.Table == table {
+			return true
+		}
+	}
+	return false
 }
 
 func reapplyFinalizerNamespace(operationKey string) (string, bool) {
@@ -423,6 +497,10 @@ func reapplyPlanFingerprintFor(plan *storage.Plan) reapplyPlanFingerprint {
 			continue
 		}
 		tables := append([]storage.TableChange(nil), nsData.Tables...)
+		artifacts := copyStringMap(nsData.Artifacts)
+		if len(tables) == 0 && len(artifacts) == 0 {
+			continue
+		}
 		sort.Slice(tables, func(i, j int) bool {
 			if tables[i].Table != tables[j].Table {
 				return tables[i].Table < tables[j].Table
@@ -435,7 +513,6 @@ func reapplyPlanFingerprintFor(plan *storage.Plan) reapplyPlanFingerprint {
 		// Canonicalize empty artifacts to nil so a nil vs empty map (which marshal
 		// to null vs {}) doesn't make an otherwise-identical plan compare unequal.
 		// This matches filterPlanToReappliableWork, which treats empty as absent.
-		artifacts := nsData.Artifacts
 		if len(artifacts) == 0 {
 			artifacts = nil
 		}

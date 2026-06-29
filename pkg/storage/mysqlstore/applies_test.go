@@ -3045,10 +3045,11 @@ func TestApplyStore_ReapplyFailed(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	reapplied, err := store.Applies().ReapplyFailed(ctx, apply.ID)
+	reapplied, err := store.Applies().ReapplyFailed(ctx, apply.ID, lock.ID)
 	require.NoError(t, err)
 	require.NotNil(t, reapplied)
 	assert.Equal(t, state.Apply.FailedRetryable, reapplied.State)
+	assert.Equal(t, lock.ID, reapplied.LockID)
 	assert.Zero(t, reapplied.Attempt)
 	assert.Empty(t, reapplied.ErrorMessage)
 	assert.Nil(t, reapplied.CompletedAt)
@@ -3080,6 +3081,33 @@ func TestApplyStore_ReapplyFailed(t *testing.T) {
 	assert.NotNil(t, completedOp.CompletedAt)
 }
 
+func TestApplyStore_ReapplyFailedRejectsActiveApplyForDatabase(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_reapply_active_database", 523, state.Apply.Failed, "staging")
+	now := time.Now()
+	apply.Deployment = "region-a"
+	apply.CompletedAt = &now
+	require.NoError(t, store.Applies().Update(ctx, apply))
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET deployment = ?, completed_at = ? WHERE id = ?`, apply.Deployment, now, apply.ID)
+	require.NoError(t, err)
+
+	active := createTestApplyWithStateEnvDeployment(t, store, lock, "apply_reapply_active_database_blocker", 524, state.Apply.Running, "production", "region-b")
+	require.NotNil(t, active)
+
+	reapplied, err := store.Applies().ReapplyFailed(ctx, apply.ID, lock.ID)
+	require.ErrorIs(t, err, storage.ErrActiveApplyExists)
+	assert.Nil(t, reapplied)
+
+	reloaded, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, reloaded)
+	assert.Equal(t, state.Apply.Failed, reloaded.State)
+}
+
 func TestApplyStore_ReapplyFailedRejectsOldFailure(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -3094,7 +3122,7 @@ func TestApplyStore_ReapplyFailedRejectsOldFailure(t *testing.T) {
 	_, err := testDB.ExecContext(ctx, `UPDATE applies SET deployment = ?, completed_at = ? WHERE id = ?`, apply.Deployment, completedAt, apply.ID)
 	require.NoError(t, err)
 
-	reapplied, err := store.Applies().ReapplyFailed(ctx, apply.ID)
+	reapplied, err := store.Applies().ReapplyFailed(ctx, apply.ID, lock.ID)
 	require.ErrorIs(t, err, storage.ErrApplyNotReappliable)
 	assert.Nil(t, reapplied)
 }
@@ -3144,7 +3172,7 @@ func TestApplyStore_ReapplyFailedRejectsNonReappliableOperation(t *testing.T) {
 			})
 			require.NoError(t, err)
 
-			reapplied, err := store.Applies().ReapplyFailed(ctx, apply.ID)
+			reapplied, err := store.Applies().ReapplyFailed(ctx, apply.ID, lock.ID)
 			require.ErrorIs(t, err, storage.ErrApplyNotReappliable)
 			assert.Nil(t, reapplied)
 
