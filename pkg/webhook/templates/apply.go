@@ -1310,9 +1310,7 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 		StartedAt:    resp.StartedAt,
 		CompletedAt:  resp.CompletedAt,
 	}
-	if resp.Metadata != nil {
-		data.RevertExpiresAt = resp.Metadata["revert_expires_at"]
-	}
+	data.RevertExpiresAt = resp.Metadata["revert_expires_at"]
 
 	if changes, err := apitypes.ParseVSchemaChanges(resp.Metadata); err != nil {
 		slog.Warn("failed to parse VSchema changes from progress metadata", "apply_id", resp.ApplyID, "error", err)

@@ -313,9 +313,9 @@ func decodePSMetadataForStorage(s string) (*psMetadataForStorage, error) {
 // setRevertExpiresAtMetadata returns the PlanetScale resume-state blob with
 // revert_expires_at set to expiresAt, preserving every other key. It merges at
 // the JSON-object level rather than re-encoding psMetadataForStorage so engine
-// fields the storage struct does not model (e.g. existing_migration_contexts)
-// survive the rewrite. The timestamp is normalized to UTC RFC3339 so the value
-// is stable across ticks and the comment/CLI parse it the same way.
+// fields the storage struct does not model survive the rewrite. The timestamp
+// is normalized to UTC RFC3339 so the value is stable across ticks and the
+// comment/CLI parse it the same way.
 func setRevertExpiresAtMetadata(metadata string, expiresAt time.Time) (string, error) {
 	obj := map[string]json.RawMessage{}
 	if metadata != "" {

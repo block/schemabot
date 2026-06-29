@@ -74,11 +74,12 @@ func TestPSDisplayMetadata(t *testing.T) {
 }
 
 // setRevertExpiresAtMetadata must set revert_expires_at without dropping engine
-// fields the storage struct does not model (e.g. existing_migration_contexts) —
-// it merges at the JSON-object level rather than re-encoding the typed struct.
+// fields the storage struct does not model — it merges at the JSON-object level
+// rather than re-encoding the typed struct, so an arbitrary unmodeled key
+// survives.
 func TestSetRevertExpiresAtMetadata(t *testing.T) {
 	expires := time.Date(2026, 6, 29, 18, 30, 0, 0, time.UTC)
-	in := `{"branch_name":"b","existing_migration_contexts":{"commerce":{"started_at":"2026-06-29T18:00:00Z"}}}`
+	in := `{"branch_name":"b","unmodeled_engine_field":{"commerce":{"started_at":"2026-06-29T18:00:00Z"}}}`
 
 	out, err := setRevertExpiresAtMetadata(in, expires)
 	require.NoError(t, err)
@@ -86,7 +87,7 @@ func TestSetRevertExpiresAtMetadata(t *testing.T) {
 	var obj map[string]json.RawMessage
 	require.NoError(t, json.Unmarshal([]byte(out), &obj))
 	assert.JSONEq(t, `"2026-06-29T18:30:00Z"`, string(obj["revert_expires_at"]))
-	assert.Contains(t, obj, "existing_migration_contexts", "unmodeled engine field must survive the rewrite")
+	assert.Contains(t, obj, "unmodeled_engine_field", "unmodeled engine field must survive the rewrite")
 	assert.JSONEq(t, `"b"`, string(obj["branch_name"]))
 
 	// Surfaced back through the display projection.
