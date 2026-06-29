@@ -31,19 +31,21 @@ type fakeOIDC struct {
 	stateOverride string // when set, echo this state instead of the request's
 	authError     string // when set, redirect with ?error=<authError>
 
-	idToken      string
-	accessToken  string
-	refreshToken string
-	omitIDToken  bool // when true, the token response omits the id_token
+	idToken          string
+	refreshedIDToken string // id_token returned for the refresh_token grant
+	accessToken      string
+	refreshToken     string
+	omitIDToken      bool // when true, the token response omits the id_token
 }
 
 func newFakeOIDC(t *testing.T) *fakeOIDC {
 	t.Helper()
 	f := &fakeOIDC{
-		challenges:   map[string]string{},
-		idToken:      "header.payload.signature",
-		accessToken:  "test-access-token",
-		refreshToken: "test-refresh-token",
+		challenges:       map[string]string{},
+		idToken:          "header.payload.signature",
+		refreshedIDToken: "refreshed.payload.signature",
+		accessToken:      "test-access-token",
+		refreshToken:     "test-refresh-token",
 	}
 
 	mux := http.NewServeMux()
@@ -99,6 +101,25 @@ func (f *fakeOIDC) handleToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
+	if r.Form.Get("grant_type") == "refresh_token" {
+		if r.Form.Get("refresh_token") == "" {
+			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+			return
+		}
+		body := map[string]any{
+			"access_token":  f.accessToken,
+			"token_type":    "Bearer",
+			"refresh_token": f.refreshToken,
+			"expires_in":    3600,
+		}
+		if !f.omitIDToken {
+			body["id_token"] = f.refreshedIDToken
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(body)
+		return
+	}
+
 	code := r.Form.Get("code")
 	verifier := r.Form.Get("code_verifier")
 

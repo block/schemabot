@@ -84,8 +84,13 @@ func (cmd *LoginCmd) Run(g *Globals) error {
 
 	// Cache the ID token: it carries the user identity and groups the server's
 	// OIDC authorizer validates, and its aud is the CLI client ID the server is
-	// configured to accept.
+	// configured to accept. The refresh token and expiry let the CLI renew it
+	// without another browser login.
 	profile.Token = result.IDToken
+	profile.RefreshToken = result.RefreshToken
+	if !result.Expiry.IsZero() {
+		profile.TokenExpiry = result.Expiry.Unix()
+	}
 	cfg.Profiles[profileName] = profile
 	if err := client.SaveConfig(cfg); err != nil {
 		return fmt.Errorf("save token to profile %q: %w", profileName, err)

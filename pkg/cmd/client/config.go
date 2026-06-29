@@ -1,11 +1,13 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/block/spirit/pkg/utils"
 	"gopkg.in/yaml.v3"
@@ -24,6 +26,10 @@ type Profile struct {
 	// `schemabot login`. Scoping it to a profile keeps a token bound to the
 	// server it was issued for, so it is never sent to a different endpoint.
 	Token string `yaml:"token,omitempty"`
+	// RefreshToken renews Token without another browser login. TokenExpiry is the
+	// Unix time (seconds) Token expires; 0 means unknown (no proactive refresh).
+	RefreshToken string `yaml:"refresh_token,omitempty"`
+	TokenExpiry  int64  `yaml:"token_expiry,omitempty"`
 	// OIDC holds the public-client settings `schemabot login` uses to run the
 	// browser auth-code flow for this profile's server. Optional; absent until a
 	// server has OIDC enabled.
@@ -103,7 +109,7 @@ func LoadConfig() (*Config, error) {
 // configHasToken reports whether any profile carries a cached token.
 func configHasToken(cfg *Config) bool {
 	for _, p := range cfg.Profiles {
-		if p.Token != "" {
+		if p.Token != "" || p.RefreshToken != "" {
 			return true
 		}
 	}
@@ -250,18 +256,92 @@ func ResolveToken(tokenFlag, endpointFlag, profileFlag string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if profile.Token == "" {
-		return "", nil
-	}
+	return profileToken(profile, endpointFlag), nil
+}
 
+// profileToken returns the cached token to send to endpointFlag, or "" when no
+// token is cached or an endpoint override points away from the profile's own
+// endpoint — a token must never be sent to a server it was not issued for.
+func profileToken(profile *Profile, endpointFlag string) string {
+	if profile.Token == "" {
+		return ""
+	}
 	endpointOverride := endpointFlag
 	if endpointOverride == "" {
 		endpointOverride = os.Getenv("SCHEMABOT_ENDPOINT")
 	}
 	if endpointOverride != "" && trimSlash(endpointOverride) != trimSlash(profile.Endpoint) {
+		return ""
+	}
+	return profile.Token
+}
+
+// tokenRefreshSkew renews a token slightly before its real expiry so a request
+// is not sent with a token that lapses mid-flight.
+const tokenRefreshSkew = 60 * time.Second
+
+// ResolveBearerToken resolves the Bearer token like ResolveToken, but renews an
+// expired profile-cached token when a refresh token and OIDC settings are
+// present, persisting the rotated token. Flag/env tokens are returned as-is.
+//
+// Error contract for the caller: a non-empty token with a non-nil error is a
+// non-fatal warning (the returned token is the best available — e.g. a stale
+// token when refresh failed — so the command can still run and the user can
+// re-authenticate); an empty token with a non-nil error is a hard failure.
+func ResolveBearerToken(ctx context.Context, tokenFlag, endpointFlag, profileFlag string) (string, error) {
+	if tokenFlag != "" {
+		return tokenFlag, nil
+	}
+	if env := os.Getenv("SCHEMABOT_TOKEN"); env != "" {
+		return env, nil
+	}
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		return "", err
+	}
+	profileName := ResolveProfileName(cfg, profileFlag)
+	profile, ok := cfg.Profiles[profileName]
+	if !ok {
+		// Mirror GetProfile: an explicitly requested missing profile is an error;
+		// an unrequested missing profile simply has no token.
+		if profileFlag != "" || os.Getenv("SCHEMABOT_PROFILE") != "" {
+			return "", fmt.Errorf("unknown profile %q", profileName)
+		}
 		return "", nil
 	}
-	return profile.Token, nil
+
+	token := profileToken(&profile, endpointFlag)
+	if token == "" {
+		return "", nil
+	}
+
+	// Refresh only when the expiry is known and (nearly) reached.
+	if profile.TokenExpiry == 0 || time.Until(time.Unix(profile.TokenExpiry, 0)) > tokenRefreshSkew {
+		return token, nil
+	}
+	if profile.RefreshToken == "" || profile.OIDC == nil {
+		return token, fmt.Errorf("token for profile %q has expired; run `schemabot login`", profileName)
+	}
+
+	result, err := RefreshToken(ctx, LoginConfig{Issuer: profile.OIDC.Issuer, ClientID: profile.OIDC.ClientID}, profile.RefreshToken)
+	if err != nil {
+		return token, fmt.Errorf("could not refresh the token for profile %q (run `schemabot login`): %w", profileName, err)
+	}
+
+	profile.Token = result.IDToken
+	if result.RefreshToken != "" {
+		profile.RefreshToken = result.RefreshToken
+	}
+	if !result.Expiry.IsZero() {
+		profile.TokenExpiry = result.Expiry.Unix()
+	}
+	cfg.Profiles[profileName] = profile
+	if err := SaveConfig(cfg); err != nil {
+		// The refreshed token is usable for this run even if it could not be saved.
+		return result.IDToken, fmt.Errorf("could not persist the refreshed token for profile %q: %w", profileName, err)
+	}
+	return result.IDToken, nil
 }
 
 func trimSlash(s string) string {

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -64,12 +65,19 @@ func main() {
 	cli.Commit = commit
 	cli.Date = date
 
-	// Authenticate every API request with the resolved Bearer token. Empty when
-	// no token is configured, which is correct against a server with auth off.
-	token, err := client.ResolveToken(cli.Token, cli.Endpoint, cli.Profile)
+	// Authenticate every API request with the resolved Bearer token, renewing an
+	// expired cached token first. Empty when no token is configured, which is
+	// correct against a server with auth off.
+	token, err := client.ResolveBearerToken(context.Background(), cli.Token, cli.Endpoint, cli.Profile)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
-		os.Exit(1)
+		// Per ResolveBearerToken's contract: an empty token with an error is a hard
+		// failure; a non-empty token with an error is a non-fatal warning (the
+		// returned token is still usable and re-login can fix it).
+		if token == "" {
+			fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "\033[33mWarning: %v\033[0m\n", err)
 	}
 	client.SetAuthToken(token)
 
