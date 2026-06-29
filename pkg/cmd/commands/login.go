@@ -88,6 +88,9 @@ func (cmd *LoginCmd) Run(g *Globals) error {
 	// without another browser login.
 	profile.Token = result.IDToken
 	profile.RefreshToken = result.RefreshToken
+	// Clear expiry when the provider omits one so a stale value can't make the
+	// new token look immediately expired to the refresh path.
+	profile.TokenExpiry = 0
 	if !result.Expiry.IsZero() {
 		profile.TokenExpiry = result.Expiry.Unix()
 	}

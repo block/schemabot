@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/alecthomas/kong"
 
@@ -68,7 +69,12 @@ func main() {
 	// Authenticate every API request with the resolved Bearer token, renewing an
 	// expired cached token first. Empty when no token is configured, which is
 	// correct against a server with auth off.
-	token, err := client.ResolveBearerToken(context.Background(), cli.Token, cli.Endpoint, cli.Profile)
+	// Bound the resolution so a slow or unreachable issuer during a token refresh
+	// can't hang the CLI at startup. Cancel as soon as it returns rather than via
+	// defer, since the os.Exit below would skip a deferred cancel.
+	authCtx, cancelAuth := context.WithTimeout(context.Background(), 30*time.Second)
+	token, err := client.ResolveBearerToken(authCtx, cli.Token, cli.Endpoint, cli.Profile)
+	cancelAuth()
 	if err != nil {
 		// Per ResolveBearerToken's contract: an empty token with an error is a hard
 		// failure; a non-empty token with an error is a non-fatal warning (the

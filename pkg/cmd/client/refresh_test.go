@@ -65,7 +65,7 @@ func TestResolveBearerToken(t *testing.T) {
 			Profiles: map[string]Profile{"default": {
 				Endpoint:     "https://schemabot.example",
 				Token:        "stale-token",
-				RefreshToken: "test-refresh-token",
+				RefreshToken: "old-refresh-token",
 				TokenExpiry:  time.Now().Add(-time.Hour).Unix(),
 				OIDC:         &OIDCLogin{Issuer: f.issuer(), ClientID: "cli-client"},
 			}},
@@ -75,10 +75,12 @@ func TestResolveBearerToken(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, f.refreshedIDToken, tok)
 
-		// The rotated token and a fresh expiry are persisted for the next command.
+		// The rotated ID token, the rotated refresh token, and a fresh expiry are
+		// all persisted for the next command.
 		reloaded, err := LoadConfig()
 		require.NoError(t, err)
 		assert.Equal(t, f.refreshedIDToken, reloaded.Profiles["default"].Token)
+		assert.Equal(t, f.refreshToken, reloaded.Profiles["default"].RefreshToken)
 		assert.Greater(t, reloaded.Profiles["default"].TokenExpiry, time.Now().Unix())
 	})
 

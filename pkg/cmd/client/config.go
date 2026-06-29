@@ -280,6 +280,15 @@ func profileToken(profile *Profile, endpointFlag string) string {
 // is not sent with a token that lapses mid-flight.
 const tokenRefreshSkew = 60 * time.Second
 
+// unixExpiry converts a token expiry to the stored Unix-seconds form, returning
+// 0 ("unknown, do not proactively refresh") when the provider omits an expiry.
+func unixExpiry(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
+}
+
 // ResolveBearerToken resolves the Bearer token like ResolveToken, but renews an
 // expired profile-cached token when a refresh token and OIDC settings are
 // present, persisting the rotated token. Flag/env tokens are returned as-is.
@@ -321,7 +330,7 @@ func ResolveBearerToken(ctx context.Context, tokenFlag, endpointFlag, profileFla
 		return token, nil
 	}
 	if profile.RefreshToken == "" || profile.OIDC == nil {
-		return token, fmt.Errorf("token for profile %q has expired; run `schemabot login`", profileName)
+		return token, fmt.Errorf("token for profile %q is expired or about to expire and cannot be refreshed; run `schemabot login`", profileName)
 	}
 
 	result, err := RefreshToken(ctx, LoginConfig{Issuer: profile.OIDC.Issuer, ClientID: profile.OIDC.ClientID}, profile.RefreshToken)
@@ -333,9 +342,9 @@ func ResolveBearerToken(ctx context.Context, tokenFlag, endpointFlag, profileFla
 	if result.RefreshToken != "" {
 		profile.RefreshToken = result.RefreshToken
 	}
-	if !result.Expiry.IsZero() {
-		profile.TokenExpiry = result.Expiry.Unix()
-	}
+	// Always set expiry, clearing it when the provider omits one, so a stale
+	// value can't make every subsequent command refresh immediately.
+	profile.TokenExpiry = unixExpiry(result.Expiry)
 	cfg.Profiles[profileName] = profile
 	if err := SaveConfig(cfg); err != nil {
 		// The refreshed token is usable for this run even if it could not be saved.
