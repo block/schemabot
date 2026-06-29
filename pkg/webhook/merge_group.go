@@ -135,8 +135,24 @@ func (h *Handler) postMergeGroupChecks(ctx context.Context, client *ghclient.Ins
 				Summary: summary,
 			},
 		}
-		if _, err := client.CreateCheckRun(ctx, repo, headSHA, opts); err != nil {
-			return fmt.Errorf("create merge_group check %q on %s: %w", target.name, headSHA, err)
+		// Reuse an existing run for this name on the merge-group SHA so a webhook
+		// redelivery updates it rather than creating a duplicate Check Run. The
+		// lookup fails closed when the App slug is unknown; on that error fall
+		// back to creating, which is the safe (if untidy) outcome.
+		existing, _, findErr := client.FindCheckRunByName(ctx, repo, headSHA, target.name)
+		if findErr != nil {
+			h.logger.Warn("could not look up existing merge_group check; creating a new one",
+				"repo", repo, "head_sha", headSHA, "check_name", target.name, "error", findErr)
+		}
+		switch {
+		case findErr == nil && existing != nil:
+			if err := client.UpdateCheckRun(ctx, repo, existing.ID, opts); err != nil {
+				return fmt.Errorf("update merge_group check %q on %s: %w", target.name, headSHA, err)
+			}
+		default:
+			if _, err := client.CreateCheckRun(ctx, repo, headSHA, opts); err != nil {
+				return fmt.Errorf("create merge_group check %q on %s: %w", target.name, headSHA, err)
+			}
 		}
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:   "merge_group_check",

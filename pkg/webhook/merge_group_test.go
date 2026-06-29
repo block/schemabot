@@ -163,6 +163,63 @@ func TestWebhookMergeGroupRejectsUnregisteredRepo(t *testing.T) {
 	}
 }
 
+// A webhook redelivery for the same merge group must not create a duplicate
+// Check Run. When SchemaBot's App slug is known it finds the run it already
+// published on the merge-group head SHA and updates it in place.
+func TestWebhookMergeGroupUpdatesExistingCheck(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	updated := make(chan int64, 4)
+	created := make(chan string, 4)
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/mergesha123/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"total_count": 1,
+			"check_runs": []map[string]any{
+				{"id": 7, "name": "SchemaBot (production)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
+			},
+		})
+	})
+	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/7", func(w http.ResponseWriter, _ *http.Request) {
+		updated <- 7
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 7})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var c createdCheckRun
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&c))
+		created <- c.Name
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 555})
+	})
+
+	installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
+	service := api.New(nil, &api.ServerConfig{
+		AllowedEnvironments: []string{"production"},
+		Repos:               map[string]api.RepoConfig{"octocat/hello-world": {}},
+	}, nil, testLogger())
+	h := &Handler{
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:    testLogger(),
+	}
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, buildMergeGroupWebhookRequest(t, "checks_requested", "mergesha123", nil))
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case id := <-updated:
+		assert.Equal(t, int64(7), id)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected the existing check run to be updated")
+	}
+
+	select {
+	case name := <-created:
+		t.Fatalf("expected an update, not a new check run: %q", name)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 // With no environment scoping configured, SchemaBot publishes a single
 // non-environment-scoped aggregate check on the merge-group head SHA.
 func TestWebhookMergeGroupSingleAggregateWhenNoEnvScoping(t *testing.T) {
