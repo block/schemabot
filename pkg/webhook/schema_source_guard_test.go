@@ -73,6 +73,16 @@ func TestUnmanagedServerManagedSchemaChanges(t *testing.T) {
 			want:      nil,
 		},
 		{
+			// A repo-root schemabot.yaml (SchemaDir ".") is an ancestor of every
+			// directory, so discovery resolves it for schema files in managed
+			// subdirectories — it must not be flagged as missing config.
+			name:      "root config covers managed subdir file -> not flagged",
+			databases: managed,
+			files:     []ghclient.PRFile{{Filename: "db/orders/schema/users.sql", Status: "modified"}},
+			configs:   []ghclient.DiscoveredConfig{{SchemaDir: "."}},
+			want:      nil,
+		},
+		{
 			name:      "removed schema file -> not flagged",
 			databases: managed,
 			files:     []ghclient.PRFile{{Filename: "db/orders/schema/users.sql", Status: "removed"}},

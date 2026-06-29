@@ -54,7 +54,9 @@ func (h *Handler) unmanagedServerManagedSchemaChanges(repo string, files []ghcli
 func schemaFileCoveredByConfig(filename string, configs []ghclient.DiscoveredConfig) bool {
 	dir := path.Dir(filename)
 	for _, cfg := range configs {
-		if dir == cfg.SchemaDir || strings.HasPrefix(dir, cfg.SchemaDir+"/") {
+		// A repo-root config (SchemaDir ".") is an ancestor of every directory,
+		// so it covers schema files anywhere in the repo.
+		if cfg.SchemaDir == "." || dir == cfg.SchemaDir || strings.HasPrefix(dir, cfg.SchemaDir+"/") {
 			return true
 		}
 	}
