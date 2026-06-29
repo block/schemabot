@@ -476,8 +476,9 @@ func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 }
 
 // A PlanetScale apply in a deploy-request phase renders its first-class phase
-// header (not a generic "In Progress") and still offers the operator a stop
-// action — the change is active, stoppable work before cutover.
+// header (not a generic "In Progress") and offers the operator a cancel action —
+// PlanetScale changes are externally authoritative, so before cutover they can
+// only be permanently cancelled, not paused and resumed.
 func TestRenderApplyStatusComment_ValidatingDeployRequest(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "boardgames",
@@ -494,6 +495,44 @@ func TestRenderApplyStatusComment_ValidatingDeployRequest(t *testing.T) {
 	assert.Contains(t, result, "**Status**: Validating Deploy Request")
 	assert.Contains(t, result, "To cancel this schema change:")
 	assert.Contains(t, result, "schemabot cancel apply-7aa13cf03496454b -e staging")
+}
+
+// The in-progress footer offers the right terminal action per engine across the
+// active states that share the stop/cancel footer: resumable engines (Spirit)
+// can be stopped and later resumed, while PlanetScale changes are externally
+// authoritative and can only be permanently cancelled.
+func TestRenderApplyStatusComment_StopOrCancelFooterByEngine(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		engine      string
+		state       string
+		wantAction  string
+		otherAction string
+	}{
+		{"planetscale running cancels", "PlanetScale", state.Apply.Running, "schemabot cancel apply-abc123 -e staging", "schemabot stop apply-abc123 -e staging"},
+		{"planetscale failed-retryable cancels", "PlanetScale", state.Apply.FailedRetryable, "schemabot cancel apply-abc123 -e staging", "schemabot stop apply-abc123 -e staging"},
+		{"spirit running stops", "Spirit", state.Apply.Running, "schemabot stop apply-abc123 -e staging", "schemabot cancel apply-abc123 -e staging"},
+		{"spirit failed-retryable stops", "Spirit", state.Apply.FailedRetryable, "schemabot stop apply-abc123 -e staging", "schemabot cancel apply-abc123 -e staging"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := ApplyStatusCommentData{
+				Database:    "testapp",
+				Environment: "staging",
+				RequestedBy: "aparajon",
+				ApplyID:     "apply-abc123",
+				State:       tc.state,
+				Engine:      tc.engine,
+				Tables: []TableProgressData{
+					{TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Status: state.Task.Running, PercentComplete: 40},
+				},
+			}
+
+			result := RenderApplyStatusComment(data)
+
+			assert.Contains(t, result, tc.wantAction)
+			assert.NotContains(t, result, tc.otherAction)
+		})
+	}
 }
 
 // A PlanetScale apply links its deploy request so the operator can follow the
