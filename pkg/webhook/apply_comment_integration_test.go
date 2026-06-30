@@ -439,7 +439,7 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	select {
 	case created := <-capture.creates:
 		newProgressID = created.ID
-		assert.Contains(t, created.Body, "Schema Change In Progress — Staging")
+		assert.Contains(t, created.Body, "Schema Change Status — Staging")
 		assert.Contains(t, created.Body, "**Status**: Resuming")
 		assert.Contains(t, created.Body, "Resuming…")
 		assert.NotContains(t, created.Body, "Stopped")

@@ -43,7 +43,7 @@ func TestRenderApplyCommentsIncludeEnvironmentInTitle(t *testing.T) {
 		})
 		firstLine, _, _ := strings.Cut(rendered, "\n")
 
-		assert.Equal(t, "## Schema Change In Progress — Production", firstLine)
+		assert.Equal(t, "## Schema Change Status — Production", firstLine)
 		assert.NotContains(t, rendered, "**Elapsed**")
 	})
 
@@ -171,7 +171,7 @@ func TestRenderApplyStatusComment_Checksumming(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## Schema Change In Progress", "apply stays in progress; checksumming is table-level")
+	assert.Contains(t, result, "## Schema Change Status", "apply stays in progress; checksumming is table-level")
 	assert.Contains(t, result, "**`orders`**")
 	assert.Contains(t, result, "🔍 Checksumming to verify data (21%)")
 	assert.Contains(t, result, "Rows verified: 321,450 / 1,466,232")
@@ -327,7 +327,8 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## Schema Change In Progress")
+	assert.Contains(t, result, "## Schema Change Status")
+	assert.Contains(t, result, "**Status**: In Progress", "the constant title carries no state, so a running apply shows its state in the Status line")
 	assert.Contains(t, result, "@aparajon")
 	assert.Contains(t, result, "`testapp`")
 	assert.Contains(t, result, "— Staging")
@@ -521,7 +522,7 @@ func TestRenderApplyStatusComment_ValidatingDeployRequest(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## Schema Change In Progress")
+	assert.Contains(t, result, "## Schema Change Status")
 	assert.Contains(t, result, "**Status**: Validating Deploy Request")
 	assert.Contains(t, result, "To cancel this schema change:")
 	assert.Contains(t, result, "schemabot cancel apply-7aa13cf03496454b -e staging")
@@ -811,7 +812,7 @@ func TestRenderApplyStatusComment_FailedRetryable(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## Schema Change In Progress")
+	assert.Contains(t, result, "## Schema Change Status")
 	assert.NotContains(t, result, "Failed_retryable")
 	assert.NotContains(t, result, "failed_retryable")
 	// The retry detail lives on the affected table, not in the headline.
@@ -935,7 +936,7 @@ func TestRenderApplyStatusComment_Resuming(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## Schema Change In Progress")
+	assert.Contains(t, result, "## Schema Change Status")
 	assert.Contains(t, result, "🔄 Resuming…")
 	assert.NotContains(t, result, "21%", "the indeterminate resume window must not show the stale pre-stop percent")
 	assert.NotContains(t, result, "21,000 / 100,000", "the indeterminate resume window must not show stale row counts")
@@ -1061,7 +1062,7 @@ func TestRenderApplyStatusComment_NoTables(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## Schema Change In Progress")
+	assert.Contains(t, result, "## Schema Change Status")
 }
 
 func TestRenderApplyStatusComment_NoRequestedBy(t *testing.T) {
@@ -1185,7 +1186,7 @@ func TestApplyStatusFromProgress(t *testing.T) {
 func TestPreviewCommentApplyProgress(t *testing.T) {
 	result := PreviewCommentApplyProgress()
 
-	assert.Contains(t, result, "Schema Change In Progress")
+	assert.Contains(t, result, "Schema Change Status")
 	assert.Contains(t, result, "**Schema `testapp`**")
 	assert.Contains(t, result, "**`orders`**")
 	assert.Contains(t, result, "**`users`**")
@@ -1197,7 +1198,7 @@ func TestPreviewCommentApplyProgress(t *testing.T) {
 func TestPreviewCommentApplyEstimateExceeded(t *testing.T) {
 	result := PreviewCommentApplyEstimateExceeded()
 
-	assert.Contains(t, result, "Schema Change In Progress")
+	assert.Contains(t, result, "Schema Change Status")
 	assert.Contains(t, result, "1 running (Active)")
 	assert.Contains(t, result, "Active")
 	assert.Contains(t, result, "Rows copied: 145,000,000 so far")
@@ -1234,7 +1235,7 @@ func TestPreviewCommentApplyStopped(t *testing.T) {
 func TestPreviewCommentApplyResuming(t *testing.T) {
 	result := PreviewCommentApplyResuming()
 
-	assert.Contains(t, result, "Schema Change In Progress")
+	assert.Contains(t, result, "Schema Change Status")
 	assert.Contains(t, result, "🔄 Resuming…")
 	// The indeterminate resume window hides the stale pre-stop percent.
 	assert.NotContains(t, result, "72%")
@@ -1788,7 +1789,7 @@ func TestRenderApplyStatusComment_RevertWindow(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "Pending Revert")
+	assert.Contains(t, result, "## Schema Change Status")
 	assert.Contains(t, result, "Complete (pending revert)")
 	assert.Contains(t, result, "schemabot revert apply-abc123 -e staging")
 	assert.Contains(t, result, "schemabot skip-revert apply-abc123 -e staging")
@@ -1811,7 +1812,7 @@ func TestRenderApplyStatusComment_SkippingRevert(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "Skipping Revert — Finalizing")
+	assert.Contains(t, result, "## Schema Change Status")
 	assert.Contains(t, result, "can no longer be reverted")
 	assert.NotContains(t, result, "schemabot revert apply-abc123 -e staging")
 	assert.NotContains(t, result, "schemabot skip-revert apply-abc123 -e staging")

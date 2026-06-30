@@ -56,9 +56,9 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 	var sb strings.Builder
 	renderedAt := currentTimestamp()
 
-	// Aggregate header: reuse the single-deployment title map keyed on the
-	// derived aggregate state so the headline vocabulary is identical.
-	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment})
+	// Aggregate header: the stable in-place status title, identical to the
+	// single-deployment comment so the headline vocabulary stays shared.
+	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment})
 	writeAggregateMetadata(&sb, data, renderedAt)
 	writeDeploymentCounts(&sb, data.Model.Counts)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)

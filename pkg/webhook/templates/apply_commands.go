@@ -136,11 +136,14 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	return sb.String()
 }
 
-// RenderApplyStarted renders a comment when an apply begins.
+// RenderApplyStarted renders the initial body of the live progress comment when
+// an apply begins. It uses the same stable status title as the in-place status
+// comment the observer later edits this into, so the headline does not jump from
+// one title to another on the first progress update.
 func RenderApplyStarted(data ApplyStatusCommentData) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "Schema Change In Progress", data.Environment)
+	writeApplyStatusHeader(&sb, data)
 	writeApplyMetadata(&sb, data, currentTimestamp())
 	sb.WriteString("\nSchema changes are being applied. Progress updates will be posted as new comments.\n")
 

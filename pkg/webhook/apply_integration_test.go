@@ -642,11 +642,11 @@ func TestE2EApplyConfirmExecutesApply(t *testing.T) {
 	// For a CREATE TABLE, it completes fast — the sync handler catches it and
 	// posts the summary directly without an "In Progress" comment.
 	//
-	// Wait for either "Schema Change In Progress" or "Schema Change Applied/Failed"
+	// Wait for either "Schema Change Status" or "Schema Change Applied/Failed"
 	// as the first comment.
 	select {
 	case body := <-result.comments:
-		hasProgress := strings.Contains(body, "Schema Change In Progress")
+		hasProgress := strings.Contains(body, "Schema Change Status")
 		hasApplied := strings.Contains(body, "Schema Change Applied")
 		hasFailed := strings.Contains(body, "Schema Change Failed")
 		assert.True(t, hasProgress || hasApplied || hasFailed,
@@ -1446,7 +1446,7 @@ func TestE2EApplyConfirmRejectsWhenHEADAdvanced(t *testing.T) {
 		assert.Contains(t, body, "abc123", "must show discovery SHA")
 		assert.Contains(t, body, "newsha456", "must show current SHA")
 		assert.Contains(t, body, "schemabot apply-confirm -e staging", "retry hint must show full retry command")
-		assert.NotContains(t, body, "Schema Change In Progress", "apply must not have started")
+		assert.NotContains(t, body, "Schema Change Status", "apply must not have started")
 		assert.NotContains(t, body, "Schema Change Applied", "apply must not have completed")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for rejection comment")
@@ -1744,7 +1744,7 @@ func TestE2EApplyConfirmRejectsWhenPlanSHAStale(t *testing.T) {
 		assert.Contains(t, body, "newsha456", "must show the current PR HEAD")
 		assert.Contains(t, body, "schemabot apply -e staging",
 			"retry hint must point at `apply` (a fresh plan is needed), not `apply-confirm`")
-		assert.NotContains(t, body, "Schema Change In Progress", "apply must not have started")
+		assert.NotContains(t, body, "Schema Change Status", "apply must not have started")
 		assert.NotContains(t, body, "Schema Change Applied", "apply must not have completed")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for rejection comment")
@@ -1806,7 +1806,7 @@ func TestE2EApplyConfirmRejectsRollbackLock(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "rollback plan")
 		assert.Contains(t, body, "schemabot rollback-confirm")
-		assert.NotContains(t, body, "Schema Change In Progress")
+		assert.NotContains(t, body, "Schema Change Status")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for rollback-lock rejection comment")
 	}
@@ -2009,7 +2009,7 @@ func TestE2EApplyConfirmRejectsWhenPlainPlanSupersedesApplyPlan(t *testing.T) {
 		assert.Contains(t, body, "the plan you confirmed is stale")
 		assert.Contains(t, body, "abc123", "must name the plan SHA the user reviewed")
 		assert.Contains(t, body, "newsha456", "must name the current HEAD")
-		assert.NotContains(t, body, "Schema Change In Progress", "apply must not start")
+		assert.NotContains(t, body, "Schema Change Status", "apply must not start")
 		assert.NotContains(t, body, "Schema Change Applied", "apply must not complete")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for apply-confirm rejection")
@@ -2088,7 +2088,7 @@ func TestE2EApplyAutoConfirmReGatesAgainstFreshHEADBeforeApply(t *testing.T) {
 	for blocked == "" {
 		select {
 		case body := <-result.comments:
-			assert.NotContains(t, body, "Schema Change In Progress", "apply must not have started")
+			assert.NotContains(t, body, "Schema Change Status", "apply must not have started")
 			assert.NotContains(t, body, "Schema Change Applied", "apply must not have completed")
 			if strings.Contains(body, "Apply Blocked") && strings.Contains(body, "ci/lint") {
 				blocked = body
@@ -2198,7 +2198,7 @@ func TestE2EApplyAutoConfirmFreshHEADBlockPreservesOtherPRLock(t *testing.T) {
 	for blocked == "" {
 		select {
 		case body := <-result.comments:
-			assert.NotContains(t, body, "Schema Change In Progress", "apply must not have started")
+			assert.NotContains(t, body, "Schema Change Status", "apply must not have started")
 			assert.NotContains(t, body, "Schema Change Applied", "apply must not have completed")
 			if strings.Contains(body, "Apply Blocked") && strings.Contains(body, "ci/lint") {
 				blocked = body

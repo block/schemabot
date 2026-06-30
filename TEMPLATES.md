@@ -1773,7 +1773,7 @@ CREATE TABLE `addresses` (
 <summary><a name="apply-started"></a><strong>Apply Started</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -1787,11 +1787,13 @@ Schema changes are being applied. Progress updates will be posted as new comment
 <summary><a name="single-table-running"></a><strong>Single Table: Running</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
 
 **`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
 
@@ -1896,11 +1898,13 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 <summary><a name="all-pending"></a><strong>All Pending</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
 
 📊 3 queued
 
@@ -1940,11 +1944,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="first-table-running"></a><strong>First Table Running</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
 
 📊 1 running (22%) · 2 queued
 
@@ -1985,11 +1991,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="second-table-running"></a><strong>Second Table Running</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
 
 📊 1/3 complete · 1 running (62%) · 1 queued
 
@@ -2030,11 +2038,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="second-table-estimate-exceeded"></a><strong>Second Table Estimate Exceeded</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
 
 📊 1/3 complete · 1 running (Active) · 1 queued
 
@@ -2076,11 +2086,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="second-table-checksumming"></a><strong>Second Table Checksumming</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
 
 📊 1/3 complete · 1 checksumming · 1 queued
 
@@ -2121,11 +2133,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="third-table-running"></a><strong>Third Table Running</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
 
 📊 2/3 complete · 1 running (17%)
 
@@ -2166,11 +2180,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="sharded-shard-progress"></a><strong>Sharded: Shard Progress</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `commerce` | **Apply ID**: `apply-7aa13cf03496454b`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
 
 **Schema `commerce`**
 
@@ -2198,11 +2214,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="sharded-many-shards-256"></a><strong>Sharded: Many Shards (256)</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `commerce` | **Apply ID**: `apply-7aa13cf03496454b`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
 
 **Schema `commerce`**
 
@@ -2267,11 +2285,13 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <summary><a name="vitess-vschema-only"></a><strong>Vitess: VSchema Only</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
 
 ### VSchema
 
@@ -2297,11 +2317,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="vitess-ddl--vschema"></a><strong>Vitess: DDL + VSchema</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
 
 Deploy request: https://app.planetscale.com/acme/myapp/deploy-requests/42
 
@@ -2336,11 +2358,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="vitess-multikeyspace-vschema"></a><strong>Vitess: Multi-keyspace VSchema</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
 
 ### VSchema
 
@@ -2503,7 +2527,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 <summary><a name="resuming"></a><strong>Resuming</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -2569,7 +2593,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 <summary><a name="waiting-for-cutover"></a><strong>Waiting For Cutover</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -2617,7 +2641,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="cutting-over"></a><strong>Cutting Over</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -2662,7 +2686,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="revert-window"></a><strong>Revert Window</strong></summary>
 
 
-## Schema Change Applied (Pending Revert) — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -2715,7 +2739,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="skipping-revert"></a><strong>Skipping Revert</strong></summary>
 
 
-## Skipping Revert — Finalizing — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -4948,7 +4972,7 @@ schemabot unlock
 <summary><a name="apply-started"></a><strong>Apply Started</strong></summary>
 
 
-## Schema Change In Progress — Staging
+## Schema Change Status — Staging
 
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -5303,7 +5327,7 @@ schemabot apply -e staging
 <summary><a name="barrier-rollout-in-progress"></a><strong>Barrier Rollout In Progress</strong></summary>
 
 
-## Schema Change In Progress — Production
+## Schema Change Status — Production
 
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -5326,7 +5350,7 @@ schemabot cutover apply-a1b2c3d4e5f6 -e production
 <details open>
 <summary>🟢 eu — ready for cutover — next in order</summary>
 
-## Schema Change In Progress — Production
+## Schema Change Status — Production
 
 **Database**: `payments_eu` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -5371,11 +5395,13 @@ schemabot cutover apply-a1b2c3d4e5f6 -e production
 <details open>
 <summary>🔄 us — running table copy</summary>
 
-## Schema Change In Progress — Production
+## Schema Change Status — Production
 
 **Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
 
 📊 1/3 complete · 1 running (62%) · 1 queued
 
@@ -5432,7 +5458,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="halt-on-failure-one-deployment-failed"></a><strong>Halt On Failure (One Deployment Failed)</strong></summary>
 
 
-## ❌ Schema Change Failed — Production
+## Schema Change Status — Production
 
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -5555,7 +5581,7 @@ _No details available yet._
 <summary><a name="all-deployments-completed"></a><strong>All Deployments Completed</strong></summary>
 
 
-## ✅ Schema Change Applied — Production
+## Schema Change Status — Production
 
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -6048,7 +6074,7 @@ schemabot apply -e production
 <summary><a name="apply-in-progress"></a><strong>Apply In Progress</strong></summary>
 
 
-## Schema Change In Progress — Production
+## Schema Change Status — Production
 
 **Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -6073,7 +6099,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="apply-failed-one-shard-failed"></a><strong>Apply Failed (One Shard Failed)</strong></summary>
 
 
-## ❌ Schema Change Failed — Production
+## Schema Change Status — Production
 
 **Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -6105,7 +6131,7 @@ schemabot apply -e production
 <summary><a name="apply-with-divergent-shards"></a><strong>Apply With Divergent Shards</strong></summary>
 
 
-## Schema Change In Progress — Production
+## Schema Change Status — Production
 
 **Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6`
 

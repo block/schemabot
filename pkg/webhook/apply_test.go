@@ -43,7 +43,7 @@ func TestFormatProgressComment(t *testing.T) {
 	assert.Contains(t, body, "`users`")
 	assert.Contains(t, body, "`orders`")
 	assert.Contains(t, body, "45%")
-	assert.Contains(t, body, "In Progress")
+	assert.Contains(t, body, "Schema Change Status")
 	// Should NOT contain the old table format
 	assert.NotContains(t, body, "| Table |")
 	assert.NotContains(t, body, "|-------|")

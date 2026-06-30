@@ -23,7 +23,7 @@ func runningApply() *storage.Apply {
 // the single-deployment comment unchanged — no aggregate header.
 func TestFormatApplyStatusComment_NoOperationsRendersSingle(t *testing.T) {
 	out := formatApplyStatusComment(runningApply(), nil, false, nil, nil, nil)
-	assert.Contains(t, out, "## Schema Change In Progress")
+	assert.Contains(t, out, "## Schema Change Status")
 	assert.NotContains(t, out, "**Deployments**:")
 }
 
@@ -46,7 +46,7 @@ func TestFormatApplyStatusComment_MultipleOperationsRendersMulti(t *testing.T) {
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier},
 	}
 	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil)
-	assert.Contains(t, out, "## Schema Change In Progress")
+	assert.Contains(t, out, "## Schema Change Status")
 	assert.Contains(t, out, "**Deployments**: 1 completed, 1 running")
 	assert.Contains(t, out, "- ✅ eu — completed")
 	assert.Contains(t, out, "- 🔄 us — running table copy")
