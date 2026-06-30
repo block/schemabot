@@ -1267,9 +1267,11 @@ func (c *LocalClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*t
 	if err != nil {
 		return nil, fmt.Errorf("build revert request for task %s: %w", task.TaskIdentifier, err)
 	}
+	c.logger.Info("sending revert request to engine", task.LogAttrs()...)
 	if _, err = eng.Revert(ctx, controlReq); err != nil {
 		return nil, fmt.Errorf("revert failed: %w", err)
 	}
+	c.logger.Info("engine accepted the revert request", task.LogAttrs()...)
 	return &ternv1.RevertResponse{Accepted: true}, nil
 }
 
@@ -1284,9 +1286,11 @@ func (c *LocalClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequ
 	if err != nil {
 		return nil, fmt.Errorf("build skip-revert request for task %s: %w", task.TaskIdentifier, err)
 	}
+	c.logger.Info("sending skip-revert request to engine", task.LogAttrs()...)
 	if _, err = eng.SkipRevert(ctx, controlReq); err != nil {
 		return nil, fmt.Errorf("skip revert failed: %w", err)
 	}
+	c.logger.Info("engine accepted the skip-revert request", task.LogAttrs()...)
 	return &ternv1.SkipRevertResponse{Accepted: true}, nil
 }
 
