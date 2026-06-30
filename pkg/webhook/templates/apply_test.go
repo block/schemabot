@@ -1408,13 +1408,33 @@ func TestRenderApplySummaryCommentCompletedCollapsedDetailsApplyIDInside(t *test
 	result := RenderApplySummaryComment(data)
 
 	assert.Contains(t, result, "<details><summary>Apply details (6 tables)</summary>")
-	assert.Contains(t, result, "### ✅ testapp_primary")
+	// All namespaces succeeded, so the per-namespace header carries no redundant ✅.
+	assert.Contains(t, result, "### testapp_primary")
 	// The Apply ID lives inside the collapsed details block, not as a trailing line.
 	assert.Contains(t, result, "**Apply ID**: `apply-a1b2c3d4e5f6`")
 	assert.NotContains(t, result, "_Apply ID:")
 	idIdx := strings.Index(result, "**Apply ID**: `apply-a1b2c3d4e5f6`")
 	closeIdx := strings.LastIndex(result, "</details>")
 	assert.True(t, idIdx >= 0 && idIdx < closeIdx, "Apply ID should appear inside the details, before the closing tag")
+}
+
+// When namespaces have mixed outcomes, the summary keeps the per-namespace status
+// emoji so the operator can see which keyspace failed and which succeeded.
+func TestRenderApplySummaryCommentMixedNamespacesKeepEmoji(t *testing.T) {
+	data := ApplyStatusCommentData{
+		ApplyID:     "apply-mixed01",
+		Database:    "boardgames",
+		Environment: "staging",
+		State:       state.Apply.Failed,
+		Tables: []TableProgressData{
+			{TableName: "orders", Namespace: "commerce", Status: state.Task.Completed},
+			{TableName: "users", Namespace: "identity", Status: state.Task.Failed},
+		},
+	}
+
+	result := RenderApplySummaryComment(data)
+	assert.Contains(t, result, "### ✅ commerce")
+	assert.Contains(t, result, "### ❌ identity")
 }
 
 func TestPreviewCommentSummaryCompletedVitessTracksVSchema(t *testing.T) {

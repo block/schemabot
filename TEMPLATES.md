@@ -3251,7 +3251,7 @@ Applied by namespace:
 - `analytics`: 1 table
 
 
-### ✅ commerce
+### commerce
 
 **`orders`**
 ```sql
@@ -3264,7 +3264,7 @@ ALTER TABLE `payments` ADD INDEX `idx_order_id`(`order_id`);
 ```
 
 
-### ✅ customers
+### customers
 
 **`users`**
 ```sql
@@ -3277,7 +3277,7 @@ ALTER TABLE `addresses` ADD INDEX `idx_zip`(`zip_code`);
 ```
 
 
-### ✅ analytics
+### analytics
 
 **`events`**
 ```sql
@@ -5734,7 +5734,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
 
-### ✅ testapp
+### testapp
 
 **`orders`**
 ```sql
@@ -5770,7 +5770,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
 
-### ✅ testapp
+### testapp
 
 **`orders`**
 ```sql
@@ -5806,7 +5806,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
 
-### ✅ testapp
+### testapp
 
 **`orders`**
 ```sql
@@ -5870,7 +5870,7 @@ schemabot apply -e production
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
 
-### ✅ testapp
+### testapp
 
 **`orders`**
 ```sql
