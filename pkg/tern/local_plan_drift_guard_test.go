@@ -262,6 +262,15 @@ func TestCanonicalDDLForDrift_FailsClosed(t *testing.T) {
 		assert.Contains(t, err.Error(), "empty DDL")
 	})
 
+	t.Run("multi-statement DDL is rejected", func(t *testing.T) {
+		// ddl.Canonicalize only canonicalizes the first statement, so a
+		// multi-statement payload would silently drop the trailing statements
+		// and mask drift on them. It must fail closed instead.
+		_, err := canonicalDDLForDrift("ALTER TABLE `users` ADD COLUMN `email` varchar(255); ALTER TABLE `users` ADD COLUMN `phone` varchar(255)")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "exactly one DDL statement")
+	})
+
 	t.Run("parseable DDL is canonicalized", func(t *testing.T) {
 		// Whitespace and unquoted identifiers normalize to the same canonical form
 		// regardless of incidental formatting, so equivalent DDL compares equal.

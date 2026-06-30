@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/spirit/pkg/statement"
 )
 
 // driftChangeKey identifies a single table DDL change for drift comparison. Two
@@ -145,17 +146,24 @@ func (c *LocalClient) driftMultisetFromApplyRequest(changes []*ternv1.TableChang
 	return ms, nil
 }
 
-// canonicalDDLForDrift normalizes a DDL statement for comparison and fails
-// closed if it cannot be parsed — ddl.Canonicalize returns the input unchanged
-// on a parse failure, so an unparseable statement would otherwise compare by raw
-// text and could mask drift.
+// canonicalDDLForDrift normalizes a single DDL statement for comparison and
+// fails closed if it cannot be parsed or carries more than one statement.
+// ddl.Canonicalize returns the input unchanged on a parse failure, so an
+// unparseable statement would otherwise compare by raw text and could mask
+// drift. It also canonicalizes only the first statement, so a multi-statement
+// payload ("ALTER ...; ALTER ...") would silently drop the trailing statements
+// and mask drift on them — reject anything that is not exactly one statement.
 func canonicalDDLForDrift(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", fmt.Errorf("empty DDL")
 	}
-	if _, _, err := ddl.ClassifyStatement(raw); err != nil {
+	results, err := statement.Classify(raw)
+	if err != nil {
 		return "", fmt.Errorf("unparseable DDL: %w", err)
+	}
+	if len(results) != 1 {
+		return "", fmt.Errorf("expected exactly one DDL statement, got %d", len(results))
 	}
 	return ddl.Canonicalize(raw), nil
 }
