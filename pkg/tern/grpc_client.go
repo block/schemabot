@@ -2911,9 +2911,11 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 		}
 		if err := c.storage.Tasks().UpsertShardProgress(ctx, shardTask); err != nil {
 			if errors.Is(err, storage.ErrApplyLeaseLost) {
-				// A peer claimed the operation; this driver is displaced. Stop —
-				// every further shard would fail the same way.
-				slog.Debug("stopping remote per-shard progress encode: operation lease lost",
+				// A peer claimed the work; this driver is displaced. Stop — every
+				// further shard would fail the same way. The lost lease may be the
+				// operation lease (fan-out drive) or the apply lease (single-operation
+				// drive), since UpsertShardProgress accepts either.
+				slog.Debug("stopping remote per-shard progress encode: drive lease lost",
 					"apply_id", storedApply.ApplyIdentifier, "table", storedTask.TableName, "shard", sh.Shard)
 				return
 			}
