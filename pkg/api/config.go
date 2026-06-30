@@ -709,6 +709,12 @@ type RepoConfig struct {
 	// while only the legacy single-App GitHub field is configured is
 	// rejected at config load to fail closed on misconfiguration.
 	GitHubApp string `yaml:"github_app,omitempty"`
+
+	// Aggregate configures this deployment's role in a multi-tenant aggregate
+	// check for the repository (leader vs participant, and — for a leader — the
+	// set of tenants expected to report). Nil means the repository uses the
+	// standard single-deployment check behavior.
+	Aggregate *AggregateConfig `yaml:"aggregate,omitempty"`
 }
 
 // DeploymentTarget is one entry in EnvironmentConfig.Deployments. It carries
@@ -892,6 +898,12 @@ func (c *ServerConfig) Validate() error {
 			if endpoints[env] == "" {
 				return fmt.Errorf("database %q environment %q deployment %q has no endpoint", name, env, envConfig.Deployment)
 			}
+		}
+	}
+
+	for repo, repoConfig := range c.Repos {
+		if err := validateAggregateConfig(repo, repoConfig.Aggregate); err != nil {
+			return err
 		}
 	}
 
