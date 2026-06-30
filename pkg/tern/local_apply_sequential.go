@@ -326,7 +326,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 
 			// Re-fetch task state from storage to detect external changes (e.g., Stop).
 			// This also guards against a race where a new apply starts and the engine's
-			// runningMigration no longer corresponds to this task.
+			// runningSchemaChange no longer corresponds to this task.
 			freshTask, fetchErr := c.storage.Tasks().Get(ctx, task.TaskIdentifier)
 			if fetchErr == nil && freshTask != nil && state.IsTerminalTaskState(freshTask.State) {
 				// Task was already marked terminal externally — stop polling

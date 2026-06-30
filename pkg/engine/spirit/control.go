@@ -29,7 +29,7 @@ import (
 // We force a checkpoint before canceling to preserve progress (Spirit only checkpoints every 50s).
 func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.mu.Lock()
-	rm := e.runningMigration
+	rm := e.runningSchemaChange
 	if rm == nil {
 		e.mu.Unlock()
 		return nil, fmt.Errorf("no active schema change to stop")
@@ -93,7 +93,7 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 // resume.
 func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.mu.Lock()
-	rm := e.runningMigration
+	rm := e.runningSchemaChange
 	if rm == nil {
 		e.mu.Unlock()
 		return nil, fmt.Errorf("no active schema change to cancel")
@@ -120,8 +120,8 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 		return nil, err
 	}
 	e.mu.Lock()
-	if e.runningMigration == rm {
-		e.runningMigration = nil
+	if e.runningSchemaChange == rm {
+		e.runningSchemaChange = nil
 	}
 	e.mu.Unlock()
 
@@ -131,7 +131,7 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 	}, nil
 }
 
-func (e *Engine) dropCancelledArtifacts(ctx context.Context, rm *runningMigration) error {
+func (e *Engine) dropCancelledArtifacts(ctx context.Context, rm *runningSchemaChange) error {
 	if rm == nil || rm.host == "" {
 		return fmt.Errorf("cancelled schema change cleanup missing connection details")
 	}
@@ -178,7 +178,7 @@ func (e *Engine) dropCancelledArtifacts(ctx context.Context, rm *runningMigratio
 // When Run() is called, Spirit checks for a checkpoint and resumes if found.
 func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.mu.Lock()
-	rm := e.runningMigration
+	rm := e.runningSchemaChange
 	if rm == nil {
 		e.mu.Unlock()
 		return nil, fmt.Errorf("no schema change to resume - use Apply to start a new one")
@@ -223,11 +223,11 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 		bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 		defer cancel()
 		e.mu.Lock()
-		if e.runningMigration != nil {
-			e.runningMigration.cancelFunc = cancel
+		if e.runningSchemaChange != nil {
+			e.runningSchemaChange.cancelFunc = cancel
 		}
 		e.mu.Unlock()
-		e.resumeMigration(bgCtx, host, username, password, database, originalDDLs, combinedStatement, deferCutover)
+		e.resumeSchemaChange(bgCtx, host, username, password, database, originalDDLs, combinedStatement, deferCutover)
 	})
 
 	return &engine.ControlResult{
@@ -248,7 +248,7 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 	}
 
 	e.mu.Lock()
-	rm := e.runningMigration
+	rm := e.runningSchemaChange
 	database := req.Database
 	if rm != nil {
 		if !rm.deferCutover {
@@ -364,7 +364,7 @@ func (e *Engine) SkipRevert(ctx context.Context, req *engine.ControlRequest) (*e
 // update the settings, and restart from checkpoint.
 func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine.VolumeResult, error) {
 	e.mu.Lock()
-	rm := e.runningMigration
+	rm := e.runningSchemaChange
 	e.mu.Unlock()
 
 	if rm == nil {
@@ -434,7 +434,7 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 
 	// Log checkpoint state AFTER restart (should still be same - Spirit resumes from checkpoint)
 	e.mu.Lock()
-	rmAfter := e.runningMigration
+	rmAfter := e.runningSchemaChange
 	e.mu.Unlock()
 	if rmAfter != nil {
 		e.logCheckpointState(rmAfter, "after_restart", nil)
@@ -448,10 +448,10 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 	}, nil
 }
 
-func (e *Engine) setVolumeRestartInProgress(rm *runningMigration, inProgress bool) {
+func (e *Engine) setVolumeRestartInProgress(rm *runningSchemaChange, inProgress bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.runningMigration == rm {
+	if e.runningSchemaChange == rm {
 		rm.volumeRestartInProgress = inProgress
 	}
 }
@@ -577,7 +577,7 @@ func (e *Engine) queryCPUHint(ctx context.Context, dsn string) int {
 // - binlog_name: MySQL binlog file being replayed
 // - binlog_pos: position within the binlog file
 // - statement: the DDL being executed
-func (e *Engine) logCheckpointState(rm *runningMigration, phase string, extra map[string]any) {
+func (e *Engine) logCheckpointState(rm *runningSchemaChange, phase string, extra map[string]any) {
 	if rm == nil || rm.host == "" {
 		e.logger.Debug("logCheckpointState: no running schema change or credentials")
 		return

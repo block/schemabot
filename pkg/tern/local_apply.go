@@ -106,7 +106,7 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 
 	// Engine says terminal — update storage and unblock.
 	// IMPORTANT: Only trust terminal states, NOT "No active schema change".
-	// "No active schema change" just means Spirit has no runningMigration,
+	// "No active schema change" just means Spirit has no runningSchemaChange,
 	// which could mean completed, never started, or crashed.
 	if result.State.IsTerminal() {
 		c.logger.Info("conflict check: engine reports terminal state",

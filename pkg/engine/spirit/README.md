@@ -6,9 +6,9 @@ Spirit copies table data row-by-row to a new shadow table with the desired schem
 
 ## Key Types
 
-**Engine** — The main type. Holds a `ddl.Differ` for schema diffing, a `lint.Linter` for safety checks, and a `runningMigration` for tracking the active schema change. Only one schema change can run at a time per Engine instance.
+**Engine** — The main type. Holds a `ddl.Differ` for schema diffing, a `lint.Linter` for safety checks, and a `runningSchemaChange` for tracking the active schema change. Only one schema change can run at a time per Engine instance.
 
-**runningMigration** — Tracks a running schema change: the Spirit runners, affected tables, DDL statements, state, and a cancel function for stopping. Created by `Apply()`, consumed by `Progress()` and control operations.
+**runningSchemaChange** — Tracks a running schema change: the Spirit runners, affected tables, DDL statements, state, and a cancel function for stopping. Created by `Apply()`, consumed by `Progress()` and control operations.
 
 **Config** — Engine configuration:
 - `TargetChunkTime` (default 500ms): How long each batch of row copies should take
@@ -79,7 +79,7 @@ Two checkpoint-related errors require user intervention:
 | File | Purpose |
 |------|---------|
 | `spirit.go` | Engine type, `Plan()`, `Apply()`, `Progress()` |
-| `execution.go` | `executeMigration()`, Spirit runner setup, error handling |
+| `execution.go` | `executeSchemaChange()`, Spirit runner setup, error handling |
 | `control.go` | `Stop()`, `Start()`, `Cutover()`, `Volume()`, `Revert()`, `SkipRevert()` |
 | `helpers.go` | Schema fetching, DSN parsing, statement classification, internal table detection |
 | `logger.go` | Custom log handler that filters Spirit debug logs and routes to apply log storage |
