@@ -478,8 +478,10 @@ func writeVSchemaStatus(sb *strings.Builder, data ApplyStatusCommentData) {
 	}
 }
 
-// writeTableProgressSection writes the per-table progress breakdown.
-// Tables are sorted: active/running first, then pending, then completed/terminal last.
+// writeTableProgressSection writes the per-table progress breakdown, grouped by
+// namespace so the operator can see which schema (MySQL) or keyspace
+// (Vitess/PlanetScale, Strata) each table belongs to. Within a namespace, tables
+// are sorted active/running first, then pending, then completed/terminal last.
 func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData) {
 	// During the resume window the per-table percents are indeterminate (the data
 	// plane has not reported continuation vs fresh copy yet), so the aggregate
@@ -488,25 +490,67 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 	if data.State != state.Apply.Resuming {
 		writeProgressSummary(sb, data.Tables)
 	}
-	sb.WriteString("\n### Table Progress\n\n")
+	sb.WriteString("\n")
 
-	sorted := make([]TableProgressData, len(data.Tables))
-	copy(sorted, data.Tables)
-	sort.SliceStable(sorted, func(i, j int) bool {
-		return tableStatePriority(sorted[i].Status) < tableStatePriority(sorted[j].Status)
-	})
+	for _, group := range groupTablesByNamespace(data.Tables) {
+		// Label the group by namespace when one is set. The bold metadata-style
+		// header and the row block below it stand in for a generic section header.
+		if group.namespace != "" {
+			fmt.Fprintf(sb, "**%s `%s`**\n\n", namespaceLabel(data.Engine), group.namespace)
+		}
 
-	for _, table := range sorted {
-		// While the apply is resuming, the data plane has not yet reported whether
-		// the schema change continues from its checkpoint or restarts from scratch,
-		// so the row-copy percent is indeterminate. Render state-only until the
-		// apply transitions to running and real progress is known.
-		if data.State == state.Apply.Resuming && !state.IsTerminalTaskState(state.NormalizeTaskStatus(table.Status)) {
-			renderResumingTable(sb, table)
+		sorted := make([]TableProgressData, len(group.tables))
+		copy(sorted, group.tables)
+		sort.SliceStable(sorted, func(i, j int) bool {
+			return tableStatePriority(sorted[i].Status) < tableStatePriority(sorted[j].Status)
+		})
+
+		for _, table := range sorted {
+			// While the apply is resuming, the data plane has not yet reported whether
+			// the schema change continues from its checkpoint or restarts from scratch,
+			// so the row-copy percent is indeterminate. Render state-only until the
+			// apply transitions to running and real progress is known.
+			if data.State == state.Apply.Resuming && !state.IsTerminalTaskState(state.NormalizeTaskStatus(table.Status)) {
+				renderResumingTable(sb, table)
+				continue
+			}
+			renderTableProgress(sb, table)
+		}
+	}
+}
+
+// namespaceTableGroup is a set of tables that share a namespace, in the order the
+// namespace first appears among the tables.
+type namespaceTableGroup struct {
+	namespace string
+	tables    []TableProgressData
+}
+
+// groupTablesByNamespace groups tables by namespace, preserving the order in
+// which each namespace first appears. Tables with no namespace are grouped under
+// the empty namespace, which renders without a header.
+func groupTablesByNamespace(tables []TableProgressData) []namespaceTableGroup {
+	var groups []namespaceTableGroup
+	index := make(map[string]int)
+	for _, t := range tables {
+		if i, ok := index[t.Namespace]; ok {
+			groups[i].tables = append(groups[i].tables, t)
 			continue
 		}
-		renderTableProgress(sb, table)
+		index[t.Namespace] = len(groups)
+		groups = append(groups, namespaceTableGroup{namespace: t.Namespace, tables: []TableProgressData{t}})
 	}
+	return groups
+}
+
+// namespaceLabel returns the operator-facing word for a table namespace: a
+// keyspace for the Vitess-family engines (PlanetScale, Strata), a schema for
+// MySQL (Spirit).
+func namespaceLabel(engine string) string {
+	if strings.EqualFold(engine, storage.EnginePlanetScale) || strings.EqualFold(engine, storage.EngineStrata) {
+		return "Keyspace"
+	}
+	return "Schema"
 }
 
 // renderResumingTable renders a table while the apply is resuming, before the
