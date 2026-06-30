@@ -548,10 +548,10 @@ func TestRenderApplyStatusComment_DeployRequestLink(t *testing.T) {
 	withURL := base
 	withURL.DeployRequestURL = "https://app.planetscale.com/block-staging/boardgames/deploy-requests/103"
 	result := RenderApplyStatusComment(withURL)
-	assert.Contains(t, result, "🔗 **Deploy request**: https://app.planetscale.com/block-staging/boardgames/deploy-requests/103")
+	assert.Contains(t, result, "Deploy request: https://app.planetscale.com/block-staging/boardgames/deploy-requests/103")
 
 	// No deploy request yet — no link line.
-	assert.NotContains(t, RenderApplyStatusComment(base), "Deploy request**:")
+	assert.NotContains(t, RenderApplyStatusComment(base), "Deploy request:")
 }
 
 func TestRenderApplyStatusComment_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing.T) {

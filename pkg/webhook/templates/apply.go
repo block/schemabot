@@ -275,7 +275,7 @@ func writeDeployRequestLink(sb *strings.Builder, data ApplyStatusCommentData) {
 	if data.DeployRequestURL == "" {
 		return
 	}
-	fmt.Fprintf(sb, "\n🔗 **Deploy request**: %s\n", data.DeployRequestURL)
+	fmt.Fprintf(sb, "\nDeploy request: %s\n", data.DeployRequestURL)
 }
 
 func stopOrCancelCommand(data ApplyStatusCommentData) string {

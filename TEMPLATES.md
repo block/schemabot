@@ -777,7 +777,7 @@ That command wasn't recognized. Available commands:
 
 📊 1/3 complete · 1 failed · 1 cancelled
 
-### Table Progress
+**Schema `testapp`**
 
 **`users`**: 🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
 
@@ -1793,8 +1793,6 @@ Schema changes are being applied. Progress updates will be posted as new comment
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-### Table Progress
-
 **`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
 
 ```sql
@@ -1826,8 +1824,6 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Status**: Applied
 
-### Table Progress
-
 **`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
 ```sql
@@ -1848,8 +1844,6 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **Status**: Failed
-
-### Table Progress
 
 **`users`**: 🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
 
@@ -1881,8 +1875,6 @@ schemabot apply -e staging
 
 **Status**: Stopped
 
-### Table Progress
-
 **`users`**: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39%
 
 ```sql
@@ -1912,7 +1904,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 
 📊 3 queued
 
-### Table Progress
+**Schema `testapp`**
 
 **`orders`**: ⏳ Queued
 
@@ -1956,7 +1948,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 📊 1 running (22%) · 2 queued
 
-### Table Progress
+**Schema `testapp`**
 
 **`orders`**: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 22%
 
@@ -2001,7 +1993,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 📊 1/3 complete · 1 running (62%) · 1 queued
 
-### Table Progress
+**Schema `testapp`**
 
 **`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
 
@@ -2046,7 +2038,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 📊 1/3 complete · 1 running (Active) · 1 queued
 
-### Table Progress
+**Schema `testapp`**
 
 **`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Active
 
@@ -2092,7 +2084,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 📊 1/3 complete · 1 checksumming · 1 queued
 
-### Table Progress
+**Schema `testapp`**
 
 **`users`**: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔍 Checksumming to verify data (21%)
 
@@ -2137,7 +2129,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 📊 2/3 complete · 1 running (17%)
 
-### Table Progress
+**Schema `testapp`**
 
 **`products`**: 🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 17%
 
@@ -2180,7 +2172,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-### Table Progress
+**Schema `commerce`**
 
 **`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
 
@@ -2212,7 +2204,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-### Table Progress
+**Schema `commerce`**
 
 **`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70%
 
@@ -2248,7 +2240,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 📊 3/3 complete
 
-### Table Progress
+**Schema `testapp`**
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
@@ -2311,9 +2303,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-🔗 **Deploy request**: https://app.planetscale.com/acme/myapp/deploy-requests/42
-
-### Table Progress
+Deploy request: https://app.planetscale.com/acme/myapp/deploy-requests/42
 
 **`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
@@ -2392,7 +2382,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 📊 1 failed · 2 cancelled
 
-### Table Progress
+**Schema `testapp`**
 
 **`orders`**: 🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
 
@@ -2438,7 +2428,7 @@ schemabot apply -e staging
 
 📊 1/3 complete · 1 failed · 1 cancelled
 
-### Table Progress
+**Schema `testapp`**
 
 **`users`**: 🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
 
@@ -2484,7 +2474,7 @@ schemabot apply -e staging
 
 📊 1/2 complete · 1 stopped
 
-### Table Progress
+**Schema `testapp`**
 
 **`users`**: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 72%
 
@@ -2521,7 +2511,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 
 **Status**: Resuming
 
-### Table Progress
+**Schema `testapp`**
 
 **`users`**: 🔄 Resuming…
 
@@ -2554,7 +2544,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 📊 1/2 complete · 1 cancelled
 
-### Table Progress
+**Schema `testapp`**
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
@@ -2591,7 +2581,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
 📊 3 waiting for cutover
 
-### Table Progress
+**Schema `testapp`**
 
 **`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
 
@@ -2639,7 +2629,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 📊 3 cutting over
 
-### Table Progress
+**Schema `testapp`**
 
 **`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...
 
@@ -2680,11 +2670,11 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Status**: Revert window
 
-🔗 **Deploy request**: https://app.planetscale.com/acme/myapp/deploy-requests/42
+Deploy request: https://app.planetscale.com/acme/myapp/deploy-requests/42
 
 ⏳ **Revert window closes in**: 28m 30s
 
-### Table Progress
+**Keyspace `testapp`**
 
 **`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
 
@@ -2733,9 +2723,9 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Status**: Skipping revert
 
-🔗 **Deploy request**: https://app.planetscale.com/acme/myapp/deploy-requests/42
+Deploy request: https://app.planetscale.com/acme/myapp/deploy-requests/42
 
-### Table Progress
+**Keyspace `testapp`**
 
 **`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
 
@@ -5348,7 +5338,7 @@ schemabot cutover apply-a1b2c3d4e5f6 -e production
 
 📊 3 waiting for cutover
 
-### Table Progress
+**Schema `testapp`**
 
 **`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
 
@@ -5389,7 +5379,7 @@ schemabot cutover apply-a1b2c3d4e5f6 -e production
 
 📊 1/3 complete · 1 running (62%) · 1 queued
 
-### Table Progress
+**Schema `testapp`**
 
 **`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
 
@@ -5477,7 +5467,7 @@ schemabot apply -e production
 
 📊 3/3 complete
 
-### Table Progress
+**Schema `testapp`**
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
@@ -5513,7 +5503,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 📊 1/3 complete · 1 failed · 1 cancelled
 
-### Table Progress
+**Schema `testapp`**
 
 **`users`**: 🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
 
@@ -5590,7 +5580,7 @@ _No details available yet._
 
 📊 3/3 complete
 
-### Table Progress
+**Schema `testapp`**
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
@@ -5626,7 +5616,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 📊 3/3 complete
 
-### Table Progress
+**Schema `testapp`**
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
@@ -5662,7 +5652,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 📊 3/3 complete
 
-### Table Progress
+**Schema `testapp`**
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
