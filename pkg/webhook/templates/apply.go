@@ -527,18 +527,25 @@ type namespaceTableGroup struct {
 }
 
 // groupTablesByNamespace groups tables by namespace, preserving the order in
-// which each namespace first appears. Tables with no namespace are grouped under
-// the empty namespace, which renders without a header.
+// which each namespace first appears. The empty namespace and the "default"
+// placeholder both mean "no specific namespace": they are folded together and
+// render without a header, so a comment never shows a meaningless
+// "Schema `default`" / "Keyspace `default`" header or splits the same logical
+// no-namespace tables into separate groups.
 func groupTablesByNamespace(tables []TableProgressData) []namespaceTableGroup {
 	var groups []namespaceTableGroup
 	index := make(map[string]int)
 	for _, t := range tables {
-		if i, ok := index[t.Namespace]; ok {
+		ns := t.Namespace
+		if ns == "default" {
+			ns = ""
+		}
+		if i, ok := index[ns]; ok {
 			groups[i].tables = append(groups[i].tables, t)
 			continue
 		}
-		index[t.Namespace] = len(groups)
-		groups = append(groups, namespaceTableGroup{namespace: t.Namespace, tables: []TableProgressData{t}})
+		index[ns] = len(groups)
+		groups = append(groups, namespaceTableGroup{namespace: ns, tables: []TableProgressData{t}})
 	}
 	return groups
 }

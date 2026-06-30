@@ -355,6 +355,36 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 	assert.Contains(t, result, "Queued")
 }
 
+// A Vitess/PlanetScale apply labels its namespace group "Keyspace" (not "Schema"),
+// so the engine-aware label selection is exercised distinctly from the MySQL case.
+func TestRenderApplyStatusComment_VitessUsesKeyspaceLabel(t *testing.T) {
+	result := RenderApplyStatusComment(ApplyStatusCommentData{
+		Database:    "boardgames",
+		Environment: "staging",
+		Engine:      "PlanetScale",
+		ApplyID:     "apply-abc",
+		State:       state.Apply.Running,
+		Tables: []TableProgressData{
+			{TableName: "customers", Namespace: "boardgames_sharded", Status: state.Task.Running},
+		},
+	})
+	assert.Contains(t, result, "**Keyspace `boardgames_sharded`**")
+}
+
+// The "default" namespace placeholder and the empty namespace both mean "no
+// specific namespace": they fold into a single group with no namespace string,
+// so the comment renders no meaningless "default" header and never splits the
+// same logical no-namespace tables apart.
+func TestGroupTablesByNamespaceFoldsDefaultPlaceholder(t *testing.T) {
+	groups := groupTablesByNamespace([]TableProgressData{
+		{TableName: "a", Namespace: ""},
+		{TableName: "b", Namespace: "default"},
+	})
+	require.Len(t, groups, 1)
+	assert.Equal(t, "", groups[0].namespace)
+	assert.Len(t, groups[0].tables, 2)
+}
+
 // A Vitess apply surfaces each keyspace's VSchema application status (and diff)
 // from engine display metadata as a dedicated section, so the PR comment shows
 // VSchema progress the same way the CLI does — including a multi-keyspace apply
