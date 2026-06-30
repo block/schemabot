@@ -1846,9 +1846,10 @@ func TestRenderApplyStatusComment_SkippingRevert(t *testing.T) {
 }
 
 // In the revert window the comment shows how long the operator has to revert or
-// skip before the change becomes permanent. A future deadline renders a
-// countdown; an absent or past-due deadline renders none rather than a stale or
-// negative value.
+// skip before the change becomes permanent. The countdown folds into the status
+// line ("Revert Window | Closes in …") so the state and its deadline read
+// together. A future deadline renders the countdown; an absent or past-due
+// deadline shows the state alone rather than a stale or negative value.
 func TestRenderApplyStatusComment_RevertWindowDeadline(t *testing.T) {
 	base := ApplyStatusCommentData{
 		ApplyID:     "apply-abc123",
@@ -1860,13 +1861,15 @@ func TestRenderApplyStatusComment_RevertWindowDeadline(t *testing.T) {
 
 	withDeadline := base
 	withDeadline.RevertExpiresAt = time.Now().Add(20 * time.Minute).UTC().Format(time.RFC3339)
-	assert.Contains(t, RenderApplyStatusComment(withDeadline), "Revert window closes in")
+	assert.Contains(t, RenderApplyStatusComment(withDeadline), "**Status**: Revert Window | Closes in")
 
-	// No deadline → no countdown line.
-	assert.NotContains(t, RenderApplyStatusComment(base), "Revert window closes in")
+	// No deadline → status line shows the state alone, no countdown.
+	noDeadline := RenderApplyStatusComment(base)
+	assert.Contains(t, noDeadline, "**Status**: Revert Window")
+	assert.NotContains(t, noDeadline, "Closes in")
 
-	// Past-due deadline → no countdown line (never show a negative countdown).
+	// Past-due deadline → status line shows the state alone (never a negative countdown).
 	pastDue := base
 	pastDue.RevertExpiresAt = time.Now().Add(-1 * time.Minute).UTC().Format(time.RFC3339)
-	assert.NotContains(t, RenderApplyStatusComment(pastDue), "Revert window closes in")
+	assert.NotContains(t, RenderApplyStatusComment(pastDue), "Closes in")
 }
