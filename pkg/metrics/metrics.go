@@ -263,6 +263,23 @@ func RecordTransientPlanRetry(ctx context.Context, database, environment, outcom
 	)
 }
 
+// RecordShardProgressWriteThrough records the outcome of the operator drive's
+// per-shard progress write-through. outcome is one of: "written" (>=1 shard row
+// persisted this poll), "skipped_no_shards_with_rows" (a copying table on a
+// sharded engine reported no per-shard breakdown — surprising), "skipped_no_lease"
+// (no lease on the context — a read-path caller), "lease_lost", or "error". The
+// ordinary unsharded/instant case is intentionally not recorded so a spike on any
+// outcome is actionable.
+func RecordShardProgressWriteThrough(ctx context.Context, database, databaseType, environment, outcome string) {
+	addCounter(ctx, "schemabot.operator.shard_progress_writethrough.total",
+		"operator per-shard progress write-through outcomes", "{write}",
+		attribute.String("database", database),
+		attribute.String("database_type", databaseType),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
 var knownSourcePolicyOperations = map[string]bool{
 	"plan":  true,
 	"apply": true,

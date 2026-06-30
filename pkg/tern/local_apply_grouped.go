@@ -1187,17 +1187,34 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 // reconcile re-applies it.
 func (c *LocalClient) writeShardProgress(ctx context.Context, table *storage.Task, tp *engine.TableProgress, now time.Time) {
 	if len(tp.Shards) == 0 {
+		// A copying table on a sharded engine that reports no per-shard breakdown is
+		// surprising and means the per-shard view will be empty — surface it. Stay
+		// quiet for the ordinary cases (MySQL row copy, or an instant/no-row table),
+		// where no shards is expected.
+		shardedEngine := table.DatabaseType == storage.DatabaseTypeVitess || table.DatabaseType == storage.DatabaseTypeStrata
+		if shardedEngine && (tp.RowsCopied > 0 || tp.RowsTotal > 0) {
+			c.logger.Warn("operator: per-shard progress skipped, engine reported a copying table with no shards",
+				append(table.LogAttrs(), "rows_copied", tp.RowsCopied, "rows_total", tp.RowsTotal)...)
+			metrics.RecordShardProgressWriteThrough(ctx, table.Database, table.DatabaseType, table.Environment, "skipped_no_shards_with_rows")
+		}
 		return
 	}
 	_, hasOpLease := storage.OperationLeaseFromContext(ctx)
 	_, hasApplyLease := storage.ApplyLeaseFromContext(ctx)
 	if !hasOpLease && !hasApplyLease {
+		// Read-path callers carry no lease and skip; expected and frequent, so the
+		// drive should be the only writer. Record it so an unexpectedly leaseless
+		// drive is visible.
+		c.logger.Debug("operator: per-shard progress skipped, no lease on context",
+			append(table.LogAttrs(), "shard_count", len(tp.Shards))...)
+		metrics.RecordShardProgressWriteThrough(ctx, table.Database, table.DatabaseType, table.Environment, "skipped_no_lease")
 		return
 	}
 	var operationID int64
 	if table.ApplyOperationID != nil {
 		operationID = *table.ApplyOperationID
 	}
+	wroteShard := false
 	for _, sh := range tp.Shards {
 		shardTask := &storage.Task{
 			TaskIdentifier:   "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16],
@@ -1226,6 +1243,7 @@ func (c *LocalClient) writeShardProgress(ctx context.Context, table *storage.Tas
 		}
 		err := c.storage.Tasks().UpsertShardProgress(ctx, shardTask)
 		if err == nil {
+			wroteShard = true
 			continue
 		}
 		if errors.Is(err, storage.ErrApplyLeaseLost) {
@@ -1236,6 +1254,7 @@ func (c *LocalClient) writeShardProgress(ctx context.Context, table *storage.Tas
 				"apply_id", table.ApplyID, "apply_operation_id", operationID,
 				"database", table.Database, "environment", table.Environment,
 				"namespace", table.Namespace, "table", table.TableName, "shard", sh.Shard)
+			metrics.RecordShardProgressWriteThrough(ctx, table.Database, table.DatabaseType, table.Environment, "lease_lost")
 			return
 		}
 		c.logger.Error("operator: failed to persist shard progress",
@@ -1243,5 +1262,9 @@ func (c *LocalClient) writeShardProgress(ctx context.Context, table *storage.Tas
 			"database", table.Database, "database_type", table.DatabaseType, "environment", table.Environment,
 			"namespace", table.Namespace, "table", table.TableName, "shard", sh.Shard,
 			"error", err)
+		metrics.RecordShardProgressWriteThrough(ctx, table.Database, table.DatabaseType, table.Environment, "error")
+	}
+	if wroteShard {
+		metrics.RecordShardProgressWriteThrough(ctx, table.Database, table.DatabaseType, table.Environment, "written")
 	}
 }
