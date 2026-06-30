@@ -197,11 +197,19 @@ func compareDriftMultisets(recomputed, dispatched driftChangeMultiset) error {
 // and hide what actually drifted. The shard is shown only when set so
 // non-sharded messages stay uncluttered.
 func formatDriftKey(k driftChangeKey) string {
+	return fmt.Sprintf("%s (%s)", formatDriftLocation(k), k.ddl)
+}
+
+// formatDriftLocation renders the namespace/shard/table/operation of a drift key
+// without its DDL, for messages that present the reviewed and re-planned DDL
+// separately. The shard is shown only when set so non-sharded messages stay
+// uncluttered.
+func formatDriftLocation(k driftChangeKey) string {
 	loc := fmt.Sprintf("%s.%s", k.namespace, k.table)
 	if k.shard != "" {
 		loc = fmt.Sprintf("%s[%s].%s", k.namespace, k.shard, k.table)
 	}
-	return fmt.Sprintf("%s/%s (%s)", loc, k.operation, k.ddl)
+	return fmt.Sprintf("%s/%s", loc, k.operation)
 }
 
 // vschemaNamespacesFromPlanResult returns the namespaces the recomputed plan

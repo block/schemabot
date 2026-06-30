@@ -446,12 +446,53 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 				fmt.Sprintf("Task %s already completed (re-plan shows no remaining changes)", task.TaskIdentifier))
 			completedCount++
 		} else {
+			// Fail closed if the re-plan would apply DDL this task was not
+			// reviewed with: the re-plan recomputes the delta against live
+			// schema, so on a drifted deployment it can produce unreviewed DDL
+			// that overwriting task.DDL would silently apply.
+			if err := verifyReplannedTaskDDL(task, ddl); err != nil {
+				return nil, err
+			}
 			task.DDL = ddl
 			activeTasks = append(activeTasks, task)
 		}
 	}
 
 	return &replanResult{ActiveTasks: activeTasks, CompletedCount: completedCount}, nil
+}
+
+// verifyReplannedTaskDDL fails closed when the DDL a resume re-plan would now
+// apply for a task differs from the DDL the task was reviewed with. The resume
+// re-plan recomputes each deployment's own delta against its live schema; on a
+// deployment whose schema has drifted, that recomputed delta is DDL no human
+// reviewed, and overwriting task.DDL with it would apply it silently. Comparing
+// canonical forms tolerates incidental formatting differences so only a real
+// semantic divergence trips the guard. A task with no reviewed DDL carries no
+// reference to compare against (only the legacy synthetic VSchema tasks, which
+// the engine-change builder already skips), so it is left to existing handling.
+func verifyReplannedTaskDDL(task *storage.Task, replannedDDL string) error {
+	if task.DDL == "" {
+		return nil
+	}
+	reviewedCanon, err := canonicalDDLForDrift(task.DDL)
+	if err != nil {
+		return fmt.Errorf("reviewed DDL for task %s: %w", task.TaskIdentifier, err)
+	}
+	replannedCanon, err := canonicalDDLForDrift(replannedDDL)
+	if err != nil {
+		return fmt.Errorf("re-planned DDL for task %s: %w", task.TaskIdentifier, err)
+	}
+	if reviewedCanon == replannedCanon {
+		return nil
+	}
+	loc := formatDriftLocation(driftChangeKey{
+		namespace: task.Namespace,
+		shard:     task.Shard,
+		table:     task.TableName,
+		operation: task.DDLAction,
+	})
+	return fmt.Errorf("local schema has drifted from the reviewed plan; resume would apply unreviewed DDL for %s: reviewed %q, re-planned %q",
+		loc, reviewedCanon, replannedCanon)
 }
 
 // prepareRetryableTasksForResume queues only the task work that previously
