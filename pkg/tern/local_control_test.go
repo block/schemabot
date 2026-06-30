@@ -200,6 +200,7 @@ func newVitessControlTestClient(apply *storage.Apply, tasks []*storage.Task, res
 			tasks:           &controlTestTaskStore{tasks: tasks},
 			applyLogs:       &controlTestApplyLogStore{},
 			applyOperations: &controlTestApplyOperationStore{data: resumeState},
+			controlRequests: &testControlRequestStore{},
 		},
 		planetscaleEngine: eng,
 		logger:            slog.Default(),
@@ -300,6 +301,54 @@ func TestLocalClient_StopQueuesStopRequestForApplyOwner(t *testing.T) {
 	assert.Equal(t, state.Task.Running, task.State)
 	assert.Equal(t, state.Apply.Running, apply.State)
 	controlReq, err := client.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, controlReq)
+	assert.Equal(t, "tern-grpc", controlReq.RequestedBy)
+	assert.Equal(t, apply.ApplyIdentifier, wakeApplyID)
+	assert.Equal(t, apply.Database, wakeDatabase)
+	assert.Equal(t, apply.Environment, wakeEnvironment)
+}
+
+// External Cancel records durable intent in shared storage instead of cancelling
+// inline. A Cancel RPC can land on any replica, but only the lease owner driving
+// the apply holds the in-process engine state — so a non-owner replica records a
+// pending cancel request for the owning driver to claim, without touching the
+// engine or mutating cancelled state itself. This keeps cancel from depending on
+// the request happening to hit the owner pod.
+func TestLocalClient_CancelQueuesCancelRequestForApplyOwner(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-cancel-queued",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-vitess-cancel-queued",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	eng := &controlCaptureEngine{}
+	client := newVitessControlTestClient(apply, []*storage.Task{task}, nil, eng)
+	var wakeApplyID, wakeDatabase, wakeEnvironment string
+	client.config.WakeOperator = func(applyIdentifier, database, environment string) {
+		wakeApplyID = applyIdentifier
+		wakeDatabase = database
+		wakeEnvironment = environment
+	}
+
+	resp, err := client.Cancel(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	assert.Nil(t, eng.cancelReq, "external cancel must not cancel the local engine directly")
+	assert.Equal(t, state.Task.Running, task.State, "external cancel must not mutate task state inline")
+	assert.Equal(t, state.Apply.Running, apply.State, "external cancel must not mutate apply state inline")
+	controlReq, err := client.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
 	require.NotNil(t, controlReq)
 	assert.Equal(t, "tern-grpc", controlReq.RequestedBy)

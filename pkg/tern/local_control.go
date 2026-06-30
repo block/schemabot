@@ -332,7 +332,75 @@ func (c *LocalClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv
 
 // Cancel terminates an in-progress schema change permanently.
 func (c *LocalClient) Cancel(ctx context.Context, req *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
-	return c.cancelOwnedApply(ctx, req, "")
+	return c.requestCancel(ctx, req, "")
+}
+
+// requestCancel records a durable, owner-routed cancel control request rather than
+// cancelling inline. A Cancel RPC can land on any pod, but only the lease owner
+// driving the apply holds the in-process engine state — so the request is queued
+// for the owning driver (processPendingCancelControlRequest) to claim and execute
+// the engine cancel plus the terminal transitions on the pod that owns the apply.
+// This mirrors requestStop's delivery; cancel keeps its own terminate semantics.
+func (c *LocalClient) requestCancel(ctx context.Context, req *ternv1.CancelRequest, caller string) (*ternv1.CancelResponse, error) {
+	c.logger.Info("Cancel requested", "database", c.config.Database, "type", c.config.Type, "apply_id", req.ApplyId)
+	apply, err := c.resolveControlApply(ctx, req.ApplyId, "cancel")
+	if err != nil {
+		return nil, err
+	}
+	if apply == nil {
+		return nil, fmt.Errorf("no active schema change")
+	}
+
+	// A terminal apply (other than stopped, which a driver can still cancel) has
+	// no work to cancel; reject synchronously rather than queue a no-op request.
+	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
+		c.logger.Warn("cancel rejected: schema change is already terminal",
+			"apply_id", apply.ApplyIdentifier, "state", apply.State)
+		return nil, fmt.Errorf("schema change %s is already terminal (state: %s)", apply.ApplyIdentifier, apply.State)
+	}
+
+	if revertWindow, err := c.applyHasRevertWindowTask(ctx, apply); err != nil {
+		return nil, err
+	} else if revertWindow {
+		c.logger.Warn("cancel rejected: schema change is in the revert window and has already cut over",
+			"apply_id", apply.ApplyIdentifier, "state", apply.State)
+		return nil, errors.New(revertWindowStopRejectionMessage(apply.ApplyIdentifier))
+	}
+
+	controlStore := c.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, fmt.Errorf("control request store is not available")
+	}
+	requestedBy := caller
+	if requestedBy == "" {
+		requestedBy = "tern-grpc"
+	}
+	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: requestedBy,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("record cancel control request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if alreadyPending {
+		c.logger.Info("cancel request already pending for apply owner",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", requestedBy)
+	} else {
+		c.logger.Info("cancel request queued for apply owner",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", requestedBy)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Cancel request queued for apply owner%s", callerApplyLogSuffix(requestedBy)), "", "")
+	}
+	c.wakeOperatorForControlRequest(apply)
+	return &ternv1.CancelResponse{Accepted: true}, nil
 }
 
 func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, caller string) (*ternv1.StopResponse, error) {
