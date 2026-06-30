@@ -1,7 +1,9 @@
 package tern
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -63,6 +65,40 @@ func TestPSDisplayMetadata(t *testing.T) {
 	// Malformed JSON surfaces an error rather than silently dropping fields.
 	_, err = PSDisplayMetadata(`{not json`)
 	require.Error(t, err)
+
+	// A persisted revert_expires_at is surfaced for the revert-window countdown.
+	m, err = PSDisplayMetadata(`{"branch_name":"b","revert_expires_at":"2026-06-29T18:30:00Z"}`)
+	require.NoError(t, err)
+	require.NotNil(t, m)
+	assert.Equal(t, "2026-06-29T18:30:00Z", m["revert_expires_at"])
+}
+
+// setRevertExpiresAtMetadata must set revert_expires_at without dropping engine
+// fields the storage struct does not model — it merges at the JSON-object level
+// rather than re-encoding the typed struct, so an arbitrary unmodeled key
+// survives.
+func TestSetRevertExpiresAtMetadata(t *testing.T) {
+	expires := time.Date(2026, 6, 29, 18, 30, 0, 0, time.UTC)
+	in := `{"branch_name":"b","unmodeled_engine_field":{"commerce":{"started_at":"2026-06-29T18:00:00Z"}}}`
+
+	out, err := setRevertExpiresAtMetadata(in, expires)
+	require.NoError(t, err)
+
+	var obj map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(out), &obj))
+	assert.JSONEq(t, `"2026-06-29T18:30:00Z"`, string(obj["revert_expires_at"]))
+	assert.Contains(t, obj, "unmodeled_engine_field", "unmodeled engine field must survive the rewrite")
+	assert.JSONEq(t, `"b"`, string(obj["branch_name"]))
+
+	// Surfaced back through the display projection.
+	m, err := PSDisplayMetadata(out)
+	require.NoError(t, err)
+	assert.Equal(t, "2026-06-29T18:30:00Z", m["revert_expires_at"])
+
+	// Empty input starts a fresh object rather than erroring.
+	out, err = setRevertExpiresAtMetadata("", expires)
+	require.NoError(t, err)
+	assert.Contains(t, out, "revert_expires_at")
 }
 
 // The display map a data-plane progress poll returns round-trips through

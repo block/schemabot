@@ -289,6 +289,7 @@ type psMetadataForStorage struct {
 	DeferredDeploy   bool                  `json:"deferred_deploy,omitempty"`
 	VSchemaStatus    string                `json:"vschema_status,omitempty"`
 	VSchemaDiffs     []vschemaKeyspaceDiff `json:"vschema_diffs,omitempty"`
+	RevertExpiresAt  *time.Time            `json:"revert_expires_at,omitempty"`
 }
 
 // vschemaKeyspaceDiff mirrors the PlanetScale engine's per-keyspace VSchema diff
@@ -307,6 +308,31 @@ func decodePSMetadataForStorage(s string) (*psMetadataForStorage, error) {
 		return nil, err
 	}
 	return &m, nil
+}
+
+// setRevertExpiresAtMetadata returns the PlanetScale resume-state blob with
+// revert_expires_at set to expiresAt, preserving every other key. It merges at
+// the JSON-object level rather than re-encoding psMetadataForStorage so engine
+// fields the storage struct does not model survive the rewrite. The timestamp
+// is normalized to UTC RFC3339 so the value is stable across ticks and the
+// comment/CLI parse it the same way.
+func setRevertExpiresAtMetadata(metadata string, expiresAt time.Time) (string, error) {
+	obj := map[string]json.RawMessage{}
+	if metadata != "" {
+		if err := json.Unmarshal([]byte(metadata), &obj); err != nil {
+			return "", fmt.Errorf("decode planetscale resume metadata to set revert_expires_at: %w", err)
+		}
+	}
+	encoded, err := json.Marshal(expiresAt.UTC().Format(time.RFC3339))
+	if err != nil {
+		return "", fmt.Errorf("encode revert_expires_at: %w", err)
+	}
+	obj["revert_expires_at"] = encoded
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return "", fmt.Errorf("re-encode planetscale resume metadata with revert_expires_at: %w", err)
+	}
+	return string(out), nil
 }
 
 // PSDisplayMetadata decodes a PlanetScale engine resume-state blob into the
@@ -342,6 +368,9 @@ func PSDisplayMetadata(resumeStateMetadata string) (map[string]string, error) {
 	}
 	if meta.DeferredDeploy {
 		set("deferred_deploy", "true")
+	}
+	if meta.RevertExpiresAt != nil {
+		set("revert_expires_at", meta.RevertExpiresAt.UTC().Format(time.RFC3339))
 	}
 	// Per-keyspace VSchema state. Mirrors the engine's live projection: every
 	// changed keyspace carries the deploy-level status, encoded as JSON so the

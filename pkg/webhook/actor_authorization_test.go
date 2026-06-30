@@ -373,7 +373,7 @@ func TestWebhookApplyScopedControlCommandBlocksUnauthorizedActor(t *testing.T) {
 		logger:    testLogger(),
 	}
 
-	for _, command := range []string{action.Stop, action.Start} {
+	for _, command := range []string{action.Stop, action.Cancel, action.Start} {
 		t.Run(command, func(t *testing.T) {
 			req := buildWebhookRequest(t, webhookPayloadOpts{
 				comment:   "schemabot " + command + " " + apply.ApplyIdentifier + " -e staging",

@@ -49,7 +49,7 @@ func (cmd *StopCmd) Run(g *Globals) error {
 		fmt.Println("Schema change already stopped")
 		return nil
 	}
-	if !state.IsState(curState, state.Apply.Running, state.Apply.RunningDegraded, state.Apply.CuttingOver, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.Pending) {
+	if !state.IsState(curState, state.Apply.Running, state.Apply.RunningDegraded, state.Apply.Paused, state.Apply.CuttingOver, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.Pending) {
 		return fmt.Errorf("cannot stop schema change in state: %s", curState)
 	}
 

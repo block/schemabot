@@ -573,6 +573,50 @@ func (c *GRPCClient) Cancel(ctx context.Context, req *ternv1.CancelRequest) (*te
 	return c.client.Cancel(ctx, req)
 }
 
+// processPendingSkipRevertControlRequest drives a durable skip-revert control
+// request for a remote apply: it proxies SkipRevert to the data plane and
+// completes the request. This is the apply owner's retry path when the API's
+// immediate skip attempt failed or its process died, leaving the request pending.
+// A transient failure returns an error so the drive exits and the operator
+// retries (the request stays pending); a rejected skip fails the request.
+func (c *GRPCClient) processPendingSkipRevertControlRequest(ctx context.Context, apply *storage.Apply, remoteID string) error {
+	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationSkipRevert)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		return nil
+	}
+	// Skip-revert is only meaningful in the revert window. Once the apply has
+	// left it (finalized, reverted, …) the request is moot — complete it so it
+	// does not linger.
+	if !state.IsState(apply.State, state.Apply.RevertWindow) {
+		return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationSkipRevert)
+	}
+	resp, err := c.client.SkipRevert(ctx, &ternv1.SkipRevertRequest{
+		ApplyId:     remoteID,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		return fmt.Errorf("process pending skip-revert for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if !resp.Accepted {
+		message := "skip-revert was not accepted by the data plane"
+		if resp.ErrorMessage != "" {
+			message = fmt.Sprintf("skip-revert was not accepted: %s", resp.ErrorMessage)
+		}
+		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationSkipRevert, message)
+	}
+	if apply.Engine == storage.EnginePlanetScale {
+		if err := c.storage.Applies().SetRevertSkipped(ctx, apply.ID, time.Now()); err != nil {
+			slog.Warn("failed to record skip-revert on apply", "apply_id", apply.ApplyIdentifier, "error", err)
+		}
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered,
+		fmt.Sprintf("Skip-revert triggered by user%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+	return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationSkipRevert)
+}
+
 // logOperationDriveLeavesParentStop records that a multi-operation
 // operation-only drive observed an apply-level pending stop request and is
 // leaving it pending. Such a drive owns only its operation; the parent stop
@@ -1573,9 +1617,10 @@ func (c *GRPCClient) triggerRemoteOperationCutover(ctx context.Context, apply *s
 		return false, c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now, scope)
 	}
 	switch {
-	case state.IsState(remoteState, state.Apply.CuttingOver), state.IsState(remoteState, state.Apply.RevertWindow):
-		// A prior driver already started the swap, or the engine is in the
-		// post-cutover revert window. Do not re-send Cutover; poll to terminal.
+	case state.IsState(remoteState, state.Apply.CuttingOver), state.IsState(remoteState, state.Apply.RevertWindow), state.IsState(remoteState, state.Apply.SkippingRevert):
+		// A prior driver already started the swap, the engine is in the post-cutover
+		// revert window, or skip-revert is finalizing. Do not re-send Cutover; poll
+		// to terminal.
 		apply.State = remoteState
 		return true, nil
 	case state.IsState(remoteState, state.Apply.WaitingForCutover):
@@ -2910,6 +2955,8 @@ func applyProgressRank(applyState string) int {
 		return 9
 	case state.Apply.RevertWindow:
 		return 10
+	case state.Apply.SkippingRevert:
+		return 11
 	default:
 		return 0
 	}
@@ -2962,6 +3009,15 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			}
 			if err := c.processPendingCutoverControlRequest(ctx, apply, scope); err != nil {
 				slog.Warn("pending gRPC cutover request processing failed; current apply owner will exit for operator retry",
+					"apply_id", apply.ApplyIdentifier,
+					"external_id", apply.ExternalID,
+					"database", apply.Database,
+					"environment", apply.Environment,
+					"error", err)
+				return err
+			}
+			if err := c.processPendingSkipRevertControlRequest(ctx, apply, scope.remoteApplyID(apply)); err != nil {
+				slog.Warn("pending gRPC skip-revert request processing failed; current apply owner will exit for operator retry",
 					"apply_id", apply.ApplyIdentifier,
 					"external_id", apply.ExternalID,
 					"database", apply.Database,

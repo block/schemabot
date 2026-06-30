@@ -64,6 +64,7 @@ Under **Repository permissions**, grant:
 | **Commit statuses** | Read | Read legacy commit statuses for the `require_passing_checks` gate |
 | **Contents** | Read | Read `schemabot.yaml`, schema files, CODEOWNERS, and commit refs |
 | **Issues** | Read & Write | Post PR comments and add reactions |
+| **Merge queues** | Read | Receive `merge_group` events so SchemaBot can publish its checks on merge-queue commits (only needed if a repo uses a merge queue) |
 | **Metadata** | Read | Required (granted automatically) |
 | **Pull requests** | Read & Write | Fetch PR info, changed files, and reviews |
 
@@ -78,6 +79,9 @@ Under **Organization permissions**, grant:
 | Event | Purpose |
 |-------|---------|
 | **Issue comment** | Receive `schemabot plan`, `schemabot help`, etc. from PR comments |
+| **Merge group** | Publish a passing SchemaBot check on a merge-queue commit so a required SchemaBot check does not block the merge queue (only needed if a repo uses a merge queue) |
+
+Subscribe to **Merge group**, not **Merge queue entry** — the two are distinct events, and SchemaBot handles only `merge_group`. The **Merge group** event requires the **Merge queues: Read** repository permission above. Because that is a new permission, adding it to an existing App marks the App as requesting new permissions, which an org or repository admin must approve on each installation before it takes effect.
 
 Future phases will also use **Check run** (action buttons) and **Pull request** (auto-plan on open/sync).
 

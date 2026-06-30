@@ -2629,6 +2629,177 @@ func TestApplyStore_ExpireRetryableTerminalizesRetryableOperations(t *testing.T)
 	assert.Equal(t, state.ApplyOperation.WaitingForCutover, parkedOp.State, "a healthy successor parked at the cutover barrier must be left untouched")
 }
 
+// TestApplyStore_ReapplyFailed verifies that deliberate reapply reopens a
+// recent failed apply while preserving completed work as already done.
+func TestApplyStore_ReapplyFailed(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_reapply_failed", 520, state.Apply.Failed, "staging")
+	now := time.Now()
+	apply.Attempt = maxRecoveryAttempts
+	apply.Deployment = "region-a"
+	apply.ErrorMessage = "retry budget exhausted"
+	apply.CompletedAt = &now
+	require.NoError(t, store.Applies().Update(ctx, apply))
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET deployment = ? WHERE id = ?`, apply.Deployment, apply.ID)
+	require.NoError(t, err)
+
+	_, err = store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: "task_reapply_failed",
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          state.Task.Failed,
+		ErrorMessage:   "copy failed",
+		TableName:      "orders",
+		Options:        []byte("{}"),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+	_, err = store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: "task_reapply_completed",
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          state.Task.Completed,
+		TableName:      "customers",
+		Options:        []byte("{}"),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		CompletedAt:    &now,
+	})
+	require.NoError(t, err)
+
+	failedOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed, ErrorMessage: "copy failed",
+	})
+	require.NoError(t, err)
+	completedOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.Completed, CompletedAt: &now,
+	})
+	require.NoError(t, err)
+
+	reapplied, err := store.Applies().ReapplyFailed(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, reapplied)
+	assert.Equal(t, state.Apply.FailedRetryable, reapplied.State)
+	assert.Zero(t, reapplied.Attempt)
+	assert.Empty(t, reapplied.ErrorMessage)
+	assert.Nil(t, reapplied.CompletedAt)
+
+	failedTask, err := store.Tasks().Get(ctx, "task_reapply_failed")
+	require.NoError(t, err)
+	require.NotNil(t, failedTask)
+	assert.Equal(t, state.Task.FailedRetryable, failedTask.State)
+	assert.Empty(t, failedTask.ErrorMessage)
+	assert.Nil(t, failedTask.CompletedAt)
+
+	completedTask, err := store.Tasks().Get(ctx, "task_reapply_completed")
+	require.NoError(t, err)
+	require.NotNil(t, completedTask)
+	assert.Equal(t, state.Task.Completed, completedTask.State)
+	assert.NotNil(t, completedTask.CompletedAt)
+
+	failedOp, err := store.ApplyOperations().Get(ctx, failedOpID)
+	require.NoError(t, err)
+	require.NotNil(t, failedOp)
+	assert.Equal(t, state.ApplyOperation.FailedRetryable, failedOp.State)
+	assert.Empty(t, failedOp.ErrorMessage)
+	assert.Nil(t, failedOp.CompletedAt)
+
+	completedOp, err := store.ApplyOperations().Get(ctx, completedOpID)
+	require.NoError(t, err)
+	require.NotNil(t, completedOp)
+	assert.Equal(t, state.ApplyOperation.Completed, completedOp.State)
+	assert.NotNil(t, completedOp.CompletedAt)
+}
+
+func TestApplyStore_ReapplyFailedRejectsOldFailure(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_reapply_old_failed", 521, state.Apply.Failed, "staging")
+	completedAt := time.Now().AddDate(0, 0, -storage.ReapplyFailureFreshnessDays-1)
+	apply.Deployment = "region-a"
+	apply.CompletedAt = &completedAt
+	require.NoError(t, store.Applies().Update(ctx, apply))
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET deployment = ?, completed_at = ? WHERE id = ?`, apply.Deployment, completedAt, apply.ID)
+	require.NoError(t, err)
+
+	reapplied, err := store.Applies().ReapplyFailed(ctx, apply.ID)
+	require.ErrorIs(t, err, storage.ErrApplyNotReappliable)
+	assert.Nil(t, reapplied)
+}
+
+func TestApplyStore_ReapplyFailedRejectsNonReappliableOperation(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		operationState string
+		taskState      string
+	}{
+		{name: "stopped", operationState: state.ApplyOperation.Stopped, taskState: state.Task.Stopped},
+		{name: "cancelled", operationState: state.ApplyOperation.Cancelled, taskState: state.Task.Cancelled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := New(testDB)
+
+			lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_reapply_"+tc.name+"_operation", 522, state.Apply.Failed, "staging")
+			now := time.Now()
+			apply.Deployment = "region-a"
+			apply.CompletedAt = &now
+			require.NoError(t, store.Applies().Update(ctx, apply))
+			_, err := testDB.ExecContext(ctx, `UPDATE applies SET deployment = ? WHERE id = ?`, apply.Deployment, apply.ID)
+			require.NoError(t, err)
+
+			operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a", State: tc.operationState, CompletedAt: &now,
+			})
+			require.NoError(t, err)
+			_, err = store.Tasks().Create(ctx, &storage.Task{
+				TaskIdentifier:   "task_reapply_" + tc.name + "_operation",
+				ApplyID:          apply.ID,
+				ApplyOperationID: &operationID,
+				PlanID:           apply.PlanID,
+				Database:         apply.Database,
+				DatabaseType:     apply.DatabaseType,
+				Engine:           storage.EngineSpirit,
+				Environment:      apply.Environment,
+				State:            tc.taskState,
+				TableName:        "orders",
+				Options:          []byte("{}"),
+				CreatedAt:        now,
+				UpdatedAt:        now,
+				CompletedAt:      &now,
+			})
+			require.NoError(t, err)
+
+			reapplied, err := store.Applies().ReapplyFailed(ctx, apply.ID)
+			require.ErrorIs(t, err, storage.ErrApplyNotReappliable)
+			assert.Nil(t, reapplied)
+
+			task, err := store.Tasks().Get(ctx, "task_reapply_"+tc.name+"_operation")
+			require.NoError(t, err)
+			require.NotNil(t, task)
+			assert.Equal(t, tc.taskState, task.State)
+		})
+	}
+}
+
 func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestination(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -3255,6 +3426,51 @@ func TestApplyStore_FindNextApplyForStopReconciliation_ClaimsStrandedContinueApp
 	assert.Equal(t, apply.ID, claimed.ID)
 	assert.Equal(t, "test-operator", claimed.LeaseOwner, "claim rotates the lease owner")
 	assert.Equal(t, state.Apply.Running, claimed.State, "reconciliation claim refreshes the lease without changing apply state")
+}
+
+// TestApplyStore_FindNextApplyForStopReconciliation_ClaimsStrandedPausedApply
+// verifies the trigger also covers on_failure "pause": a rollout held paused by
+// a failed earlier sibling (no release) with a pending stop and a pending
+// sibling is claimed here so the operator can stop the held siblings and settle
+// the apply failed. paused is deliberately absent from claimableApplyStates, so
+// without paused in the reconciliation parent eligibility a stopped paused apply
+// would strand its pending siblings forever.
+func TestApplyStore_FindNextApplyForStopReconciliation_ClaimsStrandedPausedApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stop_recon_paused", 1, state.Apply.Paused, "staging")
+
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed, OnFailure: storage.OnFailurePause,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", OnFailure: storage.OnFailurePause,
+	})
+	require.NoError(t, err)
+	// Backdate the failed row so it can't be mistaken for a fresh active op.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failedID)
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a paused apply with a pending stop and pending siblings must be claimable for reconciliation")
+	assert.Equal(t, apply.ID, claimed.ID)
+	assert.Equal(t, "test-operator", claimed.LeaseOwner, "claim rotates the lease owner")
+	assert.Equal(t, state.Apply.Paused, claimed.State, "reconciliation claim refreshes the lease without changing apply state")
 }
 
 // TestApplyStore_FindNextApplyForStopReconciliation_SkipsApplyWithActiveOp

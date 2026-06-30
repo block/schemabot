@@ -23,6 +23,7 @@ var Apply = struct {
 	Recovering        string
 	CuttingOver       string
 	RevertWindow      string
+	SkippingRevert    string
 	Completed         string
 	Failed            string
 	FailedRetryable   string
@@ -49,6 +50,7 @@ var Apply = struct {
 	Recovering:        "recovering",
 	CuttingOver:       "cutting_over",
 	RevertWindow:      "revert_window",
+	SkippingRevert:    "skipping_revert",
 	Completed:         "completed",
 	Failed:            "failed",
 	FailedRetryable:   "failed_retryable",

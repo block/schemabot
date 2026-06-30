@@ -3,9 +3,11 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/alecthomas/kong"
 
@@ -32,6 +34,7 @@ type CLI struct {
 	Progress   commands.ProgressCmd   `cmd:"" help:"Get schema change progress"`
 	Cutover    commands.CutoverCmd    `cmd:"" help:"Trigger cutover for a deferred schema change"`
 	Stop       commands.StopCmd       `cmd:"" help:"Stop an in-progress schema change"`
+	Cancel     commands.CancelCmd     `cmd:"" help:"Cancel a schema change permanently"`
 	Start      commands.StartCmd      `cmd:"" help:"Resume a stopped schema change"`
 	Release    commands.ReleaseCmd    `cmd:"" help:"Release a rollout paused after an on_failure=pause failure"`
 	Volume     commands.VolumeCmd     `cmd:"" help:"Adjust schema change speed (1-11)"`
@@ -46,6 +49,7 @@ type CLI struct {
 	Preview    commands.PreviewCmd    `cmd:"" help:"Preview CLI output templates (for development)"`
 	FixLint    commands.FixLintCmd    `cmd:"" name:"fix-lint" help:"Auto-fix lint issues in schema files"`
 	Configure  commands.ConfigureCmd  `cmd:"" help:"Configure CLI settings (endpoint, profiles)"`
+	Login      commands.LoginCmd      `cmd:"" help:"Log in via OIDC and cache a token for the active profile"`
 	Settings   commands.SettingsCmd   `cmd:"" help:"View or update schema change settings"`
 	Serve      commands.ServeCmd      `cmd:"" help:"Start the SchemaBot HTTP API server"`
 }
@@ -63,12 +67,24 @@ func main() {
 	cli.Commit = commit
 	cli.Date = date
 
-	// Authenticate every API request with the resolved Bearer token. Empty when
-	// no token is configured, which is correct against a server with auth off.
-	token, err := client.ResolveToken(cli.Token, cli.Endpoint, cli.Profile)
+	// Authenticate every API request with the resolved Bearer token, renewing an
+	// expired cached token first. Empty when no token is configured, which is
+	// correct against a server with auth off.
+	// Bound the resolution so a slow or unreachable issuer during a token refresh
+	// can't hang the CLI at startup. Cancel as soon as it returns rather than via
+	// defer, since the os.Exit below would skip a deferred cancel.
+	authCtx, cancelAuth := context.WithTimeout(context.Background(), 30*time.Second)
+	token, err := client.ResolveBearerToken(authCtx, cli.Token, cli.Endpoint, cli.Profile)
+	cancelAuth()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
-		os.Exit(1)
+		// Per ResolveBearerToken's contract: an empty token with an error is a hard
+		// failure; a non-empty token with an error is a non-fatal warning (the
+		// returned token is still usable and re-login can fix it).
+		if token == "" {
+			fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "\033[33mWarning: %v\033[0m\n", err)
 	}
 	client.SetAuthToken(token)
 

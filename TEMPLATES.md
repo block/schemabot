@@ -722,6 +722,7 @@ schemabot apply -e staging --allow-unsafe
 | `schemabot apply-confirm -e <env>` | Confirm a downgraded locked plan |
 | `schemabot unlock` | Release lock and discard plan |
 | `schemabot stop <apply-id> -e <env>` | Stop an in-progress deployment |
+| `schemabot cancel <apply-id> -e <env>` | Permanently cancel an in-progress deployment |
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
@@ -751,6 +752,7 @@ That command wasn't recognized. Available commands:
 | `schemabot apply-confirm -e <env>` | Confirm a downgraded locked plan |
 | `schemabot unlock` | Release lock and discard plan |
 | `schemabot stop <apply-id> -e <env>` | Stop an in-progress deployment |
+| `schemabot cancel <apply-id> -e <env>` | Permanently cancel an in-progress deployment |
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
@@ -944,6 +946,7 @@ That command wasn't recognized. Available commands:
 | `schemabot apply-confirm -e <env>` | Confirm a downgraded locked plan |
 | `schemabot unlock` | Release lock and discard plan |
 | `schemabot stop <apply-id> -e <env>` | Stop an in-progress deployment |
+| `schemabot cancel <apply-id> -e <env>` | Permanently cancel an in-progress deployment |
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
@@ -2289,9 +2292,9 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-To stop this schema change:
+To cancel this schema change:
 ```
-schemabot stop apply-a1b2c3d4e5f6 -e staging
+schemabot cancel apply-a1b2c3d4e5f6 -e staging
 ```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
@@ -2330,9 +2333,9 @@ ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 ---
 
-To stop this schema change:
+To cancel this schema change:
 ```
-schemabot stop apply-a1b2c3d4e5f6 -e staging
+schemabot cancel apply-a1b2c3d4e5f6 -e staging
 ```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
@@ -2366,9 +2369,9 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 ---
 
-To stop this schema change:
+To cancel this schema change:
 ```
-schemabot stop apply-a1b2c3d4e5f6 -e staging
+schemabot cancel apply-a1b2c3d4e5f6 -e staging
 ```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
@@ -2660,6 +2663,102 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ---
 
 Cutover in progress — typically completes within seconds.
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="revert-window"></a><strong>Revert Window</strong></summary>
+
+
+## Schema Change Applied (Pending Revert) — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Revert window
+
+🔗 **Deploy request**: https://app.planetscale.com/acme/myapp/deploy-requests/42
+
+⏳ **Revert window closes in**: 28m 30s
+
+### Table Progress
+
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+---
+
+To revert:
+```
+schemabot revert apply-a1b2c3d4e5f6 -e staging
+```
+
+To skip revert and keep changes:
+```
+schemabot skip-revert apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="skipping-revert"></a><strong>Skipping Revert</strong></summary>
+
+
+## Skipping Revert — Finalizing — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Skipping revert
+
+🔗 **Deploy request**: https://app.planetscale.com/acme/myapp/deploy-requests/42
+
+### Table Progress
+
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+---
+
+Skip-revert was requested — closing the revert window and making this schema change permanent. This can no longer be reverted.
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 

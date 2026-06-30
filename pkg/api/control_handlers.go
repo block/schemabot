@@ -1720,6 +1720,8 @@ func startNotAllowedForState(apply *storage.Apply) error {
 		return controlConflictf("schema change is cutting over; start is not allowed")
 	case state.IsState(apply.State, state.Apply.RevertWindow):
 		return controlConflictf("schema change is in revert window; use revert or skip-revert instead of start")
+	case state.IsState(apply.State, state.Apply.Paused):
+		return controlConflictf("schema change is paused after a failed deployment; use release to continue the remaining deployments or stop to abandon them")
 	case state.IsState(apply.State, state.Apply.FailedRetryable):
 		return controlConflictf("schema change is waiting for operator retry; start is not allowed")
 	case state.IsState(apply.State, state.Apply.Failed):
@@ -1994,36 +1996,109 @@ type SkipRevertRequest struct {
 // handleSkipRevert handles POST /api/skip-revert requests.
 func (s *Service) handleSkipRevert(w http.ResponseWriter, r *http.Request) {
 	var req SkipRevertRequest
-	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
-
-	resp, err := client.SkipRevert(r.Context(), &ternv1.SkipRevertRequest{
-		ApplyId:     applyID,
-		Environment: apply.Environment,
-	})
+	resp, httpStatus, err := s.executeSkipRevertForApply(r.Context(), client, apply, ternApplyID, req.Caller)
 	if err != nil {
-		metrics.RecordControlOperation(r.Context(), "skip_revert", apply.Database, apply.Deployment, apply.Environment, "error")
 		s.writeControlError(w, "skip-revert", apply, err)
 		return
 	}
-	metrics.RecordControlOperation(r.Context(), "skip_revert", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
+	s.writeJSON(w, httpStatus, resp)
+}
 
-	// Record skip-revert on the apply for progress visibility.
-	if resp.Accepted && apply.Engine == storage.EnginePlanetScale {
-		if err := s.storage.Applies().SetRevertSkipped(r.Context(), apply.ID, time.Now()); err != nil {
-			s.logger.Error("failed to record skip-revert on apply", append(apply.LogAttrs(), "error", err)...)
-		}
+// ExecuteSkipRevert records durable skip-revert intent for an apply and attempts
+// an immediate skip. The apply owner completes it if the immediate attempt
+// cannot. It is the in-process entry the PR-comment command path reuses.
+func (s *Service) ExecuteSkipRevert(ctx context.Context, req apitypes.ControlRequest) (*apitypes.ControlResponse, error) {
+	client, apply, ternApplyID, err := s.controlTarget(ctx, "skip-revert", req.ApplyID, req.Environment)
+	if err != nil {
+		return nil, err
 	}
-	if resp.Accepted {
-		s.logControlOperation(r, apply.ApplyIdentifier, req.Caller, storage.LogEventSkipRevertTriggered, "Skip-revert triggered by user")
+	resp, _, err := s.executeSkipRevertForApply(ctx, client, apply, ternApplyID, req.Caller)
+	return resp, err
+}
+
+// executeSkipRevertForApply records durable skip-revert intent and attempts an
+// immediate skip. The returned HTTP status is meaningful only when err == nil;
+// error paths return a zero status and callers derive it from the error.
+func (s *Service) executeSkipRevertForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.ControlResponse, int, error) {
+	// Skip-revert closes a PlanetScale revert window; other engines hard-error
+	// it. Gate on the engine so a non-PlanetScale apply can never accumulate a
+	// permanently-pending skip-revert request.
+	if apply.Engine != storage.EnginePlanetScale {
+		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, controlConflictf("skip-revert is only supported for PlanetScale schema changes")
+	}
+	// Skip-revert is only meaningful while the apply is in its revert window.
+	if !state.IsState(apply.State, state.Apply.RevertWindow) {
+		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, controlConflictf("schema change is not in its revert window (current state: %s)", apply.State)
+	}
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, 0, fmt.Errorf("control request store is not available")
 	}
 
-	s.writeJSON(w, http.StatusOK, &apitypes.ControlResponse{
-		Accepted:     resp.Accepted,
-		ErrorMessage: resp.ErrorMessage,
+	// Record durable skip-revert intent before the engine call, so a
+	// comment-driven skip-revert survives the API process dying before the call
+	// lands, and so the apply owner (the data-plane operator for a remote apply,
+	// not the webhook pod) can drive it to completion.
+	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationSkipRevert,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: caller,
 	})
+	if err != nil {
+		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, 0, fmt.Errorf("record skip-revert control request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if alreadyPending {
+		// A prior skip-revert request is already queued; do not re-drive the
+		// engine. The apply owner is completing the existing one.
+		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "success")
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventSkipRevertTriggered, "Skip-revert requested by user while skip-revert request already pending")
+		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+		return &apitypes.ControlResponse{Accepted: true, Status: apitypes.ControlStatusAlreadyRequested}, http.StatusAccepted, nil
+	}
+	s.logControlOperationForApply(ctx, apply, caller, storage.LogEventSkipRevertTriggered, "Skip-revert triggered by user")
+
+	// Attempt the skip immediately. If it fails or this process dies, the durable
+	// request remains pending for the apply owner to retry.
+	resp, err := client.SkipRevert(ctx, &ternv1.SkipRevertRequest{
+		ApplyId:     ternApplyID,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "error")
+		s.logger.Warn("immediate skip-revert failed; durable request remains pending for apply owner retry",
+			append(apply.LogAttrs(), "error", err)...)
+		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
+	}
+	metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
+
+	if resp.Accepted {
+		if apply.Engine == storage.EnginePlanetScale {
+			if err := s.storage.Applies().SetRevertSkipped(ctx, apply.ID, time.Now()); err != nil {
+				s.logger.Error("failed to record skip-revert on apply", append(apply.LogAttrs(), "error", err)...)
+			}
+		}
+		// The engine accepted the skip; the durable request's work is done.
+		if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationSkipRevert); err != nil {
+			s.logger.Warn("failed to complete skip-revert control request after immediate success; operator will reconcile",
+				append(apply.LogAttrs(), "error", err)...)
+		}
+	} else if err := controlStore.FailPending(ctx, apply.ID, storage.ControlOperationSkipRevert, resp.ErrorMessage); err != nil {
+		s.logger.Warn("failed to fail rejected skip-revert control request",
+			append(apply.LogAttrs(), "error", err)...)
+	}
+	s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+
+	return &apitypes.ControlResponse{Accepted: resp.Accepted, ErrorMessage: resp.ErrorMessage}, http.StatusOK, nil
 }
 
 // RollbackPlanRequest is the HTTP request body for POST /api/rollback/plan.

@@ -552,6 +552,15 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
+	case state.Apply.SkippingRevert:
+		bar := ui.ProgressBarWaitingCutover() // yellow — complete, revert window closing
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ✓ Complete (finalizing)\n", t.TableName, bar)
+		if t.DDL != "" {
+			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		b.WriteString("\n")
+		b.WriteString(FormatShardProgress(t.Shards))
+		return b.String()
 	case state.Apply.Cancelled:
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
 			cancelledPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
@@ -728,6 +737,30 @@ func WriteStopSuccess(data StopData) {
 	} else {
 		fmt.Printf("%sCheckpoint saved. Use 'schemabot start' to resume from where you left off.%s\n", ANSIDim, ANSIReset)
 	}
+}
+
+// CancelData contains data for rendering cancel command output.
+type CancelData struct {
+	Database       string
+	Environment    string
+	CancelledCount int
+	SkippedCount   int
+}
+
+// WriteCancelSuccess writes the cancel command success output.
+func WriteCancelSuccess(data CancelData) {
+	fmt.Printf("%s%s✖ Schema change cancelled%s\n", ANSIBold, ANSIRed, ANSIReset)
+	fmt.Println()
+	fmt.Printf("Database:    %s\n", data.Database)
+	fmt.Printf("Environment: %s\n", data.Environment)
+	if data.CancelledCount > 0 {
+		fmt.Printf("Cancelled:   %d table(s)\n", data.CancelledCount)
+	}
+	if data.SkippedCount > 0 {
+		fmt.Printf("Skipped:     %d table(s) (already terminal)\n", data.SkippedCount)
+	}
+	fmt.Println()
+	fmt.Printf("%sThis schema change cannot be resumed.%s\n", ANSIDim, ANSIReset)
 }
 
 // StartData contains data for rendering start command output.
@@ -1196,6 +1229,8 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSIRed)
 	case state.Apply.RevertWindow:
 		return colorWrap(ANSIYellow)
+	case state.Apply.SkippingRevert:
+		return colorWrap(ANSICyan)
 	default:
 		return nil
 	}

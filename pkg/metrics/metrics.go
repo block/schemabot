@@ -640,6 +640,7 @@ var knownWebhookEvents = map[string]bool{
 	"pull_request_review":         true,
 	"pull_request_review_comment": true,
 	"check_run":                   true,
+	"merge_group":                 true,
 	"ping":                        true,
 	"push":                        true,
 }
@@ -649,6 +650,7 @@ var knownWebhookActions = map[string]bool{
 	"assigned":               true,
 	"auto_merge_disabled":    true,
 	"auto_merge_enabled":     true,
+	"checks_requested":       true,
 	"closed":                 true,
 	"completed":              true,
 	"converted_to_draft":     true,
@@ -656,6 +658,7 @@ var knownWebhookActions = map[string]bool{
 	"deleted":                true,
 	"demilestoned":           true,
 	"dequeued":               true,
+	"destroyed":              true,
 	"dismissed":              true,
 	"edited":                 true,
 	"enqueued":               true,
@@ -1028,6 +1031,7 @@ var knownStatusCheckOperations = map[string]bool{
 	"schema_config_discovery":              true,
 	"schema_config_source_policy":          true,
 	"schema_config_environment_validation": true,
+	"managed_dir_missing_config":           true,
 }
 
 var knownStatusCheckStatuses = map[string]bool{

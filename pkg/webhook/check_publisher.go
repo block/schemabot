@@ -282,8 +282,6 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 		return
 	}
 
-	config := h.service.Config()
-	checkNameBase := h.aggregateCheckNameForRepo(repo)
 	storedChecks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
 	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -295,25 +293,7 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 		return
 	}
 
-	type envCheck struct {
-		name        string
-		environment string
-	}
-
-	var checks []envCheck
-	if len(config.AllowedEnvironments) > 0 {
-		for _, env := range config.AllowedEnvironments {
-			checks = append(checks, envCheck{
-				name:        aggregateCheckNameForEnv(checkNameBase, env),
-				environment: env,
-			})
-		}
-	} else {
-		checks = append(checks, envCheck{
-			name:        checkNameBase,
-			environment: aggregateSentinel,
-		})
-	}
+	checks := h.aggregateCheckTargetsForRepo(repo)
 
 	h.logger.Debug("posting passing aggregates", "repo", repo, "pr", pr, "head_sha", headSHA, "count", len(checks))
 

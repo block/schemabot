@@ -154,6 +154,26 @@ func (c *ServerConfig) SchemaPathAllowedForRepo(repo, schemaPath string) bool {
 	return false
 }
 
+// DatabaseForSchemaPath returns the name of the database whose allowed_dirs
+// covers schemaPath for a repository permitted to manage it, and whether one was
+// found. It is the inverse of the source-policy authorization check: given a
+// schema file with no in-repo config, it answers "which managed database owns
+// this directory" so operators get a precise message.
+func (c *ServerConfig) DatabaseForSchemaPath(repo, schemaPath string) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	for name, dbConfig := range c.Databases {
+		if len(dbConfig.AllowedDirs) == 0 || !databaseAllowsRepo(dbConfig, repo) {
+			continue
+		}
+		if schemaPathAllowed(dbConfig.AllowedDirs, schemaPath) {
+			return name, true
+		}
+	}
+	return "", false
+}
+
 func (d DatabaseConfig) hasSourcePolicy() bool {
 	return len(d.AllowedRepos) > 0 || len(d.AllowedDirs) > 0
 }

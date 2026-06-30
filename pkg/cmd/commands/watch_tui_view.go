@@ -161,9 +161,9 @@ func (m WatchModel) progressView() string {
 		b.WriteString("\n\n")
 		b.WriteString("🚫 Schema change cancelled.\n")
 		b.WriteString("The deploy request has been cancelled. Start a new apply to retry.\n")
-	case state.IsState(m.state, state.Apply.RevertWindow):
+	case state.IsState(m.state, state.Apply.RevertWindow, state.Apply.SkippingRevert):
 		b.WriteString("\n\n")
-		if m.skipRevertTriggered || (m.metadata != nil && m.metadata["revert_skipped"] == "true") {
+		if state.IsState(m.state, state.Apply.SkippingRevert) || m.skipRevertTriggered || (m.metadata != nil && m.metadata["revert_skipped"] == "true") {
 			elapsed := ""
 			if !m.skipRevertAt.IsZero() {
 				elapsed = fmt.Sprintf(" (%ds)", int(time.Since(m.skipRevertAt).Seconds()))

@@ -84,6 +84,18 @@ var configDiscoveryFailedBlock = checkBlockReason{
 	message:        "SchemaBot failed this check closed because it could not determine the managed schema configuration for this PR. Review the SchemaBot configuration and retry the check.",
 }
 
+// managedDirMissingConfigBlock is used when a PR changes schema files under a
+// directory the server config manages (databases.<db>.allowed_dirs) but no
+// schemabot.yaml resolves for them — for example because the PR removed the
+// config while keeping schema changes. The aggregate fails closed so dropping
+// the config cannot silently unmanage a server-owned schema directory; the
+// per-environment message naming the directories and databases is built at the
+// call site.
+var managedDirMissingConfigBlock = checkBlockReason{
+	blockingReason: "managed_dir_missing_config",
+	message:        "A schema change under a SchemaBot-managed directory has no schemabot.yaml config.",
+}
+
 // noAllowedConfiguredEnvironmentsBlock is used when schema files changed but
 // the server-configured environments for the database do not overlap this
 // service's allowed_environments. SchemaBot cannot safely plan the schema

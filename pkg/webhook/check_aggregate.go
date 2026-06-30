@@ -38,6 +38,34 @@ func (h *Handler) aggregateCheckNameForRepo(repo string) string {
 	return config.GitHubCheckNameBaseForRepo(repo)
 }
 
+// aggregateCheckTarget pairs an aggregate Check Run name with the environment
+// it represents (aggregateSentinel when this instance is not environment-scoped).
+type aggregateCheckTarget struct {
+	name        string
+	environment string
+}
+
+// aggregateCheckTargetsForRepo returns the aggregate Check Run name(s) this
+// instance publishes for repo: one per allowed environment, or a single
+// non-environment-scoped name when AllowedEnvironments is empty. Callers that
+// publish aggregates on any commit (PR head or merge-group head) must use these
+// names so branch protection's required-check names always match.
+func (h *Handler) aggregateCheckTargetsForRepo(repo string) []aggregateCheckTarget {
+	base := h.aggregateCheckNameForRepo(repo)
+	config, ok := h.serverConfig()
+	if !ok || len(config.AllowedEnvironments) == 0 {
+		return []aggregateCheckTarget{{name: base, environment: aggregateSentinel}}
+	}
+	targets := make([]aggregateCheckTarget, 0, len(config.AllowedEnvironments))
+	for _, env := range config.AllowedEnvironments {
+		targets = append(targets, aggregateCheckTarget{
+			name:        aggregateCheckNameForEnv(base, env),
+			environment: env,
+		})
+	}
+	return targets
+}
+
 func (h *Handler) configuredDatabaseEnvironments(database string) ([]string, error) {
 	config, ok := h.serverConfig()
 	if !ok {

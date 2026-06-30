@@ -1087,6 +1087,35 @@ func PreviewCommentApplyCuttingOver() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.CuttingOver, tables))
 }
 
+// PreviewCommentApplyRevertWindow renders a PlanetScale apply in its revert
+// window: the change is deployed but still revertable, with a countdown to when
+// it becomes permanent and the revert / skip-revert actions.
+func PreviewCommentApplyRevertWindow() string {
+	tables := sampleApplyTables()
+	for i := range tables {
+		tables[i].Status = state.Task.RevertWindow
+	}
+	data := sampleApplyData(state.Apply.RevertWindow, tables)
+	data.Engine = "PlanetScale"
+	data.DeployRequestURL = "https://app.planetscale.com/acme/myapp/deploy-requests/42"
+	data.RevertExpiresAt = NowFunc().Add(28*time.Minute + 30*time.Second).UTC().Format(time.RFC3339)
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplySkippingRevert renders a PlanetScale apply after skip-revert
+// was requested: the revert window is closing and the change is being made
+// permanent, so no revert / skip-revert actions are offered.
+func PreviewCommentApplySkippingRevert() string {
+	tables := sampleApplyTables()
+	for i := range tables {
+		tables[i].Status = state.Task.RevertWindow
+	}
+	data := sampleApplyData(state.Apply.SkippingRevert, tables)
+	data.Engine = "PlanetScale"
+	data.DeployRequestURL = "https://app.planetscale.com/acme/myapp/deploy-requests/42"
+	return RenderApplyStatusComment(data)
+}
+
 // =============================================================================
 // Multi-Deployment Apply Previews (MD-10)
 // =============================================================================

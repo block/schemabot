@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -74,6 +75,12 @@ type ApplyStatusCommentData struct {
 	// request's own progress, which the comment does not otherwise surface. Empty
 	// for engines without a deploy request or before one is created.
 	DeployRequestURL string
+
+	// RevertExpiresAt is the RFC3339 deadline when the revert window closes
+	// (PlanetScale only). When set and the apply is in its revert window, the
+	// comment shows the time remaining before the change becomes permanent.
+	// Empty outside the revert window or for engines without one.
+	RevertExpiresAt string
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -96,6 +103,12 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	// Deploy-request link (PlanetScale) — the operator's entry point into the
 	// deploy request's own progress, which the comment does not otherwise surface.
 	writeDeployRequestLink(&sb, data)
+
+	// Revert-window countdown (PlanetScale) — how long until the change becomes
+	// permanent, so the operator knows the window to revert or skip.
+	if state.IsState(data.State, state.Apply.RevertWindow) {
+		writeRevertWindowDeadline(&sb, data.RevertExpiresAt)
+	}
 
 	// Cutover readiness summary
 	if data.State == state.Apply.WaitingForCutover || data.State == state.Apply.CuttingOver {
@@ -156,6 +169,8 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 		writeEnvironmentTitle(sb, "Schema Change In Progress", data.Environment)
 	case state.Apply.RevertWindow:
 		writeEnvironmentTitle(sb, "Schema Change Applied (Pending Revert)", data.Environment)
+	case state.Apply.SkippingRevert:
+		writeEnvironmentTitle(sb, "Skipping Revert — Finalizing", data.Environment)
 	case state.Apply.Completed:
 		writeEnvironmentTitle(sb, "✅ Schema Change Applied", data.Environment)
 	case state.Apply.Failed:
@@ -261,6 +276,42 @@ func writeDeployRequestLink(sb *strings.Builder, data ApplyStatusCommentData) {
 		return
 	}
 	fmt.Fprintf(sb, "\n🔗 **Deploy request**: %s\n", data.DeployRequestURL)
+}
+
+func stopOrCancelCommand(data ApplyStatusCommentData) string {
+	if strings.EqualFold(data.Engine, storage.EnginePlanetScale) {
+		return "cancel"
+	}
+	return "stop"
+}
+
+func writeStopOrCancelFooterAction(sb *strings.Builder, data ApplyStatusCommentData, stopPrefix, cancelPrefix string) {
+	command := stopOrCancelCommand(data)
+	prefix := stopPrefix
+	if command == "cancel" {
+		prefix = cancelPrefix
+	}
+	writeFooterAction(sb, prefix, fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment))
+}
+
+// writeRevertWindowDeadline writes the time remaining before the revert window
+// closes, when a deadline is known and still in the future. An unset or
+// past-due deadline renders nothing so the comment never shows a stale or
+// negative countdown.
+func writeRevertWindowDeadline(sb *strings.Builder, revertExpiresAt string) {
+	if revertExpiresAt == "" {
+		return
+	}
+	expires, err := time.Parse(time.RFC3339, revertExpiresAt)
+	if err != nil {
+		return
+	}
+	// NowFunc (not time.Now) so previews and tests render a deterministic countdown.
+	remaining := expires.Sub(NowFunc())
+	if remaining <= 0 {
+		return
+	}
+	fmt.Fprintf(sb, "\n⏳ **Revert window closes in**: %s\n", formatDuration(remaining))
 }
 
 // writeCutoverSummary writes a readiness summary for cutover states,
@@ -795,18 +846,17 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Cutover in progress — typically completes within seconds.\n")
 	case state.Apply.Running, state.Apply.RunningDegraded:
-		writeFooterAction(sb, "To stop this schema change:", fmt.Sprintf("schemabot stop %s -e %s", data.ApplyID, data.Environment))
+		writeStopOrCancelFooterAction(sb, data, "To stop this schema change:", "To cancel this schema change:")
 	case state.Apply.PreparingBranch,
 		state.Apply.ApplyingBranchChanges,
 		state.Apply.ValidatingBranch,
 		state.Apply.CreatingDeployRequest,
 		state.Apply.ValidatingDeployRequest:
-		// PlanetScale's branch and deploy-request phases are active, stoppable
-		// work — the operator can halt the change before cutover just as during
-		// row copy.
-		writeFooterAction(sb, "To stop this schema change:", fmt.Sprintf("schemabot stop %s -e %s", data.ApplyID, data.Environment))
+		writeStopOrCancelFooterAction(sb, data, "To stop this schema change:", "To cancel this schema change:")
 	case state.Apply.FailedRetryable:
-		writeFooterAction(sb, "An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:", fmt.Sprintf("schemabot stop %s -e %s", data.ApplyID, data.Environment))
+		writeStopOrCancelFooterAction(sb, data,
+			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:",
+			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To cancel it:")
 	case state.Apply.Stopped:
 		writeFooterAction(sb, "Paused — to resume from where it stopped:", fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment))
 	case state.Apply.Cancelled:
@@ -817,6 +867,9 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.RevertWindow:
 		writeFooterAction(sb, "To revert:", fmt.Sprintf("schemabot revert %s -e %s", data.ApplyID, data.Environment))
 		fmt.Fprintf(sb, "\nTo skip revert and keep changes:\n```\nschemabot skip-revert %s -e %s\n```\n", data.ApplyID, data.Environment)
+	case state.Apply.SkippingRevert:
+		sb.WriteString("\n---\n\n")
+		sb.WriteString("Skip-revert was requested — closing the revert window and making this schema change permanent. This can no longer be reverted.\n")
 	}
 }
 
@@ -1258,6 +1311,7 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 		StartedAt:    resp.StartedAt,
 		CompletedAt:  resp.CompletedAt,
 	}
+	data.RevertExpiresAt = resp.Metadata["revert_expires_at"]
 
 	if changes, err := apitypes.ParseVSchemaChanges(resp.Metadata); err != nil {
 		slog.Warn("failed to parse VSchema changes from progress metadata", "apply_id", resp.ApplyID, "error", err)

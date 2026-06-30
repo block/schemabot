@@ -583,7 +583,11 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	ps := &atomicPollState{lastProgressLog: time.Now()}
+	// Seed revertSkipped from the durable signal so a driver that picks this apply
+	// up after a restart treats skip-revert as already accepted: it won't re-attempt
+	// SkipRevert, and it keeps surfacing skipping_revert while finalization is in
+	// flight rather than falling back to revert_window.
+	ps := &atomicPollState{lastProgressLog: time.Now(), revertSkipped: apply.RevertSkippedAt != nil}
 
 	for {
 		select {
@@ -670,6 +674,20 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// updated metadata like deploy request URL or migration context).
 	if result.ResumeState != nil && resumeState != nil {
 		*resumeState = *result.ResumeState
+		// Persist the revert-window deadline so the PR comment and CLI can show
+		// time remaining. revertWindowDeadline derives it from the engine's
+		// deployed_at plus the configured window; merge it in key-preserving so
+		// engine fields the storage struct does not model survive the rewrite.
+		if result.State == engine.StateRevertWindow {
+			if deadline := c.revertWindowDeadline(result.ResumeState, ps.stateEnteredAt); !deadline.IsZero() {
+				if merged, err := setRevertExpiresAtMetadata(resumeState.Metadata, deadline); err != nil {
+					c.logger.Warn("failed to stamp revert_expires_at into resume metadata; comment will omit revert deadline",
+						append(apply.LogAttrs(), "error", err)...)
+				} else {
+					resumeState.Metadata = merged
+				}
+			}
+		}
 		if c.config.Type == storage.DatabaseTypeVitess {
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, resumeState); saveErr != nil {
 				c.logger.Error("failed to save Vitess engine resume state from progress polling",
@@ -782,8 +800,32 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			c.markRevertSkipped(ctx, apply)
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
-			"Skip-revert triggered (--skip-revert)", state.Apply.RevertWindow, "")
+			"Skip-revert triggered (--skip-revert)", state.Apply.RevertWindow, state.Apply.SkippingRevert)
 		ps.revertSkipped = true
+	}
+
+	// A durable skip-revert control request (the interactive "skip now" command,
+	// vs the upfront --skip-revert flag above) was queued; honor it. This is the
+	// apply owner's retry path: the API's immediate skip attempt may have failed
+	// or its process may have died, leaving the request pending for the drive.
+	if result.State == engine.StateRevertWindow && !ps.revertSkipped {
+		if pending, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationSkipRevert); err != nil {
+			c.logger.Warn("could not load pending skip-revert control request", "apply_id", apply.ApplyIdentifier, "error", err)
+		} else if pending != nil {
+			c.logger.Info("skip-revert requested by user; closing revert window", "apply_id", apply.ApplyIdentifier, "requested_by", controlRequestCaller(pending))
+			if _, err := eng.SkipRevert(ctx, controlReq); err != nil {
+				// Leave the request pending so the next drive tick retries.
+				c.logger.Error("skip-revert (control request) failed; will retry", "error", err, "apply_id", apply.ApplyIdentifier)
+			} else {
+				c.markRevertSkipped(ctx, apply)
+				ps.revertSkipped = true
+				if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationSkipRevert); err != nil {
+					c.logger.Warn("failed to complete skip-revert control request", "apply_id", apply.ApplyIdentifier, "error", err)
+				}
+				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
+					fmt.Sprintf("Skip-revert triggered by user%s", callerApplyLogSuffix(controlRequestCaller(pending))), state.Apply.RevertWindow, state.Apply.SkippingRevert)
+			}
+		}
 	}
 
 	// Revert window enabled (default): auto-skip based on deployed_at + configured duration.
@@ -799,7 +841,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			} else {
 				c.markRevertSkipped(ctx, apply)
 				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
-					"Revert window expired, skip-revert triggered", state.Apply.RevertWindow, "")
+					"Revert window expired, skip-revert triggered", state.Apply.RevertWindow, state.Apply.SkippingRevert)
 			}
 			ps.revertSkipped = true
 		}
@@ -844,6 +886,15 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		apply.State = state.DeriveApplyState([]string{newState})
 	} else if derived, ok := c.deriveAggregateApplyState(ctx, apply, tasks); ok {
 		apply.State = derived
+	}
+	// Once skip-revert has been accepted, PlanetScale keeps reporting
+	// complete_pending_revert (which derives to revert_window) until it finishes
+	// discarding the staged revert. Surface that finalization as skipping_revert so
+	// the comment and CLI stop offering a resumable revert window and show that the
+	// change is being made permanent. It clears on its own: when the engine reports
+	// complete the aggregate derives completed and this override no longer applies.
+	if ps.revertSkipped && state.IsState(apply.State, state.Apply.RevertWindow) {
+		apply.State = state.Apply.SkippingRevert
 	}
 	apply.UpdatedAt = now
 	freshApply, err := c.storage.Applies().Get(ctx, apply.ID)
