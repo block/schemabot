@@ -63,13 +63,8 @@ func (a MySQLConnectionAssembler) Assemble(host string, _ map[string]string, cre
 	if creds == nil {
 		return "", nil, fmt.Errorf("mysql connection requires credentials")
 	}
-	// Append the default port only when the host has none. net.SplitHostPort
-	// errors when no port is present, including for bare IPv6 addresses; in that
-	// case net.JoinHostPort adds the required brackets.
 	if a.DefaultPort != "" {
-		if _, _, err := net.SplitHostPort(host); err != nil {
-			host = net.JoinHostPort(host, a.DefaultPort)
-		}
+		host = hostWithDefaultPort(host, a.DefaultPort)
 	}
 	cfg := mysql.NewConfig()
 	cfg.User = creds.Username
@@ -80,6 +75,32 @@ func (a MySQLConnectionAssembler) Assemble(host string, _ map[string]string, cre
 		cfg.Params = maps.Clone(a.Params)
 	}
 	return cfg.FormatDSN(), maps.Clone(a.Metadata), nil
+}
+
+// hostWithDefaultPort returns host with defaultPort appended when host carries
+// no port, and host unchanged when it already specifies one. It is robust to
+// every form a resolved endpoint may take:
+//
+//   - "host" / "1.2.3.4"        -> "host:port"        (bare host gains the port)
+//   - "host:3306"               -> "host:3306"        (existing port preserved)
+//   - "host:"                   -> "host:port"        (empty port filled in)
+//   - "2001:db8::1"             -> "[2001:db8::1]:port" (bare IPv6 bracketed)
+//   - "[2001:db8::1]"           -> "[2001:db8::1]:port" (bracketed IPv6 gains port)
+//   - "[2001:db8::1]:3306"      -> "[2001:db8::1]:3306" (existing port preserved)
+//
+// net.SplitHostPort succeeds with an empty port for a trailing colon, and a
+// bracketed IPv6 literal with no port already carries the brackets that
+// net.JoinHostPort would add again — so the raw host must be unwrapped before
+// rejoining to avoid a double-bracketed, undialable address.
+func hostWithDefaultPort(host, defaultPort string) string {
+	if h, port, err := net.SplitHostPort(host); err == nil {
+		if port != "" {
+			return host
+		}
+		return net.JoinHostPort(h, defaultPort)
+	}
+	bare := strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	return net.JoinHostPort(bare, defaultPort)
 }
 
 // Metadata keys the Vitess (PlanetScale) engine reads from a resolved Target.

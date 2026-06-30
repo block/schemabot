@@ -66,6 +66,30 @@ func TestMySQLConnectionAssemblerKeepsBracketedIPv6Port(t *testing.T) {
 	assert.Equal(t, "[2001:db8::1]:3307", cfg.Addr)
 }
 
+// A bracketed IPv6 literal with no port already carries the brackets; the
+// default port must be appended without bracketing a second time.
+func TestMySQLConnectionAssemblerAppendsPortToBracketedIPv6WithoutPort(t *testing.T) {
+	a := MySQLConnectionAssembler{DefaultPort: "3306"}
+
+	dsn, _, err := a.Assemble("[2001:db8::1]", nil, &Credentials{Username: "ddl", Password: "secret"})
+	require.NoError(t, err)
+	cfg, err := mysql.ParseDSN(dsn)
+	require.NoError(t, err)
+	assert.Equal(t, "[2001:db8::1]:3306", cfg.Addr)
+}
+
+// A host with a trailing colon parses with an empty port; the default port
+// fills it in rather than leaving an undialable address.
+func TestMySQLConnectionAssemblerFillsEmptyPort(t *testing.T) {
+	a := MySQLConnectionAssembler{DefaultPort: "3306"}
+
+	dsn, _, err := a.Assemble("orders.example:", nil, &Credentials{Username: "ddl", Password: "secret"})
+	require.NoError(t, err)
+	cfg, err := mysql.ParseDSN(dsn)
+	require.NoError(t, err)
+	assert.Equal(t, "orders.example:3306", cfg.Addr)
+}
+
 func TestMySQLConnectionAssemblerRequiresHost(t *testing.T) {
 	_, _, err := MySQLConnectionAssembler{}.Assemble("", nil, &Credentials{Username: "ddl", Password: "secret"})
 	require.Error(t, err)
