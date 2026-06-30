@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 )
 
 // tenantStateVersion is the schema version of the machine-readable tenant-state
@@ -41,9 +42,15 @@ type TenantDatabaseState struct {
 // authenticated RPC channel later).
 type TenantState struct {
 	Tenant string `json:"tenant"`
-	SHA    string `json:"sha"`
-	// Rollup is the tenant's overall state for the head SHA, folded from its
-	// databases. The leader maps it to the aggregate check conclusion.
+	// Environment scopes this block to one environment. A deployment may manage
+	// several environments (AllowedEnvironments), and the aggregate check is
+	// per-environment, so state is keyed by (tenant, environment): a tenant
+	// publishes one block per environment it participates in, and each
+	// environment's leader folds only the blocks for its own environment.
+	Environment string `json:"environment"`
+	SHA         string `json:"sha"`
+	// Rollup is the tenant's overall state for this environment at the head SHA,
+	// folded from its databases. The leader maps it to the check conclusion.
 	Rollup    string                `json:"rollup"`
 	Databases []TenantDatabaseState `json:"databases,omitempty"`
 }
@@ -84,11 +91,46 @@ func parseTenantStateBlock(commentBody string) (state TenantState, found bool, e
 		return TenantState{}, false, nil
 	}
 	version, convErr := strconv.Atoi(match[1])
-	if convErr != nil || version != tenantStateVersion {
-		return TenantState{}, true, fmt.Errorf("unsupported tenant-state block version %q (want %d)", match[1], tenantStateVersion)
+	if convErr != nil {
+		return TenantState{}, true, fmt.Errorf("malformed tenant-state block version %q: %w", match[1], convErr)
+	}
+	if version != tenantStateVersion {
+		return TenantState{}, true, fmt.Errorf("unsupported tenant-state block version %d (want %d)", version, tenantStateVersion)
 	}
 	if err := json.Unmarshal([]byte(match[2]), &state); err != nil {
 		return TenantState{}, true, fmt.Errorf("parse tenant-state block: %w", err)
 	}
+	if err := state.validate(); err != nil {
+		return TenantState{}, true, fmt.Errorf("invalid tenant-state block: %w", err)
+	}
 	return state, true, nil
+}
+
+// validate reports whether a parsed TenantState carries the fields a reader
+// requires to trust it. A syntactically valid but semantically empty block
+// (missing tenant, sha, rollup, or a database row missing its name or state)
+// must be rejected so a reader fails closed rather than treating it as a real
+// report.
+func (s TenantState) validate() error {
+	if strings.TrimSpace(s.Tenant) == "" {
+		return fmt.Errorf("missing tenant")
+	}
+	if strings.TrimSpace(s.Environment) == "" {
+		return fmt.Errorf("missing environment")
+	}
+	if strings.TrimSpace(s.SHA) == "" {
+		return fmt.Errorf("missing sha")
+	}
+	if strings.TrimSpace(s.Rollup) == "" {
+		return fmt.Errorf("missing rollup")
+	}
+	for i, db := range s.Databases {
+		if strings.TrimSpace(db.Database) == "" {
+			return fmt.Errorf("databases[%d] missing db", i)
+		}
+		if strings.TrimSpace(db.State) == "" {
+			return fmt.Errorf("databases[%d] (%s) missing state", i, db.Database)
+		}
+	}
+	return nil
 }
