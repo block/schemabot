@@ -50,15 +50,16 @@ const defaultAppName = "default"
 //	                                                       naming for Apps)
 //	X-GitHub-Hook-Installation-Target-ID:   <app_id>
 //
-// The Target-Type value "repository" is only sent for repository-level
-// webhooks (registered directly on a repo, distinct from App-installed
-// webhooks); SchemaBot does not handle those. The single example in
-// https://docs.github.com/en/webhooks/webhook-events-and-payloads
-// happens to be a repository webhook, which is a known source of
-// confusion. Verified against a live SchemaBot App delivery: header
-// values were Target-Type "integration" and Target-ID equal to the
-// SchemaBot App ID — i.e., never the repository ID, regardless of the
-// underlying event type.
+// The Target-Type value "repository" is sent for repository-level webhooks
+// (registered directly on a repo, distinct from App-installed webhooks).
+// SchemaBot handles those only in the opt-in repo-webhook dispatch mode
+// (when repoWebhookSecret is set); otherwise they are rejected. The single
+// example in https://docs.github.com/en/webhooks/webhook-events-and-payloads
+// happens to be a repository webhook, which is a known source of confusion.
+// Verified against a live SchemaBot App delivery: for App-installed
+// deliveries the header values were Target-Type "integration" and Target-ID
+// equal to the SchemaBot App ID — i.e., never the repository ID, regardless
+// of the underlying event type.
 const (
 	headerHookTargetID   = "X-GitHub-Hook-Installation-Target-ID"
 	headerHookTargetType = "X-GitHub-Hook-Installation-Target-Type"
