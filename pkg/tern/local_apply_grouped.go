@@ -8,8 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
@@ -1200,7 +1198,7 @@ func (c *LocalClient) writeShardProgress(ctx context.Context, table *storage.Tas
 	}
 	for _, sh := range tp.Shards {
 		shardTask := &storage.Task{
-			TaskIdentifier:   "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16],
+			TaskIdentifier:   newTaskIdentifier(),
 			ApplyID:          table.ApplyID,
 			ApplyOperationID: table.ApplyOperationID,
 			PlanID:           table.PlanID,

@@ -677,6 +677,8 @@ type mockTaskStore struct {
 	getByOperationIDErr error
 	updateErr           error
 	lastOperationID     int64
+	upsertedShards      []*storage.Task
+	upsertShardErr      error
 }
 
 func (m *mockTaskStore) GetByApplyID(context.Context, int64) ([]*storage.Task, error) {
@@ -694,6 +696,15 @@ func (m *mockTaskStore) GetByApplyOperationID(_ context.Context, applyOperationI
 	return m.tasks, nil
 }
 func (m *mockTaskStore) Update(context.Context, *storage.Task) error { return m.updateErr }
+
+func (m *mockTaskStore) UpsertShardProgress(_ context.Context, task *storage.Task) error {
+	if m.upsertShardErr != nil {
+		return m.upsertShardErr
+	}
+	stored := *task
+	m.upsertedShards = append(m.upsertedShards, &stored)
+	return nil
+}
 
 type mockApplyLogStore struct {
 	storage.ApplyLogStore
@@ -3225,6 +3236,73 @@ func TestGRPCClient_SyncStoredTasksFromRemoteTasksUsesRemoteTaskState(t *testing
 			assert.True(t, hasLogMessageContaining(logs.logs, "Remote task users changed state: running -> "+tc.wantStoredTaskState))
 		})
 	}
+}
+
+func TestGRPCClient_SyncShardProgressFromRemote(t *testing.T) {
+	// A remote Tern Progress response carries per-shard ShardProgress. The control
+	// plane is a reader/mirror, so it must encode those into per-(table, shard) task
+	// rows in its own storage — otherwise the PR comment / CLI can never show the
+	// per-shard breakdown or shard drift for a remote apply. Writing is lease-gated:
+	// the operator's drive holds the lease, read-path callers do not.
+	now := time.Now()
+	opID := int64(7)
+	apply := &storage.Apply{ID: 40, ApplyIdentifier: "apply-shard-sync", State: state.Apply.Running}
+	newStoredTask := func() *storage.Task {
+		return &storage.Task{
+			ID: 41, TaskIdentifier: "task-shard-sync", ApplyID: apply.ID,
+			ApplyOperationID: &opID, Namespace: "commerce_sharded", TableName: "customers",
+			State: state.Task.Running,
+		}
+	}
+	remoteTables := func() []*ternv1.TableProgress {
+		return []*ternv1.TableProgress{{
+			Namespace:  "commerce_sharded",
+			TableName:  "customers",
+			Status:     state.Task.Running,
+			RowsCopied: 150,
+			RowsTotal:  300,
+			Shards: []*ternv1.ShardProgress{
+				{Shard: "-80", Status: state.Task.Running, RowsCopied: 100, RowsTotal: 100},
+				{Shard: "80-", Status: state.Task.Running, RowsCopied: 50, RowsTotal: 200},
+			},
+		}}
+	}
+
+	t.Run("encodes per-shard rows under a lease", func(t *testing.T) {
+		storedTask := newStoredTask()
+		tasks := &mockTaskStore{tasks: []*storage.Task{storedTask}}
+		client := &GRPCClient{storage: &mockStorage{tasks: tasks, logs: &mockApplyLogStore{}}}
+		ctx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: apply.ID, Token: "lease-tok"})
+
+		require.NoError(t, client.syncStoredTasksFromRemoteTasks(ctx, apply, []*storage.Task{storedTask}, remoteTables(), now))
+
+		require.Len(t, tasks.upsertedShards, 2)
+		byShard := map[string]*storage.Task{}
+		for _, s := range tasks.upsertedShards {
+			byShard[s.Shard] = s
+		}
+		require.Contains(t, byShard, "-80")
+		require.Contains(t, byShard, "80-")
+		// Identity carried from the table task; rows/percent from the shard.
+		assert.Equal(t, apply.ID, byShard["-80"].ApplyID)
+		require.NotNil(t, byShard["-80"].ApplyOperationID)
+		assert.Equal(t, opID, *byShard["-80"].ApplyOperationID)
+		assert.Equal(t, "commerce_sharded", byShard["-80"].Namespace)
+		assert.Equal(t, "customers", byShard["-80"].TableName)
+		assert.Equal(t, int64(100), byShard["-80"].RowsCopied)
+		assert.Equal(t, 100, byShard["-80"].ProgressPercent) // 100/100
+		assert.Equal(t, 25, byShard["80-"].ProgressPercent)  // 50/200
+	})
+
+	t.Run("skips when no lease is on the context", func(t *testing.T) {
+		storedTask := newStoredTask()
+		tasks := &mockTaskStore{tasks: []*storage.Task{storedTask}}
+		client := &GRPCClient{storage: &mockStorage{tasks: tasks, logs: &mockApplyLogStore{}}}
+
+		require.NoError(t, client.syncStoredTasksFromRemoteTasks(t.Context(), apply, []*storage.Task{storedTask}, remoteTables(), now))
+
+		assert.Empty(t, tasks.upsertedShards, "no per-shard rows should be written without a lease")
+	})
 }
 
 func TestGRPCClient_SyncRemoteProgressByNamespace(t *testing.T) {

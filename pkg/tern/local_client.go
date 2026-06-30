@@ -1673,6 +1673,11 @@ func (c *LocalClient) existingIdempotentApply(ctx context.Context, req *ternv1.A
 	return existing, nil
 }
 
+// newTaskIdentifier returns a fresh opaque task identifier (`task-<16 hex>`).
+func newTaskIdentifier() string {
+	return "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+}
+
 // Apply executes a previously generated plan.
 // In local mode, Apply has additional conflict checking and polls for completion.
 //
@@ -1852,7 +1857,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 
 	tasks := make([]*storage.Task, len(ddlChanges))
 	for i, ddlChange := range ddlChanges {
-		taskIdentifier := "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+		taskIdentifier := newTaskIdentifier()
 		tasks[i] = &storage.Task{
 			TaskIdentifier: taskIdentifier,
 			PlanID:         plan.ID,
