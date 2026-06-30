@@ -501,6 +501,41 @@ func (ic *InstallationClient) EditIssueComment(ctx context.Context, repo string,
 	return nil
 }
 
+// IssueComment is a PR/issue comment as read by SchemaBot. AuthorLogin is the
+// GitHub-stamped author of the comment; later trust checks use it to confirm a
+// tenant-state comment was authored by SchemaBot's own App.
+type IssueComment struct {
+	ID          int64
+	Body        string
+	AuthorLogin string
+}
+
+// ListIssueComments returns every comment on a PR/issue, paginating through the
+// full set.
+func (ic *InstallationClient) ListIssueComments(ctx context.Context, repo string, pr int) ([]IssueComment, error) {
+	owner, repoName := splitRepo(repo)
+	opts := &gh.IssueListCommentsOptions{ListOptions: gh.ListOptions{PerPage: 100}}
+	var out []IssueComment
+	for {
+		comments, resp, err := ic.client.Issues.ListComments(ctx, owner, repoName, pr, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list issue comments for %s#%d: %w", repo, pr, err)
+		}
+		for _, c := range comments {
+			out = append(out, IssueComment{
+				ID:          c.GetID(),
+				Body:        c.GetBody(),
+				AuthorLogin: c.GetUser().GetLogin(),
+			})
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return out, nil
+}
+
 // AddReactionToComment adds a reaction emoji to a comment.
 func (ic *InstallationClient) AddReactionToComment(ctx context.Context, repo string, commentID int64, reaction string) error {
 	owner, repoName := splitRepo(repo)
