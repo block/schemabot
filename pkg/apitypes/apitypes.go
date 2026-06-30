@@ -410,6 +410,13 @@ type StartResponse struct {
 	StartedCount int64  `json:"started_count"`
 }
 
+// ReleaseResponse is the HTTP response for POST /api/release.
+type ReleaseResponse struct {
+	Accepted     bool   `json:"accepted"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	Status       string `json:"status,omitempty"`
+}
+
 // VolumeResponse is the HTTP response for POST /api/volume.
 type VolumeResponse struct {
 	Accepted       bool   `json:"accepted"`

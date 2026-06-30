@@ -328,6 +328,11 @@ func CallStartAPI(endpoint, environment, applyID string) (*apitypes.StartRespons
 	return callControlAPI[apitypes.StartResponse](endpoint, "/api/start", environment, applyID)
 }
 
+// CallReleaseAPI calls the release API and returns the typed result.
+func CallReleaseAPI(endpoint, environment, applyID string) (*apitypes.ReleaseResponse, error) {
+	return callControlAPI[apitypes.ReleaseResponse](endpoint, "/api/release", environment, applyID)
+}
+
 // CallVolumeAPI calls the volume API and returns the typed result.
 func CallVolumeAPI(endpoint, environment, applyID string, volume int) (*apitypes.VolumeResponse, error) {
 	req := apitypes.VolumeRequest{Environment: environment, Volume: int32(volume), ApplyID: applyID}

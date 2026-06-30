@@ -21,6 +21,7 @@ func TestCommandSpecs_CoverEveryDispatcherAction(t *testing.T) {
 		action.Stop,
 		action.Cancel,
 		action.Start,
+		action.Release,
 		action.Revert,
 		action.SkipRevert,
 		action.Cutover,
@@ -61,6 +62,7 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 		{name: action.Stop, requiresEnv: true, hasApplyID: true},
 		{name: action.Cancel, requiresEnv: true, hasApplyID: true},
 		{name: action.Start, requiresEnv: true, hasApplyID: true},
+		{name: action.Release, requiresEnv: true, hasApplyID: true},
 		{name: action.Revert, requiresEnv: true},
 		{name: action.SkipRevert, requiresEnv: true},
 		{name: action.Cutover, requiresEnv: true, hasApplyID: true},
@@ -469,6 +471,17 @@ func TestParseCommand(t *testing.T) {
 			body: "schemabot start apply_abc123 -e production",
 			expected: CommandResult{
 				Action:      "start",
+				ApplyID:     "apply_abc123",
+				Environment: "production",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "release",
+			body: "schemabot release apply_abc123 -e production",
+			expected: CommandResult{
+				Action:      "release",
 				ApplyID:     "apply_abc123",
 				Environment: "production",
 				Found:       true,

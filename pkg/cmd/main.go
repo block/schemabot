@@ -36,6 +36,7 @@ type CLI struct {
 	Stop       commands.StopCmd       `cmd:"" help:"Stop an in-progress schema change"`
 	Cancel     commands.CancelCmd     `cmd:"" help:"Cancel a schema change permanently"`
 	Start      commands.StartCmd      `cmd:"" help:"Resume a stopped schema change"`
+	Release    commands.ReleaseCmd    `cmd:"" help:"Release a rollout paused after an on_failure=pause failure"`
 	Volume     commands.VolumeCmd     `cmd:"" help:"Adjust schema change speed (1-11)"`
 	Revert     commands.RevertCmd     `cmd:"" help:"Revert a completed schema change during the revert window"`
 	SkipRevert commands.SkipRevertCmd `cmd:"" name:"skip-revert" help:"Skip the revert window, finalizing the schema change"`

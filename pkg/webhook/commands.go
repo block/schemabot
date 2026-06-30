@@ -67,6 +67,7 @@ var commandSpecs = []CommandSpec{
 	{Name: action.Stop, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Cancel, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Start, RequiresEnv: true, HasApplyID: true},
+	{Name: action.Release, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Revert, RequiresEnv: true},
 	{Name: action.SkipRevert, RequiresEnv: true},
 	{Name: action.Cutover, RequiresEnv: true, HasApplyID: true},

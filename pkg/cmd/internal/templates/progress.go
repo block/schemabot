@@ -799,6 +799,27 @@ func WriteStartNoWatch(applyID, database, environment string) {
 	}
 }
 
+// ReleaseData contains data for rendering release command output.
+type ReleaseData struct {
+	Database    string
+	Environment string
+	ApplyID     string
+}
+
+// WriteReleaseSuccess writes the release command success output.
+func WriteReleaseSuccess(data ReleaseData) {
+	fmt.Printf("%s%s▶️  Paused rollout released%s\n", ANSIBold, ANSIGreen, ANSIReset)
+	fmt.Println()
+	fmt.Printf("Database:    %s\n", data.Database)
+	fmt.Printf("Environment: %s\n", data.Environment)
+	fmt.Println()
+	if data.ApplyID != "" {
+		fmt.Printf("%sHeld deployments will resume. Use 'schemabot progress %s' to follow them.%s\n", ANSIDim, data.ApplyID, ANSIReset)
+	} else {
+		fmt.Printf("%sHeld deployments will resume.%s\n", ANSIDim, ANSIReset)
+	}
+}
+
 // ActiveApplyData contains data for a single apply in the status list.
 type ActiveApplyData struct {
 	ApplyID             string

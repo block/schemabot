@@ -117,6 +117,28 @@ func TestRenderStartCommandAcceptedAlreadyRequested(t *testing.T) {
 	assert.Contains(t, rendered, "Start was already requested")
 }
 
+func TestRenderReleaseCommandAccepted(t *testing.T) {
+	rendered := RenderReleaseCommandAccepted(ReleaseCommandAcceptedData{
+		ApplyID:     "apply_abc123",
+		Environment: "staging",
+		RequestedBy: "alice",
+	})
+	assert.Contains(t, rendered, "Release Request Accepted")
+	assert.Contains(t, rendered, "`apply_abc123`")
+	assert.Contains(t, rendered, "`staging`")
+	assert.Contains(t, rendered, "@alice")
+	assert.Contains(t, rendered, "Release request accepted")
+}
+
+func TestRenderReleaseCommandAcceptedAlreadyRequested(t *testing.T) {
+	rendered := RenderReleaseCommandAccepted(ReleaseCommandAcceptedData{
+		ApplyID:     "apply_abc123",
+		Environment: "staging",
+		Status:      apitypes.ControlStatusAlreadyRequested,
+	})
+	assert.Contains(t, rendered, "Release was already requested")
+}
+
 func TestRenderCutoverCommandAccepted(t *testing.T) {
 	rendered := RenderCutoverCommandAccepted(CutoverCommandAcceptedData{
 		ApplyID:     "apply_abc123",

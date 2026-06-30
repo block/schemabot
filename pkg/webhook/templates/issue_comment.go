@@ -65,6 +65,14 @@ type StartCommandAcceptedData struct {
 	SkippedCount int64
 }
 
+// ReleaseCommandAcceptedData contains data for a PR comment release acknowledgement.
+type ReleaseCommandAcceptedData struct {
+	ApplyID     string
+	Environment string
+	RequestedBy string
+	Status      string
+}
+
 // CutoverCommandAcceptedData contains data for a PR comment cutover acknowledgement.
 type CutoverCommandAcceptedData struct {
 	ApplyID     string
@@ -141,6 +149,24 @@ func RenderStartCommandAccepted(data StartCommandAcceptedData) string {
 	if data.StartedCount > 0 || data.SkippedCount > 0 {
 		body += fmt.Sprintf("\n**Tasks selected for start**: %d started, %d skipped.\n", data.StartedCount, data.SkippedCount)
 	}
+	return body
+}
+
+// RenderReleaseCommandAccepted renders the acknowledgement posted when a PR
+// comment release command records a durable release latch for a paused rollout.
+func RenderReleaseCommandAccepted(data ReleaseCommandAcceptedData) string {
+	statusLine := "Release request accepted. SchemaBot will let the held deployments of this paused rollout proceed; status remains available from the PR progress comment or CLI."
+	if data.Status == apitypes.ControlStatusAlreadyRequested {
+		statusLine = "Release was already requested. SchemaBot keeps the existing release latch in place; the held deployments continue from where they were."
+	}
+
+	body := "## Release Request Accepted\n\n" +
+		fmt.Sprintf("**Apply**: `%s`\n", data.ApplyID) +
+		fmt.Sprintf("**Environment**: `%s`\n", data.Environment)
+	if data.RequestedBy != "" {
+		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
+	}
+	body += "\n" + statusLine + "\n"
 	return body
 }
 

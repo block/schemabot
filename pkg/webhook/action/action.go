@@ -10,6 +10,7 @@ const (
 	Stop            = "stop"
 	Cancel          = "cancel"
 	Start           = "start"
+	Release         = "release"
 	Cutover         = "cutover"
 	Revert          = "revert"
 	SkipRevert      = "skip-revert"

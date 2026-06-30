@@ -264,6 +264,11 @@ type startResponseWrapper struct{ r *apitypes.StartResponse }
 func (w startResponseWrapper) IsAccepted() bool        { return w.r.Accepted }
 func (w startResponseWrapper) GetErrorMessage() string { return w.r.ErrorMessage }
 
+type releaseResponseWrapper struct{ r *apitypes.ReleaseResponse }
+
+func (w releaseResponseWrapper) IsAccepted() bool        { return w.r.Accepted }
+func (w releaseResponseWrapper) GetErrorMessage() string { return w.r.ErrorMessage }
+
 type volumeResponseWrapper struct{ r *apitypes.VolumeResponse }
 
 func (w volumeResponseWrapper) IsAccepted() bool        { return w.r.Accepted }

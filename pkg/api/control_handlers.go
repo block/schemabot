@@ -1745,6 +1745,172 @@ func startNotAllowedForState(apply *storage.Apply) error {
 	}
 }
 
+// ReleaseRequest is the HTTP request body for POST /api/release.
+type ReleaseRequest struct {
+	ApplyID     string `json:"apply_id"`
+	Environment string `json:"environment"`
+	Caller      string `json:"caller,omitempty"`
+}
+
+const releaseResponseStatusAlreadyRequested = apitypes.ControlStatusAlreadyRequested
+
+// handleRelease handles POST /api/release requests. It records a durable release
+// latch so the operator lets a rollout paused after an on_failure='pause'
+// deployment failure proceed with its remaining deployments.
+func (s *Service) handleRelease(w http.ResponseWriter, r *http.Request) {
+	var req ReleaseRequest
+	_, apply, _, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	if !ok {
+		return
+	}
+	resp, httpStatus, err := s.executeReleaseForApply(r.Context(), apply, req.Caller)
+	if err != nil {
+		s.writeControlError(w, "release", apply, err)
+		return
+	}
+	s.writeJSON(w, httpStatus, resp)
+}
+
+// ExecuteRelease records a durable release latch for a paused apply. It is the
+// in-process entry point shared with the GitHub comment flow.
+func (s *Service) ExecuteRelease(ctx context.Context, req apitypes.ControlRequest) (*apitypes.ReleaseResponse, error) {
+	_, apply, _, err := s.controlTarget(ctx, "release", req.ApplyID, req.Environment)
+	if err != nil {
+		return nil, err
+	}
+	resp, _, err := s.executeReleaseForApply(ctx, apply, req.Caller)
+	return resp, err
+}
+
+// executeReleaseForApply records the release latch for a paused rollout and
+// wakes the operator so the held later deployments can proceed. The returned
+// HTTP status is meaningful only when err == nil; every error path returns a
+// zero status, and callers derive the response status from the error.
+func (s *Service) executeReleaseForApply(ctx context.Context, apply *storage.Apply, caller string) (*apitypes.ReleaseResponse, int, error) {
+	if err := s.validateReleaseRequestState(ctx, apply); err != nil {
+		s.recordReleaseRejectionMetric(ctx, apply, err)
+		return nil, 0, err
+	}
+	if err := s.rejectControlIfStopPending(ctx, "release", apply); err != nil {
+		s.recordReleaseRejectionMetric(ctx, apply, err)
+		return nil, 0, err
+	}
+
+	// The release latch is one-way: once a release request latches a paused
+	// rollout open (pending or completed, per ReleasesPausedRollout), a repeat
+	// release is idempotent. Short-circuit before RequestPending so a completed
+	// latch is not rewound to pending — RequestPending resets any non-pending row
+	// back to pending, which would clear completed_at and overwrite the original
+	// requester/metadata, and would report a fresh request instead of
+	// already-latched. Only when no latch exists, or the last attempt failed
+	// (which does not latch, fail-closed), do we fall through to record/reset a
+	// pending request.
+	latched, err := s.releaseAlreadyLatched(ctx, apply)
+	if err != nil {
+		s.recordReleaseRejectionMetric(ctx, apply, err)
+		return nil, 0, err
+	}
+	if latched {
+		resp, httpStatus := s.acceptedReleaseResponse(ctx, apply, caller,
+			"Release requested by user while release was already latched", "", http.StatusAccepted, releaseResponseStatusAlreadyRequested)
+		return resp, httpStatus, nil
+	}
+
+	controlReq, alreadyLatched, err := s.createControlRequest(ctx, apply, storage.ControlOperationRelease, caller, releaseControlRequestMetadata{})
+	if err != nil {
+		s.recordReleaseRejectionMetric(ctx, apply, err)
+		return nil, 0, err
+	}
+
+	// alreadyLatched here is the concurrent-first-request race: another caller
+	// created the pending release between our latch read and RequestPending.
+	logMessage := "Release requested by user"
+	httpStatus := http.StatusOK
+	status := ""
+	if alreadyLatched {
+		logMessage = "Release requested by user while release was already latched"
+		httpStatus = http.StatusAccepted
+		status = releaseResponseStatusAlreadyRequested
+	}
+	resp, httpStatus := s.acceptedReleaseResponse(ctx, apply, caller, logMessage, releaseControlRequestErrorMessage(controlReq), httpStatus, status)
+	return resp, httpStatus, nil
+}
+
+// releaseAlreadyLatched reports whether a release request already holds the
+// paused rollout open (pending or completed). A failed or absent release does
+// not latch, so the caller records a fresh pending request.
+func (s *Service) releaseAlreadyLatched(ctx context.Context, apply *storage.Apply) (bool, error) {
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		return false, fmt.Errorf("control request store is not available")
+	}
+	existing, err := controlStore.GetByOperation(ctx, apply.ID, storage.ControlOperationRelease)
+	if err != nil {
+		return false, fmt.Errorf("load release latch for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return existing.ReleasesPausedRollout(), nil
+}
+
+// acceptedReleaseResponse records the accept metric, logs the control event,
+// wakes the operator, and builds the accepted release response shared by the
+// already-latched and freshly-recorded paths.
+func (s *Service) acceptedReleaseResponse(ctx context.Context, apply *storage.Apply, caller, logMessage, errorMessage string, httpStatus int, status string) (*apitypes.ReleaseResponse, int) {
+	metrics.RecordControlOperation(ctx, "release", apply.Database, apply.Deployment, apply.Environment, controlStatus(true))
+	s.logControlOperationForApply(ctx, apply, caller, storage.LogEventReleaseRequested, logMessage)
+	s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+	return &apitypes.ReleaseResponse{
+		Accepted:     true,
+		ErrorMessage: errorMessage,
+		Status:       status,
+	}, httpStatus
+}
+
+func (s *Service) recordReleaseRejectionMetric(ctx context.Context, apply *storage.Apply, err error) {
+	status := "error"
+	if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
+		status = "rejected"
+	}
+	metrics.RecordControlOperation(ctx, "release", apply.Database, apply.Deployment, apply.Environment, status)
+}
+
+// releaseControlRequestMetadata is the (currently empty) metadata payload stored
+// with a release control request. The release latch is binary, so the row's
+// existence and status carry the state; the struct keeps the create/decode path
+// consistent with the other control operations.
+type releaseControlRequestMetadata struct{}
+
+func releaseControlRequestErrorMessage(controlReq *storage.ApplyControlRequest) string {
+	if controlReq != nil && controlReq.Status == storage.ControlRequestFailed {
+		return controlReq.ErrorMessage
+	}
+	return ""
+}
+
+// validateReleaseRequestState rejects release requests that do not target a
+// rollout paused after an on_failure='pause' deployment failure. A release only
+// makes sense for a currently paused apply with at least one pause deployment;
+// terminal applies and applies without a pause policy are rejected.
+func (s *Service) validateReleaseRequestState(ctx context.Context, apply *storage.Apply) error {
+	if state.IsTerminalApplyState(apply.State) {
+		return controlConflictf("schema change is already terminal (current state: %s); release only applies to a paused rollout", apply.State)
+	}
+	opStore := s.storage.ApplyOperations()
+	if opStore == nil {
+		return fmt.Errorf("apply operations store is not available")
+	}
+	ops, err := opStore.ListByApply(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("list apply_operations for apply %s before release: %w", apply.ApplyIdentifier, err)
+	}
+	if !anyPauseOnFailure(ops) {
+		return controlConflictf("schema change has no on_failure=pause deployment to release")
+	}
+	if !state.IsState(apply.State, state.Apply.Paused) {
+		return controlConflictf("schema change is not paused (current state: %s); release only applies to a paused rollout", apply.State)
+	}
+	return nil
+}
+
 // VolumeRequest is the HTTP request body for POST /api/volume.
 type VolumeRequest struct {
 	ApplyID     string `json:"apply_id"`

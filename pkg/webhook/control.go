@@ -292,6 +292,36 @@ func (h *Handler) handleStartCommand(repo string, pr int, installationID int64, 
 	}))
 }
 
+// handleReleaseCommand handles the "schemabot release <apply-id> -e <env>" PR
+// comment command by recording a durable release latch so the operator lets a
+// rollout paused after an on_failure=pause failure proceed.
+func (h *Handler) handleReleaseCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
+	ctx, cancel := h.commandContext(commandTimeout)
+	defer cancel()
+
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Release,
+		h.service.ExecuteRelease,
+		func(r *apitypes.ReleaseResponse) bool { return r.Accepted },
+		func(r *apitypes.ReleaseResponse) string { return r.ErrorMessage })
+	if resp == nil {
+		return
+	}
+
+	h.logger.Info("release PR command accepted",
+		"repo", repo,
+		"pr", pr,
+		"apply_id", result.ApplyID,
+		"environment", result.Environment,
+		"requested_by", requestedBy,
+		"status", resp.Status)
+	h.postComment(repo, pr, installationID, templates.RenderReleaseCommandAccepted(templates.ReleaseCommandAcceptedData{
+		ApplyID:     result.ApplyID,
+		Environment: result.Environment,
+		RequestedBy: requestedBy,
+		Status:      resp.Status,
+	}))
+}
+
 // handleCutoverCommand handles the "schemabot cutover <apply-id> -e <env>" PR
 // comment command by recording durable cutover intent for the operator owner.
 func (h *Handler) handleCutoverCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
