@@ -143,26 +143,38 @@ func classifyDDLPhases(ddlStatements []string) (ddlPhases, error) {
 	return phases, nil
 }
 
-// executeCreateStatements runs each CREATE TABLE through Spirit. It returns false
-// when execution should stop: a cancelled context leaves the state Stopped, a
-// genuine failure transitions to StateFailed. The caller must not run later
-// phases when this returns false.
-func (e *Engine) executeCreateStatements(ctx context.Context, host, username, password, database string, creates []string) bool {
-	for _, stmt := range creates {
-		if err := e.executeSingleStatement(ctx, host, username, password, database, stmt); err != nil {
+// runStatementPhase executes each statement through run, stopping the phase as
+// soon as run returns an error. A cancelled context leaves the state Stopped; a
+// genuine failure transitions to StateFailed. stopLabel names the DDL phase in
+// the stop log; failLabel names it in the failure log and error (the DROP phase
+// keeps its distinct "phase" wording in failure messages). It returns false when
+// the caller must not run later phases.
+func (e *Engine) runStatementPhase(ctx context.Context, database, stopLabel, failLabel string, statements []string, run func(context.Context, string) error) bool {
+	for _, stmt := range statements {
+		if err := run(ctx, stmt); err != nil {
 			if ctx.Err() != nil {
-				e.logger.Info("schema change stopped during CREATE TABLE",
+				e.logger.Info("schema change stopped during "+stopLabel,
 					"database", database,
 					"reason", ctx.Err(),
 				)
 				return false
 			}
-			e.logger.Error("CREATE TABLE failed", "database", database, "error", err)
-			e.setMigrationFailed(fmt.Errorf("CREATE TABLE failed: %w", err))
+			e.logger.Error(failLabel+" failed", "database", database, "error", err)
+			e.setMigrationFailed(fmt.Errorf("%s failed: %w", failLabel, err))
 			return false
 		}
 	}
 	return true
+}
+
+// executeCreateStatements runs each CREATE TABLE through Spirit. It returns false
+// when execution should stop: a cancelled context leaves the state Stopped, a
+// genuine failure transitions to StateFailed. The caller must not run later
+// phases when this returns false.
+func (e *Engine) executeCreateStatements(ctx context.Context, host, username, password, database string, creates []string) bool {
+	return e.runStatementPhase(ctx, database, "CREATE TABLE", "CREATE TABLE", creates, func(ctx context.Context, stmt string) error {
+		return e.executeSingleStatement(ctx, host, username, password, database, stmt)
+	})
 }
 
 // executeAlterPhase combines the ALTER statements and runs them through Spirit.
@@ -204,21 +216,9 @@ func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password
 // one. It returns false when execution should stop: a cancelled context leaves
 // the state Stopped, a genuine failure transitions to StateFailed.
 func (e *Engine) executeDropStatements(ctx context.Context, host, username, password, database string, drops []string) bool {
-	for _, stmt := range drops {
-		if err := e.executeDropStatement(ctx, host, username, password, database, stmt); err != nil {
-			if ctx.Err() != nil {
-				e.logger.Info("schema change stopped during DROP TABLE",
-					"database", database,
-					"reason", ctx.Err(),
-				)
-				return false
-			}
-			e.logger.Error("DROP TABLE phase failed", "database", database, "error", err)
-			e.setMigrationFailed(fmt.Errorf("DROP TABLE phase failed: %w", err))
-			return false
-		}
-	}
-	return true
+	return e.runStatementPhase(ctx, database, "DROP TABLE", "DROP TABLE phase", drops, func(ctx context.Context, stmt string) error {
+		return e.executeDropStatement(ctx, host, username, password, database, stmt)
+	})
 }
 
 // executeDropStatement runs a single DROP TABLE statement, quarantining the
