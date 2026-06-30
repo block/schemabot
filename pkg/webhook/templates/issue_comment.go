@@ -190,6 +190,26 @@ func RenderSkipRevertCommandAccepted(data SkipRevertCommandAcceptedData) string 
 	return body
 }
 
+// RevertCommandAcceptedData contains data for a PR comment revert acknowledgement.
+type RevertCommandAcceptedData struct {
+	ApplyID     string
+	Environment string
+	RequestedBy string
+}
+
+// RenderRevertCommandAccepted renders the acknowledgement posted when a PR
+// comment revert command is accepted.
+func RenderRevertCommandAccepted(data RevertCommandAcceptedData) string {
+	body := "## Revert Request Accepted\n\n" +
+		fmt.Sprintf("**Apply**: `%s`\n", data.ApplyID) +
+		fmt.Sprintf("**Environment**: `%s`\n", data.Environment)
+	if data.RequestedBy != "" {
+		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
+	}
+	body += "\nRevert requested. SchemaBot will undo this schema change; status remains available from the PR progress comment or CLI.\n"
+	return body
+}
+
 // PreviewCommentStartCommandAccepted renders a sample start command
 // acknowledgement comment.
 func PreviewCommentStartCommandAccepted() string {
@@ -251,13 +271,4 @@ func PreviewCommentCutoverCommandAlreadyInProgress() string {
 		RequestedBy: "alice",
 		Status:      apitypes.ControlStatusAlreadyInProgress,
 	})
-}
-
-// RenderCommandNotYetAvailable renders the acknowledgement posted when a
-// recognised but not-yet-implemented PR comment command is invoked. It points
-// the user at the CLI fallback for the same action.
-func RenderCommandNotYetAvailable(action, environment string) string {
-	return fmt.Sprintf("The `%s` command is not yet available via PR comments. "+
-		"Use the CLI instead:\n```\nschemabot %s -e %s\n```",
-		action, action, environment)
 }

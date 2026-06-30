@@ -3,7 +3,6 @@ package webhook
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -332,13 +331,11 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.handleSkipRevertCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "skip-revert started"})
-	// Phase 2 commands — acknowledge but not yet implemented
 	case action.Revert:
-		h.postComment(repo, pr, installationID,
-			templates.RenderCommandNotYetAvailable(result.Action, result.Environment))
-		h.writeJSON(w, http.StatusOK, map[string]string{
-			"message": fmt.Sprintf("%s command not yet implemented", result.Action),
+		h.goSafe(repo, pr, installationID, func() {
+			h.handleRevertCommand(repo, pr, installationID, requestedBy, result)
 		})
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "revert started"})
 	default:
 		h.postComment(repo, pr, installationID, templates.RenderInvalidCommand())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "invalid command"})

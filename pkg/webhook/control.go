@@ -375,3 +375,28 @@ func (h *Handler) handleSkipRevertCommand(repo string, pr int, installationID in
 		RequestedBy: requestedBy,
 	}))
 }
+
+func (h *Handler) handleRevertCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
+	ctx, cancel := h.commandContext(commandTimeout)
+	defer cancel()
+
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Revert,
+		h.service.ExecuteRevert,
+		func(r *apitypes.ControlResponse) bool { return r.Accepted },
+		func(r *apitypes.ControlResponse) string { return r.ErrorMessage })
+	if resp == nil {
+		return
+	}
+
+	h.logger.Info("revert PR command accepted",
+		"repo", repo,
+		"pr", pr,
+		"apply_id", result.ApplyID,
+		"environment", result.Environment,
+		"requested_by", requestedBy)
+	h.postComment(repo, pr, installationID, templates.RenderRevertCommandAccepted(templates.RevertCommandAcceptedData{
+		ApplyID:     result.ApplyID,
+		Environment: result.Environment,
+		RequestedBy: requestedBy,
+	}))
+}

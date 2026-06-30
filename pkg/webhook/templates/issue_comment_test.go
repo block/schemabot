@@ -161,9 +161,15 @@ func TestRenderCutoverCommandAcceptedAlreadyInProgress(t *testing.T) {
 	assert.Contains(t, rendered, "Cutover is already in progress")
 }
 
-func TestRenderCommandNotYetAvailable(t *testing.T) {
-	rendered := RenderCommandNotYetAvailable("stop", "staging")
-	assert.Contains(t, rendered, "`stop` command is not yet available")
-	assert.Contains(t, rendered, "Use the CLI instead")
-	assert.Contains(t, rendered, "schemabot stop -e staging")
+func TestRenderRevertCommandAccepted(t *testing.T) {
+	rendered := RenderRevertCommandAccepted(RevertCommandAcceptedData{
+		ApplyID:     "apply-957642f96d634694",
+		Environment: "staging",
+		RequestedBy: "alice",
+	})
+	assert.Contains(t, rendered, "Revert Request Accepted")
+	assert.Contains(t, rendered, "`apply-957642f96d634694`")
+	assert.Contains(t, rendered, "`staging`")
+	assert.Contains(t, rendered, "@alice")
+	assert.Contains(t, rendered, "SchemaBot will undo this schema change")
 }

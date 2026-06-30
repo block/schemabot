@@ -227,29 +227,6 @@ func controlOperationCaller(caller string) string {
 	return caller
 }
 
-// logControlOperation appends an apply log entry for a control operation (cutover, stop, start, revert, etc.).
-func (s *Service) logControlOperation(r *http.Request, applyID, caller, eventType, message string) {
-	if applyID == "" {
-		s.logger.Debug("skipping control operation log — no apply ID", "event", eventType)
-		return
-	}
-	applyStore := s.storage.Applies()
-	if applyStore == nil {
-		s.logger.Error("apply store not available for control operation log", "apply_id", applyID, "event", eventType)
-		return
-	}
-	apply, err := applyStore.GetByApplyIdentifier(r.Context(), applyID)
-	if err != nil {
-		s.logger.Error("failed to look up apply for control operation log", "apply_id", applyID, "event", eventType, "error", err)
-		return
-	}
-	if apply == nil {
-		s.logger.Warn("apply not found for control operation log", "apply_id", applyID, "event", eventType)
-		return
-	}
-	s.logControlOperationForApply(r.Context(), apply, caller, eventType, message)
-}
-
 func (s *Service) logControlOperationForApply(ctx context.Context, apply *storage.Apply, caller, eventType, message string) {
 	logStore := s.storage.ApplyLogs()
 	if logStore == nil {
@@ -1961,29 +1938,47 @@ type RevertRequest struct {
 // handleRevert handles POST /api/revert requests.
 func (s *Service) handleRevert(w http.ResponseWriter, r *http.Request) {
 	var req RevertRequest
-	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
-
-	resp, err := client.Revert(r.Context(), &ternv1.RevertRequest{
-		ApplyId:     applyID,
-		Environment: apply.Environment,
-	})
+	resp, httpStatus, err := s.executeRevertForApply(r.Context(), client, apply, ternApplyID, req.Caller)
 	if err != nil {
-		metrics.RecordControlOperation(r.Context(), "revert", apply.Database, apply.Deployment, apply.Environment, "error")
 		s.writeControlError(w, "revert", apply, err)
 		return
 	}
-	metrics.RecordControlOperation(r.Context(), "revert", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
-	if resp.Accepted {
-		s.logControlOperation(r, apply.ApplyIdentifier, req.Caller, storage.LogEventRevertTriggered, "Revert triggered by user")
-	}
+	s.writeJSON(w, httpStatus, resp)
+}
 
-	s.writeJSON(w, http.StatusOK, &apitypes.ControlResponse{
+// ExecuteRevert reverts a completed schema change during its revert window. It
+// resolves the apply's data-plane client and proxies the revert, so the HTTP
+// handler and the PR-comment command share one path.
+func (s *Service) ExecuteRevert(ctx context.Context, req apitypes.ControlRequest) (*apitypes.ControlResponse, error) {
+	client, apply, ternApplyID, err := s.controlTarget(ctx, "revert", req.ApplyID, req.Environment)
+	if err != nil {
+		return nil, err
+	}
+	resp, _, err := s.executeRevertForApply(ctx, client, apply, ternApplyID, req.Caller)
+	return resp, err
+}
+
+func (s *Service) executeRevertForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.ControlResponse, int, error) {
+	resp, err := client.Revert(ctx, &ternv1.RevertRequest{
+		ApplyId:     ternApplyID,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, 0, fmt.Errorf("revert apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
+	if resp.Accepted {
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventRevertTriggered, "Revert triggered by user")
+	}
+	return &apitypes.ControlResponse{
 		Accepted:     resp.Accepted,
 		ErrorMessage: resp.ErrorMessage,
-	})
+	}, http.StatusOK, nil
 }
 
 // SkipRevertRequest is the HTTP request body for POST /api/skip-revert.

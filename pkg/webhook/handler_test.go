@@ -604,41 +604,6 @@ func TestWebhookEyesReaction(t *testing.T) {
 	}
 }
 
-func TestWebhookPhase2CommandNotYetAvailable(t *testing.T) {
-	h, comments, _ := newTestHandler(t)
-
-	// revert is the only remaining Phase 2 command not yet available via PR
-	// comments (apply, apply-confirm, unlock, stop, start, cutover, and skip-revert
-	// are now implemented).
-	cmds := []struct {
-		comment string
-		action  string
-	}{
-		{"schemabot revert -e staging", "revert"},
-	}
-
-	for _, cmd := range cmds {
-		req := buildWebhookRequest(t, webhookPayloadOpts{
-			comment: cmd.comment,
-			isPR:    true,
-		}, nil)
-
-		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, req)
-
-		require.Equal(t, http.StatusOK, rr.Code)
-		assert.Contains(t, rr.Body.String(), "not yet implemented")
-
-		select {
-		case body := <-comments:
-			assert.Contains(t, body, "not yet available via PR comments")
-			assert.Contains(t, body, cmd.action)
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for comment for %q", cmd.comment)
-		}
-	}
-}
-
 func TestWebhookSignatureValidation(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 	secret := []byte("webhook-secret")
