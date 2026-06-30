@@ -1814,6 +1814,9 @@ func TestRenderApplyStatusComment_RevertWindow(t *testing.T) {
 	assert.Contains(t, result, "Complete (pending revert)")
 	assert.Contains(t, result, "schemabot revert apply-abc123 -e staging")
 	assert.Contains(t, result, "schemabot skip-revert apply-abc123 -e staging")
+	// Skip-revert (finalize) is the likelier action, so it is offered before revert.
+	assert.Less(t, strings.Index(result, "To skip revert and keep changes:"), strings.Index(result, "To revert:"),
+		"skip-revert should be offered before revert in the revert-window footer")
 }
 
 // Once skip-revert is accepted the apply moves from revert_window to

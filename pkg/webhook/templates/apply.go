@@ -900,8 +900,9 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.Failed:
 		writeFooterAction(sb, "To retry:", fmt.Sprintf("schemabot apply -e %s", data.Environment))
 	case state.Apply.RevertWindow:
-		writeFooterAction(sb, "To revert:", fmt.Sprintf("schemabot revert %s -e %s", data.ApplyID, data.Environment))
-		fmt.Fprintf(sb, "\nTo skip revert and keep changes:\n```\nschemabot skip-revert %s -e %s\n```\n", data.ApplyID, data.Environment)
+		// Skip-revert (finalize) is the common path, so it leads; revert (undo) follows.
+		writeFooterAction(sb, "To skip revert and keep changes:", fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment))
+		fmt.Fprintf(sb, "\nTo revert:\n```\nschemabot revert %s -e %s\n```\n", data.ApplyID, data.Environment)
 	case state.Apply.SkippingRevert:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Skip-revert was requested — closing the revert window and making this schema change permanent. This can no longer be reverted.\n")
