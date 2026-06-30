@@ -87,6 +87,7 @@ func TestDriftGuard_MissingReviewedChangeFailsClosed(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "drifted")
+	assert.Contains(t, err.Error(), "re-plan against the current live schema", "the error must tell a blocked operator how to recover")
 	assert.Nil(t, store.created, "must not materialize a drifted plan")
 }
 

@@ -19,6 +19,18 @@ import (
 // a sharded engine emits one change set per shard and the same table repeats
 // across shards: keying without it would conflate a change on one shard with a
 // different change on another.
+//
+// The shard-aware comparison relies on the engine emitting a stable shard
+// identifier (engine.SchemaChange.Shard.Name) equal to the value the dispatch
+// fan-out keyed its per-shard operations on. Both sides of the multiset read
+// that same field — the dispatch's TargetShards is rebuilt from it and the
+// re-plan reads it directly — so a legitimate shard-scoped apply is compared
+// symmetrically rather than refused. This guard couples "what may be applied" to
+// "what re-planning live-vs-desired reproduces": a future reconciliation path
+// that applies repair DDL derived some other way (e.g. shard-to-shard
+// comparison or a stored repair a live-vs-desired re-plan would not recompute)
+// must route through a normal reviewed plan or add an explicit reconciliation
+// mode here, or it would trip the guard.
 type driftChangeKey struct {
 	namespace string
 	shard     string
@@ -30,6 +42,12 @@ type driftChangeKey struct {
 // driftChangeMultiset counts table DDL changes by key so duplicate changes are
 // compared exactly (set equality would silently tolerate a duplicated change).
 type driftChangeMultiset map[driftChangeKey]int
+
+// driftRecoveryHint gives a blocked operator the defined next step when the
+// guard fails closed: the reviewed plan no longer matches live schema, so it
+// must be regenerated against the current schema and re-reviewed before
+// re-applying. Without this an operator only learns what drifted, not what to do.
+const driftRecoveryHint = "to recover, re-plan against the current live schema to refresh the reviewed plan, then re-apply"
 
 // verifyMaterializedPlanMatchesLiveSchema fails closed unless the reviewed DDL a
 // dispatch carries exactly matches what this deployment would independently plan
@@ -74,16 +92,21 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 		return fmt.Errorf("dispatched plan: %w", err)
 	}
 	if err := compareDriftMultisets(recomputed, dispatched); err != nil {
-		return fmt.Errorf("local schema has drifted from the reviewed plan (database %q, target %q): %w", c.config.Database, req.Target, err)
+		return fmt.Errorf("local schema has drifted from the reviewed plan (database %q, target %q): %w; %s", c.config.Database, req.Target, err, driftRecoveryHint)
 	}
 
 	// VSchema changes are namespace-level, not shard-scoped, and travel on the
 	// whole-deployment dispatch — a shard-scoped DDL dispatch never carries them
 	// (VSchema is applied by a separate task-less finalizer). So parity is only
 	// meaningful for a whole-deployment materialize.
+	//
+	// The two sides bridge different representations of "vschema changed": the
+	// re-plan reads the engine's Metadata["vschema_changed"], the dispatch reads
+	// the proto CHANGE_TYPE_VSCHEMA. They agree today; any divergence drops a
+	// namespace from one set, which trips parity in the fail-closed direction.
 	if !shardScoped {
 		if err := compareVSchemaParity(vschemaNamespacesFromPlanResult(c, result), vschemaNamespacesFromApplyRequest(c, req.DdlChanges)); err != nil {
-			return fmt.Errorf("local vschema has drifted from the reviewed plan (database %q, target %q): %w", c.config.Database, req.Target, err)
+			return fmt.Errorf("local vschema has drifted from the reviewed plan (database %q, target %q): %w; %s", c.config.Database, req.Target, err, driftRecoveryHint)
 		}
 	}
 	return nil
