@@ -1166,34 +1166,40 @@ func (ic *InstallationClient) FetchFileContent(ctx context.Context, repo, filePa
 const maxGitHubDirEntries = 1000
 
 func (ic *InstallationClient) fetchDirectoryContents(ctx context.Context, repo, dirPath, ref string) ([]*gh.RepositoryContent, error) {
-	owner, repoName := splitRepo(repo)
-	opts := &gh.RepositoryContentGetOptions{Ref: ref}
-	readResult, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch directory content", []any{"repo", repo, "path", dirPath, "ref", ref}, func(ctx context.Context) (struct {
-		fileContent      *gh.RepositoryContent
-		directoryContent []*gh.RepositoryContent
-	}, error) {
-		fileContent, directoryContent, _, err := ic.client.Repositories.GetContents(ctx, owner, repoName, dirPath, opts)
-		if err != nil {
-			return struct {
-				fileContent      *gh.RepositoryContent
-				directoryContent []*gh.RepositoryContent
-			}{}, fmt.Errorf("fetch directory content at %s: %w", dirPath, classifyGitHubAPIError(err))
-		}
-		return struct {
-			fileContent      *gh.RepositoryContent
-			directoryContent []*gh.RepositoryContent
-		}{fileContent: fileContent, directoryContent: directoryContent}, nil
-	})
+	result, err := ic.getRepositoryContents(ctx, repo, dirPath, ref, "fetch directory content")
 	if err != nil {
 		return nil, err
 	}
-	if readResult.fileContent != nil {
+	if result.fileContent != nil {
 		return nil, fmt.Errorf("expected directory at %s, found file", dirPath)
 	}
-	if len(readResult.directoryContent) >= maxGitHubDirEntries {
+	if len(result.directoryContent) >= maxGitHubDirEntries {
 		return nil, fmt.Errorf("list schema directory %s in repo %s ref %s reached GitHub Contents API limit: %w", dirPath, repo, ref, ErrDirListingCapped)
 	}
-	return readResult.directoryContent, nil
+	return result.directoryContent, nil
+}
+
+// repositoryContents bundles the two-shaped result of the GitHub Contents API:
+// GetContents returns a file when the path is a file and a directory listing
+// when it is a directory, with the other value nil.
+type repositoryContents struct {
+	fileContent      *gh.RepositoryContent
+	directoryContent []*gh.RepositoryContent
+}
+
+// getRepositoryContents performs a retried GitHub Contents API read at
+// contentPath on ref, returning both the file and directory results. operation
+// labels the read for retry logs and error context.
+func (ic *InstallationClient) getRepositoryContents(ctx context.Context, repo, contentPath, ref, operation string) (repositoryContents, error) {
+	owner, repoName := splitRepo(repo)
+	opts := &gh.RepositoryContentGetOptions{Ref: ref}
+	return retryGitHubUnavailableRead(ctx, ic.logger, operation, []any{"repo", repo, "path", contentPath, "ref", ref}, func(ctx context.Context) (repositoryContents, error) {
+		fileContent, directoryContent, _, err := ic.client.Repositories.GetContents(ctx, owner, repoName, contentPath, opts)
+		if err != nil {
+			return repositoryContents{}, fmt.Errorf("%s at %s: %w", operation, contentPath, classifyGitHubAPIError(err))
+		}
+		return repositoryContents{fileContent: fileContent, directoryContent: directoryContent}, nil
+	})
 }
 
 // GitHubFile represents a file fetched from GitHub API.

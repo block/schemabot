@@ -25,7 +25,7 @@ func (c *LocalClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (
 // stop and start are routed to the apply owner.
 func (c *LocalClient) requestCutover(ctx context.Context, req *ternv1.CutoverRequest, caller string) (*ternv1.CutoverResponse, error) {
 	c.logger.Info("Cutover requested", "database", c.config.Database, "type", c.config.Type, "apply_id", req.ApplyId, "environment", req.Environment, "caller", caller)
-	apply, err := c.resolveCutoverApply(ctx, req)
+	apply, err := c.resolveControlApply(ctx, req.ApplyId, "cutover")
 	if err != nil {
 		return nil, err
 	}
@@ -35,16 +35,18 @@ func (c *LocalClient) requestCutover(ctx context.Context, req *ternv1.CutoverReq
 	return c.queueCutoverRequest(ctx, apply, caller)
 }
 
-// resolveCutoverApply finds the apply a cutover request targets, by apply
-// identifier when provided or by the database's active task otherwise.
-func (c *LocalClient) resolveCutoverApply(ctx context.Context, req *ternv1.CutoverRequest) (*storage.Apply, error) {
-	if req.ApplyId != "" {
-		apply, err := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
+// resolveControlApply finds the apply a control request targets, by apply
+// identifier when provided or by the database's active task otherwise. The
+// operation label names the control verb in errors and logs. Returns
+// (nil, nil) when no apply id is given and the database has no active task.
+func (c *LocalClient) resolveControlApply(ctx context.Context, applyID, operation string) (*storage.Apply, error) {
+	if applyID != "" {
+		apply, err := c.storage.Applies().GetByApplyIdentifier(ctx, applyID)
 		if err != nil {
-			return nil, fmt.Errorf("load apply %s before cutover: %w", req.ApplyId, err)
+			return nil, fmt.Errorf("load apply %s before %s: %w", applyID, operation, err)
 		}
 		if apply == nil {
-			return nil, fmt.Errorf("load apply %s before cutover: %w", req.ApplyId, storage.ErrApplyNotFound)
+			return nil, fmt.Errorf("load apply %s before %s: %w", applyID, operation, storage.ErrApplyNotFound)
 		}
 		return apply, nil
 	}
@@ -54,15 +56,15 @@ func (c *LocalClient) resolveCutoverApply(ctx context.Context, req *ternv1.Cutov
 		return nil, err
 	}
 	if task == nil {
-		c.logger.Info("cutover request found no active task", "database", c.config.Database, "type", c.config.Type)
+		c.logger.Info(operation+" request found no active task", "database", c.config.Database, "type", c.config.Type)
 		return nil, nil
 	}
 	apply, err := c.storage.Applies().Get(ctx, task.ApplyID)
 	if err != nil {
-		return nil, fmt.Errorf("load apply %d before cutover: %w", task.ApplyID, err)
+		return nil, fmt.Errorf("load apply %d before %s: %w", task.ApplyID, operation, err)
 	}
 	if apply == nil {
-		return nil, fmt.Errorf("load apply %d before cutover: %w", task.ApplyID, storage.ErrApplyNotFound)
+		return nil, fmt.Errorf("load apply %d before %s: %w", task.ApplyID, operation, storage.ErrApplyNotFound)
 	}
 	return apply, nil
 }
@@ -339,7 +341,7 @@ func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, 
 		c.logger.Warn("stop rejected because this engine supports cancel instead", "database", c.config.Database, "type", c.config.Type, "apply_id", req.ApplyId)
 		return nil, fmt.Errorf("stop not supported for this schema change; use cancel to permanently cancel it")
 	}
-	apply, err := c.resolveStopApply(ctx, req)
+	apply, err := c.resolveControlApply(ctx, req.ApplyId, "stop")
 	if err != nil {
 		return nil, err
 	}
@@ -390,36 +392,6 @@ func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, 
 	}
 	c.wakeOperatorForControlRequest(apply)
 	return &ternv1.StopResponse{Accepted: true}, nil
-}
-
-func (c *LocalClient) resolveStopApply(ctx context.Context, req *ternv1.StopRequest) (*storage.Apply, error) {
-	if req.ApplyId != "" {
-		apply, err := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
-		if err != nil {
-			return nil, fmt.Errorf("load apply %s before stop: %w", req.ApplyId, err)
-		}
-		if apply == nil {
-			return nil, fmt.Errorf("load apply %s before stop: %w", req.ApplyId, storage.ErrApplyNotFound)
-		}
-		return apply, nil
-	}
-
-	task, err := c.getActiveTaskForDatabase(ctx, c.config.Database)
-	if err != nil {
-		return nil, err
-	}
-	if task == nil {
-		c.logger.Info("stop request found no active task", "database", c.config.Database, "type", c.config.Type)
-		return nil, nil
-	}
-	apply, err := c.storage.Applies().Get(ctx, task.ApplyID)
-	if err != nil {
-		return nil, fmt.Errorf("load apply %d before stop: %w", task.ApplyID, err)
-	}
-	if apply == nil {
-		return nil, fmt.Errorf("load apply %d before stop: %w", task.ApplyID, storage.ErrApplyNotFound)
-	}
-	return apply, nil
 }
 
 func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopRequest, caller string) (*ternv1.StopResponse, error) {

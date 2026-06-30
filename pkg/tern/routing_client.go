@@ -275,24 +275,20 @@ func (c *RoutingClient) ResumeApply(ctx context.Context, apply *storage.Apply) e
 
 // ResumeApplyOperation starts or resumes one operation for a stored apply.
 func (c *RoutingClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
-	if apply == nil {
-		return fmt.Errorf("stored apply is required for routing")
-	}
-	operation, err := c.loadApplyOperation(ctx, apply, applyOperationID)
-	if err != nil {
-		return err
-	}
-	client, err := c.clientForDeployment(ctx, operation.Deployment, apply.Environment)
-	if err != nil {
-		return fmt.Errorf("get client for apply %q operation %d deployment %q environment %q: %w", apply.ApplyIdentifier, applyOperationID, operation.Deployment, apply.Environment, err)
-	}
-	c.attachObserver(client, apply.ID)
-	return client.ResumeApplyOperation(ctx, operationScopedApply(apply, operation), applyOperationID)
+	return c.resumeApplyOperation(ctx, apply, applyOperationID, Client.ResumeApplyOperation)
 }
 
 // ResumeApplyOperationCutover drives one parked operation through its cutover
 // phase, routing to the deployment's client just like ResumeApplyOperation.
 func (c *RoutingClient) ResumeApplyOperationCutover(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	return c.resumeApplyOperation(ctx, apply, applyOperationID, Client.ResumeApplyOperationCutover)
+}
+
+// resumeApplyOperation resolves the deployment client that owns one operation of
+// a stored apply, attaches any registered observer, and dispatches the resume to
+// it on an operation-scoped copy of the apply. dispatch selects the resume phase
+// (start/resume vs cutover) to run on the resolved client.
+func (c *RoutingClient) resumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64, dispatch func(Client, context.Context, *storage.Apply, int64) error) error {
 	if apply == nil {
 		return fmt.Errorf("stored apply is required for routing")
 	}
@@ -305,7 +301,7 @@ func (c *RoutingClient) ResumeApplyOperationCutover(ctx context.Context, apply *
 		return fmt.Errorf("get client for apply %q operation %d deployment %q environment %q: %w", apply.ApplyIdentifier, applyOperationID, operation.Deployment, apply.Environment, err)
 	}
 	c.attachObserver(client, apply.ID)
-	return client.ResumeApplyOperationCutover(ctx, operationScopedApply(apply, operation), applyOperationID)
+	return dispatch(client, ctx, operationScopedApply(apply, operation), applyOperationID)
 }
 
 // Endpoint returns a descriptive endpoint for the routing wrapper.

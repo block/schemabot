@@ -133,28 +133,11 @@ func validateEnvironmentPathSegment(environment string) error {
 }
 
 func (ic *InstallationClient) fetchRepositoryContents(ctx context.Context, repo, filePath, ref string) (*gh.RepositoryContent, []*gh.RepositoryContent, error) {
-	owner, repoName := splitRepo(repo)
-	opts := &gh.RepositoryContentGetOptions{Ref: ref}
-	readResult, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch repository content", []any{"repo", repo, "path", filePath, "ref", ref}, func(ctx context.Context) (struct {
-		fileContent      *gh.RepositoryContent
-		directoryContent []*gh.RepositoryContent
-	}, error) {
-		fileContent, directoryContent, _, err := ic.client.Repositories.GetContents(ctx, owner, repoName, filePath, opts)
-		if err != nil {
-			return struct {
-				fileContent      *gh.RepositoryContent
-				directoryContent []*gh.RepositoryContent
-			}{}, fmt.Errorf("fetch repository content at %s: %w", filePath, classifyGitHubAPIError(err))
-		}
-		return struct {
-			fileContent      *gh.RepositoryContent
-			directoryContent []*gh.RepositoryContent
-		}{fileContent: fileContent, directoryContent: directoryContent}, nil
-	})
+	result, err := ic.getRepositoryContents(ctx, repo, filePath, ref, "fetch repository content")
 	if err != nil {
 		return nil, nil, err
 	}
-	return readResult.fileContent, readResult.directoryContent, nil
+	return result.fileContent, result.directoryContent, nil
 }
 
 func resolveSchemaRootSymlinkTarget(configDir, symlinkPath, target string) (string, error) {
