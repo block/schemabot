@@ -1505,11 +1505,15 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 		return nil, fmt.Errorf("materialize plan %s: apply request carried no DDL changes or schema files", req.PlanId)
 	}
 
-	// The dispatch carries the reviewed plan's DDL verbatim, so the materialized
-	// plan is the reviewed plan — no re-plan-and-compare here. Drift between when
-	// the plan was reviewed and when it applies is reconciled the same way on
-	// every path: replanAndFilterTasks re-plans against live schema at apply/resume
-	// and drops or updates work, and the engine validates each change at execution.
+	// A non-primary deployment never planned locally, so materializing the
+	// primary's reviewed DDL could silently replay it against a deployment whose
+	// schema has drifted. Recompute this deployment's own diff against its live
+	// schema and refuse unless it exactly matches the dispatched (reviewed) DDL,
+	// keeping unreviewed DDL from being applied. The comparison is shard-aware: a
+	// shard-scoped dispatch is checked against the re-plan restricted to its shard.
+	if err := c.verifyMaterializedPlanMatchesLiveSchema(ctx, req, schemaFiles); err != nil {
+		return nil, fmt.Errorf("materialize plan %s: %w", req.PlanId, err)
+	}
 
 	target := req.Target
 	if target == "" {
