@@ -532,6 +532,79 @@ func TestE2ECutoverCommandRecordsDurableRequest(t *testing.T) {
 	assertReactionEventually(t, reactions)
 }
 
+// TestE2ESkipRevertCommandAcceptsApplyID is the regression guard for the
+// "Missing Apply ID" bug: a `schemabot skip-revert <apply-id> -e staging` PR
+// comment must parse the positional apply ID and be accepted, not rejected as
+// missing. It drives the full comment → dispatch → handler path against a
+// PlanetScale apply in its revert window.
+func TestE2ESkipRevertCommandAcceptsApplyID(t *testing.T) {
+	ctx := t.Context()
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+
+	store := mysqlstore.New(schemabotDB)
+	applyIdentifier := "apply_5e6f7890"
+	database := "skip_revert_pr_comments_db"
+	cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+	t.Cleanup(func() {
+		cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+		utils.CloseAndLog(schemabotDB)
+	})
+
+	applyID := createStopCommandApply(t, store, applyIdentifier, database)
+	storedApply, err := store.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	// Skip-revert is only valid for a PlanetScale apply in its revert window.
+	storedApply.Engine = storage.EnginePlanetScale
+	storedApply.State = state.Apply.RevertWindow
+	require.NoError(t, store.Applies().Update(ctx, storedApply))
+
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+	reactions := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Content string `json:"content"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		reactions <- body.Content
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	service := apiServiceForStopCommandTest(t, store, database)
+	service.RegisterTernClient(database, "staging", &stopCommandTernClient{remote: true})
+	h := &Handler{
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
+	}
+
+	postSkipRevertCommand(t, h, applyIdentifier, "alice")
+	comment := readComment(t, comments)
+	// Accepted (not the "Missing Apply ID" rejection) proves the positional apply
+	// ID was parsed from the comment.
+	assert.Contains(t, comment, "Skip-Revert Request Accepted")
+	assert.Contains(t, comment, "`"+applyIdentifier+"`")
+
+	logs, err := store.ApplyLogs().List(ctx, storage.ApplyLogFilter{ApplyID: applyID, Limit: 20})
+	require.NoError(t, err)
+	assert.True(t, applyLogContains(logs, "Skip-revert triggered by user"))
+
+	assertReactionEventually(t, reactions)
+}
+
 // TestE2ECutoverCommandRejectsPendingStop verifies that a PR comment cutover
 // command honors an outstanding stop request for the same apply, preserving the
 // operator's stop intent and surfacing the rejection back to the PR.
@@ -740,6 +813,19 @@ func postCutoverCommand(t *testing.T, h *Handler, applyIdentifier, user string) 
 	assert.Contains(t, rr.Body.String(), "cutover started")
 }
 
+func postSkipRevertCommand(t *testing.T, h *Handler, applyIdentifier, user string) {
+	t.Helper()
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment:   "schemabot skip-revert " + applyIdentifier + " -e staging",
+		userLogin: user,
+		isPR:      true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "skip-revert started")
+}
+
 func readComment(t *testing.T, comments chan string) string {
 	t.Helper()
 	select {
@@ -825,7 +911,7 @@ func (c *stopCommandTernClient) Revert(context.Context, *ternv1.RevertRequest) (
 }
 
 func (c *stopCommandTernClient) SkipRevert(context.Context, *ternv1.SkipRevertRequest) (*ternv1.SkipRevertResponse, error) {
-	return nil, nil
+	return &ternv1.SkipRevertResponse{Accepted: true}, nil
 }
 
 func (c *stopCommandTernClient) Health(context.Context) error { return nil }
