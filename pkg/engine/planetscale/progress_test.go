@@ -351,4 +351,9 @@ func TestPSDisplayMetadata(t *testing.T) {
 		assert.Nil(t, psDisplayMetadata(&psMetadata{}))
 		assert.Nil(t, psDisplayMetadata(nil))
 	})
+	t.Run("projects the revert window deadline so the comment and CLI can show time remaining", func(t *testing.T) {
+		expires := time.Date(2026, 6, 30, 17, 22, 28, 0, time.UTC)
+		m := psDisplayMetadata(&psMetadata{BranchName: "b", RevertExpiresAt: &expires})
+		assert.Equal(t, "2026-06-30T17:22:28Z", m["revert_expires_at"])
+	})
 }

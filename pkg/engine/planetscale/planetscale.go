@@ -444,6 +444,14 @@ type psMetadata struct {
 	IsInstant        bool       `json:"is_instant,omitempty"`
 	DeferredDeploy   bool       `json:"deferred_deploy,omitempty"`
 
+	// RevertExpiresAt is the deadline when the revert window closes, stamped by
+	// the data plane (deployed_at + the configured window). The engine does not
+	// compute it, but models it here so it survives the metadata round-trip and
+	// is surfaced through the display-metadata projection — the same path the
+	// storage-served projection (PSDisplayMetadata) uses — so the PR comment and
+	// CLI can show the time remaining during the revert window.
+	RevertExpiresAt *time.Time `json:"revert_expires_at,omitempty"`
+
 	// VSchemaStatus tracks the deploy's VSchema-application phase so it can be
 	// surfaced from stored state without a synthetic task row. Empty when the
 	// deploy carries no VSchema change; "applying" once the deploy reaches the

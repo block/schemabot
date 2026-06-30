@@ -615,6 +615,9 @@ func psDisplayMetadata(meta *psMetadata) map[string]string {
 	if meta.DeferredDeploy {
 		set("deferred_deploy", "true")
 	}
+	if meta.RevertExpiresAt != nil {
+		set("revert_expires_at", meta.RevertExpiresAt.UTC().Format(time.RFC3339))
+	}
 	// Project per-keyspace VSchema state. A PlanetScale deploy has a single
 	// VSchema phase, so every changed keyspace carries the same deploy-level
 	// status; the per-keyspace shape lets engines that apply VSchema per keyspace
