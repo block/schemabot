@@ -361,7 +361,8 @@ const (
 	// correlated to this apply. Transient during setup/recovery.
 	PerShardUnavailableNoChangeContext = "no_change_context"
 	// PerShardUnavailableNoShardRows means the per-shard query ran but returned
-	// no rows for this schema change while the apply was active.
+	// no rows for this schema change while the apply was active. Can occur
+	// transiently at the start of the copy phase, before shard rows register.
 	PerShardUnavailableNoShardRows = "no_shard_rows"
 )
 

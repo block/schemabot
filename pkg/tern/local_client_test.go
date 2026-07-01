@@ -2477,11 +2477,12 @@ func TestHandleAtomicProgressTickReleasesAtCutoverBarrier(t *testing.T) {
 }
 
 // When a sharded engine reaches an active state but cannot report per-shard or
-// row-copy progress (e.g. the target resolved without a vtgate DSN), the drive
-// surfaces the reason once per apply at Warn — always visible in Datadog without
-// enabling debug logging. It fires once (not per poll) and stays silent during
-// setup states, where a missing schema-change context is transient rather than
-// a degraded target resolution.
+// row-copy progress for a reason that persists for the whole apply (the target
+// resolved without a vtgate DSN), the drive surfaces it once per apply at Warn —
+// always visible in Datadog without enabling debug logging. It fires once (not
+// per poll), stays silent during setup states, and stays silent for transient
+// reasons (schema-change context still being discovered, shard rows not yet
+// registered) that can self-heal on a later poll.
 func TestHandleAtomicProgressTickPerShardUnavailableWarn(t *testing.T) {
 	newApply := func() *storage.Apply {
 		return &storage.Apply{
@@ -2492,11 +2493,14 @@ func TestHandleAtomicProgressTickPerShardUnavailableWarn(t *testing.T) {
 			State:           state.Apply.Running,
 		}
 	}
-	engineAt := func(es engine.State) *fakeControlEngine {
+	engineWithReason := func(es engine.State, reason string) *fakeControlEngine {
 		return &fakeControlEngine{progressResult: &engine.ProgressResult{
 			State:                       es,
-			PerShardProgressUnavailable: engine.PerShardUnavailableNoVtgateDSN,
+			PerShardProgressUnavailable: reason,
 		}}
+	}
+	engineAt := func(es engine.State) *fakeControlEngine {
+		return engineWithReason(es, engine.PerShardUnavailableNoVtgateDSN)
 	}
 	runTicks := func(t *testing.T, eng *fakeControlEngine, ticks int) []capturedLog {
 		t.Helper()
@@ -2545,6 +2549,13 @@ func TestHandleAtomicProgressTickPerShardUnavailableWarn(t *testing.T) {
 	t.Run("stays silent during setup states", func(t *testing.T) {
 		warnings := unavailableWarnings(runTicks(t, engineAt(engine.StateWaitingForDeploy), 3))
 		assert.Empty(t, warnings, "no warning before the apply reaches an active copy state")
+	})
+
+	t.Run("stays silent for transient reasons that can self-heal", func(t *testing.T) {
+		for _, reason := range []string{engine.PerShardUnavailableNoChangeContext, engine.PerShardUnavailableNoShardRows} {
+			warnings := unavailableWarnings(runTicks(t, engineWithReason(engine.StateRunning, reason), 3))
+			assert.Empty(t, warnings, "reason %s can resolve on a later poll and must not latch a warning", reason)
+		}
 	})
 }
 
