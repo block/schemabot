@@ -153,9 +153,14 @@ func changeSetMultiset(cs ChangeSet) (driftChangeMultiset, map[string]bool, erro
 			if tc == nil {
 				return nil, nil, fmt.Errorf("nil table change in namespace %q", ns)
 			}
-			// VSchema carries no table DDL; it is counted by parity above.
+			// In the plan/proto representation a vschema change is signalled via
+			// Metadata["vschema_changed"] and carries no table DDL. A vschema table
+			// change indicates malformed input (e.g. a change set built from an
+			// apply request's DdlChanges), so fail closed rather than skip it and
+			// risk a false match. Checked before the shard skip so a sharded
+			// namespace cannot smuggle one through.
 			if tc.ChangeType == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
-				continue
+				return nil, nil, fmt.Errorf("namespace %q table change %q carries a vschema change; vschema must be represented via metadata, not table DDL", ns, tc.TableName)
 			}
 			hasTableChanges = true
 			// A namespace carried by shard rows is counted authoritatively there;

@@ -229,3 +229,21 @@ func TestCompareChangeSets_InconsistentShardShapeFailsClosed(t *testing.T) {
 	_, err := CompareChangeSets(baseline, candidate)
 	require.Error(t, err)
 }
+
+// A vschema change represented as a table DDL entry (rather than via metadata)
+// is malformed plan/proto input and fails closed.
+func TestCompareChangeSets_VSchemaTableChangeFailsClosed(t *testing.T) {
+	baseline := protoNonShardedSet(protoAlterUsersEmail())
+	candidate := ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace: "testapp",
+		TableChanges: []*ternv1.TableChange{{
+			TableName:  "users",
+			Ddl:        "",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
+			Namespace:  "testapp",
+		}},
+	}}}
+
+	_, err := CompareChangeSets(baseline, candidate)
+	require.Error(t, err)
+}

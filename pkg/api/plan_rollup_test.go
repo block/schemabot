@@ -131,3 +131,18 @@ func TestRollupDeploymentDiffs_SingleDeploymentClean(t *testing.T) {
 	require.Len(t, rollup.Entries, 1)
 	assert.Equal(t, DeploymentMatch, rollup.Entries[0].Class)
 }
+
+// A single-deployment rollup whose primary baseline carries unparseable DDL
+// fails closed: the primary is errored and the rollup blocks, rather than
+// matching itself without a trustworthy comparison ever running.
+func TestRollupDeploymentDiffs_MalformedSingleDeploymentBaselineBlocks(t *testing.T) {
+	diffs := []DeploymentPlanDiff{
+		rollupDeployment("eu", rollupAlterUsers("not valid sql")),
+	}
+	rollup, err := RollupDeploymentDiffs(diffs)
+	require.NoError(t, err)
+	assert.False(t, rollup.Clean)
+	require.Len(t, rollup.Entries, 1)
+	assert.Equal(t, DeploymentErrored, rollup.Entries[0].Class)
+	require.Error(t, rollup.Entries[0].Err)
+}

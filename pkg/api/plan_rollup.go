@@ -75,6 +75,19 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff) (PlanRollup, error) {
 	baseline := tern.ChangeSet{Changes: diffs[0].Changes, Shards: diffs[0].Shards}
 	baselineUsable := diffs[0].Err == nil
 
+	// Validate the baseline is internally well-formed before trusting it as the
+	// comparison target. A self-comparison surfaces malformed or unparseable
+	// change content that would otherwise let a single-deployment rollup report
+	// clean, or classify the primary as a match, without a trustworthy comparison
+	// ever running.
+	var baselineErr error
+	if baselineUsable {
+		if _, err := tern.CompareChangeSets(baseline, baseline); err != nil {
+			baselineUsable = false
+			baselineErr = err
+		}
+	}
+
 	entries := make([]DeploymentRollupEntry, len(diffs))
 	clean := true
 	for i, d := range diffs {
@@ -89,13 +102,20 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff) (PlanRollup, error) {
 			entry.Err = d.Err
 			clean = false
 		case i == 0:
-			// The reviewed primary plan is the baseline; it matches itself.
-			entry.Class = DeploymentMatch
+			// The reviewed primary plan is the baseline. It matches itself only when
+			// its own content is well-formed; malformed content makes it unusable.
+			if baselineErr != nil {
+				entry.Class = DeploymentErrored
+				entry.Err = fmt.Errorf("reviewed primary plan is not a usable baseline: %w", baselineErr)
+				clean = false
+			} else {
+				entry.Class = DeploymentMatch
+			}
 		case !baselineUsable:
 			// Without a usable baseline no deployment can be confirmed to match, so
 			// every deployment blocks rather than being compared to nothing.
 			entry.Class = DeploymentErrored
-			entry.Err = fmt.Errorf("primary reviewed plan unavailable; cannot confirm deployment matches the reviewed changes")
+			entry.Err = fmt.Errorf("primary reviewed plan is not a usable baseline; cannot confirm deployment matches the reviewed changes")
 			clean = false
 		default:
 			diff, err := tern.CompareChangeSets(baseline, tern.ChangeSet{Changes: d.Changes, Shards: d.Shards})
