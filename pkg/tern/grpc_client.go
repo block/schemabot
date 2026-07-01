@@ -623,6 +623,45 @@ func (c *GRPCClient) processPendingSkipRevertControlRequest(ctx context.Context,
 	return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationSkipRevert)
 }
 
+// processPendingRevertControlRequest drives a durable revert control request for
+// a remote apply: it proxies Revert to the data plane and completes the request.
+// This is the apply owner's retry path when the API's immediate revert attempt
+// failed or its process died, leaving the request pending. A transient failure
+// returns an error so the drive exits and the operator retries (the request
+// stays pending); a rejected revert fails the request.
+func (c *GRPCClient) processPendingRevertControlRequest(ctx context.Context, apply *storage.Apply, remoteID string) error {
+	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationRevert)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		return nil
+	}
+	// Revert is only meaningful in the revert window. Once the apply has left it
+	// (finalized, reverted, …) the request is moot — complete it so it does not
+	// linger.
+	if !state.IsState(apply.State, state.Apply.RevertWindow) {
+		return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert)
+	}
+	resp, err := c.client.Revert(ctx, &ternv1.RevertRequest{
+		ApplyId:     remoteID,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		return fmt.Errorf("process pending revert for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if !resp.Accepted {
+		message := "revert was not accepted by the data plane"
+		if resp.ErrorMessage != "" {
+			message = fmt.Sprintf("revert was not accepted: %s", resp.ErrorMessage)
+		}
+		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert, message)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventRevertTriggered,
+		fmt.Sprintf("Revert triggered by user%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+	return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert)
+}
+
 // logOperationDriveLeavesParentStop records that a multi-operation
 // operation-only drive observed an apply-level pending stop request and is
 // leaving it pending. Such a drive owns only its operation; the parent stop
@@ -3026,6 +3065,15 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			}
 			if err := c.processPendingSkipRevertControlRequest(ctx, apply, scope.remoteApplyID(apply)); err != nil {
 				slog.Warn("pending gRPC skip-revert request processing failed; current apply owner will exit for operator retry",
+					"apply_id", apply.ApplyIdentifier,
+					"external_id", apply.ExternalID,
+					"database", apply.Database,
+					"environment", apply.Environment,
+					"error", err)
+				return err
+			}
+			if err := c.processPendingRevertControlRequest(ctx, apply, scope.remoteApplyID(apply)); err != nil {
+				slog.Warn("pending gRPC revert request processing failed; current apply owner will exit for operator retry",
 					"apply_id", apply.ApplyIdentifier,
 					"external_id", apply.ExternalID,
 					"database", apply.Database,

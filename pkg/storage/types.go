@@ -750,6 +750,12 @@ const (
 	ControlOperationCancel ControlOperation = "cancel"
 	// ControlOperationCutover triggers deferred cutover.
 	ControlOperationCutover ControlOperation = "cutover"
+	// ControlOperationRevert undoes a completed PlanetScale schema change during
+	// its revert window. Durable so a comment-driven revert survives the API
+	// process dying before the engine call lands, and so the apply owner (which
+	// for a remote apply is the data-plane operator, not the webhook pod) drives
+	// it to completion.
+	ControlOperationRevert ControlOperation = "revert"
 	// ControlOperationSkipRevert closes the revert window, making a PlanetScale
 	// schema change permanent. Durable so a comment-driven skip-revert survives
 	// the API process dying before the engine call lands, and so the apply owner

@@ -467,6 +467,7 @@ type capturingTernServer struct {
 	startApplyID      string
 	cutoverApplyID    string
 	skipRevertApplyID string
+	revertApplyID     string
 	progressApplyID   string
 	progressReq       *ternv1.ProgressRequest
 	progressState     ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
@@ -547,6 +548,13 @@ func (s *capturingTernServer) SkipRevert(_ context.Context, req *ternv1.SkipReve
 	return &ternv1.SkipRevertResponse{Accepted: true}, nil
 }
 
+func (s *capturingTernServer) Revert(_ context.Context, req *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
+	s.mu.Lock()
+	s.revertApplyID = req.ApplyId
+	s.mu.Unlock()
+	return &ternv1.RevertResponse{Accepted: true}, nil
+}
+
 func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	s.mu.Lock()
 	s.progressReq = &ternv1.ProgressRequest{
@@ -596,6 +604,12 @@ func (s *capturingTernServer) getSkipRevertApplyID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.skipRevertApplyID
+}
+
+func (s *capturingTernServer) getRevertApplyID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revertApplyID
 }
 
 func (s *capturingTernServer) getCutoverApplyID() string {
@@ -4534,6 +4548,58 @@ func TestGRPCClient_ProcessPendingSkipRevert(t *testing.T) {
 		require.NoError(t, err)
 		assert.Empty(t, server.getSkipRevertApplyID(), "no engine call once the revert window is gone")
 		pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationSkipRevert)
+		require.NoError(t, err)
+		assert.Nil(t, pending, "moot request completed")
+	})
+}
+
+func TestGRPCClient_ProcessPendingRevert(t *testing.T) {
+	newApply := func(s string) *storage.Apply {
+		return &storage.Apply{
+			ID: 1, ApplyIdentifier: "apply-revert-grpc",
+			Database: "testdb", DatabaseType: storage.DatabaseTypeVitess,
+			Environment: "staging", Engine: storage.EnginePlanetScale,
+			ExternalID: "remote-revert-grpc", State: s,
+		}
+	}
+	newStore := func(apply *storage.Apply) (*mockStorage, *testControlRequestStore) {
+		controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+			ApplyID: apply.ID, Operation: storage.ControlOperationRevert,
+			Status: storage.ControlRequestPending, RequestedBy: "cli:alice",
+		}}}
+		stored := *apply
+		applies := &mockApplyStore{apply: &stored}
+		return &mockStorage{applies: applies, tasks: &mockTaskStore{}, logs: &mockApplyLogStore{}, controlRequests: controlRequests}, controlRequests
+	}
+
+	t.Run("revert window: proxies revert and completes the request", func(t *testing.T) {
+		server := &capturingTernServer{}
+		client, cleanup := testCapturingGRPCClient(t, server)
+		defer cleanup()
+		apply := newApply(state.Apply.RevertWindow)
+		store, controlRequests := newStore(apply)
+		client.storage = store
+
+		err := client.processPendingRevertControlRequest(t.Context(), apply, apply.ExternalID)
+		require.NoError(t, err)
+		assert.Equal(t, "remote-revert-grpc", server.getRevertApplyID(), "revert proxied to the data plane")
+		pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationRevert)
+		require.NoError(t, err)
+		assert.Nil(t, pending, "request completed after a successful revert")
+	})
+
+	t.Run("apply already left the revert window: completes without an engine call", func(t *testing.T) {
+		server := &capturingTernServer{}
+		client, cleanup := testCapturingGRPCClient(t, server)
+		defer cleanup()
+		apply := newApply(state.Apply.Completed)
+		store, controlRequests := newStore(apply)
+		client.storage = store
+
+		err := client.processPendingRevertControlRequest(t.Context(), apply, apply.ExternalID)
+		require.NoError(t, err)
+		assert.Empty(t, server.getRevertApplyID(), "no engine call once the revert window is gone")
+		pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationRevert)
 		require.NoError(t, err)
 		assert.Nil(t, pending, "moot request completed")
 	})

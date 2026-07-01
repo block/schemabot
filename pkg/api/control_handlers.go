@@ -1962,23 +1962,75 @@ func (s *Service) ExecuteRevert(ctx context.Context, req apitypes.ControlRequest
 	return resp, err
 }
 
+// executeRevertForApply records durable revert intent and attempts an immediate
+// revert. The returned HTTP status is meaningful only when err == nil; error
+// paths return a zero status and callers derive it from the error.
 func (s *Service) executeRevertForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.ControlResponse, int, error) {
+	// Revert is only meaningful while the apply is in its revert window; gating
+	// here keeps a non-revert-window apply from accumulating a permanently-pending
+	// revert request.
+	if !state.IsState(apply.State, state.Apply.RevertWindow) {
+		metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, controlConflictf("schema change is not in its revert window (current state: %s)", apply.State)
+	}
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, 0, fmt.Errorf("control request store is not available")
+	}
+
+	// Record durable revert intent before the engine call, so a comment-driven
+	// revert survives the API process dying before the call lands, and so the
+	// apply owner (the data-plane operator for a remote apply, not the webhook
+	// pod) can drive it to completion.
+	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationRevert,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: caller,
+	})
+	if err != nil {
+		metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, 0, fmt.Errorf("record revert control request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if alreadyPending {
+		// A prior revert request is already queued; do not re-drive the engine.
+		// The apply owner is completing the existing one.
+		metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, "success")
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventRevertTriggered, "Revert requested by user while revert request already pending")
+		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+		return &apitypes.ControlResponse{Accepted: true, Status: apitypes.ControlStatusAlreadyRequested}, http.StatusAccepted, nil
+	}
+	s.logControlOperationForApply(ctx, apply, caller, storage.LogEventRevertTriggered, "Revert triggered by user")
+
+	// Attempt the revert immediately. If it fails or this process dies, the
+	// durable request remains pending for the apply owner to retry.
 	resp, err := client.Revert(ctx, &ternv1.RevertRequest{
 		ApplyId:     ternApplyID,
 		Environment: apply.Environment,
 	})
 	if err != nil {
 		metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, "error")
-		return nil, 0, fmt.Errorf("revert apply %s: %w", apply.ApplyIdentifier, err)
+		s.logger.Warn("immediate revert failed; durable request remains pending for apply owner retry",
+			append(apply.LogAttrs(), "error", err)...)
+		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
 	}
 	metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
+
 	if resp.Accepted {
-		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventRevertTriggered, "Revert triggered by user")
+		// The engine accepted the revert; the durable request's work is done.
+		if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationRevert); err != nil {
+			s.logger.Warn("failed to complete revert control request after immediate success; operator will reconcile",
+				append(apply.LogAttrs(), "error", err)...)
+		}
+	} else if err := controlStore.FailPending(ctx, apply.ID, storage.ControlOperationRevert, resp.ErrorMessage); err != nil {
+		s.logger.Warn("failed to fail rejected revert control request",
+			append(apply.LogAttrs(), "error", err)...)
 	}
-	return &apitypes.ControlResponse{
-		Accepted:     resp.Accepted,
-		ErrorMessage: resp.ErrorMessage,
-	}, http.StatusOK, nil
+	s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+
+	return &apitypes.ControlResponse{Accepted: resp.Accepted, ErrorMessage: resp.ErrorMessage}, http.StatusOK, nil
 }
 
 // SkipRevertRequest is the HTTP request body for POST /api/skip-revert.

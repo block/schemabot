@@ -678,6 +678,14 @@ func TestE2ERevertCommandRevertsApply(t *testing.T) {
 	ternClient.mu.Unlock()
 	assert.Equal(t, 1, revertCalls, "the data-plane revert should be invoked exactly once")
 
+	// Revert is a durable control request, like the other control operations, so
+	// it survives an API restart and can be driven by the apply owner. The
+	// immediate attempt succeeded here, so the request lands completed.
+	controlReq, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationRevert)
+	require.NoError(t, err)
+	require.NotNil(t, controlReq, "revert should record a durable control request")
+	assert.Equal(t, storage.ControlRequestCompleted, controlReq.Status)
+
 	assertReactionEventually(t, reactions)
 }
 

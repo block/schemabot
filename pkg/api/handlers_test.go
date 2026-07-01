@@ -5058,7 +5058,12 @@ func TestRevertHandler(t *testing.T) {
 		mock := &mockTernClient{
 			revertResp: &ternv1.RevertResponse{Accepted: true},
 		}
-		svc := newControlTestService(mock, activeTestApply("apply-rev123"))
+		// Revert is only accepted while the apply is in its revert window.
+		apply := activeTestApply("apply-rev123")
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EnginePlanetScale
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		svc := newControlTestService(mock, apply)
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
