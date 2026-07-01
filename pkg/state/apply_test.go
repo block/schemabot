@@ -75,6 +75,21 @@ func TestDeriveApplyState_AnyReverted(t *testing.T) {
 	}
 }
 
+// A revert in flight surfaces the apply as reverting, and outranks a
+// fully-reverted sibling so a multi-table revert reads as in-progress until
+// every table has finished reverting.
+func TestDeriveApplyState_Reverting(t *testing.T) {
+	testCases := [][]string{
+		{"REVERTING"},
+		{"COMPLETED", "REVERTING"},
+		{"REVERTING", "REVERTED"},
+	}
+
+	for _, states := range testCases {
+		assert.Equal(t, Apply.Reverting, DeriveApplyState(states), "input: %v", states)
+	}
+}
+
 func TestDeriveApplyState_AnyRunning(t *testing.T) {
 	testCases := [][]string{
 		{"RUNNING"},

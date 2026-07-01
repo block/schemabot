@@ -779,7 +779,7 @@ func deployStateToEngineState(drState string) engine.State {
 	case deployState.CompleteCancel, deployState.Cancelled:
 		return engine.StateCancelled
 	case deployState.InProgressRevert, deployState.InProgressRevertVSchema:
-		return engine.StateRunning
+		return engine.StateReverting
 	case deployState.CompleteRevert:
 		return engine.StateReverted
 	default:

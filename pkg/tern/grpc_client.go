@@ -2957,6 +2957,8 @@ func applyProgressRank(applyState string) int {
 		return 10
 	case state.Apply.SkippingRevert:
 		return 11
+	case state.Apply.Reverting:
+		return 12
 	default:
 		return 0
 	}

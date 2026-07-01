@@ -94,6 +94,10 @@ const (
 	State_STATE_VALIDATING_DEPLOY_REQUEST State = 15
 	State_STATE_VALIDATING_BRANCH         State = 16
 	State_STATE_RECOVERING                State = 17
+	// Reverting a completed change during its revert window (revert_window ->
+	// reverting -> reverted). Distinct from running so a multi-minute revert is
+	// not surfaced as an ordinary in-progress apply.
+	State_STATE_REVERTING State = 18
 )
 
 // Enum value maps for State.
@@ -117,6 +121,7 @@ var (
 		15: "STATE_VALIDATING_DEPLOY_REQUEST",
 		16: "STATE_VALIDATING_BRANCH",
 		17: "STATE_RECOVERING",
+		18: "STATE_REVERTING",
 	}
 	State_value = map[string]int32{
 		"STATE_NO_ACTIVE_CHANGE":          0,
@@ -137,6 +142,7 @@ var (
 		"STATE_VALIDATING_DEPLOY_REQUEST": 15,
 		"STATE_VALIDATING_BRANCH":         16,
 		"STATE_RECOVERING":                17,
+		"STATE_REVERTING":                 18,
 	}
 )
 
@@ -3369,7 +3375,7 @@ const file_tern_proto_rawDesc = "" +
 	"\x06Engine\x12\x11\n" +
 	"\rENGINE_SPIRIT\x10\x00\x12\x16\n" +
 	"\x12ENGINE_PLANETSCALE\x10\x01\x12\x11\n" +
-	"\rENGINE_STRATA\x10\x02*\xd4\x03\n" +
+	"\rENGINE_STRATA\x10\x02*\xe9\x03\n" +
 	"\x05State\x12\x1a\n" +
 	"\x16STATE_NO_ACTIVE_CHANGE\x10\x00\x12\x11\n" +
 	"\rSTATE_PENDING\x10\x01\x12\x11\n" +
@@ -3389,7 +3395,8 @@ const file_tern_proto_rawDesc = "" +
 	"\x18STATE_WAITING_FOR_DEPLOY\x10\x0e\x12#\n" +
 	"\x1fSTATE_VALIDATING_DEPLOY_REQUEST\x10\x0f\x12\x1b\n" +
 	"\x17STATE_VALIDATING_BRANCH\x10\x10\x12\x14\n" +
-	"\x10STATE_RECOVERING\x10\x11*\x81\x01\n" +
+	"\x10STATE_RECOVERING\x10\x11\x12\x13\n" +
+	"\x0fSTATE_REVERTING\x10\x12*\x81\x01\n" +
 	"\n" +
 	"ChangeType\x12\x15\n" +
 	"\x11CHANGE_TYPE_OTHER\x10\x00\x12\x16\n" +

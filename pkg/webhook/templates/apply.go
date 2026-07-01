@@ -222,6 +222,8 @@ func applyStatusDetail(applyState string) string {
 		return "Cancelled"
 	case state.Apply.RevertWindow:
 		return "Revert Window"
+	case state.Apply.Reverting:
+		return "Reverting"
 	case state.Apply.Pending:
 		return "Starting"
 	case state.Apply.Running, state.Apply.RunningDegraded:

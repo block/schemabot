@@ -1116,6 +1116,20 @@ func PreviewCommentApplySkippingRevert() string {
 	return RenderApplyStatusComment(data)
 }
 
+// PreviewCommentApplyReverting renders a PlanetScale apply while its revert is in
+// progress: the change is being undone, which can take minutes, so it surfaces
+// as reverting rather than an ordinary in-progress apply.
+func PreviewCommentApplyReverting() string {
+	tables := sampleApplyTables()
+	for i := range tables {
+		tables[i].Status = state.Task.Reverting
+	}
+	data := sampleApplyData(state.Apply.Reverting, tables)
+	data.Engine = "PlanetScale"
+	data.DeployRequestURL = "https://app.planetscale.com/acme/myapp/deploy-requests/42"
+	return RenderApplyStatusComment(data)
+}
+
 // =============================================================================
 // Multi-Deployment Apply Previews (MD-10)
 // =============================================================================

@@ -6,10 +6,23 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// The reverting state round-trips across the engine, task, and proto boundaries
+// so a revert in progress is reported end-to-end as "reverting" rather than
+// collapsing to a generic running apply.
+func TestRevertingStateConversions(t *testing.T) {
+	assert.Equal(t, state.Task.Reverting, engineStateToStorage(engine.StateReverting))
+	assert.Equal(t, ternv1.State_STATE_REVERTING, storageStateToProto(state.Task.Reverting))
+	assert.Equal(t, ternv1.State_STATE_REVERTING, storageStateToProto(state.Apply.Reverting))
+	assert.Equal(t, state.Apply.Reverting, ProtoStateToStorage(ternv1.State_STATE_REVERTING))
+	assert.False(t, isTerminalProtoState(ternv1.State_STATE_REVERTING), "reverting is in-flight, not terminal")
+}
 
 // A null namespace value in the proto map (e.g. JSON `{"default": null}`)
 // converts to an empty namespace rather than dereferencing a nil pointer.

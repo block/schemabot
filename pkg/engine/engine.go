@@ -383,6 +383,7 @@ const (
 	StateWaitingForCutover State = "waiting_for_cutover"
 	StateCuttingOver       State = "cutting_over"
 	StateRevertWindow      State = "revert_window"
+	StateReverting         State = "reverting"
 	StateCompleted         State = "completed"
 	StateFailed            State = "failed"
 	StateStopped           State = "stopped"

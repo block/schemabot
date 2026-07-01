@@ -18,6 +18,7 @@ var Task = struct {
 	Recovering        string
 	CuttingOver       string
 	RevertWindow      string
+	Reverting         string
 	Completed         string
 	Failed            string
 	FailedRetryable   string
@@ -33,6 +34,7 @@ var Task = struct {
 	Recovering:        "recovering",
 	CuttingOver:       "cutting_over",
 	RevertWindow:      "revert_window",
+	Reverting:         "reverting",
 	Completed:         "completed",
 	Failed:            "failed",
 	FailedRetryable:   "failed_retryable",
@@ -71,7 +73,7 @@ func IsTerminalTaskState(s string) bool {
 // whether to resume or retry — so they are excluded here.
 func IsInFlightTaskState(s string) bool {
 	switch NormalizeState(s) {
-	case Task.Running, Task.Checksumming, Task.WaitingForCutover, Task.CuttingOver, Task.WaitingForDeploy, Task.Recovering:
+	case Task.Running, Task.Checksumming, Task.WaitingForCutover, Task.CuttingOver, Task.WaitingForDeploy, Task.Recovering, Task.Reverting:
 		return true
 	default:
 		return false
@@ -139,7 +141,7 @@ func NormalizeTaskStatus(raw string) string {
 
 	// Pass-through for already-normalized values
 	case Task.Pending, Task.Running, Task.Checksumming, Task.Completed, Task.Stopped, Task.Failed,
-		Task.FailedRetryable, Task.RevertWindow, Task.Reverted,
+		Task.FailedRetryable, Task.RevertWindow, Task.Reverting, Task.Reverted,
 		Task.WaitingForDeploy, Task.WaitingForCutover, Task.Recovering,
 		Task.CuttingOver, Task.Cancelled:
 		return s
@@ -149,7 +151,7 @@ func NormalizeTaskStatus(raw string) string {
 	case NormalizeState(string(vitessstatus.OnlineDDLStatusComplete)):
 		return Task.Completed
 	case Task.Pending, Task.Running, Task.Checksumming, Task.Completed, Task.Stopped, Task.Failed,
-		Task.FailedRetryable, Task.RevertWindow, Task.Reverted,
+		Task.FailedRetryable, Task.RevertWindow, Task.Reverting, Task.Reverted,
 		Task.WaitingForDeploy, Task.WaitingForCutover, Task.Recovering,
 		Task.CuttingOver, Task.Cancelled:
 		return normalized

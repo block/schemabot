@@ -240,6 +240,7 @@ func previewCommentApplyFlowAllOutput() {
 		// Revert-window states (PlanetScale): deployed-but-revertable, then finalizing.
 		{"REVERT WINDOW", func() { fmt.Print(webhooktemplates.PreviewCommentApplyRevertWindow()) }},
 		{"SKIPPING REVERT", func() { fmt.Print(webhooktemplates.PreviewCommentApplySkippingRevert()) }},
+		{"REVERTING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyReverting()) }},
 		{"START COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentStartCommandAccepted()) }},
 		{"START COMMAND ALREADY PENDING", func() { fmt.Print(webhooktemplates.PreviewCommentStartCommandAlreadyRequested()) }},
 		{"CUTOVER COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted()) }},

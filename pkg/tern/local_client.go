@@ -2469,6 +2469,10 @@ func activeTaskProgressRank(taskState string) (int, bool) {
 		return 5, true
 	case state.Task.RevertWindow:
 		return 6, true
+	case state.Task.Reverting:
+		// Undoing the change after the revert window; ranks after RevertWindow so
+		// a reverting table never regresses to the resumable-window phase.
+		return 7, true
 	default:
 		return 0, false
 	}

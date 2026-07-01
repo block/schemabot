@@ -241,6 +241,10 @@ enum State {
   STATE_VALIDATING_DEPLOY_REQUEST = 15;
   STATE_VALIDATING_BRANCH = 16;
   STATE_RECOVERING = 17;
+  // Reverting a completed change during its revert window (revert_window ->
+  // reverting -> reverted). Distinct from running so a multi-minute revert is
+  // not surfaced as an ordinary in-progress apply.
+  STATE_REVERTING = 18;
 }
 
 // ChangeType represents the type of schema change.
