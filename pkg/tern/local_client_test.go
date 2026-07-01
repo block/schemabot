@@ -2476,6 +2476,78 @@ func TestHandleAtomicProgressTickReleasesAtCutoverBarrier(t *testing.T) {
 	})
 }
 
+// When a sharded engine reaches an active state but cannot report per-shard or
+// row-copy progress (e.g. the target resolved without a vtgate DSN), the drive
+// surfaces the reason once per apply at Warn — always visible in Datadog without
+// enabling debug logging. It fires once (not per poll) and stays silent during
+// setup states, where a missing migration context is transient rather than a
+// degraded target resolution.
+func TestHandleAtomicProgressTickPerShardUnavailableWarn(t *testing.T) {
+	newApply := func() *storage.Apply {
+		return &storage.Apply{
+			ID:              11,
+			ApplyIdentifier: "apply-pershard-unavailable",
+			Database:        "testdb",
+			DatabaseType:    storage.DatabaseTypeVitess,
+			State:           state.Apply.Running,
+		}
+	}
+	engineAt := func(es engine.State) *fakeControlEngine {
+		return &fakeControlEngine{progressResult: &engine.ProgressResult{
+			State:                       es,
+			PerShardProgressUnavailable: engine.PerShardUnavailableNoVtgateDSN,
+		}}
+	}
+	runTicks := func(t *testing.T, eng *fakeControlEngine, ticks int) []capturedLog {
+		t.Helper()
+		apply := newApply()
+		opID := int64(1)
+		tasks := []*storage.Task{{
+			TaskIdentifier:   "task-users",
+			ApplyID:          apply.ID,
+			ApplyOperationID: &opID,
+			State:            state.Task.Running,
+			TableName:        "users",
+			Namespace:        "testdb",
+		}}
+		stor := &exactProgressStorage{
+			applies:         &snapshotApplyStore{stored: *apply},
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			controlRequests: &testControlRequestStore{},
+			applyOperations: &listApplyOperationStore{ops: []*storage.ApplyOperation{{ID: opID, State: state.ApplyOperation.Running}}},
+		}
+		var records []capturedLog
+		client := &LocalClient{storage: stor, logger: slog.New(captureHandler{records: &records})}
+		ps := &atomicPollState{lastProgressLog: time.Now()}
+		for range ticks {
+			client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, apply.GetOptions().Map(), false)
+		}
+		return records
+	}
+
+	unavailableWarnings := func(records []capturedLog) []capturedLog {
+		var out []capturedLog
+		for _, r := range records {
+			if r.level == slog.LevelWarn && r.msg == "per-shard progress unavailable: per-shard and row-copy progress will not be reported for this apply" {
+				out = append(out, r)
+			}
+		}
+		return out
+	}
+
+	t.Run("warns once per apply with the reason on an active state", func(t *testing.T) {
+		warnings := unavailableWarnings(runTicks(t, engineAt(engine.StateRunning), 3))
+		require.Len(t, warnings, 1, "the degraded-visibility warning must fire exactly once across polls")
+		assert.Equal(t, engine.PerShardUnavailableNoVtgateDSN, warnings[0].attrs["reason"])
+		assert.Equal(t, "apply-pershard-unavailable", warnings[0].attrs["apply_id"])
+	})
+
+	t.Run("stays silent during setup states", func(t *testing.T) {
+		warnings := unavailableWarnings(runTicks(t, engineAt(engine.StateWaitingForDeploy), 3))
+		assert.Empty(t, warnings, "no warning before the apply reaches an active copy state")
+	})
+}
+
 // capturedLog records a single emitted log record's level, message, and
 // attributes for assertions.
 type capturedLog struct {
