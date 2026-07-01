@@ -130,12 +130,22 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 	if result.Tenant == "" && commandRequiresTenantTarget(result) && h.service != nil && h.service.Config().Tenant != "" {
-		h.logger.Info("ignoring work command without tenant target",
-			"repo", repo, "pr", pr, "tenant", h.service.Config().Tenant, "action", result.Action)
-		h.writeJSON(w, http.StatusOK, map[string]string{
-			"message": "tenant target required",
-		})
-		return
+		if h.fansOutUnscopedCommand(repo) {
+			h.logger.Info("aggregate participant fanning out unscoped work command; applying its own databases",
+				"repo", repo, "pr", pr, "tenant", h.service.Config().Tenant, "action", result.Action)
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:  "aggregate_participant_fanout",
+				Repository: repo,
+				Status:     "success",
+			})
+		} else {
+			h.logger.Info("ignoring work command without tenant target",
+				"repo", repo, "pr", pr, "tenant", h.service.Config().Tenant, "action", result.Action)
+			h.writeJSON(w, http.StatusOK, map[string]string{
+				"message": "tenant target required",
+			})
+			return
+		}
 	}
 
 	// Handle help command
@@ -337,6 +347,20 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 
 func commandRequiresTenantTarget(result CommandResult) bool {
 	return !result.IsHelp && (result.Found || result.MissingEnv)
+}
+
+// fansOutUnscopedCommand reports whether this deployment should self-serve an
+// unscoped work command (no -t tenant) for repo by applying its own databases,
+// rather than ignoring it. An aggregate participant fans out: an unscoped
+// `apply -e <env>` on a shared repo reaches every participant, and each applies
+// only its own databases (its own registry filtered by repo/env/allowed_dirs).
+// A tenanted deployment that is not a participant for repo keeps ignoring
+// unscoped work commands, since per-tenant routing requires an explicit -t.
+func (h *Handler) fansOutUnscopedCommand(repo string) bool {
+	if h.service == nil {
+		return false
+	}
+	return h.service.Config().AggregateRoleForRepo(repo) == api.AggregateRoleParticipant
 }
 
 // postComment posts a comment on a PR.
