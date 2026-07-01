@@ -355,9 +355,9 @@ func TestTenantScopedWorkCommandRouting(t *testing.T) {
 	// post "apply not found" for a database owned by another tenant.
 	t.Run("participant requires -t for rollback and control ops without erroring", func(t *testing.T) {
 		for _, comment := range []string{
-			"schemabot rollback a1b2c3 -e staging",
-			"schemabot stop a1b2c3 -e staging",
-			"schemabot cancel a1b2c3 -e staging",
+			"schemabot rollback apply_a1b2c3 -e staging",
+			"schemabot stop apply_a1b2c3 -e staging",
+			"schemabot cancel apply_a1b2c3 -e staging",
 		} {
 			client, mux := setupGitHubServer(t)
 			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(http.ResponseWriter, *http.Request) {

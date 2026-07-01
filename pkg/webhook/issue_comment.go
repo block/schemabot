@@ -364,16 +364,17 @@ func (h *Handler) fansOutUnscopedCommand(repo string) bool {
 }
 
 // actionFansOutUnscoped reports whether an action is one a participant can serve
-// without an explicit -t, by acting on its own databases. plan and apply cover
-// the participant's share of a shared PR, and unlock releases only the
-// participant's own database locks (locks are keyed by database, not by apply).
-// Commands that target a single apply owned by one tenant — rollback and the
-// lifecycle controls (stop, cancel, start, release, cutover, skip-revert) — are
-// not in this set: an unscoped one would reach every participant and all but the
-// owner would report "apply not found", so they require an explicit -t instead.
+// without an explicit -t, by acting on its own databases. plan, apply, and
+// apply-confirm route by environment/database, so each participant handles its
+// own share of a shared PR; unlock releases only the participant's own database
+// locks (locks are keyed by database, not by apply). Commands that target a
+// single apply owned by one tenant — rollback and the lifecycle controls (stop,
+// cancel, start, release, cutover, skip-revert, revert) — are not in this set:
+// an unscoped one would reach every participant and all but the owner would
+// report "apply not found", so they require an explicit -t instead.
 func actionFansOutUnscoped(a string) bool {
 	switch a {
-	case action.Plan, action.Apply, action.Unlock:
+	case action.Plan, action.Apply, action.ApplyConfirm, action.Unlock:
 		return true
 	default:
 		return false

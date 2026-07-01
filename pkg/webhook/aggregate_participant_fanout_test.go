@@ -43,16 +43,19 @@ func TestSkipUnownedUnscopedCommand(t *testing.T) {
 }
 
 // Fan-out applies only to unscoped commands a participant can serve on its own
-// databases: plan, apply, and unlock. A complete command (Found) fans out; a
-// plan without -e fans out as a multi-env plan; but a missing-env apply does NOT
-// fan out — otherwise every participant on a shared repo would post its own
-// duplicate "missing environment" comment (the leader posts that error once).
-// Commands that target a single apply owned by one tenant — rollback and the
-// lifecycle controls — never fan out; they require an explicit -t so only the
-// owning tenant acts instead of every participant reporting "apply not found".
+// databases: plan, apply, apply-confirm, and unlock. A complete command (Found)
+// fans out; a plan without -e fans out as a multi-env plan; but a missing-env
+// apply does NOT fan out — otherwise every participant on a shared repo would
+// post its own duplicate "missing environment" comment (the leader posts that
+// error once). Commands that target a single apply owned by one tenant —
+// rollback and the lifecycle controls — never fan out; they require an explicit
+// -t so only the owning tenant acts instead of every participant reporting
+// "apply not found".
 func TestUnscopedCommandFansOut(t *testing.T) {
 	assert.True(t, unscopedCommandFansOut(CommandResult{Found: true, Action: action.Apply}),
 		"a complete apply fans out")
+	assert.True(t, unscopedCommandFansOut(CommandResult{Found: true, Action: action.ApplyConfirm}),
+		"apply-confirm fans out with apply: it is the confirmation step of the same per-participant flow")
 	assert.True(t, unscopedCommandFansOut(CommandResult{MissingEnv: true, Action: action.Plan}),
 		"plan without -e fans out as a multi-env plan")
 	assert.True(t, unscopedCommandFansOut(CommandResult{Found: true, Action: action.Unlock}),
@@ -63,7 +66,7 @@ func TestUnscopedCommandFansOut(t *testing.T) {
 	// Commands targeting a single owned apply require an explicit -t.
 	for _, a := range []string{
 		action.Rollback, action.RollbackConfirm, action.Stop, action.Cancel,
-		action.Start, action.Release, action.Cutover, action.SkipRevert,
+		action.Start, action.Release, action.Cutover, action.SkipRevert, action.Revert,
 	} {
 		assert.False(t, unscopedCommandFansOut(CommandResult{Found: true, Action: a}),
 			"%s targets a single owned apply and must require -t", a)
