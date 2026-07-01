@@ -2846,11 +2846,11 @@ func remoteTaskOmittedRowTotals(storedTask *storage.Task, remoteTask *ternv1.Tab
 // syncShardProgressFromRemote mirrors the per-shard progress carried in a remote
 // Tern Progress response into control-plane storage as per-(table, shard) task
 // rows (`shard != ""`), so the PR comment / CLI render the per-shard breakdown and
-// the control plane can see shard drift. Like the in-process drive's write-through
-// (LocalClient.writeShardProgress) it is lease-gated and best-effort: it writes
-// only inside the operator's lease-held reconcile (read-path callers carry no
-// lease and skip), and a failed shard write is logged rather than failing the
-// table-level sync — the next reconcile re-applies it.
+// the control plane can see shard drift. It runs only inside the operator's
+// lease-held reconcile (the gRPC read path renders from storage and never reaches
+// here), so a missing lease or apply_operation is unexpected and warned rather
+// than silently dropping per-shard progress. A failed shard write is logged rather
+// than failing the table-level sync — the next reconcile re-applies it.
 func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedApply *storage.Apply, storedTask *storage.Task, shards []*ternv1.ShardProgress, now time.Time) {
 	if len(shards) == 0 {
 		return
@@ -2858,15 +2858,17 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 	_, hasOpLease := storage.OperationLeaseFromContext(ctx)
 	_, hasApplyLease := storage.ApplyLeaseFromContext(ctx)
 	if !hasOpLease && !hasApplyLease {
-		slog.Debug("skipping remote per-shard progress encode: no lease on reconcile context",
-			"apply_id", storedApply.ApplyIdentifier, "table", storedTask.TableName)
+		// This path is reached only from the lease-held drive, so no lease means
+		// per-shard progress will silently not persist — surface it for triage.
+		slog.Warn("skipping remote per-shard progress encode: no lease on reconcile context",
+			append(storedApply.LogAttrs(), "table", storedTask.TableName)...)
 		return
 	}
-	// Per-shard rows hang off the table's apply_operation; without one there is no
-	// key to write or read them under.
+	// Per-shard rows hang off the table's apply_operation; a sharded task without
+	// one is unexpected and leaves the per-shard view empty.
 	if storedTask.ApplyOperationID == nil {
-		slog.Debug("skipping remote per-shard progress encode: stored task has no apply_operation_id",
-			"apply_id", storedApply.ApplyIdentifier, "table", storedTask.TableName)
+		slog.Warn("skipping remote per-shard progress encode: stored task has no apply_operation_id",
+			append(storedApply.LogAttrs(), "table", storedTask.TableName)...)
 		return
 	}
 	for _, sh := range shards {
@@ -2916,14 +2918,14 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 				// operation lease (fan-out drive) or the apply lease (single-operation
 				// drive), since UpsertShardProgress accepts either.
 				slog.Debug("stopping remote per-shard progress encode: drive lease lost",
-					"apply_id", storedApply.ApplyIdentifier, "table", storedTask.TableName, "shard", sh.Shard)
+					append(storedApply.LogAttrs(), "table", storedTask.TableName, "shard", sh.Shard)...)
 				return
 			}
 			slog.Error("failed to encode remote per-shard progress into control-plane storage",
-				"apply_id", storedApply.ApplyIdentifier, "external_id", storedApply.ExternalID,
-				"apply_operation_id", *storedTask.ApplyOperationID,
-				"namespace", storedTask.Namespace, "table", storedTask.TableName, "shard", sh.Shard,
-				"error", err)
+				append(storedApply.LogAttrs(),
+					"apply_operation_id", *storedTask.ApplyOperationID,
+					"namespace", storedTask.Namespace, "table", storedTask.TableName, "shard", sh.Shard,
+					"error", err)...)
 		}
 	}
 }
