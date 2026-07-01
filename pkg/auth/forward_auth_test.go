@@ -125,19 +125,48 @@ func TestForwardAuth_WriteRequiresWriteGroup(t *testing.T) {
 	})
 }
 
-func TestNewForwardAuthAuthorizer_SPIFFERequiresCIDR(t *testing.T) {
-	// SPIFFE trust reads a spoofable header, so it must be gated behind a
-	// transport anchor. Configuring SPIFFE without a CIDR fails closed.
-	_, err := auth.NewForwardAuthAuthorizer(auth.ForwardAuthConfig{
+func TestForwardAuth_SPIFFEOnlyMode(t *testing.T) {
+	// SPIFFE-only (no CIDR) trusts a request purely by the SVID its XFCC carries —
+	// the mesh sidecar mode. The source IP is irrelevant; only the SVID matters.
+	cfg := auth.ForwardAuthConfig{
 		TrustedProxySPIFFE: []string{ingressSVID},
 		WriteGroups:        []string{"ops"},
-	}, nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "trusted_proxy_cidrs")
+	}
+
+	t.Run("matching SVID is trusted regardless of source", func(t *testing.T) {
+		handler, captured := newForwardAuth(t, cfg)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+		req.RemoteAddr = untrustedAddr
+		req.Header.Set("X-Forwarded-Client-Cert", `URI=`+ingressSVID)
+		req.Header.Set("X-Forwarded-User", "alice")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		require.NotNil(t, captured.user)
+		assert.Equal(t, "alice", captured.user.Subject)
+	})
+
+	t.Run("missing or wrong SVID is not trusted", func(t *testing.T) {
+		for _, xfcc := range []string{"", `URI=spiffe://example.org/ns/other/sa/attacker`} {
+			handler, captured := newForwardAuth(t, cfg)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+			req.RemoteAddr = trustedIPAddr
+			if xfcc != "" {
+				req.Header.Set("X-Forwarded-Client-Cert", xfcc)
+			}
+			req.Header.Set("X-Forwarded-User", "alice")
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			assert.Equal(t, http.StatusUnauthorized, rec.Code)
+			assert.Nil(t, captured.user)
+		}
+	})
 }
 
 func TestForwardAuth_TrustedViaSPIFFE(t *testing.T) {
-	// SPIFFE is gated behind the transport CIDR: the request must both come from
+	// CIDR + SPIFFE together is defense in depth: the request must both come from
 	// a trusted source and carry a trusted SVID in XFCC.
 	cfg := auth.ForwardAuthConfig{
 		TrustedProxyCIDRs:  []string{trustedCIDR},
