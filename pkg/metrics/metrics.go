@@ -1032,6 +1032,7 @@ var knownStatusCheckOperations = map[string]bool{
 	"schema_config_source_policy":          true,
 	"schema_config_environment_validation": true,
 	"managed_dir_missing_config":           true,
+	"aggregate_participant_skip":           true,
 }
 
 var knownStatusCheckStatuses = map[string]bool{

@@ -187,6 +187,23 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 
 	if len(configs) == 0 {
 		h.logger.Info("no schema files in PR, skipping auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source)
+		// An aggregate participant does not own the required check for the repo —
+		// the leader does — so on a PR that touches none of this deployment's
+		// schema it has nothing to report and stays silent, rather than posting a
+		// passing check that only adds a per-tenant row near the merge button. The
+		// leader publishes the required check and gates on participants' own
+		// checks when they exist, so a silent participant cannot wedge branch
+		// protection (its check is non-required by the aggregate contract).
+		if h.isAggregateParticipant(repo) {
+			h.logger.Info("aggregate participant staying silent on PR with no managed schema changes",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source)
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:  "aggregate_participant_skip",
+				Repository: repo,
+				Status:     "skipped",
+			})
+			return "no schema files in PR (aggregate participant, staying silent)"
+		}
 		// Post passing aggregates on the current HEAD SHA so branch protection
 		// isn't blocked on PRs that don't touch schema files. Always post —
 		// on synchronize events the HEAD SHA changes, so the aggregate must be

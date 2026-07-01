@@ -30,6 +30,21 @@ func (h *Handler) serverConfig() (*api.ServerConfig, bool) {
 	return config, true
 }
 
+// isAggregateParticipant reports whether this deployment is configured as an
+// aggregate participant for repo — a repo where the aggregate leader owns the
+// single required check and this deployment's own check is informational. A
+// participant has nothing to publish on a PR that touches none of its schema,
+// so it stays silent there rather than adding a passing per-tenant row near the
+// merge button. A deployment that is the sole SchemaBot on a repo has no
+// aggregate config (role ""), so this returns false and it keeps posting.
+func (h *Handler) isAggregateParticipant(repo string) bool {
+	config, ok := h.serverConfig()
+	if !ok {
+		return false
+	}
+	return config.AggregateRoleForRepo(repo) == api.AggregateRoleParticipant
+}
+
 func (h *Handler) aggregateCheckNameForRepo(repo string) string {
 	config, ok := h.serverConfig()
 	if !ok {
