@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/block/schemabot/pkg/webhook"
 	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -179,6 +180,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewCommentMultiDeployAllOutput()
 	case PreviewCommentShardedAll:
 		previewCommentShardedAllOutput()
+	case PreviewAggregateCheckSummary:
+		fmt.Print(webhook.PreviewAggregateSummary())
 	case PreviewCLIMultiDeployInProgress:
 		previewCLIMultiDeploymentApplyInProgress()
 	case PreviewCLIMultiDeployFailed:

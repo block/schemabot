@@ -138,8 +138,29 @@ render_cli_snapshot_section() {
     echo "" >> "$SNAPSHOT"
 }
 
+# Helper: render a single markdown preview wrapped in a collapsible block.
+# Used for Check Run output.summary text (rendered markdown, not a code fence).
+render_markdown_section() {
+    local heading="$1"
+    local preview_type="$2"
+
+    {
+        echo ""
+        echo "## ${heading}"
+        echo ""
+        echo "<details>"
+        echo "<summary><strong>${heading}</strong></summary>"
+        echo ""
+        "$BINARY" preview "$preview_type" 2>&1
+        echo ""
+        echo "</details>"
+        echo ""
+    } >> "$SNAPSHOT"
+}
+
 # === Paired sections (PR + CLI) ===
 render_paired_section "Plan & Status"  "comment_plan_all"       "cli_plan_all"
+render_markdown_section "Aggregate Check — Details summary" "aggregate_check_summary"
 render_paired_section "Locking"        "comment_locking_all"    "cli_locking_all"
 render_paired_section "Apply Flow"     "comment_apply_flow_all" "cli_apply_all"
 

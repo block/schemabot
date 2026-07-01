@@ -92,7 +92,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentMultiDeployCompleted, templates.PreviewCommentMultiDeployAll,
 		templates.PreviewCLIMultiDeployInProgress, templates.PreviewCLIMultiDeployFailed,
 		templates.PreviewCLIMultiDeployCompleted, templates.PreviewCLIMultiDeployAll,
-		templates.PreviewCommentShardedAll,
+		templates.PreviewCommentShardedAll, templates.PreviewAggregateCheckSummary,
 		templates.PreviewCommentSingleProgress, templates.PreviewCommentSingleComplete,
 		templates.PreviewCommentSingleFailed, templates.PreviewCommentSingleStopped,
 		templates.PreviewCommentSummaryCompleted, templates.PreviewCommentSummaryFailed,

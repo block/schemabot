@@ -149,6 +149,7 @@ const (
 	PreviewCLIMultiDeployCompleted      PreviewType = "cli_multi_deploy_completed"       // All deployments completed
 	PreviewCLIMultiDeployAll            PreviewType = "cli_multi_deploy_all"             // Show all CLI multi-deployment apply previews
 	PreviewCommentShardedAll            PreviewType = "comment_sharded_all"              // Show all sharded apply + plan previews
+	PreviewAggregateCheckSummary        PreviewType = "aggregate_check_summary"          // Aggregate check Details summary (own databases + tenant deployments)
 
 	// Single-table apply comment previews (most common case)
 	PreviewCommentSingleProgress           PreviewType = "comment_single_progress"             // Single table running

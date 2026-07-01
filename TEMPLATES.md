@@ -1205,6 +1205,28 @@ Production
 ```
 </details>
 
+
+## Aggregate Check — Details summary
+
+<details>
+<summary><strong>Aggregate Check — Details summary</strong></summary>
+
+Apply in progress
+
+| Database | Type | Change | Status |
+|----------|------|--------|--------|
+| `commerce` | vitess | 2 created, 1 altered · 2 vschema updates | In progress |
+| `orders` | mysql | 1 altered | Applied |
+
+**Tenant deployments**
+
+| Tenant | Status |
+|--------|--------|
+| `tenant-b` | Applied |
+| `tenant-c` | In progress |
+
+</details>
+
 ## Locking
 
 ### PR Comments
