@@ -766,6 +766,9 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups []stri
 		if len(fa.WriteGroups) == 0 {
 			logger.Warn("forward-auth enabled with no write groups configured: all write operations will be denied (read still works). Set auth.forward_auth.write_groups to allow writes.")
 		}
+		if len(fa.ReadGroups) == 0 {
+			logger.Info("forward-auth enabled with no read groups configured: read operations are open to any authenticated caller from the trusted proxy. Set auth.forward_auth.read_groups to restrict reads.")
+		}
 		logger.Info("forward-auth authentication enabled")
 		return authz, nil
 	default:
