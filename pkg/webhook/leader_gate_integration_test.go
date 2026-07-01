@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -98,6 +99,13 @@ func mockLeaderPRFilesTouchTenantB(mux *http.ServeMux) {
 // JSON objects; set app.slug per scenario to control trust.
 func mockParticipantCheckRuns(mux *http.ServeMux, runsByName map[string]map[string]any) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/commits/", func(w http.ResponseWriter, r *http.Request) {
+		// Only the check-runs sub-endpoint is mocked; 404 anything else so an
+		// accidental extra commits API call surfaces as a failure rather than
+		// being masked by this handler's check-runs payload.
+		if !strings.HasSuffix(r.URL.Path, "/check-runs") {
+			http.NotFound(w, r)
+			return
+		}
 		checkName := r.URL.Query().Get("check_name")
 		run, ok := runsByName[checkName]
 		if !ok {
