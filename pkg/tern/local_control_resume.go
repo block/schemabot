@@ -402,12 +402,12 @@ func replanShardTableDDL(result *engine.PlanResult) map[shardTableKey]string {
 	return out
 }
 
-// tableStillNeedsChange does a quick re-plan to check if a task's table on its
-// own shard still needs schema changes. Returns false if it already has the
-// desired schema (e.g., Spirit's cutover completed during the stop sequence).
-// When the table still needs changes, it also returns the DDL the re-plan would
-// now apply so the caller can confirm it still matches the reviewed DDL before
-// applying it.
+// tableStillNeedsChange re-plans the full schema set and then looks up whether
+// this task's table still needs a change on its (namespace, shard). Returns
+// false if it already has the desired schema (e.g., Spirit's cutover completed
+// during the stop sequence). When the table still needs changes, it also returns
+// the DDL the re-plan would now apply so the caller can confirm it still matches
+// the reviewed DDL before applying it.
 func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.Apply, plan *storage.Plan, task *storage.Task) (string, bool, error) {
 	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{}, apply.Database, plan.SchemaFiles)
 	if err != nil {
