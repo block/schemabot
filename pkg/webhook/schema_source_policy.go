@@ -2,12 +2,34 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 )
+
+// skipUnownedUnscopedCommand reports whether a "schema not owned by this
+// deployment" error should be silently ignored instead of reported on the PR.
+// On an aggregate repo (leader or participant), an unscoped command (no -t) is a
+// fan-out broadcast every installed deployment receives; a deployment that owns
+// none of the changed schema is expected to do nothing while the deployment that
+// does own it handles the command. Posting "config not authorized" from every
+// non-owning deployment would be exactly the noise fan-out removes. Scoped to
+// the not-owned error only — real failures still surface. A -t-scoped command
+// (tenant != "") always reports, since it named a specific deployment.
+func (h *Handler) skipUnownedUnscopedCommand(repo, tenant string, err error) bool {
+	if tenant != "" {
+		return false
+	}
+	config, ok := h.serverConfig()
+	if !ok || config.AggregateRoleForRepo(repo) == "" {
+		return false
+	}
+	var notOwned *schemaConfigOutsideAllowedDirsError
+	return errors.As(err, &notOwned)
+}
 
 type schemaConfigOutsideAllowedDirsError struct {
 	Database     string

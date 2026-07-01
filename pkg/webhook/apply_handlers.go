@@ -37,6 +37,11 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Apply)
 	if err != nil {
+		if h.skipUnownedUnscopedCommand(repo, result.Tenant, err) {
+			h.logger.Debug("unscoped fan-out apply touches no schema this deployment owns; staying silent",
+				"repo", repo, "pr", pr, "environment", environment)
+			return
+		}
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err)
 		return
 	}
@@ -310,6 +315,11 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	// Discover database config from PR's schemabot.yaml
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.ApplyConfirm)
 	if err != nil {
+		if h.skipUnownedUnscopedCommand(repo, result.Tenant, err) {
+			h.logger.Debug("unscoped fan-out apply-confirm touches no schema this deployment owns; staying silent",
+				"repo", repo, "pr", pr, "environment", environment)
+			return
+		}
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err)
 		return
 	}

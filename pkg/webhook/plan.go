@@ -46,6 +46,12 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Plan)
 	if err != nil {
+		if h.skipUnownedUnscopedCommand(repo, tenant, err) {
+			h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
+				"repo", repo, "pr", pr, "environment", environment)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unowned unscoped command skipped"})
+			return
+		}
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Plan, err)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema request error handled"})
 		return

@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -8,6 +9,38 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
+
+// On an aggregate repo, an unscoped fan-out command that resolves to schema this
+// deployment doesn't own is a silent no-op — the deployment that does own it
+// handles the command, so no "config not authorized" comment is posted. This is
+// the leader's behavior on a PR that touches only a participant's database
+// (e.g. kgoose): it gates on the participant's check but applies nothing itself.
+// A -t-scoped command, a non-aggregate repo, or a real error still surfaces.
+func TestSkipUnownedUnscopedCommand(t *testing.T) {
+	cfg := &api.ServerConfig{Repos: map[string]api.RepoConfig{
+		"octocat/participant-repo": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}},
+		"octocat/leader-repo": {Aggregate: &api.AggregateConfig{
+			Role:            api.AggregateRoleLeader,
+			ExpectedTenants: []api.ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"tenant-b/schema"}, CheckName: "SchemaBot Tenant B"}},
+		}},
+		"octocat/plain-repo": {},
+	}}
+	h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+	notOwned := &schemaConfigOutsideAllowedDirsError{Database: "kgoose", SchemaPath: "kgoose/schema"}
+
+	assert.True(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "", notOwned),
+		"a participant silently skips an unowned unscoped command")
+	assert.True(t, h.skipUnownedUnscopedCommand("octocat/leader-repo", "", notOwned),
+		"a leader silently skips schema it doesn't own (gates on the participant instead)")
+	assert.False(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "tenant-b", notOwned),
+		"a -t-scoped command named a deployment, so the error still surfaces")
+	assert.False(t, h.skipUnownedUnscopedCommand("octocat/plain-repo", "", notOwned),
+		"a non-aggregate repo is a single deployment — the error is useful, keep it")
+	assert.False(t, h.skipUnownedUnscopedCommand("octocat/unknown-repo", "", notOwned),
+		"an unconfigured repo has no aggregate role — keep the error")
+	assert.False(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "", errors.New("github unavailable")),
+		"a real error is not the not-owned case and must still surface")
+}
 
 // Fan-out applies only to actionable unscoped commands. A complete command
 // (Found) fans out; a plan without -e fans out as a multi-env plan; but a
