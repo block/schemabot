@@ -502,8 +502,8 @@ func (ic *InstallationClient) EditIssueComment(ctx context.Context, repo string,
 }
 
 // IssueComment is a PR/issue comment as read by SchemaBot. AuthorLogin is the
-// GitHub-stamped author of the comment; later trust checks use it to confirm a
-// tenant-state comment was authored by SchemaBot's own App.
+// GitHub-stamped author of the comment; it is captured so a trust check can
+// confirm a tenant-state comment was authored by SchemaBot's own App.
 type IssueComment struct {
 	ID          int64
 	Body        string

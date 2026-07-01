@@ -27,6 +27,9 @@ type CommentStateSource struct {
 
 // NewCommentStateSource returns a TenantStateSource backed by a PR's comments.
 func NewCommentStateSource(client commentLister, logger *slog.Logger) *CommentStateSource {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &CommentStateSource{client: client, logger: logger}
 }
 

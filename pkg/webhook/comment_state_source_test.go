@@ -93,6 +93,21 @@ func TestCommentStateSourceKeepsDistinctEnvironments(t *testing.T) {
 	assert.ElementsMatch(t, []string{"staging-1", "staging-2"}, []string{states[0].Environment, states[1].Environment})
 }
 
+// A nil logger is tolerated: the source defaults to slog.Default() so a code
+// path that logs (here, a malformed block) does not panic.
+func TestCommentStateSourceNilLogger(t *testing.T) {
+	lister := &fakeCommentLister{comments: []github.IssueComment{
+		{ID: 1, Body: "<!-- " + tenantStateMarker + " v=1\n{bad json}\n-->"},
+		tenantStateComment(t, 2, TenantState{Tenant: "tenant-a", Environment: "production", SHA: "abc", Rollup: "applied"}),
+	}}
+	src := NewCommentStateSource(lister, nil)
+
+	states, err := src.StatesForPR(t.Context(), "octocat/shared-repo", 1, "abc")
+	require.NoError(t, err)
+	require.Len(t, states, 1)
+	assert.Equal(t, "tenant-a", states[0].Tenant)
+}
+
 // A list failure is surfaced so the caller can fail closed rather than fold a
 // partial view of tenant state.
 func TestCommentStateSourceListError(t *testing.T) {
