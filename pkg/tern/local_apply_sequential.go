@@ -468,8 +468,8 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 			"apply_id", apply.ApplyIdentifier,
 			"stored_state", freshApply.State)
 		*apply = *freshApply
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-			c.logger.Warn("failed to complete pending stop request for terminal sequential apply",
+		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
+			c.logger.Warn("failed to complete pending control requests for terminal sequential apply",
 				"apply_id", apply.ApplyIdentifier, "error", err)
 		}
 		return
@@ -499,8 +499,8 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
 	}
 	if state.IsTerminalApplyState(apply.State) {
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-			c.logger.Warn("failed to complete pending stop request after sequential finalization",
+		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
+			c.logger.Warn("failed to complete pending control requests after sequential finalization",
 				append(apply.LogAttrs(), "error", err)...)
 			return
 		}

@@ -45,6 +45,25 @@ func completePendingControlRequests(ctx context.Context, store storage.Storage, 
 	return nil
 }
 
+// completePendingRequestsForTerminalApply completes the pending control
+// requests that a terminal apply moots: a pending stop is settled (the apply
+// can no longer be stopped), and a pending revert or skip-revert can no longer
+// act because the revert window is gone. Sweeping all three keeps a request
+// issued moments before the apply settled — or one that lost to a contradictory
+// command — from lingering pending forever.
+func completePendingRequestsForTerminalApply(ctx context.Context, store storage.Storage, apply *storage.Apply) error {
+	for _, op := range []storage.ControlOperation{
+		storage.ControlOperationStop,
+		storage.ControlOperationRevert,
+		storage.ControlOperationSkipRevert,
+	} {
+		if err := completePendingControlRequests(ctx, store, apply, op); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // failPendingControlRequests marks the pending control request of the given
 // operation terminally failed. A failed request is no longer pending, so the
 // operator-owned retry loop stops re-running the operation instead of spinning
