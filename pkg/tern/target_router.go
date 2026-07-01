@@ -117,6 +117,23 @@ func (r *TargetRouter) Plan(ctx context.Context, req *ternv1.PlanRequest) (*tern
 	return client.Plan(ctx, routedReq)
 }
 
+// PlanDiff routes a non-persisting desired-vs-live diff to the resolved target,
+// mirroring Plan's routing.
+func (r *TargetRouter) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("plan diff request is required")
+	}
+	client, resolved, err := r.clientForTarget(ctx, targetOrDatabase(req.Target, req.Database), req.Type, req.Environment, req.Database)
+	if err != nil {
+		return nil, err
+	}
+	routedReq := proto.Clone(req).(*ternv1.PlanRequest)
+	routedReq.Database = req.Database
+	routedReq.Type = resolved.DatabaseType
+	routedReq.Target = resolved.Target
+	return client.PlanDiff(ctx, routedReq)
+}
+
 // Apply starts a stored plan on the resolved target.
 func (r *TargetRouter) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
 	if req == nil {

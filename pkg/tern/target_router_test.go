@@ -77,6 +77,7 @@ func (s targetRouterApplyStore) GetByApplyIdentifier(_ context.Context, applyIde
 type targetRouterRecordingClient struct {
 	pullReq            *ternv1.PullSchemaRequest
 	planReq            *ternv1.PlanRequest
+	planDiffReq        *ternv1.PlanRequest
 	applyReq           *ternv1.ApplyRequest
 	progressReq        *ternv1.ProgressRequest
 	resumeApply        *storage.Apply
@@ -95,6 +96,11 @@ func (c *targetRouterRecordingClient) PullSchema(_ context.Context, req *ternv1.
 func (c *targetRouterRecordingClient) Plan(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
 	c.planReq = req
 	return &ternv1.PlanResponse{PlanId: "plan-routed"}, nil
+}
+
+func (c *targetRouterRecordingClient) PlanDiff(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	c.planDiffReq = req
+	return &ternv1.PlanDiffResponse{Engine: ternv1.Engine_ENGINE_PLANETSCALE}, nil
 }
 
 func (c *targetRouterRecordingClient) Apply(_ context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {

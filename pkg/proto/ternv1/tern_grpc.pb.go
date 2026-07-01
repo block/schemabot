@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	Tern_PullSchema_FullMethodName = "/tern.v1.Tern/PullSchema"
 	Tern_Plan_FullMethodName       = "/tern.v1.Tern/Plan"
+	Tern_PlanDiff_FullMethodName   = "/tern.v1.Tern/PlanDiff"
 	Tern_Apply_FullMethodName      = "/tern.v1.Tern/Apply"
 	Tern_Progress_FullMethodName   = "/tern.v1.Tern/Progress"
 	Tern_Cutover_FullMethodName    = "/tern.v1.Tern/Cutover"
@@ -76,6 +77,15 @@ type TernClient interface {
 	// Errors are returned in the response body (not as RPC errors) so the caller
 	// can display them to the user.
 	Plan(ctx context.Context, in *PlanRequest, opts ...grpc.CallOption) (*PlanResponse, error)
+	// PlanDiff computes a deployment's desired-vs-live diff without persisting a
+	// plan. It is the read-only producer for review-time drift detection: the
+	// control plane runs it against every deployment of a database and compares
+	// the results to surface a deployment that diverges from the reviewed plan.
+	//
+	// Unlike Plan, PlanDiff does not create a stored plan record and returns no
+	// plan_id — its result is intentionally not applyable. It is idempotent and
+	// safe to retry.
+	PlanDiff(ctx context.Context, in *PlanRequest, opts ...grpc.CallOption) (*PlanDiffResponse, error)
 	// Apply executes a previously generated plan. Returns immediately with an
 	// apply_id; execution happens asynchronously. Use Progress to track status.
 	//
@@ -198,6 +208,16 @@ func (c *ternClient) Plan(ctx context.Context, in *PlanRequest, opts ...grpc.Cal
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PlanResponse)
 	err := c.cc.Invoke(ctx, Tern_Plan_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *ternClient) PlanDiff(ctx context.Context, in *PlanRequest, opts ...grpc.CallOption) (*PlanDiffResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PlanDiffResponse)
+	err := c.cc.Invoke(ctx, Tern_PlanDiff_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -347,6 +367,15 @@ type TernServer interface {
 	// Errors are returned in the response body (not as RPC errors) so the caller
 	// can display them to the user.
 	Plan(context.Context, *PlanRequest) (*PlanResponse, error)
+	// PlanDiff computes a deployment's desired-vs-live diff without persisting a
+	// plan. It is the read-only producer for review-time drift detection: the
+	// control plane runs it against every deployment of a database and compares
+	// the results to surface a deployment that diverges from the reviewed plan.
+	//
+	// Unlike Plan, PlanDiff does not create a stored plan record and returns no
+	// plan_id — its result is intentionally not applyable. It is idempotent and
+	// safe to retry.
+	PlanDiff(context.Context, *PlanRequest) (*PlanDiffResponse, error)
 	// Apply executes a previously generated plan. Returns immediately with an
 	// apply_id; execution happens asynchronously. Use Progress to track status.
 	//
@@ -460,6 +489,9 @@ func (UnimplementedTernServer) PullSchema(context.Context, *PullSchemaRequest) (
 func (UnimplementedTernServer) Plan(context.Context, *PlanRequest) (*PlanResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Plan not implemented")
 }
+func (UnimplementedTernServer) PlanDiff(context.Context, *PlanRequest) (*PlanDiffResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PlanDiff not implemented")
+}
 func (UnimplementedTernServer) Apply(context.Context, *ApplyRequest) (*ApplyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Apply not implemented")
 }
@@ -542,6 +574,24 @@ func _Tern_Plan_Handler(srv interface{}, ctx context.Context, dec func(interface
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(TernServer).Plan(ctx, req.(*PlanRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Tern_PlanDiff_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PlanRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TernServer).PlanDiff(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tern_PlanDiff_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TernServer).PlanDiff(ctx, req.(*PlanRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -740,6 +790,10 @@ var Tern_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Plan",
 			Handler:    _Tern_Plan_Handler,
+		},
+		{
+			MethodName: "PlanDiff",
+			Handler:    _Tern_PlanDiff_Handler,
 		},
 		{
 			MethodName: "Apply",

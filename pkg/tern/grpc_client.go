@@ -171,6 +171,7 @@ type Config struct {
 //   - PullSchema: read-only live schema fetch.
 //   - Plan: each attempt produces an independent plan record and only the
 //     returned plan ID is used, so a duplicate attempt is harmless.
+//   - PlanDiff: read-only desired-vs-live diff; persists nothing.
 //   - Progress and Health: read-only.
 //
 // State-changing RPCs (Apply, Cutover, Stop, Start, Volume, Revert,
@@ -182,6 +183,7 @@ const retryServiceConfig = `{
 		"name": [
 			{"service": "tern.v1.Tern", "method": "PullSchema"},
 			{"service": "tern.v1.Tern", "method": "Plan"},
+			{"service": "tern.v1.Tern", "method": "PlanDiff"},
 			{"service": "tern.v1.Tern", "method": "Progress"},
 			{"service": "tern.v1.Tern", "method": "Health"}
 		],
@@ -268,6 +270,10 @@ func (c *GRPCClient) Close() error {
 
 func (c *GRPCClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
 	return c.client.Plan(ctx, req)
+}
+
+func (c *GRPCClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	return c.client.PlanDiff(ctx, req)
 }
 
 func (c *GRPCClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {

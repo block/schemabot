@@ -570,6 +570,9 @@ type mockTernClient struct {
 	planResp                 *ternv1.PlanResponse
 	planErr                  error
 	planReq                  *ternv1.PlanRequest
+	planDiffResp             *ternv1.PlanDiffResponse
+	planDiffErr              error
+	planDiffReq              *ternv1.PlanRequest
 	pullSchemaResp           *ternv1.PullSchemaResponse
 	pullSchemaErr            error
 	pullSchemaReq            *ternv1.PullSchemaRequest
@@ -632,6 +635,13 @@ func (m *mockTernClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*te
 		return m.planResp, m.planErr
 	}
 	return nil, m.planErr
+}
+func (m *mockTernClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	m.planDiffReq = req
+	if m.planDiffResp != nil {
+		return m.planDiffResp, m.planDiffErr
+	}
+	return nil, m.planDiffErr
 }
 func (m *mockTernClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
 	m.applyReq = req

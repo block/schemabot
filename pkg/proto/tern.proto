@@ -56,6 +56,21 @@ service Tern {
     };
   }
 
+  // PlanDiff computes a deployment's desired-vs-live diff without persisting a
+  // plan. It is the read-only producer for review-time drift detection: the
+  // control plane runs it against every deployment of a database and compares
+  // the results to surface a deployment that diverges from the reviewed plan.
+  //
+  // Unlike Plan, PlanDiff does not create a stored plan record and returns no
+  // plan_id — its result is intentionally not applyable. It is idempotent and
+  // safe to retry.
+  rpc PlanDiff(PlanRequest) returns (PlanDiffResponse) {
+    option (google.api.http) = {
+      post: "/v1/plan-diff"
+      body: "*"
+    };
+  }
+
   // Apply executes a previously generated plan. Returns immediately with an
   // apply_id; execution happens asynchronously. Use Progress to track status.
   //
@@ -465,6 +480,20 @@ message PlanResponse {
   // Per-shard membership and drift, populated for sharded engines. Empty for
   // single-endpoint engines.
   repeated ShardPlan shards = 6;
+}
+
+// PlanDiffResponse contains a deployment's desired-vs-live diff. It mirrors
+// PlanResponse but omits plan_id: PlanDiff never persists a plan, so its result
+// is not applyable. Used by the control plane to compare deployments at review
+// time.
+message PlanDiffResponse {
+  Engine engine = 1;
+  repeated SchemaChange changes = 2;
+  repeated LintViolation lint_violations = 3;
+  repeated string errors = 4;
+  // Per-shard membership and drift, populated for sharded engines. Empty for
+  // single-endpoint engines.
+  repeated ShardPlan shards = 5;
 }
 
 // ApplyRequest requests execution of a previously generated plan.

@@ -1253,11 +1253,60 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	}
 	plan.ID = planID
 
-	// Convert engine SchemaChanges to proto SchemaChanges. A sharded engine emits
-	// one SchemaChange per (namespace, shard); collapse them back to one proto
-	// SchemaChange per namespace (deduping repeated tables). Per-shard membership
-	// travels separately on PlanResponse.Shards below.
-	var changes []*ternv1.SchemaChange
+	changes, violations, protoShards := c.planResultToProtoChanges(result)
+	return &ternv1.PlanResponse{
+		PlanId:         result.PlanID,
+		Engine:         c.protoEngine(),
+		Changes:        changes,
+		LintViolations: violations,
+		Shards:         protoShards,
+	}, nil
+}
+
+// PlanDiff computes this deployment's desired-vs-live diff without persisting a
+// plan. It shares the engine planning and proto conversion with Plan but stops
+// before storage, so its result is not applyable (no plan_id). It is the
+// read-only producer the control plane runs per deployment to detect review-time
+// drift.
+func (c *LocalClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	if c.getEngine() == nil {
+		return nil, fmt.Errorf("no engine available for database type %q", c.config.Type)
+	}
+
+	schemaFiles, err := c.normalizeSchemaFiles(protoToSchemaFiles(req.SchemaFiles))
+	if err != nil {
+		return nil, err
+	}
+
+	planLogAttrs := []any{"database", c.config.Database}
+	planLogAttrs = append(planLogAttrs, dsnLogAttrs(c.config.TargetDSN)...)
+	planLogAttrs = append(planLogAttrs, "schema_file_count", len(schemaFiles))
+	c.logger.Info("LocalClient.PlanDiff: calling engine", planLogAttrs...)
+
+	result, err := c.planWithEngine(ctx, req, c.config.Database, schemaFiles)
+	if err != nil {
+		c.logger.Error("plan diff failed", "error", err, "database", c.config.Database)
+		return nil, err // Error already has clear prefix (SQL syntax/usage error)
+	}
+
+	changes, violations, protoShards := c.planResultToProtoChanges(result)
+	return &ternv1.PlanDiffResponse{
+		Engine:         c.protoEngine(),
+		Changes:        changes,
+		LintViolations: violations,
+		Shards:         protoShards,
+	}, nil
+}
+
+// planResultToProtoChanges converts an engine plan result into the proto pieces
+// Plan and PlanDiff both return: namespace-collapsed schema changes, lint
+// violations, and per-shard membership. It has no storage side effects, so both
+// the persisting Plan path and the non-persisting PlanDiff path produce
+// identical change sets for the same engine result. A sharded engine emits one
+// SchemaChange per (namespace, shard); the namespace view collapses them
+// (deduping repeated tables) while per-shard membership travels separately on
+// the response's Shards.
+func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (changes []*ternv1.SchemaChange, violations []*ternv1.LintViolation, shards []*ternv1.ShardPlan) {
 	protoByNS := make(map[string]*ternv1.SchemaChange)
 	protoTableSeen := make(map[string]map[string]bool)
 	for _, sc := range result.Changes {
@@ -1288,10 +1337,25 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 				Namespace:    ns,
 			})
 		}
+		// A SchemaChange with an empty shard targets the whole namespace
+		// (non-sharded engines) and contributes no shard rows.
+		if shardName := strings.TrimSpace(sc.Shard.Name); shardName != "" {
+			protoSP := &ternv1.ShardPlan{Shard: shardName, Namespace: ns}
+			for _, t := range sc.TableChanges {
+				protoSP.Changes = append(protoSP.Changes, &ternv1.TableChange{
+					Namespace:    ns,
+					TableName:    t.Table,
+					Ddl:          t.DDL,
+					ChangeType:   changeTypeToProto(t.Operation),
+					IsUnsafe:     t.IsUnsafe,
+					UnsafeReason: t.UnsafeReason,
+				})
+			}
+			shards = append(shards, protoSP)
+		}
 	}
 
-	// Convert lint violations to proto
-	violations := make([]*ternv1.LintViolation, len(result.LintViolations))
+	violations = make([]*ternv1.LintViolation, len(result.LintViolations))
 	for i, w := range result.LintViolations {
 		violations[i] = &ternv1.LintViolation{
 			Table:    w.Table,
@@ -1302,36 +1366,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		}
 	}
 
-	// Surface per-shard plan metadata on the response too, for parity with the
-	// gRPC path: callers of Plan can display per-shard drift/membership, and the
-	// control plane rebuilds per-shard operation groups from each shard's own
-	// changes.
-	var protoShards []*ternv1.ShardPlan
-	for _, sp := range allShardPlans {
-		protoSP := &ternv1.ShardPlan{
-			Shard:     sp.Shard,
-			Namespace: sp.Namespace,
-		}
-		for _, ch := range sp.Changes {
-			protoSP.Changes = append(protoSP.Changes, &ternv1.TableChange{
-				Namespace:    ch.Namespace,
-				TableName:    ch.Table,
-				Ddl:          ch.DDL,
-				ChangeType:   ddlActionToProtoChangeType(ch.Operation),
-				IsUnsafe:     ch.IsUnsafe,
-				UnsafeReason: ch.UnsafeReason,
-			})
-		}
-		protoShards = append(protoShards, protoSP)
-	}
-
-	return &ternv1.PlanResponse{
-		PlanId:         result.PlanID,
-		Engine:         c.protoEngine(),
-		Changes:        changes,
-		LintViolations: violations,
-		Shards:         protoShards,
-	}, nil
+	return changes, violations, shards
 }
 
 func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanRequest, database string, schemaFiles schema.SchemaFiles) (*engine.PlanResult, error) {
