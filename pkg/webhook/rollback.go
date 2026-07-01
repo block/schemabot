@@ -476,7 +476,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 	// omitted on this first comment — the observer refreshes it from engine
 	// display metadata on the next progress tick.
 	progressBody := formatProgressComment(apply, nil, nil)
-	h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, progressBody)
+	h.postInitialProgressComment(ctx, repo, pr, installationID, applyID, progressBody)
 }
 
 func (h *Handler) rollbackConfirmPlanForPR(ctx context.Context, repo string, pr int, environment, lockOwner string) (*storage.Lock, *storage.Plan, error) {
