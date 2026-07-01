@@ -14,7 +14,7 @@ func PreviewAggregateSummary() string {
 			DatabaseName:  "commerce",
 			HasChanges:    true,
 			Status:        checkStatusInProgress,
-			ChangeSummary: "2 created, 1 altered · 2 vschema updates",
+			ChangeSummary: "2 creates, 1 alter · 2 vschema updates",
 		},
 		{
 			DatabaseType:  "mysql",
@@ -22,7 +22,7 @@ func PreviewAggregateSummary() string {
 			HasChanges:    true,
 			Status:        checkStatusCompleted,
 			Conclusion:    checkConclusionSuccess,
-			ChangeSummary: "1 altered",
+			ChangeSummary: "1 alter",
 		},
 		{
 			DatabaseType: aggregateSentinel,

@@ -24,7 +24,7 @@ func TestSummarizeChanges(t *testing.T) {
 				},
 			}},
 		}
-		assert.Equal(t, "2 created, 1 altered, 1 dropped", SummarizeChanges(data))
+		assert.Equal(t, "2 creates, 1 alter, 1 drop", SummarizeChanges(data))
 	})
 
 	t.Run("appends vschema updates for non-MySQL", func(t *testing.T) {
@@ -36,7 +36,7 @@ func TestSummarizeChanges(t *testing.T) {
 				VSchemaChanged: true,
 			}},
 		}
-		assert.Equal(t, "1 created · 1 vschema update", SummarizeChanges(data))
+		assert.Equal(t, "1 create · 1 vschema update", SummarizeChanges(data))
 	})
 
 	t.Run("vschema-only change for non-MySQL", func(t *testing.T) {

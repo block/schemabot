@@ -1215,8 +1215,8 @@ Apply in progress
 
 | Database | Type | Change | Status |
 |----------|------|--------|--------|
-| `commerce` | vitess | 2 created, 1 altered · 2 vschema updates | In progress |
-| `orders` | mysql | 1 altered | Applied |
+| `commerce` | vitess | 2 creates, 1 alter · 2 vschema updates | In progress |
+| `orders` | mysql | 1 alter | Applied |
 
 **Tenant deployments**
 

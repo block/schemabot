@@ -141,8 +141,8 @@ func TestIsAggregateCheck(t *testing.T) {
 
 func TestAggregateSummary(t *testing.T) {
 	checks := []*storage.Check{
-		{DatabaseName: "orders", DatabaseType: "mysql", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "5 created, 3 altered"},
-		{DatabaseName: "users", DatabaseType: "vitess", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, ChangeSummary: "1 dropped · 2 vschema updates"},
+		{DatabaseName: "orders", DatabaseType: "mysql", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "5 creates, 3 alters"},
+		{DatabaseName: "users", DatabaseType: "vitess", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, ChangeSummary: "1 drop · 2 vschema updates"},
 	}
 
 	title, summary := aggregateSummary(checks, checkConclusionActionRequired)
@@ -157,8 +157,8 @@ func TestAggregateSummary(t *testing.T) {
 	assert.Contains(t, summary, "`users`")
 	assert.Contains(t, summary, "mysql")
 	assert.Contains(t, summary, "vitess")
-	assert.Contains(t, summary, "5 created, 3 altered")
-	assert.Contains(t, summary, "1 dropped · 2 vschema updates")
+	assert.Contains(t, summary, "5 creates, 3 alters")
+	assert.Contains(t, summary, "1 drop · 2 vschema updates")
 	assert.Contains(t, summary, "Applied")
 	assert.Contains(t, summary, "Pending")
 }
@@ -169,8 +169,8 @@ func TestAggregateSummary(t *testing.T) {
 func TestRenderDatabaseSection_EnvironmentColumn(t *testing.T) {
 	t.Run("single environment omits the column", func(t *testing.T) {
 		checks := []*storage.Check{
-			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "2 created"},
-			{DatabaseName: "users", DatabaseType: "vitess", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "1 altered"},
+			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "2 creates"},
+			{DatabaseName: "users", DatabaseType: "vitess", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "1 alter"},
 		}
 		section := renderDatabaseSection(checks, maxCheckRunTextLength)
 		assert.Contains(t, section, "| Database | Type | Change | Status |")
@@ -179,8 +179,8 @@ func TestRenderDatabaseSection_EnvironmentColumn(t *testing.T) {
 
 	t.Run("multiple environments add the column", func(t *testing.T) {
 		checks := []*storage.Check{
-			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "2 created"},
-			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusInProgress, ChangeSummary: "2 created"},
+			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "2 creates"},
+			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusInProgress, ChangeSummary: "2 creates"},
 		}
 		section := renderDatabaseSection(checks, maxCheckRunTextLength)
 		assert.Contains(t, section, "| Database | Environment | Type | Change | Status |")
@@ -194,7 +194,7 @@ func TestRenderDatabaseSection_EnvironmentColumn(t *testing.T) {
 // leader's own per-database rows.
 func TestAggregateSummary_WithParticipants(t *testing.T) {
 	checks := []*storage.Check{
-		{DatabaseType: "mysql", DatabaseName: "orders", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "2 created"},
+		{DatabaseType: "mysql", DatabaseName: "orders", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "2 creates"},
 		{DatabaseType: aggregateSentinel, DatabaseName: "tenant-b", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired},
 		{DatabaseType: aggregateSentinel, DatabaseName: "tenant-c", Environment: "production", Status: checkStatusInProgress},
 	}
@@ -209,7 +209,7 @@ func TestAggregateSummary_WithParticipants(t *testing.T) {
 	assert.Contains(t, dbSection, "| Database | Type | Change | Status |")
 	assert.Contains(t, dbSection, "`orders`")
 	assert.Contains(t, dbSection, "mysql")
-	assert.Contains(t, dbSection, "2 created")
+	assert.Contains(t, dbSection, "2 creates")
 	assert.NotContains(t, dbSection, "tenant-b", "participants must not appear in the Database section")
 	assert.NotContains(t, dbSection, "tenant-c")
 

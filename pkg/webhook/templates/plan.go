@@ -319,25 +319,26 @@ func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
 }
 
 // SummarizeChanges renders a compact one-line summary of a plan's changes for
-// the aggregate check's Change column, e.g. "5 created, 3 altered, 1 dropped ·
-// 2 vschema updates". Zero categories are omitted. The vschema clause is only
-// included for non-MySQL engines, matching the plan comment's summary. Returns
-// "" only when the plan has no changes at all. The create/alter/drop and vschema
-// counting is identical to the plan comment's summary (countStatementTypes /
-// countChanges) so the two always agree.
+// the aggregate check's Change column, e.g. "5 creates, 3 alters, 1 drop ·
+// 2 vschema updates". Each category is a pluralized noun so the phrasing stays
+// consistent with the vschema clause. Zero categories are omitted. The vschema
+// clause is only included for non-MySQL engines, matching the plan comment's
+// summary. Returns "" only when the plan has no changes at all. The
+// create/alter/drop and vschema counting is identical to the plan comment's
+// summary (countStatementTypes / countChanges) so the two always agree.
 func SummarizeChanges(data PlanCommentData) string {
 	creates, alters, drops := countStatementTypes(data.Changes)
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 
 	var parts []string
 	if creates > 0 {
-		parts = append(parts, fmt.Sprintf("%d created", creates))
+		parts = append(parts, fmt.Sprintf("%d %s", creates, pluralize("create", creates)))
 	}
 	if alters > 0 {
-		parts = append(parts, fmt.Sprintf("%d altered", alters))
+		parts = append(parts, fmt.Sprintf("%d %s", alters, pluralize("alter", alters)))
 	}
 	if drops > 0 {
-		parts = append(parts, fmt.Sprintf("%d dropped", drops))
+		parts = append(parts, fmt.Sprintf("%d %s", drops, pluralize("drop", drops)))
 	}
 	ddlSummary := strings.Join(parts, ", ")
 
