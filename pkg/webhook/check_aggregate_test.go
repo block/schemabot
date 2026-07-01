@@ -148,7 +148,11 @@ func TestAggregateSummary(t *testing.T) {
 	title, summary := aggregateSummary(checks, checkConclusionActionRequired)
 
 	assert.Contains(t, title, "1 apply pending")
-	assert.Contains(t, summary, "| Database | Type | Change | Status |")
+	// The rows span staging and production, so the global aggregate table adds an
+	// Environment column and renders both environment names.
+	assert.Contains(t, summary, "| Database | Environment | Type | Change | Status |")
+	assert.Contains(t, summary, "staging")
+	assert.Contains(t, summary, "production")
 	assert.Contains(t, summary, "`orders`")
 	assert.Contains(t, summary, "`users`")
 	assert.Contains(t, summary, "mysql")
@@ -157,6 +161,32 @@ func TestAggregateSummary(t *testing.T) {
 	assert.Contains(t, summary, "1 dropped · 2 vschema updates")
 	assert.Contains(t, summary, "Applied")
 	assert.Contains(t, summary, "Pending")
+}
+
+// A per-environment aggregate contains a single environment, so the Database
+// table omits the Environment column. The global aggregate that folds multiple
+// environments adds the column so same-named databases are unambiguous.
+func TestRenderDatabaseSection_EnvironmentColumn(t *testing.T) {
+	t.Run("single environment omits the column", func(t *testing.T) {
+		checks := []*storage.Check{
+			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "2 created"},
+			{DatabaseName: "users", DatabaseType: "vitess", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "1 altered"},
+		}
+		section := renderDatabaseSection(checks, maxCheckRunTextLength)
+		assert.Contains(t, section, "| Database | Type | Change | Status |")
+		assert.NotContains(t, section, "Environment")
+	})
+
+	t.Run("multiple environments add the column", func(t *testing.T) {
+		checks := []*storage.Check{
+			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "2 created"},
+			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusInProgress, ChangeSummary: "2 created"},
+		}
+		section := renderDatabaseSection(checks, maxCheckRunTextLength)
+		assert.Contains(t, section, "| Database | Environment | Type | Change | Status |")
+		assert.Contains(t, section, "| `orders` | staging | mysql |")
+		assert.Contains(t, section, "| `orders` | production | mysql |")
+	})
 }
 
 // When the leader gates on participant deployments, their folded outcomes render
