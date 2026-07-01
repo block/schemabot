@@ -941,7 +941,8 @@ func (c *ServerConfig) Validate() error {
 // When Type is empty or "none" (the default), authentication is disabled and
 // all requests are allowed — unchanged from deployments without this config.
 type AuthConfig struct {
-	// Type selects the authenticator: "none" (or "", the default) or "oidc".
+	// Type selects the authenticator: "none" (or "", the default), "oidc", or
+	// "forward_auth".
 	Type string `yaml:"type"`
 
 	// Issuer is the OIDC provider's issuer URL. Required when Type is "oidc".
@@ -955,6 +956,44 @@ type AuthConfig struct {
 	// GroupsClaim is the JWT claim carrying group memberships. Defaults to
 	// "groups" when empty.
 	GroupsClaim string `yaml:"groups_claim"`
+
+	// ForwardAuth configures the "forward_auth" authenticator, used when
+	// SchemaBot runs behind an authenticating reverse proxy that forwards the
+	// verified identity as HTTP headers.
+	ForwardAuth ForwardAuthSettings `yaml:"forward_auth,omitempty"`
+}
+
+// ForwardAuthSettings configures the forward-auth authenticator. The proxy's
+// identity is the trust anchor (a source CIDR, and optionally a SPIFFE ID from
+// the Envoy X-Forwarded-Client-Cert header); only then are the forwarded user
+// and group headers honored.
+type ForwardAuthSettings struct {
+	// UserHeader carries the authenticated user identity (default
+	// "X-Forwarded-User").
+	UserHeader string `yaml:"user_header,omitempty"`
+
+	// GroupsHeader carries the caller's groups (default "X-Forwarded-Groups").
+	GroupsHeader string `yaml:"groups_header,omitempty"`
+
+	// GroupsDelimiter splits a single groups-header value (default ",").
+	GroupsDelimiter string `yaml:"groups_delimiter,omitempty"`
+
+	// TrustedProxySPIFFE lists SPIFFE IDs allowed to act as the proxy, read from
+	// the XFCC header. SPIFFE-only (no TrustedProxyCIDRs) is safe only when the
+	// proxy sanitizes inbound XFCC and the server is not directly reachable — a
+	// service mesh; pair it with TrustedProxyCIDRs for defense in depth otherwise.
+	TrustedProxySPIFFE []string `yaml:"trusted_proxy_spiffe,omitempty"`
+
+	// TrustedProxyCIDRs lists source networks allowed to act as the proxy.
+	TrustedProxyCIDRs []string `yaml:"trusted_proxy_cidrs,omitempty"`
+
+	// ReadGroups are the groups granted the read tier. Empty means any
+	// authenticated caller from the trusted proxy may read.
+	ReadGroups []string `yaml:"read_groups,omitempty"`
+
+	// WriteGroups are the groups granted the write tier. Empty means no caller
+	// can perform write-tier operations.
+	WriteGroups []string `yaml:"write_groups,omitempty"`
 }
 
 // Validate checks the auth configuration. Unknown types are rejected so a
@@ -974,9 +1013,41 @@ func (a *AuthConfig) Validate() error {
 			return fmt.Errorf("audience is required when auth type is oidc")
 		}
 		return nil
+	case "forward_auth":
+		return a.ForwardAuth.validate()
 	default:
-		return fmt.Errorf("unknown auth type %q (supported: none, oidc)", a.Type)
+		return fmt.Errorf("unknown auth type %q (supported: none, oidc, forward_auth)", a.Type)
 	}
+}
+
+// validate checks the forward-auth settings so a misconfigured trust anchor
+// fails closed at startup: it requires at least one anchor (a SPIFFE ID or a
+// CIDR) and checks CIDR syntax so a typo is caught before serving. SPIFFE-only
+// (no CIDR) is allowed for mesh deployments; the authorizer warns about the XFCC
+// precondition at startup.
+func (f *ForwardAuthSettings) validate() error {
+	trimmedCIDRs := make([]string, 0, len(f.TrustedProxyCIDRs))
+	for _, c := range f.TrustedProxyCIDRs {
+		if c = strings.TrimSpace(c); c != "" {
+			trimmedCIDRs = append(trimmedCIDRs, c)
+		}
+	}
+	trimmedSPIFFE := make([]string, 0, len(f.TrustedProxySPIFFE))
+	for _, s := range f.TrustedProxySPIFFE {
+		if s = strings.TrimSpace(s); s != "" {
+			trimmedSPIFFE = append(trimmedSPIFFE, s)
+		}
+	}
+
+	if len(trimmedCIDRs) == 0 && len(trimmedSPIFFE) == 0 {
+		return fmt.Errorf("forward_auth requires at least one trust anchor (trusted_proxy_spiffe or trusted_proxy_cidrs)")
+	}
+	for _, c := range trimmedCIDRs {
+		if _, _, err := net.ParseCIDR(c); err != nil {
+			return fmt.Errorf("forward_auth trusted_proxy_cidrs entry %q is not a valid CIDR: %w", c, err)
+		}
+	}
+	return nil
 }
 
 func validateSupportChannel(c SupportChannelConfig) error {
