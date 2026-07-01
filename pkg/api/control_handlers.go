@@ -1966,6 +1966,13 @@ func (s *Service) ExecuteRevert(ctx context.Context, req apitypes.ControlRequest
 // revert. The returned HTTP status is meaningful only when err == nil; error
 // paths return a zero status and callers derive it from the error.
 func (s *Service) executeRevertForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.ControlResponse, int, error) {
+	// Revert undoes a PlanetScale deploy request in its revert window; other
+	// engines hard-error it. Gate on the engine so a non-PlanetScale apply can
+	// never accumulate a permanently-pending revert request.
+	if apply.Engine != storage.EnginePlanetScale {
+		metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, controlConflictf("revert is only supported for PlanetScale schema changes")
+	}
 	// Revert is only meaningful while the apply is in its revert window; gating
 	// here keeps a non-revert-window apply from accumulating a permanently-pending
 	// revert request.

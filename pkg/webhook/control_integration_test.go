@@ -607,9 +607,10 @@ func TestE2ESkipRevertCommandAcceptsApplyID(t *testing.T) {
 
 // TestE2ERevertCommandRevertsApply verifies that a `schemabot revert <apply-id>
 // -e staging` PR comment reverts a schema change during its revert window: the
-// apply ID is parsed, the data-plane revert is invoked, and the PR shows the
-// acknowledgement. Revert runs synchronously, unlike the durable stop/cutover/
-// skip-revert intents.
+// apply ID is parsed, a durable revert control request is recorded, the
+// data-plane revert is invoked immediately, and the PR shows the
+// acknowledgement. The durable request is the apply owner's retry path if the
+// immediate attempt cannot land.
 func TestE2ERevertCommandRevertsApply(t *testing.T) {
 	ctx := t.Context()
 	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
@@ -625,7 +626,9 @@ func TestE2ERevertCommandRevertsApply(t *testing.T) {
 		utils.CloseAndLog(schemabotDB)
 	})
 
-	applyID := createStopCommandApply(t, store, applyIdentifier, database)
+	// Revert is only valid for a PlanetScale apply in its revert window, so seed
+	// the engine at creation and move the apply into the revert window.
+	applyID := createStopCommandApplyWithEngine(t, store, applyIdentifier, database, storage.EnginePlanetScale)
 	storedApply, err := store.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
 	require.NoError(t, err)
 	require.NotNil(t, storedApply)
