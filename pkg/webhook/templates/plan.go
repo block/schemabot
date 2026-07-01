@@ -318,6 +318,39 @@ func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
 	}
 }
 
+// SummarizeChanges renders a compact one-line summary of a plan's changes for
+// the aggregate check's Change column, e.g. "5 created, 3 altered, 1 dropped ·
+// 2 vschema updates". Zero categories are omitted. The vschema clause is only
+// included for non-MySQL engines, matching the plan comment's summary. Returns
+// "" when the plan has no changes. The create/alter/drop and vschema counting
+// is identical to the plan comment's summary (countStatementTypes / countChanges)
+// so the two always agree.
+func SummarizeChanges(data PlanCommentData) string {
+	creates, alters, drops := countStatementTypes(data.Changes)
+	_, keyspacesWithVSchema := countChanges(data.Changes)
+
+	var parts []string
+	if creates > 0 {
+		parts = append(parts, fmt.Sprintf("%d created", creates))
+	}
+	if alters > 0 {
+		parts = append(parts, fmt.Sprintf("%d altered", alters))
+	}
+	if drops > 0 {
+		parts = append(parts, fmt.Sprintf("%d dropped", drops))
+	}
+	ddlSummary := strings.Join(parts, ", ")
+
+	if keyspacesWithVSchema > 0 && !data.IsMySQL {
+		vschemaSummary := fmt.Sprintf("%d vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema))
+		if ddlSummary == "" {
+			return vschemaSummary
+		}
+		return ddlSummary + " · " + vschemaSummary
+	}
+	return ddlSummary
+}
+
 // countStatementTypes counts CREATE, ALTER, and DROP statements across all keyspaces.
 func countStatementTypes(changes []KeyspaceChangeData) (creates, alters, drops int) {
 	for _, ks := range changes {

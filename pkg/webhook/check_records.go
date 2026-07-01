@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // storePlanCheckRecord stores per-database check state after a plan is generated.
@@ -109,15 +110,16 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	}
 
 	check := &storage.Check{
-		Repository:   repo,
-		PullRequest:  pr,
-		HeadSHA:      headSHA,
-		Environment:  environment,
-		DatabaseType: schema.Type,
-		DatabaseName: schema.Database,
-		HasChanges:   hasChanges,
-		Status:       checkStatusCompleted,
-		Conclusion:   conclusion,
+		Repository:    repo,
+		PullRequest:   pr,
+		HeadSHA:       headSHA,
+		Environment:   environment,
+		DatabaseType:  schema.Type,
+		DatabaseName:  schema.Database,
+		HasChanges:    hasChanges,
+		Status:        checkStatusCompleted,
+		Conclusion:    conclusion,
+		ChangeSummary: summarizePlanChanges(schema, planResp, environment),
 	}
 	if err := h.service.Storage().Checks().UpsertPlanResult(ctx, check); err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -140,6 +142,16 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 		Status:       "success",
 	})
 	return headSHA, check, nil
+}
+
+// summarizePlanChanges renders the per-database change summary stored on the
+// check and shown in the aggregate check's Change column. It derives the counts
+// from the same PlanCommentData the plan comment renders from, so the summary
+// (e.g. "5 created, 3 altered · 2 vschema updates") always agrees with the plan
+// comment's summary line. Returns "" when the plan has no changes.
+func summarizePlanChanges(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) string {
+	commentData := buildPlanCommentData(schema, planResp, environment, "", "")
+	return templates.SummarizeChanges(commentData)
 }
 
 type applyCheckKey struct {

@@ -176,6 +176,12 @@ type Check struct {
 	// Displayed in the GitHub Check Run details and PR comment.
 	ErrorMessage string
 
+	// ChangeSummary is a human-readable per-database summary of the planned
+	// schema change (e.g. "5 created, 3 altered · 2 vschema updates"). It is set
+	// at plan time and preserved across apply-state transitions. Empty for
+	// aggregate rows and for rows recorded before this field existed.
+	ChangeSummary string
+
 	// CreatedAt is when the check was created.
 	CreatedAt time.Time
 

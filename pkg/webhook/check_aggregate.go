@@ -280,17 +280,29 @@ func buildAggregateTable(checks []*storage.Check) string {
 	return sb.String()
 }
 
+// changeSummaryLabel returns the per-database change summary for the aggregate
+// check's Change column, or an em dash when no summary was recorded (aggregate
+// rows, or rows recorded before the summary was stored).
+func changeSummaryLabel(c *storage.Check) string {
+	if c.ChangeSummary == "" {
+		return "—"
+	}
+	return c.ChangeSummary
+}
+
 // renderDatabaseSection renders the leader's own per-database checks as a
-// Database table, truncating to stay within budget bytes.
+// Database table with each database's type, change summary, and status,
+// truncating to stay within budget bytes. The aggregate check is
+// environment-scoped, so the environment is not repeated per row.
 func renderDatabaseSection(dbChecks []*storage.Check, budget int) string {
 	if len(dbChecks) == 0 {
 		return ""
 	}
 	var sb strings.Builder
-	sb.WriteString("| Database | Environment | Status |\n")
-	sb.WriteString("|----------|-------------|--------|\n")
+	sb.WriteString("| Database | Type | Change | Status |\n")
+	sb.WriteString("|----------|------|--------|--------|\n")
 	for i, c := range dbChecks {
-		row := fmt.Sprintf("| `%s` | %s | %s |\n", c.DatabaseName, c.Environment, checkStatusLabel(c))
+		row := fmt.Sprintf("| `%s` | %s | %s | %s |\n", c.DatabaseName, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c))
 		if sb.Len()+len(row) > budget {
 			fmt.Fprintf(&sb, "\n... and %d more check(s)\n", len(dbChecks)-i)
 			break

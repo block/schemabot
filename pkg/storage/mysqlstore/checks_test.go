@@ -1056,6 +1056,121 @@ func TestCheckStore_CompleteForApply(t *testing.T) {
 	require.Equal(t, apply.ID, retrieved.ApplyID)
 }
 
+// A plan-time change summary must round-trip through storage and survive the
+// apply lifecycle: once the plan records "N created, M altered", later
+// apply-state transitions (in_progress, terminal completion) must not blank it,
+// so the aggregate check's Change column keeps showing what the PR changes.
+func TestCheckStore_ChangeSummaryRoundTripsAndSurvivesApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	// Plan records the summary.
+	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		Repository:    "octocat/hello-world",
+		PullRequest:   7,
+		HeadSHA:       "abc123",
+		Environment:   "staging",
+		DatabaseType:  "vitess",
+		DatabaseName:  "orders",
+		HasChanges:    true,
+		Status:        "completed",
+		Conclusion:    "action_required",
+		ChangeSummary: "5 created, 3 altered · 2 vschema updates",
+	}))
+
+	checks, err := store.Checks().GetByPR(ctx, "octocat/hello-world", 7)
+	require.NoError(t, err)
+	require.Len(t, checks, 1)
+	assert.Equal(t, "5 created, 3 altered · 2 vschema updates", checks[0].ChangeSummary)
+
+	// Apply starts and completes. Neither transition carries a summary, and both
+	// must preserve the plan-time value rather than blanking it.
+	apply := createCheckStoreApply(t, store, "apply-change-summary", state.Apply.Completed)
+
+	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  7,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "vitess",
+		DatabaseName: "orders",
+		ApplyID:      apply.ID,
+		HasChanges:   true,
+		Status:       "in_progress",
+	}))
+
+	afterStart, err := store.Checks().Get(ctx, "octocat/hello-world", 7, "staging", "vitess", "orders")
+	require.NoError(t, err)
+	require.NotNil(t, afterStart)
+	assert.Equal(t, "in_progress", afterStart.Status)
+	assert.Equal(t, "5 created, 3 altered · 2 vschema updates", afterStart.ChangeSummary,
+		"apply-start upsert must preserve the plan-time change summary")
+
+	updated, err := store.Checks().CompleteForApply(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  7,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "vitess",
+		DatabaseName: "orders",
+		ApplyID:      apply.ID,
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	}, apply)
+	require.NoError(t, err)
+	require.True(t, updated)
+
+	afterComplete, err := store.Checks().Get(ctx, "octocat/hello-world", 7, "staging", "vitess", "orders")
+	require.NoError(t, err)
+	require.NotNil(t, afterComplete)
+	assert.Equal(t, "completed", afterComplete.Status)
+	assert.Equal(t, "success", afterComplete.Conclusion)
+	assert.Equal(t, "5 created, 3 altered · 2 vschema updates", afterComplete.ChangeSummary,
+		"terminal apply completion must preserve the plan-time change summary")
+}
+
+// The plan is authoritative for its own summary on a plan-only row: a re-plan
+// overwrites the summary, and a re-plan that finds no changes clears it (rather
+// than leaving a stale summary on a now-up-to-date check).
+func TestCheckStore_ReplanUpdatesChangeSummary(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	planCheck := func(summary string) *storage.Check {
+		hasChanges := summary != ""
+		conclusion := "success"
+		if hasChanges {
+			conclusion = "action_required"
+		}
+		return &storage.Check{
+			Repository: "octocat/hello-world", PullRequest: 7, HeadSHA: "abc123",
+			Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders",
+			HasChanges: hasChanges, Status: "completed", Conclusion: conclusion,
+			ChangeSummary: summary,
+		}
+	}
+	get := func() *storage.Check {
+		c, err := store.Checks().Get(ctx, "octocat/hello-world", 7, "staging", "mysql", "orders")
+		require.NoError(t, err)
+		require.NotNil(t, c)
+		return c
+	}
+
+	require.NoError(t, store.Checks().UpsertPlanResult(ctx, planCheck("5 created")))
+	assert.Equal(t, "5 created", get().ChangeSummary)
+
+	// A new plan with different changes overwrites the summary.
+	require.NoError(t, store.Checks().UpsertPlanResult(ctx, planCheck("2 altered")))
+	assert.Equal(t, "2 altered", get().ChangeSummary)
+
+	// A new plan that finds no changes clears the summary.
+	require.NoError(t, store.Checks().UpsertPlanResult(ctx, planCheck("")))
+	assert.Empty(t, get().ChangeSummary)
+}
+
 func TestCheckStore_CompleteForApplyLeaseGuard(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
