@@ -214,6 +214,29 @@ func TestTargetRouterRoutesPlanThroughStaticTarget(t *testing.T) {
 	assert.Len(t, created, 1, "the router should cache LocalClients by resolved target route and namespace")
 }
 
+func TestTargetRouterRoutesPlanDiffThroughStaticTarget(t *testing.T) {
+	resolver := newStaticResolver(t)
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	resp, err := router.PlanDiff(t.Context(), &ternv1.PlanRequest{
+		Database:    "orders-logical",
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: "production",
+		Target:      "dsid-orders-prod",
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, ternv1.Engine_ENGINE_PLANETSCALE, resp.Engine)
+	client := created["orders-logical"]
+	require.NotNil(t, client)
+	require.NotNil(t, client.planDiffReq)
+	assert.Equal(t, "orders-logical", client.planDiffReq.Database)
+	assert.Equal(t, storage.DatabaseTypeMySQL, client.planDiffReq.Type)
+	assert.Equal(t, "dsid-orders-prod", client.planDiffReq.Target)
+	assert.Equal(t, "root@tcp(localhost:3306)/", client.targetDSN)
+}
+
 func TestTargetRouterApplyUsesTargetScopedPendingObserver(t *testing.T) {
 	resolver := newStaticResolver(t)
 	created := make(map[string]*targetRouterRecordingClient)

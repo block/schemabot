@@ -1269,6 +1269,9 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 // read-only producer the control plane runs per deployment to detect review-time
 // drift.
 func (c *LocalClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("plan diff request is required")
+	}
 	if c.getEngine() == nil {
 		return nil, fmt.Errorf("no engine available for database type %q", c.config.Type)
 	}

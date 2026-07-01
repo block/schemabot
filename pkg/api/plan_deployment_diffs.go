@@ -73,6 +73,12 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			results[i].Changes = primaryPlan.Changes
 			results[i].Shards = primaryPlan.Shards
 			results[i].LintViolations = primaryPlan.LintViolations
+			// A reviewed plan that reported planning errors is not a trustworthy
+			// baseline; record the error so the rollup fails closed rather than
+			// comparing deployments against a broken primary.
+			if len(primaryPlan.Errors) > 0 {
+				results[i].Err = fmt.Errorf("reviewed primary plan reported errors: %v", primaryPlan.Errors)
+			}
 			continue
 		}
 
@@ -93,6 +99,19 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			results[i].Changes = resp.Changes
 			results[i].Shards = resp.Shards
 			results[i].LintViolations = resp.LintViolations
+			// A diff that succeeded at the RPC layer but reported planning errors
+			// is not a trustworthy comparison input; block on it so the rollup
+			// never mistakes an incomplete diff for agreement.
+			if len(resp.Errors) > 0 {
+				diffErr := fmt.Errorf("plan diff on deployment %q target %q reported errors: %v", target.Deployment, target.Target, resp.Errors)
+				s.logger.Warn("plan deployment diff reported errors; deployment will block the review rollup",
+					"database", req.Database,
+					"environment", req.Environment,
+					"deployment", target.Deployment,
+					"target", target.Target,
+					"error", diffErr)
+				results[i].Err = diffErr
+			}
 			return nil
 		})
 	}
