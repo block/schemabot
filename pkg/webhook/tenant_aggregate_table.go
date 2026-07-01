@@ -53,14 +53,16 @@ func buildTenantAggregateTable(states []TenantState) string {
 		sb.WriteString("|----------|--------|--------|\n")
 	}
 
+	rowsByTenant := make([][]aggregateRow, len(states))
 	total := 0
-	for _, state := range states {
-		total += len(tenantAggregateRows(state))
+	for i, state := range states {
+		rowsByTenant[i] = tenantAggregateRows(state)
+		total += len(rowsByTenant[i])
 	}
 
 	rendered := 0
-	for _, state := range states {
-		for _, row := range tenantAggregateRows(state) {
+	for i, state := range states {
+		for _, row := range rowsByTenant[i] {
 			var line string
 			if multiTenant {
 				line = fmt.Sprintf("| %s | %s | %s | %s |\n", state.Tenant, formatCell(row.database), formatChange(row.change), row.status)
@@ -78,17 +80,17 @@ func buildTenantAggregateTable(states []TenantState) string {
 	return sb.String()
 }
 
-// formatCell backtick-quotes a database name, leaving the placeholder dash
-// unquoted.
+// formatCell renders a database name as an inline code span, leaving the
+// placeholder dash unquoted.
 func formatCell(value string) string {
 	if value == "" || value == "—" {
 		return "—"
 	}
-	return "`" + value + "`"
+	return codeSpan(value)
 }
 
-// formatChange backtick-quotes a DDL change, leaving free-text placeholders like
-// "no changes" (and empties) unquoted.
+// formatChange renders a DDL change as an inline code span, leaving free-text
+// placeholders like "no changes" (and empties) unquoted.
 func formatChange(value string) string {
 	switch value {
 	case "", "no changes":
@@ -97,6 +99,30 @@ func formatChange(value string) string {
 		}
 		return value
 	default:
-		return "`" + value + "`"
+		return codeSpan(value)
 	}
+}
+
+// codeSpan wraps value in a Markdown inline code span, choosing a backtick fence
+// longer than any run of backticks inside the value so quoted SQL identifiers
+// (e.g. “ `email` “) don't break the span. Per CommonMark, a value that begins
+// or ends with a backtick is padded with a single space inside the fence.
+func codeSpan(value string) string {
+	longest, run := 0, 0
+	for _, r := range value {
+		if r == '`' {
+			run++
+			if run > longest {
+				longest = run
+			}
+			continue
+		}
+		run = 0
+	}
+	fence := strings.Repeat("`", longest+1)
+	pad := ""
+	if strings.HasPrefix(value, "`") || strings.HasSuffix(value, "`") {
+		pad = " "
+	}
+	return fence + pad + value + pad + fence
 }

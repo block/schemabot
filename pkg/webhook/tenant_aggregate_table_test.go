@@ -69,3 +69,23 @@ func TestBuildTenantAggregateTableTruncates(t *testing.T) {
 	require.Contains(t, table, "more row(s)")
 	assert.True(t, strings.HasSuffix(strings.TrimSpace(table), "more row(s)"), "truncation note is last")
 }
+
+// A DDL summary that contains backticks (from quoted SQL identifiers) is wrapped
+// in a longer backtick fence so the Markdown code span still renders.
+func TestBuildTenantAggregateTableEscapesBacktickedDDL(t *testing.T) {
+	table := buildTenantAggregateTable([]TenantState{
+		{Tenant: "tenant-a", SHA: "abc", Rollup: "pending", Databases: []TenantDatabaseState{
+			{Database: "orders", Op: "ALTER TABLE", State: "running", Detail: "ADD COLUMN `email`"},
+		}},
+	})
+
+	assert.Contains(t, table, "`` ADD COLUMN `email` ``",
+		"a value containing backticks uses a double-backtick fence with space padding")
+}
+
+func TestCodeSpan(t *testing.T) {
+	assert.Equal(t, "`orders`", codeSpan("orders"))
+	assert.Equal(t, "`` `email` ``", codeSpan("`email`"), "leading/trailing backtick is space-padded inside a longer fence")
+	assert.Equal(t, "``a`b``", codeSpan("a`b"), "an interior backtick still forces a longer fence")
+	assert.Equal(t, "```a``b``c```", codeSpan("a``b``c"), "fence is one longer than the longest interior run")
+}
