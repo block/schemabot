@@ -130,7 +130,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 	if result.Tenant == "" && commandRequiresTenantTarget(result) && h.service != nil && h.service.Config().Tenant != "" {
-		if h.fansOutUnscopedCommand(repo) {
+		if h.fansOutUnscopedCommand(repo) && unscopedCommandFansOut(result) {
 			h.logger.Info("aggregate participant fanning out unscoped work command; applying its own databases",
 				"repo", repo, "pr", pr, "tenant", h.service.Config().Tenant, "action", result.Action)
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -361,6 +361,20 @@ func (h *Handler) fansOutUnscopedCommand(repo string) bool {
 		return false
 	}
 	return h.service.Config().AggregateRoleForRepo(repo) == api.AggregateRoleParticipant
+}
+
+// unscopedCommandFansOut reports whether an unscoped (no -t) command is one a
+// participant should actually act on when fanning out, as opposed to an error
+// case it should stay silent on. A complete command (Found) fans out, and a
+// plan without -e fans out as a multi-env plan. A missing-env error for
+// apply/rollback does NOT fan out: otherwise every participant on a shared repo
+// would post its own duplicate "missing environment" comment. The leader (which
+// never hits the tenant gate) posts that error once.
+func unscopedCommandFansOut(result CommandResult) bool {
+	if result.Found {
+		return true
+	}
+	return result.MissingEnv && result.Action == action.Plan
 }
 
 // postComment posts a comment on a PR.

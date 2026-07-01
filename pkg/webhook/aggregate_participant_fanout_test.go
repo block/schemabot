@@ -6,7 +6,26 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/webhook/action"
 )
+
+// Fan-out applies only to actionable unscoped commands. A complete command
+// (Found) fans out; a plan without -e fans out as a multi-env plan; but a
+// missing-env error for apply/rollback does NOT fan out — otherwise every
+// participant on a shared repo would post its own duplicate "missing
+// environment" comment (the leader posts that error once).
+func TestUnscopedCommandFansOut(t *testing.T) {
+	assert.True(t, unscopedCommandFansOut(CommandResult{Found: true, Action: action.Apply}),
+		"a complete command fans out")
+	assert.True(t, unscopedCommandFansOut(CommandResult{MissingEnv: true, Action: action.Plan}),
+		"plan without -e fans out as a multi-env plan")
+	assert.False(t, unscopedCommandFansOut(CommandResult{MissingEnv: true, Action: action.Apply}),
+		"apply without -e is an error and must not fan out (no duplicate missing-env comments)")
+	assert.False(t, unscopedCommandFansOut(CommandResult{MissingEnv: true, Action: action.Rollback}),
+		"rollback without -e is an error and must not fan out")
+	assert.False(t, unscopedCommandFansOut(CommandResult{}),
+		"an unrecognized command does not fan out")
+}
 
 // An aggregate participant fans out an unscoped work command: an
 // `apply -e <env>` with no -t tenant reaches every participant on a shared
