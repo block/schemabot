@@ -1,0 +1,410 @@
+//go:build integration
+
+// Aggregate-check leader gate integration tests. These exercise the leader that
+// folds participant deployments' Check Runs into its own per-environment
+// aggregate check, driving the fold through the check_run "completed" webhook
+// path (handleParticipantCheckCompleted -> updateAggregateCheck) and asserting
+// the Check Run the leader publishes on the PR head commit. The fail-closed
+// safety contract is the focus: only a trusted, completed, successful
+// participant check may let the aggregate pass; anything else must block merge.
+
+package webhook
+
+import (
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"testing"
+	"time"
+
+	gh "github.com/google/go-github/v86/github"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
+)
+
+const (
+	leaderOwnAppSlug     = "schemabot-leader"
+	trustedTenantAppSlug = "schemabot-tenant-b"
+	tenantBCheckName     = "SchemaBot Tenant B"
+	tenantBSchemaDir     = "tenant-b/schema"
+)
+
+// leaderRepoConfig is the standard leader configuration used across these
+// tests: a leader for octocat/hello-world that gates staging and production on
+// a single expected participant (tenant-b) whose schema lives under
+// tenant-b/schema and which publishes "SchemaBot Tenant B (<env>)" checks.
+func leaderRepoConfig() *api.ServerConfig {
+	return &api.ServerConfig{
+		AllowedEnvironments: []string{"staging", "production"},
+		Repos: map[string]api.RepoConfig{
+			"octocat/hello-world": {
+				Aggregate: &api.AggregateConfig{
+					Role: api.AggregateRoleLeader,
+					ExpectedTenants: []api.ExpectedTenant{{
+						Tenant:    "tenant-b",
+						Paths:     []string{tenantBSchemaDir},
+						CheckName: tenantBCheckName,
+					}},
+				},
+			},
+		},
+	}
+}
+
+// newLeaderHandler builds a Handler whose GitHub client is constructed with the
+// leader's own App slug plus the trusted participant App slug, mirroring how a
+// real leader deployment is wired. FindCheckRunByName only trusts runs whose
+// app.slug is the leader's own slug or a configured trusted slug, so a
+// participant run must carry trustedTenantAppSlug to be folded.
+func newLeaderHandler(t *testing.T, svc *api.Service, client *gh.Client) *Handler {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClientWithSlug(client, logger, leaderOwnAppSlug, trustedTenantAppSlug)
+	factory := &fakeClientFactory{client: installClient}
+	return NewHandler(svc, factory, nil, logger)
+}
+
+// mockLeaderPRHead serves the PR head SHA so the leader's head-SHA freshness
+// check passes for headSHA.
+func mockLeaderPRHead(mux *http.ServeMux, headSHA string) {
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: &headSHA},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+}
+
+// mockLeaderPRFilesTouchTenantB serves a PR file listing under tenant-b's
+// managed directory so the leader computes tenant-b as an expected participant.
+func mockLeaderPRFilesTouchTenantB(mux *http.ServeMux) {
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+			{Filename: new(tenantBSchemaDir + "/users.sql"), Status: new("added")},
+		})
+	})
+}
+
+// mockParticipantCheckRuns serves the participant Check Run lookup
+// (Checks.ListCheckRunsForRef) for the check names in runsByName. Names not in
+// the map return an empty result (no run). runsByName values are raw check-run
+// JSON objects; set app.slug per scenario to control trust.
+func mockParticipantCheckRuns(mux *http.ServeMux, runsByName map[string]map[string]any) {
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/", func(w http.ResponseWriter, r *http.Request) {
+		checkName := r.URL.Query().Get("check_name")
+		run, ok := runsByName[checkName]
+		if !ok {
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "check_runs": []any{}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"total_count": 1,
+			"check_runs":  []map[string]any{run},
+		})
+	})
+}
+
+// captureLeaderCheckRuns records every aggregate Check Run create/update the
+// leader publishes.
+func captureLeaderCheckRuns(mux *http.ServeMux) chan checkRunCapture {
+	checkRuns := make(chan checkRunCapture, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 999})
+	})
+	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 999})
+	})
+	return checkRuns
+}
+
+// buildParticipantCompletedRequest builds a check_run "completed" webhook for a
+// participant's env-scoped check. The leader reacts to this by re-folding the
+// aggregate for the PR head, re-reading each participant's state via the
+// trusted FindCheckRunByName path.
+func buildParticipantCompletedRequest(t *testing.T, checkName, headSHA string) *http.Request {
+	t.Helper()
+	return buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{
+		action:    "completed",
+		checkName: checkName,
+		headSHA:   headSHA,
+	}, nil)
+}
+
+// collectAggregate waits for the leader to publish an aggregate check for the
+// given env-scoped name, draining any other captured runs (the leader publishes
+// one aggregate per allowed environment).
+func collectAggregate(t *testing.T, checkRuns chan checkRunCapture, wantName string) checkRunCapture {
+	t.Helper()
+	deadline := time.After(webhookIntegrationCheckRunDeadline)
+	for {
+		select {
+		case cr := <-checkRuns:
+			if cr.Name == wantName {
+				return cr
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for aggregate check run %q", wantName)
+		}
+	}
+}
+
+// A PR touches only the participant tenant's schema, so the leader owns no
+// per-database check of its own and gates purely on the participant. When the
+// participant's env-scoped Check Run is trusted, completed, and successful, the
+// leader's aggregate for that environment passes.
+func TestE2ELeaderPassesOnTrustedSuccessfulParticipant(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	const headSHA = "abc123"
+	mockLeaderPRHead(mux, headSHA)
+	mockLeaderPRFilesTouchTenantB(mux)
+
+	prodCheckName := aggregateCheckNameForEnv(tenantBCheckName, "production")
+	stagingCheckName := aggregateCheckNameForEnv(tenantBCheckName, "staging")
+	mockParticipantCheckRuns(mux, map[string]map[string]any{
+		prodCheckName: {
+			"id": 4001, "name": prodCheckName, "status": "completed", "conclusion": "success",
+			"app": map[string]any{"slug": trustedTenantAppSlug},
+		},
+		stagingCheckName: {
+			"id": 4002, "name": stagingCheckName, "status": "completed", "conclusion": "success",
+			"app": map[string]any{"slug": trustedTenantAppSlug},
+		},
+	})
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	req := buildParticipantCompletedRequest(t, prodCheckName, headSHA)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "aggregate re-folded on participant check completion")
+
+	cr := collectAggregate(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", "production"))
+	assert.Equal(t, headSHA, cr.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, cr.Status)
+	assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
+
+	// The stored aggregate mirrors the passing Check Run.
+	stored, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1,
+		"production", aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, checkConclusionSuccess, stored.Conclusion)
+	assert.Equal(t, headSHA, stored.HeadSHA)
+}
+
+// When an expected participant has not reported its Check Run on the head
+// commit, the leader has no evidence the participant's schema is safe. It fails
+// closed: the aggregate blocks (action_required) rather than passing on the
+// participant's silence.
+func TestE2ELeaderBlocksOnMissingParticipantCheck(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	const headSHA = "abc123"
+	mockLeaderPRHead(mux, headSHA)
+	mockLeaderPRFilesTouchTenantB(mux)
+
+	// No participant runs registered — the lookup returns total_count 0.
+	mockParticipantCheckRuns(mux, nil)
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	prodCheckName := aggregateCheckNameForEnv(tenantBCheckName, "production")
+	req := buildParticipantCompletedRequest(t, prodCheckName, headSHA)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	cr := collectAggregate(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", "production"))
+	assert.Equal(t, headSHA, cr.HeadSHA)
+	assert.NotEqual(t, checkConclusionSuccess, cr.Conclusion, "missing participant must not pass the aggregate")
+	assert.Equal(t, checkStatusCompleted, cr.Status)
+	assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
+}
+
+// While the participant's Check Run is still in progress, the leader's
+// aggregate must stay in_progress (no conclusion), which blocks merge until the
+// participant reaches a terminal state.
+func TestE2ELeaderBlocksOnInProgressParticipant(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	const headSHA = "abc123"
+	mockLeaderPRHead(mux, headSHA)
+	mockLeaderPRFilesTouchTenantB(mux)
+
+	prodCheckName := aggregateCheckNameForEnv(tenantBCheckName, "production")
+	stagingCheckName := aggregateCheckNameForEnv(tenantBCheckName, "staging")
+	mockParticipantCheckRuns(mux, map[string]map[string]any{
+		prodCheckName: {
+			"id": 5001, "name": prodCheckName, "status": "in_progress",
+			"app": map[string]any{"slug": trustedTenantAppSlug},
+		},
+		stagingCheckName: {
+			"id": 5002, "name": stagingCheckName, "status": "in_progress",
+			"app": map[string]any{"slug": trustedTenantAppSlug},
+		},
+	})
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	req := buildParticipantCompletedRequest(t, prodCheckName, headSHA)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	cr := collectAggregate(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", "production"))
+	assert.Equal(t, headSHA, cr.HeadSHA)
+	assert.Equal(t, checkStatusInProgress, cr.Status)
+	assert.Empty(t, cr.Conclusion, "in-progress participant leaves the aggregate without a conclusion")
+}
+
+// A same-named Check Run published only by an untrusted GitHub App (for example
+// a GitHub Actions job configured with a matching name) can never satisfy the
+// gate. The leader fails closed: the aggregate blocks rather than trusting a
+// run whose App is not the participant's.
+func TestE2ELeaderBlocksOnUntrustedParticipantApp(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	const headSHA = "abc123"
+	mockLeaderPRHead(mux, headSHA)
+	mockLeaderPRFilesTouchTenantB(mux)
+
+	prodCheckName := aggregateCheckNameForEnv(tenantBCheckName, "production")
+	stagingCheckName := aggregateCheckNameForEnv(tenantBCheckName, "staging")
+	// The runs are completed+success but published by an untrusted App slug.
+	mockParticipantCheckRuns(mux, map[string]map[string]any{
+		prodCheckName: {
+			"id": 6001, "name": prodCheckName, "status": "completed", "conclusion": "success",
+			"app": map[string]any{"slug": "some-other-app"},
+		},
+		stagingCheckName: {
+			"id": 6002, "name": stagingCheckName, "status": "completed", "conclusion": "success",
+			"app": map[string]any{"slug": "some-other-app"},
+		},
+	})
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	req := buildParticipantCompletedRequest(t, prodCheckName, headSHA)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	cr := collectAggregate(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", "production"))
+	assert.Equal(t, headSHA, cr.HeadSHA)
+	assert.NotEqual(t, checkConclusionSuccess, cr.Conclusion, "untrusted-app check must not pass the aggregate")
+	assert.Equal(t, checkStatusCompleted, cr.Status)
+	assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
+}
+
+// A check_run completion on a repo this deployment does not lead must not
+// trigger a re-fold: a participant deployment reacting to completions would
+// double-write the leader's check. The handler returns the non-leader ignored
+// response and posts no aggregate Check Run.
+func TestE2ELeaderRefoldSkippedForNonLeaderRepo(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, &api.ServerConfig{
+		AllowedEnvironments: []string{"staging", "production"},
+		Repos: map[string]api.RepoConfig{
+			"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}},
+		},
+	})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// Any check-run POST here is a failure — a non-leader must not fold.
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	// The completed check is a participant-style check name, not this
+	// deployment's own aggregate.
+	req := buildParticipantCompletedRequest(t, aggregateCheckNameForEnv(tenantBCheckName, "production"), "abc123")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "check_run completion ignored for non-leader repo")
+
+	select {
+	case cr := <-checkRuns:
+		t.Fatalf("non-leader repo published an aggregate check on participant completion: %+v", cr)
+	case <-time.After(time.Second):
+	}
+}
+
+// A leader must not re-fold in response to its own aggregate Check Run
+// completing, or it would loop on its own writes. When the completed check name
+// is the leader's own aggregate, the handler returns the own-aggregate ignored
+// response and posts no aggregate.
+func TestE2ELeaderRefoldSkippedForOwnAggregateCheck(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	// The completed check is the leader's own env-scoped aggregate.
+	req := buildParticipantCompletedRequest(t, aggregateCheckNameForEnv("SchemaBot", "production"), "abc123")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "check_run completion ignored for own aggregate check")
+
+	select {
+	case cr := <-checkRuns:
+		t.Fatalf("leader re-folded on its own aggregate completion: %+v", cr)
+	case <-time.After(time.Second):
+	}
+}
