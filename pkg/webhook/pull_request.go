@@ -204,6 +204,29 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 			})
 			return "no schema files in PR (aggregate participant, staying silent)"
 		}
+		// A PR with no leader-managed schema can still touch schema owned by
+		// expected participant deployments. The leader's aggregate is the
+		// required check, so it must gate on those participants' Check Runs —
+		// route through the aggregate fold, which fails closed until every
+		// expected participant reports terminal success, instead of posting an
+		// unconditional passing aggregate. The fold re-runs as participants'
+		// Check Run events arrive, converging to passing once they succeed.
+		if h.leaderExpectsParticipantsForPR(repo, files) {
+			h.logger.Info("no leader-managed schema in PR but expected participant paths are touched; aggregate gate will block until participants report",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source)
+			h.goSafe(repo, pr, installationID, func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				c, err := h.clientForRepo(repo, installationID)
+				if err != nil {
+					h.logger.Error("failed to create GitHub client for participant-gated aggregate",
+						"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+					return
+				}
+				h.updateAggregateCheck(ctx, c, repo, pr, headSHA)
+			})
+			return "no schema files in PR (aggregate folds expected participants)"
+		}
 		// Post passing aggregates on the current HEAD SHA so branch protection
 		// isn't blocked on PRs that don't touch schema files. Always post —
 		// on synchronize events the HEAD SHA changes, so the aggregate must be

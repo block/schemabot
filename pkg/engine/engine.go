@@ -339,7 +339,32 @@ type ProgressResult struct {
 	// engine surface structured status to the renderer without core decoding the
 	// opaque ResumeState.Metadata or reading an engine-specific side table.
 	Metadata map[string]string
+
+	// PerShardProgressUnavailable is set by sharded engines when a progress poll
+	// cannot produce per-shard/row-copy progress, carrying a machine-readable
+	// reason (one of the PerShardUnavailable* constants). Empty means per-shard
+	// progress was available (or the engine has no per-shard concept). The drive
+	// surfaces this once per apply so an operator sees the degraded visibility in
+	// Datadog without enabling debug logging.
+	PerShardProgressUnavailable string
 }
+
+// Reasons a sharded engine could not report per-shard/row-copy progress for a
+// progress poll, carried in ProgressResult.PerShardProgressUnavailable.
+const (
+	// PerShardUnavailableNoVtgateDSN means the target resolved without a vtgate
+	// DSN, so SHOW VITESS_MIGRATIONS cannot be queried. This persists for the
+	// whole apply — a target-resolution gap (missing vtgate endpoint).
+	PerShardUnavailableNoVtgateDSN = "no_vtgate_dsn"
+	// PerShardUnavailableNoChangeContext means no schema-change context
+	// identifier is known for the deploy yet, so per-shard rows cannot be
+	// correlated to this apply. Transient during setup/recovery.
+	PerShardUnavailableNoChangeContext = "no_change_context"
+	// PerShardUnavailableNoShardRows means the per-shard query ran but returned
+	// no rows for this schema change while the apply was active. Can occur
+	// transiently at the start of the copy phase, before shard rows register.
+	PerShardUnavailableNoShardRows = "no_shard_rows"
+)
 
 // TableProgress tracks progress for a single table.
 type TableProgress struct {

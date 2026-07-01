@@ -416,3 +416,99 @@ func TestE2ELeaderRefoldSkippedForOwnAggregateCheck(t *testing.T) {
 	case <-time.After(time.Second):
 	}
 }
+
+// mockLeaderEmptyTree serves an empty git tree for headSHA so config discovery
+// resolves no schemabot.yaml — the leader manages none of the PR's files.
+func mockLeaderEmptyTree(mux *http.ServeMux, headSHA string) {
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/"+headSHA, func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.Tree{SHA: new(headSHA), Entries: []*gh.TreeEntry{}, Truncated: new(false)})
+	})
+}
+
+// A PR that touches only an expected participant's schema carries schema work
+// the leader must gate on, even though the leader itself manages none of the
+// changed files. The pull_request event routes through the aggregate fold, so
+// the required aggregate blocks (fail-closed) until the participant reports —
+// it must not pass as "no managed schema changes" while the participant's
+// schema change is unplanned, in flight, or its deployment is down.
+func TestE2ELeaderNonSchemaPRTouchingParticipantPathBlocks(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	const headSHA = "abc123"
+	mockLeaderPRHead(mux, headSHA)
+	mockLeaderPRFilesTouchTenantB(mux)
+	mockLeaderEmptyTree(mux, headSHA)
+	// The participant has posted no Check Run at all on the head commit.
+	mockParticipantCheckRuns(mux, nil)
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: headSHA,
+		headRef: "feature-branch",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "aggregate folds expected participants")
+
+	for _, env := range []string{"staging", "production"} {
+		cr := collectAggregate(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", env))
+		assert.Equal(t, headSHA, cr.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion,
+			"aggregate for %s must fail closed while the expected participant is silent", env)
+	}
+}
+
+// The expected-tenant set is path-filtered: a leader's non-schema PR touching
+// none of the participants' paths keeps the plain passing aggregate, so
+// unrelated PRs are unaffected by participant gating.
+func TestE2ELeaderNonSchemaPROutsideParticipantPathsPasses(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	const headSHA = "abc123"
+	mockLeaderPRHead(mux, headSHA)
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+			{Filename: new("README.md"), Status: new("modified")},
+		})
+	})
+	mockLeaderEmptyTree(mux, headSHA)
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: headSHA,
+		headRef: "feature-branch",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "no schema files in PR")
+	assert.NotContains(t, rr.Body.String(), "aggregate folds expected participants")
+
+	for _, env := range []string{"staging", "production"} {
+		cr := collectAggregate(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", env))
+		assert.Equal(t, headSHA, cr.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionSuccess, cr.Conclusion,
+			"aggregate for %s keeps passing on a PR outside all participant paths", env)
+	}
+}

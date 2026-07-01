@@ -713,6 +713,21 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		ps.stateEnteredAt = now
 	}
 
+	// Surface once, at Warn, when a sharded engine reached an active state but
+	// could not report per-shard/row-copy progress for a reason that persists for
+	// the whole apply (a missing vtgate DSN). Only the persistent reason warns:
+	// the transient reasons (schema-change context still being discovered, shard
+	// rows not yet registered at copy start) can self-heal on a later poll, so a
+	// one-shot warning for them would be a false alarm that latches forever; they
+	// stay visible in the engine's per-poll Debug. Warn (not Debug) so the
+	// degraded visibility is always in Datadog without enabling debug logging.
+	if result.PerShardProgressUnavailable == engine.PerShardUnavailableNoVtgateDSN && !ps.warnedPerShardUnavailable &&
+		state.IsState(newState, state.Task.Running, state.Task.WaitingForCutover, state.Task.RevertWindow) {
+		c.logger.Warn("per-shard progress unavailable: per-shard and row-copy progress will not be reported for this apply",
+			append(apply.LogAttrs(), "reason", result.PerShardProgressUnavailable, "task_state", newState)...)
+		ps.warnedPerShardUnavailable = true
+	}
+
 	// Log progress every 10 seconds
 	c.logAtomicProgress(ctx, apply, result, ps, now)
 

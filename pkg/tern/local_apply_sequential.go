@@ -259,6 +259,11 @@ type atomicPollState struct {
 	// consecutiveErrors tracks progress poll failures to fail fast when the
 	// engine is unreachable (e.g., branch deleted mid-apply).
 	consecutiveErrors int
+
+	// warnedPerShardUnavailable is set after the drive warns that a sharded
+	// engine could not report per-shard/row-copy progress, so the warning is
+	// emitted once per apply rather than on every poll.
+	warnedPerShardUnavailable bool
 }
 
 // startApplyHeartbeat starts a background goroutine that heartbeats the apply
