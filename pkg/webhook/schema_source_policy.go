@@ -31,6 +31,26 @@ func (h *Handler) skipUnownedUnscopedCommand(repo, tenant string, err error) boo
 	return errors.As(err, &notOwned)
 }
 
+// silentOnUnscopedFanOut reports whether a "nothing to do on this deployment"
+// outcome for an unscoped (no -t) command should be a logged silent skip rather
+// than a PR comment. On an aggregate repo (leader or participant) an unscoped
+// command fans out to every deployment, so one that finds no pending work — for
+// example apply-confirm after this deployment's own databases already
+// auto-applied and released their locks — must stay quiet; only the deployment
+// that actually has work to confirm responds. A -t-scoped command (tenant != "")
+// named a specific deployment, so its "nothing to do" answer is useful and still
+// surfaces.
+func (h *Handler) silentOnUnscopedFanOut(repo, tenant string) bool {
+	if tenant != "" {
+		return false
+	}
+	config, ok := h.serverConfig()
+	if !ok {
+		return false
+	}
+	return config.AggregateRoleForRepo(repo) != ""
+}
+
 type schemaConfigOutsideAllowedDirsError struct {
 	Database     string
 	DatabaseType string

@@ -388,6 +388,11 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 		return
 	}
 	if existingLock == nil {
+		if h.silentOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("unscoped fan-out apply-confirm found no pending confirmation on this deployment; staying silent",
+				"repo", repo, "pr", pr, "database", database, "environment", environment)
+			return
+		}
 		h.logger.Info("apply-confirm rejected: no lock held", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderApplyConfirmNoLock(database, environment))
 		return
