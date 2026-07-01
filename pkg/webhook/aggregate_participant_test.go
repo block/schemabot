@@ -18,7 +18,7 @@ func TestIsAggregateParticipant(t *testing.T) {
 			"octocat/shared-repo": {Aggregate: &api.AggregateConfig{
 				Role: api.AggregateRoleLeader,
 				ExpectedTenants: []api.ExpectedTenant{
-					{Tenant: "bb-block", Paths: []string{"kgoose/schema"}},
+					{Tenant: "tenant-b", Paths: []string{"tenant-b/schema"}},
 				},
 			}},
 			"octocat/participant-repo": {Aggregate: &api.AggregateConfig{

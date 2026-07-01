@@ -608,6 +608,81 @@ func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 	assert.True(t, seen["SchemaBot (production)"], "expected SchemaBot (production) check")
 }
 
+// An aggregate participant does not own the required check on a repo — the
+// leader does. On a PR that touches none of its schema, a participant posts no
+// check run at all (rather than a passing "No managed schema changes" aggregate
+// that would add a per-tenant row near the merge button).
+func TestE2EParticipantSilentOnNonSchemaPR(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, &api.ServerConfig{
+		AllowedEnvironments: []string{"staging", "production"},
+		Repos: map[string]api.RepoConfig{
+			"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}},
+		},
+	})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("abc123")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+
+	// PR changed files — no schema files.
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+			{Filename: new("README.md"), Status: new("modified")},
+		})
+	})
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.Tree{SHA: new("abc123"), Entries: []*gh.TreeEntry{}, Truncated: new(false)})
+	})
+
+	// Any check-run POST here is a failure — a participant must stay silent.
+	checkRuns := make(chan checkRunCapture, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "aggregate participant, staying silent")
+
+	// The skip is synchronous (it returns before scheduling any passing
+	// aggregate), so a brief drain confirms no check run was posted.
+	select {
+	case cr := <-checkRuns:
+		t.Fatalf("participant posted a check run on a non-schema PR: %q", cr.Name)
+	case <-time.After(2 * time.Second):
+	}
+}
+
 // TestE2ECheckRunRerequestReplansCurrentPR verifies that rerunning a SchemaBot
 // Check Run from GitHub reuses auto-plan discovery and republishes aggregate
 // check state for the current PR head.
