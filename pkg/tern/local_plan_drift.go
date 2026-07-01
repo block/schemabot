@@ -147,12 +147,15 @@ func (c *LocalClient) driftMultisetFromApplyRequest(changes []*ternv1.TableChang
 }
 
 // canonicalDDLForDrift normalizes a single DDL statement for comparison and
-// fails closed if it cannot be parsed or carries more than one statement.
-// ddl.Canonicalize returns the input unchanged on a parse failure, so an
-// unparseable statement would otherwise compare by raw text and could mask
-// drift. It also canonicalizes only the first statement, so a multi-statement
-// payload ("ALTER ...; ALTER ...") would silently drop the trailing statements
-// and mask drift on them — reject anything that is not exactly one statement.
+// fails closed if it cannot be parsed, carries more than one statement, or is
+// not actually DDL. ddl.Canonicalize returns the input unchanged on a parse
+// failure, so an unparseable statement would otherwise compare by raw text and
+// could mask drift. It also canonicalizes only the first statement, so a
+// multi-statement payload ("ALTER ...; ALTER ...") would silently drop the
+// trailing statements and mask drift on them — reject anything that is not
+// exactly one statement. statement.Classify also accepts non-DDL (e.g. SELECT,
+// INSERT), which has no place in a schema-change drift comparison, so reject
+// anything that is not a DDL statement.
 func canonicalDDLForDrift(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -164,6 +167,9 @@ func canonicalDDLForDrift(raw string) (string, error) {
 	}
 	if len(results) != 1 {
 		return "", fmt.Errorf("expected exactly one DDL statement, got %d", len(results))
+	}
+	if !results[0].Type.IsDDL() {
+		return "", fmt.Errorf("expected a DDL statement, got %s", results[0].Type)
 	}
 	return ddl.Canonicalize(raw), nil
 }

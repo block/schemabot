@@ -271,6 +271,15 @@ func TestCanonicalDDLForDrift_FailsClosed(t *testing.T) {
 		assert.Contains(t, err.Error(), "exactly one DDL statement")
 	})
 
+	t.Run("non-DDL statement is rejected", func(t *testing.T) {
+		// statement.Classify accepts non-DDL such as SELECT, which has no place
+		// in a schema-change drift comparison. It must fail closed instead of
+		// canonicalizing it as if it were DDL.
+		_, err := canonicalDDLForDrift("SELECT 1")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "expected a DDL statement")
+	})
+
 	t.Run("parseable DDL is canonicalized", func(t *testing.T) {
 		// Whitespace and unquoted identifiers normalize to the same canonical form
 		// regardless of incidental formatting, so equivalent DDL compares equal.
