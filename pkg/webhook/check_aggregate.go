@@ -45,6 +45,21 @@ func (h *Handler) isAggregateParticipant(repo string) bool {
 	return config.AggregateRoleForRepo(repo) == api.AggregateRoleParticipant
 }
 
+// leaderExpectsParticipantsForPR reports whether this deployment is the
+// aggregate leader for repo and the PR's changed files touch at least one
+// expected participant's paths. Such a PR carries schema work owned by another
+// deployment even when the leader itself has none, so the leader's aggregate
+// must fold the participants' Check Runs (fail-closed) rather than pass on
+// "no managed schema changes". Returns false for non-leaders — the expected set
+// only exists on the leader.
+func (h *Handler) leaderExpectsParticipantsForPR(repo string, files []ghclient.PRFile) bool {
+	config, ok := h.serverConfig()
+	if !ok {
+		return false
+	}
+	return len(config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))) > 0
+}
+
 func (h *Handler) aggregateCheckNameForRepo(repo string) string {
 	config, ok := h.serverConfig()
 	if !ok {
