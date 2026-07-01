@@ -154,6 +154,30 @@ func TestAggregateSummary(t *testing.T) {
 	assert.Contains(t, summary, "Pending")
 }
 
+// When the leader gates on participant deployments, their folded outcomes render
+// in a separate "Tenant deployments" section, keyed by tenant, distinct from the
+// leader's own per-database rows.
+func TestAggregateSummary_WithParticipants(t *testing.T) {
+	checks := []*storage.Check{
+		{DatabaseType: "mysql", DatabaseName: "orders", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true},
+		{DatabaseType: aggregateSentinel, DatabaseName: "tenant-b", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired},
+		{DatabaseType: aggregateSentinel, DatabaseName: "tenant-c", Environment: "production", Status: checkStatusInProgress},
+	}
+
+	_, summary := aggregateSummary(checks, checkConclusionActionRequired)
+
+	// Leader's own database in the Database section.
+	assert.Contains(t, summary, "| Database | Environment | Status |")
+	assert.Contains(t, summary, "`orders`")
+	// Participants in their own Tenant section, not the Database table.
+	assert.Contains(t, summary, "**Tenant deployments**")
+	assert.Contains(t, summary, "| Tenant | Status |")
+	assert.Contains(t, summary, "`tenant-b`")
+	assert.Contains(t, summary, "`tenant-c`")
+	// The tenant section has no Environment column, so its header is distinct.
+	assert.NotContains(t, summary, "| tenant-b | production |")
+}
+
 func TestAggregateSummary_AllSuccess(t *testing.T) {
 	checks := []*storage.Check{
 		{DatabaseName: "orders", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true},

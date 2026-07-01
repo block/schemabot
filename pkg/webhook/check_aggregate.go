@@ -241,19 +241,60 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 }
 
 // buildAggregateTable builds a markdown table showing the status of each per-database check.
-// Truncates to stay within GitHub's check run output limits.
-func buildAggregateTable(checks []*storage.Check) string {
-	var sb strings.Builder
-	sb.WriteString("| Database | Environment | Status |\n")
-	sb.WriteString("|----------|-------------|--------|\n")
+// isParticipantCheck reports whether a check is a participant deployment's
+// outcome folded into the leader's aggregate, rather than one of the leader's
+// own per-database checks. Participant outcomes carry the aggregate sentinel as
+// their database type and the tenant name as their database name.
+func isParticipantCheck(c *storage.Check) bool {
+	return c.DatabaseType == aggregateSentinel && c.DatabaseName != aggregateSentinel
+}
 
-	for i, c := range checks {
-		row := fmt.Sprintf("| `%s` | %s | %s |\n", c.DatabaseName, c.Environment, checkStatusLabel(c))
-		if sb.Len()+len(row) > maxCheckRunTextLength-1000 {
-			fmt.Fprintf(&sb, "\n... and %d more check(s)\n", len(checks)-i)
-			break
+// buildAggregateTable renders the aggregate check's summary: the leader's own
+// per-database checks in a Database table, and — when the leader gates on
+// participant deployments — each participant's rolled-up status in a separate
+// Tenant deployments table, so a reader can tell "my databases" from "the other
+// tenants I'm gating on" at a glance. Each section bounds its own size against
+// GitHub's check run output limit.
+func buildAggregateTable(checks []*storage.Check) string {
+	var dbChecks, participantChecks []*storage.Check
+	for _, c := range checks {
+		if isParticipantCheck(c) {
+			participantChecks = append(participantChecks, c)
+		} else {
+			dbChecks = append(dbChecks, c)
 		}
-		sb.WriteString(row)
+	}
+
+	var sb strings.Builder
+
+	if len(dbChecks) > 0 {
+		sb.WriteString("| Database | Environment | Status |\n")
+		sb.WriteString("|----------|-------------|--------|\n")
+		for i, c := range dbChecks {
+			row := fmt.Sprintf("| `%s` | %s | %s |\n", c.DatabaseName, c.Environment, checkStatusLabel(c))
+			if sb.Len()+len(row) > maxCheckRunTextLength-1000 {
+				fmt.Fprintf(&sb, "\n... and %d more check(s)\n", len(dbChecks)-i)
+				return sb.String()
+			}
+			sb.WriteString(row)
+		}
+	}
+
+	if len(participantChecks) > 0 {
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString("**Tenant deployments**\n\n")
+		sb.WriteString("| Tenant | Status |\n")
+		sb.WriteString("|--------|--------|\n")
+		for i, c := range participantChecks {
+			row := fmt.Sprintf("| `%s` | %s |\n", c.DatabaseName, checkStatusLabel(c))
+			if sb.Len()+len(row) > maxCheckRunTextLength-1000 {
+				fmt.Fprintf(&sb, "\n... and %d more tenant(s)\n", len(participantChecks)-i)
+				return sb.String()
+			}
+			sb.WriteString(row)
+		}
 	}
 
 	return sb.String()
