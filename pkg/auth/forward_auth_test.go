@@ -125,16 +125,30 @@ func TestForwardAuth_WriteRequiresWriteGroup(t *testing.T) {
 	})
 }
 
+func TestNewForwardAuthAuthorizer_SPIFFERequiresCIDR(t *testing.T) {
+	// SPIFFE trust reads a spoofable header, so it must be gated behind a
+	// transport anchor. Configuring SPIFFE without a CIDR fails closed.
+	_, err := auth.NewForwardAuthAuthorizer(auth.ForwardAuthConfig{
+		TrustedProxySPIFFE: []string{ingressSVID},
+		WriteGroups:        []string{"ops"},
+	}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "trusted_proxy_cidrs")
+}
+
 func TestForwardAuth_TrustedViaSPIFFE(t *testing.T) {
+	// SPIFFE is gated behind the transport CIDR: the request must both come from
+	// a trusted source and carry a trusted SVID in XFCC.
 	cfg := auth.ForwardAuthConfig{
+		TrustedProxyCIDRs:  []string{trustedCIDR},
 		TrustedProxySPIFFE: []string{ingressSVID},
 		WriteGroups:        []string{"ops"},
 	}
 
-	t.Run("matching SVID in XFCC is trusted", func(t *testing.T) {
+	t.Run("trusted source with matching SVID is trusted", func(t *testing.T) {
 		handler, captured := newForwardAuth(t, cfg)
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
-		req.RemoteAddr = untrustedAddr // only SPIFFE can grant trust here
+		req.RemoteAddr = trustedIPAddr
 		req.Header.Set("X-Forwarded-Client-Cert", `By=spiffe://example.org/ns/api/sa/schemabot;Hash=abc123;URI=`+ingressSVID)
 		req.Header.Set("X-Forwarded-User", "alice")
 		rec := httptest.NewRecorder()
@@ -145,11 +159,26 @@ func TestForwardAuth_TrustedViaSPIFFE(t *testing.T) {
 		assert.Equal(t, "alice", captured.user.Subject)
 	})
 
-	t.Run("wrong SVID is not trusted", func(t *testing.T) {
+	t.Run("trusted source with wrong SVID is not trusted", func(t *testing.T) {
+		handler, captured := newForwardAuth(t, cfg)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+		req.RemoteAddr = trustedIPAddr
+		req.Header.Set("X-Forwarded-Client-Cert", `URI=spiffe://example.org/ns/other/sa/attacker`)
+		req.Header.Set("X-Forwarded-User", "alice")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		assert.Nil(t, captured.user)
+	})
+
+	t.Run("spoofed SVID from an untrusted source is not trusted", func(t *testing.T) {
+		// A direct client outside the trusted CIDR cannot gain trust by forging
+		// the XFCC header, because the transport gate fails first.
 		handler, captured := newForwardAuth(t, cfg)
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
 		req.RemoteAddr = untrustedAddr
-		req.Header.Set("X-Forwarded-Client-Cert", `URI=spiffe://example.org/ns/other/sa/attacker`)
+		req.Header.Set("X-Forwarded-Client-Cert", `URI=`+ingressSVID)
 		req.Header.Set("X-Forwarded-User", "alice")
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)

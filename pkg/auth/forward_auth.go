@@ -27,7 +27,10 @@ type ForwardAuthConfig struct {
 
 	// TrustedProxySPIFFE lists the SPIFFE IDs allowed to act as the proxy. The
 	// caller's SPIFFE ID is read from the Envoy X-Forwarded-Client-Cert (XFCC)
-	// header. A request is trusted if its XFCC carries one of these IDs.
+	// header. Because XFCC is a spoofable HTTP header, it is only honored behind
+	// a transport anchor: TrustedProxyCIDRs must also be set, and a request is
+	// trusted only when its source is in a trusted CIDR AND its XFCC carries one
+	// of these IDs.
 	TrustedProxySPIFFE []string
 
 	// TrustedProxyCIDRs lists source networks allowed to act as the proxy. A
@@ -45,14 +48,17 @@ type ForwardAuthConfig struct {
 
 // ForwardAuthAuthorizer authenticates requests from an authenticating reverse
 // proxy that has already verified the user, then enforces a per-endpoint access
-// tier. It first proves the request came from the trusted proxy — by the proxy's
-// SPIFFE identity (from the Envoy XFCC header) or its source network — and only
-// then trusts the forwarded identity headers. This mirrors the Kubernetes API
-// server's authenticating-proxy model, Grafana's auth proxy, and oauth2-proxy.
+// tier. It first proves the request came from the trusted proxy — its source is
+// in a trusted CIDR and, when SPIFFE is configured, its Envoy XFCC header
+// carries a trusted SPIFFE ID — and only then trusts the forwarded identity
+// headers. This mirrors the Kubernetes API server's authenticating-proxy model,
+// Grafana's auth proxy, and oauth2-proxy.
 //
 // The trust anchor is mandatory: without a configured SPIFFE ID or CIDR the
 // authorizer refuses to construct, so it can never trust spoofed headers by
-// default. Read (visibility) endpoints require only an authenticated caller
+// default. Because the XFCC header is itself spoofable, SPIFFE trust is gated
+// behind the source-CIDR check (the constructor requires a CIDR whenever SPIFFE
+// is set). Read (visibility) endpoints require only an authenticated caller
 // (optionally narrowed to ReadGroups); write endpoints — which include planning,
 // since a plan stages a change against a database — require membership in a
 // configured write group. The direct-API/CLI write path is for a small
@@ -111,6 +117,12 @@ func NewForwardAuthAuthorizer(cfg ForwardAuthConfig, logger *slog.Logger) (*Forw
 
 	if len(nets) == 0 && len(spiffe) == 0 {
 		return nil, fmt.Errorf("forward_auth requires at least one trust anchor (trusted_proxy_spiffe or trusted_proxy_cidrs)")
+	}
+	// XFCC is an HTTP header a direct client could spoof, so SPIFFE trust is only
+	// meaningful once the connection itself is trusted. Require a transport anchor
+	// (CIDR) whenever SPIFFE is configured, so XFCC is honored only behind it.
+	if len(spiffe) > 0 && len(nets) == 0 {
+		return nil, fmt.Errorf("forward_auth trusted_proxy_spiffe requires trusted_proxy_cidrs (XFCC is only trustworthy behind a trusted transport)")
 	}
 
 	return &ForwardAuthAuthorizer{
@@ -210,32 +222,43 @@ func (a *ForwardAuthAuthorizer) extractGroups(r *http.Request) []string {
 }
 
 // isTrustedProxy reports whether the request provably came from the configured
-// proxy, and a short identifier of the matched anchor for logging. A request is
-// trusted if it satisfies any configured anchor: its source IP is in a trusted
-// CIDR, or its XFCC header carries a trusted SPIFFE ID.
+// proxy, and a short identifier of the matched anchor for logging.
+//
+// The source-CIDR check is a transport property the caller cannot forge, so it
+// gates everything: when CIDRs are configured, a request from outside them is
+// never trusted. The SPIFFE check reads the Envoy XFCC header, which is only
+// trustworthy once the connection itself is trusted — a direct client could
+// otherwise spoof the header. So XFCC is honored only after the CIDR gate
+// passes (the constructor requires a CIDR whenever SPIFFE is configured):
+//   - SPIFFE configured: trusted iff the source is in a trusted CIDR AND the
+//     XFCC carries a trusted SPIFFE ID.
+//   - CIDR only: trusted iff the source is in a trusted CIDR.
 func (a *ForwardAuthAuthorizer) isTrustedProxy(r *http.Request) (bool, string) {
-	if len(a.trustedNets) > 0 {
-		host, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			host = r.RemoteAddr
-		}
-		if ip := net.ParseIP(strings.TrimSpace(host)); ip != nil {
-			for _, network := range a.trustedNets {
-				if network.Contains(ip) {
-					return true, "cidr:" + ip.String()
-				}
-			}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(strings.TrimSpace(host))
+	inTrustedNet := false
+	for _, network := range a.trustedNets {
+		if ip != nil && network.Contains(ip) {
+			inTrustedNet = true
+			break
 		}
 	}
-
-	if len(a.trustedSPIFFE) > 0 {
-		for _, uri := range parseXFCCURIs(r.Header.Get("X-Forwarded-Client-Cert")) {
-			if slices.Contains(a.trustedSPIFFE, uri) {
-				return true, "spiffe:" + uri
-			}
-		}
+	if !inTrustedNet {
+		return false, ""
 	}
 
+	if len(a.trustedSPIFFE) == 0 {
+		return true, "cidr:" + ip.String()
+	}
+
+	for _, uri := range parseXFCCURIs(r.Header.Get("X-Forwarded-Client-Cert")) {
+		if slices.Contains(a.trustedSPIFFE, uri) {
+			return true, "spiffe:" + uri
+		}
+	}
 	return false, ""
 }
 
