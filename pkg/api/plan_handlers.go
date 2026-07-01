@@ -20,7 +20,6 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
@@ -941,14 +940,8 @@ func (s *Service) createStoredApply(
 	}
 
 	// Attribute the apply to the authenticated caller when the request carried a
-	// real identity (API auth enabled). This makes a direct-API/CLI apply
-	// auditable to the verified user rather than a client-supplied Caller string.
-	// With auth disabled, or on the PR-comment path (no authenticated user), the
-	// request's Caller is used unchanged.
-	caller := req.Caller
-	if subject, ok := auth.AuthenticatedSubject(ctx); ok {
-		caller = subject
-	}
+	// real identity (API auth enabled); see resolveCaller.
+	caller := resolveCaller(ctx, req.Caller)
 
 	apply := &storage.Apply{
 		ApplyIdentifier: applyIdentifier,
