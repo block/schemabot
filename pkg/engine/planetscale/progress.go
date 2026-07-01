@@ -160,21 +160,21 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 				result.Progress = overallProgress
 			}
 		} else {
-			// The query ran against a live migration context but returned no shard
-			// rows. The drive surfaces this once per apply so the gap is visible
+			// The query ran for a live schema change but returned no shard rows.
+			// The drive surfaces this once per apply so the gap is visible
 			// without reading per-poll debug.
-			result.PerShardProgressUnavailable = engine.PerShardUnavailableNoMigrationsReported
+			result.PerShardProgressUnavailable = engine.PerShardUnavailableNoShardRows
 		}
 	} else {
 		// No per-shard/row-copy progress this poll. A missing vtgate DSN is a target
-		// resolution gap that persists for the whole apply; an unset MigrationContext
-		// is transient during setup/recovery. Either way the comment and CLI fall
-		// back to deploy-request state, and the drive surfaces the reason once per
-		// apply.
+		// resolution gap that persists for the whole apply; a missing schema-change
+		// context is transient during setup/recovery. Either way the comment and CLI
+		// fall back to deploy-request state, and the drive surfaces the reason once
+		// per apply.
 		if !hasVtgateDSN {
 			result.PerShardProgressUnavailable = engine.PerShardUnavailableNoVtgateDSN
 		} else {
-			result.PerShardProgressUnavailable = engine.PerShardUnavailableNoMigrationContext
+			result.PerShardProgressUnavailable = engine.PerShardUnavailableNoChangeContext
 		}
 		e.logger.Debug("skipping per-shard progress",
 			"database", req.Database,

@@ -715,13 +715,13 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 	// Surface once, at Warn, when a sharded engine reached an active state but
 	// could not report per-shard/row-copy progress. Gating on the active states
-	// avoids false alarms during setup, where a migration context is still being
-	// discovered. Warn (not Debug) so the degraded visibility is always in
+	// avoids false alarms during setup, where the schema-change context is still
+	// being discovered. Warn (not Debug) so the degraded visibility is always in
 	// Datadog without enabling debug logging; the per-poll detail stays at Debug.
 	if result.PerShardProgressUnavailable != "" && !ps.warnedPerShardUnavailable &&
 		state.IsState(newState, state.Task.Running, state.Task.WaitingForCutover, state.Task.RevertWindow) {
 		c.logger.Warn("per-shard progress unavailable: per-shard and row-copy progress will not be reported for this apply",
-			append(apply.LogAttrs(), "reason", result.PerShardProgressUnavailable, "engine_state", newState)...)
+			append(apply.LogAttrs(), "reason", result.PerShardProgressUnavailable, "task_state", newState)...)
 		ps.warnedPerShardUnavailable = true
 	}
 

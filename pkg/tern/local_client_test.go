@@ -2480,8 +2480,8 @@ func TestHandleAtomicProgressTickReleasesAtCutoverBarrier(t *testing.T) {
 // row-copy progress (e.g. the target resolved without a vtgate DSN), the drive
 // surfaces the reason once per apply at Warn — always visible in Datadog without
 // enabling debug logging. It fires once (not per poll) and stays silent during
-// setup states, where a missing migration context is transient rather than a
-// degraded target resolution.
+// setup states, where a missing schema-change context is transient rather than
+// a degraded target resolution.
 func TestHandleAtomicProgressTickPerShardUnavailableWarn(t *testing.T) {
 	newApply := func() *storage.Apply {
 		return &storage.Apply{

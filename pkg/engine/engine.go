@@ -356,12 +356,13 @@ const (
 	// DSN, so SHOW VITESS_MIGRATIONS cannot be queried. This persists for the
 	// whole apply — a target-resolution gap (missing vtgate endpoint).
 	PerShardUnavailableNoVtgateDSN = "no_vtgate_dsn"
-	// PerShardUnavailableNoMigrationContext means no migration context is known
-	// for the deploy, so per-shard rows cannot be correlated to this apply.
-	PerShardUnavailableNoMigrationContext = "no_migration_context"
-	// PerShardUnavailableNoMigrationsReported means the per-shard query ran but
-	// returned no rows for the migration context while the apply was active.
-	PerShardUnavailableNoMigrationsReported = "no_migrations_reported"
+	// PerShardUnavailableNoChangeContext means no schema-change context
+	// identifier is known for the deploy yet, so per-shard rows cannot be
+	// correlated to this apply. Transient during setup/recovery.
+	PerShardUnavailableNoChangeContext = "no_change_context"
+	// PerShardUnavailableNoShardRows means the per-shard query ran but returned
+	// no rows for this schema change while the apply was active.
+	PerShardUnavailableNoShardRows = "no_shard_rows"
 )
 
 // TableProgress tracks progress for a single table.
