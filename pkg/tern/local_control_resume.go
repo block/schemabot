@@ -324,7 +324,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		// between re-plan (which reads schema) and Spirit's cutover (which renames
 		// the shadow table). If Spirit completed the cutover after the re-plan read
 		// the schema, the table already has the desired changes.
-		needsChange, err := c.tableStillNeedsChange(ctx, apply, plan, task)
+		replannedDDL, needsChange, err := c.tableStillNeedsChange(ctx, apply, plan, task)
 		if err != nil {
 			c.logger.Warn("could not verify table schema state, proceeding with apply",
 				"task_id", task.TaskIdentifier, "table", task.TableName, "error", err)
@@ -337,6 +337,15 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
 				fmt.Sprintf("Task %s already completed (cutover raced with re-plan)", task.TaskIdentifier))
 			continue
+		} else if err := verifyReplannedTaskDDL(task, replannedDDL); err != nil {
+			// Live schema drifted since resume began: the DDL this shard now
+			// needs no longer matches what was reviewed. Fail closed rather than
+			// apply unreviewed DDL.
+			c.logger.Error("resume aborting task: live schema drifted from the reviewed plan",
+				append(task.LogAttrs(), "error", err)...)
+			c.markTaskFailed(ctx, task, err.Error())
+			failedTask = task
+			break
 		}
 
 		action = c.runEngineTask(ctx, apply, task, options, creds)
@@ -396,13 +405,16 @@ func replanShardTableDDL(result *engine.PlanResult) map[shardTableKey]string {
 // tableStillNeedsChange does a quick re-plan to check if a task's table on its
 // own shard still needs schema changes. Returns false if it already has the
 // desired schema (e.g., Spirit's cutover completed during the stop sequence).
-func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.Apply, plan *storage.Plan, task *storage.Task) (bool, error) {
+// When the table still needs changes, it also returns the DDL the re-plan would
+// now apply so the caller can confirm it still matches the reviewed DDL before
+// applying it.
+func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.Apply, plan *storage.Plan, task *storage.Task) (string, bool, error) {
 	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{}, apply.Database, plan.SchemaFiles)
 	if err != nil {
-		return false, fmt.Errorf("re-plan check failed: %w", err)
+		return "", false, fmt.Errorf("re-plan check failed: %w", err)
 	}
-	_, stillNeeded := replanShardTableDDL(result)[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
-	return stillNeeded, nil
+	ddl, stillNeeded := replanShardTableDDL(result)[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
+	return ddl, stillNeeded, nil
 }
 
 // replanResult holds the result of replanAndFilterTasks.
@@ -439,11 +451,14 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 		}
 		ddl, stillNeeded := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
 		if !stillNeeded {
-			// This shard's table is no longer in the diff — it already completed.
+			// The re-plan diffs the reviewed target (plan.SchemaFiles) against
+			// this shard's live schema. A table dropping out of that diff means
+			// live already matches the reviewed target, so there is no remaining
+			// resume work for it — treat it as completed rather than drifted.
 			task.ProgressPercent = 100
 			task.CompletedAt = &now
 			c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
-				fmt.Sprintf("Task %s already completed (re-plan shows no remaining changes)", task.TaskIdentifier))
+				fmt.Sprintf("Task %s already completed (live schema matches the reviewed target)", task.TaskIdentifier))
 			completedCount++
 		} else {
 			// Fail closed if the re-plan would apply DDL this task was not

@@ -143,6 +143,103 @@ func TestReplanAndFilterTasks_FailsClosedOnDrift(t *testing.T) {
 	assert.Contains(t, err.Error(), "testapp.users/alter")
 }
 
+// The sequential resume loop re-plans each table right before applying it to
+// catch a cutover that raced the resume. tableStillNeedsChange must return the
+// DDL that re-plan would now apply so the loop can confirm it still matches the
+// reviewed DDL before applying — closing the window between the resume-entry
+// re-plan and this later per-task apply.
+func TestTableStillNeedsChange_ReturnsReplannedDDL(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
+
+	apply := &storage.Apply{Database: "testapp"}
+	plan := &storage.Plan{}
+	task := &storage.Task{
+		TaskIdentifier: "task_1",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+	}
+
+	ddl, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
+	require.NoError(t, err)
+	assert.True(t, needsChange)
+	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ddl)
+	require.NoError(t, verifyReplannedTaskDDL(task, ddl), "matching re-plan is not drift")
+}
+
+// When the table has dropped out of the re-plan diff (its cutover completed) the
+// sequential loop treats it as already applied, so tableStillNeedsChange must
+// report that no change remains.
+func TestTableStillNeedsChange_TableAbsentReportsDone(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	// Re-plan for a different table only: the task's table is no longer in the diff.
+	otherTablePlan := &engine.PlanResult{
+		Changes: []engine.SchemaChange{{
+			Namespace: "testapp",
+			TableChanges: []engine.TableChange{{
+				Table:     "orders",
+				Operation: statement.StatementAlterTable,
+				DDL:       "ALTER TABLE `orders` ADD COLUMN `total` int",
+			}},
+		}},
+	}
+	c := newPlanMaterializeClientWithPlan(store, otherTablePlan)
+
+	apply := &storage.Apply{Database: "testapp"}
+	plan := &storage.Plan{}
+	task := &storage.Task{
+		TaskIdentifier: "task_1",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+	}
+
+	ddl, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
+	require.NoError(t, err)
+	assert.False(t, needsChange)
+	assert.Empty(t, ddl)
+}
+
+// If live drifts between resume entry and a later per-task apply, the re-plan the
+// sequential loop performs returns DDL that no longer matches the reviewed DDL.
+// tableStillNeedsChange surfaces that DDL and verifyReplannedTaskDDL fails closed
+// so the loop refuses to apply unreviewed DDL.
+func TestTableStillNeedsChange_DriftFailsClosed(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	drifted := &engine.PlanResult{
+		Changes: []engine.SchemaChange{{
+			Namespace: "testapp",
+			TableChanges: []engine.TableChange{{
+				Table:     "users",
+				Operation: statement.StatementAlterTable,
+				DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(100)",
+			}},
+		}},
+	}
+	c := newPlanMaterializeClientWithPlan(store, drifted)
+
+	apply := &storage.Apply{Database: "testapp"}
+	plan := &storage.Plan{}
+	task := &storage.Task{
+		TaskIdentifier: "task_1",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+	}
+
+	ddl, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
+	require.NoError(t, err)
+	require.True(t, needsChange)
+	err = verifyReplannedTaskDDL(task, ddl)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "drifted from the reviewed plan")
+	assert.Contains(t, err.Error(), "testapp.users/alter")
+}
+
 // When the re-plan matches the reviewed DDL the deployment has not drifted, so
 // the task stays active and its DDL is refreshed from the re-plan.
 func TestReplanAndFilterTasks_MatchKeepsTaskActive(t *testing.T) {
