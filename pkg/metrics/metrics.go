@@ -403,6 +403,10 @@ const (
 	CheckTrustGatePassingChecks = "passing_checks"
 	// CheckTrustGatePromotion is the prior-environment promotion gate.
 	CheckTrustGatePromotion = "promotion"
+	// CheckTrustGateLeaderFold is the cross-tenant aggregate-leader fold gate,
+	// where the leader reads a participant deployment's aggregate Check Run and
+	// folds it into the shared aggregate.
+	CheckTrustGateLeaderFold = "leader_fold"
 )
 
 // RecordUntrustedAggregateNamedCheck counts PR checks that carry a SchemaBot
@@ -423,6 +427,47 @@ func RecordUntrustedAggregateNamedCheck(ctx context.Context, repository, environ
 		EnvironmentAttribute(environment),
 		attribute.String("app_slug", appSlug),
 		attribute.String("gate", gate),
+	)
+}
+
+// Outcomes for RecordLeaderParticipantGate. Each names why the
+// aggregate leader resolved a participant's Check Run to the given state when
+// folding it into the shared aggregate.
+const (
+	// LeaderParticipantGateSuccess: the participant's Check Run was trusted,
+	// completed, and successful — it does not block the aggregate.
+	LeaderParticipantGateSuccess = "success"
+	// LeaderParticipantGateFailure: the participant's Check Run completed with a
+	// non-success conclusion — the aggregate fails.
+	LeaderParticipantGateFailure = "failure"
+	// LeaderParticipantGateInProgress: the participant's Check Run is not yet
+	// terminal — the aggregate stays in progress.
+	LeaderParticipantGateInProgress = "in_progress"
+	// LeaderParticipantGateMissing: no trusted participant Check Run exists on the
+	// commit — the aggregate blocks until the participant reports.
+	LeaderParticipantGateMissing = "missing"
+	// LeaderParticipantGateUntrusted: a same-named Check Run exists but only from
+	// untrusted GitHub Apps — the aggregate blocks.
+	LeaderParticipantGateUntrusted = "untrusted"
+	// LeaderParticipantGateError: the GitHub Checks API lookup failed or the
+	// participant's check name could not be resolved — the aggregate blocks.
+	LeaderParticipantGateError = "error"
+)
+
+// RecordLeaderParticipantGate counts, per outcome, how the aggregate leader
+// resolved each expected participant's Check Run when folding it into the shared
+// aggregate. Every outcome other than "success" blocks the aggregate. A spike in
+// "missing", "untrusted", or "error" points an operator at a participant
+// deployment that is not reporting, a trusted-check-app-slugs gap or check-name
+// spoof, or a GitHub API problem, respectively — the matching warn/error logs
+// carry the repo, PR, environment, head SHA, and check name.
+func RecordLeaderParticipantGate(ctx context.Context, repository, environment, tenant, outcome string) {
+	addCounter(ctx, "schemabot.leader_participant_gate_total",
+		"Total participant Check Run resolutions folded into the aggregate leader's check, by outcome", "{gate}",
+		attribute.String("repository", repository),
+		EnvironmentAttribute(environment),
+		attribute.String("tenant", tenant),
+		attribute.String("outcome", outcome),
 	)
 }
 

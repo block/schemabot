@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -106,19 +107,46 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 		}
 	}
 
+	config := h.service.Config()
+
+	// The aggregate-check leader gates its per-environment aggregate on the
+	// Check Runs published by participant deployments, so it must fold those in
+	// even when it has no per-database checks of its own. Non-leaders (and repos
+	// with no aggregate config) never fetch files or fold — their behavior is
+	// unchanged.
+	var expectedParticipants []api.ExpectedTenant
+	if config.IsAggregateLeaderForRepo(repo) {
+		files, err := client.FetchPRFiles(ctx, repo, pr)
+		if err != nil {
+			// The leader cannot determine which participants a PR requires without
+			// the changed files. Fail closed: do not publish an aggregate at all,
+			// which leaves any existing (still-blocking) aggregate in place rather
+			// than downgrading it to a passing success we cannot justify.
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:  "aggregate_check_sync",
+				Repository: repo,
+				Status:     "error",
+			})
+			h.logger.Error("aggregate leader cannot fetch PR files, not publishing aggregate",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+			return
+		}
+		expectedParticipants = config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))
+	}
+
 	// No per-database checks means the PR doesn't touch schema files (or all check
-	// records were already deleted by PR close cleanup). No aggregate to create.
-	if len(dbChecks) == 0 {
+	// records were already deleted by PR close cleanup). With no expected
+	// participants to fold either, there is no aggregate to create.
+	if len(dbChecks) == 0 && len(expectedParticipants) == 0 {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "aggregate_check_sync",
 			Repository: repo,
 			Status:     "noop",
 		})
-		h.logger.Debug("no per-database checks for aggregate", "repo", repo, "pr", pr)
+		h.logger.Debug("no per-database checks or expected participants for aggregate", "repo", repo, "pr", pr)
 		return
 	}
 
-	config := h.service.Config()
 	checkNameBase := h.aggregateCheckNameForRepo(repo)
 
 	if len(config.AllowedEnvironments) > 0 {
@@ -127,7 +155,11 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 		// between environments (e.g., staging vs production aggregates).
 		for _, env := range config.AllowedEnvironments {
 			envChecks := filterChecksByEnvironment(dbChecks, env)
+			participantChecks := h.participantCheckOutcomes(ctx, client, repo, pr, env, headSHA, expectedParticipants)
+			envChecks = append(envChecks, participantChecks...)
 			if len(envChecks) == 0 {
+				h.logger.Debug("no checks or expected participants for aggregate environment",
+					"repo", repo, "pr", pr, "environment", env)
 				continue
 			}
 			checkName := aggregateCheckNameForEnv(checkNameBase, env)
@@ -136,8 +168,22 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 	} else {
 		// Single aggregate. Uses aggregateSentinel for the environment field
 		// since there is no per-environment scoping.
-		h.upsertAggregateCheckRun(ctx, client, repo, pr, headSHA, dbChecks, checkNameBase, aggregateSentinel)
+		participantChecks := h.participantCheckOutcomes(ctx, client, repo, pr, aggregateSentinel, headSHA, expectedParticipants)
+		aggChecks := make([]*storage.Check, 0, len(dbChecks)+len(participantChecks))
+		aggChecks = append(aggChecks, dbChecks...)
+		aggChecks = append(aggChecks, participantChecks...)
+		h.upsertAggregateCheckRun(ctx, client, repo, pr, headSHA, aggChecks, checkNameBase, aggregateSentinel)
 	}
+}
+
+// prFilePaths extracts the changed-file paths from a PR file listing for
+// expected-participant matching.
+func prFilePaths(files []ghclient.PRFile) []string {
+	paths := make([]string, 0, len(files))
+	for _, f := range files {
+		paths = append(paths, f.Filename)
+	}
+	return paths
 }
 
 // upsertAggregateCheckRun computes the aggregate conclusion from the given checks
