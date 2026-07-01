@@ -847,7 +847,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 					c.logger.Warn("failed to complete revert control request", "apply_id", apply.ApplyIdentifier, "error", err)
 				}
 				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventRevertTriggered, storage.LogSourceSchemaBot,
-					fmt.Sprintf("Revert triggered by user%s", callerApplyLogSuffix(controlRequestCaller(pending))), state.Apply.RevertWindow, state.Apply.Reverted)
+					fmt.Sprintf("Revert triggered by user%s", callerApplyLogSuffix(controlRequestCaller(pending))), state.Apply.RevertWindow, state.Apply.Reverting)
 			}
 		}
 	}
