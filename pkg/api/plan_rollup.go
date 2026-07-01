@@ -60,33 +60,46 @@ type PlanRollup struct {
 // RollupDeploymentDiffs classifies each deployment's review-time diff against the
 // reviewed primary plan and reports whether the rollup is clean.
 //
+// expectedDeployments is the configured deployment set in rollout order, primary
+// first — the same order PlanDeploymentDiffs produces. The diffs must match it
+// positionally: this turns the producer's structural convention (primary first,
+// one entry per configured deployment) into an enforced contract, so a
+// reordered, short, or otherwise mismatched result is rejected rather than
+// letting a missing or misidentified deployment silently pass the gate.
+//
 // The primary (index 0) is the reviewed baseline and classifies Match against
 // itself; every other deployment is compared to it with tern.CompareChangeSets.
-// The result fails closed: an empty result set, a primary baseline that errored
+// The result fails closed: a contract mismatch, a primary baseline that errored
 // or is otherwise unusable, or any deployment that errored or diverged makes the
-// rollup not Clean. It relies on PlanDeploymentDiffs' contract that the input
-// carries exactly one entry per configured deployment, primary first, so a
-// missing deployment cannot silently pass.
-func RollupDeploymentDiffs(diffs []DeploymentPlanDiff) (PlanRollup, error) {
-	if len(diffs) == 0 {
-		return PlanRollup{}, fmt.Errorf("no deployment diffs to roll up")
+// rollup not Clean.
+func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedDeployments []string) (PlanRollup, error) {
+	if len(expectedDeployments) == 0 {
+		return PlanRollup{}, fmt.Errorf("no expected deployments to roll up")
+	}
+	if len(diffs) != len(expectedDeployments) {
+		return PlanRollup{}, fmt.Errorf("expected %d deployment diffs in rollout order, got %d", len(expectedDeployments), len(diffs))
+	}
+	for i, name := range expectedDeployments {
+		if diffs[i].Deployment != name {
+			return PlanRollup{}, fmt.Errorf("deployment diff %d is %q, expected %q; diffs must be in rollout order with the primary first and every configured deployment present", i, diffs[i].Deployment, name)
+		}
 	}
 
 	baseline := tern.ChangeSet{Changes: diffs[0].Changes, Shards: diffs[0].Shards}
-	baselineUsable := diffs[0].Err == nil
 
-	// Validate the baseline is internally well-formed before trusting it as the
-	// comparison target. A self-comparison surfaces malformed or unparseable
-	// change content that would otherwise let a single-deployment rollup report
-	// clean, or classify the primary as a match, without a trustworthy comparison
-	// ever running.
-	var baselineErr error
-	if baselineUsable {
+	// The baseline is usable only when the primary neither errored in the producer
+	// nor carries malformed content. A self-comparison surfaces malformed or
+	// unparseable change content that would otherwise let a single-deployment
+	// rollup report clean, or classify the primary as a match, without a
+	// trustworthy comparison ever running. A self-comparison of well-formed
+	// content is provably empty, so it never false-diverges a legitimate baseline.
+	baselineCause := diffs[0].Err
+	if baselineCause == nil {
 		if _, err := tern.CompareChangeSets(baseline, baseline); err != nil {
-			baselineUsable = false
-			baselineErr = err
+			baselineCause = err
 		}
 	}
+	baselineUsable := baselineCause == nil
 
 	entries := make([]DeploymentRollupEntry, len(diffs))
 	clean := true
@@ -104,18 +117,21 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff) (PlanRollup, error) {
 		case i == 0:
 			// The reviewed primary plan is the baseline. It matches itself only when
 			// its own content is well-formed; malformed content makes it unusable.
-			if baselineErr != nil {
+			// A producer error on the primary was already handled above, so a cause
+			// here is a content error.
+			if baselineCause != nil {
 				entry.Class = DeploymentErrored
-				entry.Err = fmt.Errorf("reviewed primary plan is not a usable baseline: %w", baselineErr)
+				entry.Err = fmt.Errorf("reviewed primary plan is not a usable baseline: %w", baselineCause)
 				clean = false
 			} else {
 				entry.Class = DeploymentMatch
 			}
 		case !baselineUsable:
 			// Without a usable baseline no deployment can be confirmed to match, so
-			// every deployment blocks rather than being compared to nothing.
+			// every deployment blocks. Wrap the primary's root cause so each entry is
+			// self-contained for triage without cross-referencing the primary's.
 			entry.Class = DeploymentErrored
-			entry.Err = fmt.Errorf("primary reviewed plan is not a usable baseline; cannot confirm deployment matches the reviewed changes")
+			entry.Err = fmt.Errorf("primary reviewed plan is not a usable baseline, cannot confirm deployment matches the reviewed changes: %w", baselineCause)
 			clean = false
 		default:
 			diff, err := tern.CompareChangeSets(baseline, tern.ChangeSet{Changes: d.Changes, Shards: d.Shards})

@@ -247,3 +247,55 @@ func TestCompareChangeSets_VSchemaTableChangeFailsClosed(t *testing.T) {
 	_, err := CompareChangeSets(baseline, candidate)
 	require.Error(t, err)
 }
+
+// A namespace represented by per-shard rows on one side but only the collapsed
+// namespace view on the other diverges rather than accidentally matching: the
+// per-shard and collapsed keys occupy disjoint key spaces (shard name vs empty).
+func TestCompareChangeSets_OneSideShardedDiverges(t *testing.T) {
+	sharded := ChangeSet{
+		Changes: []*ternv1.SchemaChange{{Namespace: "testapp", TableChanges: []*ternv1.TableChange{protoAlterUsersEmail()}}},
+		Shards:  []*ternv1.ShardPlan{{Shard: "-80", Namespace: "testapp", Changes: []*ternv1.TableChange{protoAlterUsersEmail()}}},
+	}
+	collapsedOnly := protoNonShardedSet(protoAlterUsersEmail())
+
+	diff, err := CompareChangeSets(sharded, collapsedOnly)
+	require.NoError(t, err)
+	require.False(t, diff.Empty(), "sharded-vs-collapsed for the same namespace must diverge")
+	require.Len(t, diff.MissingFromCandidate, 1)
+	require.Len(t, diff.UnexpectedInCandidate, 1)
+	assert.Equal(t, "-80", diff.MissingFromCandidate[0].Shard)
+	assert.Empty(t, diff.UnexpectedInCandidate[0].Shard)
+}
+
+// Duplicate shard rows are counted as a multiset, so an asymmetric duplication
+// diverges rather than being deduped into a false match.
+func TestCompareChangeSets_DuplicateShardRowsAsymmetricDiverges(t *testing.T) {
+	baseline := ChangeSet{Shards: []*ternv1.ShardPlan{
+		{Shard: "-80", Namespace: "testapp", Changes: []*ternv1.TableChange{protoAlterUsersEmail()}},
+		{Shard: "-80", Namespace: "testapp", Changes: []*ternv1.TableChange{protoAlterUsersEmail()}},
+	}}
+	candidate := ChangeSet{Shards: []*ternv1.ShardPlan{
+		{Shard: "-80", Namespace: "testapp", Changes: []*ternv1.TableChange{protoAlterUsersEmail()}},
+	}}
+
+	diff, err := CompareChangeSets(baseline, candidate)
+	require.NoError(t, err)
+	require.False(t, diff.Empty(), "asymmetric duplicate shard rows must diverge")
+	require.Len(t, diff.MissingFromCandidate, 1)
+	assert.Equal(t, "-80", diff.MissingFromCandidate[0].Shard)
+}
+
+// VSchema parity is symmetric: a namespace the candidate changes the vschema for
+// but the baseline does not surfaces in the unexpected direction.
+func TestCompareChangeSets_VSchemaUnexpectedDirection(t *testing.T) {
+	baseline := ChangeSet{Changes: []*ternv1.SchemaChange{{Namespace: "testapp"}}}
+	candidate := ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace: "testapp",
+		Metadata:  map[string]string{"vschema_changed": "true"},
+	}}}
+
+	diff, err := CompareChangeSets(baseline, candidate)
+	require.NoError(t, err)
+	require.Equal(t, []string{"testapp"}, diff.UnexpectedVSchema)
+	assert.Empty(t, diff.MissingVSchema)
+}
