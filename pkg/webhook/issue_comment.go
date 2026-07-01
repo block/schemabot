@@ -463,12 +463,12 @@ func (h *Handler) postInitialProgressComment(ctx context.Context, repo string, p
 	apply, err := h.service.Storage().Applies().Get(ctx, applyID)
 	if err != nil {
 		h.logger.Error("failed to re-check apply state after initial progress comment; if the apply already finished, its progress comment stays at the starting state",
-			"repo", repo, "pr", pr, "apply_id", applyID, "error", err)
+			"repo", repo, "pr", pr, "error", err)
 		return
 	}
 	if apply == nil {
 		h.logger.Error("apply missing when re-checking state after initial progress comment",
-			"repo", repo, "pr", pr, "apply_id", applyID)
+			"repo", repo, "pr", pr)
 		return
 	}
 	if !state.IsTerminalApplyState(apply.State) {
