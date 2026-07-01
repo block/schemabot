@@ -145,7 +145,7 @@ func RenderApplyStarted(data ApplyStatusCommentData) string {
 
 	writeApplyStatusHeader(&sb, data)
 	writeApplyMetadata(&sb, data, currentTimestamp())
-	sb.WriteString("\nSchema changes are being applied. Progress updates will be posted as new comments.\n")
+	sb.WriteString("\nSchema changes are being applied. This comment will be updated with progress.\n")
 
 	return sb.String()
 }

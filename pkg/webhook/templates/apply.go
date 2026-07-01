@@ -1094,7 +1094,7 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 
 	fmt.Fprintf(sb, "\n<details><summary>%s</summary>\n\n", completedSummaryDetailsLabel(data))
 	if data.ApplyID != "" {
-		fmt.Fprintf(sb, "**Apply ID**: `%s`\n\n", data.ApplyID)
+		fmt.Fprintf(sb, "_Apply ID: `%s`_\n\n", data.ApplyID)
 	}
 	writeCompletedNamespaceSummary(sb, data)
 	if len(data.Tables) > 0 {

@@ -1779,7 +1779,7 @@ CREATE TABLE `addresses` (
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-Schema changes are being applied. Progress updates will be posted as new comments.
+Schema changes are being applied. This comment will be updated with progress.
 
 </details>
 
@@ -2851,7 +2851,7 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 
 <details><summary>Apply details (3 tables)</summary>
 
-**Apply ID**: `apply-a1b2c3d4e5f6`
+_Apply ID: `apply-a1b2c3d4e5f6`_
 
 
 **`orders`**
@@ -2994,7 +2994,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
 <details><summary>Apply details (8 tables)</summary>
 
-**Apply ID**: `apply-a1b2c3d4e5f6`
+_Apply ID: `apply-a1b2c3d4e5f6`_
 
 
 **`orders`**
@@ -3054,7 +3054,7 @@ ALTER TABLE `notifications` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
 <details><summary>Apply details (1 table, 1 VSchema update)</summary>
 
-**Apply ID**: `apply-a1b2c3d4e5f6`
+_Apply ID: `apply-a1b2c3d4e5f6`_
 
 Applied by namespace:
 
@@ -3093,7 +3093,7 @@ ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 <details><summary>Apply details (1 VSchema update)</summary>
 
-**Apply ID**: `apply-a1b2c3d4e5f6`
+_Apply ID: `apply-a1b2c3d4e5f6`_
 
 
 ### VSchema
@@ -3242,7 +3242,7 @@ schemabot apply -e staging
 
 <details><summary>Apply details (5 tables)</summary>
 
-**Apply ID**: `apply-a1b2c3d4e5f6`
+_Apply ID: `apply-a1b2c3d4e5f6`_
 
 Applied by namespace:
 
@@ -4978,7 +4978,7 @@ schemabot unlock
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-Schema changes are being applied. Progress updates will be posted as new comments.
+Schema changes are being applied. This comment will be updated with progress.
 
 
 </details>
@@ -5731,7 +5731,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 <details><summary>Apply details (3 tables)</summary>
 
-**Apply ID**: `apply-a1b2c3d4e5f6`
+_Apply ID: `apply-a1b2c3d4e5f6`_
 
 
 ### testapp
@@ -5767,7 +5767,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 <details><summary>Apply details (3 tables)</summary>
 
-**Apply ID**: `apply-a1b2c3d4e5f6`
+_Apply ID: `apply-a1b2c3d4e5f6`_
 
 
 ### testapp
@@ -5803,7 +5803,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 <details><summary>Apply details (3 tables)</summary>
 
-**Apply ID**: `apply-a1b2c3d4e5f6`
+_Apply ID: `apply-a1b2c3d4e5f6`_
 
 
 ### testapp
@@ -5867,7 +5867,7 @@ schemabot apply -e production
 
 <details><summary>Apply details (3 tables)</summary>
 
-**Apply ID**: `apply-a1b2c3d4e5f6`
+_Apply ID: `apply-a1b2c3d4e5f6`_
 
 
 ### testapp

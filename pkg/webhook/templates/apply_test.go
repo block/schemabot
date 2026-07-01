@@ -815,6 +815,8 @@ func TestRenderApplyStatusComment_FailedRetryable(t *testing.T) {
 	assert.Contains(t, result, "## Schema Change Status")
 	assert.NotContains(t, result, "Failed_retryable")
 	assert.NotContains(t, result, "failed_retryable")
+	// The retryable state is communicated on the always-present Status line.
+	assert.Contains(t, result, "**Status**: Retrying")
 	// The retry detail lives on the affected table, not in the headline.
 	assert.Contains(t, result, "🔄 Interrupted — retrying automatically")
 	assert.Contains(t, result, "> ⚠️ Last error: remote deployment unavailable")
@@ -1379,7 +1381,7 @@ func TestPreviewCommentSummaryCompletedLargeCollapsesAppliedDetails(t *testing.T
 
 	assert.Contains(t, result, "Applied successfully — your schema changes are live!")
 	assert.Contains(t, result, "<details><summary>Apply details (8 tables)</summary>")
-	assert.Contains(t, result, "**Apply ID**: `apply-a1b2c3d4e5f6`")
+	assert.Contains(t, result, "_Apply ID: `apply-a1b2c3d4e5f6`_")
 	assert.Equal(t, 1, strings.Count(result, "</details>"))
 }
 
@@ -1411,9 +1413,8 @@ func TestRenderApplySummaryCommentCompletedCollapsedDetailsApplyIDInside(t *test
 	// All namespaces succeeded, so the per-namespace header carries no redundant ✅.
 	assert.Contains(t, result, "### testapp_primary")
 	// The Apply ID lives inside the collapsed details block, not as a trailing line.
-	assert.Contains(t, result, "**Apply ID**: `apply-a1b2c3d4e5f6`")
-	assert.NotContains(t, result, "_Apply ID:")
-	idIdx := strings.Index(result, "**Apply ID**: `apply-a1b2c3d4e5f6`")
+	assert.Contains(t, result, "_Apply ID: `apply-a1b2c3d4e5f6`_")
+	idIdx := strings.Index(result, "_Apply ID: `apply-a1b2c3d4e5f6`_")
 	closeIdx := strings.LastIndex(result, "</details>")
 	assert.True(t, idIdx >= 0 && idIdx < closeIdx, "Apply ID should appear inside the details, before the closing tag")
 }
