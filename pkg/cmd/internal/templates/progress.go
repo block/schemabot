@@ -1241,7 +1241,7 @@ func stateColorFunc(s string) func(string) string {
 	case state.Apply.SkippingRevert:
 		return colorWrap(ANSICyan)
 	case state.Apply.Reverting:
-		return colorWrap(ANSICyan)
+		return colorWrap(ANSIYellow) // matches the yellow "undoing the change" table bar
 	default:
 		return nil
 	}

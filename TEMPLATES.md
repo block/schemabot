@@ -2792,19 +2792,19 @@ Deploy request: https://app.planetscale.com/acme/myapp/deploy-requests/42
 
 **Keyspace `testapp`**
 
-**`orders`**: Running...
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ↩️ Reverting
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: Running...
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ↩️ Reverting
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: Running...
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ↩️ Reverting
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);

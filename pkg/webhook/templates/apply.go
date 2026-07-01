@@ -645,6 +645,11 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData) {
 		fmt.Fprintf(sb, "**`%s`**: %s \u2713 Complete (pending revert)\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
+	case state.Task.Reverting:
+		bar := ui.ProgressBarWaitingCutover()
+		fmt.Fprintf(sb, "**`%s`**: %s \u21a9\ufe0f Reverting\n", table.TableName, bar)
+		writeDDLLine(sb, table.DDL)
+
 	case state.Task.Stopped:
 		renderStoppedTable(sb, table)
 
