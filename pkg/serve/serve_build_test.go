@@ -129,16 +129,17 @@ func TestForwardAuthEnforcedThroughServerHandler(t *testing.T) {
 		assert.Equal(t, http.StatusForbidden, rec.Code)
 	})
 
-	t.Run("authenticated write-tier caller passes the auth gate", func(t *testing.T) {
+	t.Run("authenticated write-tier caller is authorized and reaches the write handler", func(t *testing.T) {
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", nil)
 		req.RemoteAddr = trusted
 		req.Header.Set("X-Forwarded-User", "bob")
 		req.Header.Set("X-Forwarded-Capabilities", "owners")
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
-		// The authorizer lets a write-group member through; whatever the plan
-		// handler then returns, it must not be an auth rejection.
-		assert.NotEqual(t, http.StatusUnauthorized, rec.Code)
-		assert.NotEqual(t, http.StatusForbidden, rec.Code)
+		// The write is authorized — not rejected at auth — so it reaches the plan
+		// handler, which rejects this empty body with 400. The contrast with the
+		// read-tier caller above (403, blocked before the handler) is the proof
+		// that a write-group member is permitted to perform the write.
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
 	})
 }
