@@ -363,14 +363,35 @@ func (h *Handler) fansOutUnscopedCommand(repo string) bool {
 	return h.service.Config().AggregateRoleForRepo(repo) == api.AggregateRoleParticipant
 }
 
+// actionFansOutUnscoped reports whether an action is one a participant can serve
+// without an explicit -t, by acting on its own databases. plan and apply cover
+// the participant's share of a shared PR, and unlock releases only the
+// participant's own database locks (locks are keyed by database, not by apply).
+// Commands that target a single apply owned by one tenant — rollback and the
+// lifecycle controls (stop, cancel, start, release, cutover, skip-revert) — are
+// not in this set: an unscoped one would reach every participant and all but the
+// owner would report "apply not found", so they require an explicit -t instead.
+func actionFansOutUnscoped(a string) bool {
+	switch a {
+	case action.Plan, action.Apply, action.Unlock:
+		return true
+	default:
+		return false
+	}
+}
+
 // unscopedCommandFansOut reports whether an unscoped (no -t) command is one a
 // participant should actually act on when fanning out, as opposed to an error
-// case it should stay silent on. A complete command (Found) fans out, and a
-// plan without -e fans out as a multi-env plan. A missing-env error for
-// apply/rollback does NOT fan out: otherwise every participant on a shared repo
-// would post its own duplicate "missing environment" comment. The leader (which
-// never hits the tenant gate) posts that error once.
+// case it should stay silent on. Only fan-out actions qualify (see
+// actionFansOutUnscoped). A complete command (Found) fans out, and a plan
+// without -e fans out as a multi-env plan. A missing-env apply does NOT fan out:
+// otherwise every participant on a shared repo would post its own duplicate
+// "missing environment" comment. The leader (which never hits the tenant gate)
+// posts that error once.
 func unscopedCommandFansOut(result CommandResult) bool {
+	if !actionFansOutUnscoped(result.Action) {
+		return false
+	}
 	if result.Found {
 		return true
 	}
