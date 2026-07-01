@@ -552,12 +552,12 @@ func TestE2ESkipRevertCommandAcceptsApplyID(t *testing.T) {
 		utils.CloseAndLog(schemabotDB)
 	})
 
-	applyID := createStopCommandApply(t, store, applyIdentifier, database)
+	// Skip-revert is only valid for a PlanetScale apply in its revert window, so
+	// seed the engine at creation and move the apply into the revert window.
+	applyID := createStopCommandApplyWithEngine(t, store, applyIdentifier, database, storage.EnginePlanetScale)
 	storedApply, err := store.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
 	require.NoError(t, err)
 	require.NotNil(t, storedApply)
-	// Skip-revert is only valid for a PlanetScale apply in its revert window.
-	storedApply.Engine = storage.EnginePlanetScale
 	storedApply.State = state.Apply.RevertWindow
 	require.NoError(t, store.Applies().Update(ctx, storedApply))
 
@@ -703,6 +703,15 @@ func apiServiceForStopCommandTest(t *testing.T, store storage.Storage, database 
 
 func createStopCommandApply(t *testing.T, store storage.Storage, applyIdentifier, database string) int64 {
 	t.Helper()
+	return createStopCommandApplyWithEngine(t, store, applyIdentifier, database, storage.EngineSpirit)
+}
+
+// createStopCommandApplyWithEngine seeds a running apply (and its single task)
+// for the given engine. The engine is set at creation because Applies().Update
+// does not persist the engine column — a control command that gates on engine
+// (skip-revert is PlanetScale-only) must have it right from the insert.
+func createStopCommandApplyWithEngine(t *testing.T, store storage.Storage, applyIdentifier, database, engine string) int64 {
+	t.Helper()
 	now := time.Now().UTC()
 	apply := &storage.Apply{
 		ApplyIdentifier: applyIdentifier,
@@ -714,7 +723,7 @@ func createStopCommandApply(t *testing.T, store storage.Storage, applyIdentifier
 		Environment:     "staging",
 		Deployment:      database,
 		Caller:          "github:creator@octocat/hello-world#1",
-		Engine:          storage.EngineSpirit,
+		Engine:          engine,
 		State:           state.Apply.Running,
 		Options:         []byte("{}"),
 		CreatedAt:       now,
@@ -726,7 +735,7 @@ func createStopCommandApply(t *testing.T, store storage.Storage, applyIdentifier
 			PlanID:         1,
 			Database:       database,
 			DatabaseType:   storage.DatabaseTypeMySQL,
-			Engine:         storage.EngineSpirit,
+			Engine:         engine,
 			Repository:     "octocat/hello-world",
 			PullRequest:    1,
 			Environment:    "staging",
