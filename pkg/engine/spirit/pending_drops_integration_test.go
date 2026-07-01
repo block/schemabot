@@ -55,18 +55,18 @@ func runDDLApply(t *testing.T, eng *Engine, dsn string, ddlStatements []string) 
 	require.NoError(t, err, "parseDSN")
 
 	eng.mu.Lock()
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		database: database,
 		state:    engine.StateRunning,
 		started:  time.Now(),
 	}
 	eng.mu.Unlock()
 
-	eng.executeMigration(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
 
 	eng.mu.Lock()
 	defer eng.mu.Unlock()
-	return eng.runningMigration.state
+	return eng.runningSchemaChange.state
 }
 
 // A dropped table is quarantined in the pending drops database with its data

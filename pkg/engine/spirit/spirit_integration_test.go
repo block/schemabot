@@ -453,7 +453,7 @@ func TestEngine_Progress_NoMigration(t *testing.T) {
 
 func TestEngine_Progress_WithMigration(t *testing.T) {
 	eng := New(Config{})
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		database: "testdb",
 		tables:   []string{"users"},
 		state:    engine.StateRunning,
@@ -480,7 +480,7 @@ func TestEngine_Stop_NoMigration(t *testing.T) {
 
 func TestEngine_Stop_WithMigration(t *testing.T) {
 	eng := New(Config{})
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		database: "testdb",
 		state:    engine.StateRunning,
 	}
@@ -491,7 +491,7 @@ func TestEngine_Stop_WithMigration(t *testing.T) {
 	require.NoError(t, err, "Stop()")
 
 	assert.True(t, result.Accepted, "expected Accepted to be true")
-	assert.Equal(t, engine.StateStopped, eng.runningMigration.state)
+	assert.Equal(t, engine.StateStopped, eng.runningSchemaChange.state)
 }
 
 func TestEngine_Start_NotSupported(t *testing.T) {
@@ -571,19 +571,19 @@ func TestNew_CustomConfig(t *testing.T) {
 	assert.Equal(t, 8, eng.threads)
 }
 
-func TestSetMigrationCompleted(t *testing.T) {
+func TestSetSchemaChangeCompleted(t *testing.T) {
 	eng := New(Config{})
 
 	// No running schema change - should not panic
-	eng.setMigrationCompleted()
+	eng.setSchemaChangeCompleted()
 
 	// With running schema change
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		state: engine.StateRunning,
 	}
-	eng.setMigrationCompleted()
+	eng.setSchemaChangeCompleted()
 
-	assert.Equal(t, engine.StateCompleted, eng.runningMigration.state)
+	assert.Equal(t, engine.StateCompleted, eng.runningSchemaChange.state)
 }
 
 func TestParseDSN_Valid(t *testing.T) {
@@ -706,7 +706,7 @@ func TestEngine_CancelledArtifactCleanup(t *testing.T) {
 	host, username, password, database, err := parseDSN(dsn)
 	require.NoError(t, err)
 	eng := New(Config{})
-	err = eng.dropCancelledArtifacts(t.Context(), &runningMigration{
+	err = eng.dropCancelledArtifacts(t.Context(), &runningSchemaChange{
 		database: database,
 		tables:   []string{baseTable},
 		host:     host,
@@ -809,7 +809,7 @@ func TestEngine_Apply_WithChanges(t *testing.T) {
 
 func TestEngine_Progress_WithRunners(t *testing.T) {
 	eng := New(Config{})
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		database: "testdb",
 		tables:   []string{"users", "orders"},
 		state:    engine.StateRunning,
@@ -828,7 +828,7 @@ func TestEngine_Progress_NamespaceFromApplyChanges(t *testing.T) {
 	// syncAtomicTaskProgress fails silently (task has namespace="orders",
 	// engine returns namespace=""), and row progress is never persisted.
 	eng := New(Config{})
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		database:       "orders",
 		tableNamespace: map[string]string{"orders": "orders", "users": "myapp"},
 		tables:         []string{"orders", "users"},
@@ -877,7 +877,7 @@ func TestEngine_Progress_ClosedRunnerIsNotCompletion(t *testing.T) {
 
 	t.Run("running state keeps reporting running", func(t *testing.T) {
 		eng := New(Config{})
-		eng.runningMigration = &runningMigration{
+		eng.runningSchemaChange = &runningSchemaChange{
 			database: database,
 			tables:   []string{"progress_close"},
 			state:    engine.StateRunning,
@@ -891,7 +891,7 @@ func TestEngine_Progress_ClosedRunnerIsNotCompletion(t *testing.T) {
 
 	t.Run("volume restart reports running", func(t *testing.T) {
 		eng := New(Config{})
-		eng.runningMigration = &runningMigration{
+		eng.runningSchemaChange = &runningSchemaChange{
 			database:                database,
 			tables:                  []string{"progress_close"},
 			state:                   engine.StateStopped,
@@ -906,7 +906,7 @@ func TestEngine_Progress_ClosedRunnerIsNotCompletion(t *testing.T) {
 
 	t.Run("failed state keeps reporting failed", func(t *testing.T) {
 		eng := New(Config{})
-		eng.runningMigration = &runningMigration{
+		eng.runningSchemaChange = &runningSchemaChange{
 			database:     database,
 			tables:       []string{"progress_close"},
 			state:        engine.StateFailed,
@@ -923,7 +923,7 @@ func TestEngine_Progress_ClosedRunnerIsNotCompletion(t *testing.T) {
 
 	t.Run("completed state keeps reporting completed", func(t *testing.T) {
 		eng := New(Config{})
-		eng.runningMigration = &runningMigration{
+		eng.runningSchemaChange = &runningSchemaChange{
 			database:     database,
 			tables:       []string{"progress_close"},
 			state:        engine.StateCompleted,
@@ -973,14 +973,14 @@ func TestEngine_ExecuteMigration_AddColumn(t *testing.T) {
 	host, username, password, database, err := parseDSN(dsn)
 	require.NoError(t, err, "parseDSN")
 
-	// Run the schema change directly using executeMigration
+	// Run the schema change directly using executeSchemaChange
 	ddlStatements := []string{
 		"ALTER TABLE `test_migrate` ADD COLUMN `email` varchar(255) NULL",
 	}
 
 	// Set up running schema change state
 	eng.mu.Lock()
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		database: database,
 		tables:   []string{"test_migrate"},
 		state:    engine.StateRunning,
@@ -989,11 +989,11 @@ func TestEngine_ExecuteMigration_AddColumn(t *testing.T) {
 	eng.mu.Unlock()
 
 	// Execute the schema change synchronously for testing
-	eng.executeMigration(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
 
 	// Check that schema change completed
 	eng.mu.Lock()
-	finalState := eng.runningMigration.state
+	finalState := eng.runningSchemaChange.state
 	eng.mu.Unlock()
 
 	assert.Equal(t, engine.StateCompleted, finalState)
@@ -1046,7 +1046,7 @@ func TestEngine_ExecuteMigration_ModifyColumn(t *testing.T) {
 	}
 
 	eng.mu.Lock()
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		database: database,
 		tables:   []string{"test_modify"},
 		state:    engine.StateRunning,
@@ -1054,10 +1054,10 @@ func TestEngine_ExecuteMigration_ModifyColumn(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeMigration(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
 
 	eng.mu.Lock()
-	finalState := eng.runningMigration.state
+	finalState := eng.runningSchemaChange.state
 	eng.mu.Unlock()
 
 	assert.Equal(t, engine.StateCompleted, finalState)
@@ -1102,7 +1102,7 @@ func TestEngine_ExecuteMigration_DropColumn(t *testing.T) {
 	}
 
 	eng.mu.Lock()
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		database: database,
 		tables:   []string{"test_drop"},
 		state:    engine.StateRunning,
@@ -1110,10 +1110,10 @@ func TestEngine_ExecuteMigration_DropColumn(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeMigration(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
 
 	eng.mu.Lock()
-	finalState := eng.runningMigration.state
+	finalState := eng.runningSchemaChange.state
 	eng.mu.Unlock()
 
 	assert.Equal(t, engine.StateCompleted, finalState)
@@ -1159,7 +1159,7 @@ func TestEngine_ExecuteMigration_AddIndex(t *testing.T) {
 	}
 
 	eng.mu.Lock()
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		database: database,
 		tables:   []string{"test_index"},
 		state:    engine.StateRunning,
@@ -1167,10 +1167,10 @@ func TestEngine_ExecuteMigration_AddIndex(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeMigration(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
 
 	eng.mu.Lock()
-	finalState := eng.runningMigration.state
+	finalState := eng.runningSchemaChange.state
 	eng.mu.Unlock()
 
 	assert.Equal(t, engine.StateCompleted, finalState)
@@ -1187,7 +1187,7 @@ func TestEngine_ExecuteMigration_AddIndex(t *testing.T) {
 	assert.NotZero(t, indexCount, "expected idx_email index to exist")
 }
 
-// TestEngine_ExecuteMigration_InvalidSQL tests that executeMigration handles
+// TestEngine_ExecuteMigration_InvalidSQL tests that executeSchemaChange handles
 // invalid SQL gracefully by setting state to Failed.
 func TestEngine_ExecuteMigration_InvalidSQL(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
@@ -1208,7 +1208,7 @@ func TestEngine_ExecuteMigration_InvalidSQL(t *testing.T) {
 	}
 
 	eng.mu.Lock()
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		database: database,
 		tables:   []string{"test_invalid"},
 		state:    engine.StateRunning,
@@ -1216,10 +1216,10 @@ func TestEngine_ExecuteMigration_InvalidSQL(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeMigration(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
 
 	eng.mu.Lock()
-	finalState := eng.runningMigration.state
+	finalState := eng.runningSchemaChange.state
 	eng.mu.Unlock()
 
 	assert.Equal(t, engine.StateFailed, finalState, "expected StateFailed for invalid SQL")
@@ -1246,7 +1246,7 @@ func TestEngine_Progress_FailingApplyNeverReportsCompleted(t *testing.T) {
 	}
 
 	eng.mu.Lock()
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		database: database,
 		tables:   []string{"fail_progress"},
 		state:    engine.StateRunning,
@@ -1258,7 +1258,7 @@ func TestEngine_Progress_FailingApplyNeverReportsCompleted(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		eng.executeMigration(ctx, host, username, password, database, ddlStatements, false)
+		eng.executeSchemaChange(ctx, host, username, password, database, ddlStatements, false)
 	}()
 
 	deadline := time.NewTimer(30 * time.Second)
@@ -1327,7 +1327,7 @@ func TestEngine_ExecuteMigration_MultipleStatements(t *testing.T) {
 	}
 
 	eng.mu.Lock()
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		database: database,
 		tables:   []string{"test_multi_a", "test_multi_b"},
 		state:    engine.StateRunning,
@@ -1335,10 +1335,10 @@ func TestEngine_ExecuteMigration_MultipleStatements(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeMigration(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
 
 	eng.mu.Lock()
-	finalState := eng.runningMigration.state
+	finalState := eng.runningSchemaChange.state
 	eng.mu.Unlock()
 
 	assert.Equal(t, engine.StateCompleted, finalState)
@@ -1413,7 +1413,7 @@ func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T
 		createDDL := fmt.Sprintf("CREATE TABLE `%s` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `name` varchar(100) NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", table)
 
 		eng.mu.Lock()
-		eng.runningMigration = &runningMigration{
+		eng.runningSchemaChange = &runningSchemaChange{
 			database: database,
 			tables:   []string{table},
 			state:    engine.StateRunning,
@@ -1421,10 +1421,10 @@ func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T
 		}
 		eng.mu.Unlock()
 
-		eng.executeMigration(t.Context(), host, username, password, database, []string{createDDL}, false)
+		eng.executeSchemaChange(t.Context(), host, username, password, database, []string{createDDL}, false)
 
 		eng.mu.Lock()
-		createState := eng.runningMigration.state
+		createState := eng.runningSchemaChange.state
 		eng.mu.Unlock()
 		require.Equal(t, engine.StateCompleted, createState, "CREATE TABLE %s did not complete", table)
 
@@ -1438,7 +1438,7 @@ func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T
 		dropDDL := fmt.Sprintf("DROP TABLE `%s`", table)
 
 		eng.mu.Lock()
-		eng.runningMigration = &runningMigration{
+		eng.runningSchemaChange = &runningSchemaChange{
 			database: database,
 			tables:   []string{table},
 			state:    engine.StateRunning,
@@ -1446,10 +1446,10 @@ func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T
 		}
 		eng.mu.Unlock()
 
-		eng.executeMigration(t.Context(), host, username, password, database, []string{dropDDL}, false)
+		eng.executeSchemaChange(t.Context(), host, username, password, database, []string{dropDDL}, false)
 
 		eng.mu.Lock()
-		dropState := eng.runningMigration.state
+		dropState := eng.runningSchemaChange.state
 		eng.mu.Unlock()
 		require.Equal(t, engine.StateCompleted, dropState, "DROP TABLE %s did not complete", table)
 
@@ -1529,10 +1529,10 @@ func TestEngine_Apply_StartsGoroutine(t *testing.T) {
 
 	// Check that a schema change was started
 	eng.mu.Lock()
-	hasRunningMigration := eng.runningMigration != nil
+	hasRunningSchemaChange := eng.runningSchemaChange != nil
 	eng.mu.Unlock()
 
-	if !hasRunningMigration {
+	if !hasRunningSchemaChange {
 		t.Log("Note: schema change may have completed very quickly")
 	}
 }
@@ -1540,7 +1540,7 @@ func TestEngine_Apply_StartsGoroutine(t *testing.T) {
 // TestEngine_Progress_WithProgressCallback tests Progress with a callback set
 func TestEngine_Progress_WithNilCallback(t *testing.T) {
 	eng := New(Config{})
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		database:         "testdb",
 		tables:           []string{"users"},
 		state:            engine.StateRunning,
@@ -1557,7 +1557,7 @@ func TestEngine_Progress_WithNilCallback(t *testing.T) {
 // TestEngine_Progress_WithEmptyCallback tests Progress when callback returns empty
 func TestEngine_Progress_WithEmptyCallback(t *testing.T) {
 	eng := New(Config{})
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		database: "testdb",
 		tables:   []string{"users"},
 		state:    engine.StateRunning,
@@ -1790,7 +1790,7 @@ func TestEngine_ExecuteMigration_CancelledContextKeepsStoppedState(t *testing.T)
 	require.NoError(t, err, "parseDSN")
 
 	eng.mu.Lock()
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		database: database,
 		tables:   []string{"stop_pending_drop"},
 		state:    engine.StateStopped,
@@ -1806,10 +1806,10 @@ func TestEngine_ExecuteMigration_CancelledContextKeepsStoppedState(t *testing.T)
 		"DROP TABLE `stop_pending_drop`",
 	}
 
-	eng.executeMigration(ctx, host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(ctx, host, username, password, database, ddlStatements, false)
 
 	eng.mu.Lock()
-	finalState := eng.runningMigration.state
+	finalState := eng.runningSchemaChange.state
 	eng.mu.Unlock()
 	assert.Equal(t, engine.StateStopped, finalState, "cancelled context must leave state Stopped, not Failed/Completed")
 

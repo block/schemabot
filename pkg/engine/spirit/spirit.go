@@ -62,12 +62,12 @@ type Engine struct {
 	onLog func(level slog.Level, table, msg string)
 
 	// Running schema change state
-	mu               sync.Mutex
-	runningMigration *runningMigration
+	mu                  sync.Mutex
+	runningSchemaChange *runningSchemaChange
 }
 
-// runningMigration tracks the state of an in-progress schema change.
-type runningMigration struct {
+// runningSchemaChange tracks the state of an in-progress schema change.
+type runningSchemaChange struct {
 	database                string            // MySQL database name parsed from DSN
 	tableNamespace          map[string]string // table name → namespace (from ApplyRequest.Changes)
 	tables                  []string
@@ -189,7 +189,7 @@ func (e *Engine) DebugLogs() bool {
 // fully released before new operations begin.
 func (e *Engine) Drain() {
 	e.mu.Lock()
-	rm := e.runningMigration
+	rm := e.runningSchemaChange
 	if rm == nil {
 		e.mu.Unlock()
 		return
@@ -199,7 +199,7 @@ func (e *Engine) Drain() {
 	rm.wg.Wait()
 
 	e.mu.Lock()
-	e.runningMigration = nil
+	e.runningSchemaChange = nil
 	e.mu.Unlock()
 }
 
@@ -405,10 +405,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		}
 	}
 
-	rm := &runningMigration{
+	rm := &runningSchemaChange{
 		database:       database,
 		tableNamespace: tableNamespace,
-		tables:         nil, // Tables will be populated by executeMigration
+		tables:         nil, // Tables will be populated by executeSchemaChange
 		originalDDLs:   req.FlatDDL(),
 		state:          engine.StateRunning,
 		started:        time.Now(),
@@ -417,7 +417,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		username:       username,
 		password:       password,
 	}
-	e.runningMigration = rm
+	e.runningSchemaChange = rm
 	e.mu.Unlock()
 
 	// Start schema change in background with cancellable context.
@@ -428,11 +428,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 		defer cancel()
 		e.mu.Lock()
-		if e.runningMigration != nil {
-			e.runningMigration.cancelFunc = cancel
+		if e.runningSchemaChange != nil {
+			e.runningSchemaChange.cancelFunc = cancel
 		}
 		e.mu.Unlock()
-		e.executeMigration(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover)
+		e.executeSchemaChange(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover)
 	})
 
 	return &engine.ApplyResult{
@@ -448,14 +448,14 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.runningMigration == nil {
+	if e.runningSchemaChange == nil {
 		return &engine.ProgressResult{
 			State:   engine.StatePending,
 			Message: "No active schema change",
 		}, nil
 	}
 
-	rm := e.runningMigration
+	rm := e.runningSchemaChange
 
 	// Get progress from the single runner (handles all tables together)
 	message := fmt.Sprintf("Schema change %s", rm.state)
@@ -576,7 +576,7 @@ func buildSpiritTableProgress(prog status.Progress, stateStr string, ddlByTable,
 // surfacing the sentinel wait for a deferred cutover. A stopped tracked state
 // with a volume restart in flight reports running because the schema change
 // is restarting with new settings.
-func progressState(rm *runningMigration, spiritState status.State) engine.State {
+func progressState(rm *runningSchemaChange, spiritState status.State) engine.State {
 	state := rm.state
 	if state == engine.StateStopped && rm.volumeRestartInProgress {
 		state = engine.StateRunning

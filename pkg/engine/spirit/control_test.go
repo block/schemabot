@@ -193,7 +193,7 @@ func TestVolumeToSpiritSettings_ThreadCap(t *testing.T) {
 func TestCancelMarksRunningSchemaChangeCancelled(t *testing.T) {
 	eng := New(Config{})
 	cancelCalled := false
-	eng.runningMigration = &runningMigration{
+	eng.runningSchemaChange = &runningSchemaChange{
 		database: "testdb",
 		tables:   []string{"users"},
 		state:    engine.StateRunning,
@@ -206,7 +206,7 @@ func TestCancelMarksRunningSchemaChangeCancelled(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cleanup missing connection details")
 	assert.True(t, cancelCalled)
-	assert.Equal(t, engine.StateCancelled, eng.runningMigration.state)
+	assert.Equal(t, engine.StateCancelled, eng.runningSchemaChange.state)
 }
 
 func TestCPUScaledThreads(t *testing.T) {
@@ -250,7 +250,7 @@ func TestSettingsToVolume(t *testing.T) {
 // the operator keeps polling the active schema change.
 func TestVolumeReportsRunningWhileStoredStoppedStateRestarts(t *testing.T) {
 	eng := New(Config{})
-	rm := &runningMigration{
+	rm := &runningSchemaChange{
 		database:       "testdb",
 		tableNamespace: map[string]string{},
 		state:          engine.StateRunning,
@@ -259,7 +259,7 @@ func TestVolumeReportsRunningWhileStoredStoppedStateRestarts(t *testing.T) {
 	}
 	rm.wg.Add(1)
 	eng.mu.Lock()
-	eng.runningMigration = rm
+	eng.runningSchemaChange = rm
 	eng.mu.Unlock()
 
 	errCh := make(chan error, 1)

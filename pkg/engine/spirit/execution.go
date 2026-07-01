@@ -15,15 +15,15 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 )
 
-// executeMigration runs the Spirit schema change synchronously.
+// executeSchemaChange runs the Spirit schema change synchronously.
 // All DDL statements (CREATE, DROP, ALTER, RENAME) are passed through Spirit.
 // Spirit requires non-ALTER statements to be executed individually (not combined).
 // ALTER statements can be combined for atomic multi-table schema changes.
-func (e *Engine) executeMigration(ctx context.Context, host, username, password, database string, ddlStatements []string, deferCutover bool) {
+func (e *Engine) executeSchemaChange(ctx context.Context, host, username, password, database string, ddlStatements []string, deferCutover bool) {
 	phases, err := classifyDDLPhases(ddlStatements)
 	if err != nil {
 		e.logger.Error("failed to classify statement", "error", err)
-		e.setMigrationFailed(err)
+		e.setSchemaChangeFailed(err)
 		return
 	}
 
@@ -58,10 +58,10 @@ func (e *Engine) executeMigration(ctx context.Context, host, username, password,
 
 	// Completion is signalled only after every phase has run, so a poller never
 	// observes StateCompleted while a later DROP phase is still pending.
-	e.setMigrationCompleted()
+	e.setSchemaChangeCompleted()
 }
 
-// resumeMigration continues a stopped schema change to completion.
+// resumeSchemaChange continues a stopped schema change to completion.
 //
 // When an ALTER was in flight, its statements are resumed from Spirit's
 // checkpoint using the stored verbatim combined statement (not the original DDL
@@ -71,9 +71,9 @@ func (e *Engine) executeMigration(ctx context.Context, host, username, password,
 // phase, so once an ALTER has started they are already applied; only the DROP
 // phase remains and must run after the resumed ALTER completes. When no ALTER was
 // in flight, the whole plan is run from the start.
-func (e *Engine) resumeMigration(ctx context.Context, host, username, password, database string, originalDDLs []string, combinedStatement string, deferCutover bool) {
+func (e *Engine) resumeSchemaChange(ctx context.Context, host, username, password, database string, originalDDLs []string, combinedStatement string, deferCutover bool) {
 	if combinedStatement == "" {
-		e.executeMigration(ctx, host, username, password, database, originalDDLs, deferCutover)
+		e.executeSchemaChange(ctx, host, username, password, database, originalDDLs, deferCutover)
 		return
 	}
 
@@ -94,7 +94,7 @@ func (e *Engine) resumeMigration(ctx context.Context, host, username, password, 
 	phases, err := classifyDDLPhases(originalDDLs)
 	if err != nil {
 		e.logger.Error("failed to classify statements on resume", "database", database, "error", err)
-		e.setMigrationFailed(err)
+		e.setSchemaChangeFailed(err)
 		return
 	}
 
@@ -110,7 +110,7 @@ func (e *Engine) resumeMigration(ctx context.Context, host, username, password, 
 		return
 	}
 
-	e.setMigrationCompleted()
+	e.setSchemaChangeCompleted()
 }
 
 // ddlPhases groups a plan's statements into the order Spirit requires:
@@ -160,7 +160,7 @@ func (e *Engine) runStatementPhase(ctx context.Context, database, stopLabel, fai
 				return false
 			}
 			e.logger.Error(failLabel+" failed", "database", database, "error", err)
-			e.setMigrationFailed(fmt.Errorf("%s failed: %w", failLabel, err))
+			e.setSchemaChangeFailed(fmt.Errorf("%s failed: %w", failLabel, err))
 			return false
 		}
 	}
@@ -190,7 +190,7 @@ func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password
 		parsed, err := statement.New(stmt)
 		if err != nil {
 			e.logger.Error("failed to parse statement for logging", "database", database, "error", err, "statement", stmt)
-			e.setMigrationFailed(fmt.Errorf("parse ALTER statement %q: %w", stmt, err))
+			e.setSchemaChangeFailed(fmt.Errorf("parse ALTER statement %q: %w", stmt, err))
 			return false
 		}
 		if len(parsed) > 0 {
@@ -296,7 +296,7 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 	parsed, err := statement.New(combinedStatement)
 	if err != nil {
 		e.logger.Error("failed to parse combined statement", "error", err)
-		e.setMigrationFailed(fmt.Errorf("failed to parse combined statement: %w", err))
+		e.setSchemaChangeFailed(fmt.Errorf("failed to parse combined statement: %w", err))
 		return err
 	}
 	var tables []string
@@ -326,7 +326,7 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 			"error", err,
 			"statement", combinedStatement,
 		)
-		e.setMigrationFailed(fmt.Errorf("failed to create Spirit runner: %w", err))
+		e.setSchemaChangeFailed(fmt.Errorf("failed to create Spirit runner: %w", err))
 		return err
 	}
 
@@ -336,12 +336,12 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 
 	// Track schema change state
 	e.mu.Lock()
-	if e.runningMigration != nil {
-		e.runningMigration.tables = tables
-		e.runningMigration.ddls = ddls
-		e.runningMigration.combinedStatement = combinedStatement
-		e.runningMigration.runners = []*spiritmigration.Runner{runner}
-		e.runningMigration.progressCallback = func() string {
+	if e.runningSchemaChange != nil {
+		e.runningSchemaChange.tables = tables
+		e.runningSchemaChange.ddls = ddls
+		e.runningSchemaChange.combinedStatement = combinedStatement
+		e.runningSchemaChange.runners = []*spiritmigration.Runner{runner}
+		e.runningSchemaChange.progressCallback = func() string {
 			return runner.Progress().Summary
 		}
 	}
@@ -371,7 +371,7 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 		e.logger.Error("schema change failed",
 			"error", err,
 		)
-		e.setMigrationFailed(fmt.Errorf("schema change failed: %w", err))
+		e.setSchemaChangeFailed(fmt.Errorf("schema change failed: %w", err))
 		utils.CloseAndLog(runner)
 		return err
 	}
@@ -381,22 +381,22 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 	return nil
 }
 
-func (e *Engine) setMigrationCompleted() {
+func (e *Engine) setSchemaChangeCompleted() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.runningMigration != nil {
-		e.runningMigration.state = engine.StateCompleted
+	if e.runningSchemaChange != nil {
+		e.runningSchemaChange.state = engine.StateCompleted
 	}
 }
 
-// setMigrationFailed sets the state to failed with an error message.
-func (e *Engine) setMigrationFailed(err error) {
+// setSchemaChangeFailed sets the state to failed with an error message.
+func (e *Engine) setSchemaChangeFailed(err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.runningMigration != nil {
-		e.runningMigration.state = engine.StateFailed
+	if e.runningSchemaChange != nil {
+		e.runningSchemaChange.state = engine.StateFailed
 		if err != nil {
-			e.runningMigration.errorMessage = err.Error()
+			e.runningSchemaChange.errorMessage = err.Error()
 		}
 	}
 }
