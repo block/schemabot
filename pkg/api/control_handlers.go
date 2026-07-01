@@ -1912,6 +1912,7 @@ type VolumeRequest struct {
 	ApplyID     string `json:"apply_id"`
 	Environment string `json:"environment"`
 	Volume      int32  `json:"volume"` // 1-11 (1=conservative, 11=aggressive)
+	Caller      string `json:"caller,omitempty"`
 }
 
 // handleVolume handles POST /api/volume requests.
@@ -1938,6 +1939,10 @@ func (s *Service) handleVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metrics.RecordControlOperation(r.Context(), "volume", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
+	if resp.Accepted {
+		s.logControlOperationForApply(r.Context(), apply, resolveCaller(r.Context(), req.Caller), storage.LogEventInfo,
+			fmt.Sprintf("Volume changed from %d to %d", resp.PreviousVolume, resp.NewVolume))
+	}
 
 	s.writeJSON(w, http.StatusOK, &apitypes.VolumeResponse{
 		Accepted:       resp.Accepted,
