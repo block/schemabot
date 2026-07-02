@@ -84,6 +84,20 @@ func ColumnExists(t *testing.T, db *sql.DB, schemaName, tableName, columnName st
 	return count > 0
 }
 
+// IndexExists reports whether indexName exists on schemaName.tableName.
+func IndexExists(t *testing.T, db *sql.DB, schemaName, tableName, indexName string) bool {
+	t.Helper()
+
+	var count int
+	err := db.QueryRowContext(t.Context(),
+		`SELECT COUNT(DISTINCT index_name) FROM information_schema.statistics
+		 WHERE table_schema = ? AND table_name = ? AND index_name = ?`,
+		schemaName, tableName, indexName,
+	).Scan(&count)
+	require.NoError(t, err)
+	return count > 0
+}
+
 func retryContainerOp(ctx context.Context, opName string, op func() (string, error)) (string, error) {
 	var lastErr error
 	delay := initialDelay

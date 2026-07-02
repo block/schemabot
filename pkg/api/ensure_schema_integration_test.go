@@ -260,3 +260,40 @@ func TestEnsureSchema_RemovesObsoleteVitessTasks(t *testing.T) {
 	// ...and the next run is a clean no-op.
 	require.NoError(t, EnsureSchema(dsn, logger), "second EnsureSchema not idempotent")
 }
+
+// A deployment whose live tables drifted from the embedded schema at the index
+// level — a declared index is missing, and an index the schema no longer
+// declares is still present — must be reconciled by EnsureSchema in both
+// directions: the missing index is added and the undeclared one is dropped,
+// with the next run a clean no-op. Index-only drift is common when indexes are
+// tuned over time, so this covers the pure ALTER TABLE ADD/DROP KEY path
+// through the Spirit diff.
+func TestEnsureSchema_ReconcilesIndexDrift(t *testing.T) {
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	container, dsn, db := startEnsureSchemaContainer(t, ctx)
+	// Cleanup runs after the test, when t.Context() is already cancelled.
+	defer func() { _ = container.Terminate(t.Context()) }()
+	defer utils.CloseAndLog(db)
+
+	// Bring the schema up to date, then drift it: drop a declared index and
+	// add one the embedded schema does not declare.
+	require.NoError(t, EnsureSchema(dsn, logger))
+	require.True(t, testutil.IndexExists(t, db, "schemabot", "apply_operations", "idx_created_id"))
+
+	_, err := db.ExecContext(ctx, "ALTER TABLE `apply_operations` DROP KEY `idx_created_id`")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "ALTER TABLE `checks` ADD KEY `idx_repo_pr` (`repository`,`pull_request`)")
+	require.NoError(t, err)
+
+	// EnsureSchema reconciles both drifts...
+	require.NoError(t, EnsureSchema(dsn, logger), "EnsureSchema with index drift failed")
+	assert.True(t, testutil.IndexExists(t, db, "schemabot", "apply_operations", "idx_created_id"),
+		"missing declared index should be added back")
+	assert.False(t, testutil.IndexExists(t, db, "schemabot", "checks", "idx_repo_pr"),
+		"undeclared index should be dropped")
+
+	// ...and the next run is a clean no-op.
+	require.NoError(t, EnsureSchema(dsn, logger), "second EnsureSchema not idempotent")
+}

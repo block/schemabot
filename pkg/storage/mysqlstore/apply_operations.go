@@ -810,6 +810,13 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// non-completed, and
 	// a gated one would be redundant with the pending clause below. Start
 	// requests resume eligible work; they do not reorder the rollout.
+	//
+	// ORDER BY (created_at, id) walks idx_created_id, so under FOR UPDATE
+	// SKIP LOCKED the scan visits candidates in claim order and stops at the
+	// first unlocked match. Without that index the query would materialize
+	// and lock every matching row before LIMIT applies, and concurrent
+	// drivers would skip each other's entire candidate set instead of
+	// claiming distinct rows in parallel.
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
@@ -1174,6 +1181,9 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 		state.ApplyOperation.RevertWindow,
 	)
 
+	// ORDER BY (created_at, id) walks idx_created_id so concurrent drivers
+	// stop at the first unlocked candidate instead of locking the whole
+	// candidate set; see FindNextApplyOperation.
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations

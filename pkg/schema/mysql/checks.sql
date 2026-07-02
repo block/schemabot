@@ -19,7 +19,6 @@ CREATE TABLE `checks` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `idx_check_key` (`repository`,`pull_request`,`environment`,`database_type`,`database_name`),
   KEY `idx_repo_env_db` (`repository`,`environment`,`database_type`,`database_name`),
-  KEY `idx_repo_pr` (`repository`,`pull_request`),
   KEY `idx_check_run` (`check_run_id`),
   KEY `idx_apply_id` (`apply_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

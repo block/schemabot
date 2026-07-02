@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -4185,4 +4186,83 @@ func TestApplyOperationStore_MarkPendingStoppedByApply_OperationLease(t *testing
 	again, err := store.ApplyOperations().MarkPendingStoppedByApply(opCtx(apply.ID, ownerID, "op-token"), apply.ID)
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), again)
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_ClaimOrderWalksIndex verifies
+// the physical shape of the claim scan: ORDER BY (created_at, id) is served by
+// the idx_created_id index, so a driver's SELECT ... FOR UPDATE SKIP LOCKED
+// visits candidates in claim order and stops at the first unlocked row. If the
+// ordering required a sort instead, the claim would materialize and lock every
+// matching row before LIMIT applies, and concurrent drivers would skip each
+// other's whole candidate set instead of claiming distinct rows in parallel.
+func TestApplyOperationStore_FindNextApplyOperation_ClaimOrderWalksIndex(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	// The claim-order index is declared on the storage schema.
+	var tableName, createTable string
+	require.NoError(t, testDB.QueryRowContext(ctx, "SHOW CREATE TABLE `apply_operations`").Scan(&tableName, &createTable))
+	require.Contains(t, createTable, "KEY `idx_created_id` (`created_at`,`id`)")
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_claim_order_index", 1)
+
+	// Seed enough pending candidates that the optimizer's plan choice between
+	// an ordered index walk and a scan+sort reflects real cost, not tiny-table
+	// noise. A single statement keeps created_at identical across rows, so the
+	// claim order falls through to id.
+	const candidates = 1024
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO apply_operations (apply_id, deployment, operation_key) VALUES ")
+	args := make([]any, 0, candidates*3)
+	for i := range candidates {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString("(?, ?, ?)")
+		args = append(args, apply.ID, "region-a", fmt.Sprintf("commerce/shard-%04d/users", i))
+	}
+	_, err := testDB.ExecContext(ctx, sb.String(), args...)
+	require.NoError(t, err)
+
+	analyze, err := testDB.QueryContext(ctx, "ANALYZE TABLE `apply_operations`")
+	require.NoError(t, err)
+	require.NoError(t, analyze.Close())
+	require.NoError(t, analyze.Err())
+
+	// The claim's top-level predicate ORs across states, so no state-prefixed
+	// index can serve the ordering; the ordered walk must come from
+	// idx_created_id, with no sort step that would buffer (and under FOR
+	// UPDATE, lock) the whole candidate set.
+	var plan string
+	require.NoError(t, testDB.QueryRowContext(ctx, `
+		EXPLAIN FORMAT=JSON
+		SELECT id FROM apply_operations
+		WHERE state = ? OR (state = ? AND updated_at < NOW() - INTERVAL 1 MINUTE)
+		ORDER BY created_at, id
+		LIMIT 1`,
+		state.ApplyOperation.Pending, state.ApplyOperation.Running,
+	).Scan(&plan))
+	assert.Contains(t, plan, `"key": "idx_created_id"`,
+		"claim ordering must walk idx_created_id, plan: %s", plan)
+	assert.NotContains(t, plan, `"using_filesort": true`,
+		"claim ordering must not sort the candidate set, plan: %s", plan)
+
+	// The claim itself follows (created_at, id) order: the earliest candidate
+	// is the one leased.
+	var firstID int64
+	require.NoError(t, testDB.QueryRowContext(ctx, "SELECT MIN(id) FROM apply_operations").Scan(&firstID))
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, firstID, claimed.ID, "claim must lease the earliest candidate in (created_at, id) order")
+	assert.Equal(t, "test-operator", claimed.LeaseOwner)
+	assert.NotEmpty(t, claimed.LeaseToken)
+
+	persisted, err := store.ApplyOperations().Get(ctx, claimed.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.ApplyOperation.Running, persisted.State)
 }
