@@ -363,6 +363,17 @@ type StorageConfig struct {
 	// DSNFrom builds the MySQL connection string from separate database config
 	// and password references. It is mutually exclusive with DSN.
 	DSNFrom *DSNFromConfig `yaml:"dsn_from,omitempty"`
+
+	// AllowDestructiveSchemaChanges permits EnsureSchema to execute destructive
+	// DDL (DROP TABLE, or an ALTER TABLE containing DROP COLUMN) when converging
+	// the storage schema at startup. Default false: destructive statements are
+	// refused and skipped while the remaining additive changes still apply and
+	// startup proceeds. This keeps an older binary — starting during a rolling
+	// deploy or rollback — from destroying tables or columns a newer binary's
+	// schema added. Set true only when intentionally removing storage tables or
+	// columns, after every running pod is on a binary whose embedded schema no
+	// longer declares them.
+	AllowDestructiveSchemaChanges bool `yaml:"allow_destructive_schema_changes,omitempty"`
 }
 
 // DSNFromConfig configures a MySQL DSN assembled from separate secret values.

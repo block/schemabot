@@ -13,6 +13,7 @@
 - [Hybrid Mode](#hybrid-mode)
 - [Drivers](#drivers)
 - [Pending Drops](#pending-drops)
+- [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
 - [Repository Allowlist](#repository-allowlist)
 - [PR Checks Gate](#pr-checks-gate)
@@ -307,6 +308,34 @@ The cleaner only runs against local-mode MySQL databases (environments with a
 process has no target DSN and cannot clean that target. Cleanup runs only if the
 remote deployment is also a SchemaBot server with the target configured as
 local-mode MySQL and `cleanup_enabled: true`.
+
+## Storage Schema Changes
+
+SchemaBot's internal storage schema is self-bootstrapping: on every startup,
+`EnsureSchema` diffs the embedded schema files against the live storage
+database and applies whatever DDL is needed before the server accepts traffic.
+
+By default, destructive statements in that diff — `DROP TABLE`, or an
+`ALTER TABLE` containing `DROP COLUMN` — are refused and skipped, while the
+remaining additive changes still apply and startup proceeds. This protects
+against rolling deploys and rollbacks: a pod running an older binary sees a
+newer binary's tables and columns as surplus, and without the gate would drop
+them (destroying data the newer pods depend on). Each refused statement is
+logged at warn level with the exact DDL, and counted in the
+`schemabot.storage_schema.destructive_refusals_total` metric.
+
+To intentionally remove a storage table or column, first make sure every
+running pod is on a binary whose embedded schema no longer declares it, then
+opt in:
+
+```yaml
+storage:
+  dsn: "env:SCHEMABOT_DSN"
+  allow_destructive_schema_changes: true  # default: false
+```
+
+Leave the flag false during normal operation and revert it after the removal
+converges.
 
 ## Support Channel
 

@@ -404,7 +404,7 @@ func connectStorage(ctx context.Context, cfg *api.ServerConfig, logger *slog.Log
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage DSN: %w", err)
 	}
-	if err := api.EnsureSchema(dsn, logger); err != nil {
+	if err := api.EnsureSchema(dsn, logger, api.WithAllowDestructiveSchemaChanges(cfg.Storage.AllowDestructiveSchemaChanges)); err != nil {
 		return nil, fmt.Errorf("ensure storage schema: %w", err)
 	}
 	db, err := mysqlconn.OpenReloadable(dsn, cfg.StorageDSN)
