@@ -359,9 +359,13 @@ type ApplyStore interface {
 	// GetByLock returns applies for a lock (0-2: staging + production).
 	GetByLock(ctx context.Context, lockID int64) ([]*Apply, error)
 
-	// GetByDatabase returns applies for a specific database and environment.
-	// Used for checking active schema changes before starting a new one.
-	GetByDatabase(ctx context.Context, database, dbType, environment string) ([]*Apply, error)
+	// GetByDatabase returns the most recent applies for a specific database,
+	// ordered by creation time descending. dbType and environment are optional
+	// filters; empty strings match all values. limit bounds the number of rows
+	// returned and must be positive — every caller states how much history it
+	// can consume, so a database with a long apply history is never loaded into
+	// memory in one read.
+	GetByDatabase(ctx context.Context, database, dbType, environment string, limit int) ([]*Apply, error)
 
 	// Update updates apply state and fields.
 	// Returns ErrActiveApplyExists when moving an apply into an active state

@@ -769,7 +769,7 @@ func (s *actorAuthApplyStore) GetByApplyIdentifier(_ context.Context, applyIdent
 	return s.apply, nil
 }
 
-func (s *actorAuthApplyStore) GetByDatabase(_ context.Context, _, _, _ string) ([]*storage.Apply, error) {
+func (s *actorAuthApplyStore) GetInProgress(_ context.Context) ([]*storage.Apply, error) {
 	return nil, nil
 }
 

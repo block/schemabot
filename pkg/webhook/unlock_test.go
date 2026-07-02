@@ -54,7 +54,7 @@ type failingApplyLookupStore struct {
 	storage.ApplyStore
 }
 
-func (s *failingApplyLookupStore) GetByDatabase(_ context.Context, _, _, _ string) ([]*storage.Apply, error) {
+func (s *failingApplyLookupStore) GetInProgress(_ context.Context) ([]*storage.Apply, error) {
 	return nil, errors.New("storage read failed")
 }
 
@@ -62,7 +62,7 @@ type noActiveAppliesStore struct {
 	storage.ApplyStore
 }
 
-func (s *noActiveAppliesStore) GetByDatabase(_ context.Context, _, _, _ string) ([]*storage.Apply, error) {
+func (s *noActiveAppliesStore) GetInProgress(_ context.Context) ([]*storage.Apply, error) {
 	return nil, nil
 }
 
@@ -117,7 +117,7 @@ func TestUnlockRefusedWhenActiveApplyLookupFails(t *testing.T) {
 
 	select {
 	case body := <-comments:
-		assert.Contains(t, body, "Failed to verify active applies for database `orders`")
+		assert.Contains(t, body, "Failed to verify active applies for the locked databases")
 		assert.Contains(t, body, "storage read failed")
 		assert.Contains(t, body, "No locks were released")
 	case <-time.After(2 * time.Second):

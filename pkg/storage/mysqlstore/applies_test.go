@@ -19,6 +19,11 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
+// getByDatabaseTestLimit bounds GetByDatabase verification reads in tests.
+// It comfortably exceeds the number of applies any test creates per target,
+// so limited reads still observe every relevant row.
+const getByDatabaseTestLimit = 10
+
 func TestApplyStore_Create(t *testing.T) {
 	clearTables(t)
 	store := New(testDB)
@@ -1051,7 +1056,7 @@ func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 	})
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 
-	applies, err := store.Applies().GetByDatabase(ctx, "testdb", "mysql", "staging")
+	applies, err := store.Applies().GetByDatabase(ctx, "testdb", "mysql", "staging", getByDatabaseTestLimit)
 	require.NoError(t, err)
 	assert.Empty(t, applies)
 
@@ -1072,7 +1077,7 @@ func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotZero(t, id)
 
-	applies, err = store.Applies().GetByDatabase(ctx, "testdb", "mysql", "staging")
+	applies, err = store.Applies().GetByDatabase(ctx, "testdb", "mysql", "staging", getByDatabaseTestLimit)
 	require.NoError(t, err)
 	assert.Len(t, applies, 1)
 }
@@ -1157,7 +1162,7 @@ func TestApplyStore_CreateAllowsConcurrentActiveAppliesForDifferentTargets(t *te
 		require.NoError(t, err)
 	}
 	for _, target := range targets {
-		applies, err := store.Applies().GetByDatabase(ctx, target.database, target.dbType, target.environment)
+		applies, err := store.Applies().GetByDatabase(ctx, target.database, target.dbType, target.environment, getByDatabaseTestLimit)
 		require.NoError(t, err)
 		assert.Len(t, applies, 1)
 	}
@@ -1344,15 +1349,38 @@ func TestApplyStore_GetByDatabase(t *testing.T) {
 	lock1 := createTestLock(t, store, "db1", "mysql", "staging")
 	lock2 := createTestLock(t, store, "db2", "mysql", "staging")
 
-	// Create applies
-	createTestApply(t, store, lock1, "apply_db1", 200)
-	createTestApply(t, store, lock2, "apply_db2", 201)
+	// Create three applies on db1, terminalizing each so the next active one
+	// can be created, plus one apply on another database.
+	first := createTestApply(t, store, lock1, "apply_db1_first", 200)
+	first.State = state.Apply.Completed
+	require.NoError(t, store.Applies().Update(ctx, first))
+	second := createTestApply(t, store, lock1, "apply_db1_second", 201)
+	second.State = state.Apply.Completed
+	require.NoError(t, store.Applies().Update(ctx, second))
+	createTestApply(t, store, lock1, "apply_db1_third", 202)
+	createTestApply(t, store, lock2, "apply_db2", 203)
 
-	// GetByDatabase should only return applies for db1
-	applies, err := store.Applies().GetByDatabase(ctx, "db1", "mysql", "staging")
+	// GetByDatabase returns only db1 applies, most recently created first.
+	applies, err := store.Applies().GetByDatabase(ctx, "db1", "mysql", "staging", getByDatabaseTestLimit)
 	require.NoError(t, err)
-	require.Len(t, applies, 1)
-	require.Equal(t, "apply_db1", applies[0].ApplyIdentifier)
+	require.Len(t, applies, 3)
+	assert.Equal(t, "apply_db1_third", applies[0].ApplyIdentifier)
+	assert.Equal(t, "apply_db1_second", applies[1].ApplyIdentifier)
+	assert.Equal(t, "apply_db1_first", applies[2].ApplyIdentifier)
+
+	// The limit keeps the most recent applies and drops the oldest, preserving
+	// the descending creation order.
+	applies, err = store.Applies().GetByDatabase(ctx, "db1", "mysql", "staging", 2)
+	require.NoError(t, err)
+	require.Len(t, applies, 2)
+	assert.Equal(t, "apply_db1_third", applies[0].ApplyIdentifier)
+	assert.Equal(t, "apply_db1_second", applies[1].ApplyIdentifier)
+
+	// A non-positive limit is a caller bug and is rejected instead of falling
+	// back to an unbounded read.
+	_, err = store.Applies().GetByDatabase(ctx, "db1", "mysql", "staging", 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "limit must be positive")
 }
 
 func TestApplyStore_GetRecentLimitAndEnvironment(t *testing.T) {
@@ -3686,7 +3714,7 @@ func getStartControlRequest(t *testing.T, applyID int64) *storage.ApplyControlRe
 // the target, guarding the one-active-apply-per-target invariant.
 func assertExactlyOneRunningApply(t *testing.T, store *Storage, database, dbType, environment string) {
 	t.Helper()
-	applies, err := store.Applies().GetByDatabase(t.Context(), database, dbType, environment)
+	applies, err := store.Applies().GetByDatabase(t.Context(), database, dbType, environment, getByDatabaseTestLimit)
 	require.NoError(t, err)
 	running := 0
 	for _, a := range applies {
@@ -3702,7 +3730,7 @@ func assertExactlyOneRunningApply(t *testing.T, store *Storage, database, dbType
 // transient active states such as resuming that are not running-family.
 func assertExactlyOneActiveApply(t *testing.T, store *Storage, database, dbType, environment string) {
 	t.Helper()
-	applies, err := store.Applies().GetByDatabase(t.Context(), database, dbType, environment)
+	applies, err := store.Applies().GetByDatabase(t.Context(), database, dbType, environment, getByDatabaseTestLimit)
 	require.NoError(t, err)
 	active := 0
 	for _, a := range applies {
@@ -3843,7 +3871,7 @@ func TestApplyStore_GetByDatabase_DBError(t *testing.T) {
 	require.NoError(t, db.Close())
 
 	store := New(db)
-	_, err = store.Applies().GetByDatabase(t.Context(), "db", "mysql", "staging")
+	_, err = store.Applies().GetByDatabase(t.Context(), "db", "mysql", "staging", getByDatabaseTestLimit)
 	require.Error(t, err)
 }
 
