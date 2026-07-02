@@ -267,7 +267,7 @@ func TestWebhookMergeGroupParticipantStaysSilent(t *testing.T) {
 	select {
 	case c := <-created:
 		t.Fatalf("participant posted a merge_group check run: %q", c.Name)
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

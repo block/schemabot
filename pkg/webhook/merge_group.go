@@ -87,7 +87,7 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 	// required checks gate a merge-group entry.
 	if h.isAggregateParticipant(repo) {
 		h.logger.Info("aggregate participant staying silent on merge_group; the leader posts the required checks",
-			"repo", repo, "head_sha", headSHA)
+			"repo", repo, "head_sha", headSHA, "installation_id", installationID)
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "merge_group_check",
 			Repository: repo,

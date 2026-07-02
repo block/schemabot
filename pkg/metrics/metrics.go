@@ -1080,6 +1080,7 @@ var knownStatusCheckOperations = map[string]bool{
 	"aggregate_participant_skip":           true,
 	"aggregate_participant_fanout":         true,
 	"participant_comment_nudge":            true,
+	"merge_group_check":                    true,
 }
 
 var knownStatusCheckStatuses = map[string]bool{
