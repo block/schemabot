@@ -84,6 +84,8 @@ Under **Organization permissions**, grant:
 
 Subscribe to **Merge group**, not **Merge queue entry** — the two are distinct events, and SchemaBot handles only `merge_group`. The **Merge group** event requires the **Merge queues: Read** repository permission above. Because that is a new permission, adding it to an existing App marks the App as requesting new permissions, which an org or repository admin must approve on each installation before it takes effect.
 
+The **Push** event needs no new permission — **Contents: Read** above already unlocks it — so subscribing an existing App takes effect immediately on every installation, with no admin re-approval. Expect webhook delivery volume to rise once subscribed: GitHub sends a `push` event for every branch and tag push on installed repositories, and SchemaBot discards everything but default-branch pushes.
+
 Future phases will also use **Check run** (action buttons) and **Pull request** (auto-plan on open/sync).
 
 ### Where Can This GitHub App Be Installed?
