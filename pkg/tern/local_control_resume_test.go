@@ -1,12 +1,16 @@
 package tern
 
 import (
+	"context"
+	"errors"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/statement"
 )
@@ -261,4 +265,109 @@ func TestReplanAndFilterTasks_MatchKeepsTaskActive(t *testing.T) {
 	require.Len(t, rp.ActiveTasks, 1)
 	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", rp.ActiveTasks[0].DDL)
 	assert.Zero(t, rp.CompletedCount)
+}
+
+// scriptedPlanStore scripts plan reads for recovery tests: a nil plan with a
+// nil error models a confirmed-missing plan row, while a non-nil error models
+// a storage read failure.
+type scriptedPlanStore struct {
+	storage.PlanStore
+	plan *storage.Plan
+	err  error
+}
+
+func (s *scriptedPlanStore) GetByID(context.Context, int64) (*storage.Plan, error) {
+	return s.plan, s.err
+}
+
+// terminalRecordingObserver records terminal notifications so recovery tests
+// can assert whether an apply's registered waiter (e.g. the PR check/comment)
+// was told the apply reached a terminal state.
+type terminalRecordingObserver struct {
+	terminal []*storage.Apply
+}
+
+func (o *terminalRecordingObserver) OnProgress(*storage.Apply, []*storage.Task) {}
+func (o *terminalRecordingObserver) OnTerminal(apply *storage.Apply, _ []*storage.Task) {
+	o.terminal = append(o.terminal, apply)
+}
+
+// recoveryPlanLoadFixture builds an in-flight Vitess apply whose recovery is
+// about to load its plan, with the plan store scripted by the caller.
+func recoveryPlanLoadFixture(plans storage.PlanStore) (*LocalClient, *storage.Apply, []*storage.Task, *exactProgressApplyStore) {
+	operationID := int64(3)
+	apply := &storage.Apply{
+		ID:              21,
+		ApplyIdentifier: "apply-recover-plan",
+		PlanID:          5,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Engine:          storage.EnginePlanetScale,
+		State:           state.Apply.Running,
+	}
+	tasks := []*storage.Task{{
+		ID:               2,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-recover-plan",
+		Database:         "testdb",
+		DatabaseType:     storage.DatabaseTypeVitess,
+		Namespace:        "commerce",
+		TableName:        "users",
+		DDL:              "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		DDLAction:        "alter",
+		State:            state.Task.Running,
+	}}
+	applyStore := &exactProgressApplyStore{apply: apply}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies:         applyStore,
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			controlRequests: &testControlRequestStore{},
+			plans:           plans,
+		},
+		logger: slog.Default(),
+	}
+	return client, apply, tasks, applyStore
+}
+
+// Recovery must not convert a transient storage failure on the plan load into
+// terminal apply state: the engine-side work (a checkpointed copy or a live
+// deploy request) is untouched. The recovery attempt exits with an error so
+// the claim is released and a later attempt retries against intact storage,
+// and no terminal notification reaches the apply's observer.
+func TestResumeApplyPlanLoadStorageErrorStaysRecoverable(t *testing.T) {
+	storageErr := errors.New("storage unavailable")
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{err: storageErr})
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+
+	require.ErrorIs(t, err, storageErr)
+	assert.ErrorContains(t, err, "apply-recover-plan")
+	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.Running),
+		"in-flight apply must stay recoverable, not terminal: got %s", applyStore.apply.State)
+	assert.False(t, state.IsTerminalApplyState(applyStore.apply.State))
+	assert.Empty(t, applyStore.apply.ErrorMessage)
+	assert.Empty(t, observer.terminal, "a transient plan-load failure must not notify the terminal observer")
+}
+
+// A confirmed-missing plan row (a nil plan with no read error) is
+// unrecoverable — the reviewed DDL cannot be rebuilt — so recovery fails the
+// apply with an operator-facing reason and notifies its terminal observer.
+func TestResumeApplyMissingPlanFailsApply(t *testing.T) {
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{})
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+
+	require.NoError(t, err)
+	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.Failed),
+		"apply with no plan row must fail, got %s", applyStore.apply.State)
+	assert.Equal(t, "plan not found during recovery", applyStore.apply.ErrorMessage)
+	require.Len(t, observer.terminal, 1)
+	assert.True(t, state.IsState(observer.terminal[0].State, state.Apply.Failed))
 }

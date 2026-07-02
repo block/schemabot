@@ -466,10 +466,12 @@ type exactProgressStorage struct {
 	logs            storage.ApplyLogStore
 	controlRequests storage.ControlRequestStore
 	applyOperations storage.ApplyOperationStore
+	plans           storage.PlanStore
 }
 
 func (s *exactProgressStorage) Applies() storage.ApplyStore { return s.applies }
 func (s *exactProgressStorage) Tasks() storage.TaskStore    { return s.tasks }
+func (s *exactProgressStorage) Plans() storage.PlanStore    { return s.plans }
 func (s *exactProgressStorage) ApplyLogs() storage.ApplyLogStore {
 	if s.logs != nil {
 		return s.logs
@@ -934,6 +936,70 @@ func TestLaunchAtomicResumeMissingMetadataStaysRecoverable(t *testing.T) {
 	assert.False(t, state.IsTerminalApplyState(applyStore.apply.State),
 		"in-flight apply must stay recoverable, not terminal: got %s", applyStore.apply.State)
 	assert.NotEqual(t, state.Apply.Failed, applyStore.apply.State)
+}
+
+// After the engine accepts a grouped Vitess apply, a deploy request is live on
+// the provider. A failure to persist the engine resume state is storage
+// uncertainty, not a failed schema change: the apply pauses for operator retry
+// so the resume path reattaches to the in-flight deploy request instead of
+// permanently failing an apply whose remote work is still running.
+func TestExecuteGroupedApplySaveFailureAfterAcceptPausesForRetry(t *testing.T) {
+	operationID := int64(7)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-grouped-save-failure",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Engine:          storage.EnginePlanetScale,
+		State:           state.Apply.Pending,
+	}
+	tasks := []*storage.Task{{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-grouped-save-failure",
+		Database:         "testdb",
+		DatabaseType:     storage.DatabaseTypeVitess,
+		Namespace:        "commerce",
+		TableName:        "users",
+		DDL:              "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		DDLAction:        "alter",
+		State:            state.Task.Pending,
+	}}
+	plan := &storage.Plan{
+		PlanIdentifier: "plan-grouped-save-failure",
+		Namespaces:     map[string]*storage.NamespacePlanData{"commerce": {}},
+	}
+	applyStore := &exactProgressApplyStore{apply: apply}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies:         applyStore,
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			controlRequests: &testControlRequestStore{},
+			applyOperations: &exactProgressApplyOperationStore{saveErr: errors.New("storage unavailable")},
+		},
+		planetscaleEngine: &fakeControlEngine{applyResult: &engine.ApplyResult{
+			Accepted: true,
+			ResumeState: &engine.ResumeState{
+				MigrationContext: "ctx-grouped",
+				Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+			},
+		}},
+		heartbeatInterval: time.Hour,
+		logger:            slog.Default(),
+	}
+
+	client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false)
+
+	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.FailedRetryable),
+		"apply must pause for operator retry, got %s", applyStore.apply.State)
+	assert.Nil(t, applyStore.apply.CompletedAt)
+	assert.Contains(t, applyStore.apply.ErrorMessage, "failed to save engine resume state")
+	for _, task := range tasks {
+		assert.True(t, state.IsState(task.State, state.Task.FailedRetryable),
+			"task must pause for operator retry, got %s", task.State)
+	}
 }
 
 // Rebuilt resume changes must preserve each task's namespace and table so

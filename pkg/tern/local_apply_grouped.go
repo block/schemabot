@@ -157,9 +157,15 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	if result.ResumeState != nil {
 		resumeState = result.ResumeState
 		if c.config.Type == storage.DatabaseTypeVitess {
+			// The engine has already accepted the apply, so a deploy request is
+			// live on the provider. A failure to persist its resume state is
+			// storage uncertainty, not a failed schema change: pause for operator
+			// retry so the resume path reattaches to the in-flight work instead
+			// of abandoning it as terminal.
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, resumeState); saveErr != nil {
-				c.logger.Error("failed to save opaque engine resume state", append(apply.LogAttrs(), "error", saveErr)...)
-				c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state: %v", saveErr))
+				c.logger.Warn("failed to save engine resume state after accepted apply; pausing apply for operator retry",
+					append(apply.LogAttrs(), "error", saveErr)...)
+				c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state: %v", saveErr))
 				return
 			}
 		}

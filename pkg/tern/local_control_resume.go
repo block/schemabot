@@ -1320,12 +1320,22 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		return err
 	}
 
-	// Get the plan to retrieve original DDLs
+	// Get the plan to retrieve original DDLs. A storage read failure says
+	// nothing about whether the plan row exists, so it must not become terminal
+	// apply state — the engine-side work (a checkpointed copy or a live deploy
+	// request) is untouched. The recovery attempt exits with an error so the
+	// claim is released and a later attempt retries against intact storage.
 	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
-	if err != nil || plan == nil {
-		c.logger.Warn("plan not found for apply, marking as failed",
-			"apply_id", apply.ApplyIdentifier,
-			"plan_id", apply.PlanID)
+	if err != nil {
+		c.logger.Warn("failed to load plan during recovery; current apply owner will exit for operator retry",
+			append(apply.LogAttrs(), "error", err)...)
+		return fmt.Errorf("load plan for recovery of apply %s (database %s): %w", apply.ApplyIdentifier, apply.Database, err)
+	}
+	// A confirmed-missing plan row is unrecoverable: the reviewed DDL cannot be
+	// rebuilt, so the apply fails and its observer is notified.
+	if plan == nil {
+		c.logger.Warn("plan row does not exist for apply; recovery cannot rebuild the reviewed DDL, marking apply failed",
+			apply.LogAttrs()...)
 		apply.State = state.Apply.Failed
 		apply.ErrorMessage = "plan not found during recovery"
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
