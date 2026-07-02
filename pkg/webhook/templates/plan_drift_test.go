@@ -209,3 +209,30 @@ func TestRenderPlanComment_DriftBeforeChangeList(t *testing.T) {
 	assert.Positive(t, changeIdx)
 	assert.Less(t, driftIdx, changeIdx, "drift line appears before the change list")
 }
+
+// AnyEnvHasDriftToShow drives the auto-plan comment-skip decision: it is true
+// only when an environment has drift that must be explained (diverged or
+// unverifiable), so a red check from drift is never left without a comment. A
+// clean or nil rollup is not "drift to show".
+func TestAnyEnvHasDriftToShow(t *testing.T) {
+	drift := func(computed, clean bool) *DeploymentDriftData {
+		return &DeploymentDriftData{Computed: computed, Clean: clean}
+	}
+	cases := []struct {
+		name  string
+		plans map[string]*PlanCommentData
+		want  bool
+	}{
+		{"no drift data", map[string]*PlanCommentData{"prod": {}}, false},
+		{"clean rollup", map[string]*PlanCommentData{"prod": {DeploymentDrift: drift(true, true)}}, false},
+		{"diverged rollup", map[string]*PlanCommentData{"prod": {DeploymentDrift: drift(true, false)}}, true},
+		{"uncomputed rollup", map[string]*PlanCommentData{"prod": {DeploymentDrift: drift(false, false)}}, true},
+		{"nil plan", map[string]*PlanCommentData{"prod": nil}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := MultiEnvPlanCommentData{Environments: []string{"prod"}, Plans: tc.plans}
+			assert.Equal(t, tc.want, AnyEnvHasDriftToShow(data))
+		})
+	}
+}

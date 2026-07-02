@@ -786,7 +786,7 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	// If no environments have changes and no errors, show simple message — unless
 	// a deployment drifted, which must still surface even when the reviewed
 	// primary plans are clean no-ops.
-	if envsWithChanges == 0 && !hasErrors && !anyEnvHasDriftToShow(data) {
+	if envsWithChanges == 0 && !hasErrors && !AnyEnvHasDriftToShow(data) {
 		sb.WriteString("✅ **No schema changes detected** for any environment.\n")
 		return sb.String()
 	}
@@ -1008,11 +1008,11 @@ func allPlansIdentical(data MultiEnvPlanCommentData) bool {
 	return firstPlan != nil
 }
 
-// anyEnvHasDriftToShow reports whether any environment has drift that must be
+// AnyEnvHasDriftToShow reports whether any environment has drift that must be
 // surfaced even when no environment plans changes: a deployment that diverged or
 // could not be verified. A clean uniform rollup is not "drift to show" — with no
 // changes anywhere the simple no-changes message is clearer.
-func anyEnvHasDriftToShow(data MultiEnvPlanCommentData) bool {
+func AnyEnvHasDriftToShow(data MultiEnvPlanCommentData) bool {
 	for _, env := range data.Environments {
 		plan, ok := data.Plans[env]
 		if !ok || plan == nil || plan.DeploymentDrift == nil {

@@ -368,8 +368,11 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		h.postFailingAggregatesWithBlock(ctx, client, repo, pr, multiEnvData.HeadSHA, driftBlockUnstored, reviewTimeDeploymentDriftBlock)
 	}
 
-	// Auto-plan: skip comment if no changes and no errors (reduce PR noise)
-	// Check runs are still created above so PR status shows green
+	// Auto-plan: skip the comment only when there is genuinely nothing to show —
+	// no changes, no errors, and no deployment drift. A drifted or unverifiable
+	// deployment fails the check closed even when every primary plan is a clean
+	// no-op, so the comment must still post to explain why the check is red;
+	// skipping it would leave a red check with no visible reason on the PR.
 	if isAutoPlan {
 		hasErrors := len(multiEnvData.Errors) > 0
 		anyChanges := false
@@ -379,8 +382,8 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 				break
 			}
 		}
-		if !anyChanges && !hasErrors {
-			h.logger.Info("auto-plan: no changes detected, skipping comment", "repo", repo, "pr", pr)
+		if !anyChanges && !hasErrors && !templates.AnyEnvHasDriftToShow(multiEnvData) {
+			h.logger.Info("auto-plan: no changes, errors, or drift detected, skipping comment", "repo", repo, "pr", pr)
 			return
 		}
 	}
