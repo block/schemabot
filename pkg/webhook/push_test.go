@@ -119,6 +119,59 @@ func TestWebhookPushIgnoresBranchDeletion(t *testing.T) {
 	}
 }
 
+// An aggregate participant's checks are never required — the leader owns the
+// required aggregate — so a participant stays silent on default-branch pushes
+// rather than seeding an informational check on every landed commit.
+func TestWebhookPushParticipantStaysSilent(t *testing.T) {
+	h, created := mergeGroupTestHandler(t,
+		[]string{"production"},
+		map[string]api.RepoConfig{"octocat/hello-world": {
+			Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant},
+		}},
+	)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, buildPushWebhookRequest(t, "refs/heads/main", "pushsha123", false))
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "aggregate participant, staying silent")
+
+	select {
+	case c := <-created:
+		t.Fatalf("participant posted a default-branch check run: %q", c.Name)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// The aggregate leader keeps seeding its required check names on
+// default-branch pushes — silence is participant-only, so the leader App
+// stays selectable as a pinned required-check source.
+func TestWebhookPushLeaderStillPosts(t *testing.T) {
+	h, created := mergeGroupTestHandler(t,
+		[]string{"production"},
+		map[string]api.RepoConfig{"octocat/hello-world": {
+			Aggregate: &api.AggregateConfig{
+				Role:            api.AggregateRoleLeader,
+				ExpectedTenants: []api.ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"tenant-b/schema"}, CheckName: "SchemaBot Tenant B"}},
+			},
+		}},
+	)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, buildPushWebhookRequest(t, "refs/heads/main", "pushsha123", false))
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "default-branch checks posted")
+
+	select {
+	case c := <-created:
+		assert.Equal(t, "pushsha123", c.HeadSHA)
+		assert.Equal(t, "success", c.Conclusion)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the leader's default-branch check run")
+	}
+}
+
 // A push on a repository SchemaBot does not manage gets no check: SchemaBot's
 // check is not required there, so there is no check source to maintain.
 func TestWebhookPushRejectsUnregisteredRepo(t *testing.T) {

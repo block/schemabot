@@ -87,6 +87,22 @@ func (h *Handler) handlePush(ctx context.Context, metricApp string, w http.Respo
 		return
 	}
 
+	// An aggregate participant's checks are never required — the leader owns
+	// the required aggregate, so only the leader needs to stay selectable as a
+	// ruleset check source. A participant seeding its informational check on
+	// every landed commit would only add noise.
+	if h.isAggregateParticipant(repo) {
+		h.logger.Info("aggregate participant staying silent on default-branch push; the leader maintains the check source",
+			"repo", repo, "head_sha", headSHA, "installation_id", installationID)
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "default_branch_check",
+			Repository: repo,
+			Status:     "skipped",
+		})
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "push ignored (aggregate participant, staying silent)"})
+		return
+	}
+
 	// When check publishing is disabled for this repo, SchemaBot's check is not
 	// required either, so there is no check source to maintain.
 	if !h.shouldPublishChecks(ctx, repo, "default_branch_check") {
