@@ -119,8 +119,9 @@ func TestRenderPlanComment_NoDriftSectionWhenNil(t *testing.T) {
 	}
 
 	out := RenderPlanComment(data)
-	assert.NotContains(t, out, "deployment")
-	assert.NotContains(t, out, "drift")
+	assert.NotContains(t, out, "Same plan on all")
+	assert.NotContains(t, out, "Deployment drift detected")
+	assert.NotContains(t, out, "Could not verify deployment drift")
 }
 
 // The multi-env no-changes short-circuit must not hide drift: when every
@@ -184,8 +185,8 @@ func TestPlansIdentical_DifferentDriftPreventsDedup(t *testing.T) {
 	assert.True(t, plansIdentical(clean, clean), "identical plans and drift dedup")
 }
 
-// A missing '·' — the drift line ordering is stable so the uniform clean line is
-// emitted before the change list, keeping the safety signal at the top.
+// The uniform clean drift line is emitted before the change list, so the
+// deployment safety signal stays at the top of the PR comment.
 func TestRenderPlanComment_DriftBeforeChangeList(t *testing.T) {
 	data := PlanCommentData{
 		Database: "testapp", Environment: "production", IsMySQL: true,

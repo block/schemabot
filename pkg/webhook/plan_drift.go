@@ -26,10 +26,12 @@ import (
 // outcome is not-evaluated, avoiding N-1 live per-deployment diffs whose result
 // the rollup would classify entirely from the unusable baseline anyway.
 //
-// The preview data is nil for a single-deployment database (nothing to compare)
-// and non-nil otherwise, so the PR comment can show a uniform "same plan
-// everywhere" line or a per-deployment breakdown even when the reviewed primary
-// plan is a clean no-op.
+// On a successful rollup the preview data is nil for a single-deployment
+// database (nothing to compare) and non-nil otherwise, so the PR comment can
+// show a uniform "same plan everywhere" line or a per-deployment breakdown even
+// when the reviewed primary plan is a clean no-op. On a rollup failure the
+// preview is always non-nil (Computed:false), regardless of deployment count,
+// so the PR comment explains why the check is failing closed.
 //
 // primaryPlan is the reviewed primary plan proto returned by
 // executePlanProtoWithTransientRetry, reused as the rollup baseline so the
