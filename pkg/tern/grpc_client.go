@@ -112,6 +112,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -197,6 +198,77 @@ const retryServiceConfig = `{
 	}]
 }`
 
+// Default per-RPC deadlines applied when the caller's context carries none.
+// Operator drive goroutines run on unbounded contexts while a separate
+// heartbeat goroutine keeps renewing the apply lease, so an RPC that hangs on
+// a black-holed connection would wedge the apply forever without a peer ever
+// seeing a stale heartbeat. These bounds exist so every outbound call
+// eventually returns — bounded, not tuned.
+const (
+	// grpcControlRPCDeadline bounds the polling and control RPCs (Progress,
+	// Cutover, Stop, Cancel, Start, Health). They are storage lookups or
+	// durable control-request writes on the data plane, so this is
+	// comfortably above their normal latency.
+	grpcControlRPCDeadline = 60 * time.Second
+
+	// grpcHeavyRPCDeadline bounds the RPCs that do synchronous engine or
+	// live-schema work before returning: Apply/Plan/PlanDiff/PullSchema
+	// resolve plans and inspect live schema, and Volume/Revert/SkipRevert
+	// invoke the engine control operation inline. Generous because a large
+	// database takes a while to diff and an engine restart is not instant; a
+	// DEADLINE_EXCEEDED on Apply is handled as an ambiguous dispatch outcome
+	// and recovered through the idempotency key.
+	grpcHeavyRPCDeadline = 5 * time.Minute
+)
+
+// grpcMethodDeadline returns the default deadline for a Tern unary RPC.
+func grpcMethodDeadline(fullMethod string) time.Duration {
+	switch fullMethod {
+	case ternv1.Tern_Apply_FullMethodName,
+		ternv1.Tern_Plan_FullMethodName,
+		ternv1.Tern_PlanDiff_FullMethodName,
+		ternv1.Tern_PullSchema_FullMethodName,
+		ternv1.Tern_Volume_FullMethodName,
+		ternv1.Tern_Revert_FullMethodName,
+		ternv1.Tern_SkipRevert_FullMethodName:
+		return grpcHeavyRPCDeadline
+	default:
+		return grpcControlRPCDeadline
+	}
+}
+
+// defaultRPCDeadlineInterceptor returns a unary client interceptor that
+// applies the per-method default deadline when the caller's context has none.
+// A caller that already set a deadline keeps it — the interceptor only closes
+// the unbounded-context hole. The deadlines are parameters so tests can prove
+// the bound with short durations; production dialing uses the package
+// constants via grpcMethodDeadline.
+func defaultRPCDeadlineInterceptor(deadlineFor func(fullMethod string) time.Duration) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, deadlineFor(method))
+			defer cancel()
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+}
+
+// clientKeepaliveParams returns the transport keepalive settings for the Tern
+// connection so a dead peer is detected and the channel reconnects instead of
+// new RPCs queueing onto a broken connection. The values stay within gRPC's
+// default server-side keepalive enforcement (minimum ping interval, no pings
+// without active streams) because embedders attach the Tern service to their
+// own servers, which may not configure a custom enforcement policy — a more
+// aggressive client would be disconnected with ENHANCE_YOUR_CALM.
+func clientKeepaliveParams() keepalive.ClientParameters {
+	return keepalive.ClientParameters{
+		Time:                5 * time.Minute,
+		Timeout:             20 * time.Second,
+		PermitWithoutStream: false,
+	}
+}
+
 // NewGRPCClient creates a new gRPC client connected to the given address.
 //
 // The address may include a port (e.g. "tern.example.com:80"). The full
@@ -214,6 +286,8 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithAuthority(host),
 		grpc.WithDefaultServiceConfig(retryServiceConfig),
+		grpc.WithKeepaliveParams(clientKeepaliveParams()),
+		grpc.WithUnaryInterceptor(defaultRPCDeadlineInterceptor(grpcMethodDeadline)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", config.Address, err)

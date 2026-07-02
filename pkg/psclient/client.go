@@ -6,9 +6,28 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
+	"github.com/hashicorp/go-cleanhttp"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 )
+
+// planetScaleHTTPTimeout bounds every PlanetScale API request, including the
+// raw-HTTP throttle endpoint. Some operations (deploy request creation,
+// branch schema diffs) can legitimately take minutes on large keyspaces, so
+// the bound is generous. The invariant is that a drive goroutine can never
+// block forever on a hung PlanetScale API call — bounded, not tuned.
+const planetScaleHTTPTimeout = 5 * time.Minute
+
+// newPlanetScaleHTTPClient returns the HTTP client used for all PlanetScale
+// API requests. The Transport must be non-nil: ps.WithServiceToken wraps the
+// client's transport in an auth RoundTripper that delegates to it directly.
+func newPlanetScaleHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout:   planetScaleHTTPTimeout,
+		Transport: cleanhttp.DefaultPooledTransport(),
+	}
+}
 
 // PSClient defines the interface for PlanetScale API operations.
 // The engine flow is: create branch → get credentials → MySQL-connect to
@@ -63,7 +82,8 @@ type ThrottleDeployRequestRequest struct {
 // psClientWrapper wraps the real PlanetScale client to implement PSClient.
 type psClientWrapper struct {
 	client     *ps.Client
-	baseURL    string // for endpoints not in the SDK (throttle)
+	httpClient *http.Client // for endpoints not in the SDK (throttle)
+	baseURL    string       // for endpoints not in the SDK (throttle)
 	tokenName  string
 	tokenValue string
 }
@@ -71,17 +91,7 @@ type psClientWrapper struct {
 // NewPSClient creates a new PSClient using the real PlanetScale API.
 // Use NewPSClientWithBaseURL for endpoints not yet in the SDK (throttle).
 func NewPSClient(tokenName, tokenValue string, opts ...ps.ClientOption) (PSClient, error) {
-	allOpts := append([]ps.ClientOption{ps.WithServiceToken(tokenName, tokenValue)}, opts...)
-	client, err := ps.NewClient(allOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return &psClientWrapper{
-		client:     client,
-		baseURL:    "https://api.planetscale.com",
-		tokenName:  tokenName,
-		tokenValue: tokenValue,
-	}, nil
+	return newPSClient(tokenName, tokenValue, "https://api.planetscale.com", opts...)
 }
 
 // NewPSClientWithBaseURL creates a new PSClient with a custom base URL.
@@ -91,13 +101,26 @@ func NewPSClientWithBaseURL(tokenName, tokenValue, baseURL string) (PSClient, er
 	if baseURL != "" {
 		opts = append(opts, ps.WithBaseURL(baseURL))
 	}
-	allOpts := append([]ps.ClientOption{ps.WithServiceToken(tokenName, tokenValue)}, opts...)
+	return newPSClient(tokenName, tokenValue, baseURL, opts...)
+}
+
+func newPSClient(tokenName, tokenValue, baseURL string, opts ...ps.ClientOption) (PSClient, error) {
+	// WithHTTPClient must precede WithServiceToken: the service-token option
+	// wraps the transport of whatever client is installed at that point.
+	allOpts := append([]ps.ClientOption{
+		ps.WithHTTPClient(newPlanetScaleHTTPClient()),
+		ps.WithServiceToken(tokenName, tokenValue),
+	}, opts...)
 	client, err := ps.NewClient(allOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return &psClientWrapper{
-		client:     client,
+		client: client,
+		// The throttle endpoint sets its Authorization header per request, so
+		// it needs its own client — the SDK client's transport was wrapped by
+		// the service-token option and would add a duplicate header.
+		httpClient: newPlanetScaleHTTPClient(),
 		baseURL:    baseURL,
 		tokenName:  tokenName,
 		tokenValue: tokenValue,
@@ -200,7 +223,7 @@ func (w *psClientWrapper) ThrottleDeployRequest(ctx context.Context, req *Thrott
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", w.tokenName+":"+w.tokenValue)
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := w.httpClient.Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("throttle deploy request: %w", err)
 	}

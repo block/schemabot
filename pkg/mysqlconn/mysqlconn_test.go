@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
@@ -15,7 +16,6 @@ func TestConnectionDSN(t *testing.T) {
 		name       string
 		dsn        string
 		wantTLS    string
-		wantSame   bool
 		wantErrSub string
 	}{
 		{
@@ -24,26 +24,24 @@ func TestConnectionDSN(t *testing.T) {
 			wantTLS: "rds",
 		},
 		{
-			name:     "non-RDS host is unchanged",
-			dsn:      "root:secret@tcp(localhost:3306)/app?parseTime=true",
-			wantSame: true,
+			name:    "non-RDS host gets no TLS",
+			dsn:     "root:secret@tcp(localhost:3306)/app?parseTime=true",
+			wantTLS: "",
 		},
 		{
-			name:     "database alias is unchanged",
-			dsn:      "spirit:secret@tcp(database.example.com:3306)/app?parseTime=true",
-			wantSame: true,
+			name:    "database alias gets no TLS",
+			dsn:     "spirit:secret@tcp(database.example.com:3306)/app?parseTime=true",
+			wantTLS: "",
 		},
 		{
-			name:     "explicit TLS is preserved",
-			dsn:      "spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?tls=skip-verify",
-			wantTLS:  "skip-verify",
-			wantSame: true,
+			name:    "explicit TLS is preserved",
+			dsn:     "spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?tls=skip-verify",
+			wantTLS: "skip-verify",
 		},
 		{
-			name:     "explicit disabled TLS is preserved",
-			dsn:      "spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?tls=false",
-			wantTLS:  "false",
-			wantSame: true,
+			name:    "explicit disabled TLS is preserved",
+			dsn:     "spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?tls=false",
+			wantTLS: "false",
 		},
 		{
 			name:       "invalid DSN returns context",
@@ -62,17 +60,43 @@ func TestConnectionDSN(t *testing.T) {
 			}
 
 			require.NoError(t, err)
-			if tt.wantSame {
-				assert.Equal(t, tt.dsn, got)
-			}
-
 			cfg, err := mysql.ParseDSN(got)
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantTLS, cfg.TLSConfig)
+
+			// Every normalized DSN carries transport timeouts so a
+			// black-holed connection cannot block a goroutine forever.
+			assert.Equal(t, connectTimeout, cfg.Timeout)
+			assert.Equal(t, connReadTimeout, cfg.ReadTimeout)
+			assert.Equal(t, connWriteTimeout, cfg.WriteTimeout)
+
+			// Normalization must not alter the connection identity or
+			// existing params.
+			want, err := mysql.ParseDSN(tt.dsn)
+			require.NoError(t, err)
+			assert.Equal(t, want.Addr, cfg.Addr)
+			assert.Equal(t, want.User, cfg.User)
+			assert.Equal(t, want.Passwd, cfg.Passwd)
+			assert.Equal(t, want.DBName, cfg.DBName)
+			assert.Equal(t, want.ParseTime, cfg.ParseTime)
+
 			_, err = mysql.NewConnector(cfg)
 			require.NoError(t, err)
 		})
 	}
+}
+
+// A DSN that sets its own transport timeouts keeps them — the defaults only
+// fill in missing values.
+func TestConnectionDSNKeepsExplicitTimeouts(t *testing.T) {
+	got, err := ConnectionDSN("root:secret@tcp(localhost:3306)/app?timeout=5s&readTimeout=10s&writeTimeout=15s")
+	require.NoError(t, err)
+
+	cfg, err := mysql.ParseDSN(got)
+	require.NoError(t, err)
+	assert.Equal(t, 5*time.Second, cfg.Timeout)
+	assert.Equal(t, 10*time.Second, cfg.ReadTimeout)
+	assert.Equal(t, 15*time.Second, cfg.WriteTimeout)
 }
 
 func TestOpenNormalizesRDSDSNBeforeOpening(t *testing.T) {
@@ -95,4 +119,6 @@ func TestOpenNormalizesRDSDSNBeforeOpening(t *testing.T) {
 	cfg, parseErr := mysql.ParseDSN(gotDSN)
 	require.NoError(t, parseErr)
 	assert.Equal(t, "rds", cfg.TLSConfig)
+	assert.Equal(t, connReadTimeout, cfg.ReadTimeout)
+	assert.Equal(t, connWriteTimeout, cfg.WriteTimeout)
 }

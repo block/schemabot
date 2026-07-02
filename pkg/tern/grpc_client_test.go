@@ -5274,3 +5274,129 @@ func TestRemoteApplyIdempotencyKey_OperationAttemptRotation(t *testing.T) {
 	assert.NotEqual(t, base, remoteApplyIdempotencyKey(applyOwn, scopeOwn),
 		"this operation's own attempt advancing must rotate its key")
 }
+
+// hangingTernServer blocks every RPC until the client gives up, simulating a
+// remote deployment whose process is alive but never answers (black-holed
+// connection, wedged data plane).
+type hangingTernServer struct {
+	ternv1.UnimplementedTernServer
+}
+
+func (s *hangingTernServer) Progress(ctx context.Context, _ *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
+	<-ctx.Done()
+	return nil, status.FromContextError(ctx.Err()).Err()
+}
+
+func (s *hangingTernServer) Apply(ctx context.Context, _ *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
+	<-ctx.Done()
+	return nil, status.FromContextError(ctx.Err()).Err()
+}
+
+// newDeadlineTestClient starts an in-process Tern gRPC server and connects a
+// client that applies default per-RPC deadlines through the production
+// interceptor, with the deadline function injected so tests can use short
+// bounds.
+func newDeadlineTestClient(t *testing.T, server ternv1.TernServer, deadlineFor func(string) time.Duration) *GRPCClient {
+	t.Helper()
+
+	lis, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "localhost:0")
+	require.NoError(t, err, "failed to listen")
+
+	grpcServer := grpc.NewServer()
+	ternv1.RegisterTernServer(grpcServer, server)
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+
+	conn, err := grpc.NewClient(
+		lis.Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(defaultRPCDeadlineInterceptor(deadlineFor)),
+	)
+	require.NoError(t, err, "failed to dial")
+
+	client := &GRPCClient{
+		conn:   conn,
+		client: ternv1.NewTernClient(conn),
+	}
+	t.Cleanup(func() {
+		utils.CloseAndLog(client)
+		grpcServer.Stop()
+	})
+	return client
+}
+
+// A drive goroutine polls Progress on an unbounded context. When the remote
+// deployment stops answering, the call must return DEADLINE_EXCEEDED at the
+// default per-RPC deadline instead of blocking the driver forever while its
+// lease heartbeat keeps the apply claimed.
+func TestGRPCClientBoundsRPCsWithoutCallerDeadline(t *testing.T) {
+	client := newDeadlineTestClient(t, &hangingTernServer{}, func(string) time.Duration {
+		return 100 * time.Millisecond
+	})
+
+	start := time.Now()
+	_, err := client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: "tern-1"})
+
+	require.Error(t, err)
+	assert.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	assert.Less(t, time.Since(start), 10*time.Second, "call must return by the default deadline, not hang")
+}
+
+// A caller that sets its own deadline keeps it — the default only fills in
+// for unbounded contexts.
+func TestGRPCClientKeepsCallerDeadline(t *testing.T) {
+	client := newDeadlineTestClient(t, &hangingTernServer{}, func(string) time.Duration {
+		return time.Hour
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := client.Progress(ctx, &ternv1.ProgressRequest{ApplyId: "tern-1"})
+
+	require.Error(t, err)
+	assert.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	assert.Less(t, time.Since(start), 10*time.Second, "caller deadline must win over the default")
+}
+
+// RPCs that do synchronous engine or live-schema work server-side get the
+// generous bound; polling and control-request RPCs get the tight one.
+func TestGRPCMethodDeadlineRouting(t *testing.T) {
+	heavy := []string{
+		ternv1.Tern_Apply_FullMethodName,
+		ternv1.Tern_Plan_FullMethodName,
+		ternv1.Tern_PlanDiff_FullMethodName,
+		ternv1.Tern_PullSchema_FullMethodName,
+		ternv1.Tern_Volume_FullMethodName,
+		ternv1.Tern_Revert_FullMethodName,
+		ternv1.Tern_SkipRevert_FullMethodName,
+	}
+	for _, method := range heavy {
+		assert.Equal(t, grpcHeavyRPCDeadline, grpcMethodDeadline(method), method)
+	}
+
+	control := []string{
+		ternv1.Tern_Progress_FullMethodName,
+		ternv1.Tern_Cutover_FullMethodName,
+		ternv1.Tern_Stop_FullMethodName,
+		ternv1.Tern_Cancel_FullMethodName,
+		ternv1.Tern_Start_FullMethodName,
+		ternv1.Tern_Health_FullMethodName,
+	}
+	for _, method := range control {
+		assert.Equal(t, grpcControlRPCDeadline, grpcMethodDeadline(method), method)
+	}
+}
+
+// The keepalive settings must stay within gRPC's default server-side
+// enforcement policy: embedders attach the Tern service to their own servers,
+// and a client that pings faster than the server's minimum interval or
+// without active streams is disconnected with ENHANCE_YOUR_CALM.
+func TestClientKeepaliveParamsStayWithinDefaultEnforcement(t *testing.T) {
+	params := clientKeepaliveParams()
+	assert.GreaterOrEqual(t, params.Time, 5*time.Minute, "must not ping faster than the default server minimum")
+	assert.False(t, params.PermitWithoutStream, "default server enforcement rejects pings without active streams")
+	assert.Positive(t, params.Timeout)
+}
