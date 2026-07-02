@@ -342,6 +342,13 @@ type InstallationClient struct {
 	checkStatusSingleflight *CheckStatusSingleflight
 }
 
+// InstallationID returns the GitHub App installation this client is scoped
+// to, so callers can schedule follow-up work (e.g. a delayed aggregate
+// re-fold) that must resolve a client for the same installation later.
+func (ic *InstallationClient) InstallationID() int64 {
+	return ic.installationID
+}
+
 // loadAppSlug returns the current app slug, or empty if not yet set.
 func (ic *InstallationClient) loadAppSlug() string {
 	if p := ic.appSlug.Load(); p != nil {

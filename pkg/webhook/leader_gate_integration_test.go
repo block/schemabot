@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -467,6 +468,110 @@ func TestE2ELeaderNonSchemaPRTouchingParticipantPathBlocks(t *testing.T) {
 		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion,
 			"aggregate for %s must fail closed while the expected participant is silent", env)
 	}
+}
+
+// A participant with no schema work publishes its Check Run moments after the
+// leader's first fold and never comments, so no nudge will ever arrive. The
+// leader must converge on its own: the first fold blocks fail-closed on the
+// unreported participant and arms a delayed re-fold, and the re-fold reads the
+// now-present successful participant check and publishes a passing aggregate.
+func TestE2ELeaderRefoldsWhenParticipantReportsAfterFirstFold(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	const headSHA = "abc123"
+	mockLeaderPRHead(mux, headSHA)
+	mockLeaderPRFilesTouchTenantB(mux)
+	mockLeaderEmptyTree(mux, headSHA)
+
+	// The first fold reads one participant check per environment and sees
+	// nothing — the participant has not published yet. Every later read finds
+	// the completed, successful, trusted run, exactly like a participant that
+	// publishes its check just after the leader's first fold.
+	prodCheckName := aggregateCheckNameForEnv(tenantBCheckName, "production")
+	stagingCheckName := aggregateCheckNameForEnv(tenantBCheckName, "staging")
+	runsByName := map[string]map[string]any{
+		prodCheckName: {
+			"id": 7001, "name": prodCheckName, "status": "completed", "conclusion": "success",
+			"app": map[string]any{"slug": trustedTenantAppSlug},
+		},
+		stagingCheckName: {
+			"id": 7002, "name": stagingCheckName, "status": "completed", "conclusion": "success",
+			"app": map[string]any{"slug": trustedTenantAppSlug},
+		},
+	}
+	var checkRunReads atomic.Int64
+	firstFoldReads := int64(len(leaderRepoConfig().AllowedEnvironments))
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/", func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/check-runs") {
+			http.NotFound(w, r)
+			return
+		}
+		if checkRunReads.Add(1) <= firstFoldReads {
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "check_runs": []any{}})
+			return
+		}
+		run, ok := runsByName[r.URL.Query().Get("check_name")]
+		if !ok {
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "check_runs": []any{}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 1, "check_runs": []map[string]any{run}})
+	})
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	h.participantNudgeRefoldDelay = 10 * time.Millisecond
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: headSHA,
+		headRef: "feature-branch",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// The first fold blocks fail-closed, then the self-scheduled re-fold
+	// converges to success without any comment, commit, or webhook.
+	sawBlocked := false
+	deadline := time.After(webhookIntegrationCheckRunDeadline)
+	for {
+		var cr checkRunCapture
+		select {
+		case cr = <-checkRuns:
+		case <-deadline:
+			t.Fatalf("timed out waiting for the production aggregate to converge (saw blocked first: %v)", sawBlocked)
+		}
+		if cr.Name != aggregateCheckNameForEnv("SchemaBot", "production") {
+			continue
+		}
+		if cr.Conclusion == checkConclusionActionRequired {
+			// The blocked aggregate is created fresh on the head commit; the
+			// converged pass below updates that run in place, so head_sha only
+			// appears on this create.
+			assert.Equal(t, headSHA, cr.HeadSHA)
+			sawBlocked = true
+			continue
+		}
+		assert.True(t, sawBlocked, "the first fold must block before the re-fold converges")
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
+		break
+	}
+
+	// The converged fold resets the re-fold budget for the PR.
+	require.Eventually(t, func() bool {
+		h.participantRefoldMu.Lock()
+		defer h.participantRefoldMu.Unlock()
+		_, pending := h.participantRefoldAttempts[participantRefoldKey("octocat/hello-world", 1)]
+		return !pending
+	}, webhookIntegrationCheckRunDeadline, 10*time.Millisecond, "a fold that resolves every participant must clear the re-fold budget")
 }
 
 // The expected-tenant set is path-filtered: a leader's non-schema PR touching

@@ -45,6 +45,7 @@ func TestParticipantCheckOutcomesFold(t *testing.T) {
 		finder         *fakeCheckRunFinder
 		wantConclusion string
 		wantStatus     string
+		wantRetriable  bool
 	}{
 		{
 			name: "trusted completed success passes",
@@ -79,18 +80,19 @@ func TestParticipantCheckOutcomesFold(t *testing.T) {
 			wantStatus:     checkStatusCompleted,
 		},
 		{
-			name: "completed action_required blocks as failure",
+			name: "completed action_required blocks as pending",
 			finder: &fakeCheckRunFinder{results: map[string]*ghclient.CheckRunResult{
 				checkName: {Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired},
 			}},
-			wantConclusion: checkConclusionFailure,
+			wantConclusion: checkConclusionActionRequired,
 			wantStatus:     checkStatusCompleted,
 		},
 		{
-			name:           "missing check blocks",
+			name:           "missing check blocks and is retriable",
 			finder:         &fakeCheckRunFinder{},
 			wantConclusion: checkConclusionActionRequired,
 			wantStatus:     checkStatusCompleted,
+			wantRetriable:  true,
 		},
 		{
 			name: "untrusted-only check blocks",
@@ -101,19 +103,20 @@ func TestParticipantCheckOutcomesFold(t *testing.T) {
 			wantStatus:     checkStatusCompleted,
 		},
 		{
-			name: "lookup error blocks",
+			name: "lookup error blocks and is retriable",
 			finder: &fakeCheckRunFinder{errs: map[string]error{
 				checkName: fmt.Errorf("boom"),
 			}},
 			wantConclusion: checkConclusionActionRequired,
 			wantStatus:     checkStatusCompleted,
+			wantRetriable:  true,
 		},
 	}
 
 	h := &Handler{logger: testLogger()}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			checks := h.participantCheckOutcomes(t.Context(), tc.finder, repo, pr, env, headSHA, expected)
+			checks, retriable := h.participantCheckOutcomes(t.Context(), tc.finder, repo, pr, env, headSHA, expected)
 			require.Len(t, checks, 1)
 
 			c := checks[0]
@@ -121,6 +124,7 @@ func TestParticipantCheckOutcomesFold(t *testing.T) {
 			assert.Equal(t, "tenant-a", c.DatabaseName, "synthesized row must be labeled by tenant")
 			assert.Equal(t, env, c.Environment)
 			assert.Equal(t, headSHA, c.HeadSHA)
+			assert.Equal(t, tc.wantRetriable, retriable, "retriable must mark exactly the outcomes a re-read can improve")
 
 			conclusion, status := computeAggregate(checks)
 			assert.Equal(t, tc.wantConclusion, conclusion)
@@ -133,8 +137,9 @@ func TestParticipantCheckOutcomesFold(t *testing.T) {
 // participant paths never contributes participant rows to the aggregate.
 func TestParticipantCheckOutcomesEmptyExpected(t *testing.T) {
 	h := &Handler{logger: testLogger()}
-	checks := h.participantCheckOutcomes(t.Context(), &fakeCheckRunFinder{}, "octocat/shared-repo", 1, "staging", "sha", nil)
+	checks, retriable := h.participantCheckOutcomes(t.Context(), &fakeCheckRunFinder{}, "octocat/shared-repo", 1, "staging", "sha", nil)
 	assert.Empty(t, checks)
+	assert.False(t, retriable)
 }
 
 // A missing participant check name is a fail-closed configuration error: the
@@ -142,8 +147,9 @@ func TestParticipantCheckOutcomesEmptyExpected(t *testing.T) {
 func TestParticipantCheckOutcomesEmptyCheckNameBlocks(t *testing.T) {
 	h := &Handler{logger: testLogger()}
 	expected := []api.ExpectedTenant{{Tenant: "tenant-a", Paths: []string{"services/a"}}}
-	checks := h.participantCheckOutcomes(t.Context(), &fakeCheckRunFinder{}, "octocat/shared-repo", 1, "staging", "sha", expected)
+	checks, retriable := h.participantCheckOutcomes(t.Context(), &fakeCheckRunFinder{}, "octocat/shared-repo", 1, "staging", "sha", expected)
 	require.Len(t, checks, 1)
+	assert.False(t, retriable, "a config error cannot be fixed by re-reading; no re-fold should be scheduled")
 
 	conclusion, status := computeAggregate(checks)
 	assert.Equal(t, checkConclusionActionRequired, conclusion)

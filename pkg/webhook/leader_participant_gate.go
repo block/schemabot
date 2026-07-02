@@ -25,6 +25,11 @@ type participantCheckOutcome struct {
 	checkName  string
 	status     string // checkStatus*
 	conclusion string // checkConclusion* (empty when in_progress)
+	// retriable marks an outcome that a later re-read can improve without any
+	// config change: the participant has not reported yet, or the Checks API
+	// read failed. Untrusted-only and unresolvable-name outcomes are not
+	// retriable — only a config fix can clear those.
+	retriable bool
 }
 
 // synthesizeParticipantCheck maps a resolved participant outcome to a stored
@@ -48,12 +53,16 @@ func synthesizeParticipantCheck(outcome participantCheckOutcome, repo string, pr
 
 // blockedParticipantOutcome builds a fail-closed outcome that folds to
 // action_required so any resolution uncertainty blocks the aggregate.
-func blockedParticipantOutcome(tenant, checkName string) participantCheckOutcome {
+// retriable distinguishes uncertainty a later re-read can resolve (participant
+// not reported yet, transient API failure) from uncertainty only a config
+// change can (untrusted App, unresolvable name).
+func blockedParticipantOutcome(tenant, checkName string, retriable bool) participantCheckOutcome {
 	return participantCheckOutcome{
 		tenant:     tenant,
 		checkName:  checkName,
 		status:     checkStatusCompleted,
 		conclusion: checkConclusionActionRequired,
+		retriable:  retriable,
 	}
 }
 
@@ -71,28 +80,35 @@ func participantCheckName(base, env string) string {
 
 // participantCheckOutcomes resolves every expected participant's per-environment
 // Check Run for headSHA and returns synthesized stored Check rows to fold into
-// the aggregate leader's check for env. It fails closed: anything other than a
-// trusted, completed, success participant check yields a blocking row.
+// the aggregate leader's check for env, plus whether any outcome is retriable —
+// blocked only because the participant has not reported yet (or the read
+// failed), so a scheduled re-fold can converge without any external event. It
+// fails closed: anything other than a trusted, completed, success participant
+// check yields a blocking row.
 //
 // resolveParticipantOutcome is the fail-closed truth table:
-//   - unresolvable check name        → action_required (blocks)
-//   - Checks API error               → action_required (blocks)
-//   - only untrusted same-named runs → action_required (blocks)
-//   - no trusted run on the commit   → action_required (blocks)
-//   - trusted run, non-terminal      → in_progress    (blocks)
-//   - trusted run, completed+success → success        (passes)
-//   - trusted run, completed+other   → failure        (blocks)
+//   - unresolvable check name           → action_required (blocks)
+//   - Checks API error                  → action_required (blocks, retriable)
+//   - only untrusted same-named runs    → action_required (blocks)
+//   - no trusted run on the commit      → action_required (blocks, retriable)
+//   - trusted run, non-terminal         → in_progress     (blocks)
+//   - trusted run, completed+success    → success         (passes)
+//   - trusted run, completed+
+//     action_required                   → action_required (blocks: tenant apply pending)
+//   - trusted run, completed+other      → failure         (blocks)
 func (h *Handler) participantCheckOutcomes(
 	ctx context.Context, client checkRunFinder,
 	repo string, pr int, env, headSHA string,
 	expected []api.ExpectedTenant,
-) []*storage.Check {
+) ([]*storage.Check, bool) {
 	checks := make([]*storage.Check, 0, len(expected))
+	retriable := false
 	for _, tenant := range expected {
 		outcome := h.resolveParticipantOutcome(ctx, client, repo, pr, env, headSHA, tenant)
+		retriable = retriable || outcome.retriable
 		checks = append(checks, synthesizeParticipantCheck(outcome, repo, pr, headSHA, env))
 	}
-	return checks
+	return checks, retriable
 }
 
 func (h *Handler) resolveParticipantOutcome(
@@ -107,7 +123,7 @@ func (h *Handler) resolveParticipantOutcome(
 		h.logger.Warn("aggregate leader cannot resolve participant check name, blocking aggregate",
 			"repo", repo, "pr", pr, "environment", env, "head_sha", headSHA, "tenant", tenant.Tenant)
 		metrics.RecordLeaderParticipantGate(ctx, repo, env, tenant.Tenant, metrics.LeaderParticipantGateError)
-		return blockedParticipantOutcome(tenant.Tenant, "")
+		return blockedParticipantOutcome(tenant.Tenant, "", false)
 	}
 
 	checkName := participantCheckName(tenant.CheckName, env)
@@ -118,7 +134,7 @@ func (h *Handler) resolveParticipantOutcome(
 			"repo", repo, "pr", pr, "environment", env, "head_sha", headSHA,
 			"tenant", tenant.Tenant, "check_name", checkName, "error", err)
 		metrics.RecordLeaderParticipantGate(ctx, repo, env, tenant.Tenant, metrics.LeaderParticipantGateError)
-		return blockedParticipantOutcome(tenant.Tenant, checkName)
+		return blockedParticipantOutcome(tenant.Tenant, checkName, true)
 	}
 
 	if result == nil && len(untrusted) > 0 {
@@ -132,7 +148,7 @@ func (h *Handler) resolveParticipantOutcome(
 			metrics.RecordUntrustedAggregateNamedCheck(ctx, repo, env, appSlug, metrics.CheckTrustGateLeaderFold)
 		}
 		metrics.RecordLeaderParticipantGate(ctx, repo, env, tenant.Tenant, metrics.LeaderParticipantGateUntrusted)
-		return blockedParticipantOutcome(tenant.Tenant, checkName)
+		return blockedParticipantOutcome(tenant.Tenant, checkName, false)
 	}
 
 	if result == nil {
@@ -140,7 +156,7 @@ func (h *Handler) resolveParticipantOutcome(
 			"repo", repo, "pr", pr, "environment", env, "head_sha", headSHA,
 			"tenant", tenant.Tenant, "check_name", checkName)
 		metrics.RecordLeaderParticipantGate(ctx, repo, env, tenant.Tenant, metrics.LeaderParticipantGateMissing)
-		return blockedParticipantOutcome(tenant.Tenant, checkName)
+		return blockedParticipantOutcome(tenant.Tenant, checkName, true)
 	}
 
 	if result.Status != checkStatusCompleted {
@@ -165,6 +181,22 @@ func (h *Handler) resolveParticipantOutcome(
 			checkName:  checkName,
 			status:     checkStatusCompleted,
 			conclusion: checkConclusionSuccess,
+		}
+	}
+
+	if result.Conclusion == checkConclusionActionRequired {
+		// The participant is blocking on its own pending work (typically an
+		// apply awaiting an operator), not a failure. Fold it as action_required
+		// so the leader's aggregate reads as pending rather than failed.
+		h.logger.Warn("participant check reports pending work, blocking aggregate",
+			"repo", repo, "pr", pr, "environment", env, "head_sha", headSHA,
+			"tenant", tenant.Tenant, "check_name", checkName)
+		metrics.RecordLeaderParticipantGate(ctx, repo, env, tenant.Tenant, metrics.LeaderParticipantGatePending)
+		return participantCheckOutcome{
+			tenant:     tenant.Tenant,
+			checkName:  checkName,
+			status:     checkStatusCompleted,
+			conclusion: checkConclusionActionRequired,
 		}
 	}
 

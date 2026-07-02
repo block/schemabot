@@ -18,6 +18,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -84,6 +85,13 @@ type Handler struct {
 	// aggregate re-fold after a participant-comment nudge. Zero means the
 	// package default.
 	participantNudgeRefoldDelay time.Duration
+
+	// participantRefoldAttempts tracks, per repo#pr, how many self-scheduled
+	// aggregate re-folds have been armed while expected participants remain
+	// unresolved. Bounded by maxParticipantRefoldAttempts and cleared when a
+	// fold resolves every participant. Guarded by participantRefoldMu.
+	participantRefoldMu       sync.Mutex
+	participantRefoldAttempts map[string]int
 
 	// webhookSecretsByApp maps each configured App's logical name to its
 	// HMAC webhook secret. In legacy single-App mode there is exactly one

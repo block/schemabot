@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"time"
@@ -77,6 +78,71 @@ func (h *Handler) nudgeRefoldDelay() time.Duration {
 		return h.participantNudgeRefoldDelay
 	}
 	return defaultParticipantNudgeRefoldDelay
+}
+
+// maxParticipantRefoldAttempts bounds the self-scheduled re-folds a single
+// PR's aggregate arms while expected participants remain unresolved. The
+// budget resets whenever a fold resolves every participant, so it only caps
+// consecutive misses — a participant that never reports leaves the aggregate
+// blocked (fail-closed) until a nudge, new commit, or manual plan re-folds.
+const maxParticipantRefoldAttempts = 3
+
+// scheduleParticipantRefold arms a delayed aggregate re-fold because at least
+// one expected participant resolved as retriable (not reported yet, or a
+// failed Checks API read). Participants publish their Check Runs moments after
+// the leader's first fold, and a participant with no schema work never
+// comments, so without this the leader's aggregate would stay blocked on a
+// participant that already reported green. Attempts are bounded per PR so a
+// participant that is genuinely down cannot keep a timer chain alive forever.
+func (h *Handler) scheduleParticipantRefold(ctx context.Context, repo string, pr int, installationID int64) {
+	key := participantRefoldKey(repo, pr)
+
+	h.participantRefoldMu.Lock()
+	attempts := h.participantRefoldAttempts[key]
+	if attempts >= maxParticipantRefoldAttempts {
+		h.participantRefoldMu.Unlock()
+		h.logger.Warn("expected participants still unresolved after scheduled re-folds; aggregate stays blocked until a participant comment, new commit, or manual plan re-folds it",
+			"repo", repo, "pr", pr, "refold_attempts", attempts)
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "participant_refold",
+			Repository: repo,
+			Status:     "exhausted",
+		})
+		return
+	}
+	if h.participantRefoldAttempts == nil {
+		h.participantRefoldAttempts = make(map[string]int)
+	}
+	h.participantRefoldAttempts[key] = attempts + 1
+	h.participantRefoldMu.Unlock()
+
+	h.logger.Info("expected participants have not resolved; scheduling aggregate re-fold",
+		"repo", repo, "pr", pr, "delay", h.nudgeRefoldDelay(), "attempt", attempts+1)
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:  "participant_refold",
+		Repository: repo,
+		Status:     "scheduled",
+	})
+
+	time.AfterFunc(h.nudgeRefoldDelay(), func() {
+		h.goSafe(repo, pr, installationID, func() {
+			h.refoldAggregateForPR(repo, pr, installationID, "unresolved participant delayed re-fold")
+		})
+	})
+}
+
+// clearParticipantRefoldBudget resets the re-fold budget once a fold resolves
+// every expected participant, so a later commit on the same PR gets a fresh
+// budget.
+func (h *Handler) clearParticipantRefoldBudget(repo string, pr int) {
+	key := participantRefoldKey(repo, pr)
+	h.participantRefoldMu.Lock()
+	delete(h.participantRefoldAttempts, key)
+	h.participantRefoldMu.Unlock()
+}
+
+func participantRefoldKey(repo string, pr int) string {
+	return fmt.Sprintf("%s#%d", repo, pr)
 }
 
 // refoldAggregateForPR re-reads the PR's current head and re-runs the
