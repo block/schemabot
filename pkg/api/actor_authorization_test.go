@@ -235,3 +235,35 @@ func TestServerConfigValidatePRCommandAuthorization(t *testing.T) {
 		})
 	}
 }
+
+// The authorized-principal list for a database is the deployment-wide admin
+// teams and users plus the database's own operators, deduplicated in that
+// order — the set surfaced on command-rejection comments.
+func TestPRCommandAuthorizedPrincipals(t *testing.T) {
+	cfg := &ServerConfig{
+		PRCommandAuthorization: PRCommandAuthorizationConfig{
+			Enabled:    true,
+			AdminTeams: []string{"octocat/db-admins"},
+			AdminUsers: []string{"kara"},
+		},
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				OperatorTeams: []string{"octocat/orders-operators", "octocat/db-admins"},
+				OperatorUsers: []string{"kara", "lee"},
+			},
+		},
+	}
+
+	assert.Equal(t,
+		[]string{"octocat/db-admins", "kara", "octocat/orders-operators", "lee"},
+		cfg.PRCommandAuthorizedPrincipals("orders"),
+		"admins first, then the database's operators, deduplicated")
+
+	assert.Equal(t,
+		[]string{"octocat/db-admins", "kara"},
+		cfg.PRCommandAuthorizedPrincipals("unknown"),
+		"an unknown database still lists the deployment-wide admins")
+
+	var nilCfg *ServerConfig
+	assert.Nil(t, nilCfg.PRCommandAuthorizedPrincipals("orders"))
+}

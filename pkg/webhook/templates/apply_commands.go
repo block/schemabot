@@ -33,6 +33,10 @@ type ActorAuthorizationCommentData struct {
 	CommandName string
 	Database    string
 	Environment string
+	// AuthorizedPrincipals are the GitHub teams (org/team) and users allowed
+	// to run mutating commands for the database, listed on rejection so the
+	// blocked user knows who to ask.
+	AuthorizedPrincipals []string
 }
 
 // RenderPRCommandNotAuthorized renders a comment when a GitHub PR command
@@ -48,7 +52,15 @@ func RenderPRCommandNotAuthorized(data ActorAuthorizationCommentData) string {
 	} else {
 		fmt.Fprintf(&sb, "The requester is not authorized to run `schemabot %s` for this database.\n\n", data.CommandName)
 	}
-	sb.WriteString("A configured SchemaBot admin/database operator must run this command.\n")
+	if len(data.AuthorizedPrincipals) > 0 {
+		sb.WriteString("**Who can run this command** — members of these teams, or these users:\n")
+		for _, principal := range data.AuthorizedPrincipals {
+			fmt.Fprintf(&sb, "- @%s\n", principal)
+		}
+		sb.WriteString("\nAsk one of them to run it, or request membership in one of the teams above.\n")
+	} else {
+		sb.WriteString("A configured SchemaBot admin/database operator must run this command.\n")
+	}
 
 	return sb.String()
 }
