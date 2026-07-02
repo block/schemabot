@@ -130,6 +130,22 @@ func RecordPlanDuration(ctx context.Context, duration time.Duration, repo, datab
 	)
 }
 
+// RecordDeploymentDiff counts one deployment's review-time desired-vs-live diff
+// outcome. status is "ok" when the diff was computed and reported no planning
+// errors, or "errored" when the PlanDiff RPC failed or the diff itself reported
+// errors — the branch that makes a deployment block the review-time drift rollup
+// closed. Alert on the errored count so an unreachable or un-diffable deployment
+// gating merges is investigable without waiting on the rollup layer.
+func RecordDeploymentDiff(ctx context.Context, database, deployment, environment, status string) {
+	addCounter(ctx, "schemabot.deployment_diff.total",
+		"Total number of review-time per-deployment plan diffs by outcome", "{diff}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("status", status),
+	)
+}
+
 // RecordApply increments the applies counter with database, deployment, environment, and status attributes.
 // Status should be "success", "error", "rejected", or "conflict".
 func RecordApply(ctx context.Context, repo, database, deployment, environment, status string) {

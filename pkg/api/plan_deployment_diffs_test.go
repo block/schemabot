@@ -145,6 +145,73 @@ func TestPlanDeploymentDiffs_PerDeploymentErrorIsCaptured(t *testing.T) {
 	assert.Nil(t, results[1].Changes)
 }
 
+// A deployment's PlanDiff can carry per-shard plans, and the deployment and
+// shard axes are orthogonal: the producer iterates deployments while each
+// deployment's single diff retains its full per-shard set. This guards that the
+// producer copies resp.Shards through, so per-shard drift within a deployment
+// stays visible to the rollup rather than being flattened away.
+func TestPlanDeploymentDiffs_PreservesShards(t *testing.T) {
+	usShards := &ternv1.PlanDiffResponse{
+		Engine: ternv1.Engine_ENGINE_SPIRIT,
+		Shards: []*ternv1.ShardPlan{
+			{
+				Shard:     "-80",
+				Namespace: "testapp",
+				Changes: []*ternv1.TableChange{{
+					TableName:  "users",
+					ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+					Ddl:        "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+					Namespace:  "testapp",
+				}},
+			},
+			{
+				Shard:     "80-",
+				Namespace: "testapp",
+				Changes: []*ternv1.TableChange{{
+					TableName:  "users",
+					ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+					Ddl:        "ALTER TABLE `users` ADD COLUMN `phone` varchar(32)",
+					Namespace:  "testapp",
+				}},
+			},
+		},
+	}
+	eu := &mockTernClient{}
+	us := &mockTernClient{planDiffResp: usShards}
+	svc := twoDeploymentService(t, eu, us)
+
+	primaryPlan := &ternv1.PlanResponse{
+		PlanId: "plan_eu",
+		Engine: ternv1.Engine_ENGINE_SPIRIT,
+		Shards: []*ternv1.ShardPlan{{
+			Shard:     "0",
+			Namespace: "testapp",
+			Changes: []*ternv1.TableChange{{
+				TableName:  "users",
+				ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+				Ddl:        "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+				Namespace:  "testapp",
+			}},
+		}},
+	}
+
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan)
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+
+	// The primary reuses the reviewed plan's shard set verbatim.
+	require.NoError(t, results[0].Err)
+	assert.Equal(t, primaryPlan.Shards, results[0].Shards)
+
+	// The non-primary deployment's full two-shard set survives the producer.
+	require.NoError(t, results[1].Err)
+	require.Len(t, results[1].Shards, 2)
+	assert.Equal(t, "-80", results[1].Shards[0].Shard)
+	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", results[1].Shards[0].Changes[0].Ddl)
+	assert.Equal(t, "80-", results[1].Shards[1].Shard)
+	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `phone` varchar(32)", results[1].Shards[1].Changes[0].Ddl)
+}
+
 // A request-level failure (the database/environment resolves no deployments)
 // returns an error rather than a per-deployment result.
 func TestPlanDeploymentDiffs_UnresolvedTargetsError(t *testing.T) {

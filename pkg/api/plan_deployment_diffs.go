@@ -6,6 +6,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 )
@@ -65,9 +66,12 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			Target:       target.Target,
 		}
 
-		// Rollout index 0 is the primary. When its reviewed plan is provided,
-		// reuse it so the rollup's primary member is exactly what was reviewed and
-		// no redundant live-schema read runs.
+		// Rollout index 0 is the primary. ResolveDatabaseTargets returns targets
+		// in rollout order, primary first, so the primary is positionally index 0;
+		// a future change to that ordering would misattribute the primary here and
+		// must keep primary-first. When its reviewed plan is provided, reuse it so
+		// the rollup's primary member is exactly what was reviewed and no redundant
+		// live-schema read runs.
 		if i == 0 && primaryPlan != nil {
 			results[i].Engine = primaryPlan.Engine
 			results[i].Changes = primaryPlan.Changes
@@ -82,7 +86,6 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			continue
 		}
 
-		i, target := i, target
 		g.Go(func() error {
 			resp, err := s.planDeploymentDiff(gctx, req, target)
 			if err != nil {
@@ -92,6 +95,7 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 					"deployment", target.Deployment,
 					"target", target.Target,
 					"error", err)
+				metrics.RecordDeploymentDiff(gctx, req.Database, target.Deployment, req.Environment, "errored")
 				results[i].Err = err
 				return nil
 			}
@@ -110,8 +114,11 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 					"deployment", target.Deployment,
 					"target", target.Target,
 					"error", diffErr)
+				metrics.RecordDeploymentDiff(gctx, req.Database, target.Deployment, req.Environment, "errored")
 				results[i].Err = diffErr
+				return nil
 			}
+			metrics.RecordDeploymentDiff(gctx, req.Database, target.Deployment, req.Environment, "ok")
 			return nil
 		})
 	}
