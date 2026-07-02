@@ -241,8 +241,13 @@ func TestEnsureSchema_RemovesObsoleteVitessTasks(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	container, dsn, db := startEnsureSchemaContainer(t, ctx)
-	// Cleanup runs after the test, when t.Context() is already cancelled.
-	defer func() { _ = container.Terminate(t.Context()) }()
+	// TerminateContainer manages its own context; cleanup runs after the
+	// test, when t.Context() is already cancelled.
+	t.Cleanup(func() {
+		if err := testcontainers.TerminateContainer(container); err != nil {
+			t.Logf("failed to terminate container: %v", err)
+		}
+	})
 	defer utils.CloseAndLog(db)
 
 	// Bring the schema up to date, then simulate a pre-existing deployment by
@@ -273,8 +278,13 @@ func TestEnsureSchema_ReconcilesIndexDrift(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	container, dsn, db := startEnsureSchemaContainer(t, ctx)
-	// Cleanup runs after the test, when t.Context() is already cancelled.
-	defer func() { _ = container.Terminate(t.Context()) }()
+	// TerminateContainer manages its own context; cleanup runs after the
+	// test, when t.Context() is already cancelled.
+	t.Cleanup(func() {
+		if err := testcontainers.TerminateContainer(container); err != nil {
+			t.Logf("failed to terminate container: %v", err)
+		}
+	})
 	defer utils.CloseAndLog(db)
 
 	// Bring the schema up to date, then drift it: drop a declared index and

@@ -4234,14 +4234,18 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimOrderWalksIndex(t *test
 	// The claim's top-level predicate ORs across states, so no state-prefixed
 	// index can serve the ordering; the ordered walk must come from
 	// idx_created_id, with no sort step that would buffer (and under FOR
-	// UPDATE, lock) the whole candidate set.
+	// UPDATE, lock) the whole candidate set. The EXPLAINed SELECT carries the
+	// claim's FOR UPDATE SKIP LOCKED clauses so the plan reflects the locking
+	// read the driver actually issues; EXPLAIN itself executes nothing and
+	// takes no locks.
 	var plan string
 	require.NoError(t, testDB.QueryRowContext(ctx, `
 		EXPLAIN FORMAT=JSON
 		SELECT id FROM apply_operations
 		WHERE state = ? OR (state = ? AND updated_at < NOW() - INTERVAL 1 MINUTE)
 		ORDER BY created_at, id
-		LIMIT 1`,
+		LIMIT 1
+		FOR UPDATE SKIP LOCKED`,
 		state.ApplyOperation.Pending, state.ApplyOperation.Running,
 	).Scan(&plan))
 	assert.Contains(t, plan, `"key": "idx_created_id"`,
