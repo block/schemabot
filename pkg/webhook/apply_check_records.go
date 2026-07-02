@@ -7,6 +7,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -19,7 +20,9 @@ func (h *Handler) storeApplyPlanCheckRecord(ctx context.Context, client *ghclien
 }
 
 // updateCheckRecordForApplyStart updates the stored check state to "in_progress"
-// when an apply begins execution. The aggregate check is updated to reflect the state.
+// when an apply begins execution. The aggregate check is updated to reflect the
+// state. If the apply is already terminal by the time the claim lands, the
+// stored check state is immediately refreshed to the apply's terminal outcome.
 func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string, applyID int64) error {
 	check, err := h.service.Storage().Checks().Get(ctx, repo, pr, environment, schema.Type, schema.Database)
 	if err != nil {
@@ -118,6 +121,36 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 		Environment:  environment,
 		Status:       "success",
 	})
+
+	// The claim above races the driver: a fast apply can reach a terminal state
+	// before the claim lands, and the driver's terminal check update skips
+	// fail-closed when the stored row is not yet owned by the apply. Reload the
+	// apply now that the claim is durable; if the apply already finished, run
+	// the terminal refresh here so the stored check state converges to the
+	// apply's outcome instead of staying in_progress with no writer left to
+	// complete it.
+	apply, err := h.service.Storage().Applies().Get(ctx, applyID)
+	if err != nil {
+		return fmt.Errorf("reload apply after check claim repo %s pr %d environment %s database_type %s database %s apply_id %d: %w",
+			repo, pr, environment, schema.Type, schema.Database, applyID, err)
+	}
+	if apply == nil {
+		return fmt.Errorf("apply missing after check claim repo %s pr %d environment %s database_type %s database %s apply_id %d",
+			repo, pr, environment, schema.Type, schema.Database, applyID)
+	}
+	if state.IsTerminalApplyState(apply.State) {
+		h.logger.Info("apply finished before its check claim; refreshing stored check state to the terminal outcome",
+			apply.LogAttrs()...)
+		h.refreshChecksForTerminalApply(ctx, apply, "apply finished before check claim")
+		// The refresh resolves its own GitHub client from the durable apply; if
+		// that resolution fails, the stored check state has still converged but
+		// the visible aggregate Check Run has not. Refresh it with the request's
+		// client too — recomputing the aggregate is idempotent, and this path
+		// only runs when an apply outraces its own claim.
+		h.updateAggregateCheck(ctx, client, repo, pr, check.HeadSHA)
+		return nil
+	}
+
 	h.updateAggregateCheck(ctx, client, repo, pr, check.HeadSHA)
 	return nil
 }
