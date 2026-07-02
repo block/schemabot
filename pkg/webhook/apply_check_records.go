@@ -142,6 +142,12 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 		h.logger.Info("apply finished before its check claim; refreshing stored check state to the terminal outcome",
 			apply.LogAttrs()...)
 		h.refreshChecksForTerminalApply(ctx, apply, "apply finished before check claim")
+		// The refresh resolves its own GitHub client from the durable apply; if
+		// that resolution fails, the stored check state has still converged but
+		// the visible aggregate Check Run has not. Refresh it with the request's
+		// client too — recomputing the aggregate is idempotent, and this path
+		// only runs when an apply outraces its own claim.
+		h.updateAggregateCheck(ctx, client, repo, pr, check.HeadSHA)
 		return nil
 	}
 
