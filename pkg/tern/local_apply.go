@@ -312,14 +312,6 @@ func (c *LocalClient) cancelApplyHandle(handle applyCancelHandle) {
 	c.cancelMu.Unlock()
 }
 
-func (c *LocalClient) startApplyExecution(ctx context.Context, cancelGeneration uint64, cancel context.CancelFunc, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
-	go func() {
-		defer c.clearApplyCancel(cancelGeneration)
-		defer cancel()
-		c.runApplyExecution(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier)
-	}()
-}
-
 func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
 	if c.usesGroupedApply(apply, options) {
 		c.runWithRecovery(ctx, apply, tasks, func() {

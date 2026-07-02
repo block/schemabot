@@ -113,16 +113,16 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	}
 	defer utils.CloseAndLog(srv)
 
-	// A configured GRPC_PORT means this process serves the data plane over its
-	// inline LocalClient drive, which does not maintain apply_operations state —
-	// so default operator claiming to the apply level (unless config set it
-	// explicitly). This is a Run convenience, not a server mode: an embedder
-	// sets ServerConfig.OperatorClaimOperations directly. Applied before Start
+	// A configured GRPC_PORT means this process serves the data plane, whose
+	// LocalClient drives claim at the apply level — so default operator claiming
+	// to the apply level (unless config set it explicitly). This is a Run
+	// convenience, not a server mode: an embedder sets
+	// ServerConfig.OperatorClaimOperations directly. Applied before Start
 	// (which launches the operator) so the operator reads the resolved value.
 	if applyDataPlaneClaimDefault(cfg, grpcPort != "") {
 		srv.logger.Info("data-plane gRPC mode: defaulting operator claiming to the apply level", "grpc_port", grpcPort)
 	} else if grpcPort != "" && cfg.ShouldClaimOperations() {
-		srv.logger.Warn("data-plane gRPC mode has operation-level operator claiming enabled; the inline LocalClient drive does not maintain apply_operations state, so stop/start resume will not recover", "grpc_port", grpcPort)
+		srv.logger.Warn("data-plane gRPC mode has operation-level operator claiming enabled; data-plane drives hold apply-level leases, so stop/start resume will not recover", "grpc_port", grpcPort)
 	}
 
 	// Optionally start a gRPC server for the Tern proto (used by
@@ -394,9 +394,16 @@ func (s *Server) RegisterGRPC(ctx context.Context, gs *grpc.Server) error {
 		if err != nil {
 			return fmt.Errorf("build grpc tern client: %w", err)
 		}
-		// Owned by the Server (not the service's default client), so Close
-		// releases it.
+		// Owned by the Server (Close releases it; the service does not close its
+		// default client).
 		s.grpcClient = built
+		// A dispatched apply is queued for this data plane's own operator, which
+		// routes each claim by the apply's deployment/environment. A dispatch can
+		// carry an environment the static database config does not list, so the
+		// operator must fall back to the same client the gRPC transport serves —
+		// without it, every claim of a queued apply would fail "tern deployment
+		// not configured" and the apply would sit re-claimable forever.
+		s.svc.SetDefaultTernClient(built)
 		client = built
 	}
 	tern.NewServer(client).Register(gs)

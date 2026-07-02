@@ -224,7 +224,7 @@ func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Ap
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Cutover request queued for apply owner%s", callerApplyLogSuffix(requestedBy)), "", "")
 	}
-	c.wakeOperatorForControlRequest(apply)
+	c.wakeOperator(apply)
 	return &ternv1.CutoverResponse{Accepted: true}, nil
 }
 
@@ -399,7 +399,7 @@ func (c *LocalClient) requestCancel(ctx context.Context, req *ternv1.CancelReque
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Cancel request queued for apply owner%s", callerApplyLogSuffix(requestedBy)), "", "")
 	}
-	c.wakeOperatorForControlRequest(apply)
+	c.wakeOperator(apply)
 	return &ternv1.CancelResponse{Accepted: true}, nil
 }
 
@@ -458,7 +458,7 @@ func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, 
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Stop request queued for apply owner%s", callerApplyLogSuffix(requestedBy)), "", "")
 	}
-	c.wakeOperatorForControlRequest(apply)
+	c.wakeOperator(apply)
 	return &ternv1.StopResponse{Accepted: true}, nil
 }
 

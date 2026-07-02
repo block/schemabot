@@ -57,7 +57,7 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStartRequested, storage.LogSourceSchemaBot,
 			"Start request queued for apply owner", "", "")
 	}
-	c.wakeOperatorForControlRequest(apply)
+	c.wakeOperator(apply)
 	return &ternv1.StartResponse{
 		Accepted:     true,
 		StartedCount: startedCount,
@@ -939,7 +939,10 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		return fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	// Whole-apply scope has no single operation to order, so the stored apply
-	// options govern the drive directly (no automatic barrier park).
+	// options govern the drive directly (no automatic barrier park). A task-less
+	// apply is handled inside the shared resume path: VSchema-only plans are
+	// re-driven so the VSchema is applied, and any other task-less shape (e.g. a
+	// sharded dispatch whose shard already matches) completes as a no-op.
 	return c.resumeApplyWithTasks(ctx, apply, tasks, apply.GetOptions().Map(), false, false)
 }
 

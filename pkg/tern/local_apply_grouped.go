@@ -1222,9 +1222,10 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 // of a live re-query. It runs only inside the operator's lease-held drive: a
 // multi-operation fan-out drive holds the operation lease, a single-operation
 // (whole-apply) drive holds the apply lease, and UpsertShardProgress accepts
-// either. Read-path callers carry neither lease and skip, so a plain progress
-// read never writes. A failed shard write is logged, not fatal — the next
-// reconcile re-applies it.
+// either. Every drive runs under an operator claim, so a poll context without
+// a lease is an invariant violation: the per-shard breakdown would silently
+// stop persisting, which is warned loudly rather than skipped quietly. A
+// failed shard write is logged, not fatal — the next reconcile re-applies it.
 func (c *LocalClient) writeShardProgress(ctx context.Context, table *storage.Task, tp *engine.TableProgress, now time.Time) {
 	if len(tp.Shards) == 0 {
 		return
@@ -1232,6 +1233,8 @@ func (c *LocalClient) writeShardProgress(ctx context.Context, table *storage.Tas
 	_, hasOpLease := storage.OperationLeaseFromContext(ctx)
 	_, hasApplyLease := storage.ApplyLeaseFromContext(ctx)
 	if !hasOpLease && !hasApplyLease {
+		c.logger.Warn("per-shard progress will not be persisted: drive context carries no operation or apply lease",
+			append(table.LogAttrs(), "namespace", table.Namespace, "shard_count", len(tp.Shards))...)
 		return
 	}
 	var operationID int64

@@ -221,6 +221,72 @@ func buildSchemaWithAllTables(t *testing.T, dsn string, testTableSchemas map[str
 	return schemaFiles
 }
 
+// startTestOperator mimics the server's operator drivers for tests that
+// dispatch through LocalClient.Apply. Apply queues the apply for the operator
+// (every drive runs under an operator claim), so a test that expects the apply
+// to make progress needs this loop: it claims work exactly like api.Service
+// drivers — FindNextApply under an owner, the claim's apply lease on the drive
+// context — and drives each claim via ResumeApply. Stops when the test ends.
+func startTestOperator(t *testing.T, stor storage.Storage, client *LocalClient) {
+	t.Helper()
+	ctx := t.Context()
+	owner := "test-operator-" + t.Name()
+	// Log through the client's logger, not t.Logf: the drive goroutine can
+	// outlive the test body, and t.Logf after the test ends panics. Drive
+	// failures surface as apply state, which the tests assert on.
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				apply, err := stor.Applies().FindNextApply(ctx, owner)
+				if err != nil {
+					// Storage failure, not no-work: without this log the test only
+					// hangs to its timeout with zero diagnostics.
+					if ctx.Err() == nil {
+						client.logger.Warn("test operator: claim failed", "owner", owner, "error", err)
+					}
+					continue
+				}
+				if apply == nil {
+					// No claimable work — keep polling.
+					continue
+				}
+				driveCtx := storage.WithApplyLease(ctx, apply.Lease())
+				go func() {
+					if err := client.ResumeApply(driveCtx, apply); err != nil && ctx.Err() == nil {
+						client.logger.Warn("test operator: resume apply failed", "apply_id", apply.ApplyIdentifier, "error", err)
+					}
+				}()
+			}
+		}
+	}()
+}
+
+// driveNextQueuedApply claims the next queued apply the way an operator driver
+// does — FindNextApply under an owner, the claim's apply lease on the drive
+// context — and drives it synchronously until the drive returns. For tests that
+// assert on a settled post-drive state (a retryable-failure pause), where the
+// continuous test operator would immediately re-claim and retry.
+func driveNextQueuedApply(t *testing.T, stor storage.Storage, client *LocalClient) {
+	t.Helper()
+	ctx := t.Context()
+	owner := "test-operator-" + t.Name()
+	var apply *storage.Apply
+	require.Eventually(t, func() bool {
+		var err error
+		apply, err = stor.Applies().FindNextApply(ctx, owner)
+		return err == nil && apply != nil
+	}, 10*time.Second, 50*time.Millisecond, "no queued apply became claimable")
+	driveCtx := storage.WithApplyLease(ctx, apply.Lease())
+	if err := client.ResumeApply(driveCtx, apply); err != nil {
+		t.Logf("drive queued apply %s: %v", apply.ApplyIdentifier, err)
+	}
+}
+
 // waitForApplyComplete polls Progress until the apply reaches a terminal state or times out.
 // Fails the test immediately if the apply enters FAILED state.
 func waitForApplyComplete(t *testing.T, client *LocalClient, ctx context.Context, applyID string) {
@@ -888,6 +954,7 @@ func TestLocalClient_Apply(t *testing.T) {
 	}, stor, logger)
 	require.NoError(t, err, "failed to create client")
 	defer utils.CloseAndLog(client)
+	startTestOperator(t, stor, client)
 
 	// Build schema files including all storage tables to avoid DROP TABLE for them
 	schemaFiles := buildSchemaWithAllTables(t, dsn, map[string]string{
@@ -961,6 +1028,7 @@ func TestLocalClient_Apply_IdempotentDispatch(t *testing.T) {
 	}, stor, logger)
 	require.NoError(t, err, "failed to create client")
 	defer utils.CloseAndLog(client)
+	startTestOperator(t, stor, client)
 
 	schemaFiles := buildSchemaWithAllTables(t, dsn, map[string]string{
 		"users": "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
@@ -1111,6 +1179,9 @@ func TestLocalClient_Apply_WritesApplyOperationRow(t *testing.T) {
 
 	// The apply still runs to completion against the real Spirit engine with the
 	// operation row present (the sequential path is unaffected by the linkage).
+	// The operator starts only after the queued-state assertions above, so the
+	// pending reads are not racing the drive.
+	startTestOperator(t, stor, client)
 	waitForApplyComplete(t, client, ctx, applyResp.ApplyId)
 
 	var columnCount int
@@ -3143,6 +3214,7 @@ func TestLocalClient_Apply_MultiTableSequential(t *testing.T) {
 	}, stor, logger)
 	require.NoError(t, err, "failed to create client")
 	defer utils.CloseAndLog(client)
+	startTestOperator(t, stor, client)
 
 	// Load current schema for all tables (including storage) so the differ
 	// only sees changes for test_users and test_orders.
@@ -3352,6 +3424,7 @@ func TestLocalClient_Apply_AtomicHeartbeat(t *testing.T) {
 	}, stor, logger)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(client)
+	startTestOperator(t, stor, client)
 
 	// Use a short heartbeat interval so the ticker fires during the test
 	client.heartbeatInterval = 1 * time.Second
@@ -3451,6 +3524,7 @@ func TestLocalClient_Apply_AtomicRejectsMultiNamespace(t *testing.T) {
 	}, stor, logger)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(client)
+	startTestOperator(t, stor, client)
 
 	// Create a plan with two namespaces directly in storage
 	plan := &storage.Plan{
@@ -3527,6 +3601,7 @@ func TestLocalClient_Apply_SequentialNamespaceMatchesTask(t *testing.T) {
 	}, stor, logger)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(client)
+	startTestOperator(t, stor, client)
 
 	// Load current schema
 	dbConn, err := sql.Open("mysql", dsn)
@@ -3636,6 +3711,11 @@ func TestLocalClient_Apply_FailedAtomicHasErrorMessage(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, applyResp.Accepted, "apply should be accepted: %s", applyResp.ErrorMessage)
 
+	// Drive exactly one claim: a continuous operator would immediately re-claim
+	// the retryable failure and retry it toward permanent failure, and this test
+	// asserts on the settled first-failure pause.
+	driveNextQueuedApply(t, stor, client)
+
 	// Spirit failures are retryable by default. The first failure should pause
 	// in failed_retryable instead of becoming permanently failed.
 	require.Eventually(t, func() bool {
@@ -3658,6 +3738,91 @@ func TestLocalClient_Apply_FailedAtomicHasErrorMessage(t *testing.T) {
 	assert.Equal(t, state.Task.FailedRetryable, tasks[0].State)
 	assert.Nil(t, tasks[0].CompletedAt)
 	assert.NotEmpty(t, tasks[0].ErrorMessage, "task.ErrorMessage should contain the failure reason")
+}
+
+// A dispatch can create a task-less apply — a sharded dispatch for a shard
+// whose schema already matches produces zero tasks, and a VSchema-only apply
+// carries only the operation row. Queued applies are driven by the operator,
+// so the claim must accept the task-less shape through its dual-written
+// operation row, and the drive must then settle it: here, complete the
+// no-work apply as a no-op rather than leaving it pending forever.
+func TestLocalClient_ResumeApply_TasklessQueuedApplyCompletesNoOp(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      "mysql",
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	// A plan with DDL work but a dispatch that scoped to no tasks — the
+	// sharded no-op shape (this shard's schema already matches).
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   "mysql",
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {
+				Tables: []storage.TableChange{
+					{Namespace: "testdb", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN x INT", Operation: "alter"},
+				},
+			},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-taskless-noop",
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    "mysql",
+		Deployment:      "testdb",
+		Environment:     "staging",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Pending,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().CreateWithTasksAndOperations(ctx, apply, nil, []*storage.ApplyOperation{{
+		Deployment: apply.Deployment,
+		State:      state.ApplyOperation.Pending,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}})
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	// Claim it the way the operator does — the operation row makes the
+	// task-less pending apply claimable.
+	claimed, err := stor.Applies().FindNextApply(ctx, "test-operator-"+t.Name())
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "task-less pending apply with an operation row must be claimable")
+	require.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+
+	driveCtx := storage.WithApplyLease(ctx, claimed.Lease())
+	require.NoError(t, client.ResumeApply(driveCtx, claimed), "driving a task-less no-op apply must succeed")
+
+	persisted, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Completed, persisted.State, "a no-work apply must complete as a no-op, not stay pending or fail")
+	assert.NotNil(t, persisted.CompletedAt, "the no-op completion must stamp completed_at")
 }
 
 func TestLocalClient_AtomicRetryableFailureQueuesOperatorRetry(t *testing.T) {

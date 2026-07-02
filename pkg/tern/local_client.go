@@ -148,9 +148,10 @@ type LocalConfig struct {
 	// quarantine so DROP TABLE executes directly).
 	Metadata map[string]string
 
-	// WakeOperator notifies the owner loop after an external control request is
-	// recorded. The callback must not execute control actions itself; it only
-	// nudges the storage-claiming operator to process durable intent promptly.
+	// WakeOperator notifies the owner loop after durable work is recorded — a
+	// queued apply from a dispatch, or an external control request. The callback
+	// must not execute the work itself; it only nudges the storage-claiming
+	// operator to pick it up promptly instead of waiting out the poll interval.
 	WakeOperator func(applyIdentifier, database, environment string)
 
 	// EngineFactories supplies engine implementations for database types this
@@ -196,7 +197,9 @@ type LocalClient struct {
 	observers  map[int64]ProgressObserver // keyed by apply ID
 
 	// pendingObserver is consumed by the next direct Apply() call and registered
-	// before Spirit starts.
+	// under the created apply's ID before the operator picks the apply up; the
+	// operator drives through this same client instance, so the drive finds the
+	// observer in the registry.
 	// Protected by observerMu.
 	pendingObserver ProgressObserver
 }
@@ -271,7 +274,11 @@ func (c *LocalClient) IsRemote() bool { return false }
 // Endpoint returns the database name for this local client.
 func (c *LocalClient) Endpoint() string { return c.config.Database }
 
-func (c *LocalClient) wakeOperatorForControlRequest(apply *storage.Apply) {
+// wakeOperator nudges the storage-claiming operator to pick up durable work
+// recorded for the apply — a queued dispatch or a control request — promptly
+// instead of waiting out the poll interval. Without a configured callback
+// (library and test use) the operator's next poll picks the work up.
+func (c *LocalClient) wakeOperator(apply *storage.Apply) {
 	if c.config.WakeOperator == nil {
 		c.logger.Debug("operator wake skipped because no wake callback is configured",
 			"apply_id", apply.ApplyIdentifier,
@@ -1958,13 +1965,14 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	}
 	apply.ID = applyID
 
-	// Log apply started
+	// Record the queue event in the apply's durable log; the drive itself starts
+	// when an operator claims the apply, which the timeline records separately.
 	c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
-		fmt.Sprintf("Apply started: %s", applyIdentifier), "", state.Apply.Pending)
+		fmt.Sprintf("Apply queued: %s", applyIdentifier), "", state.Apply.Pending)
 
-	// Direct client calls can still register a pending observer before starting
-	// the engine. API-created applies use the service-level observer registry
-	// because operator drivers dispatch them asynchronously.
+	// Register any pending observer under the created apply's ID before queueing.
+	// The operator drives through this same client instance, so the drive finds
+	// the observer in the registry regardless of when the claim happens.
 	if obs := c.consumePendingObserver(); obs != nil {
 		// Set the apply ID on the observer if it supports it (e.g., CommentObserver
 		// needs the ID to look up tracked comments for editing).
@@ -1975,13 +1983,14 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		c.SetObserver(apply.ID, obs)
 	}
 
-	// Start apply in background with cancellable context (Stop() cancels this)
-	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
-	cancelGeneration := c.setApplyCancel(cancelApply)
-	// A fresh dispatch (including a remote gRPC drive) has no operation context,
-	// so it never auto-parks at the cutover barrier; ordered-cutover parking is
-	// driven by the operator's operation-scoped resume path.
-	c.startApplyExecution(applyCtx, cancelGeneration, cancelApply, apply, tasks, plan, options, false)
+	// The apply is queued, not driven here: every drive — the initial dispatch
+	// included — runs under an operator claim, so lease-guarded writes (per-shard
+	// progress write-through, operation state) always hold the capability they
+	// require. The operator's pending-claim picks the apply up; the wake makes
+	// that prompt instead of waiting out the poll interval.
+	c.logger.Info("Apply: queued for operator drive",
+		append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier)...)
+	c.wakeOperator(apply)
 
 	return &ternv1.ApplyResponse{
 		Accepted:         true,
