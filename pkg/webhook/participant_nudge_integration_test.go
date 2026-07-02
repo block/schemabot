@@ -93,6 +93,11 @@ func TestE2EParticipantCommentNudgeRefoldsAggregate(t *testing.T) {
 	assert.Equal(t, checkStatusCompleted, cr.Status)
 	assert.Equal(t, checkConclusionSuccess, cr.Conclusion,
 		"the nudge-triggered fold reads the participant's green check and passes the aggregate")
+
+	// The delayed pass publishes the aggregate a second time, so a comment that
+	// lands before the participant's Check Run update still converges.
+	second := collectAggregate(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", "production"))
+	assert.Equal(t, checkConclusionSuccess, second.Conclusion, "the delayed re-fold publishes again")
 }
 
 // A bot that is not a trusted sibling deployment stays ignored — the nudge is

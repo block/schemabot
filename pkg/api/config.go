@@ -1525,6 +1525,8 @@ type ResolvedGitHubApp struct {
 func (c *ServerConfig) TrustedCheckAppSlugsForRepo(repo string) []string {
 	app, err := c.ResolveGitHubAppForRepo(repo)
 	if err != nil {
+		slog.Warn("no GitHub App resolves for repo; treating its trusted check App slugs as empty",
+			"repo", repo, "error", err)
 		return nil
 	}
 	return app.Config.TrustedCheckAppSlugs

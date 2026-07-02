@@ -47,8 +47,11 @@ func (h *Handler) participantCommentNudge(ctx context.Context, repo string, pr i
 
 	h.goSafe(repo, pr, installationID, func() {
 		h.refoldAggregateForPR(repo, pr, installationID, "participant comment")
-		time.Sleep(h.nudgeRefoldDelay())
-		h.refoldAggregateForPR(repo, pr, installationID, "participant comment delayed pass")
+	})
+	time.AfterFunc(h.nudgeRefoldDelay(), func() {
+		h.goSafe(repo, pr, installationID, func() {
+			h.refoldAggregateForPR(repo, pr, installationID, "participant comment delayed pass")
+		})
 	})
 	return true
 }
