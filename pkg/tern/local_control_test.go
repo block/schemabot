@@ -1124,3 +1124,77 @@ func TestLocalClient_RunEngineTaskAbortsWhenTaskWriteFails(t *testing.T) {
 
 	assert.Equal(t, taskAbort, action, "the drive must exit for operator retry when the running task state cannot be persisted")
 }
+
+// A failed task-state write must leave the in-memory task reflecting the
+// stored state. Callers log and branch on task.State after a failed write
+// (conflict checks, finalization loops), so a struct claiming a transition
+// storage never accepted would mislead both the code and the operator reading
+// its logs.
+func TestLocalClient_TransitionTaskStateRestoresTaskOnWriteFailure(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-transition-task-write",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	updatedAt := time.Now().Add(-time.Minute)
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-transition-task-write",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+		UpdatedAt:      updatedAt,
+	}
+	updateErr := errors.New("storage write refused")
+	client := newFailingTaskWriteClient(apply, []*storage.Task{task}, &controlCaptureEngine{}, updateErr)
+
+	err := client.transitionTaskState(t.Context(), task, 0, state.Task.Stopped, "")
+
+	require.ErrorIs(t, err, updateErr)
+	assert.Equal(t, state.Task.Running, task.State, "in-memory task state must match the stored state after a refused write")
+	assert.Equal(t, updatedAt, task.UpdatedAt, "in-memory update time must match the stored row after a refused write")
+}
+
+// Once the engine has accepted a grouped apply, its schema change is in
+// flight, so a failed running task-state write must not record a failed
+// outcome — the engine may still complete the change on the target. The
+// current apply owner exits and the apply stays non-terminal so recovery
+// re-drives it from stored state.
+func TestLocalClient_GroupedApplyExitsWithoutTerminalizingWhenTaskWriteFails(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-grouped-task-write",
+		State:           state.Apply.Pending,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-grouped-task-write",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		TableName:      "t1",
+		DDL:            "ALTER TABLE `t1` ADD COLUMN `c` INT",
+		State:          state.Task.Pending,
+	}
+	plan := &storage.Plan{
+		PlanIdentifier: "plan-mysql-grouped-task-write",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Namespaces:     map[string]*storage.NamespacePlanData{"testdb": {}},
+	}
+	updateErr := errors.New("storage write refused")
+	client := newFailingTaskWriteClient(apply, []*storage.Task{task}, &applyAcceptingEngine{}, updateErr)
+	client.heartbeatInterval = time.Hour
+
+	client.executeGroupedApply(t.Context(), apply, []*storage.Task{task}, plan, nil, false)
+
+	assert.Equal(t, state.Apply.Running, apply.State, "apply must stay non-terminal so recovery re-drives the in-flight engine work")
+	assert.Nil(t, apply.CompletedAt, "an apply that could not persist task state has no final outcome to stamp")
+}

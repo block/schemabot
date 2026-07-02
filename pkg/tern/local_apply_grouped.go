@@ -178,9 +178,14 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 			}
 		}
 	}
+	// The engine already accepted the apply, so its work is in flight and a
+	// storage write failure must not terminalize the apply: recording failed
+	// while the engine keeps running would make the stored outcome contradict
+	// the target. Exit the current owner attempt instead so recovery re-drives
+	// from the stored non-terminal state.
 	if err := c.markTasksRunning(ctx, tasks); err != nil {
-		c.logger.Error("failed to persist running task state after engine accepted the apply", append(apply.LogAttrs(), "error", err)...)
-		c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to persist running task state: %v", err))
+		c.logger.Error("failed to persist running task state after engine accepted the apply; current apply owner will exit for operator retry",
+			append(apply.LogAttrs(), "error", err)...)
 		return
 	}
 	if c.config.Type == storage.DatabaseTypeVitess {

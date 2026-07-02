@@ -217,9 +217,15 @@ func (c *LocalClient) setupSpiritLogging(ctx context.Context, apply *storage.App
 // happened.
 func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Task, applyID int64, newState string, logMsg string) error {
 	oldState := task.State
+	oldUpdatedAt := task.UpdatedAt
 	task.State = newState
 	task.UpdatedAt = time.Now()
 	if err := c.storage.Tasks().Update(ctx, task); err != nil {
+		// Restore the in-memory fields this helper mutated so callers that log
+		// or branch on task.State after a failed write see the stored state,
+		// not a transition storage never accepted.
+		task.State = oldState
+		task.UpdatedAt = oldUpdatedAt
 		return fmt.Errorf("update task %s to state %s: %w", task.TaskIdentifier, newState, err)
 	}
 	if logMsg != "" && applyID > 0 {
