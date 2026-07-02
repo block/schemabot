@@ -1300,15 +1300,29 @@ func (c *ServerConfig) OnFailure(database, environment string) string {
 	return env.OnFailure
 }
 
+// DatabaseNotConfiguredError reports that a database has no entry in this
+// server's databases registry. Callers use it to distinguish "this server does
+// not own the database" from other configuration failures — on repos where
+// deployments share PR commands, a database missing from the registry means
+// another deployment owns the work.
+type DatabaseNotConfiguredError struct {
+	Database string
+}
+
+func (e *DatabaseNotConfiguredError) Error() string {
+	return fmt.Sprintf("database %q is not configured on this server", e.Database)
+}
+
 // DatabaseEnvironments returns the environments configured server-side for a
-// database, ordered by the server-owned promotion order.
+// database, ordered by the server-owned promotion order. Returns
+// *DatabaseNotConfiguredError when the database has no registry entry.
 func (c *ServerConfig) DatabaseEnvironments(database string) ([]string, error) {
 	if c == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
 	db := c.Database(database)
 	if db == nil {
-		return nil, fmt.Errorf("database %q is not configured on this server", database)
+		return nil, &DatabaseNotConfiguredError{Database: database}
 	}
 	environments := make([]string, 0, len(db.Environments))
 	for environment := range db.Environments {

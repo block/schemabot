@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 )
@@ -15,10 +16,11 @@ import (
 // On an aggregate repo (leader or participant), an unscoped command (no -t) is a
 // fan-out broadcast every installed deployment receives; a deployment that owns
 // none of the changed schema is expected to do nothing while the deployment that
-// does own it handles the command. Posting "config not authorized" from every
-// non-owning deployment would be exactly the noise fan-out removes. Scoped to
-// the not-owned error only — real failures still surface. A -t-scoped command
-// (tenant != "") always reports, since it named a specific deployment.
+// does own it handles the command. Posting "config not authorized" or "database
+// not configured" from every non-owning deployment would be exactly the noise
+// fan-out removes. Scoped to the not-owned error classes only — real failures
+// still surface. A -t-scoped command (tenant != "") always reports, since it
+// named a specific deployment.
 func (h *Handler) skipUnownedUnscopedCommand(repo, tenant string, err error) bool {
 	if tenant != "" {
 		return false
@@ -27,8 +29,23 @@ func (h *Handler) skipUnownedUnscopedCommand(repo, tenant string, err error) boo
 	if !ok || config.AggregateRoleForRepo(repo) == "" {
 		return false
 	}
+	return isSchemaUnownedByDeploymentError(err)
+}
+
+// isSchemaUnownedByDeploymentError reports whether err means the command
+// resolved to schema another deployment owns: either the schema config lives
+// outside this server's allowed_dirs, or the discovered database has no entry
+// in this server's databases registry at all. Under the aggregate contract both
+// mean the same thing — this deployment is not the owner — so on unscoped
+// fan-out both are silently skipped rather than reported. Anything else is a
+// real failure and must still surface.
+func isSchemaUnownedByDeploymentError(err error) bool {
 	var notOwned *schemaConfigOutsideAllowedDirsError
-	return errors.As(err, &notOwned)
+	if errors.As(err, &notOwned) {
+		return true
+	}
+	var notConfigured *api.DatabaseNotConfiguredError
+	return errors.As(err, &notConfigured)
 }
 
 // silentOnUnscopedFanOut reports whether a "nothing to do on this deployment"

@@ -48,7 +48,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	if err != nil {
 		if h.skipUnownedUnscopedCommand(repo, tenant, err) {
 			h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
-				"repo", repo, "pr", pr, "environment", environment)
+				"repo", repo, "pr", pr, "environment", environment, "error", err)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unowned unscoped command skipped"})
 			return
 		}

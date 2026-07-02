@@ -57,6 +57,15 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		return
 	}
 	if apply == nil {
+		// On an aggregate repo an unscoped rollback fans out to every
+		// deployment, but the apply lives in exactly one tenant's storage. A
+		// deployment that doesn't have it is not the owner and stays silent so
+		// only the owning deployment answers.
+		if h.silentOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("unscoped fan-out rollback targets an apply not stored on this deployment; staying silent so the owning deployment responds",
+				"repo", repo, "pr", pr, "apply_id", applyID, "environment", result.Environment)
+			return
+		}
 		h.postComment(repo, pr, installationID, templates.RenderRollbackApplyNotFound(applyID))
 		return
 	}
@@ -294,6 +303,15 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 		return
 	}
 	if existingLock == nil || rollbackPlan == nil {
+		// On an aggregate repo an unscoped rollback-confirm fans out to every
+		// deployment, but only the deployment holding the pinned rollback lock
+		// has anything to confirm. One with no pending rollback stays silent so
+		// only the owning deployment answers.
+		if h.silentOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("unscoped fan-out rollback-confirm found no pending rollback on this deployment; staying silent so the owning deployment responds",
+				"repo", repo, "pr", pr, "environment", environment)
+			return
+		}
 		h.postComment(repo, pr, installationID, templates.RenderRollbackConfirmNoLock("", environment))
 		return
 	}
