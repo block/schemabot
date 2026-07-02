@@ -120,10 +120,11 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Roll up every deployment's diff against the reviewed plan so drift on a
 	// non-primary deployment fails the check closed at review time.
-	drift := h.reviewTimeDrift(ctx, planReq, planProto, repo, pr)
+	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, repo, pr)
 
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy)
+	commentData.DeploymentDrift = driftPreview
 
 	metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "success")
 
@@ -317,7 +318,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 		// Roll up every deployment's diff against the reviewed plan so drift on a
 		// non-primary deployment fails the check closed at review time.
-		drift := h.reviewTimeDrift(ctx, planReq, planProto, repo, pr)
+		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, repo, pr)
 
 		// Store per-database check record per environment
 		var recoveredApplyOwnedCheckState bool
@@ -340,6 +341,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy)
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
+		commentData.DeploymentDrift = driftPreview
 		multiEnvData.Plans[env] = &commentData
 	}
 

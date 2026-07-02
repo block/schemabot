@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 // The drift summary names diverged deployments so the check's Change column
@@ -71,4 +72,58 @@ func TestPlanCheckConclusion_DriftFailsClosed(t *testing.T) {
 		"changes without drift require an apply")
 	assert.Equal(t, checkConclusionSuccess, planCheckConclusion(false, false, false),
 		"a clean no-op plan with no drift passes")
+}
+
+// A single-deployment database has nothing to compare, so the preview is nil and
+// no drift section is rendered on its plan comment.
+func TestDeploymentDriftPreview_NilForSingleDeployment(t *testing.T) {
+	rollup := api.PlanRollup{
+		Entries: []api.DeploymentRollupEntry{{Deployment: "primary", Class: api.DeploymentMatch}},
+		Clean:   true,
+	}
+	assert.Nil(t, deploymentDriftPreview(rollup))
+}
+
+// A clean multi-deployment rollup becomes preview data flagged clean and
+// computed, with the primary marked and every deployment classified as a match.
+func TestDeploymentDriftPreview_CleanMultiDeployment(t *testing.T) {
+	rollup := api.PlanRollup{
+		Entries: []api.DeploymentRollupEntry{
+			{Deployment: "eu", Class: api.DeploymentMatch},
+			{Deployment: "au", Class: api.DeploymentMatch},
+		},
+		Clean: true,
+	}
+	preview := deploymentDriftPreview(rollup)
+	assert.NotNil(t, preview)
+	assert.True(t, preview.Computed)
+	assert.True(t, preview.Clean)
+	assert.Len(t, preview.Deployments, 2)
+	assert.True(t, preview.Deployments[0].Primary)
+	assert.False(t, preview.Deployments[1].Primary)
+	assert.Equal(t, "match", preview.Deployments[1].Class)
+}
+
+// A diverged deployment carries a compact change-count detail; an errored
+// deployment carries a sanitized error detail so the preview names why each
+// deployment is blocking.
+func TestDeploymentDriftPreview_DivergedAndErroredDetails(t *testing.T) {
+	rollup := api.PlanRollup{
+		Entries: []api.DeploymentRollupEntry{
+			{Deployment: "eu", Class: api.DeploymentMatch},
+			{Deployment: "au", Class: api.DeploymentDiverged, Diff: tern.ChangeSetDiff{
+				UnexpectedInCandidate: []tern.ChangeSetDiffItem{{Table: "users"}},
+				MissingFromCandidate:  []tern.ChangeSetDiffItem{{Table: "orders"}, {Table: "items"}},
+			}},
+			{Deployment: "us", Class: api.DeploymentErrored, Err: assert.AnError},
+		},
+		Clean: false,
+	}
+	preview := deploymentDriftPreview(rollup)
+	assert.False(t, preview.Clean)
+	assert.Equal(t, "diverged", preview.Deployments[1].Class)
+	assert.Contains(t, preview.Deployments[1].Detail, "1 unexpected")
+	assert.Contains(t, preview.Deployments[1].Detail, "2 missing")
+	assert.Equal(t, "errored", preview.Deployments[2].Class)
+	assert.NotEmpty(t, preview.Deployments[2].Detail)
 }
