@@ -33,7 +33,7 @@ func TestUpdateCheckRecordForApplyStart_ConvergesWhenApplyAlreadyTerminal(t *tes
 	db, err := sql.Open("mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.PingContext(ctx))
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { assert.NoError(t, db.Close()) })
 
 	const (
 		repo = "octocat/claim-race-check"
@@ -135,7 +135,7 @@ func TestUpdateCheckRecordForApplyStart_KeepsInProgressForRunningApply(t *testin
 	db, err := sql.Open("mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.PingContext(ctx))
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { assert.NoError(t, db.Close()) })
 
 	const (
 		repo = "octocat/claim-running-check"
