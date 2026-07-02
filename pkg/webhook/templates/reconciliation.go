@@ -10,7 +10,10 @@ import (
 type SchemaChangeReconciliationData struct {
 	RequestedBy string
 	Timestamp   string
-	Items       []SchemaChangeReconciliationItem
+	// Tenant is the deployment's own tenant; when set, the pasteable stop and
+	// rollback hints carry it so the command addresses this deployment.
+	Tenant string
+	Items  []SchemaChangeReconciliationItem
 }
 
 // SchemaChangeReconciliationItem describes one database/environment whose live
@@ -46,9 +49,9 @@ func RenderSchemaChangeReconciliationRequired(data SchemaChangeReconciliationDat
 	sb.WriteString("\n")
 
 	if reconciliationHasInProgressApply(data.Items) {
-		writeInProgressReconciliation(&sb, data.Items)
+		writeInProgressReconciliation(&sb, data.Tenant, data.Items)
 	} else {
-		writeCompletedReconciliation(&sb, data.Items)
+		writeCompletedReconciliation(&sb, data.Tenant, data.Items)
 	}
 
 	return sb.String()
@@ -108,23 +111,23 @@ func reconciliationHasInProgressApply(items []SchemaChangeReconciliationItem) bo
 	return false
 }
 
-func writeInProgressReconciliation(sb *strings.Builder, items []SchemaChangeReconciliationItem) {
+func writeInProgressReconciliation(sb *strings.Builder, tenant string, items []SchemaChangeReconciliationItem) {
 	sb.WriteString("SchemaBot is still applying a schema change from this PR, but the current PR no longer contains that change.\n\n")
 	sb.WriteString("The live database operation was already started and may continue independently of the current PR diff.\n\n")
 	sb.WriteString("### What to do next\n\n")
 	sb.WriteString("1. First, resolve the in-flight apply:\n")
 	sb.WriteString("   - Wait for SchemaBot to post the final apply result, or\n")
 	sb.WriteString("   - If stopping is supported for this database, comment:\n")
-	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", stopCommand(items))
+	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", stopCommand(tenant, items))
 	sb.WriteString("\n2. Then reconcile the final live schema:\n")
 	sb.WriteString("   - If the live schema change should remain, add the schema change back to the PR, then comment:\n")
 	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", planCommand(items))
 	sb.WriteString("   - If the live schema change should not remain, roll it back:\n")
-	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", rollbackCommand(items))
+	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", rollbackCommand(tenant, items))
 	sb.WriteString("     After rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan.\n")
 }
 
-func writeCompletedReconciliation(sb *strings.Builder, items []SchemaChangeReconciliationItem) {
+func writeCompletedReconciliation(sb *strings.Builder, tenant string, items []SchemaChangeReconciliationItem) {
 	sb.WriteString("SchemaBot already applied a schema change from this PR, but the current PR no longer contains that change.\n\n")
 	sb.WriteString("The live database was already updated and may no longer match the current PR schema files.\n\n")
 	sb.WriteString("### What to do next\n\n")
@@ -135,7 +138,7 @@ func writeCompletedReconciliation(sb *strings.Builder, items []SchemaChangeRecon
 	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", planCommand(items))
 	sb.WriteString("\n2. Undo the live schema change:\n")
 	sb.WriteString("   - comment:\n")
-	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", rollbackCommand(items))
+	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", rollbackCommand(tenant, items))
 	sb.WriteString("   - after rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan\n")
 }
 
@@ -151,20 +154,20 @@ func planCommand(items []SchemaChangeReconciliationItem) string {
 	return cmd
 }
 
-func stopCommand(items []SchemaChangeReconciliationItem) string {
+func stopCommand(tenant string, items []SchemaChangeReconciliationItem) string {
 	item, ok := singleCommandItem(items)
 	if !ok || item.ApplyID == "" {
-		return "schemabot stop <apply-id> -e <environment>"
+		return appendTenantFlag("schemabot stop <apply-id> -e <environment>", tenant)
 	}
-	return fmt.Sprintf("schemabot stop %s -e %s", item.ApplyID, item.Environment)
+	return appendTenantFlag(fmt.Sprintf("schemabot stop %s -e %s", item.ApplyID, item.Environment), tenant)
 }
 
-func rollbackCommand(items []SchemaChangeReconciliationItem) string {
+func rollbackCommand(tenant string, items []SchemaChangeReconciliationItem) string {
 	item, ok := singleCommandItem(items)
 	if !ok || item.ApplyID == "" {
-		return "schemabot rollback <apply-id> -e <environment>"
+		return appendTenantFlag("schemabot rollback <apply-id> -e <environment>", tenant)
 	}
-	return fmt.Sprintf("schemabot rollback %s -e %s", item.ApplyID, item.Environment)
+	return appendTenantFlag(fmt.Sprintf("schemabot rollback %s -e %s", item.ApplyID, item.Environment), tenant)
 }
 
 func singleCommandItem(items []SchemaChangeReconciliationItem) (SchemaChangeReconciliationItem, bool) {
