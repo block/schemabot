@@ -128,9 +128,12 @@ func RenderPlanComment(data PlanCommentData) string {
 	// Detailed changes
 	writeKeyspaceChanges(&sb, data)
 
-	// Unsafe changes warning
-	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 {
-		writeUnsafeWarning(&sb, data.UnsafeChanges, data.AllowUnsafe, data.IsMySQL)
+	// Unsafe changes warning — shown on the plan comment for review, omitted on
+	// the locked apply comment: unsafe changes only reach an apply after the
+	// operator acknowledged them with --allow-unsafe (apply-confirm re-checks
+	// and blocks otherwise), so repeating them there is noise.
+	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && !data.IsLocked {
+		writeUnsafeWarning(&sb, data.UnsafeChanges, data.IsMySQL)
 	}
 
 	// Lint violations — shown on the plan comment for review, omitted on the
@@ -521,12 +524,8 @@ func planShardList(shards []string) string {
 	return "shards " + strings.Join(quoted, ", ")
 }
 
-func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, allowUnsafe bool, isMySQL bool) {
-	if allowUnsafe {
-		sb.WriteString("**🚨 Unsafe Changes** (`--allow-unsafe` enabled):\n")
-	} else {
-		sb.WriteString("**⛔ Unsafe Changes Detected:**\n")
-	}
+func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
+	sb.WriteString("**⛔ Unsafe Changes Detected:**\n")
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -820,7 +819,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 
 	// Unsafe changes warning
 	if plan.HasUnsafeChanges && len(plan.UnsafeChanges) > 0 {
-		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.AllowUnsafe, plan.IsMySQL)
+		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.IsMySQL)
 	}
 
 	// Lint violations

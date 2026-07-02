@@ -8,7 +8,6 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
-	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -233,7 +232,7 @@ func (h *Handler) executeApply(
 		State:       apply.State,
 		Engine:      schemaResult.Type,
 	})
-	h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, progressBody)
+	h.postInitialProgressComment(ctx, repo, pr, installationID, applyID, progressBody)
 
 	// Update stored check state to in_progress (transitions action_required to in_progress).
 	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID); err != nil {

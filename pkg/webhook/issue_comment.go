@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -440,6 +441,82 @@ func (h *Handler) postAndTrackComment(
 	if err := h.service.Storage().ApplyComments().Upsert(ctx, comment); err != nil {
 		h.logger.Error("failed to store comment ID",
 			"applyID", applyID, "commentState", commentState, "commentID", commentID, "error", err)
+	}
+}
+
+// postInitialProgressComment posts the initial progress comment for a freshly
+// accepted apply and, when the apply reached a terminal state before the
+// comment landed, finalizes the comment in place. The driver's observer can
+// only edit a tracked comment that exists: an apply that finishes faster than
+// this post (for example a metadata-only DDL) has already had its terminal
+// callback find nothing to edit, so the freshly posted comment would otherwise
+// stay frozen at its starting state after the summary comment. Re-checking the
+// apply after the post closes that window from this side — whichever of the
+// observer's terminal edit and this finalize runs last converges the comment
+// on the terminal rendering.
+func (h *Handler) postInitialProgressComment(ctx context.Context, repo string, pr int, installationID int64, applyID int64, body string) {
+	h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, body)
+
+	apply, err := h.service.Storage().Applies().Get(ctx, applyID)
+	if err != nil {
+		h.logger.Error("failed to re-check apply state after initial progress comment; if the apply already finished, its progress comment stays at the starting state",
+			"repo", repo, "pr", pr, "error", err)
+		return
+	}
+	if apply == nil {
+		h.logger.Error("apply missing when re-checking state after initial progress comment",
+			"repo", repo, "pr", pr)
+		return
+	}
+	if !state.IsTerminalApplyState(apply.State) {
+		h.logger.Debug("apply is still active after initial progress comment; the observer owns all further edits",
+			apply.LogAttrs()...)
+		return
+	}
+
+	h.logger.Info("apply reached a terminal state before its initial progress comment; finalizing the comment in place",
+		apply.LogAttrs()...)
+
+	comment, err := h.service.Storage().ApplyComments().Get(ctx, applyID, state.Comment.Progress)
+	if err != nil {
+		h.logger.Error("failed to load tracked progress comment for finalization",
+			append(apply.LogAttrs(), "error", err)...)
+		return
+	}
+	if comment == nil {
+		// Nothing to finalize: either the GitHub post itself failed, or the post
+		// succeeded but the tracking upsert did not (postAndTrackComment logged
+		// which). In the latter case a comment exists on the PR with no stored
+		// ID to edit, so it stays at its starting state until reconciliation.
+		h.logger.Debug("no tracked progress comment to finalize for terminal apply",
+			apply.LogAttrs()...)
+		return
+	}
+	if comment.EditCount > 0 {
+		// The observer has already found and edited the tracked comment, so its
+		// terminal edit lands (or has landed) with the full per-operation
+		// rendering. Skipping keeps this no-operations fallback from
+		// overwriting that richer body.
+		h.logger.Debug("observer already edits the tracked progress comment; skipping handler finalize",
+			apply.LogAttrs()...)
+		return
+	}
+
+	client, err := h.clientForRepo(repo, installationID)
+	if err != nil {
+		h.logger.Error("failed to create GitHub client to finalize progress comment",
+			append(apply.LogAttrs(), "error", err)...)
+		return
+	}
+	finalBody := formatProgressComment(apply, nil, nil)
+	if err := client.EditIssueComment(ctx, repo, comment.GitHubCommentID, h.renderPRComment(finalBody)); err != nil {
+		h.logger.Error("failed to finalize progress comment for already-terminal apply",
+			append(apply.LogAttrs(), "github_comment_id", comment.GitHubCommentID, "error", err)...)
+		return
+	}
+	if err := h.service.Storage().ApplyComments().IncrementEditCount(ctx, applyID, state.Comment.Progress); err != nil {
+		h.logger.Error("failed to increment edit count after finalizing progress comment",
+			append(apply.LogAttrs(), "error", err)...)
 	}
 }
 

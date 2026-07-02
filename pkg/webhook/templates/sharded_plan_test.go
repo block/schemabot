@@ -32,6 +32,36 @@ func TestRenderPlanComment_LintShownOnPlanNotOnApply(t *testing.T) {
 	assert.NotContains(t, apply, "Column added without DEFAULT value")
 }
 
+// Unsafe-change warnings belong on the plan comment, where the operator reviews
+// them before applying. Unsafe changes only reach an apply after the operator
+// acknowledged them with --allow-unsafe (apply-confirm re-checks and blocks
+// otherwise), so the locked apply comment omits the warning block as noise.
+func TestRenderPlanComment_UnsafeShownOnPlanNotOnApply(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` DROP COLUMN `email`"},
+		}},
+		HasUnsafeChanges: true,
+		AllowUnsafe:      true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "users", Reason: "DROP COLUMN is destructive"},
+		},
+	}
+
+	plan := RenderPlanComment(data)
+	assert.Contains(t, plan, "⛔ Unsafe Changes Detected", "the plan comment surfaces unsafe changes for review")
+	assert.Contains(t, plan, "DROP COLUMN is destructive")
+
+	data.IsLocked = true
+	apply := RenderPlanComment(data)
+	assert.NotContains(t, apply, "⛔ Unsafe Changes Detected", "the locked apply comment omits the unsafe warning as noise")
+	assert.NotContains(t, apply, "DROP COLUMN is destructive")
+	assert.NotContains(t, apply, "Destructive drop guidance", "the drop guidance rides inside the unsafe block and is omitted with it")
+	assert.Contains(t, apply, "DROP COLUMN `email`", "the DDL itself stays visible on the apply comment")
+}
+
 // A sharded plan whose shards diverge renders "what applies where": one DDL
 // block per distinct change set, each labelled with the shards it applies to.
 func TestRenderPlanComment_ShardedDivergent(t *testing.T) {

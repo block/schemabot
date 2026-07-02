@@ -899,3 +899,132 @@ func TestE2EEditTrackedCommentNotFound(t *testing.T) {
 		// expected: no edit
 	}
 }
+
+// An apply can reach a terminal state before its initial progress comment is
+// posted — a metadata-only DDL finishes faster than the handler's post, so the
+// driver's observer has already found nothing to edit at terminal. The handler
+// re-checks the apply after posting and finalizes the comment in place, so the
+// PR never shows a progress comment frozen at "Starting" after the success
+// summary. An apply that is still active is left to the observer to edit.
+func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
+	ctx := t.Context()
+
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
+	st := mysqlstore.New(schemabotDB)
+
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM apply_comments WHERE apply_id IN (SELECT id FROM applies WHERE repository = 'org/fastapply-repo')")
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM applies WHERE repository = 'org/fastapply-repo'")
+
+	newApply := func(t *testing.T, applyState string) *storage.Apply {
+		t.Helper()
+		apply := &storage.Apply{
+			ApplyIdentifier: fmt.Sprintf("apply_e2e_fast_%d", time.Now().UnixNano()),
+			PlanID:          1,
+			Database:        "e2e_fast_db",
+			DatabaseType:    "mysql",
+			Repository:      "org/fastapply-repo",
+			PullRequest:     7,
+			Environment:     "staging",
+			InstallationID:  12345,
+			Engine:          "spirit",
+			State:           applyState,
+		}
+		applyID, err := st.Applies().Create(ctx, apply)
+		require.NoError(t, err)
+		apply.ID = applyID
+		return apply
+	}
+
+	newHandler := func(t *testing.T) (*Handler, *commentCapture) {
+		t.Helper()
+		installClient, capture := setupFakeGitHubForComments(t)
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		svc := api.New(st, &api.ServerConfig{}, nil, logger)
+		h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger)
+		return h, capture
+	}
+
+	t.Run("already-terminal apply finalizes the comment in place", func(t *testing.T) {
+		apply := newApply(t, state.Apply.Completed)
+		h, capture := newHandler(t)
+
+		pending := *apply
+		pending.State = state.Apply.Pending
+		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID,
+			formatProgressComment(&pending, nil, nil))
+
+		var created commentCreate
+		select {
+		case created = <-capture.creates:
+			assert.Contains(t, created.Body, "**Status**: Starting")
+		case <-time.After(webhookIntegrationCheckRunDeadline):
+			t.Fatal("timed out waiting for the initial progress comment")
+		}
+
+		select {
+		case edited := <-capture.edits:
+			assert.Equal(t, created.ID, edited.CommentID, "the finalize edits the just-posted comment")
+			assert.Contains(t, edited.Body, "**Status**: Applied")
+			assert.NotContains(t, edited.Body, "**Status**: Starting")
+		case <-time.After(webhookIntegrationCheckRunDeadline):
+			t.Fatal("timed out waiting for the terminal finalize edit")
+		}
+
+		comment, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, comment)
+		assert.Equal(t, 1, comment.EditCount)
+	})
+
+	t.Run("observer-edited comment is not overwritten by the finalize", func(t *testing.T) {
+		apply := newApply(t, state.Apply.Completed)
+		h, capture := newHandler(t)
+
+		// The observer already found and edited the tracked comment; its
+		// terminal edit carries the full per-operation rendering, so the
+		// handler's no-operations fallback must not overwrite it.
+		require.NoError(t, st.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+			ApplyID: apply.ID, CommentState: state.Comment.Progress, GitHubCommentID: 424242,
+		}))
+		require.NoError(t, st.ApplyComments().IncrementEditCount(ctx, apply.ID, state.Comment.Progress))
+
+		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID,
+			formatProgressComment(apply, nil, nil))
+
+		select {
+		case <-capture.creates:
+		case <-time.After(webhookIntegrationCheckRunDeadline):
+			t.Fatal("timed out waiting for the initial progress comment")
+		}
+
+		select {
+		case edited := <-capture.edits:
+			t.Fatalf("an observer-edited comment must not be finalized by the handler, got edit: %q", edited.Body)
+		case <-time.After(500 * time.Millisecond):
+			// expected: the observer's terminal edit owns the final body
+		}
+	})
+
+	t.Run("active apply is left to the observer", func(t *testing.T) {
+		apply := newApply(t, state.Apply.Running)
+		h, capture := newHandler(t)
+
+		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID,
+			formatProgressComment(apply, nil, nil))
+
+		select {
+		case <-capture.creates:
+		case <-time.After(webhookIntegrationCheckRunDeadline):
+			t.Fatal("timed out waiting for the initial progress comment")
+		}
+
+		select {
+		case edited := <-capture.edits:
+			t.Fatalf("active apply must not be finalized by the handler, got edit: %q", edited.Body)
+		case <-time.After(500 * time.Millisecond):
+			// expected: the observer owns all further edits
+		}
+	})
+}
