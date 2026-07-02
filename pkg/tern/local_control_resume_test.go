@@ -368,6 +368,10 @@ func TestResumeApplyMissingPlanFailsApply(t *testing.T) {
 	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.Failed),
 		"apply with no plan row must fail, got %s", applyStore.apply.State)
 	assert.Equal(t, "plan not found during recovery", applyStore.apply.ErrorMessage)
+	assert.NotNil(t, applyStore.apply.CompletedAt, "a failed apply must record its completion time")
+	assert.True(t, state.IsState(tasks[0].State, state.Task.Failed),
+		"in-flight task must fail with its apply, got %s", tasks[0].State)
+	assert.Equal(t, "plan not found during recovery", tasks[0].ErrorMessage)
 	require.Len(t, observer.terminal, 1)
 	assert.True(t, state.IsState(observer.terminal[0].State, state.Apply.Failed))
 }

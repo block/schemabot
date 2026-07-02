@@ -1336,11 +1336,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	if plan == nil {
 		c.logger.Warn("plan row does not exist for apply; recovery cannot rebuild the reviewed DDL, marking apply failed",
 			apply.LogAttrs()...)
-		apply.State = state.Apply.Failed
-		apply.ErrorMessage = "plan not found during recovery"
-		if err := c.storage.Applies().Update(ctx, apply); err != nil {
-			c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
-		}
+		c.failApplyWithTasks(ctx, apply, tasks, "plan not found during recovery")
 		c.notifyTerminalObserver(apply, tasks)
 		return nil
 	}
