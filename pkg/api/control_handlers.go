@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
@@ -227,6 +228,19 @@ func controlOperationCaller(caller string) string {
 	return caller
 }
 
+// resolveCaller returns the identity an operation is attributed to: the
+// authenticated caller when the request carried a real identity (API auth
+// enabled), otherwise the caller supplied in the request. The authenticated
+// identity wins so a direct-API action is auditable to the verified user rather
+// than a client-supplied string; with auth disabled (or on paths with no
+// authenticated user, like control-plane dispatch) the request caller is used
+// unchanged.
+func resolveCaller(ctx context.Context, requestCaller string) string {
+	if subject, ok := auth.AuthenticatedSubject(ctx); ok {
+		return subject
+	}
+	return requestCaller
+}
 func (s *Service) logControlOperationForApply(ctx context.Context, apply *storage.Apply, caller, eventType, message string) {
 	logStore := s.storage.ApplyLogs()
 	if logStore == nil {
@@ -490,6 +504,7 @@ func (s *Service) ExecuteCutover(ctx context.Context, req apitypes.ControlReques
 // returns a zero status, and callers must derive the response status from the
 // error (e.g. via writeControlError).
 func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.ControlResponse, int, error) {
+	caller = resolveCaller(ctx, caller)
 	controlStore := s.storage.ControlRequests()
 	if controlStore == nil {
 		err := fmt.Errorf("control request store is not available")
@@ -704,6 +719,7 @@ func (s *Service) ExecuteStop(ctx context.Context, req apitypes.ControlRequest) 
 // err == nil; every error path returns a zero status, and callers must derive
 // the response status from the error (e.g. via writeControlError).
 func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) (*apitypes.StopResponse, int, error) {
+	caller = resolveCaller(ctx, caller)
 	if apply.Engine == storage.EnginePlanetScale {
 		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "stop is not supported for this schema change; use cancel to permanently cancel it")
@@ -938,6 +954,7 @@ func (s *Service) ExecuteCancel(ctx context.Context, req apitypes.ControlRequest
 }
 
 func (s *Service) executeCancelForApply(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) (*apitypes.CancelResponse, int, error) {
+	caller = resolveCaller(ctx, caller)
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
 		metrics.RecordControlOperation(ctx, "cancel", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlConflictf("schema change is already terminal (current state: %s)", apply.State)
@@ -1298,6 +1315,7 @@ func (s *Service) ExecuteStart(ctx context.Context, req apitypes.ControlRequest)
 // zero status, and callers must derive the response status from the error (e.g.
 // via writeControlError).
 func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) (*apitypes.StartResponse, int, error) {
+	caller = resolveCaller(ctx, caller)
 	if err := validateStartRequestState(apply); err != nil {
 		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, err
@@ -1764,6 +1782,7 @@ func (s *Service) ExecuteRelease(ctx context.Context, req apitypes.ControlReques
 // HTTP status is meaningful only when err == nil; every error path returns a
 // zero status, and callers derive the response status from the error.
 func (s *Service) executeReleaseForApply(ctx context.Context, apply *storage.Apply, caller string) (*apitypes.ReleaseResponse, int, error) {
+	caller = resolveCaller(ctx, caller)
 	if err := s.validateReleaseRequestState(ctx, apply); err != nil {
 		s.recordReleaseRejectionMetric(ctx, apply, err)
 		return nil, 0, err
@@ -1893,6 +1912,7 @@ type VolumeRequest struct {
 	ApplyID     string `json:"apply_id"`
 	Environment string `json:"environment"`
 	Volume      int32  `json:"volume"` // 1-11 (1=conservative, 11=aggressive)
+	Caller      string `json:"caller,omitempty"`
 }
 
 // handleVolume handles POST /api/volume requests.
@@ -1919,6 +1939,10 @@ func (s *Service) handleVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metrics.RecordControlOperation(r.Context(), "volume", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
+	if resp.Accepted {
+		s.logControlOperationForApply(r.Context(), apply, resolveCaller(r.Context(), req.Caller), storage.LogEventInfo,
+			fmt.Sprintf("Volume changed from %d to %d", resp.PreviousVolume, resp.NewVolume))
+	}
 
 	s.writeJSON(w, http.StatusOK, &apitypes.VolumeResponse{
 		Accepted:       resp.Accepted,
@@ -1966,6 +1990,7 @@ func (s *Service) ExecuteRevert(ctx context.Context, req apitypes.ControlRequest
 // revert. The returned HTTP status is meaningful only when err == nil; error
 // paths return a zero status and callers derive it from the error.
 func (s *Service) executeRevertForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.ControlResponse, int, error) {
+	caller = resolveCaller(ctx, caller)
 	// Revert undoes a PlanetScale deploy request in its revert window; other
 	// engines hard-error it. Gate on the engine so a non-PlanetScale apply can
 	// never accumulate a permanently-pending revert request.
@@ -2078,6 +2103,7 @@ func (s *Service) ExecuteSkipRevert(ctx context.Context, req apitypes.ControlReq
 // immediate skip. The returned HTTP status is meaningful only when err == nil;
 // error paths return a zero status and callers derive it from the error.
 func (s *Service) executeSkipRevertForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.ControlResponse, int, error) {
+	caller = resolveCaller(ctx, caller)
 	// Skip-revert closes a PlanetScale revert window; other engines hard-error
 	// it. Gate on the engine so a non-PlanetScale apply can never accumulate a
 	// permanently-pending skip-revert request.

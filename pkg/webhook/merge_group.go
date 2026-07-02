@@ -80,6 +80,23 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 		return
 	}
 
+	// An aggregate participant's checks are never required — the leader owns
+	// the required aggregate and posts it on the merge-group commit — so a
+	// participant posting here would only re-add the per-tenant rows the
+	// aggregate removes. A silent participant cannot wedge the queue: only
+	// required checks gate a merge-group entry.
+	if h.isAggregateParticipant(repo) {
+		h.logger.Info("aggregate participant staying silent on merge_group; the leader posts the required checks",
+			"repo", repo, "head_sha", headSHA, "installation_id", installationID)
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "merge_group_check",
+			Repository: repo,
+			Status:     "skipped",
+		})
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "merge_group ignored (aggregate participant, staying silent)"})
+		return
+	}
+
 	// When check publishing is disabled for this repo, SchemaBot's check is not
 	// required either, so skipping the merge-group check is correct.
 	if !h.shouldPublishChecks(ctx, repo, "merge_group_check") {

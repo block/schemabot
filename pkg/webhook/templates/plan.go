@@ -876,11 +876,18 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 }
 
 func tenantCommand(baseCommand, environment, tenant string) string {
-	command := fmt.Sprintf("%s -e %s", baseCommand, environment)
-	if tenant != "" {
-		command += fmt.Sprintf(" --tenant %s", tenant)
+	return appendTenantFlag(fmt.Sprintf("%s -e %s", baseCommand, environment), tenant)
+}
+
+// appendTenantFlag appends the --tenant flag to a pasteable command hint when
+// tenant is set. In tenant mode, commands without an explicit tenant target
+// are ignored, so every command hint a user may copy-paste must carry the
+// deployment's tenant.
+func appendTenantFlag(command, tenant string) string {
+	if tenant == "" {
+		return command
 	}
-	return command
+	return fmt.Sprintf("%s --tenant %s", command, tenant)
 }
 
 // allPlansIdentical returns true if all environments have identical changes.

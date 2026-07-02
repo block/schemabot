@@ -326,6 +326,15 @@ func (ic *InstallationClient) FindAllConfigsForPR(ctx context.Context, repo stri
 // hand use this directly to avoid re-listing them; FindAllConfigsForPR is the
 // convenience wrapper that fetches the files first.
 func (ic *InstallationClient) FindConfigsForPRFiles(ctx context.Context, repo, ref string, files []PRFile) ([]DiscoveredConfig, error) {
+	// Changed schema files usually share ancestor directories (adding or
+	// deleting a schema tree touches many files under one root), so probe
+	// results are memoized per directory: each unique directory is fetched at
+	// most once per discovery pass. This bounds the GitHub call volume by the
+	// number of unique directories rather than changed files × directory
+	// depth, keeping discovery for large PRs within the webhook processing
+	// deadline.
+	probes := make(configProbeCache)
+
 	configsByPath := make(map[string]DiscoveredConfig)
 	for _, file := range files {
 		if !isConfigFile(file.Filename) {
@@ -340,6 +349,7 @@ func (ic *InstallationClient) FindConfigsForPRFiles(ctx context.Context, repo, r
 			return nil, fmt.Errorf("fetch changed config %s: %w", file.Filename, err)
 		}
 		configsByPath[configDir] = newDiscoveredConfig(config, configDir)
+		probes[configDir] = config
 	}
 
 	var filenames []string
@@ -348,7 +358,7 @@ func (ic *InstallationClient) FindConfigsForPRFiles(ctx context.Context, repo, r
 	}
 	schemaFiles := filterSchemaFiles(filenames)
 	for _, schemaFile := range schemaFiles {
-		config, configDir, err := ic.findNearestConfig(ctx, repo, ref, schemaFile)
+		config, configDir, err := ic.findNearestConfig(ctx, repo, ref, schemaFile, probes)
 		if err != nil {
 			return nil, err
 		}
@@ -433,16 +443,45 @@ func filterSchemaFiles(files []string) []string {
 	return result
 }
 
-func (ic *InstallationClient) findNearestConfig(ctx context.Context, repo, ref, filePath string) (*SchemabotConfig, string, error) {
+// configProbeCache memoizes per-directory config probe results within one
+// discovery pass. A key that maps to nil records a directory known to have no
+// schemabot.yaml, so the walk never re-fetches it for another file.
+//
+// Keys are directory paths only, so a cache is valid for exactly one
+// (repo, ref) pair — always ref a single immutable commit SHA and never reuse
+// a cache across refs. Not safe for concurrent use; probing in parallel
+// requires external synchronization.
+type configProbeCache map[string]*SchemabotConfig
+
+// probeConfigDir fetches the config for dir, consulting and populating the
+// cache. It returns (nil, nil) when the directory has no schemabot.yaml.
+// Transient errors are returned without being cached so a retry can succeed.
+func (ic *InstallationClient) probeConfigDir(ctx context.Context, repo, ref, dir string, probes configProbeCache) (*SchemabotConfig, error) {
+	if config, ok := probes[dir]; ok {
+		return config, nil
+	}
+	config, err := ic.FetchConfig(ctx, repo, configPathForDir(dir), ref)
+	if err != nil {
+		if errors.Is(err, ErrNoConfig) {
+			probes[dir] = nil
+			return nil, nil
+		}
+		return nil, err
+	}
+	probes[dir] = config
+	return config, nil
+}
+
+func (ic *InstallationClient) findNearestConfig(ctx context.Context, repo, ref, filePath string, probes configProbeCache) (*SchemabotConfig, string, error) {
 	dir := path.Dir(filePath)
 
 	for {
-		config, err := ic.FetchConfig(ctx, repo, configPathForDir(dir), ref)
-		if err == nil {
-			return config, dir, nil
-		}
-		if !errors.Is(err, ErrNoConfig) {
+		config, err := ic.probeConfigDir(ctx, repo, ref, dir, probes)
+		if err != nil {
 			return nil, "", err
+		}
+		if config != nil {
+			return config, dir, nil
 		}
 
 		if dir == "." || dir == "" {

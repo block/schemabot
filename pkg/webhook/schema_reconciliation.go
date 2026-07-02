@@ -39,6 +39,7 @@ func (h *Handler) handleNoManagedSchemaChangesForCommand(ctx context.Context, cl
 			"database", databaseName, "action", commandName,
 			"record_count", len(records))
 		h.postComment(repo, pr, installationID, templates.RenderSchemaChangeReconciliationRequired(templates.SchemaChangeReconciliationData{
+			Tenant:      h.deploymentTenant(),
 			RequestedBy: requestedBy,
 			Timestamp:   templates.NowFunc().UTC().Format("2006-01-02 15:04:05"),
 			Items:       schemaChangeReconciliationItems(records),

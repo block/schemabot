@@ -120,6 +120,8 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 type reviewGatePolicy struct {
 	AdminTeams         []string
 	AdminUsers         []string
+	RepoAdminTeams     []string
+	RepoAdminUsers     []string
 	OperatorTeams      []string
 	OperatorUsers      []string
 	CodeownerReviewers map[string]struct{}
@@ -137,6 +139,18 @@ func (p reviewGatePolicy) Matches(ctx context.Context, client *ghclient.Installa
 		}
 	}
 	if matched, principal := matchedUserPrincipal(p.AdminUsers, reviewer); matched {
+		return true, principal, nil
+	}
+	if len(p.RepoAdminTeams) > 0 {
+		matched, principal, err := actorInAnyTeam(ctx, client, p.RepoAdminTeams, reviewer)
+		if err != nil {
+			return false, "", err
+		}
+		if matched {
+			return true, principal, nil
+		}
+	}
+	if matched, principal := matchedUserPrincipal(p.RepoAdminUsers, reviewer); matched {
 		return true, principal, nil
 	}
 	if len(p.OperatorTeams) > 0 {
@@ -163,9 +177,12 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 	}
 	config := h.service.Config()
 	reviewPolicy := config.ReviewPolicy
+	repoAdminTeams, repoAdminUsers := config.RepoAdmins(repo)
 	policy := reviewGatePolicy{
 		AdminTeams:         reviewPolicy.AdminTeams,
 		AdminUsers:         reviewPolicy.AdminUsers,
+		RepoAdminTeams:     repoAdminTeams,
+		RepoAdminUsers:     repoAdminUsers,
 		CodeownerReviewers: make(map[string]struct{}),
 	}
 	appendRequiredReviewers := func(values ...[]string) {
@@ -175,7 +192,7 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 			}
 		}
 	}
-	appendRequiredReviewers(reviewPolicy.AdminTeams, reviewPolicy.AdminUsers)
+	appendRequiredReviewers(reviewPolicy.AdminTeams, reviewPolicy.AdminUsers, repoAdminTeams, repoAdminUsers)
 
 	if config.ReviewPolicyIncludesDatabaseOperators() {
 		dbConfig := config.Database(database)

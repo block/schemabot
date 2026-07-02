@@ -7,19 +7,23 @@ import (
 )
 
 // RenderRollbackMissingArguments renders the message posted when `schemabot rollback`
-// is invoked without an apply ID and without an `-e` flag.
+// is invoked without an apply ID and without an `-e` flag. The usage line keeps
+// the tenant flag in optional form because this message also renders on
+// untenanted deployments.
 func RenderRollbackMissingArguments() string {
 	return "## Missing Arguments\n\n" +
-		"Usage: `schemabot rollback <apply-id> -e <environment>`\n\n" +
+		"Usage: `schemabot rollback <apply-id> -e <environment> [-t <tenant>]`\n\n" +
 		"Rollback requires both an apply ID and the `-e` flag to select the target environment."
 }
 
 // RenderRollbackMissingEnv renders the message posted when `schemabot rollback`
 // is invoked with an apply ID but no `-e` flag. Distinct from RenderMissingEnv —
-// the rollback variant tailors the example usage to rollback semantics.
+// the rollback variant tailors the example usage to rollback semantics. The
+// usage line keeps the tenant flag in optional form because this message also
+// renders on untenanted deployments.
 func RenderRollbackMissingEnv() string {
 	return "## Missing Environment\n\n" +
-		"Usage: `schemabot rollback <apply-id> -e <environment>`\n\n" +
+		"Usage: `schemabot rollback <apply-id> -e <environment> [-t <tenant>]`\n\n" +
 		"The `-e` flag is required to select the target environment."
 }
 

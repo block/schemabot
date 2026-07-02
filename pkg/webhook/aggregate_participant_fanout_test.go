@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -13,20 +14,27 @@ import (
 // On an aggregate repo, an unscoped fan-out command that resolves to schema this
 // deployment doesn't own is a silent no-op — the deployment that does own it
 // handles the command, so no "config not authorized" comment is posted. This is
-// the leader's behavior on a PR that touches only a participant's database
-// (e.g. kgoose): it gates on the participant's check but applies nothing itself.
-// A -t-scoped command, a non-aggregate repo, or a real error still surfaces.
+// the leader's behavior on a PR that touches only a participant's database: it
+// gates on the participant's check but applies nothing itself. The same applies
+// when the discovered database has no entry in this deployment's registry at
+// all — under the aggregate contract another deployment owns it. A -t-scoped
+// command, a non-aggregate repo, or a real error still surfaces.
 func TestSkipUnownedUnscopedCommand(t *testing.T) {
-	cfg := &api.ServerConfig{Repos: map[string]api.RepoConfig{
-		"octocat/participant-repo": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}},
-		"octocat/leader-repo": {Aggregate: &api.AggregateConfig{
-			Role:            api.AggregateRoleLeader,
-			ExpectedTenants: []api.ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"tenant-b/schema"}, CheckName: "SchemaBot Tenant B"}},
-		}},
-		"octocat/plain-repo": {},
-	}}
+	cfg := &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{
+			"octocat/participant-repo": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}},
+			"octocat/leader-repo": {Aggregate: &api.AggregateConfig{
+				Role:            api.AggregateRoleLeader,
+				ExpectedTenants: []api.ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"tenant-b/schema"}, CheckName: "SchemaBot Tenant B"}},
+			}},
+			"octocat/plain-repo": {},
+		},
+		Databases: map[string]api.DatabaseConfig{
+			"inventory": {Type: "mysql", Environments: map[string]api.EnvironmentConfig{"staging": {}}},
+		},
+	}
 	h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
-	notOwned := &schemaConfigOutsideAllowedDirsError{Database: "kgoose", SchemaPath: "kgoose/schema"}
+	notOwned := &schemaConfigOutsideAllowedDirsError{Database: "orders", SchemaPath: "tenant-b/schema"}
 
 	assert.True(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "", notOwned),
 		"a participant silently skips an unowned unscoped command")
@@ -40,6 +48,27 @@ func TestSkipUnownedUnscopedCommand(t *testing.T) {
 		"an unconfigured repo has no aggregate role — keep the error")
 	assert.False(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "", errors.New("github unavailable")),
 		"a real error is not the not-owned case and must still surface")
+
+	// The exact error the environment validator produces when a fan-out command
+	// discovers a database absent from this deployment's registry: skipped on
+	// aggregate repos, still surfaced for -t-scoped commands and plain repos.
+	notConfigured := h.validateRequestedDatabaseEnvironment("orders", "staging")
+	require.Error(t, notConfigured)
+	assert.True(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "", notConfigured),
+		"a participant silently skips a database missing from its registry")
+	assert.True(t, h.skipUnownedUnscopedCommand("octocat/leader-repo", "", notConfigured),
+		"a leader silently skips a participant-owned database missing from its registry")
+	assert.False(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "tenant-b", notConfigured),
+		"a -t-scoped command named a deployment, so the error still surfaces")
+	assert.False(t, h.skipUnownedUnscopedCommand("octocat/plain-repo", "", notConfigured),
+		"a non-aggregate repo is a single deployment — the error is useful, keep it")
+
+	// A registered database with an unconfigured environment is a real user
+	// error on this deployment, not an ownership signal — never skipped.
+	envNotConfigured := h.validateRequestedDatabaseEnvironment("inventory", "production")
+	require.Error(t, envNotConfigured)
+	assert.False(t, h.skipUnownedUnscopedCommand("octocat/leader-repo", "", envNotConfigured),
+		"an unconfigured environment for an owned database must still surface")
 }
 
 // On an aggregate repo an unscoped command fans out to every deployment, so a

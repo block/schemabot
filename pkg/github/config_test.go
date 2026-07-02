@@ -4,12 +4,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -245,6 +247,72 @@ func TestFindAllConfigsForPRDiscoversChangedConfigFile(t *testing.T) {
 	require.Len(t, configs, 1)
 	assert.Equal(t, "widgets", configs[0].Config.Database)
 	assert.Equal(t, "apps/widgets/schema", configs[0].SchemaDir)
+}
+
+// TestFindConfigsForPRFilesProbesEachDirectoryOnce exercises discovery for a
+// PR that touches many schema files under shared directory trees — the shape
+// of an onboarding PR that adds a declarative schema root while deleting a
+// legacy SQL tree. Discovery must fetch each candidate directory's
+// schemabot.yaml at most once, so the GitHub call volume is bounded by the
+// number of unique directories rather than changed files × directory depth,
+// and large PRs complete within the webhook processing deadline.
+func TestFindConfigsForPRFilesProbesEachDirectoryOnce(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+
+	var files []*gh.CommitFile
+	for i := range 40 {
+		files = append(files, &gh.CommitFile{
+			Filename: new(fmt.Sprintf("apps/widgets/service/resources/legacy-sql/v%04d__change.sql", i)),
+			Status:   new("removed"),
+		})
+	}
+	for i := range 10 {
+		files = append(files, &gh.CommitFile{
+			Filename: new(fmt.Sprintf("apps/widgets/service/resources/schema/widgets/table_%d.sql", i)),
+			Status:   new("added"),
+		})
+	}
+	registerPullRequestFiles(t, mux, files)
+
+	var mu sync.Mutex
+	probesByPath := make(map[string]int)
+	countProbe := func(r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		probesByPath[r.URL.Path]++
+	}
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/apps/widgets/service/resources/schema/schemabot.yaml", func(w http.ResponseWriter, r *http.Request) {
+		countProbe(r)
+		require.NoError(t, json.NewEncoder(w).Encode(gh.RepositoryContent{
+			Type:     new("file"),
+			Encoding: new("base64"),
+			Content:  new(base64.StdEncoding.EncodeToString([]byte("database: widgets\ntype: mysql\n"))),
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/", func(w http.ResponseWriter, r *http.Request) {
+		countProbe(r)
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	configs, err := ic.FindAllConfigsForPR(t.Context(), "octocat/hello-world", 1)
+
+	require.NoError(t, err)
+	require.Len(t, configs, 1)
+	assert.Equal(t, "widgets", configs[0].Config.Database)
+	assert.Equal(t, "apps/widgets/service/resources/schema", configs[0].SchemaDir)
+
+	// Every candidate directory between the changed files and the repo root,
+	// deduplicated: the two file trees share ancestors, so the probe count
+	// must not scale with the number of changed files.
+	mu.Lock()
+	defer mu.Unlock()
+	for probePath, count := range probesByPath {
+		assert.Equalf(t, 1, count, "directory probed more than once: %s", probePath)
+	}
+	assert.Len(t, probesByPath, 8)
 }
 
 func TestFindConfigForPRDiscoversChangedConfigFile(t *testing.T) {

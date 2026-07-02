@@ -49,9 +49,9 @@ func RenderRollbackPlanComment(data PlanCommentData) string {
 	// Footer
 	sb.WriteString("---\n\n")
 	sb.WriteString("To confirm this rollback, comment:\n")
-	fmt.Fprintf(&sb, "```\nschemabot rollback-confirm -e %s\n```\n\n", data.Environment)
+	fmt.Fprintf(&sb, "```\n%s\n```\n\n", tenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant))
 	sb.WriteString("To cancel, comment:\n")
-	fmt.Fprintf(&sb, "```\nschemabot unlock\n```\n")
+	fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag("schemabot unlock", data.Tenant))
 
 	return sb.String()
 }
@@ -67,28 +67,32 @@ func RenderRollbackNoCompletedApply(database, environment string) string {
 }
 
 // RenderRollbackConfirmNoLock renders a message when rollback-confirm is run
-// without a held lock.
-func RenderRollbackConfirmNoLock(database, environment string) string {
+// without a held lock. Tenant is the deployment's own tenant; when set, the
+// suggested command carries it so pasting the hint addresses this deployment.
+func RenderRollbackConfirmNoLock(database, environment, tenant string) string {
+	rollbackCmd := tenantCommand("schemabot rollback <apply-id>", environment, tenant)
 	if database == "" {
 		return fmt.Sprintf("## 🔒 No Lock Found\n\n"+
 			"**Environment**: `%s`\n\n"+
-			"No rollback lock is held by this PR. Run `schemabot rollback <apply-id> -e %s` first to generate a rollback plan.",
-			environment, environment)
+			"No rollback lock is held by this PR. Run `%s` first to generate a rollback plan.",
+			environment, rollbackCmd)
 	}
 	return fmt.Sprintf("## 🔒 No Lock Found\n\n"+
 		"**Database**: `%s` | **Environment**: `%s`\n\n"+
-		"No rollback lock is held. Run `schemabot rollback <apply-id> -e %s` first to generate a rollback plan.",
-		database, environment, environment)
+		"No rollback lock is held. Run `%s` first to generate a rollback plan.",
+		database, environment, rollbackCmd)
 }
 
 // RenderRollbackMissingApplyID renders the message posted when `schemabot rollback`
-// is invoked without an apply ID argument.
-func RenderRollbackMissingApplyID() string {
+// is invoked without an apply ID argument. Tenant is the deployment's own
+// tenant; when set, the suggested commands carry it so pasting a hint
+// addresses this deployment.
+func RenderRollbackMissingApplyID(tenant string) string {
 	return "## Missing Apply ID\n\n" +
-		"Usage: `schemabot rollback <apply-id> -e <environment>`\n\n" +
-		"Confirm a generated rollback with `schemabot rollback-confirm -e <environment>`.\n\n" +
+		fmt.Sprintf("Usage: `%s`\n\n", tenantCommand("schemabot rollback <apply-id>", "<environment>", tenant)) +
+		fmt.Sprintf("Confirm a generated rollback with `%s`.\n\n", tenantCommand("schemabot rollback-confirm", "<environment>", tenant)) +
 		"You can find the apply ID in the summary comment of a completed apply, " +
-		"or by running `schemabot status`."
+		fmt.Sprintf("or by running `%s`.", appendTenantFlag("schemabot status", tenant))
 }
 
 // RenderRollbackApplyNotFound renders the message posted when the supplied apply ID
@@ -144,16 +148,19 @@ func sanitizedRollbackRejectionReason(reason string) string {
 // RenderRollbackBlockedByLock renders the message posted when a rollback cannot
 // acquire the database lock because another caller holds it. When lockRepo and
 // lockPR are populated, the holder is rendered as a PR link; otherwise the bare
-// owner string is shown.
-func RenderRollbackBlockedByLock(database, environment, lockOwner, lockRepo string, lockPR int) string {
+// owner string is shown. Tenant is the deployment's own tenant; when set, the
+// suggested unlock command carries it so pasting the hint addresses this
+// deployment.
+func RenderRollbackBlockedByLock(database, environment, lockOwner, lockRepo string, lockPR int, tenant string) string {
 	if lockPR > 0 && lockRepo != "" {
 		return fmt.Sprintf("## Rollback Blocked\n\n"+
 			"**Database**: `%s` | **Environment**: `%s`\n\n"+
 			"A lock is currently held by [%s#%d](https://github.com/%s/pull/%d).\n\n"+
-			"Wait for that operation to complete, or ask the lock owner to run `schemabot unlock`.",
+			"Wait for that operation to complete, or ask the lock owner to run `%s`.",
 			database, environment,
 			lockRepo, lockPR,
-			lockRepo, lockPR)
+			lockRepo, lockPR,
+			appendTenantFlag("schemabot unlock", tenant))
 	}
 	return fmt.Sprintf("## Rollback Blocked\n\n"+
 		"**Database**: `%s` | **Environment**: `%s`\n\n"+
@@ -193,17 +200,21 @@ func RenderRollbackAlreadyRolledBack(database, environment string) string {
 // RenderRollbackAlreadyRolledBackLockHeld renders the message posted when
 // rollback-confirm finds no changes remain but the database lock could not be
 // released. The lock continues to block applies on the database until an
-// operator releases it.
-func RenderRollbackAlreadyRolledBackLockHeld(database, environment, lockOwner string) string {
+// operator releases it. Tenant is the deployment's own tenant; when set, the
+// suggested unlock commands carry it so pasting a hint addresses this
+// deployment.
+func RenderRollbackAlreadyRolledBackLockHeld(database, environment, lockOwner, tenant string) string {
 	return fmt.Sprintf("## Already Rolled Back\n\n"+
 		"**Database**: `%s` | **Environment**: `%s`\n\n"+
 		"The database schema already matches the original state, but SchemaBot failed to release the lock held by `%s`. "+
 		"Applies on this database will be blocked until the lock is released.\n\n"+
 		"Release it by commenting:\n"+
-		"```\nschemabot unlock\n```\n"+
+		"```\n%s\n```\n"+
 		"If the lock persists, force-release it:\n"+
-		"```\nschemabot unlock -d %s --force\n```",
-		database, environment, lockOwner, database)
+		"```\n%s\n```",
+		database, environment, lockOwner,
+		appendTenantFlag("schemabot unlock", tenant),
+		appendTenantFlag(fmt.Sprintf("schemabot unlock -d %s --force", database), tenant))
 }
 
 // RenderRollbackNotAccepted renders the message posted when the apply service

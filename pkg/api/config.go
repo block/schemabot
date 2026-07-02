@@ -715,6 +715,26 @@ type RepoConfig struct {
 	// set of tenants expected to report). Nil means the repository uses the
 	// standard single-deployment check behavior.
 	Aggregate *AggregateConfig `yaml:"aggregate,omitempty"`
+
+	// AdminTeams are GitHub teams whose members may run mutating PR comment
+	// commands and whose PR approvals satisfy the review gate for every
+	// database managed through this repository. Scoped between the global
+	// admin policy (every database) and per-database operators (one database).
+	AdminTeams []string `yaml:"admin_teams,omitempty"`
+
+	// AdminUsers are GitHub users with the same repository-scoped authority
+	// as AdminTeams.
+	AdminUsers []string `yaml:"admin_users,omitempty"`
+}
+
+// RepoAdmins returns the repository-scoped admin principals configured for
+// repo. A repository with no config entry has no repo admins.
+func (c *ServerConfig) RepoAdmins(repo string) (teams, users []string) {
+	repoConfig, ok := c.Repos[repo]
+	if !ok {
+		return nil, nil
+	}
+	return repoConfig.AdminTeams, repoConfig.AdminUsers
 }
 
 // DeploymentTarget is one entry in EnvironmentConfig.Deployments. It carries
@@ -903,6 +923,9 @@ func (c *ServerConfig) Validate() error {
 
 	for repo, repoConfig := range c.Repos {
 		if err := validateAggregateConfig(repo, repoConfig.Aggregate); err != nil {
+			return err
+		}
+		if err := validateRepoActorAuthorization(repo, repoConfig); err != nil {
 			return err
 		}
 	}
@@ -1300,15 +1323,29 @@ func (c *ServerConfig) OnFailure(database, environment string) string {
 	return env.OnFailure
 }
 
+// DatabaseNotConfiguredError reports that a database has no entry in this
+// server's databases registry. Callers use it to distinguish "this server does
+// not own the database" from other configuration failures — on repos where
+// deployments share PR commands, a database missing from the registry means
+// another deployment owns the work.
+type DatabaseNotConfiguredError struct {
+	Database string
+}
+
+func (e *DatabaseNotConfiguredError) Error() string {
+	return fmt.Sprintf("database %q is not configured on this server", e.Database)
+}
+
 // DatabaseEnvironments returns the environments configured server-side for a
-// database, ordered by the server-owned promotion order.
+// database, ordered by the server-owned promotion order. Returns
+// *DatabaseNotConfiguredError when the database has no registry entry.
 func (c *ServerConfig) DatabaseEnvironments(database string) ([]string, error) {
 	if c == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
 	db := c.Database(database)
 	if db == nil {
-		return nil, fmt.Errorf("database %q is not configured on this server", database)
+		return nil, &DatabaseNotConfiguredError{Database: database}
 	}
 	environments := make([]string, 0, len(db.Environments))
 	for environment := range db.Environments {
@@ -1516,6 +1553,20 @@ func (c *ServerConfig) AreChecksEnabled(repo string) bool {
 type ResolvedGitHubApp struct {
 	Name   string
 	Config GitHubAppConfig
+}
+
+// TrustedCheckAppSlugsForRepo returns the trusted sibling SchemaBot App slugs
+// configured for the App that owns repo, or nil when the repo resolves to no
+// App. Callers use this to recognize a sibling deployment by its bot identity
+// (login "<slug>[bot]") with the same trust set that gates Check Run reads.
+func (c *ServerConfig) TrustedCheckAppSlugsForRepo(repo string) []string {
+	app, err := c.ResolveGitHubAppForRepo(repo)
+	if err != nil {
+		slog.Warn("no GitHub App resolves for repo; treating its trusted check App slugs as empty",
+			"repo", repo, "error", err)
+		return nil
+	}
+	return app.Config.TrustedCheckAppSlugs
 }
 
 // ResolveGitHubAppForRepo returns the GitHub App that owns webhooks and

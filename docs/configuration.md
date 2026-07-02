@@ -418,6 +418,13 @@ review_policy:
   include_database_operators: true   # default: true
   include_codeowners: false          # default: false
 
+repos:
+  myorg/monorepo:
+    admin_teams:
+      - myorg/monorepo-maintainers
+    admin_users:
+      - some-maintainer
+
 databases:
   payments:
     type: mysql
@@ -431,8 +438,13 @@ databases:
 When enabled, SchemaBot checks PR approval before proceeding. A satisfying review can come from:
 
 1. `review_policy.admin_teams` or `review_policy.admin_users`, which apply to every configured database.
-2. The target database's `operator_teams` or `operator_users` when `include_database_operators` is true.
-3. Matching CODEOWNERS when `include_codeowners` is true.
+2. The PR repository's `admin_teams` or `admin_users` (under `repos:`), which apply to every database managed through that repository.
+3. The target database's `operator_teams` or `operator_users` when `include_database_operators` is true.
+4. Matching CODEOWNERS when `include_codeowners` is true.
+
+Repo admins sit between the global admin policy and per-database operators: they hold authority over every database whose schema changes flow through their repository — useful for monorepo maintainers — without gaining authority over databases managed through other repositories. The same principals may also run mutating PR comment commands when `pr_command_authorization` is enabled.
+
+> **Note:** a populated `repos:` map doubles as a repository allowlist — once any repository is listed, only listed repositories may use SchemaBot. If you add a repo entry solely to configure its admins, make sure every other repository this deployment serves is also listed, or they will be rejected as unregistered.
 
 The PR author's own approval never counts, even if they match one of the configured principals. If the GitHub API fails while checking reviews or team membership, SchemaBot blocks the apply and posts an error comment.
 

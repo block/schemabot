@@ -57,7 +57,7 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 	environment string,
 	commandName string,
 ) bool {
-	result, err := h.authorizePRCommandActor(ctx, client, requestedBy, database)
+	result, err := h.authorizePRCommandActor(ctx, client, requestedBy, repo, database)
 	status := actorAuthorizationMetricStatus(result, err)
 	metrics.RecordPRCommandActorAuthorization(ctx, metricActionKey(commandName), database, environment, repo, status, result.Reason)
 
@@ -129,6 +129,7 @@ func (h *Handler) authorizePRCommandActor(
 	ctx context.Context,
 	client *ghclient.InstallationClient,
 	actor string,
+	repo string,
 	database string,
 ) (api.ActorAuthorizationResult, error) {
 	// Without server config, SchemaBot cannot know the trusted actor policy.
@@ -147,13 +148,14 @@ func (h *Handler) authorizePRCommandActor(
 		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonMissingActor}, nil
 	}
 
-	return h.authorizeConfiguredDatabaseActor(ctx, client, actor, database)
+	return h.authorizeConfiguredDatabaseActor(ctx, client, actor, repo, database)
 }
 
 func (h *Handler) authorizeConfiguredDatabaseActor(
 	ctx context.Context,
 	client *ghclient.InstallationClient,
 	actor string,
+	repo string,
 	database string,
 ) (api.ActorAuthorizationResult, error) {
 	// Without server config, SchemaBot cannot know the trusted actor policy.
@@ -175,8 +177,9 @@ func (h *Handler) authorizeConfiguredDatabaseActor(
 	}
 
 	authConfig := config.PRCommandAuthorization
-	teamCount := len(authConfig.AdminTeams) + len(dbConfig.OperatorTeams)
-	principalCount := teamCount + len(authConfig.AdminUsers) + len(dbConfig.OperatorUsers)
+	repoAdminTeams, repoAdminUsers := config.RepoAdmins(repo)
+	teamCount := len(authConfig.AdminTeams) + len(repoAdminTeams) + len(dbConfig.OperatorTeams)
+	principalCount := teamCount + len(authConfig.AdminUsers) + len(repoAdminUsers) + len(dbConfig.OperatorUsers)
 	// Actor auth is enabled but no admin/operator principals exist for this
 	// database. Fail closed instead of treating an empty policy as "allow all".
 	if principalCount == 0 {
@@ -203,11 +206,40 @@ func (h *Handler) authorizeConfiguredDatabaseActor(
 	}
 
 	// Global admin users are checked after admin teams and before any
-	// database-scoped operator policy.
+	// repository- or database-scoped policy.
 	if matched, principal := matchedUserPrincipal(authConfig.AdminUsers, actor); matched {
 		return api.ActorAuthorizationResult{
 			Allowed:          true,
 			Reason:           api.ActorAuthReasonAllowedAdminUser,
+			MatchedPrincipal: principal,
+		}, nil
+	}
+
+	// Repository admin teams authorize every database managed through the PR's
+	// repository.
+	if len(repoAdminTeams) > 0 {
+		if client == nil {
+			return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, fmt.Errorf("github client is nil")
+		}
+		matched, principal, err := actorInAnyTeam(ctx, client, repoAdminTeams, actor)
+		if err != nil {
+			return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, err
+		}
+		if matched {
+			return api.ActorAuthorizationResult{
+				Allowed:          true,
+				Reason:           api.ActorAuthReasonAllowedRepoAdminTeam,
+				MatchedPrincipal: principal,
+			}, nil
+		}
+	}
+
+	// Repository admin users are checked after repo admin teams and before any
+	// database-scoped operator policy.
+	if matched, principal := matchedUserPrincipal(repoAdminUsers, actor); matched {
+		return api.ActorAuthorizationResult{
+			Allowed:          true,
+			Reason:           api.ActorAuthReasonAllowedRepoAdminUser,
 			MatchedPrincipal: principal,
 		}, nil
 	}

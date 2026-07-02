@@ -39,7 +39,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	if err != nil {
 		if h.skipUnownedUnscopedCommand(repo, result.Tenant, err) {
 			h.logger.Debug("unscoped fan-out apply touches no schema this deployment owns; staying silent",
-				"repo", repo, "pr", pr, "environment", environment)
+				"repo", repo, "pr", pr, "environment", environment, "error", err)
 			return
 		}
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err)
@@ -317,7 +317,7 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	if err != nil {
 		if h.skipUnownedUnscopedCommand(repo, result.Tenant, err) {
 			h.logger.Debug("unscoped fan-out apply-confirm touches no schema this deployment owns; staying silent",
-				"repo", repo, "pr", pr, "environment", environment)
+				"repo", repo, "pr", pr, "environment", environment, "error", err)
 			return
 		}
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err)

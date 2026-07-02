@@ -245,3 +245,56 @@ func TestWebhookMergeGroupSingleAggregateWhenNoEnvScoping(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// An aggregate participant's checks are never required, so it posts nothing on
+// a merge-group commit — the leader publishes the required aggregate there.
+// Without this silence, every queue entry would re-grow the per-tenant check
+// rows the aggregate removes from PR heads.
+func TestWebhookMergeGroupParticipantStaysSilent(t *testing.T) {
+	h, created := mergeGroupTestHandler(t,
+		[]string{"production"},
+		map[string]api.RepoConfig{"octocat/hello-world": {
+			Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant},
+		}},
+	)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, buildMergeGroupWebhookRequest(t, "checks_requested", "mergesha123", nil))
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "aggregate participant, staying silent")
+
+	select {
+	case c := <-created:
+		t.Fatalf("participant posted a merge_group check run: %q", c.Name)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// The aggregate leader keeps posting its required checks on merge-group
+// commits — silence is participant-only, so the queue never wedges.
+func TestWebhookMergeGroupLeaderStillPosts(t *testing.T) {
+	h, created := mergeGroupTestHandler(t,
+		[]string{"production"},
+		map[string]api.RepoConfig{"octocat/hello-world": {
+			Aggregate: &api.AggregateConfig{
+				Role:            api.AggregateRoleLeader,
+				ExpectedTenants: []api.ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"tenant-b/schema"}, CheckName: "SchemaBot Tenant B"}},
+			},
+		}},
+	)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, buildMergeGroupWebhookRequest(t, "checks_requested", "mergesha123", nil))
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "merge_group checks posted")
+
+	select {
+	case c := <-created:
+		assert.Equal(t, "SchemaBot (production)", c.Name)
+		assert.Equal(t, "success", c.Conclusion)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the leader's merge_group check run")
+	}
+}
