@@ -702,7 +702,9 @@ func (c *LocalClient) resolveTasklessApplyForSettle(ctx context.Context, targetA
 // what the tasked cancel path does after markTasksWithState. Terminal states
 // are never rewritten: an already-cancelled apply is accepted idempotently, and
 // a completed/failed/reverted apply keeps its outcome (only a stopped apply,
-// which cancel may still terminate, is moved to cancelled).
+// which cancel may still terminate, is moved to cancelled). The apply's
+// dual-written apply_operations rows settle to cancelled alongside it, so
+// operation-level claiming never sees a live operation under a cancelled apply.
 func (c *LocalClient) settleCancelForTasklessApply(ctx context.Context, targetApply *storage.Apply, caller string) (*ternv1.CancelResponse, error) {
 	apply, err := c.resolveTasklessApplyForSettle(ctx, targetApply, "cancel")
 	if err != nil {
@@ -729,8 +731,75 @@ func (c *LocalClient) settleCancelForTasklessApply(ctx context.Context, targetAp
 	apply.UpdatedAt = now
 	c.logger.Info("cancel settled task-less apply as cancelled",
 		append(apply.LogAttrs(), "previous_state", previousState, "requested_by", caller)...)
+	c.settleOperationRowsForTasklessApply(ctx, apply, state.ApplyOperation.Cancelled)
 	c.notifyTerminalObserver(apply, nil)
 	return &ternv1.CancelResponse{Accepted: true}, nil
+}
+
+// settleOperationRowsForTasklessApply moves the settled apply's dual-written
+// apply_operations rows to the apply's settled state so the operation rows
+// agree with the apply row the task-less settle just wrote. The settle runs
+// inside a claimed drive, so the lease in ctx guards each write and a lost
+// claim fails closed in storage. A load or write failure is logged, never
+// returned: the apply-level settle is the authoritative outcome, and the next
+// operation claim's terminal-parent reconciliation settles any row this pass
+// could not move.
+func (c *LocalClient) settleOperationRowsForTasklessApply(ctx context.Context, apply *storage.Apply, operationState string) {
+	ops, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		c.logger.Error("task-less settle could not load operation rows; the apply is settled and the next operation claim will reconcile them",
+			append(apply.LogAttrs(), "target_operation_state", operationState, "error", err)...)
+		return
+	}
+	for _, op := range ops {
+		if !operationRowSettlesWithTasklessApply(op.State, operationState) {
+			c.logger.Info("task-less settle leaving terminal operation row unchanged",
+				append(apply.LogAttrs(),
+					"apply_operation_id", op.ID,
+					"operation_deployment", op.Deployment,
+					"operation_state", op.State,
+					"target_operation_state", operationState)...)
+			continue
+		}
+		var writeErr error
+		if state.IsState(operationState, state.ApplyOperation.Stopped) {
+			// stopped is resumable: mirror the state but keep completed_at nil,
+			// matching the apply-level convention.
+			writeErr = c.storage.ApplyOperations().UpdateState(ctx, op.ID, operationState)
+		} else {
+			writeErr = c.storage.ApplyOperations().MarkTerminal(ctx, op.ID, operationState)
+		}
+		if writeErr != nil {
+			c.logger.Error("task-less settle could not move operation row to the apply's settled state; the next operation claim will reconcile it",
+				append(apply.LogAttrs(),
+					"apply_operation_id", op.ID,
+					"operation_deployment", op.Deployment,
+					"operation_state", op.State,
+					"target_operation_state", operationState,
+					"error", writeErr)...)
+			continue
+		}
+		c.logger.Info("task-less settle moved operation row to the apply's settled state",
+			append(apply.LogAttrs(),
+				"apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment,
+				"previous_operation_state", op.State,
+				"operation_state", operationState)...)
+	}
+}
+
+// operationRowSettlesWithTasklessApply reports whether a task-less settle may
+// move an operation row from its current state to the apply's settled state.
+// It mirrors the apply-level settle's terminal discipline: a terminal row keeps
+// its outcome, except that a cancel settle still terminalizes a stopped row —
+// stopped is the one terminal state cancel may move, exactly as the apply-level
+// cancel settle moves a stopped apply to cancelled.
+func operationRowSettlesWithTasklessApply(currentState, settledState string) bool {
+	if !state.IsApplyOperationTerminal(currentState) {
+		return true
+	}
+	return state.IsState(settledState, state.ApplyOperation.Cancelled) &&
+		state.IsState(currentState, state.ApplyOperation.Stopped)
 }
 
 // settleStopForTasklessApply terminalizes a stop whose resolved apply owns no
@@ -742,7 +811,9 @@ func (c *LocalClient) settleCancelForTasklessApply(ctx context.Context, targetAp
 // stopped (not cancelled): stop is the resumable operator verb, and a stopped
 // task-less apply stays eligible for a later cancel. Terminal states are never
 // rewritten: an already-terminal apply (stopped included) is accepted without a
-// state change so the pending stop request resolves.
+// state change so the pending stop request resolves. The apply's dual-written
+// apply_operations rows settle to stopped alongside it, keeping the resumable
+// operation rows consistent with the stopped apply.
 func (c *LocalClient) settleStopForTasklessApply(ctx context.Context, targetApply *storage.Apply, caller string) (*ternv1.StopResponse, error) {
 	apply, err := c.resolveTasklessApplyForSettle(ctx, targetApply, "stop")
 	if err != nil {
@@ -771,6 +842,7 @@ func (c *LocalClient) settleStopForTasklessApply(ctx context.Context, targetAppl
 	apply.UpdatedAt = time.Now()
 	c.logger.Info("stop settled task-less apply as stopped",
 		append(apply.LogAttrs(), "previous_state", previousState, "requested_by", caller)...)
+	c.settleOperationRowsForTasklessApply(ctx, apply, state.ApplyOperation.Stopped)
 	c.notifyTerminalObserver(apply, nil)
 	return &ternv1.StopResponse{Accepted: true}, nil
 }

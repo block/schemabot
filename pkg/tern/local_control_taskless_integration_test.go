@@ -183,6 +183,15 @@ func TestLocalClient_CancelQueuedTasklessApplySettlesCancelled(t *testing.T) {
 	assert.Equal(t, state.Apply.Cancelled, settled.State, "a cancelled queued task-less apply must settle to cancelled")
 	assert.NotNil(t, settled.CompletedAt, "a cancelled apply must carry its completion time")
 
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, ops, "a dispatched apply must dual-write its operation row")
+	for _, op := range ops {
+		assert.Equal(t, state.ApplyOperation.Cancelled, op.State,
+			"the operation row must settle to cancelled alongside its apply")
+		assert.NotNil(t, op.CompletedAt, "a cancelled operation row must carry its completion time")
+	}
+
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestCompleted)
 	assert.Equal(t, engineCallsBeforeDrive, eng.recorded(),
 		"settling a task-less cancel must never invoke the engine")
@@ -227,6 +236,15 @@ func TestLocalClient_StopQueuedTasklessApplySettlesStopped(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, settled)
 	assert.Equal(t, state.Apply.Stopped, settled.State, "a stopped queued task-less apply must settle to stopped")
+
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, ops, "a dispatched apply must dual-write its operation row")
+	for _, op := range ops {
+		assert.Equal(t, state.ApplyOperation.Stopped, op.State,
+			"the operation row must settle to stopped alongside its apply")
+		assert.Nil(t, op.CompletedAt, "a stopped operation row is resumable and must keep completed_at nil")
+	}
 
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationStop, storage.ControlRequestCompleted)
 	assert.Equal(t, engineCallsBeforeDrive, eng.recorded(),

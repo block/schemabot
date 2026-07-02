@@ -1984,8 +1984,12 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		fmt.Sprintf("Apply queued: %s", applyIdentifier), "", state.Apply.Pending)
 
 	// Register any pending observer under the created apply's ID before queueing.
-	// The operator drives through this same client instance, so the drive finds
-	// the observer in the registry regardless of when the claim happens.
+	// The observer registry is per-client-instance: in-process dispatchers — the
+	// only callers that set a pending observer — resolve this client from the
+	// same client cache (service client map or target router) the operator's
+	// drive resolves it from, so the drive finds the observer regardless of when
+	// the claim happens. Wire dispatches never set a pending observer, so a
+	// data-plane operator driving through its own client has no observer to lose.
 	if obs := c.consumePendingObserver(); obs != nil {
 		// Set the apply ID on the observer if it supports it (e.g., CommentObserver
 		// needs the ID to look up tracked comments for editing).
