@@ -466,18 +466,20 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 // volume set during one schema change never carries into a later one.
 func (e *Engine) setSchemaChangeVolume(rm *runningSchemaChange, volume int32, threads int, chunkTime, lockTimeout time.Duration) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.runningSchemaChange != rm {
+	tracked := e.runningSchemaChange == rm
+	if tracked {
+		rm.volume = volume
+		rm.threads = threads
+		rm.targetChunkTime = chunkTime
+		rm.lockWaitTimeout = lockTimeout
+	}
+	e.mu.Unlock()
+	if !tracked {
 		e.logger.Warn("volume adjustment target is no longer the tracked schema change; settings not applied",
 			"database", rm.database,
 			"volume", volume,
 		)
-		return
 	}
-	rm.volume = volume
-	rm.threads = threads
-	rm.targetChunkTime = chunkTime
-	rm.lockWaitTimeout = lockTimeout
 }
 
 func (e *Engine) setVolumeRestartInProgress(rm *runningSchemaChange, inProgress bool) {
