@@ -101,6 +101,22 @@ func TestUnscopedApplyOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 		assert.Empty(t, comments, "non-owning deployment must not post a comment for an unscoped fan-out apply")
 	})
 
+	// A tenant deployment receives the same fan-out for a PR touching only a
+	// database the leader owns; it must stay just as silent as the leader does
+	// for a participant-owned database.
+	t.Run("unscoped apply on participant deployment stays silent", func(t *testing.T) {
+		cfg := aggregateLeaderConfig()
+		repoCfg := cfg.Repos["octocat/hello-world"]
+		repoCfg.Aggregate = &api.AggregateConfig{Role: api.AggregateRoleParticipant}
+		cfg.Repos["octocat/hello-world"] = repoCfg
+		h, mux, comments := newFanOutSkipHandler(t, cfg)
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+
+		assert.Empty(t, comments, "a participant must not post Apply Failed for a database another deployment owns")
+	})
+
 	t.Run("tenant-scoped apply still reports the error", func(t *testing.T) {
 		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
