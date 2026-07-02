@@ -1,6 +1,7 @@
 package spirit
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -291,5 +292,182 @@ func TestVolumeReportsRunningWhileStoredStoppedStateRestarts(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for volume change")
 	}
+	eng.Drain()
+}
+
+// registerRunningSchemaChange installs a simulated running schema change on the
+// engine, carrying the engine's configured default copy settings the same way
+// Apply initializes a change. The caller drives the change's lifecycle through
+// rm.wg.
+func registerRunningSchemaChange(eng *Engine) *runningSchemaChange {
+	rm := &runningSchemaChange{
+		database:        "testdb",
+		tableNamespace:  map[string]string{},
+		state:           engine.StateRunning,
+		host:            "127.0.0.1:1",
+		username:        "root",
+		threads:         eng.threads,
+		targetChunkTime: eng.targetChunkTime,
+		lockWaitTimeout: eng.lockWaitTimeout,
+	}
+	eng.mu.Lock()
+	eng.runningSchemaChange = rm
+	eng.mu.Unlock()
+	return rm
+}
+
+// adjustVolume drives a Volume call through its stop/retune/restart sequence
+// against a schema change whose driver goroutine is simulated via rm.wg, and
+// returns the volume result.
+func adjustVolume(t *testing.T, eng *Engine, rm *runningSchemaChange, volume int32) *engine.VolumeResult {
+	t.Helper()
+	rm.wg.Add(1)
+
+	type volumeOutcome struct {
+		result *engine.VolumeResult
+		err    error
+	}
+	outCh := make(chan volumeOutcome, 1)
+	go func() {
+		result, err := eng.Volume(t.Context(), &engine.VolumeRequest{
+			Database:    rm.database,
+			Volume:      volume,
+			Credentials: &engine.Credentials{DSN: "root@tcp(127.0.0.1:1)/testdb"},
+		})
+		outCh <- volumeOutcome{result: result, err: err}
+	}()
+
+	// Volume stops the change and waits for its driver goroutine before
+	// restarting; release the simulated goroutine once the stop is observed.
+	require.Eventually(t, func() bool {
+		eng.mu.Lock()
+		defer eng.mu.Unlock()
+		return rm.state == engine.StateStopped && rm.volumeRestartInProgress
+	}, 5*time.Second, 10*time.Millisecond, "volume change did not stop the schema change")
+	rm.wg.Done()
+
+	select {
+	case out := <-outCh:
+		require.NoError(t, out.err)
+		return out.result
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for volume change to complete")
+		return nil
+	}
+}
+
+// A volume set while a schema change is running is scoped to that change: the
+// engine's configured defaults are untouched, and the next schema change starts
+// from the defaults again rather than inheriting the earlier retune.
+func TestVolumeScopedToRunningSchemaChange(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+
+	result := adjustVolume(t, eng, rm, 11)
+	assert.Equal(t, int32(11), result.NewVolume)
+
+	wantThreads, wantChunkTime, wantLockTimeout := volumeToSpiritSettings(11, 0)
+	eng.mu.Lock()
+	assert.Equal(t, wantThreads, rm.threads)
+	assert.Equal(t, wantChunkTime, rm.targetChunkTime)
+	assert.Equal(t, wantLockTimeout, rm.lockWaitTimeout)
+	assert.Equal(t, int32(11), rm.volume)
+	eng.mu.Unlock()
+
+	// The engine's configured defaults are not modified by the adjustment.
+	assert.Equal(t, DefaultThreads, eng.threads)
+	assert.Equal(t, DefaultTargetChunkTime, eng.targetChunkTime)
+	assert.Equal(t, DefaultLockWaitTimeout, eng.lockWaitTimeout)
+
+	eng.Drain()
+
+	// A new schema change starts from the configured defaults. The apply
+	// targets an unreachable host, so execution fails immediately — the copy
+	// settings are snapshotted when the change is registered, which is what
+	// this scenario verifies.
+	_, err := eng.Apply(t.Context(), &engine.ApplyRequest{
+		Database:    "testdb",
+		Credentials: &engine.Credentials{DSN: "root@tcp(127.0.0.1:1)/testdb"},
+		Changes: []engine.SchemaChange{{
+			Namespace: "testdb",
+			TableChanges: []engine.TableChange{{
+				Table: "users",
+				DDL:   "CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			}},
+		}},
+	})
+	require.NoError(t, err)
+	defer eng.Drain()
+
+	threads, chunkTime, lockTimeout := eng.copySettings()
+	assert.Equal(t, DefaultThreads, threads)
+	assert.Equal(t, DefaultTargetChunkTime, chunkTime)
+	assert.Equal(t, DefaultLockWaitTimeout, lockTimeout)
+	eng.mu.Lock()
+	assert.Equal(t, int32(0), eng.runningSchemaChange.volume)
+	eng.mu.Unlock()
+}
+
+// Volume reporting reflects the explicit volume set for the running schema
+// change, including neighboring levels that derive the same Spirit settings.
+func TestVolumeReportingUsesExplicitPerChangeValue(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+
+	// The change starts on the configured defaults, which map to volume 3.
+	result := adjustVolume(t, eng, rm, 7)
+	assert.Equal(t, int32(3), result.PreviousVolume)
+	assert.Equal(t, int32(7), result.NewVolume)
+
+	// Without a CPU hint, volumes 6 and 7 derive the same Spirit settings, so
+	// no restart is needed — and the reported previous volume is the explicit
+	// value set for this change.
+	result, err := eng.Volume(t.Context(), &engine.VolumeRequest{
+		Database:    "testdb",
+		Volume:      6,
+		Credentials: &engine.Credentials{DSN: "root@tcp(127.0.0.1:1)/testdb"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int32(7), result.PreviousVolume)
+	assert.Equal(t, int32(6), result.NewVolume)
+	assert.Contains(t, result.Message, "no restart")
+
+	eng.mu.Lock()
+	assert.Equal(t, int32(6), rm.volume)
+	eng.mu.Unlock()
+
+	eng.Drain()
+}
+
+// Copy settings are shared between volume adjustments, progress pollers, and
+// the schema change execution path; adjusting volume while the settings are
+// read concurrently must be safe.
+func TestVolumeConcurrentWithSettingsReads(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+
+	stopReaders := make(chan struct{})
+	var readers sync.WaitGroup
+	readers.Go(func() {
+		for {
+			select {
+			case <-stopReaders:
+				return
+			default:
+			}
+			threads, chunkTime, lockTimeout := eng.copySettings()
+			assert.Positive(t, threads)
+			assert.Positive(t, chunkTime)
+			assert.Positive(t, lockTimeout)
+			_, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+			assert.NoError(t, err)
+		}
+	})
+
+	result := adjustVolume(t, eng, rm, 11)
+	assert.Equal(t, int32(11), result.NewVolume)
+
+	close(stopReaders)
+	readers.Wait()
 	eng.Drain()
 }

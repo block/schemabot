@@ -50,13 +50,16 @@ type Engine struct {
 	spiritLogger *slog.Logger // Logger for Spirit (may filter debug logs)
 	linter       *lint.Linter
 
-	// Configuration
+	// Configuration. targetChunkTime, threads, and lockWaitTimeout are the
+	// configured default Spirit copy settings; they are immutable after New.
+	// Each schema change starts from these defaults and carries its own working
+	// copy on runningSchemaChange, which Volume retunes for that change only.
 	targetChunkTime     time.Duration
 	threads             int
 	lockWaitTimeout     time.Duration
 	debugLogs           bool
 	disablePendingDrops bool
-	cpuHint             int // Inferred CPU count from innodb_buffer_pool_instances (0 = unknown)
+	cpuHint             int // Inferred CPU count from innodb_buffer_pool_instances (0 = unknown); guarded by mu
 
 	// Log callback for routing Spirit logs to ApplyLogStore (with table context)
 	onLog func(level slog.Level, table, msg string)
@@ -81,6 +84,15 @@ type runningSchemaChange struct {
 	started                 time.Time
 	deferCutover            bool // Whether to defer cutover until manual trigger
 	volumeRestartInProgress bool // Set while stored stopped state should still be exposed as running progress.
+
+	// Spirit copy settings for this schema change. Initialized from the
+	// engine's configured defaults and retuned by Volume for this change only;
+	// they end with the change, so the next schema change starts from the
+	// configured defaults again.
+	threads         int
+	targetChunkTime time.Duration
+	lockWaitTimeout time.Duration
+	volume          int32 // Explicit volume set via Volume for this change (0 = never set)
 
 	// For resume support
 	cancelFunc context.CancelFunc
@@ -201,6 +213,20 @@ func (e *Engine) Drain() {
 	e.mu.Lock()
 	e.runningSchemaChange = nil
 	e.mu.Unlock()
+}
+
+// copySettings returns the Spirit copy settings for the tracked schema change,
+// falling back to the engine's configured defaults when no change is tracked.
+// Each schema change starts from the configured defaults and may be retuned by
+// Volume; the defaults themselves never change, so a volume set on one schema
+// change never affects a later one.
+func (e *Engine) copySettings() (threads int, chunkTime, lockTimeout time.Duration) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if rm := e.runningSchemaChange; rm != nil {
+		return rm.threads, rm.targetChunkTime, rm.lockWaitTimeout
+	}
+	return e.threads, e.targetChunkTime, e.lockWaitTimeout
 }
 
 // Plan computes the schema changes needed by diffing current schema against desired.
@@ -388,8 +414,14 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	e.Drain()
 
 	// Query CPU hint for volume scaling (best-effort, falls back to fixed counts)
-	if e.cpuHint == 0 {
-		e.cpuHint = e.queryCPUHint(ctx, req.Credentials.DSN)
+	e.mu.Lock()
+	cpuHint := e.cpuHint
+	e.mu.Unlock()
+	if cpuHint == 0 {
+		cpuHint = e.queryCPUHint(ctx, req.Credentials.DSN)
+		e.mu.Lock()
+		e.cpuHint = cpuHint
+		e.mu.Unlock()
 	}
 
 	// Initialize running state and start background execution.
@@ -406,16 +438,19 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	rm := &runningSchemaChange{
-		database:       database,
-		tableNamespace: tableNamespace,
-		tables:         nil, // Tables will be populated by executeSchemaChange
-		originalDDLs:   req.FlatDDL(),
-		state:          engine.StateRunning,
-		started:        time.Now(),
-		deferCutover:   deferCutover,
-		host:           host,
-		username:       username,
-		password:       password,
+		database:        database,
+		tableNamespace:  tableNamespace,
+		tables:          nil, // Tables will be populated by executeSchemaChange
+		originalDDLs:    req.FlatDDL(),
+		state:           engine.StateRunning,
+		started:         time.Now(),
+		deferCutover:    deferCutover,
+		host:            host,
+		username:        username,
+		password:        password,
+		threads:         e.threads,
+		targetChunkTime: e.targetChunkTime,
+		lockWaitTimeout: e.lockWaitTimeout,
 	}
 	e.runningSchemaChange = rm
 	e.mu.Unlock()

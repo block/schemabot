@@ -262,15 +262,16 @@ func (e *Engine) executeSingleStatement(ctx context.Context, host, username, pas
 		"type", stmtType,
 	)
 
+	threads, chunkTime, lockTimeout := e.copySettings()
 	migration := &spiritmigration.Migration{
 		Host:              host,
 		Username:          username,
 		Password:          &password,
 		Database:          database,
 		Statement:         stmt,
-		TargetChunkTime:   e.targetChunkTime,
-		Threads:           e.threads,
-		LockWaitTimeout:   e.lockWaitTimeout,
+		TargetChunkTime:   chunkTime,
+		Threads:           threads,
+		LockWaitTimeout:   lockTimeout,
 		InterpolateParams: true,
 	}
 
@@ -306,15 +307,16 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 		ddls = append(ddls, p.Statement)
 	}
 
+	threads, chunkTime, lockTimeout := e.copySettings()
 	migration := &spiritmigration.Migration{
 		Host:              host,
 		Username:          username,
 		Password:          &password,
 		Database:          database,
 		Statement:         combinedStatement,
-		TargetChunkTime:   e.targetChunkTime,
-		Threads:           e.threads,
-		LockWaitTimeout:   e.lockWaitTimeout,
+		TargetChunkTime:   chunkTime,
+		Threads:           threads,
+		LockWaitTimeout:   lockTimeout,
 		InterpolateParams: true,
 		DeferCutOver:      deferCutover,
 		RespectSentinel:   deferCutover, // Only wait for sentinel when deferring cutover
