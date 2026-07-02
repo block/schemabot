@@ -316,8 +316,10 @@ SchemaBot's internal storage schema is self-bootstrapping: on every startup,
 database and applies whatever DDL is needed before the server accepts traffic.
 
 By default, destructive statements in that diff — `DROP TABLE`, or an
-`ALTER TABLE` containing `DROP COLUMN` — are refused and skipped, while the
-remaining additive changes still apply and startup proceeds. This protects
+`ALTER TABLE` containing `DROP COLUMN` — are refused and skipped whole (a
+mixed `ALTER TABLE` is not rewritten, so its additive clauses are skipped with
+it), while the remaining non-destructive statements still apply and startup
+proceeds. This protects
 against rolling deploys and rollbacks: a pod running an older binary sees a
 newer binary's tables and columns as surplus, and without the gate would drop
 them (destroying data the newer pods depend on). Each refused statement is

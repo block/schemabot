@@ -42,7 +42,8 @@ type ensureSchemaOptions struct {
 // WithAllowDestructiveSchemaChanges controls whether EnsureSchema may execute
 // destructive DDL (DROP TABLE, or an ALTER TABLE containing DROP COLUMN)
 // against the storage database. It defaults to false: destructive statements
-// are refused and skipped while the remaining additive changes still apply.
+// are refused and skipped whole — including additive clauses in a mixed
+// ALTER TABLE — while the remaining non-destructive statements still apply.
 // Wire this from StorageConfig.AllowDestructiveSchemaChanges.
 func WithAllowDestructiveSchemaChanges(allow bool) EnsureSchemaOption {
 	return func(o *ensureSchemaOptions) { o.allowDestructive = allow }
@@ -61,7 +62,9 @@ func WithAllowDestructiveSchemaChanges(allow bool) EnsureSchemaOption {
 //
 // Destructive statements in the diff (DROP TABLE, or an ALTER TABLE containing
 // DROP COLUMN) are refused unless WithAllowDestructiveSchemaChanges(true) is
-// set. Refusal skips the statement, applies the remaining additive changes,
+// set. Refusal skips the statement whole (an ALTER TABLE that mixes additive
+// clauses with a DROP COLUMN is not rewritten — its additive clauses are
+// skipped with it), applies the remaining non-destructive statements,
 // and lets startup proceed — a deliberate exception to fail-closed, because
 // failing here would crash-loop every pod running an older binary during a
 // rolling deploy or rollback where a storage table or column was legitimately
