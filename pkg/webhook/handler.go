@@ -533,6 +533,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "merge_group":
 		h.handleMergeGroup(ctx, metricApp, w, body)
 		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
+	case "push":
+		h.handlePush(ctx, metricApp, w, body)
+		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
 	default:
 		h.logger.Info("webhook ignored",
 			"reason", "unsupported_event_type",
