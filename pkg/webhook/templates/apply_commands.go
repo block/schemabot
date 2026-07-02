@@ -53,9 +53,12 @@ func RenderPRCommandNotAuthorized(data ActorAuthorizationCommentData) string {
 		fmt.Fprintf(&sb, "The requester is not authorized to run `schemabot %s` for this database.\n\n", data.CommandName)
 	}
 	if len(data.AuthorizedPrincipals) > 0 {
+		// Principals render as inline code, never @-mentions: the list is
+		// guidance for the blocked user, and mentions would notify every
+		// admin team and operator on every rejected command.
 		sb.WriteString("**Who can run this command** — members of these teams, or these users:\n")
 		for _, principal := range data.AuthorizedPrincipals {
-			fmt.Fprintf(&sb, "- @%s\n", principal)
+			fmt.Fprintf(&sb, "- `%s`\n", principal)
 		}
 		sb.WriteString("\nAsk one of them to run it, or request membership in one of the teams above.\n")
 	} else {

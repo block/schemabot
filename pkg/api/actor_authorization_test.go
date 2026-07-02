@@ -275,6 +275,24 @@ func TestPRCommandAuthorizedPrincipals(t *testing.T) {
 		cfg.PRCommandAuthorizedPrincipals("octocat/hello-world", "unknown"),
 		"an unknown database still lists the deployment and repo admins")
 
+	normalized := &ServerConfig{
+		PRCommandAuthorization: PRCommandAuthorizationConfig{
+			Enabled:    true,
+			AdminTeams: []string{"@octocat/db-admins"},
+			AdminUsers: []string{"Kara"},
+		},
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				OperatorTeams: []string{"octocat/DB-Admins"},
+				OperatorUsers: []string{"kara", " lee "},
+			},
+		},
+	}
+	assert.Equal(t,
+		[]string{"octocat/db-admins", "Kara", "lee"},
+		normalized.PRCommandAuthorizedPrincipals("octocat/hello-world", "orders"),
+		"leading @, surrounding whitespace, and case variants collapse to one entry per principal")
+
 	var nilCfg *ServerConfig
 	assert.Nil(t, nilCfg.PRCommandAuthorizedPrincipals("octocat/hello-world", "orders"))
 }

@@ -154,11 +154,15 @@ func (c *ServerConfig) PRCommandAuthorizedPrincipals(repo, database string) []st
 	seen := map[string]bool{}
 	add := func(items []string) {
 		for _, item := range items {
-			if item == "" || seen[item] {
+			// GitHub logins and team slugs are case-insensitive, and operators
+			// sometimes configure them with a leading "@" — normalize both so
+			// the rendered list never repeats one principal in two spellings.
+			display := strings.TrimPrefix(strings.TrimSpace(item), "@")
+			if display == "" || seen[strings.ToLower(display)] {
 				continue
 			}
-			seen[item] = true
-			principals = append(principals, item)
+			seen[strings.ToLower(display)] = true
+			principals = append(principals, display)
 		}
 	}
 	add(c.PRCommandAuthorization.AdminTeams)
