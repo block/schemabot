@@ -147,6 +147,15 @@ func TestMain(m *testing.M) {
 // setupE2EService creates a real api.Service with a LocalClient for the given database.
 func setupE2EService(t *testing.T, appDBName string) *api.Service {
 	t.Helper()
+	return setupE2EServiceWithStorage(t, appDBName, nil)
+}
+
+// setupE2EServiceWithStorage is setupE2EService with a storage decorator hook.
+// A non-nil wrapStorage wraps the service's storage so a test can observe every
+// storage write the handler and observers perform (e.g. record stored check
+// state transitions).
+func setupE2EServiceWithStorage(t *testing.T, appDBName string, wrapStorage func(storage.Storage) storage.Storage) *api.Service {
+	t.Helper()
 	ctx := t.Context()
 
 	// Create the app database on the target
@@ -171,7 +180,10 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = schemabotDB.Close() })
 
-	st := mysqlstore.New(schemabotDB)
+	st := storage.Storage(mysqlstore.New(schemabotDB))
+	if wrapStorage != nil {
+		st = wrapStorage(st)
+	}
 
 	// Clean up any stale data from previous test runs (shared storage DB)
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE database_name = ?", appDBName)

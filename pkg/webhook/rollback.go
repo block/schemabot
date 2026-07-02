@@ -9,7 +9,6 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
-	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -382,53 +381,10 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 		SupportChannel: h.supportChannel(),
 		Logger:         h.logger,
 		OnTerminalHook: func(a *storage.Apply) {
-			updated, err := h.updateCheckRecordForApplyResult(context.Background(), repo, pr, a)
-			if err != nil {
-				h.logger.Error("observer: failed to update check record for rollback",
-					"repo", repo, "pr", pr, "database", a.Database,
-					"database_type", a.DatabaseType, "environment", a.Environment,
-					"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier,
-					"error", err)
-				return
-			}
-			if !updated {
-				h.logger.Debug("observer: skipping aggregate check update for rollback, apply no longer owns check state",
-					"repo", repo, "pr", pr, "database", a.Database,
-					"database_type", a.DatabaseType, "environment", a.Environment,
-					"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier)
-				return
-			}
-			if state.IsState(a.State, state.Apply.Completed) {
-				h.setCheckActionRequired(repo, pr, installationID, a)
-				return
-			}
-
-			ghInstClient, err := factory.ForInstallation(installationID)
-			if err != nil {
-				h.logger.Error("observer: failed to create GitHub client for rollback aggregate update",
-					"repo", repo, "pr", pr, "database", a.Database,
-					"database_type", a.DatabaseType, "environment", a.Environment,
-					"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier,
-					"error", err)
-				return
-			}
-			checkRecord, err := h.service.Storage().Checks().Get(context.Background(), repo, pr, a.Environment, a.DatabaseType, a.Database)
-			if err != nil {
-				h.logger.Error("observer: failed to load check record for rollback aggregate update",
-					"repo", repo, "pr", pr, "database", a.Database,
-					"database_type", a.DatabaseType, "environment", a.Environment,
-					"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier,
-					"error", err)
-				return
-			}
-			if checkRecord == nil {
-				h.logger.Error("observer: missing check record for rollback aggregate update",
-					"repo", repo, "pr", pr, "database", a.Database,
-					"database_type", a.DatabaseType, "environment", a.Environment,
-					"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier)
-				return
-			}
-			h.updateAggregateCheck(context.Background(), ghInstClient, repo, pr, checkRecord.HeadSHA)
+			// refreshChecksForTerminalApply routes a completed rollback straight
+			// to action_required so the stored check state never passes through
+			// success while the PR's schema change is reverted on the target.
+			h.refreshChecksForTerminalApply(context.Background(), a, "rollback confirm")
 		},
 	})
 	h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, observer)

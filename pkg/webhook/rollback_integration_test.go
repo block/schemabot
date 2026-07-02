@@ -5,6 +5,7 @@
 package webhook
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -13,7 +14,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -355,12 +358,126 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 	}
 }
 
+// checkWriteRecorder wraps the service's storage so a test can observe every
+// stored check state write for one database's check row. Any concurrent
+// aggregate refresh republishes the stored row to GitHub, so even a transient
+// stored success is an externally visible passing check — asserting on the
+// final row alone cannot prove the invariant that a state was never written.
+type checkWriteRecorder struct {
+	storage.Storage
+	checks *recordingCheckStore
+}
+
+func (s *checkWriteRecorder) Checks() storage.CheckStore { return s.checks }
+
+// checkWrite is one observable stored check state write: the store operation
+// that performed it and the status/conclusion it made visible.
+type checkWrite struct {
+	op         string
+	status     string
+	conclusion string
+}
+
+// recordingCheckStore records every stored check state write that lands for
+// one database's check row. Recording starts when StartRecording is called so
+// a test can scope the observation window to the flow under test.
+type recordingCheckStore struct {
+	storage.CheckStore
+	databaseName string
+
+	mu      sync.Mutex
+	enabled bool
+	writes  []checkWrite
+}
+
+func (s *recordingCheckStore) StartRecording() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.enabled = true
+}
+
+func (s *recordingCheckStore) Writes() []checkWrite {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.writes)
+}
+
+func (s *recordingCheckStore) record(op, databaseName, status, conclusion string) {
+	if databaseName != s.databaseName {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.enabled {
+		return
+	}
+	s.writes = append(s.writes, checkWrite{op: op, status: status, conclusion: conclusion})
+}
+
+func (s *recordingCheckStore) Upsert(ctx context.Context, check *storage.Check) error {
+	err := s.CheckStore.Upsert(ctx, check)
+	if err == nil {
+		s.record("upsert", check.DatabaseName, check.Status, check.Conclusion)
+	}
+	return err
+}
+
+func (s *recordingCheckStore) UpsertPlanResult(ctx context.Context, check *storage.Check) error {
+	err := s.CheckStore.UpsertPlanResult(ctx, check)
+	if err == nil {
+		s.record("upsert_plan_result", check.DatabaseName, check.Status, check.Conclusion)
+	}
+	return err
+}
+
+func (s *recordingCheckStore) RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, check *storage.Check) (bool, error) {
+	updated, err := s.CheckStore.RecoverApplyOwnedCheckWithNoOpPlan(ctx, check)
+	if err == nil && updated {
+		s.record("recover_apply_owned_check", check.DatabaseName, checkStatusCompleted, checkConclusionSuccess)
+	}
+	return updated, err
+}
+
+func (s *recordingCheckStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check) (bool, error) {
+	updated, err := s.CheckStore.MarkStalePlanSuccessful(ctx, check)
+	if err == nil && updated {
+		s.record("mark_stale_plan_successful", check.DatabaseName, checkStatusCompleted, checkConclusionSuccess)
+	}
+	return updated, err
+}
+
+func (s *recordingCheckStore) CompleteForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
+	updated, err := s.CheckStore.CompleteForApply(ctx, check, apply)
+	if err == nil && updated {
+		s.record("complete_for_apply", check.DatabaseName, check.Status, check.Conclusion)
+	}
+	return updated, err
+}
+
+func (s *recordingCheckStore) MarkActionRequiredForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
+	updated, err := s.CheckStore.MarkActionRequiredForApply(ctx, check, apply)
+	if err == nil && updated {
+		s.record("mark_action_required_for_apply", check.DatabaseName, check.Status, check.Conclusion)
+	}
+	return updated, err
+}
+
 // TestE2ERollbackConfirmUpdatesCheckToActionRequired verifies that after a
 // rollback-confirm completes, the check run transitions to action_required
-// (not success) since the PR's schema changes have been undone.
+// (not success) since the PR's schema changes have been undone. The stored
+// check state must move to action_required directly: a completed rollback
+// means the PR's change is reverted on the target, so no write in the terminal
+// path may make the stored state read as a passing check, even transiently —
+// a concurrent aggregate refresh (another database's plan, a check_run event,
+// another pod) reading that window would publish a passing required check for
+// a PR whose schema change is gone.
 func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
 	dbName := "webhook_rb_check"
-	svc := setupE2EService(t, dbName)
+	recorder := &recordingCheckStore{databaseName: dbName}
+	svc := setupE2EServiceWithStorage(t, dbName, func(st storage.Storage) storage.Storage {
+		recorder.CheckStore = st.Checks()
+		return &checkWriteRecorder{Storage: st, checks: recorder}
+	})
 	ctx := t.Context()
 
 	// Step 1: Create initial table
@@ -451,7 +568,9 @@ func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
 		t.Fatal("timed out waiting for rollback plan comment")
 	}
 
-	// Run rollback-confirm
+	// Run rollback-confirm, recording every stored check state write for this
+	// database from here on so the terminal transition can be proven direct.
+	recorder.StartRecording()
 	req = buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot rollback-confirm -e staging",
 		isPR:    true,
@@ -469,6 +588,28 @@ func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
 		return isRollbackActionRequiredWithoutApplyOwnership(check)
 	}, webhookIntegrationPollDeadline, 500*time.Millisecond,
 		"check should transition to action_required without active apply ownership after rollback")
+
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
+	assert.Equal(t, rollbackCompletedBlock.blockingReason, check.BlockingReason)
+	assert.Equal(t, rollbackCompletedBlock.message, check.ErrorMessage)
+
+	// The completed rollback's terminal transition must be in_progress →
+	// action_required with nothing in between: a stored success, however brief,
+	// is a passing required check to any concurrent aggregate reader.
+	writes := recorder.Writes()
+	require.NotEmpty(t, writes, "recorder should observe the rollback's stored check state writes")
+	for _, w := range writes {
+		assert.NotEqual(t, checkConclusionSuccess, w.conclusion,
+			"stored check state was written as success during rollback finalization (op %s, status %s)", w.op, w.status)
+	}
+	terminal := writes[len(writes)-1]
+	assert.Equal(t, "mark_action_required_for_apply", terminal.op)
+	assert.Equal(t, checkStatusCompleted, terminal.status)
+	assert.Equal(t, checkConclusionActionRequired, terminal.conclusion)
 
 	deadline := time.After(webhookIntegrationPollDeadline)
 	for {
