@@ -216,7 +216,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	}
 
 	if result.Found && result.Action == action.Rollback && result.ApplyID == "" {
-		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID())
+		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.deploymentTenant()))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing apply ID"})
 		return
 	}

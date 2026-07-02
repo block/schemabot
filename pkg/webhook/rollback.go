@@ -29,7 +29,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 
 	applyID := result.ApplyID
 	if applyID == "" {
-		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID())
+		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.deploymentTenant()))
 		return
 	}
 
@@ -128,7 +128,8 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	if existingLock != nil && existingLock.Owner != lockOwner {
 		h.postComment(repo, pr, installationID, templates.RenderRollbackBlockedByLock(
 			database, environment,
-			existingLock.Owner, existingLock.Repository, existingLock.PullRequest))
+			existingLock.Owner, existingLock.Repository, existingLock.PullRequest,
+			h.deploymentTenant()))
 		return
 	}
 
@@ -213,6 +214,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		DatabaseType: dbType,
 		IsMySQL:      dbType == "mysql",
 		ApplyID:      apply.ApplyIdentifier,
+		Tenant:       h.deploymentTenant(),
 	}
 
 	for _, sc := range planResp.Changes {
@@ -312,7 +314,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 				"repo", repo, "pr", pr, "environment", environment)
 			return
 		}
-		h.postComment(repo, pr, installationID, templates.RenderRollbackConfirmNoLock("", environment))
+		h.postComment(repo, pr, installationID, templates.RenderRollbackConfirmNoLock("", environment, h.deploymentTenant()))
 		return
 	}
 
@@ -341,7 +343,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 				"database_type", dbType, "environment", environment,
 				"lock_owner", lockOwner, "error", err)
 			h.postComment(repo, pr, installationID,
-				templates.RenderRollbackAlreadyRolledBackLockHeld(database, environment, lockOwner))
+				templates.RenderRollbackAlreadyRolledBackLockHeld(database, environment, lockOwner, h.deploymentTenant()))
 			return
 		}
 		h.postComment(repo, pr, installationID,

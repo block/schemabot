@@ -10,14 +10,14 @@ import (
 func TestRenderRollbackMissingArguments(t *testing.T) {
 	rendered := RenderRollbackMissingArguments()
 	assert.Contains(t, rendered, "## Missing Arguments")
-	assert.Contains(t, rendered, "schemabot rollback <apply-id> -e <environment>")
+	assert.Contains(t, rendered, "`schemabot rollback <apply-id> -e <environment> [-t <tenant>]`")
 	assert.Contains(t, rendered, "both an apply ID and the `-e` flag")
 }
 
 func TestRenderRollbackMissingEnv(t *testing.T) {
 	rendered := RenderRollbackMissingEnv()
 	assert.Contains(t, rendered, "## Missing Environment")
-	assert.Contains(t, rendered, "schemabot rollback <apply-id> -e <environment>")
+	assert.Contains(t, rendered, "`schemabot rollback <apply-id> -e <environment> [-t <tenant>]`")
 	assert.Contains(t, rendered, "The `-e` flag is required")
 	assert.NotContains(t, rendered, "both an apply ID",
 		"missing-env variant should not say both args are missing")

@@ -342,6 +342,18 @@ func (h *Handler) config() *api.ServerConfig {
 	return h.service.Config()
 }
 
+// deploymentTenant returns this deployment's own tenant, or "" when the
+// deployment is untenanted or the service is not wired. Command hints posted
+// back to the PR carry it so pasted commands address this deployment: in
+// tenant mode, commands without an explicit tenant target are ignored.
+func (h *Handler) deploymentTenant() string {
+	cfg := h.config()
+	if cfg == nil {
+		return ""
+	}
+	return cfg.Tenant
+}
+
 // clientForRepo returns an installation-scoped GitHub client for the App
 // that owns the given repository. Callers that already have a factory in
 // scope should use it directly; this is the convenience for the common
