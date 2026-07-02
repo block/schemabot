@@ -203,6 +203,64 @@ func TestCheckReviewGate_AdminUserApproval(t *testing.T) {
 	assert.True(t, result.Approved)
 }
 
+// A repo admin's approval satisfies the review gate for any database managed
+// through that repository, without granting approval authority on databases
+// managed through other repositories.
+func TestCheckReviewGate_RepoAdminUserApproval(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		cfg.Repos = map[string]api.RepoConfig{
+			"octocat/hello-world": {AdminUsers: []string{"kara"}},
+		}
+	}))
+
+	registerPREndpoint(mux, "alice")
+	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+		{
+			User:        &gh.User{Login: new("kara")},
+			State:       new(ghclient.ReviewApproved),
+			SubmittedAt: &gh.Timestamp{Time: time.Now()},
+		},
+	})
+
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
+	require.NoError(t, err)
+
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.True(t, result.Approved)
+	assert.Contains(t, result.RequiredReviewers, "kara")
+}
+
+// An approval from a user who is only a repo admin of a different repository
+// does not satisfy the review gate for this repository's PRs.
+func TestCheckReviewGate_RepoAdminOfOtherRepoBlocked(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		cfg.ReviewPolicy.AdminUsers = []string{"mona"}
+		cfg.Repos = map[string]api.RepoConfig{
+			"octocat/other-repo": {AdminUsers: []string{"kara"}},
+		}
+	}))
+
+	registerPREndpoint(mux, "alice")
+	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+		{
+			User:        &gh.User{Login: new("kara")},
+			State:       new(ghclient.ReviewApproved),
+			SubmittedAt: &gh.Timestamp{Time: time.Now()},
+		},
+	})
+
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
+	require.NoError(t, err)
+
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, result.Approved)
+	assert.NotContains(t, result.RequiredReviewers, "kara")
+}
+
 func TestCheckReviewGate_NotApproved(t *testing.T) {
 	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
 		db := cfg.Databases["orders"]

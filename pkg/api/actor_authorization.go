@@ -9,6 +9,8 @@ const (
 	ActorAuthReasonDisabled              = "disabled"
 	ActorAuthReasonAllowedAdminTeam      = "allowed_admin_team"
 	ActorAuthReasonAllowedAdminUser      = "allowed_admin_user"
+	ActorAuthReasonAllowedRepoAdminTeam  = "allowed_repo_admin_team"
+	ActorAuthReasonAllowedRepoAdminUser  = "allowed_repo_admin_user"
 	ActorAuthReasonAllowedOperatorTeam   = "allowed_operator_team"
 	ActorAuthReasonAllowedOperatorUser   = "allowed_operator_user"
 	ActorAuthReasonMissingActor          = "missing_actor"
@@ -86,6 +88,16 @@ func validateDatabaseActorAuthorization(database string, dbConfig DatabaseConfig
 		return err
 	}
 	if err := validateGitHubUsers("databases."+database+".operator_users", dbConfig.OperatorUsers); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateRepoActorAuthorization(repo string, repoConfig RepoConfig) error {
+	if err := validateGitHubTeamPrincipals("repos."+repo+".admin_teams", repoConfig.AdminTeams); err != nil {
+		return err
+	}
+	if err := validateGitHubUsers("repos."+repo+".admin_users", repoConfig.AdminUsers); err != nil {
 		return err
 	}
 	return nil

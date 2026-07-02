@@ -715,6 +715,26 @@ type RepoConfig struct {
 	// set of tenants expected to report). Nil means the repository uses the
 	// standard single-deployment check behavior.
 	Aggregate *AggregateConfig `yaml:"aggregate,omitempty"`
+
+	// AdminTeams are GitHub teams whose members may run mutating PR comment
+	// commands and whose PR approvals satisfy the review gate for every
+	// database managed through this repository. Scoped between the global
+	// admin policy (every database) and per-database operators (one database).
+	AdminTeams []string `yaml:"admin_teams,omitempty"`
+
+	// AdminUsers are GitHub users with the same repository-scoped authority
+	// as AdminTeams.
+	AdminUsers []string `yaml:"admin_users,omitempty"`
+}
+
+// RepoAdmins returns the repository-scoped admin principals configured for
+// repo. A repository with no config entry has no repo admins.
+func (c *ServerConfig) RepoAdmins(repo string) (teams, users []string) {
+	repoConfig, ok := c.Repos[repo]
+	if !ok {
+		return nil, nil
+	}
+	return repoConfig.AdminTeams, repoConfig.AdminUsers
 }
 
 // DeploymentTarget is one entry in EnvironmentConfig.Deployments. It carries
@@ -903,6 +923,9 @@ func (c *ServerConfig) Validate() error {
 
 	for repo, repoConfig := range c.Repos {
 		if err := validateAggregateConfig(repo, repoConfig.Aggregate); err != nil {
+			return err
+		}
+		if err := validateRepoActorAuthorization(repo, repoConfig); err != nil {
 			return err
 		}
 	}

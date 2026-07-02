@@ -151,6 +151,35 @@ func TestServerConfigValidatePRCommandAuthorization(t *testing.T) {
 			wantErr: "duplicate",
 		},
 		{
+			name: "valid repo admins",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Repos = map[string]RepoConfig{
+					"octocat/hello-world": {
+						AdminTeams: []string{"octocat/repo-admins"},
+						AdminUsers: []string{"kara"},
+					},
+				}
+			},
+		},
+		{
+			name: "invalid repo admin team",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Repos = map[string]RepoConfig{
+					"octocat/hello-world": {AdminTeams: []string{"repo-admins"}},
+				}
+			},
+			wantErr: "repos.octocat/hello-world.admin_teams",
+		},
+		{
+			name: "invalid repo admin user",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Repos = map[string]RepoConfig{
+					"octocat/hello-world": {AdminUsers: []string{"octocat/kara"}},
+				}
+			},
+			wantErr: "repos.octocat/hello-world.admin_users",
+		},
+		{
 			name: "username cannot contain a slash",
 			mutate: func(cfg *ServerConfig) {
 				cfg.PRCommandAuthorization = PRCommandAuthorizationConfig{
