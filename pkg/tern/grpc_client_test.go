@@ -14,6 +14,10 @@ import (
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -460,27 +464,32 @@ type capturingTernServer struct {
 	mu                sync.Mutex
 	applyReq          *ternv1.ApplyRequest
 	applyErr          error
+	applyRejectionMsg string // non-empty: Apply responds Accepted=false with this message
 	remoteApplyID     string
 	remoteOperationID string
-	cancelApplyID     string
-	stopApplyID       string
-	startApplyID      string
-	cutoverApplyID    string
-	skipRevertApplyID string
-	revertApplyID     string
-	progressApplyID   string
-	progressReq       *ternv1.ProgressRequest
-	progressState     ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
-	progressStateSet  bool
-	progressStates    []ternv1.State
-	progressTables    []*ternv1.TableProgress
-	progressError     string
-	progressErr       error
-	startErr          error
-	cutoverErr        error
-	cutoverAccepted   bool
-	cutoverMessage    string
-	startCalled       bool // tracks whether Start was actually invoked
+	// applyIDsByIdempotencyKey simulates the data plane's idempotency dedupe: a
+	// request whose key is present returns that already-accepted apply's
+	// identity instead of creating (and returning) a fresh one.
+	applyIDsByIdempotencyKey map[string]string
+	cancelApplyID            string
+	stopApplyID              string
+	startApplyID             string
+	cutoverApplyID           string
+	skipRevertApplyID        string
+	revertApplyID            string
+	progressApplyID          string
+	progressReq              *ternv1.ProgressRequest
+	progressState            ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
+	progressStateSet         bool
+	progressStates           []ternv1.State
+	progressTables           []*ternv1.TableProgress
+	progressError            string
+	progressErr              error
+	startErr                 error
+	cutoverErr               error
+	cutoverAccepted          bool
+	cutoverMessage           string
+	startCalled              bool // tracks whether Start was actually invoked
 }
 
 func (s *capturingTernServer) Apply(_ context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
@@ -490,11 +499,18 @@ func (s *capturingTernServer) Apply(_ context.Context, req *ternv1.ApplyRequest)
 	if applyID == "" {
 		applyID = "remote-apply-123"
 	}
+	if existingID, ok := s.applyIDsByIdempotencyKey[req.IdempotencyKey]; ok && req.IdempotencyKey != "" {
+		applyID = existingID
+	}
 	operationID := s.remoteOperationID
 	err := s.applyErr
+	rejectionMsg := s.applyRejectionMsg
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
+	}
+	if rejectionMsg != "" {
+		return &ternv1.ApplyResponse{Accepted: false, ErrorMessage: rejectionMsg}, nil
 	}
 	return &ternv1.ApplyResponse{Accepted: true, ApplyId: applyID, ApplyOperationId: operationID}, nil
 }
@@ -3741,15 +3757,60 @@ func TestGRPCClient_MarkRemoteApplyFailedReturnsTaskLoadError(t *testing.T) {
 	assert.Equal(t, state.Apply.Running, applyStore.apply.State)
 }
 
-func TestGRPCClient_ResumeApplyRejectsAmbiguousRemoteDispatchState(t *testing.T) {
-	// A stale active gRPC apply without an external_id is ambiguous: the prior
-	// driver may have sent the remote Apply RPC and crashed before persisting the
-	// returned data-plane ID. Fail closed instead of dispatching a duplicate
-	// remote schema change.
-	server := &capturingTernServer{remoteApplyID: "remote-duplicate"}
-	client, cleanup := testCapturingGRPCClient(t, server)
-	defer cleanup()
+// installTestMeterReader routes the global OTel meter provider to a manual
+// reader for the duration of the test so counters emitted by the code under
+// test can be collected and asserted.
+func installTestMeterReader(t *testing.T) *sdkmetric.ManualReader {
+	t.Helper()
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	previous := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(previous)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+	return reader
+}
 
+// counterValue sums the data points of the named Int64 counter whose
+// attributes include every wantAttrs entry.
+func counterValue(t *testing.T, reader *sdkmetric.ManualReader, name string, wantAttrs map[string]string) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	var total int64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok, "metric %s must be an Int64 sum", name)
+			for _, dp := range sum.DataPoints {
+				matches := true
+				for k, v := range wantAttrs {
+					got, ok := dp.Attributes.Value(attribute.Key(k))
+					if !ok || got.AsString() != v {
+						matches = false
+						break
+					}
+				}
+				if matches {
+					total += dp.Value
+				}
+			}
+		}
+	}
+	return total
+}
+
+// ambiguousDispatchTestApply builds the stored state of a drive whose prior
+// remote dispatch outcome was lost: the claim moved the applies row to running
+// (with a lease) but no remote apply id was durably written before the prior
+// driver died. Returns the apply, its still-running task, and the backing
+// storage to install on the client under test.
+func ambiguousDispatchTestApply() (*storage.Apply, *storage.Task, *mockStorage) {
 	apply := &storage.Apply{
 		ID:              8,
 		ApplyIdentifier: "apply-ambiguous-dispatch",
@@ -3764,9 +3825,12 @@ func TestGRPCClient_ResumeApplyRejectsAmbiguousRemoteDispatchState(t *testing.T)
 		TaskIdentifier: "task-ambiguous-dispatch",
 		ApplyID:        apply.ID,
 		TableName:      "users",
+		DDL:            "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:      "alter",
+		Namespace:      "default",
 		State:          state.Task.Running,
 	}
-	client.storage = &mockStorage{
+	st := &mockStorage{
 		applies: &mockApplyStore{apply: apply},
 		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
 		plans: &mockPlanStore{plan: &storage.Plan{
@@ -3774,18 +3838,173 @@ func TestGRPCClient_ResumeApplyRejectsAmbiguousRemoteDispatchState(t *testing.T)
 			PlanIdentifier: "plan-ambiguous-dispatch",
 		}},
 	}
+	return apply, task, st
+}
+
+func TestGRPCClient_ResumeApplyRecoversAmbiguousDispatchByAdoptingExistingRemoteApply(t *testing.T) {
+	// A driver can die between the data plane accepting a dispatch and the
+	// durable remote-apply-id write, leaving a running apply with no remote
+	// apply id. The next claim re-sends the same dispatch under the
+	// generation's deterministic idempotency key; the data plane returns the
+	// already-accepted apply's identity instead of executing the schema change
+	// a second time, and the drive adopts that identity and resumes polling it
+	// to terminal. The apply is never failed while the data plane executes it.
+	apply, task, st := ambiguousDispatchTestApply()
+	expectedKey := remoteApplyIdempotencyKey(apply, wholeApplyTaskScope())
+	server := &capturingTernServer{
+		remoteApplyID:            "remote-fresh-should-not-win",
+		applyIDsByIdempotencyKey: map[string]string{expectedKey: "remote-original-999"},
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	client.storage = st
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApply(ctx, apply)
+	require.NoError(t, err)
+
+	req := server.getApplyRequest()
+	require.NotNil(t, req, "expected the ambiguous apply to be re-dispatched to remote Tern")
+	assert.Equal(t, expectedKey, req.IdempotencyKey, "re-dispatch must reuse the generation's deterministic idempotency key")
+	assert.Equal(t, "remote-original-999", apply.ExternalID, "the drive must adopt the already-accepted remote apply's identity")
+	assert.Equal(t, state.Apply.Completed, apply.State)
+	assert.Equal(t, state.Task.Completed, task.State)
+	assert.Equal(t, "remote-original-999", server.getProgressApplyID(), "polling must target the adopted remote apply")
+}
+
+func TestGRPCClient_ResumeApplyRecoversAmbiguousDispatchByStartingFresh(t *testing.T) {
+	// The prior dispatch RPC can also be cut off before the data plane accepts
+	// anything (deadline before acceptance). The recovery re-dispatch finds no
+	// apply under the idempotency key, so the data plane accepts the work fresh
+	// and the drive proceeds exactly like a first dispatch.
+	apply, task, st := ambiguousDispatchTestApply()
+	server := &capturingTernServer{
+		remoteApplyID: "remote-fresh-456",
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	client.storage = st
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApply(ctx, apply)
+	require.NoError(t, err)
+
+	req := server.getApplyRequest()
+	require.NotNil(t, req, "expected the ambiguous apply to be re-dispatched to remote Tern")
+	assert.Equal(t, remoteApplyIdempotencyKey(apply, wholeApplyTaskScope()), req.IdempotencyKey)
+	assert.Equal(t, "remote-fresh-456", apply.ExternalID)
+	assert.Equal(t, state.Apply.Completed, apply.State)
+	assert.Equal(t, state.Task.Completed, task.State)
+}
+
+func TestGRPCClient_ResumeApplyKeepsAmbiguousApplyClaimableOnRetryableRedispatchError(t *testing.T) {
+	// A retryable data-plane error during the recovery re-dispatch proves
+	// nothing about the original dispatch, so stored state must stay unchanged:
+	// no terminal failure while the remote may be executing, and no
+	// failed_retryable transition whose claim-time attempt rotation would
+	// rotate the idempotency key. The apply stays claimable and the next claim
+	// re-dispatches with the same key.
+	apply, task, st := ambiguousDispatchTestApply()
+	server := &capturingTernServer{
+		applyErr: status.Error(codes.Unavailable, "data plane restarting"),
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	client.storage = st
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	err := client.ResumeApply(ctx, apply)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "remote dispatch state is ambiguous")
+	assert.Contains(t, err.Error(), "re-dispatch ambiguous gRPC apply")
 
-	assert.Nil(t, server.getApplyRequest(), "ambiguous apply should not be dispatched to remote Tern")
+	require.NotNil(t, server.getApplyRequest(), "expected the re-dispatch to be attempted")
+	assert.Equal(t, state.Apply.Running, apply.State)
+	assert.Empty(t, apply.ErrorMessage)
+	assert.Nil(t, apply.CompletedAt)
+	assert.Equal(t, state.Task.Running, task.State)
+	assert.Empty(t, task.ErrorMessage)
+}
+
+func TestGRPCClient_ResumeApplyOrphansAmbiguousApplyOnDefinitiveRedispatchRejection(t *testing.T) {
+	// A definitive data-plane rejection of the recovery re-dispatch means the
+	// dispatch cannot be resolved by key, so the apply is terminally failed —
+	// but never silently: no remote apply id is known (so no remote stop can be
+	// sent) and the orphan counter fires so an operator checks the data plane
+	// for an active schema change on the target database.
+	reader := installTestMeterReader(t)
+	apply, task, st := ambiguousDispatchTestApply()
+	server := &capturingTernServer{
+		applyRejectionMsg: "plan validation failed",
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	client.storage = st
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApply(ctx, apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "was not accepted")
+	assert.Contains(t, err.Error(), "plan validation failed")
+
 	assert.Equal(t, state.Apply.Failed, apply.State)
-	assert.Contains(t, apply.ErrorMessage, "remote dispatch state is ambiguous")
+	assert.Contains(t, apply.ErrorMessage, "plan validation failed")
 	assert.Equal(t, state.Task.Failed, task.State)
-	assert.Contains(t, task.ErrorMessage, "remote dispatch state is ambiguous")
+	assert.Empty(t, server.getStopApplyID(), "no remote apply id is known, so no stop can be sent")
+	assert.Equal(t, int64(1), counterValue(t, reader, "schemabot.remote_apply_orphaned_total", map[string]string{
+		"database":    "testdb",
+		"environment": "staging",
+		"stop":        "no_remote_id",
+	}))
+	assert.Equal(t, int64(1), counterValue(t, reader, "schemabot.remote_apply_dispatch_recovery_total", map[string]string{
+		"database":    "testdb",
+		"environment": "staging",
+	}))
+}
+
+func TestGRPCClient_FailOrphanedRemoteDispatchStopsKnownRemoteApply(t *testing.T) {
+	// When an ambiguous dispatch must be resolved as a terminal failure while
+	// the remote apply's identity is known, the verdict is paired with a
+	// best-effort remote Stop and the orphan counter, so the data plane halts
+	// the schema change and an operator can reconcile the target database.
+	// The failure is never silent while the remote runs.
+	reader := installTestMeterReader(t)
+	apply, task, st := ambiguousDispatchTestApply()
+	server := &capturingTernServer{}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	client.storage = st
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.failOrphanedRemoteDispatch(ctx, apply, []*storage.Task{task}, wholeApplyTaskScope(),
+		"remote-orphan-1", "cannot adopt remote apply remote-orphan-1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot adopt remote apply remote-orphan-1")
+
+	assert.Equal(t, "remote-orphan-1", server.getStopApplyID(), "the known remote apply must receive a best-effort stop")
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Equal(t, state.Task.Failed, task.State)
+	assert.Equal(t, int64(1), counterValue(t, reader, "schemabot.remote_apply_orphaned_total", map[string]string{
+		"database":    "testdb",
+		"environment": "staging",
+		"stop":        "stop_requested",
+	}))
 }
 
 func TestGRPCClient_ResumeApplyDoesNotFailStateWhenRemoteDispatchOutcomeIsAmbiguous(t *testing.T) {

@@ -1284,6 +1284,13 @@ func remoteApplyIdempotencyKey(apply *storage.Apply, scope applyTaskScope) strin
 	return "schemabot:v1:" + hex.EncodeToString(sum[:])
 }
 
+// errRemoteApplyIdentityConflict marks a refusal to adopt a remote apply id
+// because the stored operation row already carries a different remote identity
+// or belongs to another apply. It distinguishes an identity invariant violation
+// from a transient storage failure, so callers can decide whether the dispatch
+// stays claimable or must be resolved as unrecoverable.
+var errRemoteApplyIdentityConflict = errors.New("remote apply identity conflict")
+
 // persistRemoteApplyID stores the remote Tern apply id returned by dispatch.
 // Single-operation drives keep it on the parent applies.external_id (mutated in
 // place so the caller's Applies().Update persists it). Multi-operation drives
@@ -1304,17 +1311,17 @@ func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Ap
 		return fmt.Errorf("reload apply_operation %d before storing remote apply id: %w", op.ID, err)
 	}
 	if current.ApplyID != apply.ID {
-		return fmt.Errorf("apply_operation %d belongs to apply %d, not %s (%d)", op.ID, current.ApplyID, apply.ApplyIdentifier, apply.ID)
+		return fmt.Errorf("%w: apply_operation %d belongs to apply %d, not %s (%d)", errRemoteApplyIdentityConflict, op.ID, current.ApplyID, apply.ApplyIdentifier, apply.ID)
 	}
 	currentRemoteID := current.ExternalID
 	if currentRemoteID == "" {
 		currentRemoteID = current.EngineResumeContext
 	}
 	if currentRemoteID != "" && currentRemoteID != remoteID {
-		return fmt.Errorf("apply_operation %d already has remote apply id %q; refusing to overwrite with %q", op.ID, currentRemoteID, remoteID)
+		return fmt.Errorf("%w: apply_operation %d already has remote apply id %q; refusing to overwrite with %q", errRemoteApplyIdentityConflict, op.ID, currentRemoteID, remoteID)
 	}
 	if remoteOperationID != "" && current.ExternalOperationID != "" && current.ExternalOperationID != remoteOperationID {
-		return fmt.Errorf("apply_operation %d already has remote apply_operation id %q; refusing to overwrite with %q", op.ID, current.ExternalOperationID, remoteOperationID)
+		return fmt.Errorf("%w: apply_operation %d already has remote apply_operation id %q; refusing to overwrite with %q", errRemoteApplyIdentityConflict, op.ID, current.ExternalOperationID, remoteOperationID)
 	}
 	if err := c.storage.ApplyOperations().SaveExternalID(ctx, op.ID, remoteID); err != nil {
 		return fmt.Errorf("store remote apply id for apply_operation %d: %w", op.ID, err)
@@ -1463,7 +1470,7 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 	}
 	// Fail closed before any dispatch or state mutation: a work operation that
 	// resolves to no tasks is an invalid or stale claim. The shared resume path
-	// would otherwise mark the whole parent apply failed (dispatchPendingApply
+	// would otherwise mark the whole parent apply failed (dispatchRemoteApply
 	// and the remote-failure sites set applies.state regardless of scope), which
 	// is wrong when only this operation's lookup came back empty. Mirrors
 	// LocalClient.ResumeApplyOperation.
@@ -1720,14 +1727,10 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 	}
 
 	if shouldDispatchQueuedRemoteApply(apply, scope) {
-		return c.dispatchPendingApply(ctx, apply, scope)
+		return c.dispatchRemoteApply(ctx, apply, scope, dispatchModeQueued)
 	}
 	if hasAmbiguousRemoteDispatchState(apply, scope) {
-		errMsg := fmt.Sprintf("gRPC apply %s is %s without a remote apply id; remote dispatch state is ambiguous", apply.ApplyIdentifier, scope.dispatchState(apply))
-		if err := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); err != nil {
-			return fmt.Errorf("%s; persist failure state: %w", errMsg, err)
-		}
-		return errors.New(errMsg)
+		return c.recoverAmbiguousRemoteDispatch(ctx, apply, scope)
 	}
 
 	startControlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStart)
@@ -2121,9 +2124,91 @@ func hasAmbiguousRemoteDispatchState(apply *storage.Apply, scope applyTaskScope)
 		!shouldDispatchQueuedRemoteApply(apply, scope)
 }
 
-func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
+// remoteDispatchMode selects the failure policy for a remote Apply dispatch.
+type remoteDispatchMode int
+
+const (
+	// dispatchModeQueued is the first dispatch of a queued apply. Nothing has
+	// been sent to the data plane for this generation yet, so a definite
+	// rejection can be recorded as a terminal or retryable failure directly.
+	dispatchModeQueued remoteDispatchMode = iota
+	// dispatchModeAmbiguousRecovery re-sends a dispatch whose earlier outcome
+	// was lost, so the data plane may already be executing the schema change
+	// under this generation's idempotency key. Failures must either keep the
+	// apply claimable (the next claim re-dispatches with the same key) or go
+	// through the orphan verdict — never a silent terminal failure, and never a
+	// failed_retryable transition, whose claim-time attempt rotation would
+	// rotate the idempotency key and let a re-dispatch duplicate a remote apply
+	// the data plane already accepted.
+	dispatchModeAmbiguousRecovery
+)
+
+// recoverAmbiguousRemoteDispatch re-drives a claimed apply whose remote
+// dispatch outcome was lost: the stored row is active with no remote apply id,
+// which happens when the dispatch RPC was cut off before the response arrived
+// (deadline, cancellation) or the prior driver died between remote acceptance
+// and the durable id write. The idempotency key is deterministic for the
+// dispatch generation, so re-sending the same Apply request is safe: the data
+// plane either returns the already-accepted apply's identity (which this drive
+// adopts and resumes) or accepts the work fresh (nothing had been accepted).
+func (c *GRPCClient) recoverAmbiguousRemoteDispatch(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
+	slog.Warn("remote dispatch state is ambiguous; re-dispatching with the generation's idempotency key so the data plane returns the existing apply or starts fresh",
+		append(apply.LogAttrs(), "dispatch_state", scope.dispatchState(apply))...)
+	metrics.RecordRemoteApplyDispatchRecovery(ctx, apply.Database, apply.Environment)
+	return c.dispatchRemoteApply(ctx, apply, scope, dispatchModeAmbiguousRecovery)
+}
+
+// failOrphanedRemoteDispatch terminally fails an apply whose ambiguous remote
+// dispatch could not be recovered. The data plane may still be executing the
+// schema change, so the verdict is never silent: when the remote apply id is
+// known a best-effort remote Stop is sent first, and the orphan counter fires
+// either way so an operator knows to reconcile the target database against the
+// stored failure.
+func (c *GRPCClient) failOrphanedRemoteDispatch(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, scope applyTaskScope, remoteID, message string) error {
+	stopOutcome := "no_remote_id"
+	if remoteID == "" {
+		slog.Error("failing remote apply with no known remote apply id; the control plane cannot stop a schema change the data plane may still be executing — check the data plane and reconcile the target database",
+			append(apply.LogAttrs(), "reason", message)...)
+	} else {
+		stopResp, stopErr := c.client.Stop(ctx, &ternv1.StopRequest{
+			ApplyId:     remoteID,
+			Environment: apply.Environment,
+		})
+		switch {
+		case stopErr != nil:
+			stopOutcome = "stop_failed"
+			slog.Error("best-effort stop of orphaned remote apply failed; the data plane will keep executing the schema change — reconcile the target database",
+				append(apply.LogAttrs(), "remote_apply_id", remoteID, "reason", message, "error", stopErr)...)
+		case stopResp == nil || !stopResp.Accepted:
+			stopOutcome = "stop_failed"
+			slog.Error("best-effort stop of orphaned remote apply was not accepted; the data plane will keep executing the schema change — reconcile the target database",
+				append(apply.LogAttrs(), "remote_apply_id", remoteID, "reason", message)...)
+		default:
+			stopOutcome = "stop_requested"
+			slog.Warn("requested stop of orphaned remote apply before recording the terminal failure",
+				append(apply.LogAttrs(), "remote_apply_id", remoteID, "reason", message)...)
+		}
+	}
+	metrics.RecordRemoteApplyOrphaned(ctx, apply.Database, apply.Environment, stopOutcome)
+	if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, message, false, scope); markErr != nil {
+		return fmt.Errorf("mark orphaned gRPC apply %s failed: %w", apply.ApplyIdentifier, markErr)
+	}
+	return fmt.Errorf("gRPC apply %s: %s", apply.ApplyIdentifier, message)
+}
+
+// dispatchRemoteApply sends the idempotency-keyed Apply RPC for a claimed apply
+// and drives the accepted remote apply to completion. mode selects the failure
+// policy: see remoteDispatchMode.
+func (c *GRPCClient) dispatchRemoteApply(ctx context.Context, apply *storage.Apply, scope applyTaskScope, mode remoteDispatchMode) error {
+	recovering := mode == dispatchModeAmbiguousRecovery
 	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil {
+		if recovering {
+			// Storage uncertainty must keep the apply claimable: the data plane
+			// may be executing this generation, and the next claim re-resolves
+			// the dispatch with the same idempotency key.
+			return fmt.Errorf("load plan %d for ambiguous gRPC apply %s: %w", apply.PlanID, apply.ApplyIdentifier, err)
+		}
 		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: load plan %d: %v", apply.PlanID, err), false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after plan load error: %w", apply.ApplyIdentifier, markErr)
 		}
@@ -2131,6 +2216,9 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	}
 	if plan == nil {
 		errMsg := fmt.Sprintf("queued gRPC apply failed: plan %d not found", apply.PlanID)
+		if recovering {
+			return c.failOrphanedRemoteDispatch(ctx, apply, nil, scope, "", fmt.Sprintf("cannot re-dispatch ambiguous remote apply: plan %d not found", apply.PlanID))
+		}
 		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after missing plan: %w", apply.ApplyIdentifier, markErr)
 		}
@@ -2139,6 +2227,10 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 
 	tasks, err := c.loadApplyTasks(ctx, apply, scope)
 	if err != nil {
+		if recovering {
+			// Storage uncertainty: stay claimable, same reasoning as the plan load.
+			return fmt.Errorf("load tasks for ambiguous gRPC apply %s: %w", apply.ApplyIdentifier, err)
+		}
 		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: load tasks: %v", err), false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after task load error: %w", apply.ApplyIdentifier, markErr)
 		}
@@ -2146,6 +2238,9 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	}
 	if len(tasks) == 0 {
 		errMsg := "queued gRPC apply failed: no tasks found"
+		if recovering {
+			return c.failOrphanedRemoteDispatch(ctx, apply, tasks, scope, "", "cannot re-dispatch ambiguous remote apply: no tasks found")
+		}
 		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after missing tasks: %w", apply.ApplyIdentifier, markErr)
 		}
@@ -2165,6 +2260,10 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	targetShards := taskTargetShards(tasks)
 	if scope.operation != nil && isShardWorkOperationKey(scope.operation.OperationKey) && len(targetShards) != 1 {
 		errMsg := fmt.Sprintf("queued gRPC apply failed: shard operation %q resolved %d target shards, expected exactly 1 — its tasks carry no shard, so refusing to dispatch (the data plane would reject with \"expected exactly one target shard, got 0\"); this indicates a version or data skew", scope.operation.OperationKey, len(targetShards))
+		if recovering {
+			return c.failOrphanedRemoteDispatch(ctx, apply, tasks, scope, "",
+				fmt.Sprintf("cannot re-dispatch ambiguous remote apply: shard operation %q resolved %d target shards, expected exactly 1", scope.operation.OperationKey, len(targetShards)))
+		}
 		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after shard-scope guard: %w", apply.ApplyIdentifier, markErr)
 		}
@@ -2202,7 +2301,21 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	})
 	if err != nil {
 		if isAmbiguousRemoteApplyDispatchError(err) {
+			if recovering {
+				// Still unresolved: the apply stays claimable and the next claim
+				// re-dispatches with the same idempotency key.
+				return fmt.Errorf("re-dispatch of ambiguous gRPC apply %s has ambiguous remote dispatch outcome: %w", apply.ApplyIdentifier, err)
+			}
 			return fmt.Errorf("apply queued gRPC apply %s has ambiguous remote dispatch outcome: %w", apply.ApplyIdentifier, err)
+		}
+		if recovering {
+			if isRetryableRemoteApplyError(err) {
+				slog.Warn("re-dispatch of ambiguous remote dispatch failed with a retryable error; apply stays claimable and the next claim re-dispatches with the same idempotency key",
+					append(apply.LogAttrs(), "error", err)...)
+				return fmt.Errorf("re-dispatch ambiguous gRPC apply %s: %w", apply.ApplyIdentifier, err)
+			}
+			return c.failOrphanedRemoteDispatch(ctx, apply, tasks, scope, "",
+				fmt.Sprintf("re-dispatch of ambiguous remote dispatch was rejected: %v", err))
 		}
 		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, err.Error(), isRetryableRemoteApplyError(err), scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after remote apply error: %w", apply.ApplyIdentifier, markErr)
@@ -2211,6 +2324,10 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	}
 	if resp == nil {
 		errMsg := "remote apply returned nil response"
+		if recovering {
+			return c.failOrphanedRemoteDispatch(ctx, apply, tasks, scope, "",
+				"re-dispatch of ambiguous remote dispatch returned nil response")
+		}
 		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after nil response: %w", apply.ApplyIdentifier, markErr)
 		}
@@ -2221,6 +2338,10 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		if errMsg == "" {
 			errMsg = "remote apply was not accepted"
 		}
+		if recovering {
+			return c.failOrphanedRemoteDispatch(ctx, apply, tasks, scope, "",
+				fmt.Sprintf("re-dispatch of ambiguous remote dispatch was not accepted: %s", errMsg))
+		}
 		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after rejection: %w", apply.ApplyIdentifier, markErr)
 		}
@@ -2228,6 +2349,10 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	}
 	if resp.ApplyId == "" {
 		errMsg := "remote apply accepted without apply_id"
+		if recovering {
+			return c.failOrphanedRemoteDispatch(ctx, apply, tasks, scope, "",
+				"re-dispatch of ambiguous remote dispatch was accepted without apply_id")
+		}
 		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after missing remote apply id: %w", apply.ApplyIdentifier, markErr)
 		}
@@ -2241,6 +2366,13 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	// dispatching a duplicate. Multi-operation drives store it on the claimed
 	// operation row; single-operation drives mutate apply.ExternalID in place.
 	if err := c.persistRemoteApplyID(ctx, apply, scope, resp.ApplyId, resp.ApplyOperationId); err != nil {
+		if recovering && errors.Is(err, errRemoteApplyIdentityConflict) {
+			// The stored operation adopted a different remote identity while this
+			// drive resolved its own. The drive's remote apply id is known, so it
+			// must not be left running silently behind a failure verdict.
+			return c.failOrphanedRemoteDispatch(ctx, apply, tasks, scope, resp.ApplyId,
+				fmt.Sprintf("cannot adopt remote apply %s resolved for the ambiguous dispatch: %v", resp.ApplyId, err))
+		}
 		return fmt.Errorf("store remote apply id for %s: %w", apply.ApplyIdentifier, err)
 	}
 	apply.State = state.InitialActiveApplyState(apply.Engine)
@@ -2255,9 +2387,11 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		return fmt.Errorf("update dispatched gRPC apply %s after storing remote apply id %s: %w", apply.ApplyIdentifier, resp.ApplyId, err)
 	}
 	if persisted {
-		c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo,
-			fmt.Sprintf("Apply dispatched to remote Tern: target=%s deployment=%s remote_apply_id=%s", target, apply.Deployment, resp.ApplyId),
-			oldApplyState)
+		message := fmt.Sprintf("Apply dispatched to remote Tern: target=%s deployment=%s remote_apply_id=%s", target, apply.Deployment, resp.ApplyId)
+		if recovering {
+			message = fmt.Sprintf("Apply re-dispatched to remote Tern after ambiguous dispatch: target=%s deployment=%s remote_apply_id=%s", target, apply.Deployment, resp.ApplyId)
+		}
+		c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, message, oldApplyState)
 	}
 
 	return c.pollForCompletion(ctx, apply, false, scope,

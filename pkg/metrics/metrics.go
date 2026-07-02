@@ -570,6 +570,51 @@ func RecordRemoteApplyDedup(ctx context.Context, database, environment, outcome 
 	)
 }
 
+// RecordRemoteApplyDispatchRecovery increments the counter for control-plane
+// re-dispatches of a remote apply whose prior dispatch outcome was lost (the
+// stored row is active with no remote apply id). The re-dispatch reuses the
+// generation's idempotency key, so the data plane returns the already-accepted
+// apply or starts fresh. A spike means dispatch RPCs are being cut off before
+// their response is durably recorded — investigate control-plane to data-plane
+// connectivity, dispatch deadlines, and driver churn.
+func RecordRemoteApplyDispatchRecovery(ctx context.Context, database, environment string) {
+	addCounter(ctx, "schemabot.remote_apply_dispatch_recovery_total",
+		"Total re-dispatches of remote applies whose prior dispatch outcome was lost", "{dispatch}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+	)
+}
+
+// knownRemoteApplyOrphanStopOutcomes limits metric cardinality to the expected
+// best-effort stop outcomes recorded when a remote apply is orphaned.
+var knownRemoteApplyOrphanStopOutcomes = map[string]bool{
+	"stop_requested": true,
+	"stop_failed":    true,
+	"no_remote_id":   true,
+}
+
+// RecordRemoteApplyOrphaned increments the counter for applies the control
+// plane terminally failed while the data plane may still be executing the
+// schema change. Every increment requires operator action: reconcile the target
+// database against the stored failure. stopOutcome records the best-effort
+// remote stop paired with the verdict:
+//   - "stop_requested": the data plane accepted a stop for the known remote apply.
+//   - "stop_failed": a stop was attempted for the known remote apply and was
+//     refused or errored — the remote schema change can run to cutover.
+//   - "no_remote_id": no remote apply id is known, so no stop could be sent —
+//     check the data plane for an active schema change on the target database.
+func RecordRemoteApplyOrphaned(ctx context.Context, database, environment, stopOutcome string) {
+	if !knownRemoteApplyOrphanStopOutcomes[stopOutcome] {
+		stopOutcome = "unknown"
+	}
+	addCounter(ctx, "schemabot.remote_apply_orphaned_total",
+		"Total remote applies terminally failed by the control plane while the data plane may still be executing the schema change", "{apply}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("stop", stopOutcome),
+	)
+}
+
 // operatorMetricNames returns the canonical operator metric name alongside its
 // deprecated schemabot.scheduler.* alias. Both are emitted for one release so
 // dashboards and alerts can migrate before the legacy series is removed.
