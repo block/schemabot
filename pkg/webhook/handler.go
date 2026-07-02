@@ -80,6 +80,11 @@ type Handler struct {
 	// the package default.
 	transientPlanRetryDelay time.Duration
 
+	// participantNudgeRefoldDelay overrides the pause before the second
+	// aggregate re-fold after a participant-comment nudge. Zero means the
+	// package default.
+	participantNudgeRefoldDelay time.Duration
+
 	// webhookSecretsByApp maps each configured App's logical name to its
 	// HMAC webhook secret. In legacy single-App mode there is exactly one
 	// entry under defaultAppName. In multi-App mode there is one entry per

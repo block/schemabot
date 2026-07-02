@@ -60,14 +60,6 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
-	// Ignore comments from bots to prevent infinite loops
-	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" {
-		h.writeJSON(w, http.StatusOK, map[string]string{
-			"message": "event ignored (comment from bot)",
-		})
-		return
-	}
-
 	var payloadInstallationID int64
 	if payload.Installation != nil {
 		payloadInstallationID = payload.Installation.ID
@@ -81,6 +73,25 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	requestedBy := ""
 	if payload.Comment.User != nil {
 		requestedBy = payload.Comment.User.Login
+	}
+
+	// Ignore comments from bots to prevent infinite loops. The one exception is
+	// a trusted sibling SchemaBot deployment's comment on a repo this
+	// deployment leads: it is consumed as an aggregate re-fold nudge — never
+	// parsed as a command — because participants comment at exactly the moments
+	// their Check Runs change, and GitHub delivers check_run events only to the
+	// App that created the check.
+	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" {
+		if h.participantCommentNudge(ctx, repo, pr, installationID, requestedBy) {
+			h.writeJSON(w, http.StatusOK, map[string]string{
+				"message": "participant comment triggered aggregate re-fold",
+			})
+			return
+		}
+		h.writeJSON(w, http.StatusOK, map[string]string{
+			"message": "event ignored (comment from bot)",
+		})
+		return
 	}
 
 	// Parse command

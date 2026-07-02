@@ -1518,6 +1518,18 @@ type ResolvedGitHubApp struct {
 	Config GitHubAppConfig
 }
 
+// TrustedCheckAppSlugsForRepo returns the trusted sibling SchemaBot App slugs
+// configured for the App that owns repo, or nil when the repo resolves to no
+// App. Callers use this to recognize a sibling deployment by its bot identity
+// (login "<slug>[bot]") with the same trust set that gates Check Run reads.
+func (c *ServerConfig) TrustedCheckAppSlugsForRepo(repo string) []string {
+	app, err := c.ResolveGitHubAppForRepo(repo)
+	if err != nil {
+		return nil
+	}
+	return app.Config.TrustedCheckAppSlugs
+}
+
 // ResolveGitHubAppForRepo returns the GitHub App that owns webhooks and
 // outbound GitHub API calls for the given repository.
 //

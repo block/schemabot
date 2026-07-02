@@ -1079,6 +1079,7 @@ var knownStatusCheckOperations = map[string]bool{
 	"managed_dir_missing_config":           true,
 	"aggregate_participant_skip":           true,
 	"aggregate_participant_fanout":         true,
+	"participant_comment_nudge":            true,
 }
 
 var knownStatusCheckStatuses = map[string]bool{
