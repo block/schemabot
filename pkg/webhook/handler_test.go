@@ -605,6 +605,31 @@ func TestWebhookEyesReactionAtDispatchForSingleDeploymentRepo(t *testing.T) {
 	}
 }
 
+// A bare "schemabot plan" (no -e) fans out to every configured environment,
+// but the acknowledgment contract is the same as its scoped siblings: on a
+// repo with no aggregate role this deployment is the only SchemaBot, so the
+// eyes reaction fires at dispatch, before any discovery runs.
+func TestWebhookEyesReactionAtDispatchForBareMultiEnvPlan(t *testing.T) {
+	h, _, reactions := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the bare-plan dispatch acknowledgment")
+	}
+}
+
 // A -t-scoped command names its actor, so the addressed tenant acknowledges
 // at dispatch — instantly, before any schema discovery — even on an
 // aggregate-role repo.

@@ -176,10 +176,17 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	// Handle missing -e flag
 	if result.MissingEnv {
 		if result.Action == action.Plan {
-			// Plan without -e: run for all configured environments
+			// Plan without -e: run for all configured environments. The same
+			// acknowledgment split as scoped commands applies: repos without an
+			// aggregate role and -t-scoped plans acknowledge at dispatch, while
+			// an unscoped plan on an aggregate-role repo acknowledges at the
+			// handler's act-point once discovery resolves owned schema.
 			h.logger.Info("plan without -e flag", "repo", repo, "pr", pr)
+			if h.service == nil || h.service.Config().AggregateRoleForRepo(repo) == "" || result.Tenant != "" {
+				h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
+			}
 			h.goSafe(repo, pr, installationID, func() {
-				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, true)
+				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, true, result.CommentID)
 			})
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "multi-env plan started"})
 			return

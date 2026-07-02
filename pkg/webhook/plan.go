@@ -158,7 +158,9 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 // handleMultiEnvPlan runs plan for all configured environments and posts a single combined comment.
 // When isAutoPlan is true and no environments have changes or errors, the comment is skipped to reduce PR noise.
-func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, postPlanComment bool) {
+// commentID is the command comment to acknowledge once discovery commits this
+// deployment to acting; auto-plans pass zero (no comment to acknowledge).
+func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, postPlanComment bool, commentID int64) {
 	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
 		h.logger.Error("multi-env plan: failed to bootstrap command", "error", err)
@@ -198,6 +200,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 		schemaDatabase = config.Database
 	}
+	h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
 	configuredEnvironments, envErr := h.configuredDatabaseEnvironments(schemaDatabase)
 	if envErr != nil {
 		if isAutoPlan {
