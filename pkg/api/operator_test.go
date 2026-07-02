@@ -1322,7 +1322,11 @@ func (s *panicContainmentApplyStore) FindNextApply(_ context.Context, owner stri
 }
 
 func (s *panicContainmentApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
-	return s.apply, nil
+	if s.apply == nil {
+		return nil, nil
+	}
+	fresh := *s.apply
+	return &fresh, nil
 }
 
 func (s *panicContainmentApplyStore) Update(_ context.Context, apply *storage.Apply) error {
@@ -1345,6 +1349,9 @@ func (s *staticOperationLookupStore) Get(context.Context, int64) (*storage.Apply
 // resume call returns an error instead of crashing the driver, the apply is
 // marked failed (permanent) so recovery does not re-claim the poisoned row and
 // panic again, and the apply's tasks are failed so dependent state can settle.
+// The containment write persists the reloaded row, so a field a peer wrote
+// between the claim and the panic survives instead of being clobbered by the
+// claim-time snapshot.
 func TestResumeClaimedApply_DrivePanicFailsApply(t *testing.T) {
 	client := &panickingResumeClient{panicValue: "corrupt engine metadata"}
 	apply := &storage.Apply{
@@ -1371,10 +1378,16 @@ func TestResumeClaimedApply_DrivePanicFailsApply(t *testing.T) {
 	}, logger)
 
 	ctx := storage.WithApplyLease(t.Context(), apply.Lease())
+	// The drive holds the claim-time snapshot while a peer writes the stored
+	// row (a skip-revert dispatch) before the panic is contained.
+	claimed := *apply
+	peerWrite := time.Now()
+	apply.RevertSkippedAt = &peerWrite
+
 	var resumed bool
 	var err error
 	require.NotPanics(t, func() {
-		resumed, err = svc.resumeClaimedApply(ctx, 0, apply, 0, "")
+		resumed, err = svc.resumeClaimedApply(ctx, 0, &claimed, 0, "")
 	})
 
 	require.Error(t, err)
@@ -1383,11 +1396,14 @@ func TestResumeClaimedApply_DrivePanicFailsApply(t *testing.T) {
 	assert.Equal(t, "corrupt engine metadata", drivePanic.Value)
 	assert.False(t, resumed)
 
-	assert.True(t, applyStore.updateCalled, "the apply row must be written to its failed state")
-	assert.True(t, state.IsState(apply.State, state.Apply.Failed),
+	require.True(t, applyStore.updateCalled, "the apply row must be written to its failed state")
+	written := applyStore.apply
+	assert.True(t, state.IsState(written.State, state.Apply.Failed),
 		"the apply must be failed (permanent), not failed_retryable, so it is not re-claimed and re-panicked")
-	assert.Contains(t, apply.ErrorMessage, "corrupt engine metadata")
-	require.NotNil(t, apply.CompletedAt)
+	assert.Contains(t, written.ErrorMessage, "corrupt engine metadata")
+	require.NotNil(t, written.CompletedAt)
+	require.NotNil(t, written.RevertSkippedAt,
+		"a peer update stored between the claim and the panic must survive the containment write")
 
 	require.Len(t, taskStore.updated, 1, "the in-flight task must be settled")
 	assert.True(t, state.IsState(taskStore.updated[0].State, state.Task.Failed))
@@ -1484,7 +1500,7 @@ func TestDriveTick_ContainsDrivePanicAndKeepsClaiming(t *testing.T) {
 
 	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
 	assert.Equal(t, 1, applyStore.claims)
-	assert.True(t, state.IsState(apply.State, state.Apply.Failed),
+	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.Failed),
 		"the poisoned apply must be failed so it is not re-claimed")
 
 	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })

@@ -1211,7 +1211,7 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 			// The failed transition below owns the active-apply gauge release, so
 			// the retryable-claim decrement the other failure branches perform is
 			// intentionally omitted here.
-			s.failClaimedApplyAfterDrivePanic(ctx, driverID, apply, applyOperationID, deployment, previousState, drivePanic)
+			s.failClaimedApplyAfterDrivePanic(ctx, driverID, apply, applyOperationID, deployment, drivePanic)
 			return false, err
 		}
 		if errors.Is(err, storage.ErrApplyLeaseLost) {
@@ -1354,7 +1354,7 @@ func (s *Service) logApplyResumeClaim(ctx context.Context, driverID int, apply *
 // The apply requires operator intervention afterwards: fix the underlying code
 // or data fault the panic log identifies, then start a new apply for the
 // schema change.
-func (s *Service) failClaimedApplyAfterDrivePanic(ctx context.Context, driverID int, apply *storage.Apply, applyOperationID int64, deployment, previousState string, drivePanic *panicsafe.Error) bool {
+func (s *Service) failClaimedApplyAfterDrivePanic(ctx context.Context, driverID int, apply *storage.Apply, applyOperationID int64, deployment string, drivePanic *panicsafe.Error) bool {
 	errMsg := fmt.Sprintf("apply drive panicked: %v", drivePanic.Value)
 	now := s.clock.Now()
 
@@ -1428,19 +1428,22 @@ func (s *Service) failClaimedApplyAfterDrivePanic(ctx context.Context, driverID 
 		return false
 	}
 
-	apply.State = state.Apply.Failed
-	apply.ErrorMessage = errMsg
-	apply.CompletedAt = &now
-	apply.UpdatedAt = now
-	if err := s.storage.Applies().Update(ctx, apply); err != nil {
+	// Write the reloaded row, not the claim-time pointer: fields a stop or a
+	// peer updated between the claim and the panic must survive this write.
+	previousState := fresh.State
+	fresh.State = state.Apply.Failed
+	fresh.ErrorMessage = errMsg
+	fresh.CompletedAt = &now
+	fresh.UpdatedAt = now
+	if err := s.storage.Applies().Update(ctx, fresh); err != nil {
 		s.logger.Error("operator: failed to mark apply failed while containing drive panic; the apply will be re-claimed on a later poll",
 			append(apply.LogAttrs(), "driver", driverID, "error", err)...)
 		return false
 	}
 	// The failed transition releases the active-apply gauge the same way an
 	// engine-driven failure would have.
-	metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
-	s.logApplyDrivePanicFailure(ctx, driverID, apply, previousState, errMsg)
+	metrics.AdjustActiveApplies(ctx, -1, fresh.Database, deployment, fresh.Environment)
+	s.logApplyDrivePanicFailure(ctx, driverID, fresh, previousState, errMsg)
 	return true
 }
 
