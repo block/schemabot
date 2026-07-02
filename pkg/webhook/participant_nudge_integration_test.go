@@ -165,3 +165,146 @@ func TestE2EParticipantCommentNudgeLeaderOnly(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 }
+
+// collectAggregateConclusion drains published aggregates for name until one
+// carries the wanted conclusion, tolerating interleaved publishes from the
+// immediate and delayed fold passes.
+func collectAggregateConclusion(t *testing.T, checkRuns chan checkRunCapture, name, wantConclusion string) checkRunCapture {
+	t.Helper()
+	deadline := time.After(webhookIntegrationCheckRunDeadline)
+	for {
+		select {
+		case cr := <-checkRuns:
+			if cr.Name == name && cr.Conclusion == wantConclusion {
+				return cr
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for aggregate %q with conclusion %q", name, wantConclusion)
+		}
+	}
+}
+
+// A rollback on a participant must never leave the leader green. The
+// participant's check reads action_required after a completed rollback (the
+// PR's change is reverted), so a nudge-triggered fold blocks the aggregate —
+// and it stays blocked until a fold reads positive evidence again: a trusted,
+// completed, successful participant check from a fresh apply. There is no
+// timeout or default path back to green.
+func TestE2EParticipantCommentNudgeFailClosedThroughRollback(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, nudgeLeaderConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	const headSHA = "abc123"
+	mockLeaderPRHead(mux, headSHA)
+	mockLeaderPRFilesTouchTenantB(mux)
+	prodCheckName := aggregateCheckNameForEnv(tenantBCheckName, "production")
+	stagingCheckName := aggregateCheckNameForEnv(tenantBCheckName, "staging")
+	// The participant completed a rollback: its check is action_required.
+	participantRuns := map[string]map[string]any{
+		prodCheckName: {
+			"id": 6001, "name": prodCheckName, "status": "completed", "conclusion": "action_required",
+			"app": map[string]any{"slug": trustedTenantAppSlug},
+		},
+		stagingCheckName: {
+			"id": 6002, "name": stagingCheckName, "status": "completed", "conclusion": "action_required",
+			"app": map[string]any{"slug": trustedTenantAppSlug},
+		},
+	}
+	mockParticipantCheckRuns(mux, participantRuns)
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	h.participantNudgeRefoldDelay = 10 * time.Millisecond
+
+	req := buildParticipantBotCommentRequest(t, trustedTenantAppSlug+"[bot]")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// A completed-but-not-successful participant check (action_required after a
+	// rollback) folds as failure — the strongest blocking conclusion.
+	blocked := collectAggregateConclusion(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", "production"), checkConclusionFailure)
+	assert.Equal(t, headSHA, blocked.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, blocked.Status,
+		"a rolled-back participant blocks the aggregate")
+
+	// A fresh apply completes on the participant: its check reads success.
+	// Only now may a fold emit green.
+	participantRuns[prodCheckName]["conclusion"] = "success"
+	participantRuns[stagingCheckName]["conclusion"] = "success"
+
+	req = buildParticipantBotCommentRequest(t, trustedTenantAppSlug+"[bot]")
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// The green publish edits the existing Check Run in place (update payloads
+	// carry no head_sha); reaching this collect at all proves green returned
+	// only after the fold read a trusted, completed, successful participant
+	// check.
+	green := collectAggregateConclusion(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", "production"), checkConclusionSuccess)
+	assert.Equal(t, checkStatusCompleted, green.Status)
+}
+
+// While a participant's apply or rollback is executing, its check run is
+// non-terminal; a nudge-triggered fold maps that to in_progress and the
+// aggregate blocks. The leader cannot emit green while work is visibly in
+// flight on any expected participant.
+func TestE2EParticipantCommentNudgeBlocksOnInProgressParticipant(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, nudgeLeaderConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	const headSHA = "abc123"
+	mockLeaderPRHead(mux, headSHA)
+	mockLeaderPRFilesTouchTenantB(mux)
+	prodCheckName := aggregateCheckNameForEnv(tenantBCheckName, "production")
+	stagingCheckName := aggregateCheckNameForEnv(tenantBCheckName, "staging")
+	mockParticipantCheckRuns(mux, map[string]map[string]any{
+		prodCheckName: {
+			"id": 6101, "name": prodCheckName, "status": "in_progress",
+			"app": map[string]any{"slug": trustedTenantAppSlug},
+		},
+		stagingCheckName: {
+			"id": 6102, "name": stagingCheckName, "status": "in_progress",
+			"app": map[string]any{"slug": trustedTenantAppSlug},
+		},
+	})
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	h.participantNudgeRefoldDelay = 10 * time.Millisecond
+
+	req := buildParticipantBotCommentRequest(t, trustedTenantAppSlug+"[bot]")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	deadline := time.After(webhookIntegrationCheckRunDeadline)
+	for {
+		select {
+		case cr := <-checkRuns:
+			if cr.Name != aggregateCheckNameForEnv("SchemaBot", "production") {
+				continue
+			}
+			require.NotEqual(t, checkConclusionSuccess, cr.Conclusion,
+				"an in-flight participant must never fold green")
+			assert.Equal(t, checkStatusInProgress, cr.Status,
+				"the aggregate reports the participant's in-flight work")
+			return
+		case <-deadline:
+			t.Fatal("timed out waiting for the folded aggregate")
+		}
+	}
+}
