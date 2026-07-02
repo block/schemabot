@@ -198,22 +198,30 @@ func TestCheckStore_Delete(t *testing.T) {
 }
 
 // TestCheckStore_DeleteByPRExcludingApplyOwned verifies PR-close cleanup at the
-// storage layer: all of a PR's stored check state is deleted except rows owned
-// by an in-flight apply (apply_id set and status in_progress), which must keep
-// blocking the PR until the apply reaches a terminal state. Rows for other PRs
-// are untouched.
+// storage layer: all of a PR's stored check state is deleted except apply-owned
+// rows that still block the PR. An apply-owned row that is in_progress must keep
+// blocking until the apply reaches a terminal state, and an apply-owned row that
+// finished without a successful conclusion (action_required, failure) must keep
+// blocking until an operator reconciles the target environment — closing and
+// reopening the PR must not bypass either block. Plan-only rows and apply-owned
+// rows that concluded successfully are deleted so a reopened PR starts clean.
+// Rows for other PRs are untouched.
 func TestCheckStore_DeleteByPRExcludingApplyOwned(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := New(testDB)
 
-	// Checks for the closed PR: two deletable rows, one apply-owned in-flight
-	// row that must survive, and one terminal apply-owned row that is deletable.
 	checksToCreate := []*storage.Check{
+		// Plan-only rows: deleted regardless of status or conclusion.
 		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "staging", DatabaseType: "vitess", DatabaseName: "db1", Status: "pending"},
-		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "staging", DatabaseType: "mysql", DatabaseName: "db2", Status: "pending"},
+		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "staging", DatabaseType: "mysql", DatabaseName: "db2", Status: "completed", Conclusion: "action_required"},
+		// Apply-owned in-flight row: must survive.
 		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "production", DatabaseType: "mysql", DatabaseName: "db3", Status: "in_progress", ApplyID: 77},
+		// Apply-owned row that concluded successfully: deleted.
 		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "production", DatabaseType: "mysql", DatabaseName: "db4", Status: "completed", ApplyID: 88, Conclusion: "success"},
+		// Apply-owned terminal rows that still block: must survive.
+		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "production", DatabaseType: "mysql", DatabaseName: "db5", Status: "completed", ApplyID: 99, Conclusion: "action_required", BlockingReason: "schema_removed_after_apply_started"},
+		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "production", DatabaseType: "mysql", DatabaseName: "db6", Status: "completed", ApplyID: 111, Conclusion: "failure"},
 	}
 	for _, c := range checksToCreate {
 		require.NoError(t, store.Checks().Upsert(ctx, c))
@@ -232,13 +240,33 @@ func TestCheckStore_DeleteByPRExcludingApplyOwned(t *testing.T) {
 
 	require.NoError(t, store.Checks().DeleteByPRExcludingApplyOwned(ctx, "org/repo", 123))
 
-	// Only the apply-owned in-flight row survives for PR 123.
+	// Only the apply-owned rows that still block survive for PR 123.
 	retrieved, err := store.Checks().GetByPR(ctx, "org/repo", 123)
 	require.NoError(t, err)
-	require.Len(t, retrieved, 1)
-	assert.Equal(t, "db3", retrieved[0].DatabaseName)
-	assert.Equal(t, "in_progress", retrieved[0].Status)
-	assert.Equal(t, int64(77), retrieved[0].ApplyID)
+	require.Len(t, retrieved, 3)
+
+	byDatabase := make(map[string]*storage.Check, len(retrieved))
+	for _, c := range retrieved {
+		byDatabase[c.DatabaseName] = c
+	}
+
+	inFlight, ok := byDatabase["db3"]
+	require.True(t, ok, "apply-owned in-flight row must survive PR close")
+	assert.Equal(t, "in_progress", inFlight.Status)
+	assert.Equal(t, int64(77), inFlight.ApplyID)
+
+	removedAfterApply, ok := byDatabase["db5"]
+	require.True(t, ok, "apply-owned action_required row must survive PR close")
+	assert.Equal(t, "completed", removedAfterApply.Status)
+	assert.Equal(t, "action_required", removedAfterApply.Conclusion)
+	assert.Equal(t, int64(99), removedAfterApply.ApplyID)
+	assert.Equal(t, "schema_removed_after_apply_started", removedAfterApply.BlockingReason)
+
+	failed, ok := byDatabase["db6"]
+	require.True(t, ok, "apply-owned failed row must survive PR close")
+	assert.Equal(t, "completed", failed.Status)
+	assert.Equal(t, "failure", failed.Conclusion)
+	assert.Equal(t, int64(111), failed.ApplyID)
 
 	// PR 456's check still exists.
 	retrieved, err = store.Checks().GetByPR(ctx, "org/repo", 456)

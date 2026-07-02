@@ -383,3 +383,145 @@ func TestE2EReconcileStaleInProgressCheckFailure(t *testing.T) {
 		t.Fatal("timed out waiting for blocking aggregate check run")
 	}
 }
+
+// TestE2EPRCloseReopenRetainsStartedApplyBlock verifies that closing and
+// reopening a PR cannot bypass a block that requires operator reconciliation.
+// Scenario: an apply for the PR completes, then a later commit removes the
+// schema change from the PR, leaving the stored check state terminal,
+// action_required, and still owned by the apply — the live database no longer
+// matches the PR contents. Closing the PR deletes the PR's plan-only check
+// state but retains the blocked apply-owned row. Reopening the PR (whose net
+// diff no longer touches schema files) folds the retained row back into the
+// aggregate on the current head SHA, which reports action_required instead of
+// passing.
+func TestE2EPRCloseReopenRetainsStartedApplyBlock(t *testing.T) {
+	dbName := "webhook_close_reopen_block"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// The apply completed before the schema change was removed from the PR.
+	applyID, err := svc.Storage().Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply-close-reopen",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Completed,
+		Engine:          "spirit",
+	})
+	require.NoError(t, err)
+
+	// Stored check state after stale cleanup blocked the removed schema change:
+	// terminal, action_required, still owned by the apply.
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:     "octocat/hello-world",
+		PullRequest:    1,
+		HeadSHA:        "oldsha111",
+		Environment:    "staging",
+		DatabaseType:   "mysql",
+		DatabaseName:   dbName,
+		CheckRunID:     42,
+		ApplyID:        applyID,
+		HasChanges:     true,
+		Status:         checkStatusCompleted,
+		Conclusion:     checkConclusionActionRequired,
+		BlockingReason: schemaRemovedAfterApplyBlock.blockingReason,
+		ErrorMessage:   schemaRemovedAfterApplyBlock.message,
+	}))
+
+	// Plan-only check state for another database on the same PR: PR close
+	// deletes it because no apply ever started for it.
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "webhook_close_reopen_planonly",
+		CheckRunID:   43,
+		HasChanges:   true,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionActionRequired,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// Fake GitHub serves a PR whose current diff has no schema files, matching
+	// a PR whose later commit reverted the applied schema change.
+	result := setupFakeGitHubForPlan(t, mux, nil, "", dbName)
+	h := newE2EHandler(t, svc, client)
+
+	// Close the PR. Close cleanup runs async, so wait for the plan-only row to
+	// be deleted before asserting on the retained row.
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "closed"}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	require.Eventually(t, func() bool {
+		check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", "webhook_close_reopen_planonly")
+		return err == nil && check == nil
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond, "plan-only check state should be deleted on PR close")
+
+	// The blocked apply-owned row survives the close with its block intact.
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check, "blocked apply-owned check state must survive PR close")
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
+	assert.Equal(t, applyID, check.ApplyID)
+	assert.Equal(t, schemaRemovedAfterApplyBlock.blockingReason, check.BlockingReason)
+
+	// Reopen the PR. Auto-plan finds no schema files, and stale-check cleanup
+	// re-blocks the retained row on the current head SHA.
+	req = buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "reopened"}, nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	require.Eventually(t, func() bool {
+		check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+		return err == nil && check != nil && check.HeadSHA == "abc123"
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond, "retained check state should be re-blocked on the reopened PR's head SHA")
+
+	check, err = svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
+	assert.Equal(t, applyID, check.ApplyID)
+	assert.Equal(t, schemaRemovedAfterApplyBlock.blockingReason, check.BlockingReason)
+
+	// The aggregate on the reopened head SHA folds the retained block in and
+	// stays action_required — never success.
+	deadline := time.After(webhookIntegrationPollDeadline)
+	for {
+		var blocked bool
+		select {
+		case checkRun := <-result.checkRuns:
+			require.NotEqual(t, checkConclusionSuccess, checkRun.Conclusion,
+				"close and reopen must not produce a passing check run while the block stands")
+			blocked = checkRun.Name == aggregateCheckName &&
+				checkRun.Conclusion == checkConclusionActionRequired &&
+				checkRun.HeadSHA == "abc123"
+		case <-deadline:
+			t.Fatal("timed out waiting for blocking aggregate check run after reopen")
+		}
+		if blocked {
+			break
+		}
+	}
+
+	aggregate, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, aggregate)
+	assert.Equal(t, "abc123", aggregate.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, aggregate.Status)
+	assert.Equal(t, checkConclusionActionRequired, aggregate.Conclusion)
+}

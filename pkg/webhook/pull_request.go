@@ -327,8 +327,10 @@ func (h *Handler) aggregateMessagesForAllEnvironments(message string) map[string
 // non-terminal, that apply's database lock is retained so another PR cannot
 // acquire the database mid-apply, and the PR's stored check state is retained
 // so a close-and-reopen cannot convert in-flight apply state into a passing
-// check. If apply state cannot be read, cleanup fails closed and nothing is
-// released or deleted.
+// check. Apply-owned check state that reached a terminal state without
+// concluding successfully is also retained, so a close-and-reopen cannot
+// bypass a block that requires operator reconciliation. If apply state cannot
+// be read, cleanup fails closed and nothing is released or deleted.
 func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -362,9 +364,12 @@ func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
 		return
 	}
 
-	// Delete stored check state for this PR. Rows owned by an in-flight apply
-	// survive the delete at the storage layer even if the applies table missed
-	// the in-flight work above.
+	// Delete stored check state for this PR. Apply-owned rows that still block
+	// survive the delete at the storage layer: in-flight rows (even if the
+	// applies table missed the in-flight work above) and terminal rows whose
+	// conclusion is not success, such as a schema change removed from the PR
+	// after its apply started. Those blocks require operator reconciliation
+	// and must persist across a close and reopen.
 	if err := h.service.Storage().Checks().DeleteByPRExcludingApplyOwned(ctx, repo, pr); err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "pr_close_cleanup",

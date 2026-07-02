@@ -17,7 +17,10 @@ const checkColumns = `id, repository, pull_request, head_sha,
 	check_run_id, apply_id, has_changes, status, conclusion,
 	blocking_reason, error_message, change_summary, created_at, updated_at`
 
-const checkStatusInProgress = "in_progress"
+const (
+	checkStatusInProgress  = "in_progress"
+	checkConclusionSuccess = "success"
+)
 
 // checkStore implements storage.CheckStore using MySQL.
 type checkStore struct {
@@ -506,15 +509,28 @@ func (s *checkStore) Delete(ctx context.Context, id int64) error {
 }
 
 // DeleteByPRExcludingApplyOwned removes stored check state for a PR, except
-// rows owned by an in-flight apply. A row with apply_id set and status
-// in_progress must keep blocking until the apply reaches a terminal state,
-// even when PR-close cleanup found no non-terminal apply in the applies table.
+// apply-owned rows that still block the PR. Once an apply has started, its
+// stored check state is authoritative until an operator reconciles the target
+// environment — closing and reopening the PR must not convert it into a
+// passing aggregate. A row is retained when apply_id is set and either:
+//
+//   - status is in_progress: the apply may still be changing the live
+//     database, even when PR-close cleanup found no non-terminal apply in the
+//     applies table; or
+//   - conclusion is anything but success (action_required, failure, or
+//     unset): the apply reached the live database and the row records that
+//     operator attention is still required, e.g. the schema change was
+//     removed from the PR after the apply started or a rollback completed.
+//
+// Apply-owned rows whose conclusion is success are deleted: the apply
+// finished cleanly and matches the PR contents, so nothing remains for the
+// row to block and a reopened PR must not inherit a stale gate.
 func (s *checkStore) DeleteByPRExcludingApplyOwned(ctx context.Context, repo string, pr int) error {
 	_, err := s.db.ExecContext(ctx, `
 		DELETE FROM checks
 		WHERE repository = ? AND pull_request = ?
-		  AND NOT (apply_id IS NOT NULL AND status = ?)
-	`, repo, pr, checkStatusInProgress)
+		  AND (apply_id IS NULL OR (status != ? AND conclusion = ?))
+	`, repo, pr, checkStatusInProgress, checkConclusionSuccess)
 	if err != nil {
 		return fmt.Errorf("delete checks for closed PR %s#%d: %w", repo, pr, err)
 	}
