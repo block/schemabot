@@ -472,7 +472,8 @@ func (h *Handler) postInitialProgressComment(ctx context.Context, repo string, p
 		return
 	}
 	if !state.IsTerminalApplyState(apply.State) {
-		// The apply is still active — the observer owns all further edits.
+		h.logger.Debug("apply is still active after initial progress comment; the observer owns all further edits",
+			apply.LogAttrs()...)
 		return
 	}
 
@@ -486,7 +487,21 @@ func (h *Handler) postInitialProgressComment(ctx context.Context, repo string, p
 		return
 	}
 	if comment == nil {
-		// The post above failed and already logged why — nothing to finalize.
+		// Nothing to finalize: either the GitHub post itself failed, or the post
+		// succeeded but the tracking upsert did not (postAndTrackComment logged
+		// which). In the latter case a comment exists on the PR with no stored
+		// ID to edit, so it stays at its starting state until reconciliation.
+		h.logger.Debug("no tracked progress comment to finalize for terminal apply",
+			apply.LogAttrs()...)
+		return
+	}
+	if comment.EditCount > 0 {
+		// The observer has already found and edited the tracked comment, so its
+		// terminal edit lands (or has landed) with the full per-operation
+		// rendering. Skipping keeps this no-operations fallback from
+		// overwriting that richer body.
+		h.logger.Debug("observer already edits the tracked progress comment; skipping handler finalize",
+			apply.LogAttrs()...)
 		return
 	}
 

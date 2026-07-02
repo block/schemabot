@@ -978,6 +978,35 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		assert.Equal(t, 1, comment.EditCount)
 	})
 
+	t.Run("observer-edited comment is not overwritten by the finalize", func(t *testing.T) {
+		apply := newApply(t, state.Apply.Completed)
+		h, capture := newHandler(t)
+
+		// The observer already found and edited the tracked comment; its
+		// terminal edit carries the full per-operation rendering, so the
+		// handler's no-operations fallback must not overwrite it.
+		require.NoError(t, st.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+			ApplyID: apply.ID, CommentState: state.Comment.Progress, GitHubCommentID: 424242,
+		}))
+		require.NoError(t, st.ApplyComments().IncrementEditCount(ctx, apply.ID, state.Comment.Progress))
+
+		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID,
+			formatProgressComment(apply, nil, nil))
+
+		select {
+		case <-capture.creates:
+		case <-time.After(webhookIntegrationCheckRunDeadline):
+			t.Fatal("timed out waiting for the initial progress comment")
+		}
+
+		select {
+		case edited := <-capture.edits:
+			t.Fatalf("an observer-edited comment must not be finalized by the handler, got edit: %q", edited.Body)
+		case <-time.After(500 * time.Millisecond):
+			// expected: the observer's terminal edit owns the final body
+		}
+	})
+
 	t.Run("active apply is left to the observer", func(t *testing.T) {
 		apply := newApply(t, state.Apply.Running)
 		h, capture := newHandler(t)
