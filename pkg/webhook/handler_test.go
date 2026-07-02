@@ -605,6 +605,38 @@ func TestWebhookEyesReactionAtDispatchForSingleDeploymentRepo(t *testing.T) {
 	}
 }
 
+// A -t-scoped command names its actor, so the addressed tenant acknowledges
+// at dispatch — instantly, before any schema discovery — even on an
+// aggregate-role repo.
+func TestWebhookEyesReactionAtDispatchForTenantScopedCommand(t *testing.T) {
+	h, _, reactions := newTestHandler(t)
+	cfg := h.service.Config()
+	cfg.Tenant = "tenant-b"
+	repoCfg := cfg.Repos["octocat/hello-world"]
+	repoCfg.Aggregate = &api.AggregateConfig{Role: api.AggregateRoleParticipant}
+	if cfg.Repos == nil {
+		cfg.Repos = map[string]api.RepoConfig{}
+	}
+	cfg.Repos["octocat/hello-world"] = repoCfg
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging -t tenant-b",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the scoped-command dispatch acknowledgment")
+	}
+}
+
 func TestWebhookSignatureValidation(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 	secret := []byte("webhook-secret")

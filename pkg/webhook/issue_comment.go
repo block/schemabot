@@ -258,11 +258,14 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
-	// On a repo with no aggregate role this deployment is the only SchemaBot,
-	// so it acknowledges immediately — there is no ownership question to
-	// answer. Aggregate-role repos defer the acknowledgment to each handler's
-	// act-point, after the fan-out silent-skip gates.
-	if h.service == nil || h.service.Config().AggregateRoleForRepo(repo) == "" {
+	// Two cases are decidable at dispatch and acknowledge immediately: a repo
+	// with no aggregate role has exactly one SchemaBot (no ownership question),
+	// and a -t-scoped command names its actor (every non-addressed deployment
+	// was already filtered by the tenant gate above, so reaching this point
+	// scoped means this deployment is the addressee). Unscoped commands on
+	// aggregate-role repos defer to each handler's act-point, after the
+	// fan-out silent-skip gates, where ownership is actually known.
+	if h.service == nil || h.service.Config().AggregateRoleForRepo(repo) == "" || result.Tenant != "" {
 		h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
 	}
 
@@ -523,16 +526,19 @@ func (h *Handler) postInitialProgressComment(ctx context.Context, repo string, p
 }
 
 // acknowledgeCommandActPoint adds the eyes reaction once a handler commits to
-// acting on a command, on repos where this deployment has an aggregate role —
-// there, a fan-out means "heard" and "acting" differ, so only the deployments
-// actually doing work acknowledge and an ignoring deployment leaves only its
-// skip log. Repos without an aggregate role acknowledged at dispatch already,
-// so this is a no-op for them.
-func (h *Handler) acknowledgeCommandActPoint(repo string, pr int, installationID, commentID int64) {
+// acting on an unscoped command on an aggregate-role repo — there, a fan-out
+// means "heard" and "acting" differ, so only the deployments actually doing
+// work acknowledge and an ignoring deployment leaves only its skip log. Repos
+// without an aggregate role and -t-scoped commands acknowledged at dispatch
+// already, so this is a no-op for them.
+func (h *Handler) acknowledgeCommandActPoint(repo string, pr int, installationID int64, result CommandResult) {
+	if result.Tenant != "" {
+		return
+	}
 	if h.service != nil && h.service.Config().AggregateRoleForRepo(repo) == "" {
 		return
 	}
-	h.acknowledgeCommand(repo, pr, installationID, commentID)
+	h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
 }
 
 // acknowledgeCommand adds the eyes reaction to the command comment,

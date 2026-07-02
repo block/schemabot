@@ -82,7 +82,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 			"repo", repo, "pr", pr, "apply_id", applyID, "environment", environment)
 		return
 	}
-	h.acknowledgeCommandActPoint(repo, pr, installationID, result.CommentID)
+	h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 
 	// Rollback executes DDL against the target database, so the actor must be an
 	// authorized admin/operator before SchemaBot reveals any lock or plan detail
@@ -318,7 +318,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 		h.postComment(repo, pr, installationID, templates.RenderRollbackConfirmNoLock("", environment, h.deploymentTenant()))
 		return
 	}
-	h.acknowledgeCommandActPoint(repo, pr, installationID, result.CommentID)
+	h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 
 	database := rollbackPlan.Database
 	dbType := rollbackPlan.DatabaseType
