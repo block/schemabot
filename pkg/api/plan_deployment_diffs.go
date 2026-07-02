@@ -55,6 +55,22 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 		return nil, fmt.Errorf("resolve deployment targets for %s/%s: %w", req.Database, req.Environment, err)
 	}
 
+	// Reusing primaryPlan for the primary member hinges on the positional
+	// invariant that rollout index 0 is the primary. ResolveDatabaseTargets and
+	// ResolvePrimaryDatabaseTarget derive that ordering from the same source, so
+	// they agree today — but a future reorder of target resolution would silently
+	// attribute the reviewed plan to the wrong deployment. Cross-check here and
+	// fail closed rather than compare a deployment against the wrong baseline.
+	if primaryPlan != nil {
+		primary, err := s.config.ResolvePrimaryDatabaseTarget(req.Database, req.Environment)
+		if err != nil {
+			return nil, fmt.Errorf("resolve primary deployment for %s/%s: %w", req.Database, req.Environment, err)
+		}
+		if targets[0].Deployment != primary.Deployment {
+			return nil, fmt.Errorf("primary invariant violated for %s/%s: rollout index 0 is %q but the primary is %q", req.Database, req.Environment, targets[0].Deployment, primary.Deployment)
+		}
+	}
+
 	results := make([]DeploymentPlanDiff, len(targets))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(planDeploymentDiffConcurrency)
@@ -66,12 +82,10 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			Target:       target.Target,
 		}
 
-		// Rollout index 0 is the primary. ResolveDatabaseTargets returns targets
-		// in rollout order, primary first, so the primary is positionally index 0;
-		// a future change to that ordering would misattribute the primary here and
-		// must keep primary-first. When its reviewed plan is provided, reuse it so
-		// the rollup's primary member is exactly what was reviewed and no redundant
-		// live-schema read runs.
+		// Rollout index 0 is the primary (ResolveDatabaseTargets returns targets
+		// primary-first; the guard above enforces it). When its reviewed plan is
+		// provided, reuse it so the rollup's primary member is exactly what was
+		// reviewed and no redundant live-schema read runs.
 		if i == 0 && primaryPlan != nil {
 			results[i].Engine = primaryPlan.Engine
 			results[i].Changes = primaryPlan.Changes
