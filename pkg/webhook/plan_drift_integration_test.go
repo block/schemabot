@@ -10,6 +10,7 @@
 package webhook
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -17,9 +18,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"strings"
 	"testing"
 
+	mysql "github.com/go-sql-driver/mysql"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -61,6 +62,34 @@ type deploymentSpec struct {
 	dropDatabase bool
 }
 
+// openDriftDB opens a MySQL connection for the drift fixtures, verifies it with
+// a ping (sql.Open is lazy, so a bad DSN otherwise surfaces later in less
+// obvious places), and registers a close on cleanup so a failed setup step never
+// leaks the handle.
+func openDriftDB(t *testing.T, dsn string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	return db
+}
+
+// driftDSN returns the e2e target DSN pointed at dbName (an empty dbName keeps
+// the DSN's own database) with multi-statement execution enabled. It is built
+// via ParseDSN/FormatDSN so it survives passwords or query params that naive
+// string replacement would corrupt.
+func driftDSN(t *testing.T, dbName string) string {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	if dbName != "" {
+		cfg.DBName = dbName
+	}
+	cfg.MultiStatements = true
+	return cfg.FormatDSN()
+}
+
 // setupE2EReviewDriftService stands up a single logical database that fans out
 // to the given deployments under one environment, each backed by its own
 // physical MySQL database (seeded with that deployment's live schema) and its
@@ -72,59 +101,64 @@ func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentS
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = schemabotDB.Close() })
+	schemabotDB := openDriftDB(t, e2eSchemabotDSN)
 	st := mysqlstore.New(schemabotDB)
 
-	// Clean up any stale state for this PR/database from prior runs.
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE database_name = ?", dbName)
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM locks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM plans WHERE database_name = ?", dbName)
+	// Clean up any stale state for this PR/database from prior runs. Assert the
+	// deletes succeed: a silent isolation failure leaves stale rows in the shared
+	// schemabot_test database and surfaces as confusing cross-test flakes.
+	_, err := schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE database_name = ?", dbName)
+	require.NoError(t, err)
+	_, err = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
+	require.NoError(t, err)
+	_, err = schemabotDB.ExecContext(ctx, "DELETE FROM locks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
+	require.NoError(t, err)
+	_, err = schemabotDB.ExecContext(ctx, "DELETE FROM plans WHERE database_name = ?", dbName)
+	require.NoError(t, err)
 
 	deployments := make(map[string]api.DeploymentTarget, len(specs))
 	order := make([]string, 0, len(specs))
 	ternClients := make(map[string]tern.Client, len(specs))
 
+	adminDSN := driftDSN(t, "")
 	for _, spec := range specs {
 		physicalDB := dbName + "_" + spec.name
-		physicalDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+physicalDB, 1)
+		physicalDSN := driftDSN(t, physicalDB)
 
 		// Create and seed the deployment's physical database.
-		adminDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
-		require.NoError(t, err)
-		_, err = adminDB.ExecContext(ctx, "DROP DATABASE IF EXISTS `"+physicalDB+"`")
+		adminDB := openDriftDB(t, adminDSN)
+		_, err := adminDB.ExecContext(ctx, "DROP DATABASE IF EXISTS `"+physicalDB+"`")
 		require.NoError(t, err)
 		_, err = adminDB.ExecContext(ctx, "CREATE DATABASE `"+physicalDB+"`")
 		require.NoError(t, err)
-		_ = adminDB.Close()
 
 		if spec.liveSchema != "" {
-			seedDB, err := sql.Open("mysql", physicalDSN+"&multiStatements=true")
-			require.NoError(t, err)
+			seedDB := openDriftDB(t, physicalDSN)
 			_, err = seedDB.ExecContext(ctx, spec.liveSchema)
 			require.NoError(t, err)
-			_ = seedDB.Close()
 		}
 
-		physicalDBName := physicalDB
+		// Drop the physical database on cleanup. Detach from the test's context so
+		// the drop survives the test finishing — t.Context() is already cancelled
+		// by the time cleanup runs, which would otherwise leave databases behind.
 		t.Cleanup(func() {
-			db, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
-			if err == nil {
-				_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+physicalDBName+"`")
-				_ = db.Close()
+			dropCtx := context.WithoutCancel(t.Context())
+			db, err := sql.Open("mysql", adminDSN)
+			if err != nil {
+				t.Logf("drift cleanup: open admin db to drop %s: %v", physicalDB, err)
+				return
 			}
+			defer func() { _ = db.Close() }()
+			_, err = db.ExecContext(dropCtx, "DROP DATABASE IF EXISTS `"+physicalDB+"`")
+			assert.NoError(t, err, "drift cleanup: drop physical database %s", physicalDB)
 		})
 
 		// An unreachable/undiffable deployment: drop its physical database after
 		// seeding so the plan diff against it fails and the rollup blocks closed.
 		if spec.dropDatabase {
-			dropDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
-			require.NoError(t, err)
+			dropDB := openDriftDB(t, adminDSN)
 			_, err = dropDB.ExecContext(ctx, "DROP DATABASE IF EXISTS `"+physicalDB+"`")
 			require.NoError(t, err)
-			_ = dropDB.Close()
 		}
 
 		client, err := tern.NewLocalClient(tern.LocalConfig{
@@ -172,7 +206,9 @@ func runDriftPlan(t *testing.T, svc *api.Service, dbName string) {
 	t.Cleanup(server.Close)
 
 	client := gh.NewClient(nil)
-	client.BaseURL, _ = url.Parse(server.URL + "/")
+	baseURL, err := url.Parse(server.URL + "/")
+	require.NoError(t, err)
+	client.BaseURL = baseURL
 
 	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
 	schemaFiles := map[string]string{"users.sql": usersWithEmailSchema}
@@ -260,4 +296,43 @@ func TestE2EReviewDriftCleanWhenAllDeploymentsMatch(t *testing.T) {
 		"a uniform rollout with changes pending must be action_required, not drift-blocked")
 	assert.True(t, check.HasChanges, "the reviewed change adds a column, so the check has changes")
 	assert.Empty(t, check.BlockingReason, "a clean rollup must not record a drift block")
+}
+
+// The durable drift block's contract is that only a fresh clean rollup clears
+// it. A drifted deployment blocks the plan check closed; once that deployment's
+// schema is reconciled back to the reviewed pre-state and the PR is re-planned,
+// the now-uniform rollup must clear the block so the PR can proceed. If clearing
+// ever regressed, drift-blocked PRs would stick blocked permanently.
+func TestE2EReviewDriftClearsBlockAfterDeploymentReconciled(t *testing.T) {
+	dbName := "webhook_drift_unblock"
+	svc := setupE2EReviewDriftService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersBaseSchema},      // primary: will plan ADD email
+		{name: "au", liveSchema: usersBaseSchema},      // matches the reviewed plan
+		{name: "us", liveSchema: usersWithEmailSchema}, // drifted: already has email
+	})
+
+	// The drifted deployment first blocks the plan check closed.
+	runDriftPlan(t, svc, dbName)
+	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, driftEnv, "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check, "expected a stored check record")
+	require.Equal(t, storage.ReviewTimeDeploymentDriftBlockingReason, check.BlockingReason,
+		"the drifted deployment must first block the plan check closed")
+
+	// Reconcile the drifted deployment back to the reviewed pre-state so every
+	// deployment now diffs to the same reviewed change.
+	reconcileDB := openDriftDB(t, driftDSN(t, dbName+"_us"))
+	_, err = reconcileDB.ExecContext(t.Context(), "ALTER TABLE `users` DROP COLUMN `email`")
+	require.NoError(t, err)
+
+	// Re-planning against the now-uniform rollout clears the durable block.
+	runDriftPlan(t, svc, dbName)
+	check, err = svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, driftEnv, "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check, "expected a stored check record")
+	assert.Equal(t, "completed", check.Status)
+	assert.Equal(t, "action_required", check.Conclusion,
+		"a reconciled rollout with changes pending must be action_required, not drift-blocked")
+	assert.True(t, check.HasChanges, "the reviewed change adds a column, so the check still has changes")
+	assert.Empty(t, check.BlockingReason, "reconciling the drifted deployment must clear the durable drift block")
 }
