@@ -159,9 +159,12 @@ func (h *Handler) scheduleParticipantRefold(ctx context.Context, repo string, pr
 	})
 }
 
-// clearParticipantRefoldBudget resets the re-fold budget once a fold resolves
-// every expected participant, so a later commit on the same PR gets a fresh
-// budget.
+// clearParticipantRefoldBudget resets the re-fold budget once a fold ends with
+// no retriable participant outcomes: every participant either resolved or
+// blocks for a reason no re-read can improve (an untrusted App, an
+// unresolvable check name, or its own pending work). PR close also clears the
+// entry so the in-memory map does not retain abandoned PRs. A later fold that
+// turns retriable again gets a fresh budget.
 func (h *Handler) clearParticipantRefoldBudget(repo string, pr int) {
 	key := participantRefoldKey(repo, pr)
 	h.participantRefoldMu.Lock()

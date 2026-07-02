@@ -327,6 +327,11 @@ func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// A closed PR gets no more scheduled re-folds; drop its budget entry so the
+	// in-memory map does not accumulate one entry per closed PR. A reopen folds
+	// fresh and re-arms with a full budget.
+	h.clearParticipantRefoldBudget(repo, pr)
+
 	applies, err := h.service.Storage().Applies().GetByPR(ctx, repo, pr)
 	if err != nil {
 		// Fail closed: with apply state unknown, releasing a lock or deleting
