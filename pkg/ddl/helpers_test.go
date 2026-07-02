@@ -1,7 +1,9 @@
 package ddl
 
 import (
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/block/spirit/pkg/statement"
 	"github.com/stretchr/testify/assert"
@@ -189,6 +191,15 @@ func TestClassifyStatement_MultiStatementErrorNamesLeadingText(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "...")
 	assert.NotContains(t, err.Error(), "DROP TABLE t2")
+}
+
+// TestStatementPreview_TruncatesOnRuneBoundary verifies that the preview
+// truncates whole runes, so statements with multi-byte identifiers never
+// produce invalid UTF-8 in error messages.
+func TestStatementPreview_TruncatesOnRuneBoundary(t *testing.T) {
+	got := statementPreview(strings.Repeat("é", 100))
+	assert.Equal(t, strings.Repeat("é", 80)+"...", got)
+	assert.True(t, utf8.ValidString(got))
 }
 
 func TestClassifyStatementOp(t *testing.T) {

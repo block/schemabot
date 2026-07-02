@@ -57,14 +57,17 @@ func ClassifyStatement(stmt string) (statement.StatementType, string, error) {
 }
 
 // statementPreview returns the leading text of a statement for error messages,
-// truncated so multi-statement blobs do not flood logs.
+// truncated so multi-statement blobs do not flood logs. Truncation counts
+// runes, not bytes, so multi-byte identifiers are never split into invalid
+// UTF-8.
 func statementPreview(stmt string) string {
 	const maxPreview = 80
 	s := strings.TrimSpace(stmt)
-	if len(s) <= maxPreview {
+	runes := []rune(s)
+	if len(runes) <= maxPreview {
 		return s
 	}
-	return s[:maxPreview] + "..."
+	return string(runes[:maxPreview]) + "..."
 }
 
 // ClassifyStatementOp is like ClassifyStatement but returns the operation as a
