@@ -103,7 +103,7 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 			CommandName:          commandName,
 			Database:             database,
 			Environment:          environment,
-			AuthorizedPrincipals: h.service.Config().PRCommandAuthorizedPrincipals(database),
+			AuthorizedPrincipals: h.service.Config().PRCommandAuthorizedPrincipals(repo, database),
 		}))
 		return true
 	}

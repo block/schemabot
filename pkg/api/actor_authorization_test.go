@@ -246,6 +246,12 @@ func TestPRCommandAuthorizedPrincipals(t *testing.T) {
 			AdminTeams: []string{"octocat/db-admins"},
 			AdminUsers: []string{"kara"},
 		},
+		Repos: map[string]RepoConfig{
+			"octocat/hello-world": {
+				AdminTeams: []string{"octocat/repo-admins", "octocat/db-admins"},
+				AdminUsers: []string{"mona"},
+			},
+		},
 		Databases: map[string]DatabaseConfig{
 			"orders": {
 				OperatorTeams: []string{"octocat/orders-operators", "octocat/db-admins"},
@@ -255,15 +261,20 @@ func TestPRCommandAuthorizedPrincipals(t *testing.T) {
 	}
 
 	assert.Equal(t,
-		[]string{"octocat/db-admins", "kara", "octocat/orders-operators", "lee"},
-		cfg.PRCommandAuthorizedPrincipals("orders"),
-		"admins first, then the database's operators, deduplicated")
+		[]string{"octocat/db-admins", "kara", "octocat/repo-admins", "mona", "octocat/orders-operators", "lee"},
+		cfg.PRCommandAuthorizedPrincipals("octocat/hello-world", "orders"),
+		"deployment admins, then repo admins, then the database's operators, deduplicated across all three")
 
 	assert.Equal(t,
-		[]string{"octocat/db-admins", "kara"},
-		cfg.PRCommandAuthorizedPrincipals("unknown"),
-		"an unknown database still lists the deployment-wide admins")
+		[]string{"octocat/db-admins", "kara", "octocat/orders-operators", "lee"},
+		cfg.PRCommandAuthorizedPrincipals("octocat/other-repo", "orders"),
+		"a repo with no config entry contributes no repo admins")
+
+	assert.Equal(t,
+		[]string{"octocat/db-admins", "kara", "octocat/repo-admins", "mona"},
+		cfg.PRCommandAuthorizedPrincipals("octocat/hello-world", "unknown"),
+		"an unknown database still lists the deployment and repo admins")
 
 	var nilCfg *ServerConfig
-	assert.Nil(t, nilCfg.PRCommandAuthorizedPrincipals("orders"))
+	assert.Nil(t, nilCfg.PRCommandAuthorizedPrincipals("octocat/hello-world", "orders"))
 }
