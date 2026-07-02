@@ -80,12 +80,39 @@ func (h *Handler) nudgeRefoldDelay() time.Duration {
 	return defaultParticipantNudgeRefoldDelay
 }
 
-// maxParticipantRefoldAttempts bounds the self-scheduled re-folds a single
-// PR's aggregate arms while expected participants remain unresolved. The
-// budget resets whenever a fold resolves every participant, so it only caps
-// consecutive misses — a participant that never reports leaves the aggregate
-// blocked (fail-closed) until a nudge, new commit, or manual plan re-folds.
-const maxParticipantRefoldAttempts = 3
+// participantRefoldBackoff staggers the self-scheduled re-folds a single PR's
+// aggregate arms while expected participants remain unresolved. Participants
+// publish their Check Runs within seconds of the leader's first fold, so the
+// first retry comes quickly and later ones back off. One entry per attempt;
+// the budget resets whenever a fold resolves every participant, so it only
+// caps consecutive misses — a participant that never reports leaves the
+// aggregate blocked (fail-closed) until a nudge, new commit, or manual plan
+// re-folds.
+var participantRefoldBackoff = []time.Duration{5 * time.Second, 15 * time.Second, 45 * time.Second}
+
+var maxParticipantRefoldAttempts = len(participantRefoldBackoff)
+
+// participantRefoldDelay resolves the delay before the attempt-th re-fold
+// (zero-based). The test override, when set, applies to every attempt.
+func (h *Handler) participantRefoldDelay(attempt int) time.Duration {
+	if h.participantNudgeRefoldDelay > 0 {
+		return h.participantNudgeRefoldDelay
+	}
+	if attempt >= len(participantRefoldBackoff) {
+		return participantRefoldBackoff[len(participantRefoldBackoff)-1]
+	}
+	return participantRefoldBackoff[attempt]
+}
+
+// participantRefoldBudgetRemaining reports whether the PR can still arm a
+// self-scheduled re-fold. The fold uses this to render unresolved participants
+// as in_progress (a re-read is coming) versus action_required (the budget is
+// spent and an operator needs to look at the participant deployment).
+func (h *Handler) participantRefoldBudgetRemaining(repo string, pr int) bool {
+	h.participantRefoldMu.Lock()
+	defer h.participantRefoldMu.Unlock()
+	return h.participantRefoldAttempts[participantRefoldKey(repo, pr)] < maxParticipantRefoldAttempts
+}
 
 // scheduleParticipantRefold arms a delayed aggregate re-fold because at least
 // one expected participant resolved as retriable (not reported yet, or a
@@ -116,15 +143,16 @@ func (h *Handler) scheduleParticipantRefold(ctx context.Context, repo string, pr
 	h.participantRefoldAttempts[key] = attempts + 1
 	h.participantRefoldMu.Unlock()
 
+	delay := h.participantRefoldDelay(attempts)
 	h.logger.Info("expected participants have not resolved; scheduling aggregate re-fold",
-		"repo", repo, "pr", pr, "delay", h.nudgeRefoldDelay(), "attempt", attempts+1)
+		"repo", repo, "pr", pr, "delay", delay, "attempt", attempts+1)
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 		Operation:  "participant_refold",
 		Repository: repo,
 		Status:     "scheduled",
 	})
 
-	time.AfterFunc(h.nudgeRefoldDelay(), func() {
+	time.AfterFunc(delay, func() {
 		h.goSafe(repo, pr, installationID, func() {
 			h.refoldAggregateForPR(repo, pr, installationID, "unresolved participant delayed re-fold")
 		})

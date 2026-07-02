@@ -121,7 +121,10 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 			// The leader cannot determine which participants a PR requires without
 			// the changed files. Fail closed: do not publish an aggregate at all,
 			// which leaves any existing (still-blocking) aggregate in place rather
-			// than downgrading it to a passing success we cannot justify.
+			// than downgrading it to a passing success we cannot justify. The read
+			// failure is as transient as a failed participant Checks read, so arm
+			// a bounded re-fold — otherwise one API blip strands the aggregate
+			// until an external event re-folds it.
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 				Operation:  "aggregate_check_sync",
 				Repository: repo,
@@ -129,6 +132,7 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 			})
 			h.logger.Error("aggregate leader cannot fetch PR files, not publishing aggregate",
 				"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+			h.scheduleParticipantRefold(ctx, repo, pr, client.InstallationID())
 			return
 		}
 		expectedParticipants = config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))
@@ -153,8 +157,12 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 	// API read) can newly resolve on a later re-read. Participants with no
 	// schema work publish their check but never comment, so no nudge will
 	// arrive — the leader must re-fold on its own schedule or the aggregate
-	// stays blocked on a participant that already reported green.
+	// stays blocked on a participant that already reported green. While the
+	// re-fold budget lasts, unresolved participants render as in_progress
+	// (equally merge-blocking) so the wait is not mislabeled as pending
+	// applies.
 	participantsRetriable := false
+	retryPending := h.participantRefoldBudgetRemaining(repo, pr)
 
 	if len(config.AllowedEnvironments) > 0 {
 		// Per-environment aggregates: create one aggregate per allowed environment.
@@ -162,7 +170,7 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 		// between environments (e.g., staging vs production aggregates).
 		for _, env := range config.AllowedEnvironments {
 			envChecks := filterChecksByEnvironment(dbChecks, env)
-			participantChecks, retriable := h.participantCheckOutcomes(ctx, client, repo, pr, env, headSHA, expectedParticipants)
+			participantChecks, retriable := h.participantCheckOutcomes(ctx, client, repo, pr, env, headSHA, expectedParticipants, retryPending)
 			participantsRetriable = participantsRetriable || retriable
 			envChecks = append(envChecks, participantChecks...)
 			if len(envChecks) == 0 {
@@ -176,7 +184,7 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 	} else {
 		// Single aggregate. Uses aggregateSentinel for the environment field
 		// since there is no per-environment scoping.
-		participantChecks, retriable := h.participantCheckOutcomes(ctx, client, repo, pr, aggregateSentinel, headSHA, expectedParticipants)
+		participantChecks, retriable := h.participantCheckOutcomes(ctx, client, repo, pr, aggregateSentinel, headSHA, expectedParticipants, retryPending)
 		participantsRetriable = retriable
 		aggChecks := make([]*storage.Check, 0, len(dbChecks)+len(participantChecks))
 		aggChecks = append(aggChecks, dbChecks...)

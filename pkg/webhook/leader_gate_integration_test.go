@@ -226,8 +226,9 @@ func TestE2ELeaderPassesOnTrustedSuccessfulParticipant(t *testing.T) {
 
 // When an expected participant has not reported its Check Run on the head
 // commit, the leader has no evidence the participant's schema is safe. It fails
-// closed: the aggregate blocks (action_required) rather than passing on the
-// participant's silence.
+// closed: the aggregate blocks as in_progress (a self-scheduled re-fold will
+// re-read the participant shortly) rather than passing on the participant's
+// silence.
 func TestE2ELeaderBlocksOnMissingParticipantCheck(t *testing.T) {
 	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
 
@@ -256,8 +257,8 @@ func TestE2ELeaderBlocksOnMissingParticipantCheck(t *testing.T) {
 	cr := collectAggregate(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", "production"))
 	assert.Equal(t, headSHA, cr.HeadSHA)
 	assert.NotEqual(t, checkConclusionSuccess, cr.Conclusion, "missing participant must not pass the aggregate")
-	assert.Equal(t, checkStatusCompleted, cr.Status)
-	assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
+	assert.Equal(t, checkStatusInProgress, cr.Status)
+	assert.Empty(t, cr.Conclusion, "the wait for a participant re-read blocks without a conclusion")
 }
 
 // While the participant's Check Run is still in progress, the leader's
@@ -464,9 +465,9 @@ func TestE2ELeaderNonSchemaPRTouchingParticipantPathBlocks(t *testing.T) {
 	for _, env := range []string{"staging", "production"} {
 		cr := collectAggregate(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", env))
 		assert.Equal(t, headSHA, cr.HeadSHA)
-		assert.Equal(t, checkStatusCompleted, cr.Status)
-		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion,
-			"aggregate for %s must fail closed while the expected participant is silent", env)
+		assert.Equal(t, checkStatusInProgress, cr.Status,
+			"aggregate for %s must block while the expected participant is silent", env)
+		assert.Empty(t, cr.Conclusion)
 	}
 }
 
@@ -551,11 +552,12 @@ func TestE2ELeaderRefoldsWhenParticipantReportsAfterFirstFold(t *testing.T) {
 		if cr.Name != aggregateCheckNameForEnv("SchemaBot", "production") {
 			continue
 		}
-		if cr.Conclusion == checkConclusionActionRequired {
+		if cr.Status == checkStatusInProgress {
 			// The blocked aggregate is created fresh on the head commit; the
 			// converged pass below updates that run in place, so head_sha only
 			// appears on this create.
 			assert.Equal(t, headSHA, cr.HeadSHA)
+			assert.Empty(t, cr.Conclusion, "the wait for the participant re-read blocks without a conclusion")
 			sawBlocked = true
 			continue
 		}

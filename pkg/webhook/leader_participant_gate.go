@@ -32,13 +32,28 @@ type participantCheckOutcome struct {
 	retriable bool
 }
 
+// participantUnresolvedBlockingReason marks a synthesized participant row whose
+// Check Run could not be read yet (not reported, or a failed Checks API read).
+// It drives the aggregate's title and the tenant table's status label so an
+// unresolved participant reads as "waiting to report" / "not reported" rather
+// than as a pending or failed apply. Synthesized rows are never persisted, so
+// the marker never reaches stored check state.
+const participantUnresolvedBlockingReason = "participant_unresolved"
+
 // synthesizeParticipantCheck maps a resolved participant outcome to a stored
 // Check shape so computeAggregate folds it exactly like a per-database check.
 // DatabaseType is the aggregate sentinel and DatabaseName is the tenant so the
 // synthesized row is distinguishable in the aggregate table while still
 // contributing its status/conclusion to the fold.
-func synthesizeParticipantCheck(outcome participantCheckOutcome, repo string, pr int, headSHA, env string) *storage.Check {
-	return &storage.Check{
+//
+// A retriable outcome with re-fold budget remaining renders as in_progress: a
+// scheduled re-fold will re-read the participant within seconds, and
+// in_progress blocks merge exactly as hard as action_required without
+// mislabeling the wait as pending applies. Once the budget is spent the row
+// lands action_required — the participant is genuinely not reporting and an
+// operator needs to look.
+func synthesizeParticipantCheck(outcome participantCheckOutcome, repo string, pr int, headSHA, env string, retryPending bool) *storage.Check {
+	check := &storage.Check{
 		Repository:   repo,
 		PullRequest:  pr,
 		HeadSHA:      headSHA,
@@ -49,6 +64,14 @@ func synthesizeParticipantCheck(outcome participantCheckOutcome, repo string, pr
 		Status:       outcome.status,
 		Conclusion:   outcome.conclusion,
 	}
+	if outcome.retriable {
+		check.BlockingReason = participantUnresolvedBlockingReason
+		if retryPending {
+			check.Status = checkStatusInProgress
+			check.Conclusion = ""
+		}
+	}
+	return check
 }
 
 // blockedParticipantOutcome builds a fail-closed outcome that folds to
@@ -99,14 +122,14 @@ func participantCheckName(base, env string) string {
 func (h *Handler) participantCheckOutcomes(
 	ctx context.Context, client checkRunFinder,
 	repo string, pr int, env, headSHA string,
-	expected []api.ExpectedTenant,
+	expected []api.ExpectedTenant, retryPending bool,
 ) ([]*storage.Check, bool) {
 	checks := make([]*storage.Check, 0, len(expected))
 	retriable := false
 	for _, tenant := range expected {
 		outcome := h.resolveParticipantOutcome(ctx, client, repo, pr, env, headSHA, tenant)
 		retriable = retriable || outcome.retriable
-		checks = append(checks, synthesizeParticipantCheck(outcome, repo, pr, headSHA, env))
+		checks = append(checks, synthesizeParticipantCheck(outcome, repo, pr, headSHA, env, retryPending))
 	}
 	return checks, retriable
 }

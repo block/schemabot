@@ -88,10 +88,10 @@ func TestParticipantCheckOutcomesFold(t *testing.T) {
 			wantStatus:     checkStatusCompleted,
 		},
 		{
-			name:           "missing check blocks and is retriable",
+			name:           "missing check blocks as in_progress while a re-fold is coming",
 			finder:         &fakeCheckRunFinder{},
-			wantConclusion: checkConclusionActionRequired,
-			wantStatus:     checkStatusCompleted,
+			wantConclusion: "",
+			wantStatus:     checkStatusInProgress,
 			wantRetriable:  true,
 		},
 		{
@@ -103,12 +103,12 @@ func TestParticipantCheckOutcomesFold(t *testing.T) {
 			wantStatus:     checkStatusCompleted,
 		},
 		{
-			name: "lookup error blocks and is retriable",
+			name: "lookup error blocks as in_progress while a re-fold is coming",
 			finder: &fakeCheckRunFinder{errs: map[string]error{
 				checkName: fmt.Errorf("boom"),
 			}},
-			wantConclusion: checkConclusionActionRequired,
-			wantStatus:     checkStatusCompleted,
+			wantConclusion: "",
+			wantStatus:     checkStatusInProgress,
 			wantRetriable:  true,
 		},
 	}
@@ -116,7 +116,7 @@ func TestParticipantCheckOutcomesFold(t *testing.T) {
 	h := &Handler{logger: testLogger()}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			checks, retriable := h.participantCheckOutcomes(t.Context(), tc.finder, repo, pr, env, headSHA, expected)
+			checks, retriable := h.participantCheckOutcomes(t.Context(), tc.finder, repo, pr, env, headSHA, expected, true)
 			require.Len(t, checks, 1)
 
 			c := checks[0]
@@ -133,11 +133,56 @@ func TestParticipantCheckOutcomesFold(t *testing.T) {
 	}
 }
 
+// Once the re-fold budget is spent, an unresolved participant stops rendering
+// as in_progress: no re-read is coming, so the aggregate lands action_required
+// and names the reporting gap instead of pending applies.
+func TestParticipantCheckOutcomesUnresolvedAfterBudgetExhausted(t *testing.T) {
+	const (
+		repo    = "octocat/shared-repo"
+		pr      = 7
+		env     = "staging"
+		headSHA = "abc123"
+	)
+	expected := []api.ExpectedTenant{{Tenant: "tenant-a", Paths: []string{"services/a"}, CheckName: "SchemaBot Tenant A"}}
+
+	h := &Handler{logger: testLogger()}
+	checks, retriable := h.participantCheckOutcomes(t.Context(), &fakeCheckRunFinder{}, repo, pr, env, headSHA, expected, false)
+	require.Len(t, checks, 1)
+	assert.True(t, retriable)
+
+	conclusion, status := computeAggregate(checks)
+	assert.Equal(t, checkConclusionActionRequired, conclusion)
+	assert.Equal(t, checkStatusCompleted, status)
+
+	title, _ := aggregateSummary(checks, conclusion)
+	assert.Equal(t, "1 participant deployment has not reported", title,
+		"an unresolved participant must read as a reporting gap, not a pending apply")
+}
+
+// While a re-fold is pending, the aggregate's in_progress title names the wait
+// for participants instead of claiming an apply is running, and the tenant
+// table labels the row as waiting.
+func TestAggregateSummaryWaitingForParticipants(t *testing.T) {
+	expected := []api.ExpectedTenant{{Tenant: "tenant-a", Paths: []string{"services/a"}, CheckName: "SchemaBot Tenant A"}}
+	h := &Handler{logger: testLogger()}
+	checks, _ := h.participantCheckOutcomes(t.Context(), &fakeCheckRunFinder{}, "octocat/shared-repo", 7, "staging", "abc123", expected, true)
+	require.Len(t, checks, 1)
+
+	conclusion, status := computeAggregate(checks)
+	require.Empty(t, conclusion)
+	require.Equal(t, checkStatusInProgress, status)
+
+	title, summary := aggregateSummary(checks, conclusion)
+	assert.Equal(t, "Waiting for 1 participant deployment to report", title)
+	assert.Contains(t, summary, "Waiting to report")
+	assert.Contains(t, summary, "`tenant-a`")
+}
+
 // An empty expected set folds to nothing, so a non-leader or a PR touching no
 // participant paths never contributes participant rows to the aggregate.
 func TestParticipantCheckOutcomesEmptyExpected(t *testing.T) {
 	h := &Handler{logger: testLogger()}
-	checks, retriable := h.participantCheckOutcomes(t.Context(), &fakeCheckRunFinder{}, "octocat/shared-repo", 1, "staging", "sha", nil)
+	checks, retriable := h.participantCheckOutcomes(t.Context(), &fakeCheckRunFinder{}, "octocat/shared-repo", 1, "staging", "sha", nil, true)
 	assert.Empty(t, checks)
 	assert.False(t, retriable)
 }
@@ -147,7 +192,7 @@ func TestParticipantCheckOutcomesEmptyExpected(t *testing.T) {
 func TestParticipantCheckOutcomesEmptyCheckNameBlocks(t *testing.T) {
 	h := &Handler{logger: testLogger()}
 	expected := []api.ExpectedTenant{{Tenant: "tenant-a", Paths: []string{"services/a"}}}
-	checks, retriable := h.participantCheckOutcomes(t.Context(), &fakeCheckRunFinder{}, "octocat/shared-repo", 1, "staging", "sha", expected)
+	checks, retriable := h.participantCheckOutcomes(t.Context(), &fakeCheckRunFinder{}, "octocat/shared-repo", 1, "staging", "sha", expected, true)
 	require.Len(t, checks, 1)
 	assert.False(t, retriable, "a config error cannot be fixed by re-reading; no re-fold should be scheduled")
 
