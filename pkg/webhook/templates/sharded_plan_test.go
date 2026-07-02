@@ -58,6 +58,7 @@ func TestRenderPlanComment_UnsafeShownOnPlanNotOnApply(t *testing.T) {
 	apply := RenderPlanComment(data)
 	assert.NotContains(t, apply, "⛔ Unsafe Changes Detected", "the locked apply comment omits the unsafe warning as noise")
 	assert.NotContains(t, apply, "DROP COLUMN is destructive")
+	assert.NotContains(t, apply, "Destructive drop guidance", "the drop guidance rides inside the unsafe block and is omitted with it")
 	assert.Contains(t, apply, "DROP COLUMN `email`", "the DDL itself stays visible on the apply comment")
 }
 
