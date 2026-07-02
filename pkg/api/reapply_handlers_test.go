@@ -58,7 +58,8 @@ func TestExecuteReapplyAttributesAuthenticatedCaller(t *testing.T) {
 	applies := &reapplyApplyStore{apply: apply}
 	client := &mockTernClient{planResp: reapplyPlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
 	logs := &capturingApplyLogStore{}
-	svc := newReapplyTestService(t, client, plans, applies, reapplyTestTask(apply, "users", state.Task.Failed), storage.ApplyLogStore(logs))
+	locks := newReapplyLockStore()
+	svc := newReapplyTestService(t, client, plans, applies, locks, reapplyTestTask(apply, "users", state.Task.Failed), storage.ApplyLogStore(logs))
 
 	ctx := auth.WithUser(t.Context(), &auth.User{Subject: "bob@example.com"})
 	resp, err := svc.ExecuteReapply(ctx, apitypes.ControlRequest{
@@ -71,6 +72,9 @@ func TestExecuteReapplyAttributesAuthenticatedCaller(t *testing.T) {
 	assert.True(t, resp.Accepted)
 	assert.True(t, hasApplyLogMessageContaining(logs.logs, "Reapply requested by user (caller: bob@example.com)"),
 		"the apply log must attribute the reapply to the authenticated caller")
+	require.NotNil(t, locks.lock)
+	assert.Equal(t, "bob@example.com", locks.lock.Owner,
+		"the reapply lock must be owned by the authenticated caller, not the client-supplied string")
 }
 
 func TestExecuteReapplyRejectsChangedPlanWithoutReapplying(t *testing.T) {
@@ -158,7 +162,7 @@ func TestExecuteReapplyRejectsStaleFailure(t *testing.T) {
 	plans := newReapplyPlanStore(sourcePlan)
 	applies := &reapplyApplyStore{apply: apply}
 	client := &mockTernClient{planResp: reapplyPlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
-	svc := newReapplyTestService(t, client, plans, applies, reapplyTestTask(apply, "users", state.Task.Failed))
+	svc := newReapplyTestService(t, client, plans, applies, newReapplyLockStore(), reapplyTestTask(apply, "users", state.Task.Failed))
 
 	resp, err := svc.ExecuteReapply(t.Context(), apitypes.ControlRequest{
 		Environment: "staging",
@@ -181,7 +185,7 @@ func TestExecuteReapplyRejectsEnvironmentMismatch(t *testing.T) {
 	plans := newReapplyPlanStore(sourcePlan)
 	applies := &reapplyApplyStore{apply: apply}
 	client := &mockTernClient{planResp: reapplyPlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
-	svc := newReapplyTestService(t, client, plans, applies, reapplyTestTask(apply, "users", state.Task.Failed))
+	svc := newReapplyTestService(t, client, plans, applies, newReapplyLockStore(), reapplyTestTask(apply, "users", state.Task.Failed))
 
 	resp, err := svc.ExecuteReapply(t.Context(), apitypes.ControlRequest{
 		Environment: "production",

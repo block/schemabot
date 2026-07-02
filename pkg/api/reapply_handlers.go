@@ -90,13 +90,13 @@ func (s *Service) ExecuteReapply(ctx context.Context, req apitypes.ControlReques
 	}
 	// caller owns the lock acquired below, so require it up front — before any
 	// apply/plan reads — rather than failing deep inside lock acquisition.
-	if req.Caller == "" {
+	caller := resolveCaller(ctx, req.Caller)
+	if caller == "" {
 		return nil, controlHTTPErrorf(http.StatusBadRequest, "caller is required")
 	}
 	if s.storage == nil {
 		return nil, fmt.Errorf("storage is not available")
 	}
-	caller := resolveCaller(ctx, req.Caller)
 
 	apply, err := s.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyID)
 	if err != nil {
@@ -130,14 +130,14 @@ func (s *Service) executeReapplyForApply(ctx context.Context, req apitypes.Contr
 		return nil, fmt.Errorf("plan %d not found for reapply apply %s: %w", apply.PlanID, apply.ApplyIdentifier, storage.ErrPlanNotFound)
 	}
 
-	lock, releaseLockOnReject, err := s.acquireReapplyLock(ctx, req, sourcePlan, apply)
+	lock, releaseLockOnReject, err := s.acquireReapplyLock(ctx, caller, req.Force, sourcePlan, apply)
 	if err != nil {
 		return nil, err
 	}
 	reapplyAccepted := false
 	defer func() {
 		if !reapplyAccepted && releaseLockOnReject {
-			s.releaseReapplyLockAfterReject(ctx, req, sourcePlan, apply)
+			s.releaseReapplyLockAfterReject(ctx, caller, sourcePlan, apply)
 		}
 	}()
 
@@ -192,58 +192,58 @@ func (s *Service) executeReapplyForApply(ctx context.Context, req apitypes.Contr
 	}, nil
 }
 
-func (s *Service) acquireReapplyLock(ctx context.Context, req apitypes.ControlRequest, plan *storage.Plan, apply *storage.Apply) (*storage.Lock, bool, error) {
+func (s *Service) acquireReapplyLock(ctx context.Context, caller string, force bool, plan *storage.Plan, apply *storage.Apply) (*storage.Lock, bool, error) {
 	existing, err := s.storage.Locks().Get(ctx, plan.Database, plan.DatabaseType)
 	if err != nil {
 		return nil, false, fmt.Errorf("load reapply lock for %s/%s before acquire: %w", plan.Database, plan.DatabaseType, err)
 	}
-	releaseOnReject := existing == nil || existing.Owner != req.Caller
+	releaseOnReject := existing == nil || existing.Owner != caller
 	lock := &storage.Lock{
 		DatabaseName: plan.Database,
 		DatabaseType: plan.DatabaseType,
 		Repository:   plan.Repository,
 		PullRequest:  plan.PullRequest,
-		Owner:        req.Caller,
+		Owner:        caller,
 	}
 	if err := s.storage.Locks().Acquire(ctx, lock); err != nil {
 		if errors.Is(err, storage.ErrLockHeld) {
-			if !req.Force {
+			if !force {
 				return nil, false, fmt.Errorf("reapply lock for %s/%s is held by another owner; retry with force to take over the lock: %w", plan.Database, plan.DatabaseType, err)
 			}
-			s.logger.Warn("reapply force releasing database lock", append(apply.LogAttrs(), "requested_by", req.Caller)...)
+			s.logger.Warn("reapply force releasing database lock", append(apply.LogAttrs(), "requested_by", caller)...)
 			// Release-then-acquire is intentionally non-atomic and fails closed: if a
 			// third caller wins the lock in the gap, the re-Acquire below returns
 			// ErrLockHeld and the reapply is rejected. Force never proceeds without
 			// holding the lock.
 			if releaseErr := s.storage.Locks().ForceRelease(ctx, plan.Database, plan.DatabaseType); releaseErr != nil {
-				return nil, false, fmt.Errorf("force release reapply lock for %s/%s owner %s: %w", plan.Database, plan.DatabaseType, req.Caller, releaseErr)
+				return nil, false, fmt.Errorf("force release reapply lock for %s/%s owner %s: %w", plan.Database, plan.DatabaseType, caller, releaseErr)
 			}
 			if acquireErr := s.storage.Locks().Acquire(ctx, lock); acquireErr != nil {
-				return nil, false, fmt.Errorf("acquire reapply lock for %s/%s owner %s after force release: %w", plan.Database, plan.DatabaseType, req.Caller, acquireErr)
+				return nil, false, fmt.Errorf("acquire reapply lock for %s/%s owner %s after force release: %w", plan.Database, plan.DatabaseType, caller, acquireErr)
 			}
 		} else {
-			return nil, false, fmt.Errorf("acquire reapply lock for %s/%s owner %s: %w", plan.Database, plan.DatabaseType, req.Caller, err)
+			return nil, false, fmt.Errorf("acquire reapply lock for %s/%s owner %s: %w", plan.Database, plan.DatabaseType, caller, err)
 		}
 	}
 	acquired, err := s.storage.Locks().Get(ctx, plan.Database, plan.DatabaseType)
 	if err != nil {
 		return nil, false, fmt.Errorf("load acquired reapply lock for %s/%s: %w", plan.Database, plan.DatabaseType, err)
 	}
-	if acquired == nil || acquired.Owner != req.Caller {
-		return nil, false, fmt.Errorf("reapply lock for %s/%s was not acquired by %s: %w", plan.Database, plan.DatabaseType, req.Caller, storage.ErrLockHeld)
+	if acquired == nil || acquired.Owner != caller {
+		return nil, false, fmt.Errorf("reapply lock for %s/%s was not acquired by %s: %w", plan.Database, plan.DatabaseType, caller, storage.ErrLockHeld)
 	}
 	return acquired, releaseOnReject, nil
 }
 
-func (s *Service) releaseReapplyLockAfterReject(ctx context.Context, req apitypes.ControlRequest, plan *storage.Plan, apply *storage.Apply) {
-	if err := s.storage.Locks().Release(ctx, plan.Database, plan.DatabaseType, req.Caller); err != nil {
+func (s *Service) releaseReapplyLockAfterReject(ctx context.Context, caller string, plan *storage.Plan, apply *storage.Apply) {
+	if err := s.storage.Locks().Release(ctx, plan.Database, plan.DatabaseType, caller); err != nil {
 		s.logger.Warn("reapply rejected after acquiring database lock; lock release failed", append(apply.LogAttrs(),
-			"requested_by", req.Caller,
+			"requested_by", caller,
 			"error", err,
 		)...)
 		return
 	}
-	s.logger.Info("reapply rejected after acquiring database lock; lock released", append(apply.LogAttrs(), "requested_by", req.Caller)...)
+	s.logger.Info("reapply rejected after acquiring database lock; lock released", append(apply.LogAttrs(), "requested_by", caller)...)
 }
 
 func validateReapplyCandidate(apply *storage.Apply) error {
