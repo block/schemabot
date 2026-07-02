@@ -778,6 +778,33 @@ func RecordOperatorTerminalSummaryFailure(ctx context.Context, reason string) {
 	)
 }
 
+// knownRecoveredPanicOperations limits metric cardinality to the panic
+// containment boundaries that exist in the codebase.
+var knownRecoveredPanicOperations = map[string]bool{
+	"apply_drive":            true,
+	"operator_tick":          true,
+	"summary_reconciliation": true,
+	"observer_poll":          true,
+}
+
+// RecordRecoveredPanic increments the recovered-panic counter for a background
+// operation whose panic was contained instead of crashing the process. Any
+// non-zero rate means a code or data bug is being converted into degraded work
+// (a failed apply, a stopped poller, a skipped reconciliation pass). The paired
+// error log carries the panic value, stack, and work identifiers, so the
+// operator action is to find that log, fix the underlying fault, and reconcile
+// the affected work.
+func RecordRecoveredPanic(ctx context.Context, operation string) {
+	if !knownRecoveredPanicOperations[operation] {
+		operation = "unknown"
+	}
+	addCounter(ctx, "schemabot.panic.recovered_total",
+		"Total number of panics recovered at background-work boundaries", "{panic}",
+		EnvironmentAttribute(""),
+		attribute.String("operation", operation),
+	)
+}
+
 // RecordOperatorClaimDuration records how long it took to claim and resume an apply.
 func RecordOperatorClaimDuration(ctx context.Context, duration time.Duration, database, deployment, environment, previousState string) {
 	for _, name := range operatorMetricNames("claim_duration_seconds") {

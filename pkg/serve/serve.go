@@ -31,6 +31,7 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
+	"github.com/block/schemabot/pkg/panicsafe"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
@@ -98,7 +99,27 @@ func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, l
 
 	reconcileCtx := context.WithoutCancel(ctx)
 	go func() {
-		r.reconcileMissingSummaryComments(reconcileCtx)
+		// The reconcile pass renders GitHub comments from stored apply state; a
+		// panic on one poisoned row must degrade only this startup pass, not
+		// kill the process that serves webhooks and drives applies.
+		err := panicsafe.Call(func() error {
+			r.reconcileMissingSummaryComments(reconcileCtx)
+			return nil
+		})
+		if err == nil {
+			return
+		}
+		var reconcilePanic *panicsafe.Error
+		if !errors.As(err, &reconcilePanic) {
+			// The reconcile callback returns nothing, so only a contained panic
+			// reaches here today; keep the signal if that invariant changes.
+			logger.Error("missing-summary reconciliation failed", "error", err)
+			return
+		}
+		logger.Error("missing-summary reconciliation panicked; missing summary comments will not be reconciled until the next restart",
+			"panic", fmt.Sprint(reconcilePanic.Value),
+			"stack", string(reconcilePanic.Stack))
+		metrics.RecordRecoveredPanic(reconcileCtx, "summary_reconciliation")
 	}()
 }
 

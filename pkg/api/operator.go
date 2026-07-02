@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/panicsafe"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -154,7 +155,7 @@ func (s *Service) operatorDriver(ctx context.Context, driverID int, stop <-chan 
 
 	s.logger.Debug("operator driver started", "driver", driverID)
 
-	s.recoverApplies(ctx, driverID)
+	s.driveTick(ctx, driverID)
 
 	for {
 		select {
@@ -166,11 +167,41 @@ func (s *Service) operatorDriver(ctx context.Context, driverID int, stop <-chan 
 			return
 		case <-wake:
 			s.logger.Debug("operator driver woke for queued apply", "driver", driverID)
-			s.recoverApplies(ctx, driverID)
+			s.driveTick(ctx, driverID)
 		case <-ticker.C:
-			s.recoverApplies(ctx, driverID)
+			s.driveTick(ctx, driverID)
 		}
 	}
+}
+
+// driveTick runs one claim-and-drive pass behind a panic boundary so a
+// poisoned claim degrades only this tick: the panic is logged with its stack
+// and counted, and the driver keeps polling. Panics raised inside the engine
+// drive are already converted to errors (and fail the claimed apply) at the
+// resumeClaimedApply seam, so a panic reaching this boundary comes from the
+// claim or projection machinery itself and leaves no apply marked failed —
+// that work is retried on a later tick.
+func (s *Service) driveTick(ctx context.Context, driverID int) {
+	err := panicsafe.Call(func() error {
+		s.recoverApplies(ctx, driverID)
+		return nil
+	})
+	if err == nil {
+		return
+	}
+	var tickPanic *panicsafe.Error
+	if !errors.As(err, &tickPanic) {
+		// recoverApplies handles its own failures and never returns an error, so
+		// only a contained panic reaches here today; keep the signal if that
+		// invariant ever changes.
+		s.logger.Error("operator: drive tick failed", "driver", driverID, "error", err)
+		return
+	}
+	s.logger.Error("operator: drive tick panicked; the driver continues and retries on the next tick",
+		"driver", driverID,
+		"panic", fmt.Sprint(tickPanic.Value),
+		"stack", string(tickPanic.Stack))
+	metrics.RecordRecoveredPanic(ctx, "operator_tick")
 }
 
 // expireRetryableApplies runs the retryable-apply expiry maintenance pass,
@@ -452,8 +483,18 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 			// never make progress. Terminalize it now rather than leaving it to
 			// be re-leased on every poll once its heartbeat goes stale.
 			s.failOperationWithoutTasks(operationLeaseCtx, applyLeaseCtx, driverID, op, apply)
+			return
 		}
-		return
+		var drivePanic *panicsafe.Error
+		if !errors.As(resumeErr, &drivePanic) {
+			// Transient drive failures leave the operation claimable so a later
+			// poll retries it; resumeClaimedApply already logged the cause.
+			return
+		}
+		// A contained drive panic already failed this operation's tasks and the
+		// parent apply. Fall through so the operation row is persisted from its
+		// now-failed tasks immediately instead of waiting to be re-leased once
+		// its heartbeat goes stale.
 	}
 
 	// Persist the operation row from its OWN drive outcome — the aggregate of
@@ -1141,15 +1182,38 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 	// closed when no tasks scope to the operation. The cutover variant drives a
 	// barrier-parked operation through its swap instead of its copy phase. The
 	// legacy whole-apply path (applyOperationID == 0) drives every task.
-	switch {
-	case applyOperationID > 0 && opts.cutover:
-		err = client.ResumeApplyOperationCutover(ctx, apply, applyOperationID)
-	case applyOperationID > 0:
-		err = client.ResumeApplyOperation(ctx, apply, applyOperationID)
-	default:
-		err = client.ResumeApply(ctx, apply)
-	}
+	// The drive runs behind a panic boundary: engine and resume code process
+	// stored metadata, so one poisoned row must degrade only this apply, not
+	// the process. A contained panic surfaces as a *panicsafe.Error and is
+	// handled as a permanent failure below.
+	err = panicsafe.Call(func() error {
+		switch {
+		case applyOperationID > 0 && opts.cutover:
+			return client.ResumeApplyOperationCutover(ctx, apply, applyOperationID)
+		case applyOperationID > 0:
+			return client.ResumeApplyOperation(ctx, apply, applyOperationID)
+		default:
+			return client.ResumeApply(ctx, apply)
+		}
+	})
 	if err != nil {
+		var drivePanic *panicsafe.Error
+		if errors.As(err, &drivePanic) {
+			s.logger.Error("operator: engine drive panicked; the apply will be marked failed so it is not re-claimed and panicked again",
+				append(apply.LogAttrs(),
+					"driver", driverID,
+					"apply_operation_id", applyOperationID,
+					"operation_deployment", deployment,
+					"panic", fmt.Sprint(drivePanic.Value),
+					"stack", string(drivePanic.Stack))...)
+			metrics.RecordRecoveredPanic(ctx, "apply_drive")
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "drive_panic")
+			// The failed transition below owns the active-apply gauge release, so
+			// the retryable-claim decrement the other failure branches perform is
+			// intentionally omitted here.
+			s.failClaimedApplyAfterDrivePanic(ctx, driverID, apply, applyOperationID, deployment, previousState, drivePanic)
+			return false, err
+		}
 		if errors.Is(err, storage.ErrApplyLeaseLost) {
 			s.logger.Warn("operator: apply lease was lost; driver will stop writing this apply",
 				"driver", driverID,
@@ -1270,6 +1334,141 @@ func (s *Service) logApplyResumeClaim(ctx context.Context, driverID int, apply *
 		CreatedAt: s.clock.Now(),
 	}); err != nil {
 		s.logger.Warn("operator: failed to log apply claim; apply claim will not appear in apply logs",
+			"driver", driverID,
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"error", err)
+	}
+}
+
+// failClaimedApplyAfterDrivePanic contains an engine-drive panic to the
+// claimed work. The tasks in the drive's scope are marked failed so the
+// operation row can settle to a terminal state from its own tasks, and — when
+// this driver holds the parent apply lease — the apply row is marked failed so
+// neither the stale-heartbeat nor the retry recovery path re-claims the same
+// row and panics again. failed (permanent) is deliberate: failed_retryable
+// would queue the apply straight back into the panicking code path. Returns
+// true when this call transitioned the apply row to failed.
+//
+// The apply requires operator intervention afterwards: fix the underlying code
+// or data fault the panic log identifies, then start a new apply for the
+// schema change.
+func (s *Service) failClaimedApplyAfterDrivePanic(ctx context.Context, driverID int, apply *storage.Apply, applyOperationID int64, deployment, previousState string, drivePanic *panicsafe.Error) bool {
+	errMsg := fmt.Sprintf("apply drive panicked: %v", drivePanic.Value)
+	now := s.clock.Now()
+
+	// Fail the tasks the panicked drive was scoped to. The operation-claim
+	// paths derive the operation row from its tasks (markOperationFromOwnResult),
+	// so failing the tasks is what lets the operation row — and through the
+	// rollout projection, the parent apply — settle terminally.
+	var tasks []*storage.Task
+	var tasksErr error
+	if applyOperationID > 0 {
+		tasks, tasksErr = s.storage.Tasks().GetByApplyOperationID(ctx, applyOperationID)
+	} else {
+		tasks, tasksErr = s.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	}
+	if tasksErr != nil {
+		s.logger.Error("operator: failed to load tasks while containing drive panic; the operation row will settle from a later reconcile instead",
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"apply_operation_id", applyOperationID,
+				"operation_deployment", deployment,
+				"error", tasksErr)...)
+	}
+	for _, task := range tasks {
+		if state.IsTerminalTaskState(task.State) {
+			s.logger.Debug("operator: task already terminal while containing drive panic; leaving its state",
+				append(task.LogAttrs(), "driver", driverID)...)
+			continue
+		}
+		if task.ErrorMessage == "" {
+			task.ErrorMessage = errMsg
+		}
+		task.State = state.Task.Failed
+		task.CompletedAt = &now
+		task.UpdatedAt = now
+		if err := s.storage.Tasks().Update(ctx, task); err != nil {
+			s.logger.Error("operator: failed to mark task failed while containing drive panic; the task will settle from a later reconcile instead",
+				append(task.LogAttrs(), "driver", driverID, "error", err)...)
+		}
+	}
+
+	// A multi-operation drive holds only its operation lease; the parent
+	// applies row is owned by the rollout projection, which settles it from the
+	// now-failed operation row. Only a driver holding the parent apply lease
+	// writes the apply row directly.
+	if _, hasApplyLease := storage.ApplyLeaseFromContext(ctx); !hasApplyLease {
+		s.logger.Info("operator: contained drive panic under the operation lease; the parent apply will settle via the rollout projection",
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"apply_operation_id", applyOperationID,
+				"operation_deployment", deployment)...)
+		return false
+	}
+
+	// Reload before writing: a stop or a competing driver may have already
+	// terminalized the apply between the claim and the panic, and a terminal
+	// state must not be overwritten.
+	fresh, err := s.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		s.logger.Error("operator: failed to reload apply while containing drive panic; the apply is not marked failed and will be re-claimed on a later poll",
+			append(apply.LogAttrs(), "driver", driverID, "error", err)...)
+		return false
+	}
+	if fresh == nil {
+		s.logger.Error("operator: apply not found while containing drive panic; the apply is not marked failed",
+			append(apply.LogAttrs(), "driver", driverID)...)
+		return false
+	}
+	if state.IsTerminalApplyState(fresh.State) {
+		s.logger.Info("operator: apply already terminal while containing drive panic; leaving its state",
+			append(apply.LogAttrs(), "driver", driverID, "current_state", fresh.State)...)
+		return false
+	}
+
+	apply.State = state.Apply.Failed
+	apply.ErrorMessage = errMsg
+	apply.CompletedAt = &now
+	apply.UpdatedAt = now
+	if err := s.storage.Applies().Update(ctx, apply); err != nil {
+		s.logger.Error("operator: failed to mark apply failed while containing drive panic; the apply will be re-claimed on a later poll",
+			append(apply.LogAttrs(), "driver", driverID, "error", err)...)
+		return false
+	}
+	// The failed transition releases the active-apply gauge the same way an
+	// engine-driven failure would have.
+	metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+	s.logApplyDrivePanicFailure(ctx, driverID, apply, previousState, errMsg)
+	return true
+}
+
+// logApplyDrivePanicFailure appends a durable apply log entry recording that a
+// contained drive panic failed the apply, so the timeline explains the terminal
+// state without server logs. Best-effort: a failed append must not block
+// containment.
+func (s *Service) logApplyDrivePanicFailure(ctx context.Context, driverID int, apply *storage.Apply, previousState, errMsg string) {
+	logStore := s.storage.ApplyLogs()
+	if logStore == nil {
+		s.logger.Warn("operator: no apply log store configured; the drive panic will not appear in apply logs",
+			"driver", driverID,
+			"apply_id", apply.ApplyIdentifier)
+		return
+	}
+	logCtx, cancel := context.WithTimeout(ctx, ApplyClaimLogTimeout)
+	defer cancel()
+	if err := logStore.Append(logCtx, &storage.ApplyLog{
+		ApplyID:   apply.ID,
+		Level:     storage.LogLevelError,
+		EventType: storage.LogEventError,
+		Source:    storage.LogSourceSchemaBot,
+		Message:   fmt.Sprintf("Apply failed after a drive panic was contained by operator driver %d: %s. Fix the underlying fault, then start a new apply.", driverID, errMsg),
+		OldState:  previousState,
+		NewState:  apply.State,
+		CreatedAt: s.clock.Now(),
+	}); err != nil {
+		s.logger.Warn("operator: failed to log drive panic failure; the failure will not appear in apply logs",
 			"driver", driverID,
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,

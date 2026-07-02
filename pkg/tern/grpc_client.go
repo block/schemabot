@@ -116,6 +116,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/panicsafe"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -407,7 +408,47 @@ func remoteApplyStateDescription(remoteState ternv1.State) string {
 // pollAndNotifyObserver polls storage for apply state changes and notifies the
 // observer. This is the GRPCClient equivalent of LocalClient's progress poller
 // calling the observer — but driven by storage reads instead of engine polling.
+//
+// The poll runs behind a panic boundary: observer callbacks render
+// GitHub-facing progress and terminal updates from stored state, so a panic on
+// one poisoned apply must stop only this apply's notifications, not the
+// process that drives every apply. On a contained panic the observer is
+// cleared and the poller exits; the apply's drive is unaffected.
 func (c *GRPCClient) pollAndNotifyObserver(applyID int64) {
+	err := panicsafe.Call(func() error {
+		c.notifyObserverUntilTerminal(applyID)
+		return nil
+	})
+	if err == nil {
+		return
+	}
+	var pollPanic *panicsafe.Error
+	if !errors.As(err, &pollPanic) {
+		// The poll loop returns nothing, so only a contained panic reaches here
+		// today; keep the signal if that invariant changes.
+		slog.Error("observer poll failed; progress and terminal notifications for this apply are stopped", "error", err)
+		c.clearObserver(applyID)
+		return
+	}
+	attrs := []any{
+		"panic", fmt.Sprint(pollPanic.Value),
+		"stack", string(pollPanic.Stack),
+	}
+	// Best-effort identifier lookup for triage: the poller may have panicked
+	// before its first successful apply load, so the identifiers may be
+	// unavailable rather than the log being skipped.
+	if apply, lookupErr := c.storage.Applies().Get(context.Background(), applyID); lookupErr == nil && apply != nil {
+		attrs = append(apply.LogAttrs(), attrs...)
+	}
+	slog.Error("observer poll panicked; progress and terminal notifications for this apply are stopped", attrs...)
+	metrics.RecordRecoveredPanic(context.Background(), "observer_poll")
+	c.clearObserver(applyID)
+}
+
+// notifyObserverUntilTerminal is pollAndNotifyObserver's poll loop: it ticks
+// until the apply reaches a terminal state, the observer is cleared, or the
+// apply row disappears.
+func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
