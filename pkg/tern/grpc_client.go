@@ -124,6 +124,13 @@ import (
 const (
 	grpcProgressPollInterval       = 500 * time.Millisecond
 	maxGRPCProgressPollErrorStreak = 10
+
+	// orphanedRemoteStopTimeout bounds the best-effort Stop RPC sent before an
+	// orphaned remote apply is recorded as failed. The stop must not inherit
+	// the drive context — the same cancellation or deadline that made the
+	// dispatch ambiguous would otherwise skip the stop attempt entirely — but
+	// it also must not block the terminal failure write indefinitely.
+	orphanedRemoteStopTimeout = 30 * time.Second
 )
 
 var grpcStoppedAfterStartGracePeriod = 30 * time.Second
@@ -2170,7 +2177,12 @@ func (c *GRPCClient) failOrphanedRemoteDispatch(ctx context.Context, apply *stor
 		slog.Error("failing remote apply with no known remote apply id; the control plane cannot stop a schema change the data plane may still be executing — check the data plane and reconcile the target database",
 			append(apply.LogAttrs(), "reason", message)...)
 	} else {
-		stopResp, stopErr := c.client.Stop(ctx, &ternv1.StopRequest{
+		// The drive context may already be canceled or past its deadline —
+		// often the very condition that made the dispatch ambiguous — so the
+		// stop gets its own bounded context to still reach the data plane.
+		stopCtx, cancelStop := context.WithTimeout(context.WithoutCancel(ctx), orphanedRemoteStopTimeout)
+		defer cancelStop()
+		stopResp, stopErr := c.client.Stop(stopCtx, &ternv1.StopRequest{
 			ApplyId:     remoteID,
 			Environment: apply.Environment,
 		})

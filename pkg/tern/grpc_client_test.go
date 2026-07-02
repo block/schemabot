@@ -3766,9 +3766,12 @@ func installTestMeterReader(t *testing.T) *sdkmetric.ManualReader {
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	previous := otel.GetMeterProvider()
 	otel.SetMeterProvider(mp)
+	// Shutdown runs after the test finishes, when t.Context() is already
+	// canceled, so the cleanup context must not inherit its cancellation.
+	shutdownCtx := context.WithoutCancel(t.Context())
 	t.Cleanup(func() {
 		otel.SetMeterProvider(previous)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		require.NoError(t, mp.Shutdown(shutdownCtx))
 	})
 	return reader
 }
@@ -3817,6 +3820,7 @@ func ambiguousDispatchTestApply() (*storage.Apply, *storage.Task, *mockStorage) 
 		PlanID:          100,
 		Database:        "testdb",
 		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
 		Environment:     "staging",
 		State:           state.Apply.Running,
 	}
