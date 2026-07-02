@@ -65,7 +65,7 @@ type prClosedCheckStore struct {
 	deleteCalls int
 }
 
-func (s *prClosedCheckStore) DeleteByPRExcludingApplyOwned(_ context.Context, _ string, _ int) error {
+func (s *prClosedCheckStore) DeleteByPRRetainingBlockingApplyOwned(_ context.Context, _ string, _ int) error {
 	s.deleteCalls++
 	return nil
 }

@@ -197,16 +197,16 @@ func TestCheckStore_Delete(t *testing.T) {
 	require.ErrorIs(t, store.Checks().Delete(ctx, 99999), storage.ErrCheckNotFound)
 }
 
-// TestCheckStore_DeleteByPRExcludingApplyOwned verifies PR-close cleanup at the
-// storage layer: all of a PR's stored check state is deleted except apply-owned
-// rows that still block the PR. An apply-owned row that is in_progress must keep
+// TestCheckStore_DeleteByPRRetainingBlockingApplyOwned verifies PR-close cleanup
+// at the storage layer: all of a PR's stored check state is deleted except
+// apply-owned rows that still block the PR. An apply-owned row that is in_progress must keep
 // blocking until the apply reaches a terminal state, and an apply-owned row that
 // finished without a successful conclusion (action_required, failure) must keep
 // blocking until an operator reconciles the target environment — closing and
 // reopening the PR must not bypass either block. Plan-only rows and apply-owned
 // rows that concluded successfully are deleted so a reopened PR starts clean.
 // Rows for other PRs are untouched.
-func TestCheckStore_DeleteByPRExcludingApplyOwned(t *testing.T) {
+func TestCheckStore_DeleteByPRRetainingBlockingApplyOwned(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := New(testDB)
@@ -238,7 +238,7 @@ func TestCheckStore_DeleteByPRExcludingApplyOwned(t *testing.T) {
 		Status:       "pending",
 	}))
 
-	require.NoError(t, store.Checks().DeleteByPRExcludingApplyOwned(ctx, "org/repo", 123))
+	require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "org/repo", 123))
 
 	// Only the apply-owned rows that still block survive for PR 123.
 	retrieved, err := store.Checks().GetByPR(ctx, "org/repo", 123)
@@ -275,7 +275,7 @@ func TestCheckStore_DeleteByPRExcludingApplyOwned(t *testing.T) {
 	assert.Equal(t, "db1", retrieved[0].DatabaseName)
 
 	// Deleting for a non-existent PR is a no-op, not an error.
-	require.NoError(t, store.Checks().DeleteByPRExcludingApplyOwned(ctx, "org/repo", 999))
+	require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "org/repo", 999))
 }
 
 func TestCheckStore_GetByPR_DBError(t *testing.T) {

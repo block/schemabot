@@ -370,7 +370,7 @@ func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
 	// conclusion is not success, such as a schema change removed from the PR
 	// after its apply started. Those blocks require operator reconciliation
 	// and must persist across a close and reopen.
-	if err := h.service.Storage().Checks().DeleteByPRExcludingApplyOwned(ctx, repo, pr); err != nil {
+	if err := h.service.Storage().Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, repo, pr); err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "pr_close_cleanup",
 			Repository: repo,

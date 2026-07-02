@@ -508,8 +508,8 @@ func (s *checkStore) Delete(ctx context.Context, id int64) error {
 	return checkRowsAffected(result, storage.ErrCheckNotFound)
 }
 
-// DeleteByPRExcludingApplyOwned removes stored check state for a PR, except
-// apply-owned rows that still block the PR. Once an apply has started, its
+// DeleteByPRRetainingBlockingApplyOwned removes stored check state for a PR,
+// retaining apply-owned rows that still block the PR. Once an apply has started, its
 // stored check state is authoritative until an operator reconciles the target
 // environment — closing and reopening the PR must not convert it into a
 // passing aggregate. A row is retained when apply_id is set and either:
@@ -525,7 +525,7 @@ func (s *checkStore) Delete(ctx context.Context, id int64) error {
 // Apply-owned rows whose conclusion is success are deleted: the apply
 // finished cleanly and matches the PR contents, so nothing remains for the
 // row to block and a reopened PR must not inherit a stale gate.
-func (s *checkStore) DeleteByPRExcludingApplyOwned(ctx context.Context, repo string, pr int) error {
+func (s *checkStore) DeleteByPRRetainingBlockingApplyOwned(ctx context.Context, repo string, pr int) error {
 	_, err := s.db.ExecContext(ctx, `
 		DELETE FROM checks
 		WHERE repository = ? AND pull_request = ?

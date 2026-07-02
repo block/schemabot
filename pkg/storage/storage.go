@@ -150,14 +150,15 @@ type CheckStore interface {
 	// Delete removes stored check state by ID.
 	Delete(ctx context.Context, id int64) error
 
-	// DeleteByPRExcludingApplyOwned removes stored check state for a PR,
-	// except apply-owned rows that still block the PR: rows with apply_id set
-	// that are in_progress or whose conclusion is anything but success. Used
+	// DeleteByPRRetainingBlockingApplyOwned removes stored check state for a
+	// PR, retaining apply-owned rows that still block the PR: rows with
+	// apply_id set that are in_progress or whose conclusion is anything but
+	// success. Apply-owned rows that concluded successfully are deleted. Used
 	// for cleanup when a PR is closed or merged: once an apply has started,
 	// its stored check state stays authoritative across a close and reopen
 	// until the apply both reaches a terminal state and concludes
 	// successfully, or an operator reconciles the target environment.
-	DeleteByPRExcludingApplyOwned(ctx context.Context, repo string, pr int) error
+	DeleteByPRRetainingBlockingApplyOwned(ctx context.Context, repo string, pr int) error
 }
 
 // SettingsStore manages admin-level SchemaBot settings (global config).
