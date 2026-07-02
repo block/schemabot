@@ -105,12 +105,15 @@ func NewPSClientWithBaseURL(tokenName, tokenValue, baseURL string) (PSClient, er
 }
 
 func newPSClient(tokenName, tokenValue, baseURL string, opts ...ps.ClientOption) (PSClient, error) {
-	// WithHTTPClient must precede WithServiceToken: the service-token option
-	// wraps the transport of whatever client is installed at that point.
-	allOpts := append([]ps.ClientOption{
+	// Caller options apply first; the bounded HTTP client and the service
+	// token install last so no caller option can displace them. Within that
+	// pair, WithHTTPClient must precede WithServiceToken: the service-token
+	// option wraps the transport of whatever client is installed at that
+	// point.
+	allOpts := append(append([]ps.ClientOption{}, opts...),
 		ps.WithHTTPClient(newPlanetScaleHTTPClient()),
 		ps.WithServiceToken(tokenName, tokenValue),
-	}, opts...)
+	)
 	client, err := ps.NewClient(allOpts...)
 	if err != nil {
 		return nil, err

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -35,6 +36,36 @@ func TestNewPSClientWithBaseURLBoundsHTTPRequests(t *testing.T) {
 	require.NotNil(t, wrapper.httpClient)
 	assert.Equal(t, planetScaleHTTPTimeout, wrapper.httpClient.Timeout)
 	assert.Equal(t, "https://ps.example.com", wrapper.baseURL)
+}
+
+// Caller-supplied client options cannot displace the auth and timeout
+// invariants: the bounded HTTP client and the service token install after
+// all caller options, so SDK requests authenticate even when a caller
+// passes its own HTTP client.
+func TestNewPSClientCallerHTTPClientCannotDropAuth(t *testing.T) {
+	var gotAuth []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Values("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, err := w.Write([]byte(`{}`))
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	client, err := NewPSClient("token-name", "token-value",
+		ps.WithBaseURL(server.URL),
+		ps.WithHTTPClient(&http.Client{}),
+	)
+	require.NoError(t, err)
+
+	_, err = client.GetBranch(t.Context(), &ps.GetDatabaseBranchRequest{
+		Organization: "org",
+		Database:     "db",
+		Branch:       "main",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"token-name:token-value"}, gotAuth)
 }
 
 // The SDK's service-token option wraps the transport of the client installed
