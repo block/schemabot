@@ -581,6 +581,30 @@ func TestWebhookIgnoresSchemaBotProse(t *testing.T) {
 	}
 }
 
+// On a repo with no aggregate role this deployment is the only SchemaBot, so
+// the acknowledgment fires at dispatch — the user sees the eyes reaction
+// immediately, before schema discovery runs.
+func TestWebhookEyesReactionAtDispatchForSingleDeploymentRepo(t *testing.T) {
+	h, _, reactions := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the dispatch acknowledgment reaction")
+	}
+}
+
 func TestWebhookSignatureValidation(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 	secret := []byte("webhook-secret")

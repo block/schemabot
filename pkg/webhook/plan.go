@@ -61,7 +61,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema request error handled"})
 		return
 	}
-	h.acknowledgeCommand(repo, pr, installationID, commentID)
+	h.acknowledgeCommandActPoint(repo, pr, installationID, commentID)
 
 	// Reject if the PR HEAD advanced after discovery loaded schema files.
 	// Rendering a plan comment against stale files would mislead the user
