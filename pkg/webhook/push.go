@@ -112,9 +112,10 @@ func (h *Handler) handlePush(ctx context.Context, metricApp string, w http.Respo
 			"so commits on the default branch require no additional verification. " +
 			"This check also keeps SchemaBot selectable as a required-check source in branch rulesets.",
 	}); err != nil {
-		// Return 500 so GitHub redelivers. A missed post only ages the
-		// ruleset source index, but redelivery is idempotent and keeps the
-		// index fresh without operator involvement.
+		// Return 500 so the delivery is recorded as failed and shows up in the
+		// App's delivery log for redelivery. A missed post only ages the
+		// ruleset source index — the next default-branch push refreshes it —
+		// and reposting is idempotent.
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "default_branch_check",
 			Repository: repo,

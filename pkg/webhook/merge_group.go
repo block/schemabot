@@ -121,8 +121,10 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 		summary: "Schema changes in queued pull requests are applied and verified by SchemaBot before " +
 			"they enter the merge queue, so no additional verification is required for this merge group.",
 	}); err != nil {
-		// Return 500 so GitHub redelivers. The merge queue blocks until the check
-		// is posted, so a transient failure must be retried, not dropped.
+		// Return 500 so the delivery is recorded as failed and shows up in the
+		// App's delivery log for redelivery. The merge queue blocks until the
+		// check is posted, so the failure must be visible for retry, not
+		// silently dropped.
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "merge_group_check",
 			Repository: repo,
