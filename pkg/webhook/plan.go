@@ -16,7 +16,7 @@ import (
 )
 
 // handlePlanCommand handles the "schemabot plan -e <env>" command.
-func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, environment, databaseName, tenant string, installationID int64, requestedBy string) {
+func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, environment, databaseName, tenant string, installationID int64, requestedBy string, commentID int64) {
 	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
 		h.logger.Error("plan: failed to bootstrap command", "error", err)
@@ -61,6 +61,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema request error handled"})
 		return
 	}
+	h.acknowledgeCommand(repo, pr, installationID, commentID)
 
 	// Reject if the PR HEAD advanced after discovery loaded schema files.
 	// Rendering a plan comment against stale files would mislead the user

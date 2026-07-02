@@ -97,6 +97,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	// Parse command
 	parser := NewCommandParser()
 	result := parser.ParseCommand(payload.Comment.Body)
+	result.CommentID = payload.Comment.ID
 
 	if !result.IsMention {
 		h.writeJSON(w, http.StatusOK, map[string]string{
@@ -238,24 +239,6 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
-	// Add acknowledgment reaction now that we know this instance will handle
-	// the command. Placed after all skip/filter checks so only the owning
-	// instance reacts — avoids duplicate reactions in multi-instance setups.
-	if payload.Comment.ID > 0 && h.ghClients.Len() > 0 {
-		h.goSafe(repo, pr, installationID, func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			client, err := h.clientForRepo(repo, installationID)
-			if err != nil {
-				h.logger.Error("failed to create GitHub client for reaction", "error", err)
-				return
-			}
-			if err := client.AddReactionToComment(ctx, repo, payload.Comment.ID, "eyes"); err != nil {
-				h.logger.Error("failed to add acknowledgment reaction", "error", err)
-			}
-		})
-	}
-
 	// Reject -y/--yes on commands that don't support it
 	if result.Action != action.Apply && parser.HasAutoConfirmFlag(payload.Comment.Body) {
 		h.postComment(repo, pr, installationID, templates.RenderUnsupportedAutoConfirm(result.Action))
@@ -284,7 +267,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 
 	switch result.Action {
 	case action.Plan:
-		h.handlePlanCommand(w, repo, pr, result.Environment, result.Database, result.Tenant, installationID, requestedBy)
+		h.handlePlanCommand(w, repo, pr, result.Environment, result.Database, result.Tenant, installationID, requestedBy, result.CommentID)
 	case action.Help:
 		h.postComment(repo, pr, installationID, templates.RenderHelpComment())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "help posted"})
@@ -529,6 +512,30 @@ func (h *Handler) postInitialProgressComment(ctx context.Context, repo string, p
 		h.logger.Error("failed to increment edit count after finalizing progress comment",
 			append(apply.LogAttrs(), "error", err)...)
 	}
+}
+
+// acknowledgeCommand adds the eyes reaction to the command comment. Handlers
+// call it once they commit to acting on the command — after their silent-skip
+// gates — so on a fan-out only the deployments actually doing work
+// acknowledge, and an ignoring deployment leaves only its skip log.
+func (h *Handler) acknowledgeCommand(repo string, pr int, installationID, commentID int64) {
+	if commentID <= 0 || h.ghClients.Len() == 0 {
+		return
+	}
+	h.goSafe(repo, pr, installationID, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		client, err := h.clientForRepo(repo, installationID)
+		if err != nil {
+			h.logger.Error("failed to create GitHub client for command acknowledgment",
+				"repo", repo, "pr", pr, "error", err)
+			return
+		}
+		if err := client.AddReactionToComment(ctx, repo, commentID, "eyes"); err != nil {
+			h.logger.Error("failed to add command acknowledgment reaction",
+				"repo", repo, "pr", pr, "error", err)
+		}
+	})
 }
 
 func (h *Handler) renderPRComment(body string) string {

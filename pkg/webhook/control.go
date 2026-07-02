@@ -123,6 +123,7 @@ func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int
 			fmt.Sprintf("Apply %s belongs to environment %q, not %q", result.ApplyID, apply.Environment, result.Environment))
 		return nil, false
 	}
+	h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
 	return apply, true
 }
 

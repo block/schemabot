@@ -49,6 +49,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err)
 		return
 	}
+	h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
 
 	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.Apply); blocked {
 		return
@@ -417,6 +418,7 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 			"This lock belongs to a rollback plan. Use `schemabot rollback-confirm` to execute it, or `schemabot unlock` to cancel it.")
 		return
 	}
+	h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
 
 	// Cross-delivery freshness check: reject if the confirmation plan (the one
 	// the user reviewed) was rendered against a commit that is no longer the
@@ -489,6 +491,7 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 		h.postComment(repo, pr, installationID, templates.RenderNoLocksFound())
 		return
 	}
+	h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
 
 	// Unlock mutates lock state for every matched database, including
 	// force-releasing CLI-owned locks, so the actor must be an authorized

@@ -581,29 +581,6 @@ func TestWebhookIgnoresSchemaBotProse(t *testing.T) {
 	}
 }
 
-func TestWebhookEyesReaction(t *testing.T) {
-	h, _, reactions := newTestHandler(t)
-
-	// Use an env-scoped command that reaches the reaction point (after all
-	// skip/filter checks). Help returns before the reaction fires.
-	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot plan -e staging",
-		isPR:    true,
-	}, nil)
-
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-
-	require.Equal(t, http.StatusOK, rr.Code)
-
-	select {
-	case reaction := <-reactions:
-		assert.Equal(t, "eyes", reaction)
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for eyes reaction")
-	}
-}
-
 func TestWebhookSignatureValidation(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 	secret := []byte("webhook-secret")

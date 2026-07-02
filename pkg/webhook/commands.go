@@ -139,7 +139,11 @@ func NewCommandParser() *CommandParser {
 
 // CommandResult represents the result of parsing a command.
 type CommandResult struct {
-	Action       string
+	Action string
+	// CommentID is the PR comment that carried this command. Handlers
+	// acknowledge it with a reaction once they commit to acting, so on a
+	// fan-out only the deployments actually doing work acknowledge.
+	CommentID    int64
 	ApplyID      string // Positional apply identifier for apply-scoped commands.
 	Environment  string
 	Database     string // Optional -d flag value
