@@ -5195,6 +5195,64 @@ func TestSkipRevertHandler(t *testing.T) {
 	})
 }
 
+// Revert and skip-revert are contradictory intents for the same revert window —
+// one undoes the change, the other makes it permanent. Once either has a
+// pending durable request, the opposite command is rejected with a conflict
+// that names the intent already in flight, instead of recording a second,
+// contradictory request for the drive to arbitrate.
+func TestRevertWindowCommandsRejectContradiction(t *testing.T) {
+	revertWindowApply := func(id string) *storage.Apply {
+		apply := activeTestApply(id)
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EnginePlanetScale
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		return apply
+	}
+	post := func(t *testing.T, mux *http.ServeMux, path, applyID string) *httptest.ResponseRecorder {
+		t.Helper()
+		body := fmt.Sprintf(`{"environment": "staging", "apply_id": %q}`, applyID)
+		req := httptest.NewRequestWithContext(t.Context(), "POST", path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w
+	}
+
+	t.Run("revert rejected while skip-revert is pending", func(t *testing.T) {
+		// The immediate skip attempt fails, so the durable skip-revert request
+		// stays pending for the apply owner.
+		mock := &mockTernClient{skipRevertErr: errors.New("data plane unavailable")}
+		svc := newControlTestService(mock, revertWindowApply("apply-conflict-rv"))
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		first := post(t, mux, "/api/skip-revert", "apply-conflict-rv")
+		require.Equal(t, http.StatusAccepted, first.Code, first.Body.String())
+
+		second := post(t, mux, "/api/revert", "apply-conflict-rv")
+		assert.Equal(t, http.StatusConflict, second.Code, second.Body.String())
+		assert.Contains(t, second.Body.String(), "skip-revert is already pending")
+		assert.Nil(t, mock.revertReq, "the contradictory revert must not reach the data plane")
+	})
+
+	t.Run("skip-revert rejected while revert is pending", func(t *testing.T) {
+		// The immediate revert attempt fails, so the durable revert request
+		// stays pending for the apply owner.
+		mock := &mockTernClient{revertErr: errors.New("data plane unavailable")}
+		svc := newControlTestService(mock, revertWindowApply("apply-conflict-sr"))
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		first := post(t, mux, "/api/revert", "apply-conflict-sr")
+		require.Equal(t, http.StatusAccepted, first.Code, first.Body.String())
+
+		second := post(t, mux, "/api/skip-revert", "apply-conflict-sr")
+		assert.Equal(t, http.StatusConflict, second.Code, second.Body.String())
+		assert.Contains(t, second.Body.String(), "revert is already pending")
+		assert.Nil(t, mock.skipRevertReq, "the contradictory skip-revert must not reach the data plane")
+	})
+}
+
 func TestDeriveErrorCode(t *testing.T) {
 	tests := []struct {
 		name     string
