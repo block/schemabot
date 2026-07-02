@@ -197,6 +197,45 @@ func hasBlockingCheckForEnvironment(checks []*storage.Check, environment string)
 	return false
 }
 
+// awaitingCurrentCommitTitle is the aggregate title shown when only results
+// recorded for another commit hold the aggregate open — nothing is running for
+// the commit the Check Run is published on, and the current commit's own plan
+// or apply results are still pending.
+const awaitingCurrentCommitTitle = "Awaiting results for the latest commit"
+
+// normalizeStaleContributions returns the fold contributions for headSHA.
+// A row stored for a different commit contributes a blocking in-progress
+// placeholder instead of its stored status and conclusion: results computed
+// for another commit say nothing about the current one, so they must hold the
+// aggregate open until the current commit's plan or apply results replace
+// them. Rows for the current commit pass through unchanged.
+func normalizeStaleContributions(checks []*storage.Check, headSHA string) (contributions []*storage.Check, staleCount int) {
+	contributions = make([]*storage.Check, 0, len(checks))
+	for _, c := range checks {
+		if c.HeadSHA == headSHA {
+			contributions = append(contributions, c)
+			continue
+		}
+		stale := *c
+		stale.Status = checkStatusInProgress
+		stale.Conclusion = ""
+		contributions = append(contributions, &stale)
+		staleCount++
+	}
+	return contributions, staleCount
+}
+
+// anyInProgressOnCommit reports whether any check recorded for headSHA is
+// genuinely in progress, as opposed to a stale-row placeholder.
+func anyInProgressOnCommit(checks []*storage.Check, headSHA string) bool {
+	for _, c := range checks {
+		if c.HeadSHA == headSHA && c.Status == checkStatusInProgress {
+			return true
+		}
+	}
+	return false
+}
+
 // computeAggregate determines the aggregate conclusion and status from per-database checks.
 func computeAggregate(checks []*storage.Check) (conclusion, status string) {
 	// in_progress takes precedence — the aggregate should show running

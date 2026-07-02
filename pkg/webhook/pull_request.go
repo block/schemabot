@@ -173,6 +173,12 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 
 	configs = h.filterManagedDiscoveredConfigs(ctx, repo, pr, headSHA, source, configs)
 
+	// Config discovery and the managed-directory guard just re-verified this
+	// commit, and the clear re-checks allowed-environment coverage for every
+	// discovered database. Together those cover every condition that records
+	// an aggregate blocking reason, so a stored block can now be released.
+	h.clearAggregateBlocksForVerifiedPR(ctx, client, repo, pr, headSHA, configs)
+
 	// Collect database names from discovered configs
 	affectedDatabases := make(map[string]bool)
 	for _, cfg := range configs {

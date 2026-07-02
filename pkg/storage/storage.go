@@ -113,6 +113,14 @@ type CheckStore interface {
 	// Returns true when the row was marked successful.
 	MarkStalePlanSuccessful(ctx context.Context, check *Check) (bool, error)
 
+	// ClearAggregateBlock clears the blocking reason on stored aggregate check
+	// state after the PR-level guards re-verified that the blocking condition
+	// no longer applies. The update is conditional on the head SHA and blocking
+	// reason the caller read, so a block recorded concurrently by another
+	// writer (for example for a newer commit) is never erased. Returns true
+	// when the row was cleared.
+	ClearAggregateBlock(ctx context.Context, check *Check) (bool, error)
+
 	// CompleteForApply updates stored check state to a terminal state only if
 	// it still belongs to the given apply and no newer apply exists for the
 	// same PR/environment/database. Returns false when another driver changed
