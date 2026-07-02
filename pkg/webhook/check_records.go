@@ -18,7 +18,8 @@ import (
 // regardless of whether the reviewed primary plan itself had changes, because a
 // deployment's live schema no longer matches what was reviewed (or could not be
 // confirmed to match). Summary explains why for the check's Change column and
-// logs. A nil result means no drift rollup applied to this record.
+// logs. A nil result is non-blocking: either the rollup ran clean or drift was
+// not computed for this path (e.g. apply-time callsites).
 type reviewDriftResult struct {
 	Blocked bool
 	Summary string
