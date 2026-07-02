@@ -422,8 +422,8 @@ func (s *recordingCheckStore) Upsert(ctx context.Context, check *storage.Check) 
 	return err
 }
 
-func (s *recordingCheckStore) UpsertPlanResult(ctx context.Context, check *storage.Check) error {
-	err := s.CheckStore.UpsertPlanResult(ctx, check)
+func (s *recordingCheckStore) UpsertPlanResult(ctx context.Context, check *storage.Check, drift storage.PlanDriftState) error {
+	err := s.CheckStore.UpsertPlanResult(ctx, check, drift)
 	if err == nil {
 		s.record("upsert_plan_result", check.DatabaseName, check.Status, check.Conclusion)
 	}
@@ -599,12 +599,21 @@ func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
 
 	// The completed rollback's terminal transition must be in_progress →
 	// action_required with nothing in between: a stored success, however brief,
-	// is a passing required check to any concurrent aggregate reader.
+	// is a passing required check to any concurrent aggregate reader. Prove
+	// both halves — the check was marked in_progress while the rollback ran,
+	// and the only completed conclusion ever stored is action_required.
 	writes := recorder.Writes()
 	require.NotEmpty(t, writes, "recorder should observe the rollback's stored check state writes")
+	assert.True(t, slices.ContainsFunc(writes, func(w checkWrite) bool {
+		return w.status == checkStatusInProgress
+	}), "stored check state must be marked in_progress while the rollback executes")
 	for _, w := range writes {
 		assert.NotEqual(t, checkConclusionSuccess, w.conclusion,
 			"stored check state was written as success during rollback finalization (op %s, status %s)", w.op, w.status)
+		if w.status == checkStatusCompleted {
+			assert.Equal(t, checkConclusionActionRequired, w.conclusion,
+				"every completed stored check state write during rollback finalization must be action_required (op %s)", w.op)
+		}
 	}
 	terminal := writes[len(writes)-1]
 	assert.Equal(t, "mark_action_required_for_apply", terminal.op)
