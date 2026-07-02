@@ -105,7 +105,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	}
 
 	// Execute plan via the service
-	planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)
+	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
 	if err != nil {
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "error", err)
 		metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "error")
@@ -118,13 +118,17 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 
+	// Roll up every deployment's diff against the reviewed plan so drift on a
+	// non-primary deployment fails the check closed at review time.
+	drift := h.reviewTimeDrift(ctx, planReq, planProto, repo, pr)
+
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy)
 
 	metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "success")
 
 	// Store per-database check record and update aggregate
-	headSHA, recoveredApplyOwnedCheckState, checkErr := h.storeManualPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
+	headSHA, recoveredApplyOwnedCheckState, checkErr := h.storeManualPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, drift)
 	if checkErr != nil {
 		h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "error", checkErr)
 	}
@@ -133,7 +137,13 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Post plan comment
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 
-	if headSHA != "" {
+	// When drift blocked the check but its record could not be persisted, the
+	// aggregate must not be recomputed from stale (possibly passing) stored rows.
+	// Post a failing aggregate from the in-memory drift result so the gate still
+	// blocks closed.
+	if drift != nil && drift.Blocked && checkErr != nil {
+		h.postFailingAggregates(ctx, client, repo, pr, schemaResult.HeadSHA, map[string]string{environment: drift.Summary})
+	} else if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
 
@@ -230,6 +240,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 	// Collect plans for all environments
 	var headSHA string
+	// Environments whose drift-blocking check record could not be persisted, kept
+	// so a failing aggregate can be posted from the in-memory drift result rather
+	// than letting the post-loop aggregate recompute from stale stored rows.
+	driftBlockUnstored := map[string]string{}
 	multiEnvData := templates.MultiEnvPlanCommentData{
 		RequestedBy:  requestedBy,
 		Tenant:       tenant,
@@ -292,24 +306,31 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			SourceTrusted: true,
 		}
 
-		planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)
+		planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
 		if err != nil {
 			h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "env", env, "error", err)
 			multiEnvData.Errors[env] = userFacingError(err)
 			continue
 		}
 
+		// Roll up every deployment's diff against the reviewed plan so drift on a
+		// non-primary deployment fails the check closed at review time.
+		drift := h.reviewTimeDrift(ctx, planReq, planProto, repo, pr)
+
 		// Store per-database check record per environment
 		var recoveredApplyOwnedCheckState bool
 		var sha string
 		var checkErr error
 		if isAutoPlan {
-			sha, checkErr = h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, env)
+			sha, checkErr = h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, env, drift)
 		} else {
-			sha, recoveredApplyOwnedCheckState, checkErr = h.storeManualPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, env)
+			sha, recoveredApplyOwnedCheckState, checkErr = h.storeManualPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, env, drift)
 		}
 		if checkErr != nil {
 			h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "env", env, "error", checkErr)
+			if drift != nil && drift.Blocked {
+				driftBlockUnstored[env] = drift.Summary
+			}
 		}
 		if sha != "" {
 			headSHA = sha
@@ -333,6 +354,14 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		} else {
 			h.postFailingAggregates(ctx, client, repo, pr, prInfo.HeadSHA, multiEnvData.Errors)
 		}
+	}
+
+	// For any environment whose drift-blocking check record could not be
+	// persisted, post a failing aggregate from the in-memory drift result after
+	// the stored-row aggregate sync so a stale passing row cannot leave the gate
+	// open. Posted last so it wins over updateAggregateCheck for these envs.
+	if len(driftBlockUnstored) > 0 && multiEnvData.HeadSHA != "" {
+		h.postFailingAggregates(ctx, client, repo, pr, multiEnvData.HeadSHA, driftBlockUnstored)
 	}
 
 	// Auto-plan: skip comment if no changes and no errors (reduce PR noise)

@@ -12,7 +12,7 @@ import (
 
 // storeApplyPlanCheckRecord stores a check record when an apply plan is posted.
 func (h *Handler) storeApplyPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, error) {
-	return h.storePlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment)
+	return h.storePlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, nil)
 }
 
 // updateCheckRecordForApplyStart updates the stored check state to "in_progress"

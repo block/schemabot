@@ -263,6 +263,32 @@ func RecordTransientPlanRetry(ctx context.Context, database, environment, outcom
 	)
 }
 
+var knownReviewDriftClassifications = map[string]bool{
+	"match":    true,
+	"diverged": true,
+	"errored":  true,
+}
+
+// RecordReviewDrift increments the counter for a deployment's review-time drift
+// classification against the reviewed primary plan. A spike with
+// classification="diverged" means a deployment's live schema no longer matches
+// what was reviewed — an operator must reconcile that deployment before the PR
+// can apply. classification="errored" means the deployment could not be diffed
+// or compared and is failing the check closed; investigate connectivity to that
+// deployment or the plan input.
+func RecordReviewDrift(ctx context.Context, database, environment, deployment, classification string) {
+	if !knownReviewDriftClassifications[classification] {
+		classification = "errored"
+	}
+	addCounter(ctx, "schemabot.review_drift.total",
+		"review-time per-deployment drift classifications against the reviewed primary plan", "{deployment}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("deployment", deployment),
+		attribute.String("classification", classification),
+	)
+}
+
 var knownSourcePolicyOperations = map[string]bool{
 	"plan":  true,
 	"apply": true,

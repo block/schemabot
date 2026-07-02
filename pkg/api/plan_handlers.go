@@ -391,6 +391,18 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 // and returns the plan response. This is the shared implementation used by both
 // the HTTP handler and the webhook handler.
 func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.PlanResponse, error) {
+	_, resp, err := s.ExecutePlanProto(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// ExecutePlanProto runs a plan and returns both the reviewed primary plan proto
+// and its API projection. The proto is the reviewed baseline the review-time
+// drift rollup compares deployments against, so it is exposed alongside the API
+// response rather than reconstructed from storage.
+func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv1.PlanResponse, *apitypes.PlanResponse, error) {
 	ctx, span := otel.Tracer("schemabot").Start(ctx, "ExecutePlan",
 		trace.WithAttributes(
 			attribute.String("database", req.Database),
@@ -403,7 +415,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 	if warning, err := validateSchemaFiles(req.SchemaFiles); err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "invalid schema files")
-		return nil, err
+		return nil, nil, err
 	} else if warning != "" {
 		s.logger.Warn("plan request has empty schema files", "warning", warning, "database", req.Database)
 	}
@@ -417,7 +429,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		span.SetStatus(otelcodes.Error, "resolve target")
 		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
-		return nil, fmt.Errorf("resolve target for %s/%s: %w", req.Database, req.Environment, err)
+		return nil, nil, fmt.Errorf("resolve target for %s/%s: %w", req.Database, req.Environment, err)
 	}
 	deployment = resolvedTarget.Deployment
 	if req.Type != resolvedTarget.DatabaseType {
@@ -426,7 +438,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		span.SetStatus(otelcodes.Error, "type mismatch")
 		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
-		return nil, typeErr
+		return nil, nil, typeErr
 	}
 
 	prInt := 0
@@ -467,7 +479,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 				"schema_path", req.SchemaPath,
 				"reason", reason,
 				"error", err)
-			return nil, fmt.Errorf("source policy: %w", err)
+			return nil, nil, fmt.Errorf("source policy: %w", err)
 		}
 	}
 
@@ -477,7 +489,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		span.SetStatus(otelcodes.Error, "tern client")
 		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
-		return nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
+		return nil, nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
 	}
 
 	ternReq := &ternv1.PlanRequest{
@@ -524,13 +536,13 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 			"error", err,
 		)
 		if client.IsRemote() && grpcstatus.Code(err) == grpccodes.Unavailable {
-			return nil, &RemoteDeploymentUnavailableError{
+			return nil, nil, &RemoteDeploymentUnavailableError{
 				Deployment: deployment,
 				Target:     resolvedTarget.Target,
 				Err:        err,
 			}
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	span.SetAttributes(attribute.String("plan_id", resp.PlanId), attribute.Int("change_count", len(resp.Changes)))
 	metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "success")
@@ -556,10 +568,10 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		Target:       resolvedTarget.Target,
 	}
 	if err := s.storePlanResponse(ctx, req, resp, route); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return planResponseFromProto(resp), nil
+	return resp, planResponseFromProto(resp), nil
 }
 
 type storedPlanRoute struct {

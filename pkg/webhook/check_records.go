@@ -13,22 +13,41 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
+// reviewDriftResult carries the review-time per-deployment drift outcome into
+// the plan check record. When Blocked is true the plan check fails closed
+// regardless of whether the reviewed primary plan itself had changes, because a
+// deployment's live schema no longer matches what was reviewed (or could not be
+// confirmed to match). Summary explains why for the check's Change column and
+// logs. A nil result means no drift rollup applied to this record.
+type reviewDriftResult struct {
+	Blocked bool
+	Summary string
+}
+
 // storePlanCheckRecord stores per-database check state after a plan is generated.
 // The state is used internally by the aggregate check to compute its overall status.
 // No per-database GitHub Check Run is created — only the aggregate is visible on the PR.
 // Returns the commit SHA used for the plan. Failures are non-fatal.
-func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, error) {
-	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment)
+func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, drift *reviewDriftResult) (string, error) {
+	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, drift)
 	return headSHA, err
 }
 
 // storeManualPlanCheckRecord stores per-database check state after a manual
 // plan and then reconciles same-head apply-owned stored check state when the manual
 // plan proves the target already matches the PR schema.
-func (h *Handler) storeManualPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, bool, error) {
-	headSHA, check, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment)
+func (h *Handler) storeManualPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, drift *reviewDriftResult) (string, bool, error) {
+	headSHA, check, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, drift)
 	if err != nil {
 		return headSHA, false, err
+	}
+
+	// A drift-blocked check is not a clean no-op plan even when the primary's own
+	// diff is empty: a non-primary deployment drifted or could not be confirmed,
+	// so recovering (clearing) apply-owned check state here would wrongly unblock
+	// the PR. Leave the blocking check state in place for an operator to reconcile.
+	if drift != nil && drift.Blocked {
+		return headSHA, false, nil
 	}
 
 	recoveredApplyOwnedCheckState, err := h.service.Storage().Checks().RecoverApplyOwnedCheckWithNoOpPlan(ctx, check)
@@ -56,7 +75,26 @@ func (h *Handler) storeManualPlanCheckRecord(ctx context.Context, client *ghclie
 	return headSHA, recoveredApplyOwnedCheckState, nil
 }
 
-func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, *storage.Check, error) {
+// planCheckConclusion decides a plan check's stored conclusion. Review-time
+// drift fails the check closed ahead of the plan's own outcome: a deployment
+// whose live schema no longer matches the reviewed plan (or that could not be
+// confirmed to match) must block the PR even when the primary's diff is clean or
+// empty. A primary plan that reported errors likewise fails; otherwise changes
+// require an apply and an empty diff passes.
+func planCheckConclusion(hasChanges, hasPlanErrors, driftBlocked bool) string {
+	switch {
+	case driftBlocked:
+		return checkConclusionFailure
+	case hasPlanErrors:
+		return checkConclusionFailure
+	case hasChanges:
+		return checkConclusionActionRequired
+	default:
+		return checkConclusionSuccess
+	}
+}
+
+func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, drift *reviewDriftResult) (string, *storage.Check, error) {
 	headSHA := schema.HeadSHA
 	if headSHA == "" {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -98,15 +136,13 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 
 	tables := planResp.FlatTables()
 	hasChanges := len(tables) > 0
+	driftBlocked := drift != nil && drift.Blocked
 
-	var conclusion string
-	switch {
-	case len(planResp.Errors) > 0:
-		conclusion = checkConclusionFailure
-	case hasChanges:
-		conclusion = checkConclusionActionRequired
-	default:
-		conclusion = checkConclusionSuccess
+	conclusion := planCheckConclusion(hasChanges, len(planResp.Errors) > 0, driftBlocked)
+
+	changeSummary := summarizePlanChanges(schema, planResp, environment)
+	if driftBlocked {
+		changeSummary = drift.Summary
 	}
 
 	check := &storage.Check{
@@ -116,10 +152,10 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 		Environment:   environment,
 		DatabaseType:  schema.Type,
 		DatabaseName:  schema.Database,
-		HasChanges:    hasChanges,
+		HasChanges:    hasChanges || driftBlocked,
 		Status:        checkStatusCompleted,
 		Conclusion:    conclusion,
-		ChangeSummary: summarizePlanChanges(schema, planResp, environment),
+		ChangeSummary: changeSummary,
 	}
 	if err := h.service.Storage().Checks().UpsertPlanResult(ctx, check); err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{

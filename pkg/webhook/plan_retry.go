@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/metrics"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 )
 
 const (
@@ -57,9 +58,19 @@ func (h *Handler) planRetryDelay() time.Duration {
 // the gRPC client's retry budget while still surfacing sustained outages
 // within seconds.
 func (h *Handler) executePlanWithTransientRetry(ctx context.Context, planReq api.PlanRequest, repo string, pr int) (*apitypes.PlanResponse, error) {
-	planResp, err := h.service.ExecutePlan(ctx, planReq)
+	_, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
+	return planResp, err
+}
+
+// executePlanProtoWithTransientRetry runs ExecutePlanProto with the same
+// transient-retry behavior as executePlanWithTransientRetry, additionally
+// returning the reviewed primary plan proto so callers can feed it to the
+// review-time drift rollup without re-planning or reconstructing it from
+// storage.
+func (h *Handler) executePlanProtoWithTransientRetry(ctx context.Context, planReq api.PlanRequest, repo string, pr int) (*ternv1.PlanResponse, *apitypes.PlanResponse, error) {
+	planProto, planResp, err := h.service.ExecutePlanProto(ctx, planReq)
 	if err == nil || !isTransientRemotePlanError(err) {
-		return planResp, err
+		return planProto, planResp, err
 	}
 
 	delay := h.planRetryDelay()
@@ -80,11 +91,11 @@ func (h *Handler) executePlanWithTransientRetry(ctx context.Context, planReq api
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, fmt.Errorf("plan retry for %s/%s cancelled: %w", planReq.Database, planReq.Environment, ctx.Err())
+			return nil, nil, fmt.Errorf("plan retry for %s/%s cancelled: %w", planReq.Database, planReq.Environment, ctx.Err())
 		case <-timer.C:
 		}
 
-		planResp, retryErr := h.service.ExecutePlan(ctx, planReq)
+		planProto, planResp, retryErr := h.service.ExecutePlanProto(ctx, planReq)
 		if retryErr == nil {
 			metrics.RecordTransientPlanRetry(ctx, planReq.Database, planReq.Environment, "recovered")
 			h.logger.Info("plan retry recovered from transient remote unavailability",
@@ -94,7 +105,7 @@ func (h *Handler) executePlanWithTransientRetry(ctx context.Context, planReq api
 				"environment", planReq.Environment,
 				"retry_attempt", retryAttempt,
 				"plan_id", planResp.PlanID)
-			return planResp, nil
+			return planProto, planResp, nil
 		}
 		if !isTransientRemotePlanError(retryErr) {
 			metrics.RecordTransientPlanRetry(ctx, planReq.Database, planReq.Environment, "stopped_non_transient")
@@ -105,7 +116,7 @@ func (h *Handler) executePlanWithTransientRetry(ctx context.Context, planReq api
 				"environment", planReq.Environment,
 				"retry_attempt", retryAttempt,
 				"error", retryErr)
-			return nil, retryErr
+			return nil, nil, retryErr
 		}
 		lastErr = retryErr
 	}
@@ -119,5 +130,5 @@ func (h *Handler) executePlanWithTransientRetry(ctx context.Context, planReq api
 		"max_retries", maxTransientPlanRetries,
 		"first_error", firstErr,
 		"last_error", lastErr)
-	return nil, firstErr
+	return nil, nil, firstErr
 }
