@@ -523,7 +523,10 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 		engineTableProgress = c.snapshotEngineProgress(ctx, eng, stopCreds)
 	}
 
-	stoppedCount, skippedCount, applyID := c.markTasksWithState(ctx, tasks, targetApplyID, engineTableProgress, terminalState)
+	stoppedCount, skippedCount, applyID, err := c.markTasksWithState(ctx, tasks, targetApplyID, engineTableProgress, terminalState)
+	if err != nil {
+		return nil, fmt.Errorf("persist %s task state during stop: %w", terminalState, err)
+	}
 
 	if applyID > 0 && stoppedCount > 0 {
 		eventMsg := fmt.Sprintf("Stop requested: %d tasks stopped, %d skipped", stoppedCount, skippedCount)
@@ -614,7 +617,10 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 	}
 	c.cancelApplyHandle(applyCancel)
 
-	cancelledCount, skippedCount, applyID := c.markTasksWithState(ctx, tasks, targetApplyID, nil, state.Task.Cancelled)
+	cancelledCount, skippedCount, applyID, err := c.markTasksWithState(ctx, tasks, targetApplyID, nil, state.Task.Cancelled)
+	if err != nil {
+		return nil, fmt.Errorf("persist cancelled task state during cancel: %w", err)
+	}
 	if applyID > 0 && cancelledCount > 0 {
 		if err := c.markApplyCancelled(ctx, applyID); err != nil {
 			return nil, err
@@ -1008,9 +1014,14 @@ func (c *LocalClient) snapshotEngineProgress(ctx context.Context, eng engine.Eng
 	return nil
 }
 
-// markTasksStopped sets all non-terminal targeted tasks to STOPPED, preserving engine progress.
-// Returns (stopped count, skipped count, apply ID for logging).
-func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.Task, targetApplyID int64, engineProgress map[string]*engine.TableProgress, newState string) (int64, int64, int64) {
+// markTasksWithState sets all non-terminal targeted tasks to the given
+// terminal state, preserving engine progress.
+// Returns (stopped count, skipped count, apply ID for logging). The first
+// failed task write aborts and returns the error: reporting a stop or cancel
+// as accepted while task rows still read as active would let the stored state
+// diverge from what the operator was told, so the control call must fail and
+// be retried instead.
+func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.Task, targetApplyID int64, engineProgress map[string]*engine.TableProgress, newState string) (int64, int64, int64, error) {
 	var stoppedCount, skippedCount int64
 	var applyID int64
 
@@ -1038,13 +1049,15 @@ func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.T
 			task.ChecksumRowsTotal = et.ChecksumRowsTotal
 		}
 
-		c.transitionTaskState(ctx, task, task.ApplyID, newState,
-			fmt.Sprintf("Task %s %s", task.TaskIdentifier, newState))
+		if err := c.transitionTaskState(ctx, task, task.ApplyID, newState,
+			fmt.Sprintf("Task %s %s", task.TaskIdentifier, newState)); err != nil {
+			return stoppedCount, skippedCount, applyID, err
+		}
 
 		stoppedCount++
 	}
 
-	return stoppedCount, skippedCount, applyID
+	return stoppedCount, skippedCount, applyID, nil
 }
 
 // firstFailedTaskError returns an apply-level failure reason derived from task
@@ -1159,10 +1172,25 @@ func (c *LocalClient) markApplyStopped(ctx context.Context, applyID int64) error
 	return nil
 }
 
+// cancelPreservesApplyOutcome reports whether a cancel must leave the apply's
+// stored state untouched. Completed, failed, and reverted record the final
+// outcome of engine work that already happened, and a late cancel must never
+// rewrite that outcome — a fully-applied change recorded as cancelled would
+// mislead the merge gate and operators about what is live on the target.
+// Cancelled itself is re-writable (a repeated cancel is idempotent), and
+// stopped is terminal but explicitly cancellable: a driver may cancel a
+// stopped apply to abandon its checkpoint permanently.
+func cancelPreservesApplyOutcome(applyState string) bool {
+	return state.IsTerminalApplyState(applyState) &&
+		!state.IsState(applyState, state.Apply.Cancelled, state.Apply.Stopped)
+}
+
 // markApplyCancelled sets the apply to cancelled. Called by Stop() for Vitess
 // databases where cancelling the deploy request is permanent. This runs before
 // the apply goroutine sees the context cancellation, so failApplyWithTasks
 // will find the apply already terminal and leave it alone.
+// An apply whose stored state already records a final outcome (see
+// cancelPreservesApplyOutcome) keeps that state.
 func (c *LocalClient) markApplyCancelled(ctx context.Context, applyID int64) error {
 	apply, err := c.storage.Applies().Get(ctx, applyID)
 	if err != nil {
@@ -1170,6 +1198,12 @@ func (c *LocalClient) markApplyCancelled(ctx context.Context, applyID int64) err
 	}
 	if apply == nil {
 		return fmt.Errorf("load apply %d for cancelled state: %w", applyID, storage.ErrApplyNotFound)
+	}
+	if cancelPreservesApplyOutcome(apply.State) {
+		c.logger.Info("apply already reached a final outcome, not marking cancelled",
+			"apply_id", apply.ApplyIdentifier,
+			"state", apply.State)
+		return nil
 	}
 	now := time.Now()
 	apply.State = state.Apply.Cancelled

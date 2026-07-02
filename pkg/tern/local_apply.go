@@ -114,7 +114,11 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 			"engine_message", result.Message, "storage_state", t.State)
 		now := time.Now()
 		t.CompletedAt = &now
-		c.transitionTaskState(ctx, t, 0, engineStateToStorage(result.State), "")
+		if err := c.transitionTaskState(ctx, t, 0, engineStateToStorage(result.State), ""); err != nil {
+			c.logger.Warn("conflict check: failed to persist terminal engine state for stale task; task continues to block until a later check persists it",
+				append(t.LogAttrs(), "error", err)...)
+			return false
+		}
 		return true
 	}
 
@@ -136,7 +140,11 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		now := time.Now()
 		t.ErrorMessage = "Task abandoned: engine has no active schema change (server may have crashed)"
 		t.CompletedAt = &now
-		c.transitionTaskState(ctx, t, 0, state.Task.Failed, "")
+		if err := c.transitionTaskState(ctx, t, 0, state.Task.Failed, ""); err != nil {
+			c.logger.Warn("conflict check: failed to persist abandoned task cleanup; task continues to block until a later check persists it",
+				append(t.LogAttrs(), "error", err)...)
+			return false
+		}
 		return true
 	}
 
@@ -203,31 +211,40 @@ func (c *LocalClient) setupSpiritLogging(ctx context.Context, apply *storage.App
 
 // transitionTaskState updates a task's state, persists it, and optionally logs a state transition.
 // Fields like CompletedAt, StartedAt, ErrorMessage, or progress must be set on the task BEFORE calling this.
-func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Task, applyID int64, newState string, logMsg string) {
+// A write failure is returned so the caller decides whether the drive can
+// continue: stored task state that lags the in-memory drive is what a crash
+// recovery re-drives from, so most callers must not proceed as if the write
+// happened.
+func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Task, applyID int64, newState string, logMsg string) error {
 	oldState := task.State
 	task.State = newState
 	task.UpdatedAt = time.Now()
 	if err := c.storage.Tasks().Update(ctx, task); err != nil {
-		c.logger.Error("failed to update task state", append(task.LogAttrs(), "error", err)...)
+		return fmt.Errorf("update task %s to state %s: %w", task.TaskIdentifier, newState, err)
 	}
 	if logMsg != "" && applyID > 0 {
 		taskID := task.ID
 		c.logApplyEvent(ctx, applyID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			logMsg, oldState, newState)
 	}
+	return nil
 }
 
 // markTasksRunning sets DDL tasks to running state with a start timestamp.
-func (c *LocalClient) markTasksRunning(ctx context.Context, tasks []*storage.Task) {
+// The tasks belong to one apply, so the first failed write aborts the batch:
+// a partial batch is not a state the drive can reason about, and the caller
+// must not poll engine work against task rows storage never accepted.
+func (c *LocalClient) markTasksRunning(ctx context.Context, tasks []*storage.Task) error {
 	now := time.Now()
 	for _, task := range tasks {
 		task.State = state.Task.Running
 		task.StartedAt = &now
 		task.UpdatedAt = now
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			c.logger.Error("failed to update task state", append(task.LogAttrs(), "error", err)...)
+			return fmt.Errorf("mark task %s running: %w", task.TaskIdentifier, err)
 		}
 	}
+	return nil
 }
 
 // runWithRecovery wraps an apply function with panic recovery so a single panic

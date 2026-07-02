@@ -180,9 +180,9 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 		var err error
 		taskCreds, err = c.credentialsForMySQLNamespace(task.Namespace)
 		if err != nil {
-			c.markTaskFailed(ctx, task, err.Error())
+			action := c.markTaskFailed(ctx, task, err.Error())
 			c.logger.Error("task failed to resolve namespace credentials", append(task.LogAttrs(), "namespace", task.Namespace, "error", err)...)
-			return taskFailed
+			return action
 		}
 	}
 
@@ -192,24 +192,29 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	result, err := c.getEngine().Apply(ctx, sequentialEngineApplyRequest(task, options, taskCreds))
 
 	if err != nil {
+		var action taskAction
 		if c.shouldRetryEngineError(err) {
-			c.markTaskRetryable(ctx, task, err.Error())
+			action = c.markTaskRetryable(ctx, task, err.Error())
 		} else {
-			c.markTaskFailed(ctx, task, err.Error())
+			action = c.markTaskFailed(ctx, task, err.Error())
 		}
 		c.logger.Error("task failed", append(task.LogAttrs(), "error", err)...)
-		return taskFailed
+		return action
 	}
 	if !result.Accepted {
-		c.markTaskFailed(ctx, task, result.Message)
+		action := c.markTaskFailed(ctx, task, result.Message)
 		c.logger.Error("task rejected", append(task.LogAttrs(), "message", result.Message)...)
-		return taskFailed
+		return action
 	}
 
 	// Mark task running
 	now := time.Now()
 	task.StartedAt = &now
-	c.transitionTaskState(ctx, task, 0, state.Task.Running, "")
+	if err := c.transitionTaskState(ctx, task, 0, state.Task.Running, ""); err != nil {
+		c.logger.Error("failed to persist running task state after engine accepted the task; current apply owner will exit for operator retry",
+			append(task.LogAttrs(), "error", err)...)
+		return taskAbort
+	}
 	c.logger.Info("task running", "task_id", task.TaskIdentifier, "table", task.TableName)
 
 	// Poll to completion. Thread the engine's returned resume state into the
@@ -351,8 +356,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				var permanent *engine.PermanentError
 				if errors.As(err, &permanent) {
 					c.logger.Error("progress check failed with permanent error", append(task.LogAttrs(), "error", err)...)
-					c.markTaskFailed(ctx, task, fmt.Sprintf("progress polling failed: %v", err))
-					return taskFailed
+					return c.markTaskFailed(ctx, task, fmt.Sprintf("progress polling failed: %v", err))
 				}
 				// A transient poll that nonetheless never succeeds must not spin
 				// forever: an apply that cannot reach a terminal state holds the
@@ -362,11 +366,9 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				c.logger.Warn("progress check failed", append(task.LogAttrs(), "error", err, "consecutive_errors", consecutiveErrors)...)
 				if consecutiveErrors >= 10 {
 					if c.shouldRetryEngineError(err) {
-						c.markTaskRetryable(ctx, task, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", consecutiveErrors, err))
-						return taskFailed
+						return c.markTaskRetryable(ctx, task, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", consecutiveErrors, err))
 					}
-					c.markTaskFailed(ctx, task, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", consecutiveErrors, err))
-					return taskFailed
+					return c.markTaskFailed(ctx, task, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", consecutiveErrors, err))
 				}
 				continue
 			}
@@ -410,7 +412,11 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					logMsg = fmt.Sprintf("Task %s finished: engine_state=%s message=%q rows=%d/%d",
 						task.TaskIdentifier, result.State, result.Message, task.RowsCopied, task.RowsTotal)
 				}
-				c.transitionTaskState(ctx, task, task.ApplyID, task.State, logMsg)
+				if err := c.transitionTaskState(ctx, task, task.ApplyID, task.State, logMsg); err != nil {
+					c.logger.Error("failed to persist terminal task state after engine finished; current apply owner will exit for operator retry",
+						append(task.LogAttrs(), "error", err)...)
+					return taskAbort
+				}
 				c.logger.Info("task finished",
 					"task_id", task.TaskIdentifier,
 					"table", task.TableName,
@@ -423,7 +429,13 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				return taskContinue
 			}
 
-			c.transitionTaskState(ctx, task, 0, task.State, "")
+			// A failed progress write is retried by design: the next tick
+			// recomputes and rewrites the full task state, so log and keep
+			// polling rather than abandoning in-flight engine work.
+			if err := c.transitionTaskState(ctx, task, 0, task.State, ""); err != nil {
+				c.logger.Warn("failed to persist task progress; stored task state lags the engine until the next poll write succeeds",
+					append(task.LogAttrs(), "error", err)...)
+			}
 
 			// Notify observer with full apply + tasks context
 			if obs := c.getObserver(task.ApplyID); obs != nil {
@@ -437,19 +449,36 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 	}
 }
 
-// markTaskFailed sets a task to FAILED state with the given error message and persists it.
-func (c *LocalClient) markTaskFailed(ctx context.Context, task *storage.Task, errMsg string) {
+// markTaskFailed sets a task to FAILED state with the given error message and
+// persists it. Returns taskFailed once the failure is recorded. When the write
+// fails, the drive cannot finalize from task rows storage does not reflect, so
+// it returns taskAbort: the current apply owner exits without changing final
+// state and operator recovery re-drives from stored state.
+func (c *LocalClient) markTaskFailed(ctx context.Context, task *storage.Task, errMsg string) taskAction {
 	now := time.Now()
 	task.ErrorMessage = errMsg
 	task.CompletedAt = &now
-	c.transitionTaskState(ctx, task, 0, state.Task.Failed, "")
+	if err := c.transitionTaskState(ctx, task, 0, state.Task.Failed, ""); err != nil {
+		c.logger.Error("failed to persist failed task state; current apply owner will exit for operator retry",
+			append(task.LogAttrs(), "error", err)...)
+		return taskAbort
+	}
+	return taskFailed
 }
 
 // markTaskRetryable records a task failure that operator recovery may retry.
-func (c *LocalClient) markTaskRetryable(ctx context.Context, task *storage.Task, errMsg string) {
+// Returns taskFailed once the pause is recorded, or taskAbort when the write
+// fails and the current apply owner must exit for operator retry instead of
+// finalizing from task rows storage does not reflect.
+func (c *LocalClient) markTaskRetryable(ctx context.Context, task *storage.Task, errMsg string) taskAction {
 	task.ErrorMessage = errMsg
 	task.CompletedAt = nil
-	c.transitionTaskState(ctx, task, 0, state.Task.FailedRetryable, "")
+	if err := c.transitionTaskState(ctx, task, 0, state.Task.FailedRetryable, ""); err != nil {
+		c.logger.Error("failed to persist retryable task state; current apply owner will exit for operator retry",
+			append(task.LogAttrs(), "error", err)...)
+		return taskAbort
+	}
+	return taskFailed
 }
 
 func (c *LocalClient) shouldRetryEngineError(err error) bool {
@@ -490,7 +519,13 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		apply.CompletedAt = &now
 		for _, task := range tasks {
 			if task.State == state.Task.Pending {
-				c.transitionTaskState(ctx, task, 0, state.Task.Cancelled, "")
+				// Best-effort finalization: each pending task is cancelled
+				// independently so one write failure does not leave the rest
+				// pending.
+				if err := c.transitionTaskState(ctx, task, 0, state.Task.Cancelled, ""); err != nil {
+					c.logger.Error("failed to persist cancelled state for pending task while finalizing failed apply; stored task row stays pending until operator recovery reconciles it",
+						append(task.LogAttrs(), "error", err)...)
+				}
 			}
 		}
 	case stoppedByUser:

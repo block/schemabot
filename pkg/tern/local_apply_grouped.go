@@ -178,7 +178,11 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 			}
 		}
 	}
-	c.markTasksRunning(ctx, tasks)
+	if err := c.markTasksRunning(ctx, tasks); err != nil {
+		c.logger.Error("failed to persist running task state after engine accepted the apply", append(apply.LogAttrs(), "error", err)...)
+		c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to persist running task state: %v", err))
+		return
+	}
 	if c.config.Type == storage.DatabaseTypeVitess {
 		apply.State = state.Apply.ValidatingDeployRequest
 	} else {
@@ -732,7 +736,11 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	c.logAtomicProgress(ctx, apply, result, ps, now)
 
 	// Update all tasks with engine progress
-	c.syncAtomicTaskProgress(ctx, tasks, result, newState, now)
+	if err := c.syncAtomicTaskProgress(ctx, tasks, result, newState, now); err != nil {
+		c.logger.Warn("task progress write failed; current apply owner will exit for operator retry",
+			append(apply.LogAttrs(), "error", err)...)
+		return true
+	}
 	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		c.logger.Warn("pending stop request processing failed after progress sync; current apply owner will exit for operator retry",
 			"apply_id", apply.ApplyIdentifier, "error", err)
@@ -1161,7 +1169,11 @@ func (c *LocalClient) logAtomicProgress(ctx context.Context, apply *storage.Appl
 }
 
 // syncAtomicTaskProgress updates all tasks with engine state and per-table progress.
-func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time) {
+// The tasks belong to one drive, so the first failed task write aborts the
+// sync and returns the error: the caller must not act on an engine result
+// (terminal finalization, auto-deploy/cutover triggers) that storage does not
+// reflect.
+func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time) error {
 	tableProgress := indexEngineTableProgress(result.Tables)
 	retryableFailure := state.IsState(newState, state.Task.FailedRetryable)
 	instantFromMetadata := false
@@ -1213,8 +1225,11 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 		if result.State == engine.StateCompleted {
 			task.ProgressPercent = 100
 		}
-		c.transitionTaskState(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, newState), "")
+		if err := c.transitionTaskState(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, newState), ""); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // writeShardProgress persists a table's per-shard breakdown as per-shard tasks
