@@ -40,19 +40,19 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 
 	stor := h.service.Storage()
 	if stor == nil {
-		h.logger.Error("storage not configured for rollback", "repo", repo, "pr", pr, "applyID", applyID)
+		h.logger.Error("storage not configured for rollback", "repo", repo, "pr", pr, "apply_id", applyID)
 		h.postCommandError(repo, pr, installationID, action.Rollback, result.Environment, requestedBy, "Storage is not available")
 		return
 	}
 	applyStore := stor.Applies()
 	if applyStore == nil {
-		h.logger.Error("apply store not configured for rollback", "repo", repo, "pr", pr, "applyID", applyID)
+		h.logger.Error("apply store not configured for rollback", "repo", repo, "pr", pr, "apply_id", applyID)
 		h.postCommandError(repo, pr, installationID, action.Rollback, result.Environment, requestedBy, "Apply store is not available")
 		return
 	}
 	apply, err := applyStore.GetByApplyIdentifier(ctx, applyID)
 	if err != nil {
-		h.logger.Error("failed to look up rollback apply", "repo", repo, "pr", pr, "applyID", applyID, "error", err)
+		h.logger.Error("failed to look up rollback apply", "repo", repo, "pr", pr, "apply_id", applyID, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Rollback, result.Environment, requestedBy, "Failed to look up apply: "+err.Error())
 		return
 	}
@@ -79,7 +79,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	// the comment delivery and can react to the same rollback request.
 	if h.service != nil && !h.service.Config().IsEnvironmentAllowed(environment) {
 		h.logger.Info("ignoring rollback for non-allowed environment",
-			"repo", repo, "pr", pr, "applyID", applyID, "environment", environment)
+			"repo", repo, "pr", pr, "apply_id", applyID, "environment", environment)
 		return
 	}
 
@@ -112,7 +112,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	// Check for existing lock
 	lockStore := stor.Locks()
 	if lockStore == nil {
-		h.logger.Error("lock store not configured for rollback", "repo", repo, "pr", pr, "applyID", applyID, "database", database, "database_type", dbType)
+		h.logger.Error("lock store not configured for rollback", "repo", repo, "pr", pr, "apply_id", applyID, "database", database, "database_type", dbType)
 		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, "Lock store is not available")
 		return
 	}
@@ -157,7 +157,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	}); err != nil {
 		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
 		h.logger.Warn("rollback rejected by source apply guardrails after lock acquisition",
-			"repo", repo, "pr", pr, "applyID", applyID,
+			"repo", repo, "pr", pr, "apply_id", applyID,
 			"environment", result.Environment, "database", database, "error", err)
 		h.postRollbackRejected(repo, pr, installationID, apply, applyID, environment, database, err.Error())
 		return
@@ -174,7 +174,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 			h.postComment(repo, pr, installationID, templates.RenderRollbackNoCompletedApply(database, environment))
 			return
 		}
-		h.logger.Error("rollback plan failed", "repo", repo, "pr", pr, "applyID", applyID, "error", err)
+		h.logger.Error("rollback plan failed", "repo", repo, "pr", pr, "apply_id", applyID, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, errMsg)
 		return
 	}
@@ -248,13 +248,13 @@ func (h *Handler) handleRollbackSourceError(repo string, pr int, installationID 
 	}
 	if status >= http.StatusInternalServerError {
 		h.logger.Error("rollback source validation failed",
-			"repo", repo, "pr", pr, "applyID", applyID,
+			"repo", repo, "pr", pr, "apply_id", applyID,
 			"environment", environment, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, err.Error())
 		return
 	}
 	h.logger.Warn("rollback rejected by source apply guardrails",
-		"repo", repo, "pr", pr, "applyID", applyID,
+		"repo", repo, "pr", pr, "apply_id", applyID,
 		"environment", environment, "error", err)
 	h.postRollbackRejected(repo, pr, installationID, apply, applyID, environment, "", err.Error())
 }
