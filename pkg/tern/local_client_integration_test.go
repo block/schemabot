@@ -3983,3 +3983,82 @@ func TestLocalClient_AtomicRetryableFailureQueuesOperatorRetry(t *testing.T) {
 		}
 	}
 }
+
+// A dispatched apply's engine options must survive the queue: the operator
+// drive re-derives its options from the stored apply, so an option dropped at
+// persistence time is silently lost — a --branch the user asked to reuse would
+// see the engine create a fresh branch instead. The full wire option map must
+// round-trip into storage and back out to the engine's ApplyRequest.
+func TestLocalClient_ApplyPersistsBranchOptionForQueuedDrive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+	eng := &stagedGroupedResumeEngine{}
+	client.spiritEngine = eng
+
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-branch-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {
+				Tables: []storage.TableChange{
+					{Namespace: "testdb", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN branch_note VARCHAR(255)", Operation: "alter"},
+				},
+			},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+	plan.ID = planID
+
+	resp, err := client.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId:      plan.PlanIdentifier,
+		Database:    "testdb",
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: localClientTestEnvironment,
+		Options: map[string]string{
+			"branch":        "reuse-me",
+			"defer_cutover": "true",
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Accepted)
+
+	stored, err := stor.Applies().GetByApplyIdentifier(ctx, resp.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	storedOpts := stored.GetOptions()
+	assert.Equal(t, "reuse-me", storedOpts.Branch, "the dispatched branch option must be persisted on the apply")
+	assert.True(t, storedOpts.DeferCutover, "the dispatched defer_cutover option must be persisted on the apply")
+
+	driveNextQueuedApply(t, stor, client)
+
+	require.NotEmpty(t, eng.applyRequests, "the queued drive must reach the engine")
+	engineOptions := eng.applyRequests[len(eng.applyRequests)-1].Options
+	assert.Equal(t, "reuse-me", engineOptions["branch"],
+		"the queued drive's engine request must carry the dispatched branch option")
+	assert.Equal(t, "true", engineOptions["defer_cutover"],
+		"the queued drive's engine request must carry the dispatched defer_cutover option")
+}

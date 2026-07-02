@@ -274,13 +274,31 @@ func (c *LocalClient) IsRemote() bool { return false }
 // Endpoint returns the database name for this local client.
 func (c *LocalClient) Endpoint() string { return c.config.Database }
 
-// wakeOperator nudges the storage-claiming operator to pick up durable work
-// recorded for the apply — a queued dispatch or a control request — promptly
-// instead of waiting out the poll interval. Without a configured callback
-// (library and test use) the operator's next poll picks the work up.
+// wakeOperator nudges the storage-claiming operator to pick up a durable
+// control request recorded for the apply promptly instead of waiting out the
+// poll interval. A skipped control-request wake only delays processing — the
+// request is serviced when the operator next claims the (already claimable)
+// apply — so the skip is expected in library and test use and logged at Debug.
+// Queued applies use wakeOperatorForQueuedApply, whose skip can strand work.
 func (c *LocalClient) wakeOperator(apply *storage.Apply) {
 	if c.config.WakeOperator == nil {
-		c.logger.Debug("operator wake skipped because no wake callback is configured",
+		c.logger.Debug("operator wake skipped because no wake callback is configured; the control request will be processed when an operator next claims this apply",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment)
+		return
+	}
+	c.config.WakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+}
+
+// wakeOperatorForQueuedApply nudges the operator to claim a newly queued apply.
+// Unlike a control-request wake, a skipped wake here is not benign: every drive
+// runs under an operator claim, so a queued apply makes no progress until an
+// operator polling this storage claims it — and in an embedding that runs no
+// operator at all, it will never be driven.
+func (c *LocalClient) wakeOperatorForQueuedApply(apply *storage.Apply) {
+	if c.config.WakeOperator == nil {
+		c.logger.Warn("operator wake skipped because no wake callback is configured; the queued apply will not be driven until an operator polling this storage claims it",
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
 			"environment", apply.Environment)
@@ -1841,20 +1859,15 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		caller = options["caller"]
 	}
 
-	deferCutover := options["defer_cutover"] == "true"
-	allowUnsafe := options["allow_unsafe"] == "true"
-
-	// Build typed ApplyOptions for storage (booleans, not strings).
-	// Revert window is ON by default — only disabled when skip_revert is explicitly set.
-	skipRevert := options["skip_revert"] == "true"
-	deferDeploy := options["defer_deploy"] == "true"
-	applyOpts := storage.ApplyOptions{
-		DeferCutover: deferCutover,
-		DeferDeploy:  deferDeploy,
-		AllowUnsafe:  allowUnsafe,
-		SkipRevert:   skipRevert,
-		Target:       plan.Target,
-	}
+	// Build typed ApplyOptions for storage from the full wire option map, so
+	// every engine-relevant option the dispatch carried (branch, volume,
+	// rollback, ...) survives the round trip into the stored apply — the queued
+	// operator drive re-derives its options from the stored apply, not from this
+	// request. Revert window is ON by default — only disabled when skip_revert
+	// is explicitly set. The plan's validated target is authoritative over any
+	// target string the request carried.
+	applyOpts := storage.ApplyOptionsFromMap(options)
+	applyOpts.Target = plan.Target
 	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, ddlChanges, applyOpts); err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
@@ -1990,7 +2003,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// that prompt instead of waiting out the poll interval.
 	c.logger.Info("Apply: queued for operator drive",
 		append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier)...)
-	c.wakeOperator(apply)
+	c.wakeOperatorForQueuedApply(apply)
 
 	return &ternv1.ApplyResponse{
 		Accepted:         true,
