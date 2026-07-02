@@ -278,7 +278,10 @@ var knownReviewDriftClassifications = map[string]bool{
 // deployment or the plan input.
 func RecordReviewDrift(ctx context.Context, database, environment, deployment, classification string) {
 	if !knownReviewDriftClassifications[classification] {
-		classification = "errored"
+		// An unrecognized classification is a coding gap, not a drift signal.
+		// Coercing it to "errored" would inflate the blocking-failure count, so
+		// bucket it as "unknown" and keep the real failure classes accurate.
+		classification = "unknown"
 	}
 	addCounter(ctx, "schemabot.review_drift.total",
 		"review-time per-deployment drift classifications against the reviewed primary plan", "{deployment}",

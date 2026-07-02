@@ -64,7 +64,13 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 
 // UpsertPlanResult stores plan-derived check state without overwriting
 // in-progress apply-owned state for the same PR/environment/database.
-func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check) error {
+//
+// drift declares whether this write evaluated review-time deployment drift. A
+// not-evaluated write (an apply-time plan) must not silently clear a stored
+// drift block: the block depends on live deployment state, not PR content, so
+// only a write that re-ran the rollup and found the deployments clean may clear
+// it. See storage.PlanDriftState.
+func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check, drift storage.PlanDriftState) error {
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
@@ -99,6 +105,40 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check)
 		// recovery path releases it. A plan result — even from a newer PR commit that
 		// diffs cleanly against the mid-apply database — must not take ownership or
 		// convert the row into a passing check.
+		//
+		// A not-evaluated write additionally preserves the full gating state of an
+		// existing review-time drift block: it may refresh the head SHA and check
+		// run id so the current-head aggregate stays aligned, but it must not clear
+		// the block's conclusion, blocking reason, or summary. Only a write that
+		// re-ran the rollup (clean or blocked) rewrites those columns.
+		if drift == storage.PlanDriftNotEvaluated {
+			_, err = s.db.ExecContext(ctx, `
+				UPDATE checks
+				SET head_sha = ?,
+				    check_run_id = ?,
+				    apply_id     = CASE WHEN COALESCE(blocking_reason, '') = ? THEN apply_id     ELSE NULL END,
+				    has_changes  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN has_changes  ELSE ?    END,
+				    status       = CASE WHEN COALESCE(blocking_reason, '') = ? THEN status       ELSE ?    END,
+				    conclusion   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN conclusion   ELSE ?    END,
+				    blocking_reason = CASE WHEN COALESCE(blocking_reason, '') = ? THEN blocking_reason ELSE ? END,
+				    error_message   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN error_message   ELSE ? END,
+				    change_summary  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN change_summary  ELSE ? END
+				WHERE repository = ? AND pull_request = ?
+				  AND environment = ? AND database_type = ? AND database_name = ?
+				  AND NOT (status = ? AND apply_id IS NOT NULL)
+			`, check.HeadSHA, checkRunID,
+				storage.ReviewTimeDeploymentDriftBlockingReason,
+				storage.ReviewTimeDeploymentDriftBlockingReason, check.HasChanges,
+				storage.ReviewTimeDeploymentDriftBlockingReason, check.Status,
+				storage.ReviewTimeDeploymentDriftBlockingReason, check.Conclusion,
+				storage.ReviewTimeDeploymentDriftBlockingReason, check.BlockingReason,
+				storage.ReviewTimeDeploymentDriftBlockingReason, check.ErrorMessage,
+				storage.ReviewTimeDeploymentDriftBlockingReason, nullString(check.ChangeSummary),
+				check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+				checkStatusInProgress)
+			return err
+		}
+
 		_, err = s.db.ExecContext(ctx, `
 			UPDATE checks
 			SET head_sha = ?,
@@ -174,6 +214,11 @@ func successfulNoOpPlanResult(check *storage.Check) bool {
 // database. Returns true when the row is in the plan-only successful state after
 // this call (whether this call wrote it or it already was), and false only when a
 // started apply still owns it.
+//
+// This deliberately clears a review-time deployment drift block too: once a later
+// commit removes the database from the PR and no apply has started, the reviewed
+// plan is no longer part of the merge gate, so the plan-only drift block should
+// stop blocking. A started apply still owns the row and is left untouched.
 func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check) (bool, error) {
 	var checkRunID any
 	if check.CheckRunID != 0 {

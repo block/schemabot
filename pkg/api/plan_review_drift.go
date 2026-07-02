@@ -43,17 +43,33 @@ func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, pr
 		return PlanRollup{}, fmt.Errorf("roll up deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
 	}
 
+	// Include repo/pr/head SHA so an operator can tell which PR is blocked from
+	// the drift warn log alone.
+	var pr int32
+	if req.PullRequest != nil {
+		pr = *req.PullRequest
+	}
+	var headSHA string
+	if req.HeadSHA != nil {
+		headSHA = *req.HeadSHA
+	}
 	for _, entry := range rollup.Entries {
 		metrics.RecordReviewDrift(ctx, req.Database, req.Environment, entry.Deployment, entry.Class.String())
 		switch entry.Class {
 		case DeploymentDiverged:
 			s.logger.Warn("review-time drift: deployment diverged from the reviewed plan; the plan check will block the PR until reconciled",
+				"repository", req.Repository,
+				"pr", pr,
+				"head_sha", headSHA,
 				"database", req.Database,
 				"environment", req.Environment,
 				"deployment", entry.Deployment,
 				"target", entry.Target)
 		case DeploymentErrored:
 			s.logger.Warn("review-time drift: deployment could not be diffed or compared; the plan check will block the PR closed",
+				"repository", req.Repository,
+				"pr", pr,
+				"head_sha", headSHA,
 				"database", req.Database,
 				"environment", req.Environment,
 				"deployment", entry.Deployment,

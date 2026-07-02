@@ -10,16 +10,28 @@ import (
 )
 
 // reviewTimeDrift computes the review-time drift rollup for a database and
-// environment and turns it into the check-record outcome. It returns nil when
-// every deployment matches the reviewed plan (no block). Any divergence, a
-// deployment that could not be diffed or compared, or a failure to compute the
-// rollup at all blocks the plan check closed: without a trustworthy comparison
-// SchemaBot cannot confirm the reviewed change is safe to apply everywhere.
+// environment and turns it into the check-record outcome. It returns a clean
+// outcome when every deployment matches the reviewed plan, and a blocked outcome
+// on any divergence, a deployment that could not be diffed or compared, or a
+// failure to compute the rollup at all: without a trustworthy comparison
+// SchemaBot cannot confirm the reviewed change is safe to apply everywhere, so
+// the plan check fails closed.
+//
+// The primary plan reporting errors is not a drift signal — that generic plan
+// failure already fails the check on its own — so the rollup is skipped and the
+// outcome is not-evaluated, avoiding N-1 live per-deployment diffs whose result
+// the rollup would classify entirely from the unusable baseline anyway.
 //
 // primaryPlan is the reviewed primary plan proto returned by
 // executePlanProtoWithTransientRetry, reused as the rollup baseline so the
 // comparison is against exactly what was reviewed.
-func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, primaryPlan *ternv1.PlanResponse, repo string, pr int) *reviewDriftResult {
+func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, primaryPlan *ternv1.PlanResponse, repo string, pr int) reviewDriftOutcome {
+	if len(primaryPlan.GetErrors()) > 0 {
+		h.logger.Debug("skipping review-time drift rollup: primary plan reported errors",
+			"repo", repo, "pr", pr, "database", planReq.Database, "environment", planReq.Environment)
+		return reviewDriftOutcome{state: driftNotEvaluated}
+	}
+
 	rollup, err := h.service.RollupReviewTimeDrift(ctx, planReq, primaryPlan)
 	if err != nil {
 		h.logger.Error("review-time drift rollup failed; the plan check will block the PR closed",
@@ -30,17 +42,17 @@ func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, 
 			"error", err)
 		// Keep the stored Change column short and stable; the root cause is in the
 		// log above, and the raw error is untrusted for the aggregate's markdown.
-		return &reviewDriftResult{
-			Blocked: true,
-			Summary: "drift check failed; see logs",
+		return reviewDriftOutcome{
+			state:   driftBlocked,
+			summary: "drift check failed; see logs",
 		}
 	}
 	if rollup.Clean {
-		return nil
+		return reviewDriftOutcome{state: driftClean}
 	}
-	return &reviewDriftResult{
-		Blocked: true,
-		Summary: summarizeReviewDrift(rollup),
+	return reviewDriftOutcome{
+		state:   driftBlocked,
+		summary: summarizeReviewDrift(rollup),
 	}
 }
 

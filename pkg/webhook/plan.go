@@ -139,10 +139,12 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// When drift blocked the check but its record could not be persisted, the
 	// aggregate must not be recomputed from stale (possibly passing) stored rows.
-	// Post a failing aggregate from the in-memory drift result so the gate still
-	// blocks closed.
-	if drift != nil && drift.Blocked && checkErr != nil {
-		h.postFailingAggregates(ctx, client, repo, pr, schemaResult.HeadSHA, map[string]string{environment: drift.Summary})
+	// Post a failing aggregate carrying the drift block from the in-memory result
+	// so the gate still blocks closed. This is best-effort visibility: with the
+	// per-database row unstored, a later recompute has no durable drift row to
+	// read, so the store error is logged above and not treated as a safe update.
+	if drift.blocks() && checkErr != nil {
+		h.postFailingAggregatesWithBlock(ctx, client, repo, pr, schemaResult.HeadSHA, map[string]string{environment: drift.summary}, reviewTimeDeploymentDriftBlock)
 	} else if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
@@ -328,8 +330,8 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 		if checkErr != nil {
 			h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "env", env, "error", checkErr)
-			if drift != nil && drift.Blocked {
-				driftBlockUnstored[env] = drift.Summary
+			if drift.blocks() {
+				driftBlockUnstored[env] = drift.summary
 			}
 		}
 		if sha != "" {
@@ -361,7 +363,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// the stored-row aggregate sync so a stale passing row cannot leave the gate
 	// open. Posted last so it wins over updateAggregateCheck for these envs.
 	if len(driftBlockUnstored) > 0 && multiEnvData.HeadSHA != "" {
-		h.postFailingAggregates(ctx, client, repo, pr, multiEnvData.HeadSHA, driftBlockUnstored)
+		h.postFailingAggregatesWithBlock(ctx, client, repo, pr, multiEnvData.HeadSHA, driftBlockUnstored, reviewTimeDeploymentDriftBlock)
 	}
 
 	// Auto-plan: skip comment if no changes and no errors (reduce PR noise)

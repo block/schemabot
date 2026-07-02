@@ -94,7 +94,13 @@ type CheckStore interface {
 	// released only by apply completion (CompleteForApply), rollback completion
 	// (MarkActionRequiredForApply), or the explicit same-head no-op recovery
 	// path (RecoverApplyOwnedCheckWithNoOpPlan).
-	UpsertPlanResult(ctx context.Context, check *Check) error
+	//
+	// drift declares how this write treats a review-time deployment drift block:
+	// a write from a path that re-ran the drift rollup can clear a stale block
+	// (PlanDriftClean) or set one (PlanDriftBlocked); a write from a path that
+	// did not evaluate drift (PlanDriftNotEvaluated, e.g. an apply-time plan)
+	// must preserve any existing drift block rather than silently clearing it.
+	UpsertPlanResult(ctx context.Context, check *Check, drift PlanDriftState) error
 
 	// RecoverApplyOwnedCheckWithNoOpPlan updates same-head apply-owned stored check state
 	// from in_progress to a successful no-op plan result. Returns true when recovery occurred.

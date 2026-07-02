@@ -127,6 +127,34 @@ type Lock struct {
 // updates the visible GitHub Check Run, then writes an aggregate stored state
 // row whose CheckRunID points at that GitHub object. Later GitHub check_run
 // webhooks use CheckRunID to find the matching stored state.
+
+// PlanDriftState declares how a plan-result write treats a stored review-time
+// deployment drift block. It lets UpsertPlanResult tell "the drift rollup ran
+// and this deployment set is clean" apart from "drift was not evaluated on this
+// write" — two cases that both carry an empty BlockingReason but must clear vs
+// preserve an existing drift block respectively.
+type PlanDriftState int
+
+const (
+	// PlanDriftNotEvaluated means the write did not run the drift rollup (e.g. an
+	// apply-time plan). It is the zero value so an unset drift argument fails
+	// safe: an existing drift block is preserved, never silently cleared.
+	PlanDriftNotEvaluated PlanDriftState = iota
+	// PlanDriftClean means the rollup ran and every deployment matched the
+	// reviewed plan, so a stale drift block may be cleared.
+	PlanDriftClean
+	// PlanDriftBlocked means the rollup ran and a deployment diverged or could
+	// not be confirmed, so the write records the drift block.
+	PlanDriftBlocked
+)
+
+// ReviewTimeDeploymentDriftBlockingReason is the stable Check.BlockingReason
+// value for a review-time deployment drift block. It is defined here so the
+// plan-result write guard and the webhook block reason share one source of
+// truth: UpsertPlanResult preserves a row carrying this reason on a
+// not-evaluated write instead of clearing it.
+const ReviewTimeDeploymentDriftBlockingReason = "review_time_deployment_drift"
+
 type Check struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
 	ID int64
