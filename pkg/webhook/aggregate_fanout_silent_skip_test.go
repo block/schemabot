@@ -101,9 +101,9 @@ func TestUnscopedApplyOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 		assert.Empty(t, comments, "non-owning deployment must not post a comment for an unscoped fan-out apply")
 	})
 
-	// A tenant deployment receives the same fan-out for a PR touching only a
-	// database the leader owns; it must stay just as silent as the leader does
-	// for a participant-owned database.
+	// A participant deployment receives the same fan-out for a PR touching
+	// only a database another deployment owns; the skip is role-agnostic, so
+	// it stays just as silent as a leader would.
 	t.Run("unscoped apply on participant deployment stays silent", func(t *testing.T) {
 		cfg := aggregateLeaderConfig()
 		repoCfg := cfg.Repos["octocat/hello-world"]
