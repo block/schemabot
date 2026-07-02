@@ -162,9 +162,10 @@ func (h *Handler) postPassingAggregateChecks(ctx context.Context, client *ghclie
 			},
 		}
 		// Reuse an existing run for this name on the SHA so a webhook
-		// redelivery updates it rather than creating a duplicate Check Run. The
-		// lookup fails closed when the App slug is unknown; on that error fall
-		// back to creating, which is the safe (if untidy) outcome.
+		// redelivery updates it rather than creating a duplicate Check Run.
+		// The lookup errors when the App slug is unknown; on any lookup error
+		// fall back to creating a new run — a duplicate Check Run is the safe
+		// outcome, a missing one is not.
 		existing, _, findErr := client.FindCheckRunByName(ctx, repo, headSHA, target.name)
 		if findErr != nil {
 			h.logger.Warn("could not look up existing check; creating a new one",
@@ -174,11 +175,11 @@ func (h *Handler) postPassingAggregateChecks(ctx context.Context, client *ghclie
 		switch {
 		case findErr == nil && existing != nil:
 			if err := client.UpdateCheckRun(ctx, repo, existing.ID, opts); err != nil {
-				return fmt.Errorf("update %s check %q on %s: %w", content.operation, target.name, headSHA, err)
+				return fmt.Errorf("update %s check %q on %s@%s: %w", content.operation, target.name, repo, headSHA, err)
 			}
 		default:
 			if _, err := client.CreateCheckRun(ctx, repo, headSHA, opts); err != nil {
-				return fmt.Errorf("create %s check %q on %s: %w", content.operation, target.name, headSHA, err)
+				return fmt.Errorf("create %s check %q on %s@%s: %w", content.operation, target.name, repo, headSHA, err)
 			}
 		}
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
