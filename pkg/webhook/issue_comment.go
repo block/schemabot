@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -546,6 +547,48 @@ func (h *Handler) acknowledgeCommandActPoint(repo string, pr int, installationID
 		return
 	}
 	h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
+}
+
+// acknowledgeCommandEarlyIfOwned acknowledges an unscoped command on an
+// aggregate-role repo as soon as ownership is decidable from config discovery
+// alone — the config file resolves to a database this deployment's registry
+// knows, under an allowed schema directory — without waiting for the schema
+// files to load, which on large schema directories dominates the latency
+// between the command and its acknowledgment. The probe is advisory: it mirrors
+// the source-policy predicates without their logs and metrics, the authoritative
+// checks still run in discovery immediately after, and any probe miss defers to
+// the handler's act-point acknowledgment. Returns whether it acknowledged.
+func (h *Handler) acknowledgeCommandEarlyIfOwned(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, databaseName, tenant string, installationID, commentID int64) bool {
+	if tenant != "" {
+		return false
+	}
+	config, ok := h.serverConfig()
+	if !ok || config.AggregateRoleForRepo(repo) == "" {
+		return false
+	}
+	var (
+		sbConfig  *ghclient.SchemabotConfig
+		configDir string
+		err       error
+	)
+	if databaseName != "" {
+		sbConfig, configDir, err = client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
+	} else {
+		sbConfig, configDir, err = client.FindConfigForPR(ctx, repo, pr)
+	}
+	if err != nil || sbConfig == nil {
+		h.logger.Debug("early ownership probe could not resolve a schema config; acknowledgment defers to the act-point",
+			"repo", repo, "pr", pr, "database", databaseName, "error", err)
+		return false
+	}
+	if config.RepoHasSchemaDirAllowlist(repo) && !config.SchemaPathAllowedForRepo(repo, configDir) {
+		return false
+	}
+	if config.Database(sbConfig.Database) == nil {
+		return false
+	}
+	h.acknowledgeCommand(repo, pr, installationID, commentID)
+	return true
 }
 
 // acknowledgeCommand adds the eyes reaction to the command comment,

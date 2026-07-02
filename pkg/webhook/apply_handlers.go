@@ -34,6 +34,8 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		return
 	}
 
+	ackedEarly := h.acknowledgeCommandEarlyIfOwned(ctx, client, repo, pr, databaseName, result.Tenant, installationID, result.CommentID)
+
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Apply)
 	if err != nil {
@@ -49,7 +51,9 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err)
 		return
 	}
-	h.acknowledgeCommandActPoint(repo, pr, installationID, result)
+	if !ackedEarly {
+		h.acknowledgeCommandActPoint(repo, pr, installationID, result)
+	}
 
 	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.Apply); blocked {
 		return

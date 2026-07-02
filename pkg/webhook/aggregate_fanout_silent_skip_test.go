@@ -280,6 +280,35 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 		}
 	})
 
+	// The acknowledgment must not wait for schema files to load: ownership is
+	// decidable from config discovery alone, so on databases with large schema
+	// directories the user still sees the reaction promptly. Failing the file
+	// fetch proves the reaction fired before it.
+	t.Run("owning deployment acknowledges before schema files load", func(t *testing.T) {
+		cfg := aggregateLeaderConfig()
+		cfg.Databases = map[string]api.DatabaseConfig{
+			"orders": {Environments: map[string]api.EnvironmentConfig{
+				"staging": {Deployment: "default", Target: "orders"},
+			}},
+		}
+		h, mux, _ := newFanOutSkipHandler(t, cfg)
+		serveSchemaConfigForDatabase(t, mux, "orders")
+		mux.HandleFunc("GET /repos/octocat/hello-world/contents/staging", func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "schema listing unavailable", http.StatusInternalServerError)
+		})
+		reactions := registerReactionRecorder(t, mux)
+
+		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot",
+			CommandResult{Action: action.Apply, CommentID: 42})
+
+		select {
+		case content := <-reactions:
+			assert.Equal(t, "eyes", content)
+		case <-time.After(2 * time.Second):
+			t.Fatal("the acknowledgment must fire from config discovery, before schema files load")
+		}
+	})
+
 	t.Run("silently skipping deployment does not react", func(t *testing.T) {
 		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
