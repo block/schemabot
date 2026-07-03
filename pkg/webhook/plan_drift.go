@@ -70,6 +70,12 @@ func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, 
 	}, preview
 }
 
+// erroredDriftDetail is the sanitized detail shown in the PR preview for a
+// deployment whose diff could not be computed. The raw error is untrusted for
+// PR markdown (it can carry internal hostnames, IPs, or DSN fragments) and is
+// logged server-side instead.
+const erroredDriftDetail = "diff failed; see server logs"
+
 // deploymentDriftPreview turns a computed rollup into the PR-preview rendering
 // data. It returns nil for a single-deployment database: with one deployment
 // there is nothing to compare, so a "same plan everywhere" line would be noise.
@@ -88,9 +94,11 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 		case api.DeploymentDiverged:
 			entry.Detail = describeDriftDiff(e.Diff)
 		case api.DeploymentErrored:
-			if e.Err != nil {
-				entry.Detail = clampDriftSummary(e.Err.Error())
-			}
+			// The raw diff error can wrap dial failures carrying internal
+			// hostnames, IPs, or DSN fragments, so it stays out of the PR
+			// markdown. The root cause is logged with the deployment in
+			// RollupReviewTimeDrift; the preview shows only a sanitized line.
+			entry.Detail = erroredDriftDetail
 		}
 		entries[i] = entry
 	}

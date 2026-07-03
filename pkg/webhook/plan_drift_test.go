@@ -125,5 +125,8 @@ func TestDeploymentDriftPreview_DivergedAndErroredDetails(t *testing.T) {
 	assert.Contains(t, preview.Deployments[1].Detail, "1 unexpected")
 	assert.Contains(t, preview.Deployments[1].Detail, "2 missing")
 	assert.Equal(t, "errored", preview.Deployments[2].Class)
-	assert.NotEmpty(t, preview.Deployments[2].Detail)
+	// The raw diff error stays out of the PR markdown: the preview carries only
+	// the sanitized detail, and the underlying error text is not leaked.
+	assert.Equal(t, erroredDriftDetail, preview.Deployments[2].Detail)
+	assert.NotContains(t, preview.Deployments[2].Detail, assert.AnError.Error())
 }

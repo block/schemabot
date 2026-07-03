@@ -49,7 +49,7 @@ func TestRenderPlanComment_DriftNotCleanListsDeployments(t *testing.T) {
 			Deployments: []DeploymentDriftEntry{
 				{Deployment: "eu", Primary: true, Class: "match"},
 				{Deployment: "au", Class: "diverged", Detail: "1 unexpected change(s) vs the reviewed plan"},
-				{Deployment: "us", Class: "errored", Detail: "connection refused"},
+				{Deployment: "us", Class: "errored", Detail: "diff failed; see server logs"},
 			},
 		},
 	}
@@ -62,7 +62,7 @@ func TestRenderPlanComment_DriftNotCleanListsDeployments(t *testing.T) {
 	assert.Contains(t, out, "1 unexpected change(s) vs the reviewed plan")
 	assert.Contains(t, out, "`us`")
 	assert.Contains(t, out, "could not verify")
-	assert.Contains(t, out, "connection refused")
+	assert.Contains(t, out, "diff failed; see server logs")
 }
 
 // Drift on a non-primary deployment must surface even when the reviewed primary

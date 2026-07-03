@@ -83,6 +83,71 @@ func PreviewCommentPlanNoChanges() string {
 	})
 }
 
+// PreviewCommentPlanDriftClean renders a plan comment whose review-time drift
+// rollup confirmed the reviewed plan on every deployment (uniform clean line).
+func PreviewCommentPlanDriftClean() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "production",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes:     samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true,
+			Clean:    true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "eu", Primary: true, Class: "match"},
+				{Deployment: "au", Class: "match"},
+				{Deployment: "us", Class: "match"},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanDriftDetected renders a plan comment whose review-time drift
+// rollup found deployments that no longer match the reviewed plan: a
+// per-deployment breakdown naming the matching, diverged, and errored targets.
+func PreviewCommentPlanDriftDetected() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "production",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes:     samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true,
+			Clean:    false,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "eu", Primary: true, Class: "match"},
+				{Deployment: "au", Class: "diverged", Detail: "1 unexpected, 2 missing change(s) vs the reviewed plan"},
+				{Deployment: "us", Class: "errored", Detail: "diff failed; see server logs"},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanDriftUnverified renders a plan comment whose review-time
+// drift rollup could not be computed, so the plan check fails closed.
+func PreviewCommentPlanDriftUnverified() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:        "testapp",
+		SchemaName:      "testapp",
+		Environment:     "production",
+		HeadSHA:         previewHeadSHA,
+		Repository:      previewRepository,
+		RequestedBy:     previewRequestedBy,
+		IsMySQL:         true,
+		Changes:         samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{Computed: false},
+	})
+}
+
 // PreviewCommentNoManagedSchemaChanges renders the safe empty-diff comment when
 // SchemaBot has no apply-owned state for the PR.
 func PreviewCommentNoManagedSchemaChanges() string {
