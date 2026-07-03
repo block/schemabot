@@ -86,6 +86,12 @@ type Handler struct {
 	// package default.
 	participantNudgeRefoldDelay time.Duration
 
+	// participantRefoldDelayOverride overrides the backoff before each
+	// self-scheduled aggregate re-fold armed while expected participants
+	// remain unresolved. Test-only: when set it applies to every attempt.
+	// Zero means the package backoff schedule.
+	participantRefoldDelayOverride time.Duration
+
 	// participantRefoldAttempts tracks, per repo#pr, how many self-scheduled
 	// aggregate re-folds have been armed while expected participants remain
 	// unresolved. Bounded by maxParticipantRefoldAttempts and cleared when a

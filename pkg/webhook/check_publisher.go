@@ -85,6 +85,12 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 	}
 
 	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
+		// False covers a transient PR-fetch failure as well as a genuinely
+		// newer head; either way a leader's next re-fold fetches the
+		// then-current head, so arming a bounded re-fold converges the
+		// aggregate instead of stranding one waiting on a participant re-read.
+		// verifyHeadSHAStillCurrentForPR already logged the reason.
+		h.scheduleLeaderRefoldIfConfigured(ctx, repo, pr, client.InstallationID())
 		return
 	}
 
@@ -96,6 +102,10 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 			Status:     "error",
 		})
 		h.logger.Error("failed to fetch checks for aggregate", "repo", repo, "pr", pr, "error", err)
+		// A storage blip must not end a leader's retry chain while its
+		// aggregate renders unresolved participants as in_progress; the
+		// bounded re-fold retries the read.
+		h.scheduleLeaderRefoldIfConfigured(ctx, repo, pr, client.InstallationID())
 		return
 	}
 

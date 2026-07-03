@@ -525,6 +525,16 @@ type PullRequestInfo struct {
 	BaseRef string
 	BaseSHA string
 	User    string
+	// State is the PR's lifecycle state as GitHub reports it: "open" or
+	// "closed" (a merged PR reads as closed).
+	State string
+}
+
+// IsClosed reports whether the PR is closed (merged or unmerged). Callers that
+// act on a PR asynchronously — timers, reconciliation — use this to stop work
+// that only makes sense on an open PR.
+func (pri *PullRequestInfo) IsClosed() bool {
+	return pri.State == "closed"
 }
 
 // FetchPullRequest is the dedupe-friendly variant. It honours the
@@ -597,6 +607,7 @@ func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string,
 		BaseRef: ghPR.GetBase().GetRef(),
 		BaseSHA: ghPR.GetBase().GetSHA(),
 		User:    ghPR.GetUser().GetLogin(),
+		State:   ghPR.GetState(),
 	}, nil
 }
 

@@ -19,7 +19,7 @@ func TestParticipantRefoldBudget(t *testing.T) {
 	h := &Handler{logger: testLogger()}
 	// Keep armed timers from firing inside the test process; pending timers at
 	// process exit are inert.
-	h.participantNudgeRefoldDelay = time.Hour
+	h.participantRefoldDelayOverride = time.Hour
 
 	attempts := func() (int, bool) {
 		h.participantRefoldMu.Lock()

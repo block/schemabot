@@ -56,20 +56,22 @@ func TestParticipantCheckOutcomesFold(t *testing.T) {
 			wantStatus:     checkStatusCompleted,
 		},
 		{
-			name: "in progress blocks",
+			name: "in progress blocks and stays retriable",
 			finder: &fakeCheckRunFinder{results: map[string]*ghclient.CheckRunResult{
 				checkName: {Status: checkStatusInProgress},
 			}},
 			wantConclusion: "",
 			wantStatus:     checkStatusInProgress,
+			wantRetriable:  true,
 		},
 		{
-			name: "queued blocks as in progress",
+			name: "queued blocks as in progress and stays retriable",
 			finder: &fakeCheckRunFinder{results: map[string]*ghclient.CheckRunResult{
 				checkName: {Status: checkStatusQueued},
 			}},
 			wantConclusion: "",
 			wantStatus:     checkStatusInProgress,
+			wantRetriable:  true,
 		},
 		{
 			name: "completed failure blocks",

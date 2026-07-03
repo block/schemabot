@@ -26,10 +26,20 @@ type participantCheckOutcome struct {
 	status     string // checkStatus*
 	conclusion string // checkConclusion* (empty when in_progress)
 	// retriable marks an outcome that a later re-read can improve without any
-	// config change: the participant has not reported yet, or the Checks API
-	// read failed. Untrusted-only and unresolvable-name outcomes are not
-	// retriable — only a config fix can clear those.
+	// config change: the participant has not reported yet, the Checks API
+	// read failed, or the participant's run has not reached a terminal state.
+	// Untrusted-only and unresolvable-name outcomes are not retriable — only
+	// a config fix can clear those.
 	retriable bool
+}
+
+// unresolved reports whether the outcome blocks only because the participant's
+// Check Run could not be read (not reported yet, or a failed Checks API read).
+// A trusted non-terminal run is retriable too — a later re-read can observe it
+// finish — but it is not unresolved: its live in_progress status is already
+// the right thing to render, so it must not be relabeled as a reporting gap.
+func (o participantCheckOutcome) unresolved() bool {
+	return o.retriable && o.status == checkStatusCompleted
 }
 
 // participantUnresolvedBlockingReason marks a synthesized participant row whose
@@ -46,12 +56,13 @@ const participantUnresolvedBlockingReason = "participant_unresolved"
 // synthesized row is distinguishable in the aggregate table while still
 // contributing its status/conclusion to the fold.
 //
-// A retriable outcome with re-fold budget remaining renders as in_progress: a
-// scheduled re-fold will re-read the participant within seconds, and
+// An unresolved outcome with re-fold budget remaining renders as in_progress:
+// a scheduled re-fold will re-read the participant within seconds, and
 // in_progress blocks merge exactly as hard as action_required without
 // mislabeling the wait as pending applies. Once the budget is spent the row
 // lands action_required — the participant is genuinely not reporting and an
-// operator needs to look.
+// operator needs to look. A retriable outcome that did read a live run (a
+// trusted non-terminal check) keeps that run's own status.
 func synthesizeParticipantCheck(outcome participantCheckOutcome, repo string, pr int, headSHA, env string, retryPending bool) *storage.Check {
 	check := &storage.Check{
 		Repository:   repo,
@@ -64,7 +75,7 @@ func synthesizeParticipantCheck(outcome participantCheckOutcome, repo string, pr
 		Status:       outcome.status,
 		Conclusion:   outcome.conclusion,
 	}
-	if outcome.retriable {
+	if outcome.unresolved() {
 		check.BlockingReason = participantUnresolvedBlockingReason
 		if retryPending {
 			check.Status = checkStatusInProgress
@@ -104,17 +115,17 @@ func participantCheckName(base, env string) string {
 // participantCheckOutcomes resolves every expected participant's per-environment
 // Check Run for headSHA and returns synthesized stored Check rows to fold into
 // the aggregate leader's check for env, plus whether any outcome is retriable —
-// blocked only because the participant has not reported yet (or the read
-// failed), so a scheduled re-fold can converge without any external event. It
-// fails closed: anything other than a trusted, completed, success participant
-// check yields a blocking row.
+// blocked only because the participant has not reported yet, the read failed,
+// or its run is not yet terminal — so a scheduled re-fold can converge without
+// any external event. It fails closed: anything other than a trusted,
+// completed, success participant check yields a blocking row.
 //
 // resolveParticipantOutcome is the fail-closed truth table:
 //   - unresolvable check name           → action_required (blocks)
 //   - Checks API error                  → action_required (blocks, retriable)
 //   - only untrusted same-named runs    → action_required (blocks)
 //   - no trusted run on the commit      → action_required (blocks, retriable)
-//   - trusted run, non-terminal         → in_progress     (blocks)
+//   - trusted run, non-terminal         → in_progress     (blocks, retriable)
 //   - trusted run, completed+success    → success         (passes)
 //   - trusted run, completed+
 //     action_required                   → action_required (blocks: tenant apply pending)
@@ -183,6 +194,9 @@ func (h *Handler) resolveParticipantOutcome(
 	}
 
 	if result.Status != checkStatusCompleted {
+		// A run that flips terminal moments later may never comment (a
+		// participant with no schema work publishes success silently), so the
+		// leader must re-read on its own schedule to observe the finish.
 		h.logger.Debug("participant check is not yet terminal, aggregate stays in progress",
 			"repo", repo, "pr", pr, "environment", env, "head_sha", headSHA,
 			"tenant", tenant.Tenant, "check_name", checkName, "check_status", result.Status)
@@ -191,6 +205,7 @@ func (h *Handler) resolveParticipantOutcome(
 			tenant:    tenant.Tenant,
 			checkName: checkName,
 			status:    checkStatusInProgress,
+			retriable: true,
 		}
 	}
 

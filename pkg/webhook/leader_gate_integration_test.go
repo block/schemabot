@@ -69,17 +69,30 @@ func newLeaderHandler(t *testing.T, svc *api.Service, client *gh.Client) *Handle
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClientWithSlug(client, logger, leaderOwnAppSlug, trustedTenantAppSlug)
 	factory := &fakeClientFactory{client: installClient}
-	return NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger)
+	// A fold that leaves participants unresolved arms a self-scheduled re-fold;
+	// keep those timers from firing inside the test process (pending timers at
+	// process exit are inert). Tests that exercise re-fold convergence lower
+	// this after construction.
+	h.participantRefoldDelayOverride = time.Hour
+	return h
 }
 
-// mockLeaderPRHead serves the PR head SHA so the leader's head-SHA freshness
-// check passes for headSHA.
+// mockLeaderPRHead serves an open PR with the given head SHA so the leader's
+// head-SHA freshness check passes for headSHA.
 func mockLeaderPRHead(mux *http.ServeMux, headSHA string) {
+	mockLeaderPRHeadWithState(mux, headSHA, "open")
+}
+
+// mockLeaderPRHeadWithState serves the PR with the given head SHA and
+// lifecycle state ("open" or "closed").
+func mockLeaderPRHeadWithState(mux *http.ServeMux, headSHA, state string) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
-			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: &headSHA},
-			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
-			User: &gh.User{Login: new("testuser")},
+			State: &state,
+			Head:  &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: &headSHA},
+			Base:  &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			User:  &gh.User{Login: new("testuser")},
 		})
 	})
 }
@@ -528,7 +541,7 @@ func TestE2ELeaderRefoldsWhenParticipantReportsAfterFirstFold(t *testing.T) {
 	checkRuns := captureLeaderCheckRuns(mux)
 
 	h := newLeaderHandler(t, svc, client)
-	h.participantNudgeRefoldDelay = 10 * time.Millisecond
+	h.participantRefoldDelayOverride = 10 * time.Millisecond
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action:  "opened",
 		headSHA: headSHA,
@@ -617,5 +630,80 @@ func TestE2ELeaderNonSchemaPROutsideParticipantPathsPasses(t *testing.T) {
 		assert.Equal(t, checkStatusCompleted, cr.Status)
 		assert.Equal(t, checkConclusionSuccess, cr.Conclusion,
 			"aggregate for %s keeps passing on a PR outside all participant paths", env)
+	}
+}
+
+// participantRefoldAttemptCount reads the leader's re-fold budget entry for the
+// PR, reporting the consumed attempts and whether an entry exists at all.
+func participantRefoldAttemptCount(h *Handler, repo string, pr int) (int, bool) {
+	h.participantRefoldMu.Lock()
+	defer h.participantRefoldMu.Unlock()
+	n, ok := h.participantRefoldAttempts[participantRefoldKey(repo, pr)]
+	return n, ok
+}
+
+// A re-fold pass that cannot read the PR head must not end the retry chain:
+// the aggregate is rendering unresolved participants as in_progress on the
+// promise of a coming re-read, so the leader arms another bounded attempt
+// instead of stranding the wait until an external event happens to re-fold.
+func TestE2ELeaderBrokenRefoldArmsAnotherAttempt(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// No PR endpoint is registered, so the re-fold's head fetch fails.
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	h.refoldAggregateForPR("octocat/hello-world", 1, 12345, "unresolved participant delayed re-fold")
+
+	attempts, armed := participantRefoldAttemptCount(h, "octocat/hello-world", 1)
+	assert.True(t, armed, "a broken re-fold pass must arm another bounded attempt")
+	assert.Equal(t, 1, attempts)
+
+	select {
+	case cr := <-checkRuns:
+		t.Fatalf("a re-fold that cannot read the PR head must not publish an aggregate: %+v", cr)
+	default:
+	}
+}
+
+// An armed re-fold can fire after its PR closes. The leader publishes nothing
+// on the closed PR and arms no further attempts; it drops the PR's re-fold
+// budget entry so the in-memory map does not retain closed PRs.
+func TestE2ELeaderRefoldSkipsClosedPR(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	mockLeaderPRHeadWithState(mux, "abc123", "closed")
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	// The chain was armed while the PR was open, so a budget entry exists when
+	// the timer fires.
+	h.scheduleParticipantRefold(t.Context(), "octocat/hello-world", 1, 12345)
+	_, armed := participantRefoldAttemptCount(h, "octocat/hello-world", 1)
+	require.True(t, armed)
+
+	h.refoldAggregateForPR("octocat/hello-world", 1, 12345, "unresolved participant delayed re-fold")
+
+	_, armed = participantRefoldAttemptCount(h, "octocat/hello-world", 1)
+	assert.False(t, armed, "a closed PR's re-fold budget entry must be dropped")
+
+	select {
+	case cr := <-checkRuns:
+		t.Fatalf("a re-fold must not publish an aggregate on a closed PR: %+v", cr)
+	default:
 	}
 }
