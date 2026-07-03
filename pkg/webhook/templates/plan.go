@@ -837,18 +837,18 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 	writePlanSummary(sb, *plan, totalStatements, keyspacesWithVSchema)
 }
 
-// writeCollapsibleKeyspaceChanges renders the DDL for a plan inside a collapsed
-// <details> block. The summary line carries the statement count so reviewers can
-// gauge the size of the change without expanding the SQL.
+// writeCollapsibleKeyspaceChanges renders a plan's changes — DDL, plus VSchema
+// diffs for non-MySQL keyspaces — inside a collapsed <details> block. The
+// summary line carries the statement count so reviewers can gauge the size of
+// the change without expanding it.
 func writeCollapsibleKeyspaceChanges(sb *strings.Builder, plan PlanCommentData, totalStatements int) {
-	var ddl strings.Builder
-	writeKeyspaceChanges(&ddl, plan)
-
 	summary := "Show changes"
 	if totalStatements > 0 {
 		summary = fmt.Sprintf("Show SQL (%d %s)", totalStatements, pluralize("statement", totalStatements))
 	}
-	fmt.Fprintf(sb, "<details>\n<summary>%s</summary>\n\n%s</details>\n\n", summary, ddl.String())
+	fmt.Fprintf(sb, "<details>\n<summary>%s</summary>\n\n", summary)
+	writeKeyspaceChanges(sb, plan)
+	sb.WriteString("</details>\n\n")
 }
 
 // writeMultiEnvFooter writes the footer with apply commands and error guidance.
