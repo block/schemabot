@@ -446,12 +446,14 @@ func (s *Server) Start(ctx context.Context) {
 	s.svc.StartPendingDropsCleaner(ctx)
 }
 
-// Close releases the resources the Server owns and returns the first cleanup
-// error encountered. svc.Close stops the operator and health monitor and closes
-// the service's clients and storage (the database pool), so Close only stops the
-// pending-drops cleaner, shuts down telemetry, closes the service, and closes the
-// gRPC fallback client it built itself. It does not stop any gRPC server the
-// embedder owns. Safe to call once after Start.
+// Close releases the resources the Server owns and returns all cleanup errors
+// encountered, joined together. It stops the pending-drops cleaner, stops the
+// operator (before closing the gRPC client it built, see below), shuts down
+// telemetry, closes that gRPC fallback client, and closes the service. svc.Close
+// stops the health monitor and closes the service's clients and storage (the
+// database pool); it repeats StopOperator, which is idempotent, so that is a
+// no-op. It does not stop any gRPC server the embedder owns. Safe to call once
+// after Start.
 func (s *Server) Close() error {
 	s.svc.StopPendingDropsCleaner()
 	// Stop the operator before closing the gRPC client below: RegisterGRPC set
