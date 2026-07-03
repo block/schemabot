@@ -454,6 +454,12 @@ func (s *Server) Start(ctx context.Context) {
 // embedder owns. Safe to call once after Start.
 func (s *Server) Close() error {
 	s.svc.StopPendingDropsCleaner()
+	// Stop the operator before closing the gRPC client below: RegisterGRPC set
+	// that client as the service's default, so until the drivers drain, a claim
+	// of a queued apply can route to it — closing it first would hand a
+	// shutdown-window drive a closed client. StopOperator waits for in-flight
+	// drivers and is idempotent, so svc.Close repeating it is a no-op.
+	s.svc.StopOperator()
 
 	var errs []error
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
