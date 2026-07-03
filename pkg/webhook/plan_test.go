@@ -266,9 +266,38 @@ func TestRenderPlanComment_ShowsUnsafeWarning(t *testing.T) {
 
 	rendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, rendered, "⛔ Unsafe Changes Detected")
+	assert.Contains(t, rendered, "**Issues**: **1** unsafe change detected")
 	assert.Contains(t, rendered, "`orders`")
 	assert.Contains(t, rendered, "DROP INDEX without making invisible first")
+}
+
+// The unsafe warning is rendered as an "Issues" summary line — parallel to the
+// "Plan" summary — with the total pluralized count, followed by a bullet per
+// affected table so the reviewer sees both the headline and the detail.
+func TestRenderPlanComment_UnsafeWarningSummaryCountsChanges(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace: "testdb",
+			Statements: []string{
+				"ALTER TABLE `orders` DROP INDEX `idx_status`",
+				"ALTER TABLE `customers` DROP COLUMN `email`",
+			},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []templates.UnsafeChangeData{
+			{Table: "orders", Reason: "DROP INDEX without making invisible first"},
+			{Table: "customers", Reason: "DROP COLUMN is destructive"},
+		},
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "⚠️ **Issues**: **2** unsafe changes detected")
+	assert.Contains(t, rendered, "- `orders`: DROP INDEX without making invisible first")
+	assert.Contains(t, rendered, "- `customers`: DROP COLUMN is destructive")
 }
 
 func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
@@ -716,7 +745,7 @@ func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {
 
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
-	assert.Contains(t, rendered, "⛔ Unsafe Changes Detected")
+	assert.Contains(t, rendered, "⛔ 1 Unsafe Change Detected")
 	assert.Contains(t, rendered, "`users`")
 	assert.Contains(t, rendered, "DROP TABLE removes all data")
 	assert.Contains(t, rendered, "--allow-unsafe")

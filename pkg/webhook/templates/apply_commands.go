@@ -128,7 +128,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 
 	// Unsafe changes blocked section
 	sb.WriteString("---\n\n")
-	sb.WriteString("**⛔ Unsafe Changes Detected:**\n")
+	fmt.Fprintf(&sb, "**⛔ %d Unsafe %s Detected:**\n", len(data.UnsafeChanges), pluralize("Change", len(data.UnsafeChanges)))
 	for _, c := range data.UnsafeChanges {
 		reason := ui.CleanLintReason(c.Reason)
 		if reason != "" {

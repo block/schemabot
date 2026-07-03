@@ -525,7 +525,8 @@ func planShardList(shards []string) string {
 }
 
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
-	sb.WriteString("**⛔ Unsafe Changes Detected:**\n")
+	n := len(changes)
+	fmt.Fprintf(sb, "⚠️ **Issues**: **%d** unsafe %s detected\n", n, pluralize("change", n))
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
