@@ -16,7 +16,9 @@ import (
 // primaryPlan is the just-reviewed primary plan proto, reused as the rollup's
 // baseline so the comparison is against exactly what the user reviewed rather
 // than a fresh read of the primary's live schema (which could have drifted and
-// tripped a spurious primary-vs-primary mismatch).
+// tripped a spurious primary-vs-primary mismatch). primaryDeployment is the
+// deployment that plan was created against; the producer fails closed if it no
+// longer maps to rollout index 0 at rollup time.
 //
 // The expected deployment set is resolved independently from the producer's
 // results so the rollup can enforce that the diffs cover every configured
