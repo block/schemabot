@@ -650,6 +650,65 @@ func TestRenderMultiEnvPlanComment_StrataHeaderWithErrors(t *testing.T) {
 	assert.Contains(t, rendered, "**Type**: `Strata`")
 }
 
+// A multi-environment plan collapses its DDL behind a <details> block so the
+// SQL doesn't dominate the comment, while the summary line advertises the
+// statement count so a reviewer can gauge the change size without expanding it.
+func TestRenderMultiEnvPlanComment_CollapsesDDL(t *testing.T) {
+	changes := []templates.KeyspaceChangeData{{
+		Keyspace: "testdb",
+		Statements: []string{
+			"CREATE TABLE `customers` (`id` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+			"CREATE TABLE `orders` (`id` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+		},
+	}}
+	data := templates.MultiEnvPlanCommentData{
+		Database:     "testdb",
+		IsMySQL:      true,
+		Environments: []string{"staging", "production"},
+		Plans: map[string]*templates.PlanCommentData{
+			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, Changes: changes},
+			"production": {Database: "testdb", Environment: "production", IsMySQL: true, Changes: changes},
+		},
+		Errors: map[string]string{},
+	}
+
+	rendered := templates.RenderMultiEnvPlanComment(data)
+
+	assert.Contains(t, rendered, "<details>\n<summary>Show SQL (2 statements)</summary>")
+	assert.Contains(t, rendered, "</details>")
+	assert.Contains(t, rendered, "```sql")
+	assert.Contains(t, rendered, "CREATE TABLE `customers`")
+	// The DDL fence lives inside the collapsed block, before it closes.
+	assert.Less(t, strings.Index(rendered, "```sql"), strings.Index(rendered, "</details>"),
+		"the SQL fence should be rendered inside the <details> block")
+	// The plan summary stays outside the collapse so it is visible at a glance.
+	assert.Contains(t, rendered, "📋 **Plan**: **2** tables to create")
+	assert.Greater(t, strings.Index(rendered, "📋 **Plan**"), strings.Index(rendered, "</details>"),
+		"the plan summary should stay outside (below) the collapsed DDL")
+}
+
+// A single statement uses the singular "statement" in the collapse summary.
+func TestRenderMultiEnvPlanComment_CollapseSummarySingular(t *testing.T) {
+	changes := []templates.KeyspaceChangeData{{
+		Keyspace:   "testdb",
+		Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
+	}}
+	data := templates.MultiEnvPlanCommentData{
+		Database:     "testdb",
+		IsMySQL:      true,
+		Environments: []string{"staging", "production"},
+		Plans: map[string]*templates.PlanCommentData{
+			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, Changes: changes},
+			"production": {Database: "testdb", Environment: "production", IsMySQL: true, Changes: changes},
+		},
+		Errors: map[string]string{},
+	}
+
+	rendered := templates.RenderMultiEnvPlanComment(data)
+
+	assert.Contains(t, rendered, "<summary>Show SQL (1 statement)</summary>")
+}
+
 func TestUserFacingErrorExplainsNoHealthyUpstream(t *testing.T) {
 	err := &api.RemoteDeploymentUnavailableError{
 		Deployment: "pie",
