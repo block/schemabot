@@ -543,7 +543,7 @@ func (h *Handler) acknowledgeCommandActPoint(repo string, pr int, installationID
 	if result.Tenant != "" {
 		return
 	}
-	if h.service != nil && h.service.Config().AggregateRoleForRepo(repo) == "" {
+	if h.service == nil || h.service.Config().AggregateRoleForRepo(repo) == "" {
 		return
 	}
 	h.acknowledgeCommand(repo, pr, installationID, result.CommentID)

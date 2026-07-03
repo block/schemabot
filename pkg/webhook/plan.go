@@ -204,7 +204,6 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 		schemaDatabase = config.Database
 	}
-	h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
 	configuredEnvironments, envErr := h.configuredDatabaseEnvironments(schemaDatabase)
 	if envErr != nil {
 		if isAutoPlan {
@@ -221,6 +220,13 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, envErr)
 		return
 	}
+	// Ownership is only fully decided once the discovered database resolves in
+	// this deployment's registry: config discovery alone can pass on a repo with
+	// no schema-dir allowlist even when the database belongs to another
+	// deployment, and acknowledging there would promise work a fan-out silent
+	// skip never does. The registry lookups above are in-memory, so the
+	// acknowledgment is still immediate.
+	h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
 	configuredEnvironments = append([]string(nil), configuredEnvironments...)
 	allowedEnvironments := append([]string(nil), h.service.Config().AllowedEnvironments...)
 

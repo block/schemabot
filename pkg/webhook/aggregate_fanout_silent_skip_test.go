@@ -309,6 +309,24 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 		}
 	})
 
+	// A bare multi-env plan on a repo without a schema-dir allowlist resolves
+	// config discovery successfully even on a deployment that does not own the
+	// database — ownership is only decided at the registry lookup. A fan-out
+	// participant in that position silently skips, so it must not acknowledge.
+	t.Run("multi-env plan on unowned database does not react", func(t *testing.T) {
+		h, mux, _ := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+		reactions := registerReactionRecorder(t, mux)
+
+		h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, true, 42)
+
+		select {
+		case <-reactions:
+			t.Fatal("a deployment that cannot resolve the database in its registry must not acknowledge")
+		case <-time.After(100 * time.Millisecond):
+		}
+	})
+
 	t.Run("silently skipping deployment does not react", func(t *testing.T) {
 		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
