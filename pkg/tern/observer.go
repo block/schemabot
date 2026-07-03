@@ -114,12 +114,27 @@ func (c *LocalClient) deliverTerminalIfSettled(ctx context.Context, applyID int6
 		return
 	}
 	apply, err := c.storage.Applies().Get(ctx, applyID)
-	if err != nil || apply == nil {
+	if err != nil {
 		c.logger.Warn("could not re-check apply state after observer registration; a drive that already settled will not have notified the observer",
 			"apply_id", applyID, "error", err)
 		return
 	}
+	if apply == nil {
+		// The apply was created moments earlier on this same path, so a missing
+		// row is anomalous rather than an error condition. Leave the observer for
+		// the drive rather than notifying against a phantom terminal.
+		c.logger.Warn("apply not found when re-checking state after observer registration; leaving the observer for the drive",
+			"apply_id", applyID)
+		return
+	}
 	if !state.IsTerminalApplyState(apply.State) {
+		return
+	}
+	// Claim the observer before loading tasks. If the drive's own terminal path
+	// won the race and already took it, there is nothing to deliver — return
+	// early and skip the tasks query entirely.
+	obs := c.takeObserver(applyID)
+	if obs == nil {
 		return
 	}
 	tasks, err := c.storage.Tasks().GetByApplyID(ctx, applyID)
@@ -128,5 +143,5 @@ func (c *LocalClient) deliverTerminalIfSettled(ctx context.Context, applyID int6
 			"apply_id", applyID, "error", err)
 		tasks = nil
 	}
-	c.notifyTerminalObserver(apply, tasks)
+	obs.OnTerminal(apply, tasks)
 }
