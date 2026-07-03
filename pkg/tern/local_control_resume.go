@@ -924,9 +924,11 @@ func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan) []engine.Sc
 }
 
 func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*storage.Task) {
-	if obs := c.getObserver(apply.ID); obs != nil {
+	// takeObserver (remove-then-notify, atomically) rather than get/notify/clear:
+	// the drive's terminal path can race deliverTerminalIfSettled's re-check, and
+	// OnTerminal must fire exactly once.
+	if obs := c.takeObserver(apply.ID); obs != nil {
 		obs.OnTerminal(apply, tasks)
-		c.clearObserver(apply.ID)
 	}
 }
 

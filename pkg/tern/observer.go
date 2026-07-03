@@ -1,6 +1,11 @@
 package tern
 
-import "github.com/block/schemabot/pkg/storage"
+import (
+	"context"
+
+	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
+)
 
 // ProgressObserver receives notifications from the apply progress poller.
 // Implementations can post PR comments, update dashboards, send Slack
@@ -81,4 +86,47 @@ func (c *LocalClient) clearObserver(applyID int64) {
 	c.observerMu.Lock()
 	defer c.observerMu.Unlock()
 	delete(c.observers, applyID)
+}
+
+// takeObserver atomically removes and returns the observer for an apply, or
+// nil if none is set. Terminal delivery goes through it so that when the
+// drive's own terminal path races a late registration's re-check, exactly one
+// of them holds the observer and notifies.
+func (c *LocalClient) takeObserver(applyID int64) ProgressObserver {
+	c.observerMu.Lock()
+	defer c.observerMu.Unlock()
+	obs := c.observers[applyID]
+	delete(c.observers, applyID)
+	return obs
+}
+
+// deliverTerminalIfSettled re-checks a freshly registered observer's apply and
+// delivers the terminal notification if the drive has already finished. An
+// apply becomes claimable the moment its create transaction commits — before
+// Apply registers the dispatch's observer — so a poll-tick claim can start the
+// drive inside that window. Progress lookups re-read the registry per event,
+// so a still-running drive picks the late observer up on its own; a drive fast
+// enough to have already settled (e.g. a task-less no-op) delivered its
+// terminal notification to nobody, which without this re-check would strand
+// the observer unnotified and registered forever.
+func (c *LocalClient) deliverTerminalIfSettled(ctx context.Context, applyID int64) {
+	if c.getObserver(applyID) == nil {
+		return
+	}
+	apply, err := c.storage.Applies().Get(ctx, applyID)
+	if err != nil || apply == nil {
+		c.logger.Warn("could not re-check apply state after observer registration; a drive that already settled will not have notified the observer",
+			"apply_id", applyID, "error", err)
+		return
+	}
+	if !state.IsTerminalApplyState(apply.State) {
+		return
+	}
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, applyID)
+	if err != nil {
+		c.logger.Warn("could not load tasks for late terminal observer notification; notifying without them",
+			"apply_id", applyID, "error", err)
+		tasks = nil
+	}
+	c.notifyTerminalObserver(apply, tasks)
 }
