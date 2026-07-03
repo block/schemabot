@@ -34,7 +34,7 @@ func TestRollupReviewTimeDrift_CleanWhenAllMatch(t *testing.T) {
 	us := &mockTernClient{planDiffResp: alterUsersDiff(ddl)}
 	svc := twoDeploymentService(t, eu, us)
 
-	rollup, err := svc.RollupReviewTimeDrift(t.Context(), planDiffReq(t), reviewedUsersPlan(ddl))
+	rollup, err := svc.RollupReviewTimeDrift(t.Context(), planDiffReq(t), reviewedUsersPlan(ddl), "eu")
 	require.NoError(t, err)
 	assert.True(t, rollup.Clean, "matching deployments must roll up clean")
 	require.Len(t, rollup.Entries, 2)
@@ -52,7 +52,7 @@ func TestRollupReviewTimeDrift_DivergingDeploymentBlocks(t *testing.T) {
 	svc := twoDeploymentService(t, eu, us)
 
 	reviewed := reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-	rollup, err := svc.RollupReviewTimeDrift(t.Context(), planDiffReq(t), reviewed)
+	rollup, err := svc.RollupReviewTimeDrift(t.Context(), planDiffReq(t), reviewed, "eu")
 	require.NoError(t, err)
 	assert.False(t, rollup.Clean, "a diverging deployment must block the rollup")
 	require.Len(t, rollup.Entries, 2)
@@ -70,7 +70,7 @@ func TestRollupReviewTimeDrift_UnreachableDeploymentBlocks(t *testing.T) {
 	us := &mockTernClient{planDiffErr: errors.New("us unreachable")}
 	svc := twoDeploymentService(t, eu, us)
 
-	rollup, err := svc.RollupReviewTimeDrift(t.Context(), planDiffReq(t), reviewedUsersPlan(ddl))
+	rollup, err := svc.RollupReviewTimeDrift(t.Context(), planDiffReq(t), reviewedUsersPlan(ddl), "eu")
 	require.NoError(t, err)
 	assert.False(t, rollup.Clean, "an unreachable deployment must block the rollup")
 	require.Len(t, rollup.Entries, 2)
@@ -88,6 +88,6 @@ func TestRollupReviewTimeDrift_UnresolvedTargetsError(t *testing.T) {
 
 	req := planDiffReq(t)
 	req.Database = "unknown"
-	_, err := svc.RollupReviewTimeDrift(t.Context(), req, reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"))
+	_, err := svc.RollupReviewTimeDrift(t.Context(), req, reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"), "eu")
 	require.Error(t, err)
 }

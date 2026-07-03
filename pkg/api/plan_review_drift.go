@@ -23,7 +23,7 @@ import (
 // deployment in rollout order — a missing, extra, or reordered deployment fails
 // closed rather than being mistaken for agreement. The returned rollup is Clean
 // only when every deployment matches.
-func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse) (PlanRollup, error) {
+func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryDeployment string) (PlanRollup, error) {
 	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
 	if err != nil {
 		return PlanRollup{}, fmt.Errorf("resolve deployment targets for %s/%s: %w", req.Database, req.Environment, err)
@@ -33,7 +33,7 @@ func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, pr
 		expectedDeployments[i] = t.Deployment
 	}
 
-	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan)
+	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primaryDeployment)
 	if err != nil {
 		return PlanRollup{}, fmt.Errorf("plan deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
 	}

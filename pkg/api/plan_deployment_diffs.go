@@ -49,25 +49,30 @@ type DeploymentPlanDiff struct {
 // deployment neither hides the others nor aborts the rollup; only a
 // request-level failure (target resolution) returns an error. Results are
 // returned in rollout order, primary first.
-func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse) ([]DeploymentPlanDiff, error) {
+//
+// primaryDeployment is the deployment the reviewed primaryPlan was created
+// against (rollout index 0 at plan time). When a primaryPlan is reused, it is
+// checked against targets[0] here so a deployment-order change between plan and
+// rollup — which would map the reviewed baseline onto a different deployment —
+// fails closed rather than being compared against the wrong live schema.
+func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryDeployment string) ([]DeploymentPlanDiff, error) {
 	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
 	if err != nil {
 		return nil, fmt.Errorf("resolve deployment targets for %s/%s: %w", req.Database, req.Environment, err)
 	}
 
-	// Reusing primaryPlan for the primary member hinges on the positional
-	// invariant that rollout index 0 is the primary. ResolveDatabaseTargets and
-	// ResolvePrimaryDatabaseTarget derive that ordering from the same source, so
-	// they agree today — but a future reorder of target resolution would silently
-	// attribute the reviewed plan to the wrong deployment. Cross-check here and
-	// fail closed rather than compare a deployment against the wrong baseline.
+	// Reusing primaryPlan for the primary member assumes it was created against
+	// the deployment now at rollout index 0. Verify that against the plan's
+	// recorded origin deployment (captured at plan time) and fail closed on a
+	// mismatch — e.g. deployment_order changed between plan and rollup — rather
+	// than comparing deployments against a baseline built for a different
+	// deployment.
 	if primaryPlan != nil {
-		primary, err := s.config.ResolvePrimaryDatabaseTarget(req.Database, req.Environment)
-		if err != nil {
-			return nil, fmt.Errorf("resolve primary deployment for %s/%s: %w", req.Database, req.Environment, err)
+		if primaryDeployment == "" {
+			return nil, fmt.Errorf("plan diff for %s/%s: reviewed plan has no origin deployment to verify the primary against", req.Database, req.Environment)
 		}
-		if targets[0].Deployment != primary.Deployment {
-			return nil, fmt.Errorf("primary invariant violated for %s/%s: rollout index 0 is %q but the primary is %q", req.Database, req.Environment, targets[0].Deployment, primary.Deployment)
+		if targets[0].Deployment != primaryDeployment {
+			return nil, fmt.Errorf("primary invariant violated for %s/%s: rollout index 0 is %q but the reviewed plan was created against %q", req.Database, req.Environment, targets[0].Deployment, primaryDeployment)
 		}
 	}
 
