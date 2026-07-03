@@ -264,7 +264,7 @@ require (
 )
 
 // needed for Strata and vtcombo OnlineDDL suppport
-replace vitess.io/vitess => github.com/block/vitess v0.0.0-20260702135400-add994347c62
+replace vitess.io/vitess => github.com/block/vitess v0.0.0-20260703150944-881ec2298245
 
 // needed for SPATIAL index support in Spirit v0.13.0
 replace github.com/pingcap/tidb/pkg/parser => github.com/block/tidb/pkg/parser v0.0.0-20260506200501-e528fd979fc8
