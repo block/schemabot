@@ -279,6 +279,26 @@ func TestParseCommand(t *testing.T) {
 			},
 		},
 		{
+			name: "apply with custom environment (qa)",
+			body: "schemabot apply -e qa",
+			expected: CommandResult{
+				Action:      "apply",
+				Environment: "qa",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "apply with custom environment (load)",
+			body: "schemabot apply -e load",
+			expected: CommandResult{
+				Action:      "apply",
+				Environment: "load",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
 			name: "plan with database flag",
 			body: "schemabot plan -e staging -d my-database",
 			expected: CommandResult{
