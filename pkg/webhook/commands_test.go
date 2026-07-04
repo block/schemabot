@@ -299,6 +299,16 @@ func TestParseCommand(t *testing.T) {
 			},
 		},
 		{
+			name: "env flag does not consume a following flag",
+			body: "schemabot apply -e --tenant alpha",
+			expected: CommandResult{
+				Action:     "apply",
+				Tenant:     "alpha",
+				MissingEnv: true,
+				IsMention:  true,
+			},
+		},
+		{
 			name: "plan with database flag",
 			body: "schemabot plan -e staging -d my-database",
 			expected: CommandResult{
