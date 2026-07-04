@@ -716,8 +716,10 @@ func TestRenderMultiEnvPlanComment_CollapsesDDL(t *testing.T) {
 		"the plan summary should stay outside (below) the collapsed DDL")
 }
 
-// A single statement uses the singular "statement" in the collapse summary.
-func TestRenderMultiEnvPlanComment_CollapseSummarySingular(t *testing.T) {
+// A multi-environment plan with a single change is small enough to show inline,
+// so its DDL is rendered directly instead of behind a <details> block while the
+// plan summary still appears below.
+func TestRenderMultiEnvPlanComment_SingleChangeInline(t *testing.T) {
 	changes := []templates.KeyspaceChangeData{{
 		Keyspace:   "testdb",
 		Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
@@ -729,6 +731,37 @@ func TestRenderMultiEnvPlanComment_CollapseSummarySingular(t *testing.T) {
 		Plans: map[string]*templates.PlanCommentData{
 			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, Changes: changes},
 			"production": {Database: "testdb", Environment: "production", IsMySQL: true, Changes: changes},
+		},
+		Errors: map[string]string{},
+	}
+
+	rendered := templates.RenderMultiEnvPlanComment(data)
+
+	assert.NotContains(t, rendered, "<details>", "a single change renders inline, not collapsed")
+	assert.Contains(t, rendered, "```sql")
+	assert.Contains(t, rendered, "ALTER TABLE `orders` ADD COLUMN `x` int")
+	// The plan summary still appears (below the inline DDL).
+	assert.Contains(t, rendered, "📋 **Plan**")
+}
+
+// When a plan has more than one change overall — here a single DDL statement
+// alongside a VSchema update — the DDL still collapses, and the summary uses the
+// singular "statement" for the one statement it contains.
+func TestRenderMultiEnvPlanComment_CollapseSummarySingular(t *testing.T) {
+	changes := []templates.KeyspaceChangeData{{
+		Keyspace:       "testks",
+		Statements:     []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
+		VSchemaChanged: true,
+		VSchemaDiff:    "+ vindex added",
+	}}
+	data := templates.MultiEnvPlanCommentData{
+		Database:     "testks",
+		IsMySQL:      false,
+		DatabaseType: "PlanetScale",
+		Environments: []string{"staging", "production"},
+		Plans: map[string]*templates.PlanCommentData{
+			"staging":    {Database: "testks", Environment: "staging", IsMySQL: false, DatabaseType: "PlanetScale", Changes: changes},
+			"production": {Database: "testks", Environment: "production", IsMySQL: false, DatabaseType: "PlanetScale", Changes: changes},
 		},
 		Errors: map[string]string{},
 	}

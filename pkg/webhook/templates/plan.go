@@ -815,9 +815,14 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 		return
 	}
 
-	// Detailed changes, collapsed so the DDL doesn't dominate the comment while
-	// the unsafe/lint warnings and summary below stay visible at a glance.
-	writeCollapsibleKeyspaceChanges(sb, *plan, totalStatements)
+	// Detailed changes. A single change is small enough to show inline; more
+	// than one is collapsed so the DDL doesn't dominate the comment while the
+	// unsafe/lint warnings and summary below stay visible at a glance.
+	if totalChanges == 1 {
+		writeKeyspaceChanges(sb, *plan)
+	} else {
+		writeCollapsibleKeyspaceChanges(sb, *plan, totalStatements)
+	}
 
 	// Unsafe changes warning
 	if plan.HasUnsafeChanges && len(plan.UnsafeChanges) > 0 {
