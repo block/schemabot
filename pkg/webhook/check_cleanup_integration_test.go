@@ -189,8 +189,11 @@ func TestE2EStaleCheckCleanup(t *testing.T) {
 
 // TestE2EReconcileStaleInProgressCheck verifies that when a check is stuck at
 // "in_progress" from a crashed apply, the next plan or apply command reconciles
-// it to the apply's terminal state. This prevents branch protection from being
-// blocked indefinitely after a server crash mid-apply.
+// it to the apply's terminal state. The reconciled result belongs to the
+// commit the apply ran against, so on the PR's newer HEAD the aggregate stays
+// open (blocking) rather than passing on the old result; the plan that
+// triggered reconciliation stores the current commit's own results and drives
+// the aggregate to its real conclusion.
 func TestE2EReconcileStaleInProgressCheck(t *testing.T) {
 	dbName := "webhook_stale_inprogress"
 	svc := setupE2EService(t, dbName)
@@ -263,12 +266,17 @@ func TestE2EReconcileStaleInProgressCheck(t *testing.T) {
 	assert.Equal(t, checkConclusionSuccess, check.Conclusion)
 	assert.Equal(t, applyID, check.ApplyID)
 
+	// The reconciled success belongs to the previous commit, so the aggregate
+	// published on the current HEAD holds it as a blocking placeholder instead
+	// of passing on a result the current commit never produced.
 	select {
 	case checkRun := <-result.checkRuns:
 		assert.Equal(t, aggregateCheckName, checkRun.Name)
 		assert.Equal(t, "abc123", checkRun.HeadSHA)
-		assert.Equal(t, checkStatusCompleted, checkRun.Status)
-		assert.Equal(t, checkConclusionSuccess, checkRun.Conclusion)
+		assert.Equal(t, checkStatusInProgress, checkRun.Status)
+		assert.Empty(t, checkRun.Conclusion)
+		require.NotNil(t, checkRun.Output)
+		assert.Equal(t, awaitingCurrentCommitTitle, checkRun.Output.Title)
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for aggregate check run")
 	}
@@ -277,14 +285,16 @@ func TestE2EReconcileStaleInProgressCheck(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, aggregate)
 	assert.Equal(t, "abc123", aggregate.HeadSHA)
-	assert.Equal(t, checkStatusCompleted, aggregate.Status)
-	assert.Equal(t, checkConclusionSuccess, aggregate.Conclusion)
+	assert.Equal(t, checkStatusInProgress, aggregate.Status)
+	assert.Empty(t, aggregate.Conclusion)
 }
 
 // TestE2EReconcileStaleInProgressCheckFailure verifies startup/webhook
 // reconciliation for a check that is still in_progress even though its apply
-// already failed. Reconciliation must publish the failure instead of leaving
-// branch protection pending forever.
+// already failed. Reconciliation records the failure on the stored
+// per-database state; because that result belongs to the commit the apply ran
+// against, the aggregate on the PR's newer HEAD keeps blocking as a
+// placeholder until the current commit's own results land.
 func TestE2EReconcileStaleInProgressCheckFailure(t *testing.T) {
 	dbName := "webhook_stale_inprogress_failed"
 	svc := setupE2EService(t, dbName)
@@ -359,13 +369,17 @@ func TestE2EReconcileStaleInProgressCheckFailure(t *testing.T) {
 	assert.Equal(t, checkConclusionFailure, check.Conclusion)
 	assert.Equal(t, applyID, check.ApplyID)
 
+	// The reconciled failure belongs to the previous commit; the aggregate on
+	// the current HEAD holds it as a blocking placeholder. Merge stays blocked
+	// either way, and the current commit's own plan results decide the real
+	// conclusion.
 	select {
 	case checkRun := <-result.checkRuns:
 		assert.Equal(t, aggregateCheckName, checkRun.Name)
 		assert.Equal(t, "abc123", checkRun.HeadSHA)
-		assert.Equal(t, checkStatusCompleted, checkRun.Status)
-		assert.Equal(t, checkConclusionFailure, checkRun.Conclusion)
+		assert.Equal(t, checkStatusInProgress, checkRun.Status)
+		assert.Empty(t, checkRun.Conclusion)
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for failing aggregate check run")
+		t.Fatal("timed out waiting for blocking aggregate check run")
 	}
 }

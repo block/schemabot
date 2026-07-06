@@ -272,6 +272,34 @@ func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage
 	return isPlanOnlySuccessful(current), nil
 }
 
+// ClearAggregateBlock clears the blocking reason on stored aggregate check
+// state. The WHERE clause pins the head SHA and blocking reason the caller
+// read, making the clear an optimistic-concurrency write: a block recorded
+// concurrently (a different reason, or the same reason re-recorded on a newer
+// commit) does not match and is preserved. Returns true when the row was
+// cleared.
+func (s *checkStore) ClearAggregateBlock(ctx context.Context, check *storage.Check) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE checks
+		SET blocking_reason = '',
+		    error_message = ''
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+		  AND head_sha = ? AND blocking_reason = ?
+	`, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		check.HeadSHA, check.BlockingReason)
+	if err != nil {
+		return false, fmt.Errorf("clear aggregate blocking reason %q for %s#%d %s (head %s): %w",
+			check.BlockingReason, check.Repository, check.PullRequest, check.Environment, check.HeadSHA, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("rows affected clearing aggregate blocking reason %q for %s#%d %s: %w",
+			check.BlockingReason, check.Repository, check.PullRequest, check.Environment, err)
+	}
+	return rows > 0, nil
+}
+
 // isPlanOnlySuccessful reports whether stored check state is already in the
 // plan-only successful state stale cleanup converges to: a completed, successful
 // check with no started apply and no pending schema change.

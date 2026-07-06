@@ -823,6 +823,105 @@ func TestCheckStore_MarkStalePlanSuccessfulLeavesInProgressApplyBlockingUnderCha
 	require.Equal(t, apply.ID, retrieved.ApplyID)
 }
 
+// seedBlockedAggregateRow stores an aggregate check row carrying a blocking
+// reason, as recorded when a PR-level guard fails the aggregate closed.
+func seedBlockedAggregateRow(t *testing.T, store *Storage, headSHA, blockingReason string) {
+	t.Helper()
+	require.NoError(t, store.Checks().Upsert(t.Context(), &storage.Check{
+		Repository:     "org/repo",
+		PullRequest:    123,
+		HeadSHA:        headSHA,
+		Environment:    "_aggregate",
+		DatabaseType:   "_aggregate",
+		DatabaseName:   "_aggregate",
+		CheckRunID:     200,
+		HasChanges:     false,
+		Status:         "completed",
+		Conclusion:     "failure",
+		BlockingReason: blockingReason,
+		ErrorMessage:   "guard failed the aggregate closed",
+	}))
+}
+
+// After the auto-plan guards re-verify a PR, the blocking reason on the stored
+// aggregate row is released so fresh plan results can drive the aggregate
+// again. The clear is pinned to the head SHA and reason the caller read.
+func TestCheckStore_ClearAggregateBlockClearsMatchingRow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	seedBlockedAggregateRow(t, store, "abc123", "managed_dir_missing_config")
+
+	existing, err := store.Checks().Get(ctx, "org/repo", 123, "_aggregate", "_aggregate", "_aggregate")
+	require.NoError(t, err)
+	require.NotNil(t, existing)
+
+	cleared, err := store.Checks().ClearAggregateBlock(ctx, existing)
+	require.NoError(t, err)
+	require.True(t, cleared)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "_aggregate", "_aggregate", "_aggregate")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Empty(t, retrieved.BlockingReason)
+	assert.Empty(t, retrieved.ErrorMessage)
+	assert.Equal(t, "failure", retrieved.Conclusion, "the clear releases only the block; conclusion is replaced by the next aggregate write")
+}
+
+// The clear is an optimistic-concurrency write: when another writer records a
+// block for a newer commit between the caller's read and the clear, the head
+// SHA no longer matches and the newer block stays authoritative.
+func TestCheckStore_ClearAggregateBlockPreservesConcurrentlyMovedRow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	seedBlockedAggregateRow(t, store, "abc123", "managed_dir_missing_config")
+
+	stale, err := store.Checks().Get(ctx, "org/repo", 123, "_aggregate", "_aggregate", "_aggregate")
+	require.NoError(t, err)
+	require.NotNil(t, stale)
+
+	// Another writer re-records the block on a newer commit before the clear.
+	seedBlockedAggregateRow(t, store, "def456", "managed_dir_missing_config")
+
+	cleared, err := store.Checks().ClearAggregateBlock(ctx, stale)
+	require.NoError(t, err)
+	require.False(t, cleared)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "_aggregate", "_aggregate", "_aggregate")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "def456", retrieved.HeadSHA)
+	assert.Equal(t, "managed_dir_missing_config", retrieved.BlockingReason)
+}
+
+// A block recorded for a different reason after the caller's read is a newer
+// guard decision; the clear must not release it.
+func TestCheckStore_ClearAggregateBlockPreservesDifferentReason(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	seedBlockedAggregateRow(t, store, "abc123", "managed_dir_missing_config")
+
+	stale, err := store.Checks().Get(ctx, "org/repo", 123, "_aggregate", "_aggregate", "_aggregate")
+	require.NoError(t, err)
+	require.NotNil(t, stale)
+
+	seedBlockedAggregateRow(t, store, "abc123", "schema_config_discovery_failed")
+
+	cleared, err := store.Checks().ClearAggregateBlock(ctx, stale)
+	require.NoError(t, err)
+	require.False(t, cleared)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "_aggregate", "_aggregate", "_aggregate")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "schema_config_discovery_failed", retrieved.BlockingReason)
+}
+
 // newChangedRowsStore opens a Storage on a connection without clientFoundRows so
 // UPDATE ... RowsAffected reflects changed rows, matching production semantics.
 func newChangedRowsStore(t *testing.T) *Storage {
