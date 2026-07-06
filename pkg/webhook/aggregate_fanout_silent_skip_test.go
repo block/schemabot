@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -210,5 +211,135 @@ func TestUnscopedRollbackConfirmNoLockStaysSilentOnAggregateRepo(t *testing.T) {
 		body := requireComment(t, comments, "no-lock rollback-confirm comment")
 		assert.Contains(t, body, "No Lock Found")
 		assert.Contains(t, body, "`staging`")
+	})
+}
+
+// registerReactionRecorder captures acknowledgment reactions posted to the
+// command comment.
+func registerReactionRecorder(t *testing.T, mux *http.ServeMux) chan string {
+	t.Helper()
+	reactions := make(chan string, 4)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Content string `json:"content"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		reactions <- body.Content
+		w.WriteHeader(http.StatusCreated)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 1}))
+	})
+	return reactions
+}
+
+// The acknowledgment reaction means "this deployment is acting on your
+// command": a deployment that owns the discovered database reacts with eyes,
+// while a fan-out deployment that silently skips unowned work leaves only its
+// log — so the reaction count on a shared repo reflects the deployments doing
+// work, not everyone who heard the command.
+func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
+	t.Run("owning deployment reacts", func(t *testing.T) {
+		cfg := aggregateLeaderConfig()
+		cfg.Databases = map[string]api.DatabaseConfig{
+			"orders": {Environments: map[string]api.EnvironmentConfig{
+				"staging": {Deployment: "default", Target: "orders"},
+			}},
+		}
+		h, mux, _ := newFanOutSkipHandler(t, cfg)
+		serveSchemaConfigForDatabase(t, mux, "orders")
+		// Discovery loads the schema files next to schemabot.yaml: serve the
+		// root directory listing and one table file so the command proceeds
+		// past discovery to the acknowledgment point.
+		mux.HandleFunc("GET /repos/octocat/hello-world/contents/", func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{
+				{"type": "file", "name": "schemabot.yaml", "path": "schemabot.yaml"},
+				{"type": "dir", "name": "staging", "path": "staging"},
+			}))
+		})
+		mux.HandleFunc("GET /repos/octocat/hello-world/contents/staging", func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{
+				{"type": "file", "name": "users.sql", "path": "staging/users.sql"},
+			}))
+		})
+		mux.HandleFunc("GET /repos/octocat/hello-world/contents/staging/users.sql", func(w http.ResponseWriter, _ *http.Request) {
+			ddl := "CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
+				"type": "file", "encoding": "base64",
+				"content": base64.StdEncoding.EncodeToString([]byte(ddl)),
+			}))
+		})
+		reactions := registerReactionRecorder(t, mux)
+
+		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot",
+			CommandResult{Action: action.Apply, CommentID: 42})
+
+		select {
+		case content := <-reactions:
+			assert.Equal(t, "eyes", content)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for the acknowledgment reaction")
+		}
+	})
+
+	// The acknowledgment must not wait for schema files to load: ownership is
+	// decidable from config discovery alone, so on databases with large schema
+	// directories the user still sees the reaction promptly. Failing the file
+	// fetch proves the reaction fired before it.
+	t.Run("owning deployment acknowledges before schema files load", func(t *testing.T) {
+		cfg := aggregateLeaderConfig()
+		cfg.Databases = map[string]api.DatabaseConfig{
+			"orders": {Environments: map[string]api.EnvironmentConfig{
+				"staging": {Deployment: "default", Target: "orders"},
+			}},
+		}
+		h, mux, _ := newFanOutSkipHandler(t, cfg)
+		serveSchemaConfigForDatabase(t, mux, "orders")
+		mux.HandleFunc("GET /repos/octocat/hello-world/contents/staging", func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "schema listing unavailable", http.StatusInternalServerError)
+		})
+		reactions := registerReactionRecorder(t, mux)
+
+		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot",
+			CommandResult{Action: action.Apply, CommentID: 42})
+
+		select {
+		case content := <-reactions:
+			assert.Equal(t, "eyes", content)
+		case <-time.After(2 * time.Second):
+			t.Fatal("the acknowledgment must fire from config discovery, before schema files load")
+		}
+	})
+
+	// A bare multi-env plan on a repo without a schema-dir allowlist resolves
+	// config discovery successfully even on a deployment that does not own the
+	// database — ownership is only decided at the registry lookup. A fan-out
+	// participant in that position silently skips, so it must not acknowledge.
+	t.Run("multi-env plan on unowned database does not react", func(t *testing.T) {
+		h, mux, _ := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+		reactions := registerReactionRecorder(t, mux)
+
+		h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, true, 42)
+
+		select {
+		case <-reactions:
+			t.Fatal("a deployment that cannot resolve the database in its registry must not acknowledge")
+		case <-time.After(100 * time.Millisecond):
+		}
+	})
+
+	t.Run("silently skipping deployment does not react", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+		reactions := registerReactionRecorder(t, mux)
+
+		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot",
+			CommandResult{Action: action.Apply, CommentID: 42})
+
+		assert.Empty(t, comments, "the silent skip posts nothing")
+		select {
+		case <-reactions:
+			t.Fatal("a silently skipping deployment must not acknowledge the command")
+		case <-time.After(100 * time.Millisecond):
+		}
 	})
 }

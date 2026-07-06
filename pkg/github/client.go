@@ -342,6 +342,13 @@ type InstallationClient struct {
 	checkStatusSingleflight *CheckStatusSingleflight
 }
 
+// InstallationID returns the GitHub App installation this client is scoped
+// to, so callers can schedule follow-up work (e.g. a delayed aggregate
+// re-fold) that must resolve a client for the same installation later.
+func (ic *InstallationClient) InstallationID() int64 {
+	return ic.installationID
+}
+
 // loadAppSlug returns the current app slug, or empty if not yet set.
 func (ic *InstallationClient) loadAppSlug() string {
 	if p := ic.appSlug.Load(); p != nil {
@@ -518,6 +525,16 @@ type PullRequestInfo struct {
 	BaseRef string
 	BaseSHA string
 	User    string
+	// State is the PR's lifecycle state as GitHub reports it: "open" or
+	// "closed" (a merged PR reads as closed).
+	State string
+}
+
+// IsClosed reports whether the PR is closed (merged or unmerged). Callers that
+// act on a PR asynchronously — timers, reconciliation — use this to stop work
+// that only makes sense on an open PR.
+func (pri *PullRequestInfo) IsClosed() bool {
+	return pri.State == "closed"
 }
 
 // FetchPullRequest is the dedupe-friendly variant. It honours the
@@ -590,6 +607,7 @@ func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string,
 		BaseRef: ghPR.GetBase().GetRef(),
 		BaseSHA: ghPR.GetBase().GetSHA(),
 		User:    ghPR.GetUser().GetLogin(),
+		State:   ghPR.GetState(),
 	}, nil
 }
 

@@ -266,9 +266,38 @@ func TestRenderPlanComment_ShowsUnsafeWarning(t *testing.T) {
 
 	rendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, rendered, "⛔ Unsafe Changes Detected")
+	assert.Contains(t, rendered, "**Issues**: **1** unsafe change detected")
 	assert.Contains(t, rendered, "`orders`")
 	assert.Contains(t, rendered, "DROP INDEX without making invisible first")
+}
+
+// The unsafe warning is rendered as an "Issues" summary line — parallel to the
+// "Plan" summary — with the total pluralized count, followed by a bullet per
+// affected table so the reviewer sees both the headline and the detail.
+func TestRenderPlanComment_UnsafeWarningSummaryCountsChanges(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace: "testdb",
+			Statements: []string{
+				"ALTER TABLE `orders` DROP INDEX `idx_status`",
+				"ALTER TABLE `customers` DROP COLUMN `email`",
+			},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []templates.UnsafeChangeData{
+			{Table: "orders", Reason: "DROP INDEX without making invisible first"},
+			{Table: "customers", Reason: "DROP COLUMN is destructive"},
+		},
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "⚠️ **Issues**: **2** unsafe changes detected")
+	assert.Contains(t, rendered, "- `orders`: DROP INDEX without making invisible first")
+	assert.Contains(t, rendered, "- `customers`: DROP COLUMN is destructive")
 }
 
 func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
@@ -650,6 +679,98 @@ func TestRenderMultiEnvPlanComment_StrataHeaderWithErrors(t *testing.T) {
 	assert.Contains(t, rendered, "**Type**: `Strata`")
 }
 
+// A multi-environment plan collapses its DDL behind a <details> block so the
+// SQL doesn't dominate the comment, while the summary line advertises the
+// statement count so a reviewer can gauge the change size without expanding it.
+func TestRenderMultiEnvPlanComment_CollapsesDDL(t *testing.T) {
+	changes := []templates.KeyspaceChangeData{{
+		Keyspace: "testdb",
+		Statements: []string{
+			"CREATE TABLE `customers` (`id` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+			"CREATE TABLE `orders` (`id` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+		},
+	}}
+	data := templates.MultiEnvPlanCommentData{
+		Database:     "testdb",
+		IsMySQL:      true,
+		Environments: []string{"staging", "production"},
+		Plans: map[string]*templates.PlanCommentData{
+			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, Changes: changes},
+			"production": {Database: "testdb", Environment: "production", IsMySQL: true, Changes: changes},
+		},
+		Errors: map[string]string{},
+	}
+
+	rendered := templates.RenderMultiEnvPlanComment(data)
+
+	assert.Contains(t, rendered, "<details>\n<summary>Show SQL (2 statements)</summary>")
+	assert.Contains(t, rendered, "</details>")
+	assert.Contains(t, rendered, "```sql")
+	assert.Contains(t, rendered, "CREATE TABLE `customers`")
+	// The DDL fence lives inside the collapsed block, before it closes.
+	assert.Less(t, strings.Index(rendered, "```sql"), strings.Index(rendered, "</details>"),
+		"the SQL fence should be rendered inside the <details> block")
+	// The plan summary stays outside the collapse so it is visible at a glance.
+	assert.Contains(t, rendered, "📋 **Plan**: **2** tables to create")
+	assert.Greater(t, strings.Index(rendered, "📋 **Plan**"), strings.Index(rendered, "</details>"),
+		"the plan summary should stay outside (below) the collapsed DDL")
+}
+
+// A multi-environment plan with a single change is small enough to show inline,
+// so its DDL is rendered directly instead of behind a <details> block while the
+// plan summary still appears below.
+func TestRenderMultiEnvPlanComment_SingleChangeInline(t *testing.T) {
+	changes := []templates.KeyspaceChangeData{{
+		Keyspace:   "testdb",
+		Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
+	}}
+	data := templates.MultiEnvPlanCommentData{
+		Database:     "testdb",
+		IsMySQL:      true,
+		Environments: []string{"staging", "production"},
+		Plans: map[string]*templates.PlanCommentData{
+			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, Changes: changes},
+			"production": {Database: "testdb", Environment: "production", IsMySQL: true, Changes: changes},
+		},
+		Errors: map[string]string{},
+	}
+
+	rendered := templates.RenderMultiEnvPlanComment(data)
+
+	assert.NotContains(t, rendered, "<details>", "a single change renders inline, not collapsed")
+	assert.Contains(t, rendered, "```sql")
+	assert.Contains(t, rendered, "ALTER TABLE `orders` ADD COLUMN `x` int")
+	// The plan summary still appears (below the inline DDL).
+	assert.Contains(t, rendered, "📋 **Plan**")
+}
+
+// When a plan has more than one change overall — here a single DDL statement
+// alongside a VSchema update — the DDL still collapses, and the summary uses the
+// singular "statement" for the one statement it contains.
+func TestRenderMultiEnvPlanComment_CollapseSummarySingular(t *testing.T) {
+	changes := []templates.KeyspaceChangeData{{
+		Keyspace:       "testks",
+		Statements:     []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
+		VSchemaChanged: true,
+		VSchemaDiff:    "+ vindex added",
+	}}
+	data := templates.MultiEnvPlanCommentData{
+		Database:     "testks",
+		IsMySQL:      false,
+		DatabaseType: "PlanetScale",
+		Environments: []string{"staging", "production"},
+		Plans: map[string]*templates.PlanCommentData{
+			"staging":    {Database: "testks", Environment: "staging", IsMySQL: false, DatabaseType: "PlanetScale", Changes: changes},
+			"production": {Database: "testks", Environment: "production", IsMySQL: false, DatabaseType: "PlanetScale", Changes: changes},
+		},
+		Errors: map[string]string{},
+	}
+
+	rendered := templates.RenderMultiEnvPlanComment(data)
+
+	assert.Contains(t, rendered, "<summary>Show SQL (1 statement)</summary>")
+}
+
 func TestUserFacingErrorExplainsNoHealthyUpstream(t *testing.T) {
 	err := &api.RemoteDeploymentUnavailableError{
 		Deployment: "pie",
@@ -716,7 +837,7 @@ func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {
 
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
-	assert.Contains(t, rendered, "⛔ Unsafe Changes Detected")
+	assert.Contains(t, rendered, "⛔ 1 Unsafe Change Detected")
 	assert.Contains(t, rendered, "`users`")
 	assert.Contains(t, rendered, "DROP TABLE removes all data")
 	assert.Contains(t, rendered, "--allow-unsafe")

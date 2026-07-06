@@ -199,14 +199,20 @@ type VolumeRequest struct {
 
 // PlanResponse is the HTTP response for POST /api/plan.
 type PlanResponse struct {
-	PlanID       string                   `json:"plan_id"`
-	Database     string                   `json:"database,omitempty"`
-	DatabaseType string                   `json:"database_type,omitempty"`
-	Environment  string                   `json:"environment,omitempty"`
-	Engine       string                   `json:"engine"`
-	Changes      []*SchemaChangeResponse  `json:"changes"`
-	LintResults  []*LintViolationResponse `json:"lint_violations"`
-	Errors       []string                 `json:"errors"`
+	PlanID       string `json:"plan_id"`
+	Database     string `json:"database,omitempty"`
+	DatabaseType string `json:"database_type,omitempty"`
+	Environment  string `json:"environment,omitempty"`
+	// Deployment is the primary deployment this plan was created against
+	// (rollout index 0 at plan time). The review-time drift rollup carries it
+	// forward so it can verify the plan's baseline still maps to the primary at
+	// rollup time, rather than trusting that current config re-resolves the same
+	// primary.
+	Deployment  string                   `json:"deployment,omitempty"`
+	Engine      string                   `json:"engine"`
+	Changes     []*SchemaChangeResponse  `json:"changes"`
+	LintResults []*LintViolationResponse `json:"lint_violations"`
+	Errors      []string                 `json:"errors"`
 	// Shards carries the per-shard plan for a sharded engine: each changing shard
 	// and the changes it needs. The namespace-level Changes above collapse a
 	// keyspace to one entry, so a keyspace whose shards diverge is represented

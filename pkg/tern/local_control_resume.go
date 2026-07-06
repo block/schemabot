@@ -57,7 +57,7 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStartRequested, storage.LogSourceSchemaBot,
 			"Start request queued for apply owner", "", "")
 	}
-	c.wakeOperatorForControlRequest(apply)
+	c.wakeOperator(apply)
 	return &ternv1.StartResponse{
 		Accepted:     true,
 		StartedCount: startedCount,
@@ -924,22 +924,54 @@ func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan) []engine.Sc
 }
 
 func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*storage.Task) {
-	if obs := c.getObserver(apply.ID); obs != nil {
+	// takeObserver (remove-then-notify, atomically) rather than get/notify/clear:
+	// the drive's terminal path can race deliverTerminalIfSettled's re-check, and
+	// OnTerminal must fire exactly once.
+	if obs := c.takeObserver(apply.ID); obs != nil {
 		obs.OnTerminal(apply, tasks)
-		c.clearObserver(apply.ID)
 	}
+}
+
+// guardDriveScope fails closed when a claimed apply does not belong to the
+// database this client is bound to. Operators claim from whatever Tern storage
+// they poll and resolve the drive client afterwards, and that resolution can
+// fall back to a database-bound default client (RegisterGRPC wires the gRPC
+// transport's client as the service-wide fallback) — so in a storage database
+// shared by more than one tern, a claim of another tern's apply would
+// otherwise run that apply's DDL against this client's target. Every
+// legitimate drive reaches a client whose database matches the apply's
+// deployment (Apply stamps Deployment from the creating client's database;
+// routing resolves operation drives by their deployment) or the apply's
+// database (the target router builds per-target clients keyed by it), so a
+// claim matching neither is foreign work. The refused apply stays claimable
+// by an operator whose client matches once its lease goes stale.
+func (c *LocalClient) guardDriveScope(apply *storage.Apply) error {
+	if apply == nil {
+		return fmt.Errorf("stored apply is required")
+	}
+	if apply.Deployment == c.config.Database || apply.Database == c.config.Database {
+		return nil
+	}
+	return fmt.Errorf("apply %s (database %q, deployment %q) is outside this client's database scope (%q); refusing to drive it against the wrong target",
+		apply.ApplyIdentifier, apply.Database, apply.Deployment, c.config.Database)
 }
 
 // ResumeApply starts or resumes an apply claimed by an operator driver.
 // Pending applies are dispatched for the first time; stale applies use the
 // engine's resume metadata to continue after a missed heartbeat.
 func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
+	if err := c.guardDriveScope(apply); err != nil {
+		return err
+	}
 	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
 		return fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	// Whole-apply scope has no single operation to order, so the stored apply
-	// options govern the drive directly (no automatic barrier park).
+	// options govern the drive directly (no automatic barrier park). A task-less
+	// apply is handled inside the shared resume path: VSchema-only plans are
+	// re-driven so the VSchema is applied, and any other task-less shape (e.g. a
+	// sharded dispatch whose shard already matches) completes as a no-op.
 	return c.resumeApplyWithTasks(ctx, apply, tasks, apply.GetOptions().Map(), false, false)
 }
 
@@ -949,6 +981,9 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 // are loaded scoped to the operation rather than the whole apply, so a driver
 // can advance one deployment independently of its siblings.
 func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	if err := c.guardDriveScope(apply); err != nil {
+		return err
+	}
 	op, err := c.storage.ApplyOperations().Get(ctx, applyOperationID)
 	if err != nil {
 		return fmt.Errorf("get apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
@@ -1008,6 +1043,9 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
 	if apply == nil {
 		return fmt.Errorf("stored apply is required to drive apply_operation %d cutover", applyOperationID)
+	}
+	if err := c.guardDriveScope(apply); err != nil {
+		return err
 	}
 	op, err := c.storage.ApplyOperations().Get(ctx, applyOperationID)
 	if err != nil {

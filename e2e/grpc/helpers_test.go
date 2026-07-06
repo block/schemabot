@@ -379,7 +379,7 @@ func grpcClearSchemabotState(t *testing.T) {
 	}
 	defer utils.CloseAndLog(db)
 
-	rows, err := db.QueryContext(context.Background(), "SHOW TABLES") //nolint:usetesting // cleanup utility
+	rows, err := db.QueryContext(t.Context(), "SHOW TABLES")
 	if err != nil {
 		return
 	}
@@ -393,7 +393,7 @@ func grpcClearSchemabotState(t *testing.T) {
 	}
 
 	for _, table := range tables {
-		_, _ = db.ExecContext(context.Background(), "DELETE FROM `"+table+"`") //nolint:usetesting // cleanup utility
+		_, _ = db.ExecContext(t.Context(), "DELETE FROM `"+table+"`")
 	}
 }
 
@@ -412,7 +412,7 @@ func grpcClearTernStorage(t *testing.T, env string) {
 	}
 	defer utils.CloseAndLog(db)
 
-	rows, err := db.QueryContext(context.Background(), "SHOW TABLES") //nolint:usetesting // cleanup utility
+	rows, err := db.QueryContext(t.Context(), "SHOW TABLES")
 	if err != nil {
 		return
 	}
@@ -426,7 +426,7 @@ func grpcClearTernStorage(t *testing.T, env string) {
 	}
 
 	for _, table := range tables {
-		_, _ = db.ExecContext(context.Background(), "DELETE FROM `"+table+"`") //nolint:usetesting // cleanup utility
+		_, _ = db.ExecContext(t.Context(), "DELETE FROM `"+table+"`")
 	}
 }
 
@@ -452,12 +452,14 @@ func grpcCreateTestTable(t *testing.T, env, tableName, ddl string) {
 			return
 		}
 		defer utils.CloseAndLog(db2)
+		ctx, cancel := testutil.CleanupContext(30 * time.Second)
+		defer cancel()
 		for _, suffix := range []string{"_new", "_old", "_chkpnt", ""} {
 			name := tableName
 			if suffix != "" {
 				name = "_" + tableName + suffix
 			}
-			_, _ = db2.ExecContext(context.Background(), "DROP TABLE IF EXISTS `"+name+"`") //nolint:usetesting // cleanup
+			_, _ = db2.ExecContext(ctx, "DROP TABLE IF EXISTS `"+name+"`")
 		}
 	})
 }

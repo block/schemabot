@@ -570,7 +570,12 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		return nil, nil, err
 	}
 
-	return resp, planResponseFromProto(resp), nil
+	planResp := planResponseFromProto(resp)
+	// Record the primary deployment this plan was created against so the
+	// review-time drift rollup can verify the baseline still maps to the primary
+	// at rollup time.
+	planResp.Deployment = deployment
+	return resp, planResp, nil
 }
 
 type storedPlanRoute struct {

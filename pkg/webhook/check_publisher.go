@@ -85,6 +85,12 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 	}
 
 	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
+		// False covers a transient PR-fetch failure as well as a genuinely
+		// newer head; either way a leader's next re-fold fetches the
+		// then-current head, so arming a bounded re-fold converges the
+		// aggregate instead of stranding one waiting on a participant re-read.
+		// verifyHeadSHAStillCurrentForPR already logged the reason.
+		h.scheduleLeaderRefoldIfConfigured(ctx, repo, pr, client.InstallationID())
 		return
 	}
 
@@ -96,6 +102,10 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 			Status:     "error",
 		})
 		h.logger.Error("failed to fetch checks for aggregate", "repo", repo, "pr", pr, "error", err)
+		// A storage blip must not end a leader's retry chain while its
+		// aggregate renders unresolved participants as in_progress; the
+		// bounded re-fold retries the read.
+		h.scheduleLeaderRefoldIfConfigured(ctx, repo, pr, client.InstallationID())
 		return
 	}
 
@@ -121,7 +131,10 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 			// The leader cannot determine which participants a PR requires without
 			// the changed files. Fail closed: do not publish an aggregate at all,
 			// which leaves any existing (still-blocking) aggregate in place rather
-			// than downgrading it to a passing success we cannot justify.
+			// than downgrading it to a passing success we cannot justify. The read
+			// failure is as transient as a failed participant Checks read, so arm
+			// a bounded re-fold — otherwise one API blip strands the aggregate
+			// until an external event re-folds it.
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 				Operation:  "aggregate_check_sync",
 				Repository: repo,
@@ -129,6 +142,7 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 			})
 			h.logger.Error("aggregate leader cannot fetch PR files, not publishing aggregate",
 				"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+			h.scheduleParticipantRefold(ctx, repo, pr, client.InstallationID())
 			return
 		}
 		expectedParticipants = config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))
@@ -149,13 +163,25 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 
 	checkNameBase := h.aggregateCheckNameForRepo(repo)
 
+	// A retriable participant outcome (not reported yet, or a failed Checks
+	// API read) can newly resolve on a later re-read. Participants with no
+	// schema work publish their check but never comment, so no nudge will
+	// arrive — the leader must re-fold on its own schedule or the aggregate
+	// stays blocked on a participant that already reported green. While the
+	// re-fold budget lasts, unresolved participants render as in_progress
+	// (equally merge-blocking) so the wait is not mislabeled as pending
+	// applies.
+	participantsRetriable := false
+	retryPending := h.participantRefoldBudgetRemaining(repo, pr)
+
 	if len(config.AllowedEnvironments) > 0 {
 		// Per-environment aggregates: create one aggregate per allowed environment.
 		// Each uses the real environment name in the storage key to avoid collisions
 		// between environments (e.g., staging vs production aggregates).
 		for _, env := range config.AllowedEnvironments {
 			envChecks := filterChecksByEnvironment(dbChecks, env)
-			participantChecks := h.participantCheckOutcomes(ctx, client, repo, pr, env, headSHA, expectedParticipants)
+			participantChecks, retriable := h.participantCheckOutcomes(ctx, client, repo, pr, env, headSHA, expectedParticipants, retryPending)
+			participantsRetriable = participantsRetriable || retriable
 			envChecks = append(envChecks, participantChecks...)
 			if len(envChecks) == 0 {
 				h.logger.Debug("no checks or expected participants for aggregate environment",
@@ -168,11 +194,18 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 	} else {
 		// Single aggregate. Uses aggregateSentinel for the environment field
 		// since there is no per-environment scoping.
-		participantChecks := h.participantCheckOutcomes(ctx, client, repo, pr, aggregateSentinel, headSHA, expectedParticipants)
+		participantChecks, retriable := h.participantCheckOutcomes(ctx, client, repo, pr, aggregateSentinel, headSHA, expectedParticipants, retryPending)
+		participantsRetriable = retriable
 		aggChecks := make([]*storage.Check, 0, len(dbChecks)+len(participantChecks))
 		aggChecks = append(aggChecks, dbChecks...)
 		aggChecks = append(aggChecks, participantChecks...)
 		h.upsertAggregateCheckRun(ctx, client, repo, pr, headSHA, aggChecks, checkNameBase, aggregateSentinel)
+	}
+
+	if participantsRetriable {
+		h.scheduleParticipantRefold(ctx, repo, pr, client.InstallationID())
+	} else {
+		h.clearParticipantRefoldBudget(repo, pr)
 	}
 }
 

@@ -227,9 +227,10 @@ func TestE2EParticipantCommentNudgeFailClosedThroughRollback(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	// A completed-but-not-successful participant check (action_required after a
-	// rollback) folds as failure — the strongest blocking conclusion.
-	blocked := collectAggregateConclusion(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", "production"), checkConclusionFailure)
+	// The participant's post-rollback check reads action_required — its change
+	// was reverted and a re-apply is pending — so the aggregate blocks as
+	// action_required.
+	blocked := collectAggregateConclusion(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", "production"), checkConclusionActionRequired)
 	assert.Equal(t, headSHA, blocked.HeadSHA)
 	assert.Equal(t, checkStatusCompleted, blocked.Status,
 		"a rolled-back participant blocks the aggregate")

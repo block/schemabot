@@ -112,7 +112,12 @@ func (s *Service) wakeOperator(applyIdentifier, database, environment string) {
 	s.operatorMu.Unlock()
 
 	if !running || wake == nil {
-		s.logger.Debug("operator wake skipped because operator is not running",
+		// A wake reaches here for every kind of queued durable work — a queued
+		// apply dispatch as well as control requests — and every drive runs under
+		// an operator claim, so with no operator running none of it will be
+		// picked up. Warn so an operator-less deployment shape is visible before
+		// someone has to debug a queued apply that never starts.
+		s.logger.Warn("operator wake skipped because the operator is not running; queued applies and control requests will not be driven until the operator starts",
 			"apply_id", applyIdentifier,
 			"database", database,
 			"environment", environment)

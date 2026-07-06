@@ -236,23 +236,66 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 		summary = buildAggregateTable(checks)
 	case checkConclusionActionRequired:
 		pending := 0
+		unresolved := 0
 		for _, c := range checks {
-			if c.Conclusion == checkConclusionActionRequired {
-				pending++
+			if c.Conclusion != checkConclusionActionRequired {
+				continue
+			}
+			pending++
+			if isUnresolvedParticipantCheck(c) {
+				unresolved++
 			}
 		}
-		if pending == 1 {
+		switch {
+		case pending > 0 && unresolved == pending:
+			// Every blocking row is a participant whose Check Run could not be
+			// read; no apply is actually pending, the participants are silent.
+			if pending == 1 {
+				title = "1 participant deployment has not reported"
+			} else {
+				title = fmt.Sprintf("%d participant deployments have not reported", pending)
+			}
+		case pending == 1:
 			title = "1 apply pending"
-		} else {
+		default:
 			title = fmt.Sprintf("%d applies pending", pending)
 		}
 		summary = buildAggregateTable(checks)
 	default:
 		// in_progress — conclusion is empty
-		title = "Apply in progress"
+		inProgress := 0
+		waiting := 0
+		for _, c := range checks {
+			if c.Status != checkStatusInProgress {
+				continue
+			}
+			inProgress++
+			if isUnresolvedParticipantCheck(c) {
+				waiting++
+			}
+		}
+		if inProgress > 0 && waiting == inProgress {
+			// Nothing is applying; the fold is waiting for participant Check
+			// Runs a scheduled re-fold will re-read shortly.
+			if waiting == 1 {
+				title = "Waiting for 1 participant deployment to report"
+			} else {
+				title = fmt.Sprintf("Waiting for %d participant deployments to report", waiting)
+			}
+		} else {
+			title = "Apply in progress"
+		}
 		summary = buildAggregateTable(checks)
 	}
 	return title, summary
+}
+
+// isUnresolvedParticipantCheck reports whether a synthesized participant row
+// blocks only because the participant's Check Run could not be read (not
+// reported yet, or a failed Checks API read) — the aggregate should present it
+// as a reporting gap, never as a pending or failed apply.
+func isUnresolvedParticipantCheck(c *storage.Check) bool {
+	return c.BlockingReason == participantUnresolvedBlockingReason
 }
 
 // isParticipantCheck reports whether a check is a participant deployment's
@@ -392,6 +435,12 @@ func allChecksAreUpToDate(checks []*storage.Check) bool {
 func checkStatusLabel(c *storage.Check) string {
 	if c.Status == checkStatusCompleted && c.Conclusion == checkConclusionSuccess && !c.HasChanges {
 		return "Up to date"
+	}
+	if isUnresolvedParticipantCheck(c) {
+		if c.Status == checkStatusInProgress {
+			return "Waiting to report"
+		}
+		return "Not reported"
 	}
 	return conclusionEmoji(c.Status, c.Conclusion)
 }

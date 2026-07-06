@@ -16,7 +16,7 @@ import (
 )
 
 // handlePlanCommand handles the "schemabot plan -e <env>" command.
-func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, environment, databaseName, tenant string, installationID int64, requestedBy string) {
+func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, environment, databaseName, tenant string, installationID int64, requestedBy string, commentID int64) {
 	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
 		h.logger.Error("plan: failed to bootstrap command", "error", err)
@@ -43,6 +43,8 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 
+	ackedEarly := h.acknowledgeCommandEarlyIfOwned(ctx, client, repo, pr, databaseName, tenant, installationID, commentID)
+
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Plan)
 	if err != nil {
@@ -60,6 +62,9 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Plan, err)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema request error handled"})
 		return
+	}
+	if !ackedEarly {
+		h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
 	}
 
 	// Reject if the PR HEAD advanced after discovery loaded schema files.
@@ -120,7 +125,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Roll up every deployment's diff against the reviewed plan so drift on a
 	// non-primary deployment fails the check closed at review time.
-	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, repo, pr)
+	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
 
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy)
@@ -158,7 +163,9 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 // handleMultiEnvPlan runs plan for all configured environments and posts a single combined comment.
 // When isAutoPlan is true and no environments have changes or errors, the comment is skipped to reduce PR noise.
-func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, postPlanComment bool) {
+// commentID is the command comment to acknowledge once discovery commits this
+// deployment to acting; auto-plans pass zero (no comment to acknowledge).
+func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, postPlanComment bool, commentID int64) {
 	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
 		h.logger.Error("multi-env plan: failed to bootstrap command", "error", err)
@@ -214,6 +221,13 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, envErr)
 		return
 	}
+	// Ownership is only fully decided once the discovered database resolves in
+	// this deployment's registry: config discovery alone can pass on a repo with
+	// no schema-dir allowlist even when the database belongs to another
+	// deployment, and acknowledging there would promise work a fan-out silent
+	// skip never does. The registry lookups above are in-memory, so the
+	// acknowledgment is still immediate.
+	h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
 	configuredEnvironments = append([]string(nil), configuredEnvironments...)
 	allowedEnvironments := append([]string(nil), h.service.Config().AllowedEnvironments...)
 
@@ -318,7 +332,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 		// Roll up every deployment's diff against the reviewed plan so drift on a
 		// non-primary deployment fails the check closed at review time.
-		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, repo, pr)
+		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
 
 		// Store per-database check record per environment
 		var recoveredApplyOwnedCheckState bool

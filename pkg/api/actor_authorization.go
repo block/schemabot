@@ -139,3 +139,40 @@ func validateGitHubUsers(field string, users []string) error {
 	}
 	return nil
 }
+
+// PRCommandAuthorizedPrincipals returns the GitHub principals (teams as
+// "org/team", plain user logins) allowed to run mutating PR commands for
+// database via repo, in the order the authorizer consults them: the
+// deployment-wide admin teams/users, the repository's admin teams/users, then
+// the database's operator teams/users. Rejection comments surface this list so
+// a blocked user knows who to ask instead of guessing.
+func (c *ServerConfig) PRCommandAuthorizedPrincipals(repo, database string) []string {
+	if c == nil {
+		return nil
+	}
+	var principals []string
+	seen := map[string]bool{}
+	add := func(items []string) {
+		for _, item := range items {
+			// GitHub logins and team slugs are case-insensitive, and operators
+			// sometimes configure them with a leading "@" — normalize both so
+			// the rendered list never repeats one principal in two spellings.
+			display := strings.TrimPrefix(strings.TrimSpace(item), "@")
+			if display == "" || seen[strings.ToLower(display)] {
+				continue
+			}
+			seen[strings.ToLower(display)] = true
+			principals = append(principals, display)
+		}
+	}
+	add(c.PRCommandAuthorization.AdminTeams)
+	add(c.PRCommandAuthorization.AdminUsers)
+	repoAdminTeams, repoAdminUsers := c.RepoAdmins(repo)
+	add(repoAdminTeams)
+	add(repoAdminUsers)
+	if db, ok := c.Databases[database]; ok {
+		add(db.OperatorTeams)
+		add(db.OperatorUsers)
+	}
+	return principals
+}

@@ -235,3 +235,64 @@ func TestServerConfigValidatePRCommandAuthorization(t *testing.T) {
 		})
 	}
 }
+
+// The authorized-principal list for a database is the deployment-wide admin
+// teams and users plus the database's own operators, deduplicated in that
+// order — the set surfaced on command-rejection comments.
+func TestPRCommandAuthorizedPrincipals(t *testing.T) {
+	cfg := &ServerConfig{
+		PRCommandAuthorization: PRCommandAuthorizationConfig{
+			Enabled:    true,
+			AdminTeams: []string{"octocat/db-admins"},
+			AdminUsers: []string{"kara"},
+		},
+		Repos: map[string]RepoConfig{
+			"octocat/hello-world": {
+				AdminTeams: []string{"octocat/repo-admins", "octocat/db-admins"},
+				AdminUsers: []string{"mona"},
+			},
+		},
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				OperatorTeams: []string{"octocat/orders-operators", "octocat/db-admins"},
+				OperatorUsers: []string{"kara", "lee"},
+			},
+		},
+	}
+
+	assert.Equal(t,
+		[]string{"octocat/db-admins", "kara", "octocat/repo-admins", "mona", "octocat/orders-operators", "lee"},
+		cfg.PRCommandAuthorizedPrincipals("octocat/hello-world", "orders"),
+		"deployment admins, then repo admins, then the database's operators, deduplicated across all three")
+
+	assert.Equal(t,
+		[]string{"octocat/db-admins", "kara", "octocat/orders-operators", "lee"},
+		cfg.PRCommandAuthorizedPrincipals("octocat/other-repo", "orders"),
+		"a repo with no config entry contributes no repo admins")
+
+	assert.Equal(t,
+		[]string{"octocat/db-admins", "kara", "octocat/repo-admins", "mona"},
+		cfg.PRCommandAuthorizedPrincipals("octocat/hello-world", "unknown"),
+		"an unknown database still lists the deployment and repo admins")
+
+	normalized := &ServerConfig{
+		PRCommandAuthorization: PRCommandAuthorizationConfig{
+			Enabled:    true,
+			AdminTeams: []string{"@octocat/db-admins"},
+			AdminUsers: []string{"Kara"},
+		},
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				OperatorTeams: []string{"octocat/DB-Admins"},
+				OperatorUsers: []string{"kara", " lee "},
+			},
+		},
+	}
+	assert.Equal(t,
+		[]string{"octocat/db-admins", "Kara", "lee"},
+		normalized.PRCommandAuthorizedPrincipals("octocat/hello-world", "orders"),
+		"leading @, surrounding whitespace, and case variants collapse to one entry per principal")
+
+	var nilCfg *ServerConfig
+	assert.Nil(t, nilCfg.PRCommandAuthorizedPrincipals("octocat/hello-world", "orders"))
+}

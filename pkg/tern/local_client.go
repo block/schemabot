@@ -148,9 +148,10 @@ type LocalConfig struct {
 	// quarantine so DROP TABLE executes directly).
 	Metadata map[string]string
 
-	// WakeOperator notifies the owner loop after an external control request is
-	// recorded. The callback must not execute control actions itself; it only
-	// nudges the storage-claiming operator to process durable intent promptly.
+	// WakeOperator notifies the owner loop after durable work is recorded — a
+	// queued apply from a dispatch, or an external control request. The callback
+	// must not execute the work itself; it only nudges the storage-claiming
+	// operator to pick it up promptly instead of waiting out the poll interval.
 	WakeOperator func(applyIdentifier, database, environment string)
 
 	// EngineFactories supplies engine implementations for database types this
@@ -196,7 +197,9 @@ type LocalClient struct {
 	observers  map[int64]ProgressObserver // keyed by apply ID
 
 	// pendingObserver is consumed by the next direct Apply() call and registered
-	// before Spirit starts.
+	// under the created apply's ID before the operator picks the apply up; the
+	// operator drives through this same client instance, so the drive finds the
+	// observer in the registry.
 	// Protected by observerMu.
 	pendingObserver ProgressObserver
 }
@@ -271,9 +274,31 @@ func (c *LocalClient) IsRemote() bool { return false }
 // Endpoint returns the database name for this local client.
 func (c *LocalClient) Endpoint() string { return c.config.Database }
 
-func (c *LocalClient) wakeOperatorForControlRequest(apply *storage.Apply) {
+// wakeOperator nudges the storage-claiming operator to pick up a durable
+// control request recorded for the apply promptly instead of waiting out the
+// poll interval. A skipped control-request wake only delays processing — the
+// request is serviced when the operator next claims the (already claimable)
+// apply — so the skip is expected in library and test use and logged at Debug.
+// Queued applies use wakeOperatorForQueuedApply, whose skip can strand work.
+func (c *LocalClient) wakeOperator(apply *storage.Apply) {
 	if c.config.WakeOperator == nil {
-		c.logger.Debug("operator wake skipped because no wake callback is configured",
+		c.logger.Debug("operator wake skipped because no wake callback is configured; the control request will be processed when an operator next claims this apply",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment)
+		return
+	}
+	c.config.WakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+}
+
+// wakeOperatorForQueuedApply nudges the operator to claim a newly queued apply.
+// Unlike a control-request wake, a skipped wake here is not benign: every drive
+// runs under an operator claim, so a queued apply makes no progress until an
+// operator polling this storage claims it — and in an embedding that runs no
+// operator at all, it will never be driven.
+func (c *LocalClient) wakeOperatorForQueuedApply(apply *storage.Apply) {
+	if c.config.WakeOperator == nil {
+		c.logger.Warn("operator wake skipped because no wake callback is configured; the queued apply will not be driven until an operator polling this storage claims it",
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
 			"environment", apply.Environment)
@@ -1834,20 +1859,15 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		caller = options["caller"]
 	}
 
-	deferCutover := options["defer_cutover"] == "true"
-	allowUnsafe := options["allow_unsafe"] == "true"
-
-	// Build typed ApplyOptions for storage (booleans, not strings).
-	// Revert window is ON by default — only disabled when skip_revert is explicitly set.
-	skipRevert := options["skip_revert"] == "true"
-	deferDeploy := options["defer_deploy"] == "true"
-	applyOpts := storage.ApplyOptions{
-		DeferCutover: deferCutover,
-		DeferDeploy:  deferDeploy,
-		AllowUnsafe:  allowUnsafe,
-		SkipRevert:   skipRevert,
-		Target:       plan.Target,
-	}
+	// Build typed ApplyOptions for storage from the full wire option map, so
+	// every engine-relevant option the dispatch carried (branch, volume,
+	// rollback, ...) survives the round trip into the stored apply — the queued
+	// operator drive re-derives its options from the stored apply, not from this
+	// request. Revert window is ON by default — only disabled when skip_revert
+	// is explicitly set. The plan's validated target is authoritative over any
+	// target string the request carried.
+	applyOpts := storage.ApplyOptionsFromMap(options)
+	applyOpts.Target = plan.Target
 	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, ddlChanges, applyOpts); err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
@@ -1958,13 +1978,18 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	}
 	apply.ID = applyID
 
-	// Log apply started
+	// Record the queue event in the apply's durable log; the drive itself starts
+	// when an operator claims the apply, which the timeline records separately.
 	c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
-		fmt.Sprintf("Apply started: %s", applyIdentifier), "", state.Apply.Pending)
+		fmt.Sprintf("Apply queued: %s", applyIdentifier), "", state.Apply.Pending)
 
-	// Direct client calls can still register a pending observer before starting
-	// the engine. API-created applies use the service-level observer registry
-	// because operator drivers dispatch them asynchronously.
+	// Register any pending observer under the created apply's ID before queueing.
+	// The observer registry is per-client-instance: in-process dispatchers — the
+	// only callers that set a pending observer — resolve this client from the
+	// same client cache (service client map or target router) the operator's
+	// drive resolves it from, so the drive finds the observer regardless of when
+	// the claim happens. Wire dispatches never set a pending observer, so a
+	// data-plane operator driving through its own client has no observer to lose.
 	if obs := c.consumePendingObserver(); obs != nil {
 		// Set the apply ID on the observer if it supports it (e.g., CommentObserver
 		// needs the ID to look up tracked comments for editing).
@@ -1973,15 +1998,22 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			setter.SetApplyID(apply.ID)
 		}
 		c.SetObserver(apply.ID, obs)
+		// The apply became claimable when the create transaction committed, so a
+		// poll-tick claim can start — and even finish — the drive before the
+		// registration above. A still-running drive finds the observer on its next
+		// progress event; one that already settled will not, so deliver the missed
+		// terminal notification here in that case.
+		c.deliverTerminalIfSettled(ctx, apply.ID)
 	}
 
-	// Start apply in background with cancellable context (Stop() cancels this)
-	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
-	cancelGeneration := c.setApplyCancel(cancelApply)
-	// A fresh dispatch (including a remote gRPC drive) has no operation context,
-	// so it never auto-parks at the cutover barrier; ordered-cutover parking is
-	// driven by the operator's operation-scoped resume path.
-	c.startApplyExecution(applyCtx, cancelGeneration, cancelApply, apply, tasks, plan, options, false)
+	// The apply is queued, not driven here: every drive — the initial dispatch
+	// included — runs under an operator claim, so lease-guarded writes (per-shard
+	// progress write-through, operation state) always hold the capability they
+	// require. The operator's pending-claim picks the apply up; the wake makes
+	// that prompt instead of waiting out the poll interval.
+	c.logger.Info("Apply: queued for operator drive",
+		append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier)...)
+	c.wakeOperatorForQueuedApply(apply)
 
 	return &ternv1.ApplyResponse{
 		Accepted:         true,

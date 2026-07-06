@@ -2011,6 +2011,21 @@ func (s *Service) executeRevertForApply(ctx context.Context, client tern.Client,
 		return nil, 0, fmt.Errorf("control request store is not available")
 	}
 
+	// Revert and skip-revert are mutually exclusive intents: one undoes the
+	// change, the other makes it permanent. Reject the contradiction up front
+	// instead of recording both and leaving the drive to pick a winner by
+	// ordering. The check is advisory — under a concurrent race the drive's
+	// ordering remains authoritative — but it catches the common sequential case.
+	skipRevertPending, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationSkipRevert)
+	if err != nil {
+		metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, 0, fmt.Errorf("check pending skip-revert control request before revert for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if skipRevertPending != nil {
+		metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, controlConflictf("skip-revert is already pending for this schema change; the revert window is being closed and the change will become permanent")
+	}
+
 	// Record durable revert intent before the engine call, so a comment-driven
 	// revert survives the API process dying before the call lands, and so the
 	// apply owner (the data-plane operator for a remote apply, not the webhook
@@ -2120,6 +2135,21 @@ func (s *Service) executeSkipRevertForApply(ctx context.Context, client tern.Cli
 	if controlStore == nil {
 		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "error")
 		return nil, 0, fmt.Errorf("control request store is not available")
+	}
+
+	// Skip-revert and revert are mutually exclusive intents: one makes the
+	// change permanent, the other undoes it. Reject the contradiction up front
+	// instead of recording both and leaving the drive to pick a winner by
+	// ordering. The check is advisory — under a concurrent race the drive's
+	// ordering remains authoritative — but it catches the common sequential case.
+	revertPending, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationRevert)
+	if err != nil {
+		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, 0, fmt.Errorf("check pending revert control request before skip-revert for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if revertPending != nil {
+		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, controlConflictf("revert is already pending for this schema change; it is being undone")
 	}
 
 	// Record durable skip-revert intent before the engine call, so a

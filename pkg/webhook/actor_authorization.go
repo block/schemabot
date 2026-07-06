@@ -99,10 +99,11 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 			"command", commandName, "requested_by", requestedBy,
 			"reason", result.Reason)
 		h.postComment(repo, pr, installationID, templates.RenderPRCommandNotAuthorized(templates.ActorAuthorizationCommentData{
-			RequestedBy: requestedBy,
-			CommandName: commandName,
-			Database:    database,
-			Environment: environment,
+			RequestedBy:          requestedBy,
+			CommandName:          commandName,
+			Database:             database,
+			Environment:          environment,
+			AuthorizedPrincipals: h.service.Config().PRCommandAuthorizedPrincipals(repo, database),
 		}))
 		return true
 	}

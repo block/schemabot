@@ -483,8 +483,12 @@ const (
 	// completed, and successful — it does not block the aggregate.
 	LeaderParticipantGateSuccess = "success"
 	// LeaderParticipantGateFailure: the participant's Check Run completed with a
-	// non-success conclusion — the aggregate fails.
+	// failing conclusion — the aggregate fails.
 	LeaderParticipantGateFailure = "failure"
+	// LeaderParticipantGatePending: the participant's Check Run completed with
+	// action_required — the participant has pending work (typically an apply
+	// awaiting an operator) and the aggregate blocks as pending.
+	LeaderParticipantGatePending = "pending"
 	// LeaderParticipantGateInProgress: the participant's Check Run is not yet
 	// terminal — the aggregate stays in progress.
 	LeaderParticipantGateInProgress = "in_progress"
@@ -1125,17 +1129,20 @@ var knownStatusCheckOperations = map[string]bool{
 	"aggregate_participant_skip":           true,
 	"aggregate_participant_fanout":         true,
 	"participant_comment_nudge":            true,
+	"participant_refold":                   true,
 	"merge_group_check":                    true,
 	"default_branch_check":                 true,
 }
 
 var knownStatusCheckStatuses = map[string]bool{
-	"success": true,
-	"error":   true,
-	"skipped": true,
-	"stale":   true,
-	"noop":    true,
-	"blocked": true,
+	"success":   true,
+	"error":     true,
+	"skipped":   true,
+	"stale":     true,
+	"noop":      true,
+	"blocked":   true,
+	"scheduled": true,
+	"exhausted": true,
 }
 
 // StatusCheckOperation describes one status-check storage or GitHub operation.

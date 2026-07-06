@@ -581,11 +581,12 @@ func TestWebhookIgnoresSchemaBotProse(t *testing.T) {
 	}
 }
 
-func TestWebhookEyesReaction(t *testing.T) {
+// On a repo with no aggregate role this deployment is the only SchemaBot, so
+// the acknowledgment fires at dispatch — the user sees the eyes reaction
+// immediately, before schema discovery runs.
+func TestWebhookEyesReactionAtDispatchForSingleDeploymentRepo(t *testing.T) {
 	h, _, reactions := newTestHandler(t)
 
-	// Use an env-scoped command that reaches the reaction point (after all
-	// skip/filter checks). Help returns before the reaction fires.
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
 		isPR:    true,
@@ -600,7 +601,64 @@ func TestWebhookEyesReaction(t *testing.T) {
 	case reaction := <-reactions:
 		assert.Equal(t, "eyes", reaction)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for eyes reaction")
+		t.Fatal("timed out waiting for the dispatch acknowledgment reaction")
+	}
+}
+
+// A bare "schemabot plan" (no -e) fans out to every configured environment,
+// but the acknowledgment contract is the same as its scoped siblings: on a
+// repo with no aggregate role this deployment is the only SchemaBot, so the
+// eyes reaction fires at dispatch, before any discovery runs.
+func TestWebhookEyesReactionAtDispatchForBareMultiEnvPlan(t *testing.T) {
+	h, _, reactions := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the bare-plan dispatch acknowledgment")
+	}
+}
+
+// A -t-scoped command names its actor, so the addressed tenant acknowledges
+// at dispatch — instantly, before any schema discovery — even on an
+// aggregate-role repo.
+func TestWebhookEyesReactionAtDispatchForTenantScopedCommand(t *testing.T) {
+	h, _, reactions := newTestHandler(t)
+	cfg := h.service.Config()
+	cfg.Tenant = "tenant-b"
+	repoCfg := cfg.Repos["octocat/hello-world"]
+	repoCfg.Aggregate = &api.AggregateConfig{Role: api.AggregateRoleParticipant}
+	if cfg.Repos == nil {
+		cfg.Repos = map[string]api.RepoConfig{}
+	}
+	cfg.Repos["octocat/hello-world"] = repoCfg
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging -t tenant-b",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the scoped-command dispatch acknowledgment")
 	}
 }
 

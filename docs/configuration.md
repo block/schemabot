@@ -274,6 +274,8 @@ Increase `drivers` when one SchemaBot server should make operator progress acros
 
 A driver claim means selecting one stale apply and refreshing its heartbeat in the same storage transaction. That heartbeat refresh is the driver's lease while it reloads state and drives the apply to a terminal state.
 
+**Sizing:** each driver drives one claimed apply synchronously to a terminal state, and that includes waiting states such as deferred cutovers and revert windows, so a server's effective apply concurrency is `drivers × replicas`. Size that product to the number of applies you expect to be in flight at once, counting parked ones — a deferred cutover holds its driver for the full wait. A control plane that dispatches to remote servers bounds end-to-end concurrency with its own driver pool the same way.
+
 ## Pending Drops
 
 For MySQL databases executed by the Spirit engine, `DROP TABLE` statements are

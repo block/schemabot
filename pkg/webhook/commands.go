@@ -125,7 +125,7 @@ func NewCommandParser() *CommandParser {
 		mentionRegex:      regexp.MustCompile(`(?im)^ {0,3}schemabot(?:[ \t]+|$)`),
 		helpRegex:         regexp.MustCompile(`(?im)^ {0,3}schemabot[ \t]+help\b`),
 		applyIDRegex:      regexp.MustCompile(`(?i)\b(apply[_-][a-f0-9]+)\b`),
-		environmentRegex:  regexp.MustCompile(`(?i)-e\s+(staging|production)`),
+		environmentRegex:  regexp.MustCompile(`(?i)-e\s+([a-z0-9][a-z0-9_-]*)`),
 		databaseRegex:     regexp.MustCompile(`(?i)-d\s+([a-zA-Z0-9_-]+)`),
 		tenantRegex:       regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`),
 		tenantFlagRegex:   regexp.MustCompile(`(?i)(?:^|\s)(?:--tenant|-t)(?:[ \t]+([^\s]+))?`),
@@ -139,7 +139,11 @@ func NewCommandParser() *CommandParser {
 
 // CommandResult represents the result of parsing a command.
 type CommandResult struct {
-	Action       string
+	Action string
+	// CommentID is the PR comment that carried this command. Handlers
+	// acknowledge it with a reaction once they commit to acting, so on a
+	// fan-out only the deployments actually doing work acknowledge.
+	CommentID    int64
 	ApplyID      string // Positional apply identifier for apply-scoped commands.
 	Environment  string
 	Database     string // Optional -d flag value

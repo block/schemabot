@@ -4,7 +4,6 @@ package integration
 
 import (
 	"bytes"
-	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -922,7 +921,7 @@ func startSchemaBotLocal(t *testing.T) string {
 	server := &http.Server{Handler: mux}
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) //nolint:usetesting // runs after test context cancelled
+		ctx, cancel := testutil.CleanupContext(5 * time.Second)
 		defer cancel()
 		_ = server.Shutdown(ctx)
 	})
@@ -952,7 +951,9 @@ func startSchemaBotLocalDB(t *testing.T, dbName string) string {
 	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db connection")
 	t.Cleanup(func() {
-		_, _ = targetDB.ExecContext(context.Background(), "DROP DATABASE IF EXISTS "+dbName) //nolint:usetesting // runs after test context cancelled
+		ctx, cancel := testutil.CleanupContext(30 * time.Second)
+		defer cancel()
+		_, _ = targetDB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+dbName)
 		_ = targetDB.Close()
 	})
 
@@ -1004,7 +1005,7 @@ func startSchemaBotLocalDB(t *testing.T, dbName string) string {
 	server := &http.Server{Handler: mux}
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) //nolint:usetesting // runs after test context cancelled
+		ctx, cancel := testutil.CleanupContext(5 * time.Second)
 		defer cancel()
 		_ = server.Shutdown(ctx)
 	})
@@ -1071,7 +1072,7 @@ func startSchemaBotWithGRPC(t *testing.T) string {
 	server := &http.Server{Handler: mux}
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) //nolint:usetesting // runs after test context cancelled
+		ctx, cancel := testutil.CleanupContext(5 * time.Second)
 		defer cancel()
 		_ = server.Shutdown(ctx)
 	})

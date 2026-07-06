@@ -224,7 +224,7 @@ func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Ap
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Cutover request queued for apply owner%s", callerApplyLogSuffix(requestedBy)), "", "")
 	}
-	c.wakeOperatorForControlRequest(apply)
+	c.wakeOperator(apply)
 	return &ternv1.CutoverResponse{Accepted: true}, nil
 }
 
@@ -399,7 +399,7 @@ func (c *LocalClient) requestCancel(ctx context.Context, req *ternv1.CancelReque
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Cancel request queued for apply owner%s", callerApplyLogSuffix(requestedBy)), "", "")
 	}
-	c.wakeOperatorForControlRequest(apply)
+	c.wakeOperator(apply)
 	return &ternv1.CancelResponse{Accepted: true}, nil
 }
 
@@ -458,7 +458,7 @@ func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, 
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Stop request queued for apply owner%s", callerApplyLogSuffix(requestedBy)), "", "")
 	}
-	c.wakeOperatorForControlRequest(apply)
+	c.wakeOperator(apply)
 	return &ternv1.StopResponse{Accepted: true}, nil
 }
 
@@ -551,7 +551,17 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 	}
 
 	if stoppedCount == 0 && skippedCount == 0 {
-		return nil, fmt.Errorf("no active schema change")
+		// No apply was resolved and the database has no targetable tasks: there
+		// is genuinely nothing to stop.
+		if targetApply == nil {
+			return nil, fmt.Errorf("no active schema change")
+		}
+		// A resolved apply with no targetable tasks is the task-less shape (a
+		// queued apply stopped before its first drive created tasks). The apply
+		// row itself is still active work, so settle it directly — erroring here
+		// would leave the durable stop request pending and the apply re-claimed
+		// on every operator poll forever.
+		return c.settleStopForTasklessApply(ctx, targetApply, caller)
 	}
 
 	// Edge case: stop was requested but every targeted task is already
@@ -627,7 +637,18 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 			eventMsg, "", "")
 	}
 	if cancelledCount == 0 && skippedCount == 0 {
-		return nil, fmt.Errorf("no active schema change")
+		// No apply was resolved and the database has no targetable tasks: there
+		// is genuinely nothing to cancel.
+		if targetApply == nil {
+			return nil, fmt.Errorf("no active schema change")
+		}
+		// A resolved apply with no targetable tasks is the task-less shape (a
+		// queued apply cancelled before its first drive created tasks, or a
+		// VSchema-only apply that never has any). The apply row itself is still
+		// active work, so settle it directly — erroring here would leave the
+		// durable cancel request pending and the apply re-claimed on every
+		// operator poll forever.
+		return c.settleCancelForTasklessApply(ctx, targetApply, caller)
 	}
 	if cancelledCount == 0 && skippedCount > 0 && applyID > 0 {
 		if targetApply != nil && state.IsState(targetApply.State, state.Apply.Cancelled) {
@@ -642,6 +663,188 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		CancelledCount: cancelledCount,
 		SkippedCount:   skippedCount,
 	}, nil
+}
+
+// resolveTasklessApplyForSettle reloads a control-targeted apply and confirms
+// it truly owns no tasks, so a stop or cancel that found no task work can
+// settle the apply row directly. A queued apply claimed before its first drive
+// (and a VSchema-only apply, which never has tasks) is exactly this shape: the
+// apply is active work with nothing for the engine or task paths to act on.
+// Returns the freshly loaded apply. Fails closed — settling would abandon live
+// work — when the apply cannot be reloaded or when it does own tasks that this
+// client's database-scoped task read could not see.
+func (c *LocalClient) resolveTasklessApplyForSettle(ctx context.Context, targetApply *storage.Apply, operation string) (*storage.Apply, error) {
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, targetApply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load tasks for apply %s before task-less %s settle: %w", targetApply.ApplyIdentifier, operation, err)
+	}
+	if len(tasks) > 0 {
+		c.logger.Warn(operation+" found no targetable tasks in this client's database scope, but the apply owns tasks; failing closed rather than settling over unseen task work",
+			append(targetApply.LogAttrs(), "task_count", len(tasks), "client_database", c.config.Database)...)
+		return nil, fmt.Errorf("%s cannot settle apply %s: its %d tasks are outside this client's database scope (%s)",
+			operation, targetApply.ApplyIdentifier, len(tasks), c.config.Database)
+	}
+	apply, err := c.storage.Applies().Get(ctx, targetApply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("reload apply %s before task-less %s settle: %w", targetApply.ApplyIdentifier, operation, err)
+	}
+	if apply == nil {
+		return nil, fmt.Errorf("reload apply %s before task-less %s settle: %w", targetApply.ApplyIdentifier, operation, storage.ErrApplyNotFound)
+	}
+	return apply, nil
+}
+
+// settleCancelForTasklessApply terminalizes a cancel whose resolved apply owns
+// no tasks. There is no task or engine work to cancel, but the apply row itself
+// is still active work: it settles to cancelled through the existing
+// markApplyCancelled path so the durable cancel request completes, the terminal
+// observer is notified, and the operator never re-claims the apply — mirroring
+// what the tasked cancel path does after markTasksWithState. Terminal states
+// are never rewritten: an already-cancelled apply is accepted idempotently, and
+// a completed/failed/reverted apply keeps its outcome (only a stopped apply,
+// which cancel may still terminate, is moved to cancelled). The apply's
+// dual-written apply_operations rows settle to cancelled alongside it, so
+// operation-level claiming never sees a live operation under a cancelled apply.
+func (c *LocalClient) settleCancelForTasklessApply(ctx context.Context, targetApply *storage.Apply, caller string) (*ternv1.CancelResponse, error) {
+	apply, err := c.resolveTasklessApplyForSettle(ctx, targetApply, "cancel")
+	if err != nil {
+		return nil, err
+	}
+	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
+		c.logger.Info("cancel found task-less apply already terminal; accepting without a state change",
+			append(apply.LogAttrs(), "requested_by", caller)...)
+		return &ternv1.CancelResponse{Accepted: true}, nil
+	}
+	previousState := apply.State
+	if err := c.markApplyCancelled(ctx, apply.ID); err != nil {
+		return nil, err
+	}
+	eventMsg := "Cancel requested: task-less apply cancelled before any task work started"
+	if caller != "" {
+		eventMsg += callerApplyLogSuffix(caller)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
+		eventMsg, previousState, state.Apply.Cancelled)
+	now := time.Now()
+	apply.State = state.Apply.Cancelled
+	apply.CompletedAt = &now
+	apply.UpdatedAt = now
+	c.logger.Info("cancel settled task-less apply as cancelled",
+		append(apply.LogAttrs(), "previous_state", previousState, "requested_by", caller)...)
+	c.settleOperationRowsForTasklessApply(ctx, apply, state.ApplyOperation.Cancelled)
+	c.notifyTerminalObserver(apply, nil)
+	return &ternv1.CancelResponse{Accepted: true}, nil
+}
+
+// settleOperationRowsForTasklessApply moves the settled apply's dual-written
+// apply_operations rows to the apply's settled state so the operation rows
+// agree with the apply row the task-less settle just wrote. The settle runs
+// inside a claimed drive, so the lease in ctx guards each write and a lost
+// claim fails closed in storage. A load or write failure is logged, never
+// returned: the apply-level settle is the authoritative outcome, and the next
+// operation claim's terminal-parent reconciliation settles any row this pass
+// could not move.
+func (c *LocalClient) settleOperationRowsForTasklessApply(ctx context.Context, apply *storage.Apply, operationState string) {
+	ops, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		c.logger.Error("task-less settle could not load operation rows; the apply is settled and the next operation claim will reconcile them",
+			append(apply.LogAttrs(), "target_operation_state", operationState, "error", err)...)
+		return
+	}
+	for _, op := range ops {
+		if !operationRowSettlesWithTasklessApply(op.State, operationState) {
+			c.logger.Info("task-less settle leaving terminal operation row unchanged",
+				append(apply.LogAttrs(),
+					"apply_operation_id", op.ID,
+					"operation_deployment", op.Deployment,
+					"operation_state", op.State,
+					"target_operation_state", operationState)...)
+			continue
+		}
+		var writeErr error
+		if state.IsState(operationState, state.ApplyOperation.Stopped) {
+			// stopped is resumable: mirror the state but keep completed_at nil,
+			// matching the apply-level convention.
+			writeErr = c.storage.ApplyOperations().UpdateState(ctx, op.ID, operationState)
+		} else {
+			writeErr = c.storage.ApplyOperations().MarkTerminal(ctx, op.ID, operationState)
+		}
+		if writeErr != nil {
+			c.logger.Error("task-less settle could not move operation row to the apply's settled state; the next operation claim will reconcile it",
+				append(apply.LogAttrs(),
+					"apply_operation_id", op.ID,
+					"operation_deployment", op.Deployment,
+					"operation_state", op.State,
+					"target_operation_state", operationState,
+					"error", writeErr)...)
+			continue
+		}
+		c.logger.Info("task-less settle moved operation row to the apply's settled state",
+			append(apply.LogAttrs(),
+				"apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment,
+				"previous_operation_state", op.State,
+				"operation_state", operationState)...)
+	}
+}
+
+// operationRowSettlesWithTasklessApply reports whether a task-less settle may
+// move an operation row from its current state to the apply's settled state.
+// It mirrors the apply-level settle's terminal discipline: a terminal row keeps
+// its outcome, except that a cancel settle still terminalizes a stopped row —
+// stopped is the one terminal state cancel may move, exactly as the apply-level
+// cancel settle moves a stopped apply to cancelled.
+func operationRowSettlesWithTasklessApply(currentState, settledState string) bool {
+	if !state.IsApplyOperationTerminal(currentState) {
+		return true
+	}
+	return state.IsState(settledState, state.ApplyOperation.Cancelled) &&
+		state.IsState(currentState, state.ApplyOperation.Stopped)
+}
+
+// settleStopForTasklessApply terminalizes a stop whose resolved apply owns no
+// tasks. There is no task or engine work to stop, but the apply row itself is
+// still active work: it settles to stopped through the existing
+// markApplyStopped path so the durable stop request completes, the terminal
+// observer is notified, and the operator never re-claims the apply — mirroring
+// what the tasked stop path does after markTasksWithState. The apply settles to
+// stopped (not cancelled): stop is the resumable operator verb, and a stopped
+// task-less apply stays eligible for a later cancel. Terminal states are never
+// rewritten: an already-terminal apply (stopped included) is accepted without a
+// state change so the pending stop request resolves. The apply's dual-written
+// apply_operations rows settle to stopped alongside it, keeping the resumable
+// operation rows consistent with the stopped apply.
+func (c *LocalClient) settleStopForTasklessApply(ctx context.Context, targetApply *storage.Apply, caller string) (*ternv1.StopResponse, error) {
+	apply, err := c.resolveTasklessApplyForSettle(ctx, targetApply, "stop")
+	if err != nil {
+		return nil, err
+	}
+	if state.IsTerminalApplyState(apply.State) {
+		c.logger.Info("stop found task-less apply already terminal; accepting without a state change",
+			append(apply.LogAttrs(), "requested_by", caller)...)
+		return &ternv1.StopResponse{
+			Accepted:     true,
+			ErrorMessage: fmt.Sprintf("Schema change already %s", apply.State),
+		}, nil
+	}
+	previousState := apply.State
+	if err := c.markApplyStopped(ctx, apply.ID); err != nil {
+		return nil, err
+	}
+	eventMsg := "Stop requested: task-less apply stopped before any task work started"
+	if caller != "" {
+		eventMsg += callerApplyLogSuffix(caller)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+		eventMsg, previousState, state.Apply.Stopped)
+	apply.State = state.Apply.Stopped
+	apply.CompletedAt = nil
+	apply.UpdatedAt = time.Now()
+	c.logger.Info("stop settled task-less apply as stopped",
+		append(apply.LogAttrs(), "previous_state", previousState, "requested_by", caller)...)
+	c.settleOperationRowsForTasklessApply(ctx, apply, state.ApplyOperation.Stopped)
+	c.notifyTerminalObserver(apply, nil)
+	return &ternv1.StopResponse{Accepted: true}, nil
 }
 
 // stopHandledUnlessStartPending reports a completed stop as handled unless a

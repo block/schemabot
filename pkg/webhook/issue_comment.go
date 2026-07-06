@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -97,6 +98,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	// Parse command
 	parser := NewCommandParser()
 	result := parser.ParseCommand(payload.Comment.Body)
+	result.CommentID = payload.Comment.ID
 
 	if !result.IsMention {
 		h.writeJSON(w, http.StatusOK, map[string]string{
@@ -175,10 +177,17 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	// Handle missing -e flag
 	if result.MissingEnv {
 		if result.Action == action.Plan {
-			// Plan without -e: run for all configured environments
+			// Plan without -e: run for all configured environments. The same
+			// acknowledgment split as scoped commands applies: repos without an
+			// aggregate role and -t-scoped plans acknowledge at dispatch, while
+			// an unscoped plan on an aggregate-role repo acknowledges at the
+			// handler's act-point once discovery resolves owned schema.
 			h.logger.Info("plan without -e flag", "repo", repo, "pr", pr)
+			if h.service == nil || h.service.Config().AggregateRoleForRepo(repo) == "" || result.Tenant != "" {
+				h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
+			}
 			h.goSafe(repo, pr, installationID, func() {
-				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, true)
+				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, true, result.CommentID)
 			})
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "multi-env plan started"})
 			return
@@ -238,24 +247,6 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
-	// Add acknowledgment reaction now that we know this instance will handle
-	// the command. Placed after all skip/filter checks so only the owning
-	// instance reacts — avoids duplicate reactions in multi-instance setups.
-	if payload.Comment.ID > 0 && h.ghClients.Len() > 0 {
-		h.goSafe(repo, pr, installationID, func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			client, err := h.clientForRepo(repo, installationID)
-			if err != nil {
-				h.logger.Error("failed to create GitHub client for reaction", "error", err)
-				return
-			}
-			if err := client.AddReactionToComment(ctx, repo, payload.Comment.ID, "eyes"); err != nil {
-				h.logger.Error("failed to add acknowledgment reaction", "error", err)
-			}
-		})
-	}
-
 	// Reject -y/--yes on commands that don't support it
 	if result.Action != action.Apply && parser.HasAutoConfirmFlag(payload.Comment.Body) {
 		h.postComment(repo, pr, installationID, templates.RenderUnsupportedAutoConfirm(result.Action))
@@ -275,6 +266,17 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
+	// Two cases are decidable at dispatch and acknowledge immediately: a repo
+	// with no aggregate role has exactly one SchemaBot (no ownership question),
+	// and a -t-scoped command names its actor (every non-addressed deployment
+	// was already filtered by the tenant gate above, so reaching this point
+	// scoped means this deployment is the addressee). Unscoped commands on
+	// aggregate-role repos defer to each handler's act-point, after the
+	// fan-out silent-skip gates, where ownership is actually known.
+	if h.service == nil || h.service.Config().AggregateRoleForRepo(repo) == "" || result.Tenant != "" {
+		h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
+	}
+
 	h.logger.Info("processing command",
 		"action", result.Action,
 		"environment", result.Environment,
@@ -284,7 +286,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 
 	switch result.Action {
 	case action.Plan:
-		h.handlePlanCommand(w, repo, pr, result.Environment, result.Database, result.Tenant, installationID, requestedBy)
+		h.handlePlanCommand(w, repo, pr, result.Environment, result.Database, result.Tenant, installationID, requestedBy, result.CommentID)
 	case action.Help:
 		h.postComment(repo, pr, installationID, templates.RenderHelpComment())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "help posted"})
@@ -531,6 +533,86 @@ func (h *Handler) postInitialProgressComment(ctx context.Context, repo string, p
 	}
 }
 
+// acknowledgeCommandActPoint adds the eyes reaction once a handler commits to
+// acting on an unscoped command on an aggregate-role repo — there, a fan-out
+// means "heard" and "acting" differ, so only the deployments actually doing
+// work acknowledge and an ignoring deployment leaves only its skip log. Repos
+// without an aggregate role and -t-scoped commands acknowledged at dispatch
+// already, so this is a no-op for them.
+func (h *Handler) acknowledgeCommandActPoint(repo string, pr int, installationID int64, result CommandResult) {
+	if result.Tenant != "" {
+		return
+	}
+	if h.service == nil || h.service.Config().AggregateRoleForRepo(repo) == "" {
+		return
+	}
+	h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
+}
+
+// acknowledgeCommandEarlyIfOwned acknowledges an unscoped command on an
+// aggregate-role repo as soon as ownership is decidable from config discovery
+// alone — the config file resolves to a database this deployment's registry
+// knows, under an allowed schema directory — without waiting for the schema
+// files to load, which on large schema directories dominates the latency
+// between the command and its acknowledgment. The probe is advisory: it mirrors
+// the source-policy predicates without their logs and metrics, the authoritative
+// checks still run in discovery immediately after, and any probe miss defers to
+// the handler's act-point acknowledgment. Returns whether it acknowledged.
+func (h *Handler) acknowledgeCommandEarlyIfOwned(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, databaseName, tenant string, installationID, commentID int64) bool {
+	if tenant != "" {
+		return false
+	}
+	config, ok := h.serverConfig()
+	if !ok || config.AggregateRoleForRepo(repo) == "" {
+		return false
+	}
+	var (
+		sbConfig  *ghclient.SchemabotConfig
+		configDir string
+		err       error
+	)
+	if databaseName != "" {
+		sbConfig, configDir, err = client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
+	} else {
+		sbConfig, configDir, err = client.FindConfigForPR(ctx, repo, pr)
+	}
+	if err != nil || sbConfig == nil {
+		h.logger.Debug("early ownership probe could not resolve a schema config; acknowledgment defers to the act-point",
+			"repo", repo, "pr", pr, "database", databaseName, "error", err)
+		return false
+	}
+	if config.RepoHasSchemaDirAllowlist(repo) && !config.SchemaPathAllowedForRepo(repo, configDir) {
+		return false
+	}
+	if config.Database(sbConfig.Database) == nil {
+		return false
+	}
+	h.acknowledgeCommand(repo, pr, installationID, commentID)
+	return true
+}
+
+// acknowledgeCommand adds the eyes reaction to the command comment,
+// signalling "this deployment is acting on your command".
+func (h *Handler) acknowledgeCommand(repo string, pr int, installationID, commentID int64) {
+	if commentID <= 0 || h.ghClients.Len() == 0 {
+		return
+	}
+	h.goSafe(repo, pr, installationID, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		client, err := h.clientForRepo(repo, installationID)
+		if err != nil {
+			h.logger.Error("failed to create GitHub client for command acknowledgment",
+				"repo", repo, "pr", pr, "error", err)
+			return
+		}
+		if err := client.AddReactionToComment(ctx, repo, commentID, "eyes"); err != nil {
+			h.logger.Error("failed to add command acknowledgment reaction",
+				"repo", repo, "pr", pr, "error", err)
+		}
+	})
+}
+
 func (h *Handler) renderPRComment(body string) string {
 	return appendSupportChannelFooter(body, h.supportChannel())
 }
@@ -579,5 +661,6 @@ func shouldShowSupportChannel(body string) bool {
 			return true
 		}
 	}
-	return strings.Contains(body, "⛔ Unsafe Changes Detected")
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "unsafe changes detected") || strings.Contains(lower, "unsafe change detected")
 }

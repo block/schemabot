@@ -36,14 +36,14 @@ import (
 // primaryPlan is the reviewed primary plan proto returned by
 // executePlanProtoWithTransientRetry, reused as the rollup baseline so the
 // comparison is against exactly what was reviewed.
-func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, primaryPlan *ternv1.PlanResponse, repo string, pr int) (reviewDriftOutcome, *templates.DeploymentDriftData) {
+func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, primaryPlan *ternv1.PlanResponse, primaryDeployment string, repo string, pr int) (reviewDriftOutcome, *templates.DeploymentDriftData) {
 	if len(primaryPlan.GetErrors()) > 0 {
 		h.logger.Debug("skipping review-time drift rollup: primary plan reported errors",
 			"repo", repo, "pr", pr, "database", planReq.Database, "environment", planReq.Environment)
 		return reviewDriftOutcome{state: driftNotEvaluated}, nil
 	}
 
-	rollup, err := h.service.RollupReviewTimeDrift(ctx, planReq, primaryPlan)
+	rollup, err := h.service.RollupReviewTimeDrift(ctx, planReq, primaryPlan, primaryDeployment)
 	if err != nil {
 		h.logger.Error("review-time drift rollup failed; the plan check will block the PR closed",
 			"repo", repo,

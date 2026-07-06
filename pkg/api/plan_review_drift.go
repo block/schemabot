@@ -16,14 +16,16 @@ import (
 // primaryPlan is the just-reviewed primary plan proto, reused as the rollup's
 // baseline so the comparison is against exactly what the user reviewed rather
 // than a fresh read of the primary's live schema (which could have drifted and
-// tripped a spurious primary-vs-primary mismatch).
+// tripped a spurious primary-vs-primary mismatch). primaryDeployment is the
+// deployment that plan was created against; the producer fails closed if it no
+// longer maps to rollout index 0 at rollup time.
 //
 // The expected deployment set is resolved independently from the producer's
 // results so the rollup can enforce that the diffs cover every configured
 // deployment in rollout order — a missing, extra, or reordered deployment fails
 // closed rather than being mistaken for agreement. The returned rollup is Clean
 // only when every deployment matches.
-func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse) (PlanRollup, error) {
+func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryDeployment string) (PlanRollup, error) {
 	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
 	if err != nil {
 		return PlanRollup{}, fmt.Errorf("resolve deployment targets for %s/%s: %w", req.Database, req.Environment, err)
@@ -33,7 +35,7 @@ func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, pr
 		expectedDeployments[i] = t.Deployment
 	}
 
-	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan)
+	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primaryDeployment)
 	if err != nil {
 		return PlanRollup{}, fmt.Errorf("plan deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
 	}

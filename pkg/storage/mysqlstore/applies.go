@@ -1131,11 +1131,19 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 	// Apply creation/update enforces at most one active apply per
 	// database/type/environment. The claim query only needs to find stale work;
 	// FOR UPDATE SKIP LOCKED prevents concurrent drivers from claiming the same row.
+	//
+	// The pending clause requires child rows so a half-created apply is never
+	// claimed. Creation dual-writes tasks and the apply_operations row in one
+	// transaction, so either proves the create committed fully; a VSchema-only
+	// apply carries an operation row but no tasks, so tasks alone would strand it.
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM applies a
 		WHERE (
-				(a.state = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id))
+				(a.state = ? AND (
+					EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id)
+					OR EXISTS (SELECT 1 FROM apply_operations ao WHERE ao.apply_id = a.id)
+				))
 				OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL 1 MINUTE)
 				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= NOW() - INTERVAL ? DAY)
 				OR (
@@ -1238,7 +1246,10 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 		FROM applies a
 		WHERE a.id = ?
 			AND (
-				(a.state = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id))
+				(a.state = ? AND (
+					EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id)
+					OR EXISTS (SELECT 1 FROM apply_operations ao WHERE ao.apply_id = a.id)
+				))
 				OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL 1 MINUTE)
 				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= NOW() - INTERVAL ? DAY)
 				OR (
