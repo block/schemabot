@@ -661,5 +661,6 @@ func shouldShowSupportChannel(body string) bool {
 			return true
 		}
 	}
-	return strings.Contains(body, "⛔ Unsafe Changes Detected")
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "unsafe changes detected") || strings.Contains(lower, "unsafe change detected")
 }

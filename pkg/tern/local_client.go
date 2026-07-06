@@ -1998,6 +1998,12 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			setter.SetApplyID(apply.ID)
 		}
 		c.SetObserver(apply.ID, obs)
+		// The apply became claimable when the create transaction committed, so a
+		// poll-tick claim can start — and even finish — the drive before the
+		// registration above. A still-running drive finds the observer on its next
+		// progress event; one that already settled will not, so deliver the missed
+		// terminal notification here in that case.
+		c.deliverTerminalIfSettled(ctx, apply.ID)
 	}
 
 	// The apply is queued, not driven here: every drive — the initial dispatch

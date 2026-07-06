@@ -437,6 +437,9 @@ schemabot apply -e staging
 
 ### Staging & Production
 
+<details>
+<summary>Show SQL (3 statements)</summary>
+
 ```sql
 CREATE TABLE `users` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -461,6 +464,8 @@ CREATE TABLE `orders` (
 
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+</details>
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -494,6 +499,9 @@ schemabot apply -e production
 
 ### Production
 
+<details>
+<summary>Show SQL (3 statements)</summary>
+
 ```sql
 CREATE TABLE `users` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -518,6 +526,8 @@ CREATE TABLE `orders` (
 
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+</details>
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -542,6 +552,9 @@ schemabot apply -e production
 
 ### Staging
 
+<details>
+<summary>Show SQL (3 statements)</summary>
+
 ```sql
 CREATE TABLE `users` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -566,6 +579,8 @@ CREATE TABLE `orders` (
 
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+</details>
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -600,6 +615,9 @@ schemabot plan -e production
 
 ### Staging & Production
 
+<details>
+<summary>Show SQL (3 statements)</summary>
+
 ```sql
 CREATE TABLE `users` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -624,6 +642,8 @@ CREATE TABLE `orders` (
 
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+</details>
 
 ⚠️ **Lint Warnings**:
 - [orders] Primary key uses signed integer type (should be UNSIGNED)
@@ -663,7 +683,7 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 
 ---
 
-**⛔ Unsafe Changes Detected:**
+**⛔ 1 Unsafe Change Detected:**
 - `customers`: Unsafe operation detected: DROP COLUMN `nickname`
 
 **Destructive drop guidance:**
@@ -695,7 +715,7 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 
 ---
 
-**⛔ Unsafe Changes Detected:**
+**⛔ 1 Unsafe Change Detected:**
 - `customers`: Unsafe operation detected: DROP INDEX `idx_customers_email`
 
 **Destructive drop guidance:**
@@ -6110,7 +6130,7 @@ ALTER TABLE `mutes`
     DROP COLUMN `legacy_reason`;
 ```
 
-**⛔ Unsafe Changes Detected:**
+⚠️ **Issues**: **1** unsafe change detected
 - `mutes` (shard `40-80`): DROP COLUMN removes data and is irreversible
 
 **Destructive drop guidance:**

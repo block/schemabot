@@ -1643,13 +1643,19 @@ func TestLocalClient_ResumeApplyOperationCutoverFailsClosedOnApplyMismatch(t *te
 
 	ownerApplyID, operationID := seedCutoverOperationWithTask(ctx, t, stor, state.ApplyOperation.WaitingForCutover)
 
-	// A different apply that does not own the operation.
+	// A different apply that does not own the operation. It targets this
+	// client's database ("testdb") so it passes the drive's database-scope
+	// guard and actually reaches the operation-ownership check under test,
+	// but on a sibling deployment so it doesn't collide with the owner's
+	// active apply on the "testdb" deployment. The foreign-scope path (an
+	// apply outside this client's database entirely) is covered by
+	// TestLocalClient_ResumeRefusesApplyOutsideDatabaseScope.
 	now := time.Now()
 	otherApply := &storage.Apply{
 		ApplyIdentifier: fmt.Sprintf("apply-cutover-other-%d", time.Now().UnixNano()),
-		Database:        "otherdb",
+		Database:        "testdb",
 		DatabaseType:    storage.DatabaseTypeMySQL,
-		Deployment:      "otherdb",
+		Deployment:      "testdb-sibling",
 		Engine:          storage.EngineSpirit,
 		State:           state.Apply.WaitingForCutover,
 		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{}),
