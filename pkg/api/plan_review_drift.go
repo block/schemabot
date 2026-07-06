@@ -20,11 +20,13 @@ import (
 // deployment that plan was created against; the producer fails closed if it no
 // longer maps to rollout index 0 at rollup time.
 //
-// The expected deployment set is resolved independently from the producer's
-// results so the rollup can enforce that the diffs cover every configured
-// deployment in rollout order — a missing, extra, or reordered deployment fails
-// closed rather than being mistaken for agreement. The returned rollup is Clean
-// only when every deployment matches.
+// The database/environment is resolved once here to the configured deployment
+// set in rollout order, then shared with the producer. The resolved order is
+// also passed to RollupDeploymentDiffs as the expected set so the rollup can
+// enforce that the producer returned one diff per deployment in that order — a
+// missing, extra, or reordered result fails closed rather than being mistaken
+// for agreement. The returned rollup is Clean only when every deployment
+// matches.
 func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryDeployment string) (PlanRollup, error) {
 	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
 	if err != nil {
@@ -35,7 +37,7 @@ func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, pr
 		expectedDeployments[i] = t.Deployment
 	}
 
-	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primaryDeployment)
+	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primaryDeployment, targets)
 	if err != nil {
 		return PlanRollup{}, fmt.Errorf("plan deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
 	}
