@@ -378,6 +378,11 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// open. Posted last so it wins over updateAggregateCheck for these envs.
 	if len(driftBlockUnstored) > 0 && multiEnvData.HeadSHA != "" {
 		h.postFailingAggregatesWithBlock(ctx, client, repo, pr, multiEnvData.HeadSHA, driftBlockUnstored, reviewTimeDeploymentDriftBlock)
+	} else if len(driftBlockUnstored) > 0 {
+		h.logger.Warn("deployment drift blocked one or more environments but no head SHA is known; the fallback failing aggregate was not posted, so an operator must re-run plan to re-establish the merge-gate block",
+			"repo", repo,
+			"pr", pr,
+			"environments", len(driftBlockUnstored))
 	}
 
 	// Auto-plan: skip comment if no changes and no errors (reduce PR noise)

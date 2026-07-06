@@ -82,6 +82,12 @@ func (h *Handler) storeManualPlanCheckRecord(ctx context.Context, client *ghclie
 	// so recovering (clearing) apply-owned check state here would wrongly unblock
 	// the PR. Leave the blocking check state in place for an operator to reconcile.
 	if drift.blocks() {
+		h.logger.Info("plan check is deployment-drift blocked; leaving stored check state in place and skipping apply-owned no-op recovery so the block is not cleared",
+			"repo", repo,
+			"pr", pr,
+			"database", schema.Database,
+			"database_type", schema.Type,
+			"environment", environment)
 		return headSHA, false, nil
 	}
 
