@@ -60,7 +60,7 @@ type DeploymentPlanDiff struct {
 // fails closed rather than being compared against the wrong live schema.
 func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryDeployment string, targets []routing.ExecutionTarget) ([]DeploymentPlanDiff, error) {
 	if len(targets) == 0 {
-		return nil, fmt.Errorf("plan deployment diffs for %s/%s: no deployment targets", req.Database, req.Environment)
+		return nil, fmt.Errorf("no deployment targets for %s/%s", req.Database, req.Environment)
 	}
 
 	// Reusing primaryPlan for the primary member assumes it was created against
