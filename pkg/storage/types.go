@@ -60,8 +60,9 @@ const (
 	OnFailureContinue = "continue"
 
 	// OnFailurePause holds the rollout after a failure until a human releases
-	// it. It is a known value but not yet supported; config validation rejects
-	// it until the release machinery lands.
+	// it (continue) or stops it (abort) via the release gate. Until released,
+	// later deployments do not start and the apply reports the non-terminal
+	// paused state; the merge gate stays fail-closed on the failed deployment.
 	OnFailurePause = "pause"
 )
 

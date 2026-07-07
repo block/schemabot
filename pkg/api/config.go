@@ -648,12 +648,11 @@ type EnvironmentConfig struct {
 	// terminally fails. "halt" (the default, also used when unset) stops the
 	// rollout — later deployments in deployment_order are not started. "continue"
 	// drops a terminal-failed deployment as a blocker so the rollout attempts
-	// every deployment instead of stopping at the first failure. "pause" is a
-	// known value reserved for a future release-gate behaviour and is rejected
-	// at validation until that machinery lands. It governs only rollout
-	// continuation; the apply's pass/fail verdict and the merge gate stay
-	// fail-closed on any failed deployment. Only meaningful alongside a
-	// Deployments map.
+	// every deployment instead of stopping at the first failure. "pause" holds
+	// the rollout after a failure until a human releases it (continue) or stops
+	// it (abort) via the release gate. It governs only rollout continuation; the
+	// apply's pass/fail verdict and the merge gate stay fail-closed on any
+	// failed deployment. Only meaningful alongside a Deployments map.
 	OnFailure string `yaml:"on_failure,omitempty"`
 
 	// For PlanetScale/Vitess:
@@ -862,11 +861,9 @@ func (c *ServerConfig) Validate() error {
 					return fmt.Errorf("database %q environment %q sets on_failure without a deployments map", name, env)
 				}
 				switch envConfig.OnFailure {
-				case storage.OnFailureHalt, storage.OnFailureContinue:
-				case storage.OnFailurePause:
-					return fmt.Errorf("database %q environment %q sets on_failure %q which is not yet supported; use %q or %q", name, env, storage.OnFailurePause, storage.OnFailureHalt, storage.OnFailureContinue)
+				case storage.OnFailureHalt, storage.OnFailureContinue, storage.OnFailurePause:
 				default:
-					return fmt.Errorf("database %q environment %q has invalid on_failure %q (want %q or %q)", name, env, envConfig.OnFailure, storage.OnFailureHalt, storage.OnFailureContinue)
+					return fmt.Errorf("database %q environment %q has invalid on_failure %q (want %q, %q, or %q)", name, env, envConfig.OnFailure, storage.OnFailureHalt, storage.OnFailureContinue, storage.OnFailurePause)
 				}
 			}
 			switch {

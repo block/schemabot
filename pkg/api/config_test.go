@@ -33,6 +33,7 @@ func TestServerConfig_OnFailure(t *testing.T) {
 					"unset":    {Target: "payments", Deployment: "payments-a"},
 					"halt":     {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, OnFailure: storage.OnFailureHalt},
 					"continue": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, OnFailure: storage.OnFailureContinue},
+					"pause":    {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, OnFailure: storage.OnFailurePause},
 				},
 			},
 		},
@@ -41,6 +42,7 @@ func TestServerConfig_OnFailure(t *testing.T) {
 	assert.Equal(t, storage.OnFailureHalt, cfg.OnFailure("payments", "unset"), "unset defaults to halting")
 	assert.Equal(t, storage.OnFailureHalt, cfg.OnFailure("payments", "halt"), "explicit halt halts")
 	assert.Equal(t, storage.OnFailureContinue, cfg.OnFailure("payments", "continue"), "explicit continue does not halt")
+	assert.Equal(t, storage.OnFailurePause, cfg.OnFailure("payments", "pause"), "explicit pause resolves to pause")
 	assert.Equal(t, storage.OnFailureHalt, cfg.OnFailure("payments", "missing-env"), "unconfigured env defaults to halting")
 	assert.Equal(t, storage.OnFailureHalt, cfg.OnFailure("missing-db", "continue"), "unconfigured database defaults to halting")
 }
@@ -1731,15 +1733,14 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			wantErrSub: `invalid on_failure "warp-speed"`,
 		},
 		{
-			name: "on_failure pause is rejected as not yet supported",
+			name: "on_failure pause with a deployments map is accepted",
 			envConfig: EnvironmentConfig{
 				Deployments: map[string]DeploymentTarget{
 					"payments-a": {Target: "payments"},
 				},
 				OnFailure: storage.OnFailurePause,
 			},
-			tern:       baseTern,
-			wantErrSub: `sets on_failure "pause" which is not yet supported`,
+			tern: baseTern,
 		},
 	}
 
