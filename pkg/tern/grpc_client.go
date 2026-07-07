@@ -163,16 +163,24 @@ type Config struct {
 // retryServiceConfig enables client-side retries for idempotent RPCs.
 //
 // The network path to a remote Tern deployment often crosses proxies and
-// service meshes, where brief connection resets or TLS handshake flaps
-// surface as UNAVAILABLE before the request reaches the server. Retrying
-// rides out sub-second blips instead of failing the caller's operation.
+// service meshes, where connection resets or TLS handshake flaps surface as
+// UNAVAILABLE before the request reaches the server. Retrying rides out the
+// blip instead of failing the caller's operation.
 //
-// Only RPCs that are safe to re-send are retried:
-//   - PullSchema: read-only live schema fetch.
-//   - Plan: each attempt produces an independent plan record and only the
-//     returned plan ID is used, so a duplicate attempt is harmless.
-//   - PlanDiff: read-only desired-vs-live diff; persists nothing.
-//   - Progress and Health: read-only.
+// Only RPCs that are safe to re-send are retried, in two budgets:
+//
+// Caller-facing reads (PullSchema, Plan, PlanDiff) get a long budget: a
+// human or review workflow is waiting on the response, and a data-plane pod
+// restart or mesh drain lasts seconds — well past a sub-second budget — so
+// these ride out up to roughly fifteen seconds before surfacing UNAVAILABLE.
+// (Plan is retry-safe because each attempt produces an independent plan
+// record and only the returned plan ID is used.) The budget must stay under
+// the API server's 30s response timeout, which bounds these calls end to end.
+//
+// Fast polls (Progress, Health) keep a sub-second budget: Progress is called
+// on tight drive loops that own their own failure handling, and Health feeds
+// the remote-deployment outage monitor, which must observe an outage promptly
+// rather than ride it out.
 //
 // State-changing RPCs (Apply, Cutover, Stop, Start, Volume, Revert,
 // SkipRevert) are intentionally not retried here: re-sending them could
@@ -183,7 +191,17 @@ const retryServiceConfig = `{
 		"name": [
 			{"service": "tern.v1.Tern", "method": "PullSchema"},
 			{"service": "tern.v1.Tern", "method": "Plan"},
-			{"service": "tern.v1.Tern", "method": "PlanDiff"},
+			{"service": "tern.v1.Tern", "method": "PlanDiff"}
+		],
+		"retryPolicy": {
+			"maxAttempts": 5,
+			"initialBackoff": "0.5s",
+			"maxBackoff": "8s",
+			"backoffMultiplier": 3.0,
+			"retryableStatusCodes": ["UNAVAILABLE"]
+		}
+	}, {
+		"name": [
 			{"service": "tern.v1.Tern", "method": "Progress"},
 			{"service": "tern.v1.Tern", "method": "Health"}
 		],

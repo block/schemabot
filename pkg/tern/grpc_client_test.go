@@ -129,8 +129,12 @@ type flakyTernServer struct {
 	mu          sync.Mutex
 	planCalls   int
 	applyCalls  int
+	pullCalls   int
+	healthCalls int
 	failPlans   int
 	failApplies int
+	failPulls   int
+	failHealths int
 }
 
 func (s *flakyTernServer) Plan(context.Context, *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
@@ -153,10 +157,36 @@ func (s *flakyTernServer) Apply(context.Context, *ternv1.ApplyRequest) (*ternv1.
 	return &ternv1.ApplyResponse{Accepted: true, ApplyId: "remote-apply-1"}, nil
 }
 
+func (s *flakyTernServer) PullSchema(context.Context, *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pullCalls++
+	if s.pullCalls <= s.failPulls {
+		return nil, status.Error(codes.Unavailable, "upstream connect error")
+	}
+	return &ternv1.PullSchemaResponse{Database: "testdb"}, nil
+}
+
+func (s *flakyTernServer) Health(context.Context, *ternv1.HealthRequest) (*ternv1.HealthResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.healthCalls++
+	if s.healthCalls <= s.failHealths {
+		return nil, status.Error(codes.Unavailable, "upstream connect error")
+	}
+	return &ternv1.HealthResponse{Status: "ok"}, nil
+}
+
 func (s *flakyTernServer) calls() (plans, applies int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.planCalls, s.applyCalls
+}
+
+func (s *flakyTernServer) readCalls() (pulls, healths int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pullCalls, s.healthCalls
 }
 
 // newRetryTestClient starts an in-process Tern gRPC server and connects a
@@ -199,19 +229,34 @@ func TestGRPCClientRetriesPlanOnUnavailable(t *testing.T) {
 	assert.Equal(t, 2, plans, "client should retry the failed plan attempt")
 }
 
-// Retries are bounded: a deployment that stays unavailable surfaces
-// UNAVAILABLE to the caller after the retry budget instead of retrying
-// forever.
-func TestGRPCClientPlanRetriesAreBounded(t *testing.T) {
-	server := &flakyTernServer{failPlans: 10}
+// A data-plane pod restart or mesh drain lasts seconds, not milliseconds. A
+// caller-facing read must ride out a sustained blip — several consecutive
+// UNAVAILABLE attempts — and still return the response a human is waiting on.
+func TestGRPCClientPullSchemaRidesOutSustainedUnavailable(t *testing.T) {
+	server := &flakyTernServer{failPulls: 3}
 	client := newRetryTestClient(t, server)
 
-	_, err := client.Plan(t.Context(), &ternv1.PlanRequest{Database: "testdb"})
+	resp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "testdb"})
+
+	require.NoError(t, err)
+	assert.Equal(t, "testdb", resp.GetDatabase())
+	pulls, _ := server.readCalls()
+	assert.Equal(t, 4, pulls, "the caller-facing read budget must survive a sustained blip, not just a single reset")
+}
+
+// Retries are bounded, and the fast-poll budget stays small: Health feeds the
+// remote-deployment outage monitor, which must observe an outage promptly
+// rather than ride it out.
+func TestGRPCClientHealthRetriesFailFast(t *testing.T) {
+	server := &flakyTernServer{failHealths: 10}
+	client := newRetryTestClient(t, server)
+
+	err := client.Health(t.Context())
 
 	require.Error(t, err)
 	assert.Equal(t, codes.Unavailable, status.Code(err))
-	plans, _ := server.calls()
-	assert.Equal(t, 3, plans, "client should stop after the configured attempt budget")
+	_, healths := server.readCalls()
+	assert.Equal(t, 3, healths, "fast polls must stop after the small attempt budget so outages surface promptly")
 }
 
 // Apply is state-changing, so the client surfaces a transient UNAVAILABLE
