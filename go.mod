@@ -19,6 +19,7 @@ require (
 	github.com/docker/go-connections v0.6.0
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/go-mysql-org/go-mysql v1.15.1-0.20260526024741-088eb1fbf0ea
+	github.com/go-mysql/hotswap-dsn-driver v1.0.1
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/gofri/go-github-ratelimit/v2 v2.0.2
 	github.com/google/go-github/v86 v86.0.0

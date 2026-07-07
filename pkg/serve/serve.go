@@ -256,7 +256,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 			return nil, fmt.Errorf("ensure schema after %d attempts: %w", maxRetries, err)
 		}
 
-		db, err = mysqlconn.Open(dsn)
+		db, err = mysqlconn.OpenReloadable(dsn, cfg.StorageDSN)
 		if err != nil {
 			return nil, fmt.Errorf("open database: %w", err)
 		}
