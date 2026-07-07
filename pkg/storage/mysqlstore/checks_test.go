@@ -197,29 +197,22 @@ func TestCheckStore_Delete(t *testing.T) {
 	require.ErrorIs(t, store.Checks().Delete(ctx, 99999), storage.ErrCheckNotFound)
 }
 
-// TestCheckStore_DeleteByPRRetainingBlockingApplyOwned verifies PR-close cleanup
-// at the storage layer: all of a PR's stored check state is deleted except
-// apply-owned rows that still block the PR. An apply-owned row that is in_progress must keep
-// blocking until the apply reaches a terminal state, and an apply-owned row that
-// finished without a successful conclusion (action_required, failure) must keep
-// blocking until an operator reconciles the target environment — closing and
-// reopening the PR must not bypass either block. Plan-only rows and apply-owned
-// rows that concluded successfully are deleted so a reopened PR starts clean.
-// Rows for other PRs are untouched.
-func TestCheckStore_DeleteByPRRetainingBlockingApplyOwned(t *testing.T) {
-	clearTables(t)
+// seedPRCloseRetentionChecks stores one row of every retention shape PR-close
+// cleanup distinguishes for PR 123, plus a row on another PR that cleanup must
+// never touch.
+func seedPRCloseRetentionChecks(t *testing.T, store storage.Storage) {
+	t.Helper()
 	ctx := t.Context()
-	store := New(testDB)
 
 	checksToCreate := []*storage.Check{
-		// Plan-only rows: deleted regardless of status or conclusion.
+		// Plan-only rows: deleted on every close kind regardless of status or conclusion.
 		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "staging", DatabaseType: "vitess", DatabaseName: "db1", Status: "pending"},
 		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "staging", DatabaseType: "mysql", DatabaseName: "db2", Status: "completed", Conclusion: "action_required"},
-		// Apply-owned in-flight row: must survive.
+		// Apply-owned in-flight row: survives every close kind.
 		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "production", DatabaseType: "mysql", DatabaseName: "db3", Status: "in_progress", ApplyID: 77},
-		// Apply-owned row that concluded successfully: deleted.
+		// Apply-owned row that concluded successfully: retention depends on the close kind.
 		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "production", DatabaseType: "mysql", DatabaseName: "db4", Status: "completed", ApplyID: 88, Conclusion: "success"},
-		// Apply-owned terminal rows that still block: must survive.
+		// Apply-owned terminal rows that still block: survive every close kind.
 		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "production", DatabaseType: "mysql", DatabaseName: "db5", Status: "completed", ApplyID: 99, Conclusion: "action_required", BlockingReason: "schema_removed_after_apply_started"},
 		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "production", DatabaseType: "mysql", DatabaseName: "db6", Status: "completed", ApplyID: 111, Conclusion: "failure"},
 	}
@@ -237,18 +230,30 @@ func TestCheckStore_DeleteByPRRetainingBlockingApplyOwned(t *testing.T) {
 		DatabaseName: "db1",
 		Status:       "pending",
 	}))
+}
 
-	require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "org/repo", 123))
+// retainedChecksByDatabase asserts how many of PR 123's rows survived cleanup
+// and returns them keyed by database name.
+func retainedChecksByDatabase(t *testing.T, store storage.Storage, wantRetained int) map[string]*storage.Check {
+	t.Helper()
+	ctx := t.Context()
 
-	// Only the apply-owned rows that still block survive for PR 123.
 	retrieved, err := store.Checks().GetByPR(ctx, "org/repo", 123)
 	require.NoError(t, err)
-	require.Len(t, retrieved, 3)
+	require.Len(t, retrieved, wantRetained)
 
 	byDatabase := make(map[string]*storage.Check, len(retrieved))
 	for _, c := range retrieved {
 		byDatabase[c.DatabaseName] = c
 	}
+	return byDatabase
+}
+
+// assertAlwaysBlockingRowsRetained verifies the apply-owned rows every close
+// kind must retain: the in-flight row and the terminal rows that concluded
+// without success (action_required, failure).
+func assertAlwaysBlockingRowsRetained(t *testing.T, byDatabase map[string]*storage.Check) {
+	t.Helper()
 
 	inFlight, ok := byDatabase["db3"]
 	require.True(t, ok, "apply-owned in-flight row must survive PR close")
@@ -267,15 +272,72 @@ func TestCheckStore_DeleteByPRRetainingBlockingApplyOwned(t *testing.T) {
 	assert.Equal(t, "completed", failed.Status)
 	assert.Equal(t, "failure", failed.Conclusion)
 	assert.Equal(t, int64(111), failed.ApplyID)
+}
 
-	// PR 456's check still exists.
-	retrieved, err = store.Checks().GetByPR(ctx, "org/repo", 456)
+// assertOtherPRUntouched verifies that PR-close cleanup for PR 123 never
+// touches another PR's stored check state.
+func assertOtherPRUntouched(t *testing.T, store storage.Storage) {
+	t.Helper()
+
+	retrieved, err := store.Checks().GetByPR(t.Context(), "org/repo", 456)
 	require.NoError(t, err)
 	require.Len(t, retrieved, 1)
 	assert.Equal(t, "db1", retrieved[0].DatabaseName)
+}
 
-	// Deleting for a non-existent PR is a no-op, not an error.
-	require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "org/repo", 999))
+// TestCheckStore_DeleteByPRRetainingBlockingApplyOwned verifies PR-close cleanup
+// at the storage layer. On every close kind, plan-only rows are deleted, rows
+// for other PRs are untouched, and apply-owned rows that still block survive:
+// an in_progress row must keep blocking until the apply reaches a terminal
+// state, and a terminal row without a successful conclusion (action_required,
+// failure) must keep blocking until an operator reconciles the target
+// environment — closing and reopening the PR must not bypass either block.
+//
+// The close kinds differ on apply-owned rows that concluded successfully. A
+// merged close deletes them: the merged PR carries the applied schema, so
+// nothing remains to block. An unmerged close retains them: the stored success
+// may predate a commit that removed the applied change (the PR can close
+// before stale cleanup converts the row), so only reopen-time cleanup may
+// decide whether the row still matches the PR contents.
+func TestCheckStore_DeleteByPRRetainingBlockingApplyOwned(t *testing.T) {
+	t.Run("merged close deletes successful apply-owned rows", func(t *testing.T) {
+		clearTables(t)
+		ctx := t.Context()
+		store := New(testDB)
+		seedPRCloseRetentionChecks(t, store)
+
+		require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "org/repo", 123, true))
+
+		byDatabase := retainedChecksByDatabase(t, store, 3)
+		assertAlwaysBlockingRowsRetained(t, byDatabase)
+		_, ok := byDatabase["db4"]
+		assert.False(t, ok, "apply-owned success row is deleted on merged close")
+		assertOtherPRUntouched(t, store)
+
+		// Deleting for a non-existent PR is a no-op, not an error.
+		require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "org/repo", 999, true))
+	})
+
+	t.Run("unmerged close retains successful apply-owned rows", func(t *testing.T) {
+		clearTables(t)
+		ctx := t.Context()
+		store := New(testDB)
+		seedPRCloseRetentionChecks(t, store)
+
+		require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "org/repo", 123, false))
+
+		byDatabase := retainedChecksByDatabase(t, store, 4)
+		assertAlwaysBlockingRowsRetained(t, byDatabase)
+		successful, ok := byDatabase["db4"]
+		require.True(t, ok, "apply-owned success row must survive unmerged close")
+		assert.Equal(t, "completed", successful.Status)
+		assert.Equal(t, "success", successful.Conclusion)
+		assert.Equal(t, int64(88), successful.ApplyID)
+		assertOtherPRUntouched(t, store)
+
+		// Deleting for a non-existent PR is a no-op, not an error.
+		require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "org/repo", 999, false))
+	})
 }
 
 func TestCheckStore_GetByPR_DBError(t *testing.T) {

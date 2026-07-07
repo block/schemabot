@@ -74,7 +74,7 @@ func TestE2EPRCloseCleanup(t *testing.T) {
 	// Close the PR while the apply is running. The handler is invoked directly
 	// (not through the async webhook goroutine) so the retention assertions
 	// below observe a finished cleanup pass.
-	h.handlePRClosed("octocat/hello-world", 1, 12345)
+	h.handlePRClosed("octocat/hello-world", 1, 12345, false)
 
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)
@@ -507,6 +507,153 @@ func TestE2EPRCloseReopenRetainsStartedApplyBlock(t *testing.T) {
 		case checkRun := <-result.checkRuns:
 			require.NotEqual(t, checkConclusionSuccess, checkRun.Conclusion,
 				"close and reopen must not produce a passing check run while the block stands")
+			blocked = checkRun.Name == aggregateCheckName &&
+				checkRun.Conclusion == checkConclusionActionRequired &&
+				checkRun.HeadSHA == "abc123"
+		case <-deadline:
+			t.Fatal("timed out waiting for blocking aggregate check run after reopen")
+		}
+		if blocked {
+			break
+		}
+	}
+
+	aggregate, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, aggregate)
+	assert.Equal(t, "abc123", aggregate.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, aggregate.Status)
+	assert.Equal(t, checkConclusionActionRequired, aggregate.Conclusion)
+}
+
+// TestE2EUnmergedCloseRetainsSuccessfulApplyOwnedCheck verifies that closing a
+// PR without merging cannot bypass a started apply's block via a stale success
+// conclusion. Scenario: an apply for the PR completes and its stored check
+// state concludes success, then a later commit removes the applied schema
+// change and the PR is closed — without merging — before stale cleanup runs,
+// so the row still reads success at close time. The unmerged close retains the
+// apply-owned success row: the stored success only proves the database matched
+// the PR when the row was written, and the unmerged branch means the change
+// never landed. Reopening the PR (whose diff no longer touches schema files)
+// runs stale cleanup, which converts the retained row to action_required and
+// folds it into an aggregate that blocks merge instead of passing.
+func TestE2EUnmergedCloseRetainsSuccessfulApplyOwnedCheck(t *testing.T) {
+	dbName := "webhook_unmerged_close_success"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// The apply completed before the schema change was removed from the PR.
+	applyID, err := svc.Storage().Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply-unmerged-close",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Completed,
+		Engine:          "spirit",
+	})
+	require.NoError(t, err)
+
+	// Stored check state as the apply left it: terminal, success, still owned
+	// by the apply. Stale cleanup for the commit that removed the schema change
+	// has not run, so nothing has converted the row yet.
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha222",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   42,
+		ApplyID:      applyID,
+		HasChanges:   true,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionSuccess,
+	}))
+
+	// Plan-only check state for another database on the same PR. The unmerged
+	// close deletes it, which doubles as the signal that the async close
+	// cleanup pass finished before the retention assertions below run.
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha222",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "webhook_unmerged_close_planonly",
+		CheckRunID:   43,
+		HasChanges:   true,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionActionRequired,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// Fake GitHub serves a PR whose current diff has no schema files, matching
+	// a PR whose later commit reverted the applied schema change.
+	result := setupFakeGitHubForPlan(t, mux, nil, "", dbName)
+	h := newE2EHandler(t, svc, client)
+
+	// Close the PR without merging. Close cleanup runs async, so wait for the
+	// plan-only row to be deleted — the same cleanup statement decides the
+	// retained row's fate — before asserting on the retained row.
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "closed", merged: false}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	require.Eventually(t, func() bool {
+		check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", "webhook_unmerged_close_planonly")
+		return err == nil && check == nil
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond, "plan-only check state should be deleted on unmerged PR close")
+
+	// The apply-owned success row survives the unmerged close untouched.
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check, "apply-owned success row must survive an unmerged close")
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionSuccess, check.Conclusion)
+	assert.Equal(t, applyID, check.ApplyID)
+
+	// Reopen the PR. Auto-plan finds no schema files; stale-check cleanup
+	// converts the retained row on the current head SHA before the aggregate
+	// for that commit is published.
+	req = buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "reopened"}, nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	require.Eventually(t, func() bool {
+		check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+		return err == nil && check != nil && check.Conclusion == checkConclusionActionRequired
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond, "retained success row should be converted to action_required on reopen")
+
+	check, err = svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, "abc123", check.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
+	assert.Equal(t, applyID, check.ApplyID)
+	assert.Equal(t, schemaRemovedAfterApplyBlock.blockingReason, check.BlockingReason)
+
+	// The aggregate on the reopened head SHA folds the converted block in and
+	// reports action_required — never success, even though the "no managed
+	// schema changes" path also runs for this reopen: the retained apply-owned
+	// row blocks the passing aggregate until it is converted.
+	deadline := time.After(webhookIntegrationPollDeadline)
+	for {
+		var blocked bool
+		select {
+		case checkRun := <-result.checkRuns:
+			require.NotEqual(t, checkConclusionSuccess, checkRun.Conclusion,
+				"unmerged close and reopen must not produce a passing check run while the block stands")
 			blocked = checkRun.Name == aggregateCheckName &&
 				checkRun.Conclusion == checkConclusionActionRequired &&
 				checkRun.HeadSHA == "abc123"

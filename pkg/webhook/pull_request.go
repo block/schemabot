@@ -18,7 +18,8 @@ type pullRequestPayload struct {
 	Action      string `json:"action"`
 	Before      string `json:"before"`
 	PullRequest struct {
-		Number int `json:"number"`
+		Number int  `json:"number"`
+		Merged bool `json:"merged"`
 		Head   struct {
 			SHA string `json:"sha"`
 			Ref string `json:"ref"`
@@ -54,7 +55,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		// proceed to auto-plan below
 	case "closed":
 		h.goSafe(payload.Repository.FullName, payload.PullRequest.Number, installationID, func() {
-			h.handlePRClosed(payload.Repository.FullName, payload.PullRequest.Number, installationID)
+			h.handlePRClosed(payload.Repository.FullName, payload.PullRequest.Number, installationID, payload.PullRequest.Merged)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "PR close cleanup started"})
 		return
@@ -329,9 +330,13 @@ func (h *Handler) aggregateMessagesForAllEnvironments(message string) map[string
 // so a close-and-reopen cannot convert in-flight apply state into a passing
 // check. Apply-owned check state that reached a terminal state without
 // concluding successfully is also retained, so a close-and-reopen cannot
-// bypass a block that requires operator reconciliation. If apply state cannot
-// be read, cleanup fails closed and nothing is released or deleted.
-func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
+// bypass a block that requires operator reconciliation. On a close without
+// merge, apply-owned check state that concluded successfully is retained too:
+// the stored success may predate a commit that removed the applied change,
+// and only reopen-time cleanup can re-verify it against the PR contents. If
+// apply state cannot be read, cleanup fails closed and nothing is released
+// or deleted.
+func (h *Handler) handlePRClosed(repo string, pr int, _ int64, merged bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -369,21 +374,30 @@ func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
 	// applies table missed the in-flight work above) and terminal rows whose
 	// conclusion is not success, such as a schema change removed from the PR
 	// after its apply started. Those blocks require operator reconciliation
-	// and must persist across a close and reopen.
-	if err := h.service.Storage().Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, repo, pr); err != nil {
+	// and must persist across a close and reopen. On an unmerged close,
+	// apply-owned rows that concluded successfully survive too: the stored
+	// success may predate a commit that removed the applied change, so
+	// reopen-time cleanup must re-verify it before the row can stop blocking.
+	if err := h.service.Storage().Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, repo, pr, merged); err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "pr_close_cleanup",
 			Repository: repo,
 			Status:     "error",
 		})
-		h.logger.Error("failed to delete checks for closed PR", "repo", repo, "pr", pr, "error", err)
+		h.logger.Error("failed to delete checks for closed PR", "repo", repo, "pr", pr, "merged", merged, "error", err)
 	} else {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "pr_close_cleanup",
 			Repository: repo,
 			Status:     "success",
 		})
-		h.logger.Info("deleted checks for closed PR", "repo", repo, "pr", pr)
+		if merged {
+			h.logger.Info("deleted checks for merged PR; apply-owned rows that still block are retained",
+				"repo", repo, "pr", pr)
+		} else {
+			h.logger.Info("deleted plan-only checks for unmerged closed PR; all apply-owned rows are retained",
+				"repo", repo, "pr", pr)
+		}
 	}
 }
 

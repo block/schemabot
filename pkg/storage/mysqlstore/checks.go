@@ -205,7 +205,7 @@ func (s *checkStore) RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, che
 func successfulNoOpPlanResult(check *storage.Check) bool {
 	return check != nil &&
 		check.Status == "completed" &&
-		check.Conclusion == "success" &&
+		check.Conclusion == checkConclusionSuccess &&
 		!check.HasChanges
 }
 
@@ -308,7 +308,7 @@ func (s *checkStore) ClearAggregateBlock(ctx context.Context, check *storage.Che
 // check with no started apply and no pending schema change.
 func isPlanOnlySuccessful(check *storage.Check) bool {
 	return check.Status == "completed" &&
-		check.Conclusion == "success" &&
+		check.Conclusion == checkConclusionSuccess &&
 		check.ApplyID == 0 &&
 		!check.HasChanges
 }
@@ -508,31 +508,57 @@ func (s *checkStore) Delete(ctx context.Context, id int64) error {
 	return checkRowsAffected(result, storage.ErrCheckNotFound)
 }
 
-// DeleteByPRRetainingBlockingApplyOwned removes stored check state for a PR,
-// retaining apply-owned rows that still block the PR. Once an apply has started, its
-// stored check state is authoritative until an operator reconciles the target
-// environment — closing and reopening the PR must not convert it into a
-// passing aggregate. A row is retained when apply_id is set and either:
+// DeleteByPRRetainingBlockingApplyOwned removes stored check state for a
+// closed PR, retaining apply-owned rows the close must not unblock. Once an
+// apply has started, its stored check state is authoritative until an
+// operator reconciles the target environment — closing and reopening the PR
+// must not convert it into a passing aggregate.
 //
-//   - status is in_progress: the apply may still be changing the live
-//     database, even when PR-close cleanup found no non-terminal apply in the
-//     applies table; or
-//   - conclusion is anything but success (action_required, failure, or
+// Plan-only rows (apply_id unset) are always deleted: no apply ever reached
+// the live database for them, so a reopened PR starts clean.
+//
+// On a merged close, an apply-owned row is retained when it is either:
+//
+//   - in_progress: the apply may still be changing the live database, even
+//     when PR-close cleanup found no non-terminal apply in the applies
+//     table; or
+//   - concluded as anything but success (action_required, failure, or
 //     unset): the apply reached the live database and the row records that
 //     operator attention is still required, e.g. the schema change was
 //     removed from the PR after the apply started or a rollback completed.
 //
-// Apply-owned rows whose conclusion is success are deleted: the apply
-// finished cleanly and matches the PR contents, so nothing remains for the
-// row to block and a reopened PR must not inherit a stale gate.
-func (s *checkStore) DeleteByPRRetainingBlockingApplyOwned(ctx context.Context, repo string, pr int) error {
+// Apply-owned rows whose conclusion is success are deleted on a merged
+// close: the apply finished cleanly and the merged PR carries the applied
+// schema, so nothing remains for the row to block.
+//
+// On an unmerged close, every apply-owned row is retained, including rows
+// whose conclusion is success. A stored success only proves the database
+// matched the PR when the row was last written — a commit that removed the
+// applied change may close the PR before stale cleanup converts the row to
+// action_required, and the unmerged branch means the change never landed.
+// Reopen-time stale cleanup converges the retained row: it converts it to
+// action_required when the schema change is gone from the PR, or a fresh
+// plan result replaces it when the change is still present.
+func (s *checkStore) DeleteByPRRetainingBlockingApplyOwned(ctx context.Context, repo string, pr int, merged bool) error {
+	if merged {
+		_, err := s.db.ExecContext(ctx, `
+			DELETE FROM checks
+			WHERE repository = ? AND pull_request = ?
+			  AND (apply_id IS NULL OR (status != ? AND conclusion = ?))
+		`, repo, pr, checkStatusInProgress, checkConclusionSuccess)
+		if err != nil {
+			return fmt.Errorf("delete checks for merged closed PR %s#%d: %w", repo, pr, err)
+		}
+		return nil
+	}
+
 	_, err := s.db.ExecContext(ctx, `
 		DELETE FROM checks
 		WHERE repository = ? AND pull_request = ?
-		  AND (apply_id IS NULL OR (status != ? AND conclusion = ?))
-	`, repo, pr, checkStatusInProgress, checkConclusionSuccess)
+		  AND apply_id IS NULL
+	`, repo, pr)
 	if err != nil {
-		return fmt.Errorf("delete checks for closed PR %s#%d: %w", repo, pr, err)
+		return fmt.Errorf("delete plan-only checks for unmerged closed PR %s#%d: %w", repo, pr, err)
 	}
 	return nil
 }

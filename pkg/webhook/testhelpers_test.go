@@ -61,6 +61,7 @@ func setupGitHubServer(t *testing.T) (*gh.Client, *http.ServeMux) {
 // prWebhookPayloadOpts configures how buildPRWebhookRequest constructs the payload.
 type prWebhookPayloadOpts struct {
 	action    string // "opened", "synchronize", "reopened", "closed", etc.
+	merged    bool   // for "closed": whether the PR merged or was closed without merging
 	beforeSHA string
 	headSHA   string
 	headRef   string
@@ -91,6 +92,7 @@ func buildPRWebhookRequest(t *testing.T, opts prWebhookPayloadOpts, secret []byt
 		"action": opts.action,
 		"pull_request": map[string]any{
 			"number": 1,
+			"merged": opts.merged,
 			"head": map[string]any{
 				"sha": opts.headSHA,
 				"ref": opts.headRef,
