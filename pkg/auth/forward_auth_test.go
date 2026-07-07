@@ -336,7 +336,7 @@ func TestForwardAuth_SkipsInfraPaths(t *testing.T) {
 		WriteGroups:       []string{"owners"},
 	})
 
-	for _, path := range []string{"/health", "/metrics", "/webhook"} {
+	for _, path := range []string{"/livez", "/health", "/metrics", "/webhook"} {
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, nil)
 		req.RemoteAddr = untrustedAddr // untrusted, but these paths skip auth
 		rec := httptest.NewRecorder()

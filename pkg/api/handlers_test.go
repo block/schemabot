@@ -3527,6 +3527,47 @@ func TestHealth(t *testing.T) {
 	})
 }
 
+// TestLivez verifies the liveness endpoint reflects process health only: it
+// reports alive even when the storage database is unreachable, so a storage
+// outage pulls instances from the Service (readiness) instead of restarting
+// them and aborting in-flight schema changes.
+func TestLivez(t *testing.T) {
+	t.Run("alive", func(t *testing.T) {
+		svc := newTestService()
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		req := httptest.NewRequestWithContext(t.Context(), "GET", "/livez", nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp map[string]string
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err, "failed to decode response")
+		assert.Equal(t, "alive", resp["status"])
+	})
+
+	t.Run("alive while storage is unreachable", func(t *testing.T) {
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		svc := New(&mockStorage{pingErr: errors.New("connection refused")}, testServerConfig(), nil, logger)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		req := httptest.NewRequestWithContext(t.Context(), "GET", "/livez", nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp map[string]string
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err, "failed to decode response")
+		assert.Equal(t, "alive", resp["status"])
+	})
+}
+
 func TestServiceClose(t *testing.T) {
 	svc := newTestService()
 	assert.NoError(t, svc.Close())

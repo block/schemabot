@@ -189,6 +189,8 @@ func (a *OIDCAuthorizer) extractGroups(token *oidc.IDToken) ([]string, error) {
 // infrastructure endpoints.
 func skipAuth(path string) bool {
 	switch {
+	case path == "/livez":
+		return true
 	case path == "/health":
 		return true
 	case path == "/metrics":
