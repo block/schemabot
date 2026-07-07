@@ -21,8 +21,9 @@
 #                             to fail.
 #   - production-pause     -> on_failure: pause: a failed deployment holds the
 #                             rollout in the non-terminal paused state until an
-#                             operator releases it (continue) or stops it (abort)
-#                             via `schemabot release` / `schemabot stop`.
+#                             operator releases it (`schemabot release`) so the
+#                             remaining deployments proceed, or aborts it with
+#                             `schemabot stop`.
 # All use cutover_policy: barrier and deployment_order [eu, us].
 
 # SchemaBot's own storage database

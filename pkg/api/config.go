@@ -649,9 +649,10 @@ type EnvironmentConfig struct {
 	// rollout — later deployments in deployment_order are not started. "continue"
 	// drops a terminal-failed deployment as a blocker so the rollout attempts
 	// every deployment instead of stopping at the first failure. "pause" holds
-	// the rollout after a failure until a human releases it (continue) or stops
-	// it (abort) via the release gate. It governs only rollout continuation; the
-	// apply's pass/fail verdict and the merge gate stay fail-closed on any
+	// the rollout after a failure until a human releases it (via the release
+	// control op) so the remaining deployments proceed; to abort instead, use
+	// the separate stop/cancel control op. It governs only rollout continuation;
+	// the apply's pass/fail verdict and the merge gate stay fail-closed on any
 	// failed deployment. Only meaningful alongside a Deployments map.
 	OnFailure string `yaml:"on_failure,omitempty"`
 
