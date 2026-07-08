@@ -414,6 +414,15 @@ func (ic *InstallationClient) storeAppSlug(slug string) {
 
 const githubSecondaryRateLimitMaxSleep = 5 * time.Second
 
+// NewRateLimitedTransport wraps base with GitHub secondary-rate-limit
+// handling (bounded sleep on a 403 secondary limit), matching the transport
+// every InstallationClient uses. Exposed for App-level clients built outside
+// this package that must issue GitHub calls at volume without tripping the
+// secondary limit.
+func NewRateLimitedTransport(base http.RoundTripper) http.RoundTripper {
+	return newGitHubRateLimitTransport(base)
+}
+
 func newGitHubRateLimitTransport(base http.RoundTripper) http.RoundTripper {
 	return github_ratelimit.New(base,
 		github_secondary_ratelimit.WithSingleSleepLimit(githubSecondaryRateLimitMaxSleep, nil),

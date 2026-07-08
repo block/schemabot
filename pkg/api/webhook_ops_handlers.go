@@ -17,6 +17,7 @@ import (
 	gh "github.com/google/go-github/v86/github"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	ghclient "github.com/block/schemabot/pkg/github"
 )
 
 const (
@@ -185,12 +186,15 @@ func newWebhookRedriveGitHubClient(app webhookRedriveApp, logger *slog.Logger) (
 	if privateKey == "" {
 		return nil, fmt.Errorf("app %q private key resolved to empty value", app.name)
 	}
-	transport, err := ghinstallation.NewAppsTransport(http.DefaultTransport, app.id, []byte(privateKey))
+	appsTransport, err := ghinstallation.NewAppsTransport(http.DefaultTransport, app.id, []byte(privateKey))
 	if err != nil {
 		return nil, fmt.Errorf("create GitHub App transport for app %q: %w", app.name, err)
 	}
-	client := gh.NewClient(&http.Client{Transport: transport, Timeout: 30 * time.Second})
-	client.DisableRateLimitCheck = true
+	// A crawl issues many list/detail/redeliver calls per run, so wrap the
+	// transport with the shared secondary-rate-limit handling (bounded sleep
+	// on a 403 secondary limit) that every other GitHub client here uses,
+	// rather than issuing bare requests that would trip the limit mid-crawl.
+	client := gh.NewClient(&http.Client{Transport: ghclient.NewRateLimitedTransport(appsTransport), Timeout: 30 * time.Second})
 	logger.Info("created GitHub App webhook redrive client", "app_name", app.name, "app_id", app.id)
 	return client, nil
 }
@@ -199,6 +203,13 @@ func redriveWebhookAppDeliveries(ctx context.Context, client webhookRedriveDeliv
 	result := WebhookRedriveResult{AppName: appName, DryRun: dryRun}
 	cursor := startCursor
 	historyExhausted := false
+	// A GitHub delivery record is immutable: a failed delivery stays "failed"
+	// forever, and a redelivery is a new record sharing the original's GUID.
+	// Track GUIDs whose attempt succeeded so a failed original is not
+	// re-redelivered when a newer redelivery of it already succeeded. The
+	// crawl walks newest→oldest, so the success is seen before its failed
+	// original — keeping repeated redrives of a stable window convergent.
+	succeededGUIDs := make(map[string]struct{})
 	for result.Pages < maxPages {
 		result.Pages++
 		deliveries, resp, err := client.ListHookDeliveries(ctx, &gh.ListCursorOptions{PerPage: webhookRedrivePageSize, Cursor: cursor})
@@ -219,14 +230,37 @@ func redriveWebhookAppDeliveries(ctx context.Context, client webhookRedriveDeliv
 				continue
 			}
 			result.OldestFetched = delivered.Format(time.RFC3339)
-			if !delivered.Before(windowStart) && !delivered.After(windowEnd) && webhookRedriveDeliverySelected(delivery) {
-				selection, ok, err := webhookRedriveSelectionFor(ctx, client, delivery, repo, pr)
-				if err != nil {
-					return result, err
+
+			guid := delivery.GetGUID()
+			if webhookDeliverySucceeded(delivery) {
+				if guid != "" {
+					succeededGUIDs[guid] = struct{}{}
 				}
-				if ok {
-					result.Selected = append(result.Selected, selection)
+				continue
+			}
+			if delivered.Before(windowStart) || delivered.After(windowEnd) || !webhookRedriveEventEligible(delivery) {
+				continue
+			}
+			if _, ok := succeededGUIDs[guid]; ok && guid != "" {
+				// A newer redelivery of this delivery already succeeded during
+				// this crawl; skip it so a re-run over a stable window does not
+				// re-fire downstream events.
+				continue
+			}
+			selection, ok, err := webhookRedriveSelectionFor(ctx, client, delivery, repo, pr)
+			if err != nil {
+				// A per-delivery detail-fetch or payload-parse failure must not
+				// abort the whole crawl; skip this one and keep going so the
+				// operator still gets (and can act on) the rest.
+				result.Skipped++
+				if logger != nil {
+					logger.Warn("skipping webhook delivery whose detail could not be resolved for repo/PR filtering",
+						"app_name", appName, "delivery_id", delivery.GetID(), "event", delivery.GetEvent(), "action", delivery.GetAction(), "error", err)
 				}
+				continue
+			}
+			if ok {
+				result.Selected = append(result.Selected, selection)
 			}
 		}
 		oldestInPage := deliveries[len(deliveries)-1].GetDeliveredAt().Time
@@ -282,8 +316,19 @@ func waitWebhookRedriveDelay(ctx context.Context) error {
 	}
 }
 
-func webhookRedriveDeliverySelected(delivery *gh.HookDelivery) bool {
-	if delivery == nil || delivery.GetID() == 0 || strings.EqualFold(delivery.GetStatus(), "OK") {
+// webhookDeliverySucceeded reports whether a delivery's own attempt succeeded.
+// GitHub's status string mirrors the HTTP response text ("OK", "Accepted",
+// …), so any 2xx status code is the robust success predicate — matching on
+// the literal "OK" would misclassify a 202 as a failure and redrive it.
+func webhookDeliverySucceeded(delivery *gh.HookDelivery) bool {
+	return delivery.GetStatusCode()/100 == 2
+}
+
+// webhookRedriveEventEligible reports whether a delivery is one of the
+// check-creating events a redrive targets. It does not consider success or
+// failure — the caller redrives only the failed ones.
+func webhookRedriveEventEligible(delivery *gh.HookDelivery) bool {
+	if delivery == nil || delivery.GetID() == 0 {
 		return false
 	}
 	switch delivery.GetEvent() {
@@ -328,7 +373,11 @@ func webhookRedriveSelectionFor(ctx context.Context, client webhookRedriveDelive
 		return selection, false, nil
 	}
 	// check_suite and merge_group payloads can carry several pull requests;
-	// the delivery is selected when any of them matches the filter.
+	// the delivery is selected when any of them matches the filter. A
+	// pr-filtered redrive intentionally skips deliveries whose payload names
+	// no pull request — merge_group deliveries and check_suite deliveries for
+	// fork PRs — since the filter cannot confirm they belong to the requested
+	// PR. Run without --pr (repo-scoped) to include those.
 	if pr != 0 {
 		if !slices.Contains(payload.prs, pr) {
 			return selection, false, nil

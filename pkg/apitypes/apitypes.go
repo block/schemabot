@@ -75,10 +75,14 @@ type WebhookRedriveResult struct {
 	HistoryExhausted bool `json:"history_exhausted,omitempty"`
 	// NextCursor continues the listing in a follow-up request (with app set);
 	// empty when the window is covered or history is exhausted.
-	NextCursor  string                    `json:"next_cursor,omitempty"`
-	Selected    []WebhookRedriveSelection `json:"selected"`
-	Redelivered int                       `json:"redelivered"`
-	Failed      int                       `json:"failed"`
+	NextCursor string                    `json:"next_cursor,omitempty"`
+	Selected   []WebhookRedriveSelection `json:"selected"`
+	// Skipped counts in-window eligible deliveries whose detail could not be
+	// resolved for repo/PR filtering; they are left out of Selected rather
+	// than aborting the crawl.
+	Skipped     int `json:"skipped,omitempty"`
+	Redelivered int `json:"redelivered"`
+	Failed      int `json:"failed"`
 }
 
 type WebhookRedriveSelection struct {

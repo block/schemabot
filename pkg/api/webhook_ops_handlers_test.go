@@ -55,37 +55,53 @@ func (f *fakeWebhookRedriveDeliveryClient) RedeliverHookDelivery(_ context.Conte
 	return &gh.HookDelivery{ID: new(deliveryID)}, &gh.Response{}, nil
 }
 
-func TestWebhookRedriveDeliverySelectedAllowsOnlyFailedCheckCreatingEvents(t *testing.T) {
+func TestWebhookRedriveEventEligibleMatchesCheckCreatingEvents(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name   string
 		event  string
 		action string
-		status string
 		want   bool
 	}{
-		{name: "failed pull request opened", event: "pull_request", action: "opened", status: "timed out", want: true},
-		{name: "failed pull request synchronize", event: "pull_request", action: "synchronize", status: "ERROR", want: true},
-		{name: "failed check suite requested", event: "check_suite", action: "requested", status: "ERROR", want: true},
-		{name: "failed merge group checks requested", event: "merge_group", action: "checks_requested", status: "ERROR", want: true},
-		{name: "successful delivery skipped", event: "pull_request", action: "opened", status: "OK", want: false},
-		{name: "issue comment skipped", event: "issue_comment", action: "created", status: "ERROR", want: false},
-		{name: "closed pull request skipped", event: "pull_request", action: "closed", status: "ERROR", want: false},
-		{name: "destroyed merge group skipped", event: "merge_group", action: "destroyed", status: "ERROR", want: false},
+		{name: "pull request opened", event: "pull_request", action: "opened", want: true},
+		{name: "pull request synchronize", event: "pull_request", action: "synchronize", want: true},
+		{name: "check suite requested", event: "check_suite", action: "requested", want: true},
+		{name: "merge group checks requested", event: "merge_group", action: "checks_requested", want: true},
+		{name: "issue comment excluded", event: "issue_comment", action: "created", want: false},
+		{name: "closed pull request excluded", event: "pull_request", action: "closed", want: false},
+		{name: "destroyed merge group excluded", event: "merge_group", action: "destroyed", want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			delivery := &gh.HookDelivery{
-				ID:     new(int64(123)),
-				Event:  new(tt.event),
-				Action: new(tt.action),
-				Status: new(tt.status),
-			}
+			delivery := &gh.HookDelivery{ID: new(int64(123)), Event: new(tt.event), Action: new(tt.action)}
+			assert.Equal(t, tt.want, webhookRedriveEventEligible(delivery))
+		})
+	}
+}
 
-			assert.Equal(t, tt.want, webhookRedriveDeliverySelected(delivery))
+// Delivery success is judged by the 2xx status code, not the literal status
+// string: a 202 ("Accepted") is a success, not a failure to redrive.
+func TestWebhookDeliverySucceededUsesStatusCode(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		code int
+		want bool
+	}{
+		{name: "200 OK", code: 200, want: true},
+		{name: "202 Accepted", code: 202, want: true},
+		{name: "500 error", code: 500, want: false},
+		{name: "408 timeout", code: 408, want: false},
+		{name: "0 never delivered", code: 0, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, webhookDeliverySucceeded(&gh.HookDelivery{StatusCode: new(tt.code)}))
 		})
 	}
 }
@@ -267,6 +283,57 @@ func TestRedriveWebhookAppDeliveriesReportsExhaustedHistory(t *testing.T) {
 	assert.False(t, result.ReachedWindowStart)
 	assert.True(t, result.HistoryExhausted)
 	assert.Empty(t, result.NextCursor)
+}
+
+// A failed delivery is not re-selected when a newer redelivery of it (same
+// GUID) already succeeded during the crawl, so repeated redrives over a
+// stable window converge instead of re-firing downstream events.
+func TestRedriveWebhookAppDeliveriesSkipsAlreadySucceededRedeliveries(t *testing.T) {
+	t.Parallel()
+
+	windowStart := time.Date(2026, 7, 7, 19, 40, 0, 0, time.UTC)
+	windowEnd := time.Date(2026, 7, 7, 19, 50, 0, 0, time.UTC)
+	succeededRedelivery := webhookRedriveTestDelivery(11, windowEnd.Add(-time.Minute), "pull_request", "opened", "OK", 200)
+	succeededRedelivery.GUID = new("guid-a")
+	failedOriginalA := webhookRedriveTestDelivery(10, windowEnd.Add(-2*time.Minute), "pull_request", "opened", "ERROR", 500)
+	failedOriginalA.GUID = new("guid-a")
+	failedOriginalB := webhookRedriveTestDelivery(20, windowEnd.Add(-3*time.Minute), "pull_request", "opened", "ERROR", 500)
+	failedOriginalB.GUID = new("guid-b")
+
+	// Newest first: the successful redelivery of guid-a precedes its failed original.
+	client := &fakeWebhookRedriveDeliveryClient{pages: [][]*gh.HookDelivery{{succeededRedelivery, failedOriginalA, failedOriginalB}}}
+
+	result, err := redriveWebhookAppDeliveries(t.Context(), client, "default", "", windowStart, windowEnd, 10, true, "", 0, discardLogger())
+
+	require.NoError(t, err)
+	require.Len(t, result.Selected, 1, "guid-a already succeeded; only guid-b remains")
+	assert.Equal(t, int64(20), result.Selected[0].ID)
+}
+
+// A per-delivery detail-fetch failure during repo/PR filtering skips that one
+// delivery (counted) instead of aborting the whole crawl.
+func TestRedriveWebhookAppDeliveriesSkipsDeliveriesWithUnresolvableDetail(t *testing.T) {
+	t.Parallel()
+
+	windowStart := time.Date(2026, 7, 7, 19, 40, 0, 0, time.UTC)
+	windowEnd := time.Date(2026, 7, 7, 19, 50, 0, 0, time.UTC)
+	client := &fakeWebhookRedriveDeliveryClient{
+		pages: [][]*gh.HookDelivery{{
+			webhookRedriveTestDelivery(101, windowEnd.Add(-time.Minute), "pull_request", "opened", "ERROR", 500),
+			webhookRedriveTestDelivery(102, windowEnd.Add(-2*time.Minute), "pull_request", "opened", "ERROR", 500),
+		}},
+		details: map[int64]*gh.HookDelivery{
+			101: webhookRedriveTestDeliveryDetail(101, "octo/repo", 12),
+			// 102 has no detail → GetHookDelivery errors → skipped, not fatal.
+		},
+	}
+
+	result, err := redriveWebhookAppDeliveries(t.Context(), client, "default", "", windowStart, windowEnd, 10, true, "octo/repo", 12, discardLogger())
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Skipped)
+	require.Len(t, result.Selected, 1)
+	assert.Equal(t, int64(101), result.Selected[0].ID)
 }
 
 func webhookRedriveTestDelivery(id int64, deliveredAt time.Time, event, action, status string, statusCode int) *gh.HookDelivery {
