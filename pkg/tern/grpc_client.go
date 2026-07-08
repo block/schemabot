@@ -176,13 +176,18 @@ type Config struct {
 // (Plan is retry-safe because each attempt produces an independent plan
 // record and only the returned plan ID is used.) The budget must stay under
 // the API server's 30s response timeout, which bounds these calls end to end.
+// gRPC clamps maxAttempts to 5, so raising it further has no effect. During a
+// sustained outage a multi-environment auto-plan pays this budget per
+// environment (serial Plan + concurrent PlanDiff waves), so the whole flow
+// stays within its command timeout only for a handful of environments — the
+// exhausted calls fail closed either way.
 //
 // Fast polls (Progress, Health) keep a sub-second budget: Progress is called
 // on tight drive loops that own their own failure handling, and Health feeds
 // the remote-deployment outage monitor, which must observe an outage promptly
 // rather than ride it out.
 //
-// State-changing RPCs (Apply, Cutover, Stop, Start, Volume, Revert,
+// State-changing RPCs (Apply, Cutover, Stop, Cancel, Start, Volume, Revert,
 // SkipRevert) are intentionally not retried here: re-sending them could
 // duplicate work or advance an apply twice, and the operator's durable
 // queue already owns redelivery for dispatch failures.
