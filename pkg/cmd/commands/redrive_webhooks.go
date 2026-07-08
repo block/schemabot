@@ -121,7 +121,9 @@ func redriveWindowCoverage(oldestFetched, windowStart, windowEnd string) (int, b
 		return 0, false
 	}
 	covered := min(max(end.Sub(oldest), 0), total)
-	return int(covered * 100 / total), true
+	// Compute the percentage in float64: covered*100 as a Duration (int64
+	// nanoseconds) would overflow for windows longer than a few years.
+	return int(float64(covered) / float64(total) * 100), true
 }
 
 // runChunkedWebhookRedrive covers the window with a series of bounded server
@@ -271,12 +273,15 @@ func writeRedriveWebhookResponse(response *apitypes.WebhookRedriveResponse, dryR
 	totalFailed := 0
 	for _, result := range response.Results {
 		totalFailed += result.Failed
-		for _, selected := range result.Selected {
-			if _, err := fmt.Fprintf(os.Stderr, "selected app=%s id=%d delivered_at=%s event=%s action=%s status=%s status_code=%d repo=%s pr=%d\n",
-				result.AppName, selected.ID, selected.DeliveredAt, selected.Event, selected.Action, selected.Status, selected.StatusCode, selected.Repo, selected.PR); err != nil {
-				return err
-			}
-			if dryRun {
+		// The per-delivery detail is the dry-run's selection preview and can be
+		// very large on a wide window, so print it only for --dry-run; a real
+		// redrive reports the per-app redelivered/failed summary below.
+		if dryRun {
+			for _, selected := range result.Selected {
+				if _, err := fmt.Fprintf(os.Stderr, "selected app=%s id=%d delivered_at=%s event=%s action=%s status=%s status_code=%d repo=%s pr=%d\n",
+					result.AppName, selected.ID, selected.DeliveredAt, selected.Event, selected.Action, selected.Status, selected.StatusCode, selected.Repo, selected.PR); err != nil {
+					return err
+				}
 				if _, err := fmt.Fprintf(os.Stdout, "%d\n", selected.ID); err != nil {
 					return err
 				}
