@@ -179,6 +179,20 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		return
 	}
 
+	// A user-issued plan on a PR with no managed schema changes converges the
+	// checks (or explains apply-owned state) instead of searching the whole
+	// repo for a config. Auto-plan skips this: it is only dispatched for
+	// configs already discovered from the PR's changed files.
+	if !isAutoPlan {
+		if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Plan, "", databaseName, requestedBy); err != nil {
+			h.logger.Error("failed to check whether plan command needs schema change reconciliation", "repo", repo, "pr", pr, "database", databaseName, "error", err)
+			h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, err.Error())
+			return
+		} else if handled {
+			return
+		}
+	}
+
 	// Find config to get the database identity. Environments are server-owned.
 	var schemaDatabase string
 	if databaseName != "" {

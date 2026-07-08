@@ -94,6 +94,29 @@ func PreviewCommentNoManagedSchemaChanges() string {
 	})
 }
 
+// PreviewCommentNoManagedSchemaChangesChecksRefreshed renders the plan-command
+// outcome for a PR with no managed schema changes and no apply-owned state:
+// the SchemaBot checks were recreated as passing on the current head.
+func PreviewCommentNoManagedSchemaChangesChecksRefreshed() string {
+	return RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-03-15 14:30:00",
+		HeadSHA:     previewHeadSHA,
+	})
+}
+
+// PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants renders
+// the aggregate-leader variant of the checks-refreshed comment: the refreshed
+// check gates on tenant deployments' own checks for the touched schema paths.
+func PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants() string {
+	return RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
+		RequestedBy:    previewRequestedBy,
+		Timestamp:      "2026-03-15 14:30:00",
+		HeadSHA:        previewHeadSHA,
+		GatedOnTenants: true,
+	})
+}
+
 // PreviewCommentSchemaReconciliationInProgress renders the reconciliation
 // comment for a PR whose current diff no longer contains managed schema files
 // while a stored apply from that PR is still running.

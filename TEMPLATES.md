@@ -134,6 +134,30 @@ This PR does not contain schema changes managed by SchemaBot. SchemaBot did not 
 </details>
 
 <details>
+<summary><a name="no-managed-schema-changes-checks-refreshed"></a><strong>No Managed Schema Changes (Checks Refreshed)</strong></summary>
+
+
+## ✅ No Managed Schema Changes
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
+
+This PR does not contain schema changes managed by SchemaBot. The SchemaBot checks were refreshed as passing on `abcdef1234567890abcdef1234567890abcdef12`.
+
+</details>
+
+<details>
+<summary><a name="no-managed-schema-changes-gated-on-tenants"></a><strong>No Managed Schema Changes (Gated On Tenants)</strong></summary>
+
+
+## ✅ No Managed Schema Changes
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
+
+This PR does not contain schema changes managed by this SchemaBot deployment, but it touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on `abcdef1234567890abcdef1234567890abcdef12` and will pass once every tenant deployment's own check succeeds.
+
+</details>
+
+<details>
 <summary><a name="reconciliation-required-in-progress"></a><strong>Reconciliation Required (In Progress)</strong></summary>
 
 

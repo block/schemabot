@@ -202,6 +202,104 @@ func setupFakeGitHubForPlanOnTruncatedRepoWithPRState(t *testing.T, mux *http.Se
 	return result
 }
 
+// TestE2EPlanCommandOnNoSchemaChangesPRRecreatesPassingCheck exercises the
+// stuck-check rescue flow: a PR has no managed schema changes but its
+// SchemaBot check is missing (for example the PR predates check enablement
+// for the repo, or the check-creating webhook delivery was lost), so branch
+// protection waits on a check nothing will create. A user comments
+// `schemabot plan -e staging` to recover. The command must recreate the
+// aggregate check as passing on the current head and say so in a comment —
+// even in a repository whose recursive tree listing GitHub truncates, since
+// converging the checks for a no-schema-changes PR requires no whole-repo
+// config scan.
+func TestE2EPlanCommandOnNoSchemaChangesPRRecreatesPassingCheck(t *testing.T) {
+	dbName := "webhook_truncated_repo_converge"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlanOnTruncatedRepo(t, mux, nil, schemabotConfig, dbName)
+	h := newE2EHandlerWithConfigDirHints(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "No Managed Schema Changes")
+		assert.Contains(t, body, "abc123")
+		assert.NotContains(t, body, "truncated repository tree")
+		assert.NotContains(t, body, "Plan Failed")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for no-managed-schema-changes comment")
+	}
+
+	select {
+	case cr := <-result.checkRuns:
+		assert.Contains(t, cr.Name, "SchemaBot")
+		assert.Equal(t, "completed", cr.Status)
+		assert.Equal(t, "success", cr.Conclusion)
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for passing check run")
+	}
+}
+
+// TestE2EPlanCommandOnClosedPRRefusesToRecreateChecks exercises the plan
+// command on a closed PR with no managed schema changes: close-time cleanup
+// owns a closed PR's stored check state, so instead of recreating Check Runs
+// on a PR that can never merge, the command replies with an explicit error
+// and creates no Check Runs.
+func TestE2EPlanCommandOnClosedPRRefusesToRecreateChecks(t *testing.T) {
+	dbName := "webhook_truncated_repo_closed_pr"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlanOnTruncatedRepoWithPRState(t, mux, nil, schemabotConfig, dbName, "closed")
+	h := newE2EHandlerWithConfigDirHints(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "is closed")
+		assert.Contains(t, body, "open PRs")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for closed-PR error comment")
+	}
+
+	select {
+	case cr := <-result.checkRuns:
+		t.Fatalf("no Check Run should be created for a closed PR, got %q (%s/%s)", cr.Name, cr.Status, cr.Conclusion)
+	default:
+	}
+}
+
 // TestE2EPlanCommandOnTruncatedRepoDiscoversConfigViaConfiguredDirs exercises
 // database-scoped discovery on a huge monorepo: a user comments
 // `schemabot plan -e staging -d <db>` on a PR whose diff does not touch that

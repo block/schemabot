@@ -120,6 +120,10 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges())
 	case PreviewCommentNoManagedSchema:
 		fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChanges())
+	case PreviewCommentChecksRefreshed:
+		fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshed())
+	case PreviewCommentChecksRefreshedTenant:
+		fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants())
 	case PreviewCommentReconcileInProgress:
 		fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationInProgress())
 	case PreviewCommentReconcileCompleted:
