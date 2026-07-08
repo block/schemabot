@@ -191,13 +191,16 @@ func TestLocalClient_VolumeQueuedCrossInstanceAppliedBySequentialDrive(t *testin
 
 	// A different level while one is pending is rejected with retry guidance,
 	// so the level the driver reads, applies, and completes stays unambiguous.
-	_, err = receivingClient.Volume(ctx, &ternv1.VolumeRequest{
+	// The rejection travels as an unaccepted response, not an error, so callers
+	// across the gRPC boundary can tell a conflict from a transport failure.
+	conflicting, err := receivingClient.Volume(ctx, &ternv1.VolumeRequest{
 		ApplyId:     apply.ApplyIdentifier,
 		Environment: localClientTestEnvironment,
 		Volume:      3,
 	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "already queued")
+	require.NoError(t, err)
+	assert.False(t, conflicting.Accepted, "a conflicting level must not be accepted")
+	assert.Contains(t, conflicting.ErrorMessage, "already queued")
 
 	driveNextQueuedApply(t, stor, drivingClient)
 
@@ -348,13 +351,14 @@ func TestLocalClient_VolumeRejectsTerminalApplyAndInvalidLevel(t *testing.T) {
 	require.NotNil(t, settled)
 	require.Equal(t, state.Apply.Completed, settled.State)
 
-	_, err = client.Volume(ctx, &ternv1.VolumeRequest{
+	rejected, err := client.Volume(ctx, &ternv1.VolumeRequest{
 		ApplyId:     apply.ApplyIdentifier,
 		Environment: localClientTestEnvironment,
 		Volume:      5,
 	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "volume can only be adjusted while it is running")
+	require.NoError(t, err)
+	assert.False(t, rejected.Accepted, "a terminal apply must not accept a volume adjustment")
+	assert.Contains(t, rejected.ErrorMessage, "volume can only be adjusted while it is running")
 
 	req, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationVolume)
 	require.NoError(t, err)

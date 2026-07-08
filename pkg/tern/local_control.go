@@ -1450,10 +1450,15 @@ func (c *LocalClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*t
 	// A terminal apply has no running copy to retune; reject synchronously
 	// rather than queue a request no driver will ever service. This includes
 	// stopped applies — resume the schema change first, then adjust volume.
+	// Rejections travel as unaccepted responses (not errors) so callers across
+	// the gRPC boundary can distinguish them from transport or storage failures.
 	if state.IsTerminalApplyState(apply.State) {
 		c.logger.Warn("volume rejected: schema change is not active",
 			"apply_id", apply.ApplyIdentifier, "state", apply.State, "volume", req.Volume)
-		return nil, fmt.Errorf("schema change %s is %s; volume can only be adjusted while it is running", apply.ApplyIdentifier, apply.State)
+		return &ternv1.VolumeResponse{
+			Accepted:     false,
+			ErrorMessage: fmt.Sprintf("Schema change %s is %s; volume can only be adjusted while it is running", apply.ApplyIdentifier, apply.State),
+		}, nil
 	}
 
 	return c.queueVolumeRequest(ctx, apply, req.Volume)
@@ -1494,7 +1499,11 @@ func (c *LocalClient) queueVolumeRequest(ctx context.Context, apply *storage.App
 				"database", apply.Database,
 				"environment", apply.Environment,
 				"error", decodeErr)
-			return nil, fmt.Errorf("a volume adjustment is already queued for apply %s; retry after the driver resolves it", apply.ApplyIdentifier)
+			c.wakeOperator(apply)
+			return &ternv1.VolumeResponse{
+				Accepted:     false,
+				ErrorMessage: fmt.Sprintf("A volume adjustment is already queued for apply %s; retry after the driver resolves it", apply.ApplyIdentifier),
+			}, nil
 		}
 		if pendingVolume != volume {
 			c.logger.Info("volume rejected: a different volume adjustment is already queued",
@@ -1503,7 +1512,10 @@ func (c *LocalClient) queueVolumeRequest(ctx context.Context, apply *storage.App
 				"environment", apply.Environment,
 				"pending_volume", pendingVolume,
 				"requested_volume", volume)
-			return nil, fmt.Errorf("a volume adjustment to %d is already queued for apply %s; the driver applies it at its next progress check — retry afterwards", pendingVolume, apply.ApplyIdentifier)
+			return &ternv1.VolumeResponse{
+				Accepted:     false,
+				ErrorMessage: fmt.Sprintf("A volume adjustment to %d is already queued for apply %s; the driver applies it at its next progress check — retry afterwards", pendingVolume, apply.ApplyIdentifier),
+			}, nil
 		}
 		c.logger.Info("volume request already pending for apply driver",
 			"apply_id", apply.ApplyIdentifier,
