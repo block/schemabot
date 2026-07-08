@@ -181,6 +181,7 @@ func mergeWebhookRedriveResults(base, next apitypes.WebhookRedriveResult) apityp
 	base.Fetched += next.Fetched
 	base.Pages += next.Pages
 	base.Selected = append(base.Selected, next.Selected...)
+	base.Skipped += next.Skipped
 	base.Redelivered += next.Redelivered
 	base.Failed += next.Failed
 	base.OldestFetched = next.OldestFetched
