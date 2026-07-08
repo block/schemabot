@@ -221,6 +221,62 @@ func withLoading(message string, show bool, fn func() error) error {
 	return err
 }
 
+// startLiveProgress renders a spinner with a caller-updated status line on
+// stderr, for chunked operations that report progress between requests.
+// update replaces the status text; stop clears the line. Both are no-ops when
+// show is false or stderr is not a terminal, so scripted runs stay clean.
+func startLiveProgress(show bool) (update func(string), stop func()) {
+	if !show || !loadingSpinnerTerminal() {
+		return func(string) {}, func() {}
+	}
+
+	var mu sync.Mutex
+	message := ""
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		frame := 0
+		ticker := time.NewTicker(loadingSpinnerInterval)
+		defer ticker.Stop()
+		for {
+			mu.Lock()
+			current := message
+			mu.Unlock()
+			if current != "" {
+				if _, err := fmt.Fprintf(loadingSpinnerWriter, "\r\033[2K%s%s %s%s", templates.ANSIDim, loadingSpinnerFrames[frame%len(loadingSpinnerFrames)], current, templates.ANSIReset); err != nil {
+					return
+				}
+			}
+			frame++
+			select {
+			case <-done:
+				if _, err := fmt.Fprint(loadingSpinnerWriter, "\r\033[2K"); err != nil {
+					return
+				}
+				return
+			case <-ticker.C:
+			}
+		}
+	})
+
+	update = func(text string) {
+		mu.Lock()
+		message = text
+		mu.Unlock()
+	}
+	// stop is idempotent: callers commonly invoke it explicitly on the success
+	// path and again via defer, and a plain close(done) would panic the second
+	// time.
+	var stopOnce sync.Once
+	stop = func() {
+		stopOnce.Do(func() {
+			close(done)
+			wg.Wait()
+		})
+	}
+	return update, stop
+}
+
 // requireControlScope validates the explicit fields that scope a control operation.
 func requireControlScope(applyID, environment string) error {
 	if applyID == "" {

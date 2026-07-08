@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/alecthomas/kong"
@@ -51,6 +53,7 @@ type CLI struct {
 	Configure  commands.ConfigureCmd  `cmd:"" help:"Configure CLI settings (endpoint, profiles)"`
 	Login      commands.LoginCmd      `cmd:"" help:"Log in via OIDC and cache a token for the active profile"`
 	Settings   commands.SettingsCmd   `cmd:"" help:"View or update schema change settings"`
+	Webhooks   commands.WebhooksCmd   `cmd:"" help:"Manage GitHub webhook operations"`
 	Serve      commands.ServeCmd      `cmd:"" help:"Start the SchemaBot HTTP API server"`
 }
 
@@ -88,7 +91,19 @@ func main() {
 	}
 	client.SetAuthToken(token)
 
+	// Cancel long-running commands on Ctrl+C / SIGTERM. The first signal
+	// cancels the context so in-flight requests stop and the command can print
+	// a clean summary; a second signal restores default handling and
+	// force-terminates. Bind as the context.Context interface so command Run
+	// methods can declare a ctx parameter (kong binds concrete values by
+	// dynamic type, so an interface parameter needs BindTo).
+	runCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx.BindTo(runCtx, (*context.Context)(nil))
+
 	err = ctx.Run(&cli.Globals)
+	// Stop intercepting signals now that the command is done; an explicit call
+	// rather than defer, since the os.Exit below would skip a deferred stop.
+	stopSignals()
 	if err != nil {
 		// ErrSilent means the error was already displayed - just exit with code 1
 		if !errors.Is(err, commands.ErrSilent) {

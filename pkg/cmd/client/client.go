@@ -72,6 +72,14 @@ func ListDatabases(endpoint string, opts ListDatabasesOptions) (*apitypes.Databa
 	return &result, nil
 }
 
+func RedriveWebhooks(ctx context.Context, endpoint string, req apitypes.WebhookRedriveRequest) (*apitypes.WebhookRedriveResponse, error) {
+	var result apitypes.WebhookRedriveResponse
+	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/webhooks/redrive", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // PullSchemaOptions controls optional live schema pull request fields.
 type PullSchemaOptions struct {
 	Namespaces    []string

@@ -25,6 +25,12 @@ var authTransport = &bearerTransport{base: http.DefaultTransport}
 // Uses a 30s timeout to avoid hanging indefinitely on network stalls.
 var httpClient = &http.Client{Timeout: 30 * time.Second, Transport: authTransport}
 
+// webhookOpsHTTPClient serves the webhook operator endpoints, which crawl
+// GitHub delivery history or every open PR server-side and routinely need far
+// longer than the default client timeout. Matches the server's own budget
+// for these routes.
+var webhookOpsHTTPClient = &http.Client{Timeout: 15 * time.Minute, Transport: authTransport}
+
 // SetAuthToken configures the Bearer token attached to every CLI request. An
 // empty token leaves requests unauthenticated, which is correct against a
 // server with auth disabled. Surrounding whitespace is trimmed so a token
@@ -159,17 +165,34 @@ func doSendBody(endpoint, method, path string, body any) error {
 // doPostInto sends a JSON POST to endpoint+path and unmarshals the JSON response into result.
 // Returns an *APIError for non-200 responses (use IsNotFound to check for 404).
 func doPostInto(endpoint, path string, body any, result any) error {
+	return doPostIntoWithClient(context.Background(), httpClient, endpoint, path, body, result)
+}
+
+// doSlowPostIntoCtx is doPostInto with the long-running webhook ops client and
+// a caller-supplied context, for operator endpoints whose server-side work
+// legitimately outlives the default timeout and that must stop promptly when
+// the operator cancels (Ctrl+C).
+func doSlowPostIntoCtx(ctx context.Context, endpoint, path string, body any, result any) error {
+	return doPostIntoWithClient(ctx, webhookOpsHTTPClient, endpoint, path, body, result)
+}
+
+func doPostIntoWithClient(ctx context.Context, client *http.Client, endpoint, path string, body any, result any) error {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("marshal request body: %w", err)
 	}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint+path, bytes.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+path, bytes.NewReader(jsonBody))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
+		// Surface a canceled context as-is so callers can tell an operator
+		// cancellation apart from a real connection failure.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return FormatConnectionError(endpoint, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
