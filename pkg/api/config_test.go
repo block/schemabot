@@ -3342,6 +3342,48 @@ func TestSchemaDirHintsForRepoNotExhaustiveWhenDatabaseHasNoAllowedDirs(t *testi
 	assert.False(t, exhaustive, "a database without allowed_dirs accepts a config anywhere in the repo")
 }
 
+func TestSchemaDirHintsForDatabase(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"widgets": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"apps/widgets/schema", "apps/widgets/legacy/"},
+			},
+			"open": {
+				AllowedRepos: []string{"octocat/hello-world"},
+			},
+			"wild": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"apps/wild/schema", "*"},
+			},
+			"payments": {
+				AllowedRepos: []string{"octocat/other-repo"},
+				AllowedDirs:  []string{"payments/schema"},
+			},
+		},
+	}
+
+	dirs, exhaustive := cfg.SchemaDirHintsForDatabase("octocat/hello-world", "widgets")
+	assert.Equal(t, []string{"apps/widgets/legacy", "apps/widgets/schema"}, dirs)
+	assert.True(t, exhaustive, "every allowed dir is a literal directory")
+
+	dirs, exhaustive = cfg.SchemaDirHintsForDatabase("octocat/hello-world", "open")
+	assert.Empty(t, dirs)
+	assert.False(t, exhaustive, "a database without allowed_dirs accepts a config anywhere")
+
+	dirs, exhaustive = cfg.SchemaDirHintsForDatabase("octocat/hello-world", "wild")
+	assert.Equal(t, []string{"apps/wild/schema"}, dirs)
+	assert.False(t, exhaustive, "a wildcard entry accepts configs outside every probe-able directory")
+
+	dirs, exhaustive = cfg.SchemaDirHintsForDatabase("octocat/hello-world", "payments")
+	assert.Empty(t, dirs)
+	assert.True(t, exhaustive, "a database that does not accept the repo has no policy-valid config location in it")
+
+	dirs, exhaustive = cfg.SchemaDirHintsForDatabase("octocat/hello-world", "unknown")
+	assert.Empty(t, dirs)
+	assert.True(t, exhaustive, "an unconfigured database has no policy-valid config location")
+}
+
 func TestSchemaDirHintsForRepoNoMatches(t *testing.T) {
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{

@@ -65,6 +65,9 @@ type DatabaseNotFoundError struct {
 }
 
 func (e *DatabaseNotFoundError) Error() string {
+	if len(e.AvailableDatabases) == 0 {
+		return fmt.Sprintf("database '%s' not found", e.DatabaseName)
+	}
 	return fmt.Sprintf("database '%s' not found. Available databases: %s",
 		e.DatabaseName, strings.Join(e.AvailableDatabases, ", "))
 }
@@ -137,36 +140,7 @@ func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref stri
 		return result, nil
 	}
 
-	var configPaths []string
-	for _, entry := range entries {
-		if entry.Type == "blob" && strings.HasSuffix(entry.Path, ConfigFileName) {
-			configPaths = append(configPaths, entry.Path)
-		}
-	}
-
-	result := &FindAllConfigsResult{}
-	if len(configPaths) == 0 {
-		return result, nil
-	}
-
-	for _, configPath := range configPaths {
-		config, err := ic.FetchConfig(ctx, repo, configPath, ref)
-		if err != nil {
-			ic.logger.Warn("failed to parse config", "path", configPath, "error", err)
-			result.InvalidConfigs = append(result.InvalidConfigs, InvalidConfigInfo{
-				Path:  configPath,
-				Error: err.Error(),
-			})
-			continue
-		}
-
-		schemaDir := path.Dir(configPath)
-		result.ValidConfigs = append(result.ValidConfigs, DiscoveredConfig{
-			Config:    config,
-			Path:      configPath,
-			SchemaDir: schemaDir,
-		})
-	}
+	result := ic.collectConfigsFromTree(ctx, repo, ref, entries)
 
 	ic.logger.Debug("config discovery complete",
 		"valid", len(result.ValidConfigs),
@@ -174,6 +148,61 @@ func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref stri
 		"repo", repo,
 	)
 	return result, nil
+}
+
+// collectConfigsFromTree fetches and parses every schemabot.yaml among the
+// given tree entries. Unparseable configs are reported as invalid rather than
+// failing the whole discovery.
+func (ic *InstallationClient) collectConfigsFromTree(ctx context.Context, repo, ref string, entries []TreeEntry) *FindAllConfigsResult {
+	result := &FindAllConfigsResult{}
+	for _, entry := range entries {
+		if entry.Type != "blob" || !strings.HasSuffix(entry.Path, ConfigFileName) {
+			continue
+		}
+		config, err := ic.FetchConfig(ctx, repo, entry.Path, ref)
+		if err != nil {
+			ic.logger.Warn("failed to parse config", "path", entry.Path, "error", err)
+			result.InvalidConfigs = append(result.InvalidConfigs, InvalidConfigInfo{
+				Path:  entry.Path,
+				Error: err.Error(),
+			})
+			continue
+		}
+		result.ValidConfigs = append(result.ValidConfigs, DiscoveredConfig{
+			Config:    config,
+			Path:      entry.Path,
+			SchemaDir: path.Dir(entry.Path),
+		})
+	}
+	return result
+}
+
+// findAllConfigsForDatabase discovers configs for a database-scoped lookup.
+// With a complete tree it returns the full discovery result (scoped=false).
+// With a truncated tree it probes only the named database's configured
+// schema directories (scoped=true): absence there is authoritative for the
+// database, but the result does not enumerate other databases' configs. When
+// the database's directories cannot be probed exhaustively, it fails closed
+// with ErrGitTreeTruncated.
+func (ic *InstallationClient) findAllConfigsForDatabase(ctx context.Context, repo, ref, databaseName string) (*FindAllConfigsResult, bool, error) {
+	entries, truncated, err := ic.FetchGitTree(ctx, repo, ref)
+	if err != nil {
+		return nil, false, fmt.Errorf("fetch git tree: %w", err)
+	}
+	if !truncated {
+		return ic.collectConfigsFromTree(ctx, repo, ref, entries), false, nil
+	}
+	result, ok, hintErr := ic.findConfigsInDatabaseHintDirs(ctx, repo, ref, databaseName)
+	if hintErr != nil {
+		return nil, false, fmt.Errorf("discover schemabot config in configured schema dirs of database %s in repo %s ref %s: %w", databaseName, repo, ref, hintErr)
+	}
+	if !ok {
+		return nil, false, fmt.Errorf("discover schemabot config for database %s in repo %s ref %s: %w", databaseName, repo, ref, ErrGitTreeTruncated)
+	}
+	ic.logger.Info("git tree truncated; scoped config discovery to the database's configured schema dirs",
+		"repo", repo, "ref", ref, "database", databaseName,
+		"valid", len(result.ValidConfigs), "invalid", len(result.InvalidConfigs))
+	return result, true, nil
 }
 
 // findConfigsInHintDirs discovers schemabot.yaml configs by scanning the
@@ -196,7 +225,7 @@ func (ic *InstallationClient) findConfigsInHintDirs(ctx context.Context, repo, r
 		ic.logger.Debug("no config dir hints configured; cannot scan truncated repo", "repo", repo, "ref", ref)
 		return nil, false, nil
 	}
-	hints, exhaustive := ic.configDirHints(repo)
+	hints, exhaustive := ic.configDirHints.SchemaDirHintsForRepo(repo)
 	if !exhaustive {
 		ic.logger.Warn("configured schema dirs do not cover every policy-valid config location (a database allows configs outside any probe-able directory); keeping fail-closed truncation error",
 			"repo", repo, "ref", ref, "hint_dirs", len(hints))
@@ -207,15 +236,60 @@ func (ic *InstallationClient) findConfigsInHintDirs(ctx context.Context, repo, r
 		return nil, false, nil
 	}
 
+	result, err := ic.scanHintDirsForConfigs(ctx, repo, ref, hints)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if len(result.ValidConfigs) == 0 && len(result.InvalidConfigs) == 0 {
+		ic.logger.Warn("configured schema dirs contain no configs; keeping fail-closed truncation error",
+			"repo", repo, "ref", ref, "hint_dirs", len(hints))
+		return nil, false, nil
+	}
+	return result, true, nil
+}
+
+// findConfigsInDatabaseHintDirs discovers schemabot.yaml configs by scanning
+// only the named database's configured schema directories, for lookups that
+// already know which database they want. ok is false when the client has no
+// hints or the database's directories are not exhaustive (its config could
+// live outside any probe-able directory) — the caller must keep failing
+// closed with the truncation error. Unlike the repo-wide scan, an empty
+// result with exhaustive directories IS authoritative: no policy-valid
+// location for this database's config was left unscanned.
+func (ic *InstallationClient) findConfigsInDatabaseHintDirs(ctx context.Context, repo, ref, databaseName string) (*FindAllConfigsResult, bool, error) {
+	if ic.configDirHints == nil {
+		ic.logger.Debug("no config dir hints configured; cannot scan truncated repo",
+			"repo", repo, "ref", ref, "database", databaseName)
+		return nil, false, nil
+	}
+	hints, exhaustive := ic.configDirHints.SchemaDirHintsForDatabase(repo, databaseName)
+	if !exhaustive {
+		ic.logger.Warn("database's configured schema dirs do not cover every policy-valid config location; keeping fail-closed truncation error",
+			"repo", repo, "ref", ref, "database", databaseName, "hint_dirs", len(hints))
+		return nil, false, nil
+	}
+
+	result, err := ic.scanHintDirsForConfigs(ctx, repo, ref, hints)
+	if err != nil {
+		return nil, false, err
+	}
+	return result, true, nil
+}
+
+// scanHintDirsForConfigs scans the recursive subtree of each directory for
+// schemabot.yaml files. The scan is recursive per directory, so configs
+// nested below a directory are found (allowed_dirs matching is prefix-based).
+func (ic *InstallationClient) scanHintDirsForConfigs(ctx context.Context, repo, ref string, dirs []string) (*FindAllConfigsResult, error) {
 	result := &FindAllConfigsResult{}
 	seen := make(map[string]struct{})
 	// Hint directories often share path prefixes; memoize the shallow
 	// per-level fetches so shared levels cost one API call per scan.
 	levelCache := make(map[string][]TreeEntry)
-	for _, dir := range hints {
+	for _, dir := range dirs {
 		entries, found, err := ic.fetchGitSubtreeCached(ctx, repo, ref, dir, levelCache)
 		if err != nil {
-			return nil, false, fmt.Errorf("scan configured schema dir %s: %w", dir, err)
+			return nil, fmt.Errorf("scan configured schema dir %s: %w", dir, err)
 		}
 		if !found {
 			ic.logger.Debug("configured schema dir does not exist at ref; skipping",
@@ -249,38 +323,61 @@ func (ic *InstallationClient) findConfigsInHintDirs(ctx context.Context, repo, r
 			})
 		}
 	}
-
-	if len(result.ValidConfigs) == 0 && len(result.InvalidConfigs) == 0 {
-		ic.logger.Warn("configured schema dirs contain no configs; keeping fail-closed truncation error",
-			"repo", repo, "ref", ref, "hint_dirs", len(hints))
-		return nil, false, nil
-	}
-	return result, true, nil
+	return result, nil
 }
 
-// FindConfigByDatabaseName finds a schemabot.yaml config by database name.
+// FindConfigByDatabaseName finds a schemabot.yaml config by database name:
+// first among the PR's changed files, then by searching the repository.
 func (ic *InstallationClient) FindConfigByDatabaseName(ctx context.Context, repo string, pr int, databaseName string) (*SchemabotConfig, string, error) {
+	config, configDir, found, err := ic.FindConfigByDatabaseNameInPR(ctx, repo, pr, databaseName)
+	if err != nil {
+		return nil, "", err
+	}
+	if found {
+		return config, configDir, nil
+	}
+	return ic.FindConfigByDatabaseNameInRepo(ctx, repo, pr, databaseName)
+}
+
+// FindConfigByDatabaseNameInPR finds the named database's schemabot.yaml
+// among the configs reachable from the PR's changed files. found is false
+// when the PR does not touch that database's schema — resolving it then
+// requires the repository-wide search (FindConfigByDatabaseNameInRepo),
+// which callers may want to gate or avoid.
+func (ic *InstallationClient) FindConfigByDatabaseNameInPR(ctx context.Context, repo string, pr int, databaseName string) (*SchemabotConfig, string, bool, error) {
+	prInfo, err := ic.FetchPullRequest(ctx, repo, pr)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("fetch PR info: %w", err)
+	}
+
+	files, err := ic.FetchPRFiles(ctx, repo, pr)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("fetch PR files: %w", err)
+	}
+
+	prConfigs, err := ic.FindConfigsForPRFiles(ctx, repo, prInfo.HeadSHA, files)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("find configs for PR: %w", err)
+	}
+	config, configDir, ok, err := selectConfigByDatabaseName(databaseName, prConfigs)
+	if err != nil {
+		return nil, "", false, err
+	}
+	return config, configDir, ok, nil
+}
+
+// FindConfigByDatabaseNameInRepo finds the named database's schemabot.yaml by
+// searching the repository at the PR's head. When the repository tree is
+// truncated, the search probes only the named database's configured schema
+// directories, so it stays cheap regardless of how many databases the server
+// configures for the repo.
+func (ic *InstallationClient) FindConfigByDatabaseNameInRepo(ctx context.Context, repo string, pr int, databaseName string) (*SchemabotConfig, string, error) {
 	prInfo, err := ic.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
 		return nil, "", fmt.Errorf("fetch PR info: %w", err)
 	}
 
-	files, err := ic.FetchPRFiles(ctx, repo, pr)
-	if err != nil {
-		return nil, "", fmt.Errorf("fetch PR files: %w", err)
-	}
-
-	prConfigs, err := ic.FindConfigsForPRFiles(ctx, repo, prInfo.HeadSHA, files)
-	if err != nil {
-		return nil, "", fmt.Errorf("find configs for PR: %w", err)
-	}
-	if config, configDir, ok, err := selectConfigByDatabaseName(databaseName, prConfigs); err != nil {
-		return nil, "", err
-	} else if ok {
-		return config, configDir, nil
-	}
-
-	result, err := ic.FindAllConfigs(ctx, repo, prInfo.HeadSHA)
+	result, scoped, err := ic.findAllConfigsForDatabase(ctx, repo, prInfo.HeadSHA, databaseName)
 	if err != nil {
 		return nil, "", fmt.Errorf("find configs: %w", err)
 	}
@@ -291,6 +388,21 @@ func (ic *InstallationClient) FindConfigByDatabaseName(ctx context.Context, repo
 			invalidPaths = append(invalidPaths, ic.Path)
 		}
 		return nil, "", fmt.Errorf("%w at %s", ErrInvalidConfig, strings.Join(invalidPaths, ", "))
+	}
+
+	if scoped {
+		config, configDir, ok, err := selectConfigByDatabaseName(databaseName, result.ValidConfigs)
+		if err != nil {
+			return nil, "", err
+		}
+		if !ok {
+			// The scoped scan covered every directory this database's config
+			// could live in, so absence is authoritative. Other databases
+			// were not enumerated, so no available-databases list is offered.
+			return nil, "", &DatabaseNotFoundError{DatabaseName: databaseName}
+		}
+		ic.logger.Debug("found config for database via scoped truncated-tree probe", "database", databaseName, "path", configDir)
+		return config, configDir, nil
 	}
 
 	if len(result.ValidConfigs) == 0 {

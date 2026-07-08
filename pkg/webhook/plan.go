@@ -84,6 +84,13 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 
+	// A user-issued plan reads the resolved database's live schema, so it
+	// requires that database's configured principals.
+	if h.planForResolvedDatabaseBlocked(ctx, repo, pr, installationID, requestedBy, schemaResult.Database, environment) {
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan blocked by actor authorization"})
+		return
+	}
+
 	// Build PlanRequest in the format expected by the API service
 	prNumber := int32(pr)
 	deployment := ""
@@ -160,6 +167,38 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	})
 }
 
+// planForResolvedDatabaseBlocked enforces actor authorization once a
+// user-issued plan has resolved which database it targets. A plan reads the
+// database's live schema, so it requires the same configured principals as
+// the mutating commands — the database's operator teams/users and the
+// instance admins. A plan that resolves no managed database (the stuck-check
+// rescue on a no-schema-changes PR) never reaches this gate, and databases
+// not configured on this deployment defer to the downstream ownership
+// handling so fan-out deployments stay silent. When blocked, the
+// authorization path has already posted the rejection comment.
+func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo string, pr int, installationID int64, requestedBy, databaseName, environment string) bool {
+	if databaseName == "" {
+		h.logger.Debug("plan resolved no database; no authorization gate", "repo", repo, "pr", pr)
+		return false
+	}
+	dbConfig := h.service.Config().Database(databaseName)
+	if dbConfig == nil {
+		h.logger.Debug("plan database is not configured on this deployment; deferring to downstream ownership handling",
+			"repo", repo, "pr", pr, "database", databaseName)
+		return false
+	}
+	authzClient, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, databaseName, environment, action.Plan)
+	if blocked {
+		return true
+	}
+	if authzClient == nil {
+		h.logger.Debug("PR command authorization disabled; plan proceeds ungated",
+			"repo", repo, "pr", pr, "database", databaseName, "requested_by", requestedBy)
+		return false
+	}
+	return h.enforcePRCommandActorAuthorization(ctx, authzClient, repo, pr, installationID, requestedBy, databaseName, dbConfig.Type, environment, action.Plan)
+}
+
 // handleMultiEnvPlan runs plan for all configured environments and posts a single combined comment.
 // When isAutoPlan is true and no environments have changes or errors, the comment is skipped to reduce PR noise.
 // commentID is the command comment to acknowledge once discovery commits this
@@ -218,6 +257,13 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 		schemaDatabase = config.Database
 	}
+	// A user-issued plan reads the resolved database's live schema, so it
+	// requires that database's configured principals. Auto-plans are
+	// system-triggered with no actor to authorize.
+	if !isAutoPlan && h.planForResolvedDatabaseBlocked(ctx, repo, pr, installationID, requestedBy, schemaDatabase, "") {
+		return
+	}
+
 	configuredEnvironments, envErr := h.configuredDatabaseEnvironments(schemaDatabase)
 	if envErr != nil {
 		if isAutoPlan {

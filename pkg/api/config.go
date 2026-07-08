@@ -562,7 +562,8 @@ type DatabaseConfig struct {
 
 // PRCommandAuthorizationConfig configures actor authorization for mutating
 // SchemaBot GitHub PR comment commands (apply, stop, cutover, rollback,
-// unlock, and their confirmation variants).
+// unlock, and their confirmation variants), and for user-issued plan
+// commands that resolve to a configured database.
 type PRCommandAuthorizationConfig struct {
 	// Enabled turns on fail-closed actor authorization for mutating PR
 	// commands.
@@ -751,6 +752,48 @@ func (c *ServerConfig) RepoAdmins(repo string) (teams, users []string) {
 // truncated-tree fallback must keep failing closed, because a partial probe
 // could return a confidently wrong result (a single config where a full scan
 // would find several, or a "database not found" for a config that exists).
+// SchemaDirHintsForDatabase returns the configured schema directories of the
+// named database when it accepts changes from repo, sorted and deduplicated.
+// A database-scoped truncated-tree probe only needs this database's
+// directories, so a repo with hundreds of configured databases costs a few
+// API calls instead of a scan of every configured directory.
+//
+// exhaustive reports whether the returned directories cover every location
+// this database's policy-valid config could live in. It is true with no
+// directories when the database does not exist or does not accept the repo —
+// no policy-valid config location exists, so an empty probe result is
+// authoritative. It is false when the database has no allowed_dirs
+// restriction or a wildcard ("*") or repo-root (".") entry, where the config
+// could live anywhere and the probe must keep failing closed.
+func (c *ServerConfig) SchemaDirHintsForDatabase(repo, database string) (dirs []string, exhaustive bool) {
+	db, ok := c.Databases[database]
+	if !ok {
+		return nil, true
+	}
+	if len(db.AllowedRepos) > 0 && !repoAllowed(db.AllowedRepos, repo) {
+		return nil, true
+	}
+	if len(db.AllowedDirs) == 0 {
+		return nil, false
+	}
+	seen := make(map[string]struct{})
+	exhaustive = true
+	for _, dir := range db.AllowedDirs {
+		normalized, err := normalizeSchemaPath(dir)
+		if err != nil || normalized == "*" || normalized == "." {
+			exhaustive = false
+			continue
+		}
+		if _, dup := seen[normalized]; dup {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		dirs = append(dirs, normalized)
+	}
+	slices.Sort(dirs)
+	return dirs, exhaustive
+}
+
 func (c *ServerConfig) SchemaDirHintsForRepo(repo string) (dirs []string, exhaustive bool) {
 	seen := make(map[string]struct{})
 	exhaustive = true

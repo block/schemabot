@@ -33,7 +33,7 @@ func newE2EHandlerWithConfigDirHints(t *testing.T, svc *api.Service, client *gh.
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
-	installClient.SetConfigDirHints(svc.Config().SchemaDirHintsForRepo)
+	installClient.SetConfigDirHints(svc.Config())
 	factory := &fakeClientFactory{client: installClient}
 	return NewHandler(svc, factory, nil, logger)
 }

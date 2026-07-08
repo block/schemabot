@@ -718,6 +718,19 @@ func registerDirectoryContent(t *testing.T, mux *http.ServeMux, endpointPath str
 // subtrees resolve: shallow fetches of the root and intermediate levels return
 // directory entries, and the apps/widgets/schema subtree lists subtreeEntries
 // (paths relative to that directory).
+// registerConfigTestPullRequest serves PR #1 with head SHA abc123, matching
+// the tree fixtures used by the truncated-repo config tests.
+func registerConfigTestPullRequest(t *testing.T, mux *http.ServeMux) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"head": map[string]any{"ref": "feature", "sha": "abc123"},
+			"base": map[string]any{"ref": "main", "sha": "def456"},
+			"user": map[string]any{"login": "mona"},
+		}))
+	})
+}
+
 func registerTruncatedRepoWithSchemaSubtree(t *testing.T, mux *http.ServeMux, subtreeEntries []map[string]any) {
 	t.Helper()
 
@@ -760,13 +773,27 @@ func registerGitBlob(t *testing.T, mux *http.ServeMux, sha, content string) {
 	})
 }
 
-func widgetsConfigDirHints(t *testing.T, dirs ...string) func(repo string) ([]string, bool) {
-	t.Helper()
+// testConfigDirHints implements ConfigDirHints for tests: the repo-wide scan
+// and every database-scoped lookup return the same directories.
+type testConfigDirHints struct {
+	t          *testing.T
+	dirs       []string
+	exhaustive bool
+}
 
-	return func(repo string) ([]string, bool) {
-		require.Equal(t, "octocat/hello-world", repo)
-		return dirs, true
-	}
+func (h testConfigDirHints) SchemaDirHintsForRepo(repo string) ([]string, bool) {
+	require.Equal(h.t, "octocat/hello-world", repo)
+	return h.dirs, h.exhaustive
+}
+
+func (h testConfigDirHints) SchemaDirHintsForDatabase(repo, _ string) ([]string, bool) {
+	require.Equal(h.t, "octocat/hello-world", repo)
+	return h.dirs, h.exhaustive
+}
+
+func widgetsConfigDirHints(t *testing.T, dirs ...string) ConfigDirHints {
+	t.Helper()
+	return testConfigDirHints{t: t, dirs: dirs, exhaustive: true}
 }
 
 // A repo-root schema path cannot be recovered through a subtree fetch when
@@ -870,6 +897,68 @@ func TestFindAllConfigsTruncatedTreeFailsClosedWhenNoHintsForRepo(t *testing.T) 
 	assert.ErrorIs(t, err, ErrGitTreeTruncated)
 }
 
+// A database-scoped lookup on a truncated repo probes only the named
+// database's configured directories: the config is found without scanning
+// every configured directory in the repo.
+func TestFindConfigByDatabaseNameInRepoTruncatedUsesScopedProbe(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+	registerConfigTestPullRequest(t, mux)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(widgetsConfigDirHints(t, "apps/widgets/schema"))
+
+	config, configDir, err := ic.FindConfigByDatabaseNameInRepo(t.Context(), "octocat/hello-world", 1, "widgets")
+
+	require.NoError(t, err)
+	assert.Equal(t, "widgets", config.Database)
+	assert.Equal(t, "apps/widgets/schema", configDir)
+}
+
+// A scoped probe that lists the database's configured directories completely
+// and finds no config for it is authoritative: the caller gets a clear
+// not-found error, with no misleading available-databases list (other
+// databases were never enumerated).
+func TestFindConfigByDatabaseNameInRepoTruncatedScopedProbeNotFound(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+	registerConfigTestPullRequest(t, mux)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(widgetsConfigDirHints(t, "apps/widgets/schema"))
+
+	_, _, err := ic.FindConfigByDatabaseNameInRepo(t.Context(), "octocat/hello-world", 1, "payments")
+
+	var notFound *DatabaseNotFoundError
+	require.ErrorAs(t, err, &notFound)
+	assert.Equal(t, "payments", notFound.DatabaseName)
+	assert.Empty(t, notFound.AvailableDatabases)
+	assert.NotContains(t, err.Error(), "Available databases")
+}
+
+// A database whose own directories cannot be probed exhaustively keeps the
+// fail-closed truncation error for scoped lookups, exactly like the
+// repo-wide scan.
+func TestFindConfigByDatabaseNameInRepoTruncatedNotExhaustiveFailsClosed(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, nil)
+	registerConfigTestPullRequest(t, mux)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(testConfigDirHints{t: t, dirs: []string{"apps/widgets/schema"}, exhaustive: false})
+
+	_, _, err := ic.FindConfigByDatabaseNameInRepo(t.Context(), "octocat/hello-world", 1, "widgets")
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrGitTreeTruncated)
+}
+
 // A database that allows configs outside every probe-able directory (no
 // allowed_dirs, a wildcard, or a repo-root entry) makes the hint list
 // non-exhaustive: a partial probe could return a confidently wrong result, so
@@ -883,10 +972,7 @@ func TestFindAllConfigsTruncatedTreeFailsClosedWhenHintsNotExhaustive(t *testing
 	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
 
 	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	ic.SetConfigDirHints(func(repo string) ([]string, bool) {
-		require.Equal(t, "octocat/hello-world", repo)
-		return []string{"apps/widgets/schema"}, false
-	})
+	ic.SetConfigDirHints(testConfigDirHints{t: t, dirs: []string{"apps/widgets/schema"}, exhaustive: false})
 
 	_, err := ic.FindAllConfigs(t.Context(), "octocat/hello-world", "abc123")
 

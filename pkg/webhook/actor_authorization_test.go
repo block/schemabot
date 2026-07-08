@@ -914,6 +914,104 @@ func actorAuthStorageTestHandler(cfg *api.ServerConfig, store storage.Storage, i
 
 // commentRecorder returns a mux handler that captures posted PR comment bodies
 // on the given channel and responds like the GitHub create-comment API.
+// A user-issued plan reads the resolved database's live schema, so an actor
+// who is neither an admin nor one of that database's operators is blocked
+// with a rejection that lists who can run the command.
+func TestPlanForResolvedDatabaseBlocksUnauthorizedActor(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	blocked := h.planForResolvedDatabaseBlocked(t.Context(), "octocat/hello-world", 1, 12345, "mona", "orders", "")
+
+	assert.True(t, blocked)
+	body := requireComment(t, comments, "unauthorized plan comment")
+	assert.Contains(t, body, "SchemaBot Command Not Authorized")
+	assert.Contains(t, body, "@mona is not authorized")
+}
+
+// The database's configured operator users satisfy the plan gate: planning
+// requires the same access the database's mutating commands do.
+func TestPlanForResolvedDatabaseAllowsDatabaseOperator(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"mona"}
+		cfg.Databases["orders"] = db
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	blocked := h.planForResolvedDatabaseBlocked(t.Context(), "octocat/hello-world", 1, 12345, "mona", "orders", "")
+
+	assert.False(t, blocked)
+	select {
+	case body := <-comments:
+		t.Fatalf("no comment should be posted for an authorized operator, got %q", body)
+	default:
+	}
+}
+
+// With PR command authorization disabled, plan keeps its ungated behavior.
+func TestPlanForResolvedDatabaseUngatedWhenAuthorizationDisabled(t *testing.T) {
+	client, _ := setupGitHubServer(t)
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	h := actorAuthTestHandler(actorAuthTestConfig(false), installClient)
+
+	blocked := h.planForResolvedDatabaseBlocked(t.Context(), "octocat/hello-world", 1, 12345, "mona", "orders", "")
+
+	assert.False(t, blocked)
+}
+
+// A database not configured on this deployment defers to the downstream
+// ownership handling, so fan-out deployments stay silent instead of posting
+// authorization rejections for databases they do not manage.
+func TestPlanForResolvedDatabaseSkipsGateForUnconfiguredDatabase(t *testing.T) {
+	client, _ := setupGitHubServer(t)
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	blocked := h.planForResolvedDatabaseBlocked(t.Context(), "octocat/hello-world", 1, 12345, "mona", "someone-elses-db", "")
+
+	assert.False(t, blocked)
+}
+
+// The full plan command path authorizes the actor once discovery resolves
+// the database — even when the PR itself touches that database's schema,
+// planning it requires the database's configured principals.
+func TestHandleMultiEnvPlanBlocksUnauthorizedActorAfterDiscovery(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	registerApplyDiscoveryEndpoints(t, mux, "orders")
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
+	})
+	h := actorAuthStorageTestHandler(cfg, &emptyStorage{}, installClient)
+
+	h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "mona", false, true, 0)
+
+	body := requireComment(t, comments, "unauthorized plan comment")
+	assert.Contains(t, body, "SchemaBot Command Not Authorized")
+	assert.Contains(t, body, "@mona is not authorized")
+}
+
 func commentRecorder(t *testing.T, comments chan<- string) http.HandlerFunc {
 	t.Helper()
 	return func(w http.ResponseWriter, r *http.Request) {

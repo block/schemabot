@@ -59,13 +59,12 @@ type Client struct {
 	// configuration set at construction; never mutated afterwards.
 	trustedCheckAppSlugs []string
 
-	// configDirHints returns the configured schema directories that may serve
-	// a repo, used by config discovery as probe targets when GitHub truncates
-	// the repository tree and a whole-repo scan is impossible, plus whether
-	// those directories provably cover every policy-valid config location.
-	// Static configuration set at construction; never mutated afterwards. Nil
-	// when the embedder has no directory configuration to offer.
-	configDirHints func(repo string) (dirs []string, exhaustive bool)
+	// configDirHints supplies the configured schema directories used by
+	// config discovery as probe targets when GitHub truncates the repository
+	// tree and a whole-repo scan is impossible. Static configuration set at
+	// construction; never mutated afterwards. Nil when the embedder has no
+	// directory configuration to offer.
+	configDirHints ConfigDirHints
 
 	// slugFetchMu serialises slug-fetch attempts so concurrent
 	// ForInstallation callers do not thundering-herd retry on startup
@@ -115,13 +114,29 @@ func WithTrustedCheckAppSlugs(slugs []string) ClientOption {
 	}
 }
 
+// ConfigDirHints supplies the server-configured schema directories that
+// config discovery probes when GitHub truncates the repository tree (repos
+// beyond the Trees API response cap), where a whole-repo scan is impossible.
+// Both methods report whether the returned directories provably cover every
+// policy-valid config location for their scope; non-exhaustive hints are
+// never probed, keeping discovery fail-closed.
+type ConfigDirHints interface {
+	// SchemaDirHintsForRepo returns the directories of every database that
+	// accepts changes from repo.
+	SchemaDirHintsForRepo(repo string) (dirs []string, exhaustive bool)
+	// SchemaDirHintsForDatabase returns only the named database's
+	// directories, for database-scoped lookups that need not pay a scan of
+	// every configured directory. exhaustive is true with no directories
+	// when the database does not serve the repo at all — an empty probe
+	// result is then authoritative.
+	SchemaDirHintsForDatabase(repo, database string) (dirs []string, exhaustive bool)
+}
+
 // WithConfigDirHints provides the configured schema directories that may serve
-// a given repo, plus whether they provably cover every policy-valid config
-// location. Config discovery probes these directories for schemabot.yaml
-// files when GitHub truncates the repository tree (repos beyond the Trees API
-// response cap), where a whole-repo scan is impossible; non-exhaustive hints
-// are never probed, keeping discovery fail-closed.
-func WithConfigDirHints(hints func(repo string) (dirs []string, exhaustive bool)) ClientOption {
+// a given repo. Config discovery probes these directories for schemabot.yaml
+// files when GitHub truncates the repository tree, where a whole-repo scan is
+// impossible.
+func WithConfigDirHints(hints ConfigDirHints) ClientOption {
 	return func(c *Client) {
 		c.configDirHints = hints
 	}
@@ -351,12 +366,11 @@ type InstallationClient struct {
 	// configuration copied from the parent Client; never mutated.
 	trustedCheckAppSlugs []string
 
-	// configDirHints returns the configured schema directories that may serve
-	// a repo (and whether they are exhaustive), used by config discovery as
-	// probe targets when GitHub truncates the repository tree. Copied from
-	// the parent Client; nil when the embedder has no directory configuration
-	// to offer.
-	configDirHints func(repo string) (dirs []string, exhaustive bool)
+	// configDirHints supplies the configured schema directories used by
+	// config discovery as probe targets when GitHub truncates the repository
+	// tree. Copied from the parent Client; nil when the embedder has no
+	// directory configuration to offer.
+	configDirHints ConfigDirHints
 
 	// checkStatusSingleflight is owned by the parent Client factory and
 	// shared across every InstallationClient it produces so concurrent
@@ -381,7 +395,7 @@ func (ic *InstallationClient) InstallationID() int64 {
 // a repo, used by config discovery when GitHub truncates the repository tree.
 // Production clients receive this from the parent Client (WithConfigDirHints);
 // this setter exists for directly-constructed clients (tests, library use).
-func (ic *InstallationClient) SetConfigDirHints(hints func(repo string) (dirs []string, exhaustive bool)) {
+func (ic *InstallationClient) SetConfigDirHints(hints ConfigDirHints) {
 	ic.configDirHints = hints
 }
 
