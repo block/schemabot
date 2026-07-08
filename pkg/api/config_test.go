@@ -3276,3 +3276,42 @@ func TestPendingDropsTargetsResolveEachPass(t *testing.T) {
 	assert.Equal(t, 0, unresolved)
 	assert.Equal(t, pendingdrops.Target{Database: "mydb", Environment: "staging", DSN: dsn}, targets[0])
 }
+
+func TestSchemaDirHintsForRepo(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"widgets": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"apps/widgets/schema", "apps/widgets/legacy/"},
+			},
+			"payments": {
+				AllowedRepos: []string{"octocat/other-repo"},
+				AllowedDirs:  []string{"payments/schema"},
+			},
+			"anyrepo": {
+				AllowedDirs: []string{"shared/schema", "apps/widgets/schema"},
+			},
+			"unbounded": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"*", "", " ", "."},
+			},
+		},
+	}
+
+	hints := cfg.SchemaDirHintsForRepo("octocat/hello-world")
+
+	assert.Equal(t, []string{"apps/widgets/legacy", "apps/widgets/schema", "shared/schema"}, hints)
+}
+
+func TestSchemaDirHintsForRepoNoMatches(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				AllowedRepos: []string{"octocat/other-repo"},
+				AllowedDirs:  []string{"payments/schema"},
+			},
+		},
+	}
+
+	assert.Empty(t, cfg.SchemaDirHintsForRepo("octocat/hello-world"))
+}

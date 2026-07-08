@@ -737,6 +737,40 @@ func (c *ServerConfig) RepoAdmins(repo string) (teams, users []string) {
 	return repoConfig.AdminTeams, repoConfig.AdminUsers
 }
 
+// SchemaDirHintsForRepo returns the configured schema directories of every
+// database that accepts changes from repo, sorted and deduplicated. Config
+// discovery uses these as probe targets when GitHub truncates the repository
+// tree (repos beyond the Trees API response cap), where a whole-repo scan is
+// impossible. Wildcard and empty entries carry no directory to probe and are
+// skipped; a database with no allowed_repos restriction accepts any trusted
+// repo, so its directories are always included.
+func (c *ServerConfig) SchemaDirHintsForRepo(repo string) []string {
+	seen := make(map[string]struct{})
+	var dirs []string
+	for _, db := range c.Databases {
+		if len(db.AllowedRepos) > 0 && !repoAllowed(db.AllowedRepos, repo) {
+			continue
+		}
+		for _, dir := range db.AllowedDirs {
+			// Normalize exactly like the allowed_dirs policy checks so the
+			// probed directories match what the policy would accept. Wildcard
+			// and repo-root entries name no directory to probe; invalid
+			// entries are rejected at config load and cannot appear here.
+			normalized, err := normalizeSchemaPath(dir)
+			if err != nil || normalized == "*" || normalized == "." {
+				continue
+			}
+			if _, ok := seen[normalized]; ok {
+				continue
+			}
+			seen[normalized] = struct{}{}
+			dirs = append(dirs, normalized)
+		}
+	}
+	slices.Sort(dirs)
+	return dirs
+}
+
 // DeploymentTarget is one entry in EnvironmentConfig.Deployments. It carries
 // the per-deployment override values for a multi-deployment environment. The
 // enclosing map key identifies the Tern deployment (and must also appear in

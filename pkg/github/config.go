@@ -113,14 +113,28 @@ type FindAllConfigsResult struct {
 	InvalidConfigs []InvalidConfigInfo
 }
 
-// FindAllConfigs uses the Tree API to discover all schemabot.yaml config files in the repository.
+// FindAllConfigs uses the Tree API to discover all schemabot.yaml config files
+// in the repository. When the repository is too large for the Trees API to
+// list completely, discovery falls back to scanning the server-configured
+// schema directories for the repo; when no such fallback is possible it fails
+// closed with ErrGitTreeTruncated.
 func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref string) (*FindAllConfigsResult, error) {
 	entries, truncated, err := ic.FetchGitTree(ctx, repo, ref)
 	if err != nil {
 		return nil, fmt.Errorf("fetch git tree: %w", err)
 	}
 	if truncated {
-		return nil, fmt.Errorf("discover schemabot configs in repo %s ref %s: %w", repo, ref, ErrGitTreeTruncated)
+		result, ok, hintErr := ic.findConfigsInHintDirs(ctx, repo, ref)
+		if hintErr != nil {
+			return nil, fmt.Errorf("discover schemabot configs in configured schema dirs of repo %s ref %s: %w", repo, ref, hintErr)
+		}
+		if !ok {
+			return nil, fmt.Errorf("discover schemabot configs in repo %s ref %s: %w", repo, ref, ErrGitTreeTruncated)
+		}
+		ic.logger.Info("git tree truncated; discovered configs from configured schema dirs",
+			"repo", repo, "ref", ref,
+			"valid", len(result.ValidConfigs), "invalid", len(result.InvalidConfigs))
+		return result, nil
 	}
 
 	var configPaths []string
@@ -160,6 +174,79 @@ func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref stri
 		"repo", repo,
 	)
 	return result, nil
+}
+
+// findConfigsInHintDirs discovers schemabot.yaml configs by scanning the
+// subtree of each server-configured schema directory for the repo. It serves
+// repositories whose full recursive tree GitHub truncates, where a whole-repo
+// scan is impossible. The scan is recursive per directory, so configs nested
+// below a configured directory are found (allowed_dirs matching is
+// prefix-based). Only server-managed directories are covered — a config
+// outside every configured directory would be rejected by the allowed_dirs
+// policy anyway.
+//
+// ok is false when the client has no directory hints for the repo or when the
+// hinted directories contain no config files at all: an empty result cannot
+// distinguish "repo has no configs" from "the hints do not cover the configs",
+// so the caller must keep failing closed with the truncation error instead of
+// reporting ErrNoConfig.
+func (ic *InstallationClient) findConfigsInHintDirs(ctx context.Context, repo, ref string) (*FindAllConfigsResult, bool, error) {
+	if ic.configDirHints == nil {
+		ic.logger.Debug("no config dir hints configured; cannot scan truncated repo", "repo", repo, "ref", ref)
+		return nil, false, nil
+	}
+	hints := ic.configDirHints(repo)
+	if len(hints) == 0 {
+		ic.logger.Debug("no config dir hints for repo; cannot scan truncated repo", "repo", repo, "ref", ref)
+		return nil, false, nil
+	}
+
+	result := &FindAllConfigsResult{}
+	seen := make(map[string]struct{})
+	for _, dir := range hints {
+		entries, found, err := ic.FetchGitSubtree(ctx, repo, ref, dir)
+		if err != nil {
+			return nil, false, fmt.Errorf("scan configured schema dir %s: %w", dir, err)
+		}
+		if !found {
+			ic.logger.Debug("configured schema dir does not exist at ref; skipping",
+				"repo", repo, "ref", ref, "dir", dir)
+			continue
+		}
+		for _, entry := range entries {
+			if entry.Type != "blob" || !isConfigFile(entry.Path) {
+				continue
+			}
+			configPath := dir + "/" + entry.Path
+			// Nested hint directories can surface the same config twice.
+			if _, ok := seen[configPath]; ok {
+				continue
+			}
+			seen[configPath] = struct{}{}
+
+			config, err := ic.FetchConfig(ctx, repo, configPath, ref)
+			if err != nil {
+				ic.logger.Warn("failed to parse config", "path", configPath, "error", err)
+				result.InvalidConfigs = append(result.InvalidConfigs, InvalidConfigInfo{
+					Path:  configPath,
+					Error: err.Error(),
+				})
+				continue
+			}
+			result.ValidConfigs = append(result.ValidConfigs, DiscoveredConfig{
+				Config:    config,
+				Path:      configPath,
+				SchemaDir: path.Dir(configPath),
+			})
+		}
+	}
+
+	if len(result.ValidConfigs) == 0 && len(result.InvalidConfigs) == 0 {
+		ic.logger.Warn("configured schema dirs contain no configs; keeping fail-closed truncation error",
+			"repo", repo, "ref", ref, "hint_dirs", len(hints))
+		return nil, false, nil
+	}
+	return result, true, nil
 }
 
 // FindConfigByDatabaseName finds a schemabot.yaml config by database name.

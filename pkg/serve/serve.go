@@ -626,7 +626,8 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 
 	appID := serverConfig.GitHub.ResolveAppID()
 	ghClient := ghclient.NewClient(appID, []byte(ghPrivateKey), logger,
-		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs))
+		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs),
+		ghclient.WithConfigDirHints(serverConfig.SchemaDirHintsForRepo))
 	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger,
 		webhook.WithRepoWebhookSecret([]byte(repoWebhookSecret)))
 	logger.Info("GitHub webhook endpoint registered",
@@ -687,7 +688,8 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 		}
 
 		clients[e.name] = ghclient.NewClient(e.id, []byte(privateKey), logger,
-			ghclient.WithTrustedCheckAppSlugs(e.cfg.TrustedCheckAppSlugs))
+			ghclient.WithTrustedCheckAppSlugs(e.cfg.TrustedCheckAppSlugs),
+			ghclient.WithConfigDirHints(serverConfig.SchemaDirHintsForRepo))
 		secretsByApp[e.name] = []byte(secret)
 		appByID[e.id] = e.name
 
