@@ -760,13 +760,29 @@ func registerGitBlob(t *testing.T, mux *http.ServeMux, sha, content string) {
 	})
 }
 
-func widgetsConfigDirHints(t *testing.T, dirs ...string) func(repo string) []string {
+func widgetsConfigDirHints(t *testing.T, dirs ...string) func(repo string) ([]string, bool) {
 	t.Helper()
 
-	return func(repo string) []string {
+	return func(repo string) ([]string, bool) {
 		require.Equal(t, "octocat/hello-world", repo)
-		return dirs
+		return dirs, true
 	}
+}
+
+// A repo-root schema path cannot be recovered through a subtree fetch when
+// the repository tree is truncated — the root tree is the truncated listing
+// itself — so schema-file loading keeps the truncation error instead of
+// misreporting an empty schema directory.
+func TestFetchSchemaFilesFromTreeTruncatedRepoRootFailsClosed(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, nil)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	_, err := ic.fetchSchemaFilesFromTree(t.Context(), "octocat/hello-world", "abc123", ".")
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrGitTreeTruncated)
 }
 
 func TestFindAllConfigsTruncatedTreeFallsBackToConfigDirHints(t *testing.T) {
@@ -847,6 +863,30 @@ func TestFindAllConfigsTruncatedTreeFailsClosedWhenNoHintsForRepo(t *testing.T) 
 
 	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ic.SetConfigDirHints(widgetsConfigDirHints(t))
+
+	_, err := ic.FindAllConfigs(t.Context(), "octocat/hello-world", "abc123")
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrGitTreeTruncated)
+}
+
+// A database that allows configs outside every probe-able directory (no
+// allowed_dirs, a wildcard, or a repo-root entry) makes the hint list
+// non-exhaustive: a partial probe could return a confidently wrong result, so
+// discovery must keep the truncation error even when other hinted directories
+// would have yielded configs.
+func TestFindAllConfigsTruncatedTreeFailsClosedWhenHintsNotExhaustive(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(func(repo string) ([]string, bool) {
+		require.Equal(t, "octocat/hello-world", repo)
+		return []string{"apps/widgets/schema"}, false
+	})
 
 	_, err := ic.FindAllConfigs(t.Context(), "octocat/hello-world", "abc123")
 

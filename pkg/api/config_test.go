@@ -3298,9 +3298,48 @@ func TestSchemaDirHintsForRepo(t *testing.T) {
 		},
 	}
 
-	hints := cfg.SchemaDirHintsForRepo("octocat/hello-world")
+	hints, exhaustive := cfg.SchemaDirHintsForRepo("octocat/hello-world")
 
 	assert.Equal(t, []string{"apps/widgets/legacy", "apps/widgets/schema", "shared/schema"}, hints)
+	assert.False(t, exhaustive, "the unbounded database accepts configs outside every probe-able directory")
+}
+
+func TestSchemaDirHintsForRepoExhaustiveWhenAllDirsLiteral(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"widgets": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"apps/widgets/schema"},
+			},
+			"payments": {
+				AllowedRepos: []string{"octocat/other-repo"},
+			},
+		},
+	}
+
+	hints, exhaustive := cfg.SchemaDirHintsForRepo("octocat/hello-world")
+
+	assert.Equal(t, []string{"apps/widgets/schema"}, hints)
+	assert.True(t, exhaustive, "every repo-eligible database restricts configs to literal directories")
+}
+
+func TestSchemaDirHintsForRepoNotExhaustiveWhenDatabaseHasNoAllowedDirs(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"widgets": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"apps/widgets/schema"},
+			},
+			"open": {
+				AllowedRepos: []string{"octocat/hello-world"},
+			},
+		},
+	}
+
+	hints, exhaustive := cfg.SchemaDirHintsForRepo("octocat/hello-world")
+
+	assert.Equal(t, []string{"apps/widgets/schema"}, hints)
+	assert.False(t, exhaustive, "a database without allowed_dirs accepts a config anywhere in the repo")
 }
 
 func TestSchemaDirHintsForRepoNoMatches(t *testing.T) {
@@ -3313,5 +3352,7 @@ func TestSchemaDirHintsForRepoNoMatches(t *testing.T) {
 		},
 	}
 
-	assert.Empty(t, cfg.SchemaDirHintsForRepo("octocat/hello-world"))
+	hints, exhaustive := cfg.SchemaDirHintsForRepo("octocat/hello-world")
+	assert.Empty(t, hints)
+	assert.True(t, exhaustive, "no repo-eligible database means no policy-valid config location exists")
 }

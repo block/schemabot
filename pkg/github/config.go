@@ -181,21 +181,27 @@ func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref stri
 // repositories whose full recursive tree GitHub truncates, where a whole-repo
 // scan is impossible. The scan is recursive per directory, so configs nested
 // below a configured directory are found (allowed_dirs matching is
-// prefix-based). Only server-managed directories are covered — a config
-// outside every configured directory would be rejected by the allowed_dirs
-// policy anyway.
+// prefix-based). The scan only runs when the hints are exhaustive — every
+// policy-valid config location is covered by a hinted directory — because a
+// partial probe returned as authoritative could report a single config where
+// a full scan would find several, or omit a database whose config exists.
 //
-// ok is false when the client has no directory hints for the repo or when the
-// hinted directories contain no config files at all: an empty result cannot
-// distinguish "repo has no configs" from "the hints do not cover the configs",
-// so the caller must keep failing closed with the truncation error instead of
-// reporting ErrNoConfig.
+// ok is false when the client has no directory hints for the repo, the hints
+// are not exhaustive, or the hinted directories contain no config files at
+// all: an empty result cannot distinguish "repo has no configs" from "the
+// hints do not cover the configs", so the caller must keep failing closed
+// with the truncation error instead of reporting ErrNoConfig.
 func (ic *InstallationClient) findConfigsInHintDirs(ctx context.Context, repo, ref string) (*FindAllConfigsResult, bool, error) {
 	if ic.configDirHints == nil {
 		ic.logger.Debug("no config dir hints configured; cannot scan truncated repo", "repo", repo, "ref", ref)
 		return nil, false, nil
 	}
-	hints := ic.configDirHints(repo)
+	hints, exhaustive := ic.configDirHints(repo)
+	if !exhaustive {
+		ic.logger.Warn("configured schema dirs do not cover every policy-valid config location (a database allows configs outside any probe-able directory); keeping fail-closed truncation error",
+			"repo", repo, "ref", ref, "hint_dirs", len(hints))
+		return nil, false, nil
+	}
 	if len(hints) == 0 {
 		ic.logger.Debug("no config dir hints for repo; cannot scan truncated repo", "repo", repo, "ref", ref)
 		return nil, false, nil
@@ -203,8 +209,11 @@ func (ic *InstallationClient) findConfigsInHintDirs(ctx context.Context, repo, r
 
 	result := &FindAllConfigsResult{}
 	seen := make(map[string]struct{})
+	// Hint directories often share path prefixes; memoize the shallow
+	// per-level fetches so shared levels cost one API call per scan.
+	levelCache := make(map[string][]TreeEntry)
 	for _, dir := range hints {
-		entries, found, err := ic.FetchGitSubtree(ctx, repo, ref, dir)
+		entries, found, err := ic.fetchGitSubtreeCached(ctx, repo, ref, dir, levelCache)
 		if err != nil {
 			return nil, false, fmt.Errorf("scan configured schema dir %s: %w", dir, err)
 		}

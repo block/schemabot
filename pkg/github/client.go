@@ -61,10 +61,11 @@ type Client struct {
 
 	// configDirHints returns the configured schema directories that may serve
 	// a repo, used by config discovery as probe targets when GitHub truncates
-	// the repository tree and a whole-repo scan is impossible. Static
-	// configuration set at construction; never mutated afterwards. Nil when
-	// the embedder has no directory configuration to offer.
-	configDirHints func(repo string) []string
+	// the repository tree and a whole-repo scan is impossible, plus whether
+	// those directories provably cover every policy-valid config location.
+	// Static configuration set at construction; never mutated afterwards. Nil
+	// when the embedder has no directory configuration to offer.
+	configDirHints func(repo string) (dirs []string, exhaustive bool)
 
 	// slugFetchMu serialises slug-fetch attempts so concurrent
 	// ForInstallation callers do not thundering-herd retry on startup
@@ -115,10 +116,12 @@ func WithTrustedCheckAppSlugs(slugs []string) ClientOption {
 }
 
 // WithConfigDirHints provides the configured schema directories that may serve
-// a given repo. Config discovery probes these directories for schemabot.yaml
+// a given repo, plus whether they provably cover every policy-valid config
+// location. Config discovery probes these directories for schemabot.yaml
 // files when GitHub truncates the repository tree (repos beyond the Trees API
-// response cap), where a whole-repo scan is impossible.
-func WithConfigDirHints(hints func(repo string) []string) ClientOption {
+// response cap), where a whole-repo scan is impossible; non-exhaustive hints
+// are never probed, keeping discovery fail-closed.
+func WithConfigDirHints(hints func(repo string) (dirs []string, exhaustive bool)) ClientOption {
 	return func(c *Client) {
 		c.configDirHints = hints
 	}
@@ -349,10 +352,11 @@ type InstallationClient struct {
 	trustedCheckAppSlugs []string
 
 	// configDirHints returns the configured schema directories that may serve
-	// a repo, used by config discovery as probe targets when GitHub truncates
-	// the repository tree. Copied from the parent Client; nil when the
-	// embedder has no directory configuration to offer.
-	configDirHints func(repo string) []string
+	// a repo (and whether they are exhaustive), used by config discovery as
+	// probe targets when GitHub truncates the repository tree. Copied from
+	// the parent Client; nil when the embedder has no directory configuration
+	// to offer.
+	configDirHints func(repo string) (dirs []string, exhaustive bool)
 
 	// checkStatusSingleflight is owned by the parent Client factory and
 	// shared across every InstallationClient it produces so concurrent
@@ -377,7 +381,7 @@ func (ic *InstallationClient) InstallationID() int64 {
 // a repo, used by config discovery when GitHub truncates the repository tree.
 // Production clients receive this from the parent Client (WithConfigDirHints);
 // this setter exists for directly-constructed clients (tests, library use).
-func (ic *InstallationClient) SetConfigDirHints(hints func(repo string) []string) {
+func (ic *InstallationClient) SetConfigDirHints(hints func(repo string) (dirs []string, exhaustive bool)) {
 	ic.configDirHints = hints
 }
 
@@ -1255,11 +1259,25 @@ func (ic *InstallationClient) fetchGitTreeShallow(ctx context.Context, repo, tre
 // exist (or is not a directory) at ref. The error wraps ErrGitTreeTruncated
 // when the subtree itself is too large to list completely.
 func (ic *InstallationClient) FetchGitSubtree(ctx context.Context, repo, ref, dir string) (entries []TreeEntry, found bool, err error) {
+	return ic.fetchGitSubtreeCached(ctx, repo, ref, dir, nil)
+}
+
+// fetchGitSubtreeCached is FetchGitSubtree with an optional memo for the
+// shallow per-level fetches, keyed by tree SHA. Callers resolving several
+// directories at the same ref pass one map so shared path-prefix levels (and
+// the root tree) cost a single API call per scan; nil disables memoization.
+func (ic *InstallationClient) fetchGitSubtreeCached(ctx context.Context, repo, ref, dir string, levelCache map[string][]TreeEntry) (entries []TreeEntry, found bool, err error) {
 	treeSHA := ref
 	for segment := range strings.SplitSeq(dir, "/") {
-		levelEntries, err := ic.fetchGitTreeShallow(ctx, repo, treeSHA)
-		if err != nil {
-			return nil, false, fmt.Errorf("resolve %s under %s in repo %s ref %s: %w", segment, dir, repo, ref, err)
+		levelEntries, cached := levelCache[treeSHA]
+		if !cached {
+			levelEntries, err = ic.fetchGitTreeShallow(ctx, repo, treeSHA)
+			if err != nil {
+				return nil, false, fmt.Errorf("resolve %s under %s in repo %s ref %s: %w", segment, dir, repo, ref, err)
+			}
+			if levelCache != nil {
+				levelCache[treeSHA] = levelEntries
+			}
 		}
 		next := ""
 		for _, entry := range levelEntries {
@@ -1489,6 +1507,12 @@ func (ic *InstallationClient) fetchSchemaFilesFromTree(ctx context.Context, repo
 		return nil, fmt.Errorf("fetch git tree: %w", err)
 	}
 	if truncated {
+		// A repo-root schema path cannot be recovered by a subtree fetch —
+		// the root tree IS the truncated listing — so keep the truncation
+		// error rather than misreport "no schema files".
+		if schemaPath == "" || schemaPath == "." {
+			return nil, fmt.Errorf("fetch schema files from repo root of %s ref %s: %w", repo, headSHA, ErrGitTreeTruncated)
+		}
 		// The whole-repo listing exceeds the Trees API cap, but the schema
 		// directory's own subtree can still be listed completely. Prefix the
 		// subtree's relative paths back to repo-relative so the filtering
