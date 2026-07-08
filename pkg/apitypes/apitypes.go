@@ -45,6 +45,53 @@ type ErrorResponse struct {
 	ErrorCode string `json:"error_code"`
 }
 
+type WebhookRedriveRequest struct {
+	WindowStart string `json:"window_start"`
+	WindowEnd   string `json:"window_end"`
+	App         string `json:"app,omitempty"`
+	Repo        string `json:"repo,omitempty"`
+	PR          int    `json:"pr,omitempty"`
+	MaxPages    int    `json:"max_pages"`
+	DryRun      bool   `json:"dry_run,omitempty"`
+	// Cursor continues a previous request's listing for one App. Each request
+	// processes a bounded number of pages so it finishes well within any
+	// intermediary HTTP timeout; the caller loops until next_cursor is empty.
+	Cursor string `json:"cursor,omitempty"`
+}
+
+type WebhookRedriveResponse struct {
+	Results []WebhookRedriveResult `json:"results"`
+}
+
+type WebhookRedriveResult struct {
+	AppName            string `json:"app_name"`
+	DryRun             bool   `json:"dry_run"`
+	Fetched            int    `json:"fetched"`
+	Pages              int    `json:"pages"`
+	OldestFetched      string `json:"oldest_fetched,omitempty"`
+	ReachedWindowStart bool   `json:"reached_window_start"`
+	// HistoryExhausted is true when GitHub's retained delivery history ended
+	// before the window start was reached: older deliveries no longer exist.
+	HistoryExhausted bool `json:"history_exhausted,omitempty"`
+	// NextCursor continues the listing in a follow-up request (with app set);
+	// empty when the window is covered or history is exhausted.
+	NextCursor  string                    `json:"next_cursor,omitempty"`
+	Selected    []WebhookRedriveSelection `json:"selected"`
+	Redelivered int                       `json:"redelivered"`
+	Failed      int                       `json:"failed"`
+}
+
+type WebhookRedriveSelection struct {
+	ID          int64  `json:"id"`
+	DeliveredAt string `json:"delivered_at"`
+	Event       string `json:"event"`
+	Action      string `json:"action"`
+	Status      string `json:"status"`
+	StatusCode  int    `json:"status_code"`
+	Repo        string `json:"repo,omitempty"`
+	PR          int    `json:"pr,omitempty"`
+}
+
 // =============================================================================
 // Request Types
 // =============================================================================

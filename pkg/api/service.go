@@ -695,6 +695,7 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 	handle("GET /api/status", s.handleStatus)
 	handle("GET /api/logs/{database}", s.handleLogs)
 	handle("GET /api/logs", s.handleLogsWithoutDatabase)
+	handle("POST /api/webhooks/redrive", s.handleWebhookRedrive)
 
 	// Lock API (database-level locking)
 	handle("POST /api/locks/acquire", s.handleLockAcquire)

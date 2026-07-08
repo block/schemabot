@@ -21,6 +21,7 @@ func TestTierForRequest(t *testing.T) {
 		{http.MethodPost, "/api/rollback/plan", TierWrite},
 		{http.MethodPost, "/api/apply", TierWrite},
 		{http.MethodPost, "/api/cutover", TierWrite},
+		{http.MethodPost, "/api/webhooks/redrive", TierWrite},
 		{http.MethodPost, "/api/settings", TierWrite},
 		{http.MethodDelete, "/api/locks", TierWrite},
 	}
