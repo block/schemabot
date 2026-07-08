@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -798,7 +799,59 @@ const (
 	// 'start': 'start' resumes stopped work and carries no claim-ordering
 	// clause, so it cannot release a paused rollout.
 	ControlOperationRelease ControlOperation = "release"
+	// ControlOperationVolume adjusts the speed/concurrency of a running schema
+	// change. Durable because only the instance driving the apply holds the
+	// engine state for the running schema change, and a volume RPC can land on
+	// any instance sharing the route's storage. The desired level travels in
+	// the request metadata (see VolumeControlRequestMetadata); the driver
+	// retunes the engine at its next progress tick.
+	ControlOperationVolume ControlOperation = "volume"
 )
+
+// MinVolume and MaxVolume bound the volume scale shared by every engine:
+// 1 = maximum throttle (least production impact), 11 = no throttle (fastest).
+const (
+	MinVolume int32 = 1
+	MaxVolume int32 = 11
+)
+
+// VolumeControlRequestMetadata is the JSON payload stored on a volume control
+// request. The row carries the desired level so the driving instance can
+// retune the engine without a synchronous exchange with the requester.
+type VolumeControlRequestMetadata struct {
+	Volume int32 `json:"volume"`
+}
+
+// EncodeVolumeControlRequestMetadata serializes the desired volume level for
+// storage on a volume control request, rejecting out-of-range levels so an
+// invalid request is refused at write time rather than discovered by the
+// driver.
+func EncodeVolumeControlRequestMetadata(volume int32) ([]byte, error) {
+	if volume < MinVolume || volume > MaxVolume {
+		return nil, fmt.Errorf("volume %d is out of range: must be between %d and %d", volume, MinVolume, MaxVolume)
+	}
+	data, err := json.Marshal(VolumeControlRequestMetadata{Volume: volume})
+	if err != nil {
+		return nil, fmt.Errorf("encode volume control request metadata for level %d: %w", volume, err)
+	}
+	return data, nil
+}
+
+// DecodeVolumeControlRequestMetadata parses the desired volume level from a
+// volume control request's metadata, validating the shared volume range.
+func DecodeVolumeControlRequestMetadata(metadata []byte) (int32, error) {
+	if len(metadata) == 0 {
+		return 0, fmt.Errorf("volume control request metadata is empty")
+	}
+	var payload VolumeControlRequestMetadata
+	if err := json.Unmarshal(metadata, &payload); err != nil {
+		return 0, fmt.Errorf("decode volume control request metadata: %w", err)
+	}
+	if payload.Volume < MinVolume || payload.Volume > MaxVolume {
+		return 0, fmt.Errorf("volume %d in control request metadata is out of range: must be between %d and %d", payload.Volume, MinVolume, MaxVolume)
+	}
+	return payload.Volume, nil
+}
 
 // ControlRequestStatus is the durable processing status for a control request.
 type ControlRequestStatus string
@@ -1074,6 +1127,7 @@ const (
 	LogEventCancelRequested     = "cancel_requested"
 	LogEventStartRequested      = "start_requested"
 	LogEventReleaseRequested    = "release_requested"
+	LogEventVolumeRequested     = "volume_requested"
 	LogEventDeployTriggered     = "deploy_triggered"
 	LogEventCutoverTriggered    = "cutover_triggered"
 	LogEventSkipRevertTriggered = "skip_revert_triggered"

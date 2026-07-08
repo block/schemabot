@@ -1427,36 +1427,190 @@ func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Tas
 	return req, nil
 }
 
-// Volume modifies the schema change speed/concurrency in-flight.
+// Volume adjusts the speed/concurrency of an in-flight schema change by
+// queueing a durable volume request. Only the instance driving the apply holds
+// the engine state for the running schema change, and a volume RPC can land on
+// any instance sharing this route's storage — so the request is recorded for
+// the driver, which retunes the engine at its next progress tick. The response
+// reports the queued target level; the previous level is only known to the
+// driver, so PreviousVolume is left unset.
 func (c *LocalClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	if req.Volume < 1 || req.Volume > 11 {
-		return nil, fmt.Errorf("volume must be between 1 and 11")
+	if req.Volume < storage.MinVolume || req.Volume > storage.MaxVolume {
+		return nil, fmt.Errorf("volume must be between %d and %d", storage.MinVolume, storage.MaxVolume)
 	}
-
-	task, creds, eng, err := c.controlSetup(ctx)
+	c.logger.Info("Volume requested", "database", c.config.Database, "type", c.config.Type, "apply_id", req.ApplyId, "environment", req.Environment, "volume", req.Volume)
+	apply, err := c.resolveControlApply(ctx, req.ApplyId, "volume")
 	if err != nil {
 		return nil, err
 	}
-	controlReq, err := c.buildControlRequest(ctx, task, creds, eng, engine.ControlVolume)
-	if err != nil {
-		return nil, fmt.Errorf("build volume request for task %s: %w", task.TaskIdentifier, err)
+	if apply == nil {
+		return nil, fmt.Errorf("no active schema change")
 	}
 
-	result, err := eng.Volume(ctx, &engine.VolumeRequest{
-		Database:    c.config.Database,
-		Volume:      req.Volume,
-		ResumeState: controlReq.ResumeState,
-		Credentials: controlReq.Credentials,
+	// A terminal apply has no running copy to retune; reject synchronously
+	// rather than queue a request no driver will ever service. This includes
+	// stopped applies — resume the schema change first, then adjust volume.
+	if state.IsTerminalApplyState(apply.State) {
+		c.logger.Warn("volume rejected: schema change is not active",
+			"apply_id", apply.ApplyIdentifier, "state", apply.State, "volume", req.Volume)
+		return nil, fmt.Errorf("schema change %s is %s; volume can only be adjusted while it is running", apply.ApplyIdentifier, apply.State)
+	}
+
+	return c.queueVolumeRequest(ctx, apply, req.Volume)
+}
+
+// queueVolumeRequest records a durable volume control request carrying the
+// desired level in its metadata and wakes the operator. A pending volume
+// request is immutable until the driver resolves it: a second request for the
+// same level is an idempotent accept, while a different level is rejected with
+// retry guidance. This keeps the level the driver reads, applies, and completes
+// unambiguous — there is no window where a superseding write could make the
+// driver complete a level it never applied.
+func (c *LocalClient) queueVolumeRequest(ctx context.Context, apply *storage.Apply, volume int32) (*ternv1.VolumeResponse, error) {
+	controlStore := c.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, fmt.Errorf("control request store is not available")
+	}
+	metadata, err := storage.EncodeVolumeControlRequestMetadata(volume)
+	if err != nil {
+		return nil, fmt.Errorf("encode volume request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	requestedBy := "tern-grpc"
+	controlReq, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationVolume,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: requestedBy,
+		Metadata:    metadata,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("volume failed: %w", err)
+		return nil, fmt.Errorf("record volume control request for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-
+	if alreadyPending {
+		pendingVolume, decodeErr := storage.DecodeVolumeControlRequestMetadata(controlReq.Metadata)
+		if decodeErr != nil {
+			c.logger.Warn("volume rejected: pending volume request has undecodable metadata; the driver will fail it at its next progress tick",
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"environment", apply.Environment,
+				"error", decodeErr)
+			return nil, fmt.Errorf("a volume adjustment is already queued for apply %s; retry after the driver resolves it", apply.ApplyIdentifier)
+		}
+		if pendingVolume != volume {
+			c.logger.Info("volume rejected: a different volume adjustment is already queued",
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"environment", apply.Environment,
+				"pending_volume", pendingVolume,
+				"requested_volume", volume)
+			return nil, fmt.Errorf("a volume adjustment to %d is already queued for apply %s; the driver applies it at its next progress check — retry afterwards", pendingVolume, apply.ApplyIdentifier)
+		}
+		c.logger.Info("volume request already pending for apply driver",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"volume", volume,
+			"requested_by", requestedBy)
+	} else {
+		c.logger.Info("volume request queued for apply driver",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"volume", volume,
+			"requested_by", requestedBy)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventVolumeRequested, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Volume change to %d queued for apply driver%s", volume, callerApplyLogSuffix(requestedBy)), "", "")
+	}
+	c.wakeOperator(apply)
 	return &ternv1.VolumeResponse{
-		Accepted:       result.Accepted,
-		PreviousVolume: result.PreviousVolume,
-		NewVolume:      result.NewVolume,
+		Accepted:  true,
+		NewVolume: volume,
 	}, nil
+}
+
+// processPendingVolumeControlRequest services a pending volume request from
+// the driving instance's progress tick. The desired level travels in the
+// request's metadata; the driver retunes the engine's running schema change
+// and completes the request. Volume is a tuning knob, not a safety operation:
+// an engine rejection fails the request terminally and the copy continues at
+// its current volume, and a storage error is returned for the caller to log
+// and retry at the next tick without aborting the drive.
+func (c *LocalClient) processPendingVolumeControlRequest(ctx context.Context, apply *storage.Apply, eng engine.Engine, creds *engine.Credentials, resumeState *engine.ResumeState) error {
+	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationVolume)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		return nil
+	}
+	caller := controlRequestCaller(controlReq)
+	volume, err := storage.DecodeVolumeControlRequestMetadata(controlReq.Metadata)
+	if err != nil {
+		c.logger.Warn("pending volume request has invalid metadata; failing the request and continuing at the current volume",
+			append(apply.LogAttrs(), "requested_by", caller, "error", err)...)
+		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationVolume, fmt.Sprintf("volume request metadata is invalid: %v", err))
+	}
+	result, err := eng.Volume(ctx, &engine.VolumeRequest{
+		Database:    apply.Database,
+		Volume:      volume,
+		ResumeState: resumeState,
+		Credentials: creds,
+	})
+	if err != nil {
+		c.logger.Warn("engine rejected pending volume request; schema change continues at its current volume",
+			append(apply.LogAttrs(), "volume", volume, "requested_by", caller, "error", err)...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Volume change to %d failed: %v; schema change continues at its current volume", volume, err), "", "")
+		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationVolume, err.Error())
+	}
+	if result == nil || !result.Accepted {
+		message := "not accepted"
+		if result != nil && result.Message != "" {
+			message = result.Message
+		}
+		c.logger.Warn("engine did not accept pending volume request; schema change continues at its current volume",
+			append(apply.LogAttrs(), "volume", volume, "requested_by", caller, "message", message)...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Volume change to %d was not accepted: %s; schema change continues at its current volume", volume, message), "", "")
+		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationVolume, message)
+	}
+	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationVolume); err != nil {
+		return err
+	}
+	c.logger.Info("pending volume request applied",
+		append(apply.LogAttrs(), "previous_volume", result.PreviousVolume, "volume", result.NewVolume, "requested_by", caller)...)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Volume changed from %d to %d%s", result.PreviousVolume, result.NewVolume, callerApplyLogSuffix(caller)), "", "")
+	if err := c.recordAppliedVolume(ctx, apply, result.NewVolume); err != nil {
+		c.logger.Warn("failed to record applied volume on apply options; progress will keep reporting the previous volume",
+			append(apply.LogAttrs(), "volume", result.NewVolume, "error", err)...)
+	}
+	return nil
+}
+
+// recordAppliedVolume persists the volume the engine is now running at onto
+// the apply's stored options, which progress and the CLI read the volume from.
+// The apply row is reloaded first so this targeted options write does not
+// clobber state another write advanced past the drive's in-memory copy.
+func (c *LocalClient) recordAppliedVolume(ctx context.Context, apply *storage.Apply, volume int32) error {
+	if volume < storage.MinVolume || volume > storage.MaxVolume {
+		return fmt.Errorf("engine reported applied volume %d out of range for apply %s", volume, apply.ApplyIdentifier)
+	}
+	stored, err := c.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("load apply %s to record applied volume: %w", apply.ApplyIdentifier, err)
+	}
+	if stored == nil {
+		return fmt.Errorf("load apply %s to record applied volume: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
+	}
+	opts := stored.GetOptions()
+	opts.Volume = int(volume)
+	stored.SetOptions(opts)
+	if err := c.storage.Applies().Update(ctx, stored); err != nil {
+		return fmt.Errorf("record applied volume %d on apply %s: %w", volume, apply.ApplyIdentifier, err)
+	}
+	apply.Options = stored.Options
+	return nil
 }
 
 // Revert reverts a completed schema change during the revert window.

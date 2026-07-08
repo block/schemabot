@@ -328,6 +328,19 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
 				return taskAbort
 			}
+			// A volume failure never aborts the drive: the copy continues at
+			// its current volume and a still-pending request is retried at the
+			// next tick. A lost lease is the exception — this owner must stop
+			// driving.
+			if err := c.processPendingVolumeControlRequest(ctx, apply, eng, creds, resumeState); err != nil {
+				if errors.Is(err, storage.ErrApplyLeaseLost) {
+					c.logger.Warn("pending volume request processing lost the apply lease; current apply owner will exit for operator retry",
+						"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
+					return taskAbort
+				}
+				c.logger.Warn("pending volume request processing failed; the drive continues and retries at the next progress tick",
+					"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
+			}
 
 			// Re-fetch task state from storage to detect external changes (e.g., Stop).
 			// This also guards against a race where a new apply starts and the engine's

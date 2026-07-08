@@ -3732,12 +3732,14 @@ func TestTernHealth(t *testing.T) {
 }
 
 func TestVolumeHandler(t *testing.T) {
-	t.Run("success returns volume values", func(t *testing.T) {
+	// A volume adjustment is queued as a durable control request for the
+	// driving instance, so the accepted response carries the queued target
+	// level; the previous level is only known to the driver and stays unset.
+	t.Run("accepted queue returns target volume", func(t *testing.T) {
 		mock := &mockTernClient{
 			volumeResp: &ternv1.VolumeResponse{
-				Accepted:       true,
-				PreviousVolume: 3,
-				NewVolume:      11,
+				Accepted:  true,
+				NewVolume: 11,
 			},
 		}
 		svc := newControlTestService(mock, activeTestApply("apply-vol123"))
@@ -3756,16 +3758,16 @@ func TestVolumeHandler(t *testing.T) {
 		err := json.NewDecoder(w.Body).Decode(&resp)
 		require.NoError(t, err, "failed to decode response")
 
-		// Verify the response includes volume values (not zeros)
 		assert.Equal(t, true, resp["accepted"])
 		prevVol, _ := resp["previous_volume"].(float64) // JSON numbers are float64
 		newVol, _ := resp["new_volume"].(float64)
-		assert.Equal(t, float64(3), prevVol)
+		assert.Equal(t, float64(0), prevVol)
 		assert.Equal(t, float64(11), newVol)
 
 		require.NotNil(t, mock.volumeReq, "expected volume request to be captured")
 		assert.Equal(t, "apply-vol123", mock.volumeReq.ApplyId)
 		assert.Equal(t, "staging", mock.volumeReq.Environment)
+		assert.Equal(t, int32(11), mock.volumeReq.Volume)
 	})
 
 	t.Run("invalid volume range", func(t *testing.T) {

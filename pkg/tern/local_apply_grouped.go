@@ -745,6 +745,18 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			"apply_id", apply.ApplyIdentifier, "error", err)
 		return true
 	}
+	// A volume failure never aborts the drive: the copy continues at its
+	// current volume and a still-pending request is retried at the next tick.
+	// A lost lease is the exception — this owner must stop driving.
+	if err := c.processPendingVolumeControlRequest(ctx, apply, eng, creds, resumeState); err != nil {
+		if errors.Is(err, storage.ErrApplyLeaseLost) {
+			c.logger.Warn("pending volume request processing lost the apply lease; current apply owner will exit for operator retry",
+				"apply_id", apply.ApplyIdentifier, "error", err)
+			return true
+		}
+		c.logger.Warn("pending volume request processing failed; the drive continues and retries at the next progress tick",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+	}
 
 	opts := storage.ApplyOptionsFromMap(options)
 	controlReq := &engine.ControlRequest{

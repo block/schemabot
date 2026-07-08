@@ -1923,8 +1923,8 @@ func (s *Service) handleVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Volume < 1 || req.Volume > 11 {
-		s.writeError(w, http.StatusBadRequest, "volume must be between 1 and 11")
+	if req.Volume < storage.MinVolume || req.Volume > storage.MaxVolume {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("volume must be between %d and %d", storage.MinVolume, storage.MaxVolume))
 		return
 	}
 
@@ -1940,8 +1940,8 @@ func (s *Service) handleVolume(w http.ResponseWriter, r *http.Request) {
 	}
 	metrics.RecordControlOperation(r.Context(), "volume", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
-		s.logControlOperationForApply(r.Context(), apply, resolveCaller(r.Context(), req.Caller), storage.LogEventInfo,
-			fmt.Sprintf("Volume changed from %d to %d", resp.PreviousVolume, resp.NewVolume))
+		s.logControlOperationForApply(r.Context(), apply, resolveCaller(r.Context(), req.Caller), storage.LogEventVolumeRequested,
+			fmt.Sprintf("Volume change to %d queued; the driver applies it at its next progress check", req.Volume))
 	}
 
 	s.writeJSON(w, http.StatusOK, &apitypes.VolumeResponse{

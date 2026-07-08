@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -116,5 +117,53 @@ func TestApplyOptionsFromMapIgnoresInvalidVolume(t *testing.T) {
 
 		assert.Zero(t, options.Volume)
 		assert.Empty(t, options.Map())
+	}
+}
+
+// TestVolumeControlRequestMetadataRoundTrip verifies the desired level a
+// volume control request carries survives the storage encode/decode round
+// trip for every level on the shared volume scale.
+func TestVolumeControlRequestMetadataRoundTrip(t *testing.T) {
+	for volume := MinVolume; volume <= MaxVolume; volume++ {
+		metadata, err := EncodeVolumeControlRequestMetadata(volume)
+		require.NoError(t, err)
+		assert.JSONEq(t, fmt.Sprintf(`{"volume":%d}`, volume), string(metadata))
+
+		decoded, err := DecodeVolumeControlRequestMetadata(metadata)
+		require.NoError(t, err)
+		assert.Equal(t, volume, decoded)
+	}
+}
+
+// TestEncodeVolumeControlRequestMetadataRejectsOutOfRange verifies an
+// out-of-range level is refused at write time so the driver never reads an
+// unactionable volume request.
+func TestEncodeVolumeControlRequestMetadataRejectsOutOfRange(t *testing.T) {
+	for _, volume := range []int32{0, -1, 12} {
+		_, err := EncodeVolumeControlRequestMetadata(volume)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "out of range")
+	}
+}
+
+// TestDecodeVolumeControlRequestMetadataRejectsInvalidPayloads verifies the
+// driver refuses empty, malformed, and out-of-range payloads with a decode
+// error instead of retuning the engine to an unintended level.
+func TestDecodeVolumeControlRequestMetadataRejectsInvalidPayloads(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata []byte
+	}{
+		{name: "empty", metadata: nil},
+		{name: "malformed json", metadata: []byte(`{"volume":`)},
+		{name: "missing volume", metadata: []byte(`{}`)},
+		{name: "below range", metadata: []byte(`{"volume":0}`)},
+		{name: "above range", metadata: []byte(`{"volume":12}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := DecodeVolumeControlRequestMetadata(tt.metadata)
+			require.Error(t, err)
+		})
 	}
 }
