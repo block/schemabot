@@ -31,8 +31,8 @@ func TestIndexRedriveableDeliveries(t *testing.T) {
 
 	require.True(t, complete)
 	require.Len(t, redriveable, 2)
-	assert.Equal(t, redriveableDeliveries{app: "production", ids: []int64{11, 12}}, redriveable[5])
-	assert.Equal(t, redriveableDeliveries{app: "production", ids: []int64{13}}, redriveable[9])
+	assert.Equal(t, map[string][]int64{"production": {11, 12}}, redriveable[5])
+	assert.Equal(t, map[string][]int64{"production": {13}}, redriveable[9])
 
 	_, complete = indexRedriveableDeliveries(&apitypes.WebhookRedriveResponse{
 		Results: []apitypes.WebhookRedriveResult{
@@ -47,4 +47,25 @@ func TestIndexRedriveableDeliveries(t *testing.T) {
 		},
 	})
 	assert.True(t, complete, "exhausted history covered everything GitHub retains")
+}
+
+// A PR with retained failed deliveries in more than one App (for example
+// after an App migration) keeps each App's delivery IDs under that App, so
+// each is later redelivered with its own token rather than mixed.
+func TestIndexRedriveableDeliveriesGroupsMultipleAppsPerPR(t *testing.T) {
+	redriveable, _ := indexRedriveableDeliveries(&apitypes.WebhookRedriveResponse{
+		Results: []apitypes.WebhookRedriveResult{
+			{AppName: "old-app", ReachedWindowStart: true, Selected: []apitypes.WebhookRedriveSelection{{ID: 1, PR: 7}}},
+			{AppName: "new-app", ReachedWindowStart: true, Selected: []apitypes.WebhookRedriveSelection{{ID: 2, PR: 7}}},
+		},
+	})
+
+	assert.Equal(t, map[string][]int64{"old-app": {1}, "new-app": {2}}, redriveable[7])
+}
+
+// A PR title or server error containing tabs/newlines is neutralized so it
+// cannot break the tab-separated report layout.
+func TestSanitizeCell(t *testing.T) {
+	assert.Equal(t, "a b c", sanitizeCell("a\tb\nc"))
+	assert.Equal(t, "plain", sanitizeCell("plain"))
 }

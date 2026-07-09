@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -37,6 +38,11 @@ type ChecksBackfillCmd struct {
 // checksSynthesizeBatchSize matches the server's per-request PR cap.
 const checksSynthesizeBatchSize = 10
 
+// checksRedriveBatchSize bounds the delivery IDs redelivered per request, so
+// the redrive phase stays chunked (like synthesize) and no single request can
+// outlive an intermediary HTTP timeout under the server's per-delivery delay.
+const checksRedriveBatchSize = 50
+
 // checksBackfillAction is one PR's classification and (after acting) outcome.
 type checksBackfillAction struct {
 	PR           int      `json:"pr"`
@@ -50,11 +56,14 @@ type checksBackfillAction struct {
 	UntrustedConflictNames []string `json:"untrusted_conflict_names,omitempty"`
 	// Classification is "redrive" when GitHub still retains a failed
 	// check-creating delivery for the PR, otherwise "synthesize".
-	Classification string  `json:"classification"`
-	App            string  `json:"app,omitempty"`
-	DeliveryIDs    []int64 `json:"delivery_ids,omitempty"`
-	Outcome        string  `json:"outcome,omitempty"`
-	Error          string  `json:"error,omitempty"`
+	Classification string `json:"classification"`
+	// RedriveByApp groups the PR's redriveable delivery IDs by the App that
+	// owns them. A repo/PR can have retained failed deliveries in more than
+	// one App (for example after an App migration), and a delivery can only be
+	// redelivered with its own App's token, so the grouping must be preserved.
+	RedriveByApp map[string][]int64 `json:"redrive_by_app,omitempty"`
+	Outcome      string             `json:"outcome,omitempty"`
+	Error        string             `json:"error,omitempty"`
 }
 
 type checksBackfillReport struct {
@@ -139,10 +148,9 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 				UntrustedConflictNames: missing.UntrustedConflictNames,
 				Classification:         "synthesize",
 			}
-			if hits, ok := redriveable[missing.Number]; ok {
+			if byApp, ok := redriveable[missing.Number]; ok {
 				action.Classification = "redrive"
-				action.App = hits.app
-				action.DeliveryIDs = hits.ids
+				action.RedriveByApp = byApp
 			}
 			report.Actions = append(report.Actions, action)
 		}
@@ -187,17 +195,13 @@ func backfillCanceledError(err error, stopProgress func()) error {
 
 // redriveableDeliveries is one PR's failed check-creating deliveries; all of
 // a repo's deliveries come from the App that serves it, so one App per PR.
-type redriveableDeliveries struct {
-	app string
-	ids []int64
-}
 
 // indexRedriveableDeliveries maps PR number to its failed check-creating
 // deliveries from the crawl. searchComplete is false when any App's crawl
 // stopped before covering the window (page budget), meaning some redriveable
 // PRs may classify as synthesize instead.
-func indexRedriveableDeliveries(crawl *apitypes.WebhookRedriveResponse) (map[int]redriveableDeliveries, bool) {
-	redriveable := make(map[int]redriveableDeliveries)
+func indexRedriveableDeliveries(crawl *apitypes.WebhookRedriveResponse) (map[int]map[string][]int64, bool) {
+	redriveable := make(map[int]map[string][]int64)
 	searchComplete := true
 	if crawl == nil {
 		return redriveable, searchComplete
@@ -210,36 +214,47 @@ func indexRedriveableDeliveries(crawl *apitypes.WebhookRedriveResponse) (map[int
 			if selected.PR == 0 {
 				continue
 			}
-			entry := redriveable[selected.PR]
-			entry.app = result.AppName
-			entry.ids = append(entry.ids, selected.ID)
-			redriveable[selected.PR] = entry
+			byApp := redriveable[selected.PR]
+			if byApp == nil {
+				byApp = make(map[string][]int64)
+				redriveable[selected.PR] = byApp
+			}
+			// Preserve the owning App per delivery: a PR can have deliveries in
+			// more than one App, and each can only be redelivered with its own
+			// App's token.
+			byApp[result.AppName] = append(byApp[result.AppName], selected.ID)
 		}
 	}
 	return redriveable, searchComplete
 }
 
 func (cmd *ChecksBackfillCmd) act(ctx context.Context, endpoint string, report *checksBackfillReport, updateProgress func(string)) error {
-	// Redeliveries first, grouped per App so each request redelivers by ID.
+	// Redeliveries first, grouped per App (a delivery only redelivers with its
+	// own App's token) and chunked so no single request redelivers an
+	// unbounded number of deliveries.
 	idsByApp := make(map[string][]int64)
 	for _, action := range report.Actions {
-		if action.Classification == "redrive" {
-			idsByApp[action.App] = append(idsByApp[action.App], action.DeliveryIDs...)
+		for app, ids := range action.RedriveByApp {
+			idsByApp[app] = append(idsByApp[app], ids...)
 		}
 	}
 	redriveFailedByApp := make(map[string]bool)
-	for app, ids := range idsByApp {
-		updateProgress(fmt.Sprintf("redelivering %d failed deliveries via app %s...", len(ids), app))
-		resp, err := cmdclient.RedriveWebhooks(ctx, endpoint, apitypes.WebhookRedriveRequest{
-			App:         app,
-			DeliveryIDs: ids,
-		})
-		if err != nil {
-			return fmt.Errorf("redeliver failed deliveries via app %q: %w", app, err)
-		}
-		for _, result := range resp.Results {
-			if result.Failed > 0 {
-				redriveFailedByApp[app] = true
+	for _, app := range sortedKeys(idsByApp) {
+		ids := idsByApp[app]
+		for start := 0; start < len(ids); start += checksRedriveBatchSize {
+			batch := ids[start:min(start+checksRedriveBatchSize, len(ids))]
+			updateProgress(fmt.Sprintf("redelivering %d/%d failed deliveries via app %s...", min(start+len(batch), len(ids)), len(ids), app))
+			resp, err := cmdclient.RedriveWebhooks(ctx, endpoint, apitypes.WebhookRedriveRequest{
+				App:         app,
+				DeliveryIDs: batch,
+			})
+			if err != nil {
+				return fmt.Errorf("redeliver failed deliveries via app %q: %w", app, err)
+			}
+			for _, result := range resp.Results {
+				if result.Failed > 0 {
+					redriveFailedByApp[app] = true
+				}
 			}
 		}
 	}
@@ -252,7 +267,13 @@ func (cmd *ChecksBackfillCmd) act(ctx context.Context, endpoint string, report *
 		actionByPR[action.PR] = action
 		switch action.Classification {
 		case "redrive":
-			if redriveFailedByApp[action.App] {
+			anyFailed := false
+			for app := range action.RedriveByApp {
+				if redriveFailedByApp[app] {
+					anyFailed = true
+				}
+			}
+			if anyFailed {
 				action.Outcome = "redelivered (some redeliveries failed; see server logs)"
 			} else {
 				action.Outcome = "redelivered"
@@ -317,7 +338,10 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 				failed++
 			}
 		}
-		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", action.URL, shortSHA(action.HeadSHA), strings.Join(action.MissingNames, ", "), status, action.Title); err != nil {
+		// The status (server outcome/error) and the GitHub-controlled title are
+		// tab-separated cells: strip tabs/newlines so a value containing them
+		// cannot break the table layout.
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", action.URL, shortSHA(action.HeadSHA), strings.Join(action.MissingNames, ", "), sanitizeCell(status), sanitizeCell(action.Title)); err != nil {
 			return err
 		}
 	}
@@ -341,9 +365,31 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 // backfill would use for the PR.
 func describeBackfillPlan(action checksBackfillAction) string {
 	if action.Classification == "redrive" {
-		return fmt.Sprintf("redrive %d failed deliveries (app %s)", len(action.DeliveryIDs), action.App)
+		total := 0
+		for _, ids := range action.RedriveByApp {
+			total += len(ids)
+		}
+		return fmt.Sprintf("redrive %d failed deliveries (app %s)", total, strings.Join(sortedKeys(action.RedriveByApp), ", "))
 	}
 	return "synthesize via auto-plan (no retained delivery)"
+}
+
+// sortedKeys returns the map keys in deterministic order, so per-App output
+// (dry-run plan, redrive progress) does not depend on map iteration order.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// sanitizeCell collapses tabs and newlines to spaces so a caller-influenced
+// value (a PR title, a server error string) cannot break the tab-separated
+// table layout.
+func sanitizeCell(s string) string {
+	return strings.NewReplacer("\t", " ", "\n", " ", "\r", " ").Replace(s)
 }
 
 func shortSHA(sha string) string {
