@@ -161,13 +161,17 @@ func TestBuildMultiApplyData_ScopesShardsByOperation(t *testing.T) {
 }
 
 // The per-deployment section reflects the operation's own state and error, not
-// the parent apply's aggregate state.
+// the parent apply's aggregate state. Redispatch is apply-level, so the parent
+// apply's attempt count carries into each deployment's retry counter.
 func TestBuildDeploymentDetail_UsesOperationStateAndError(t *testing.T) {
 	op := &storage.ApplyOperation{ID: 1, Deployment: "us", State: state.ApplyOperation.Failed, ErrorMessage: "lock wait timeout"}
-	detail := buildDeploymentDetail(runningApply(), op, nil, operationDisplay{}, nil)
+	apply := runningApply()
+	apply.Attempt = 3
+	detail := buildDeploymentDetail(apply, op, nil, operationDisplay{}, nil)
 	assert.Equal(t, state.Apply.Failed, detail.State)
 	assert.Equal(t, "lock wait timeout", detail.ErrorMessage)
 	assert.Equal(t, "payments", detail.Database)
+	assert.Equal(t, 3, detail.Attempt)
 }
 
 // The storage→presentation boundary resolves the rollout policies: barrier flips

@@ -156,6 +156,7 @@ func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tas
 		Environment:      apply.Environment,
 		State:            op.State,
 		Engine:           apply.Engine,
+		Attempt:          apply.Attempt,
 		ErrorMessage:     op.ErrorMessage,
 		Tables:           tableProgressFromTasks(apply.Database, tasks, shardsByTable),
 		VSchemaChanges:   display.VSchema,
