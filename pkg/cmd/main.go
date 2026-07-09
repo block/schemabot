@@ -53,7 +53,8 @@ type CLI struct {
 	Configure  commands.ConfigureCmd  `cmd:"" help:"Configure CLI settings (endpoint, profiles)"`
 	Login      commands.LoginCmd      `cmd:"" help:"Log in via OIDC and cache a token for the active profile"`
 	Settings   commands.SettingsCmd   `cmd:"" help:"View or update schema change settings"`
-	Webhooks   commands.WebhooksCmd   `cmd:"" help:"Manage GitHub webhook operations"`
+	Webhooks   commands.WebhooksCmd   `cmd:"" help:"Manage GitHub App webhook deliveries"`
+	Checks     commands.ChecksCmd     `cmd:"" help:"Manage SchemaBot Check Runs on PRs"`
 	Serve      commands.ServeCmd      `cmd:"" help:"Start the SchemaBot HTTP API server"`
 }
 

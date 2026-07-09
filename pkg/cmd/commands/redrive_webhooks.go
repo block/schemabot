@@ -15,7 +15,10 @@ import (
 
 var webhookRedriveNow = func() time.Time { return time.Now().UTC() }
 
-// WebhooksCmd groups GitHub App webhook delivery operator commands.
+// WebhooksCmd groups GitHub webhook delivery operator commands. Missing
+// Check Runs are handled by `schemabot checks backfill`, which redrives or
+// synthesizes per PR; redrive here is the window-scoped tool for a known
+// delivery outage.
 type WebhooksCmd struct {
 	Redrive RedriveWebhooksCmd `cmd:"" help:"Redeliver failed GitHub App webhook deliveries from a time window"`
 }
@@ -58,7 +61,7 @@ func (cmd *RedriveWebhooksCmd) Run(ctx context.Context, g *Globals) error {
 		PR:          cmd.PR,
 		MaxPages:    cmd.MaxPages,
 		DryRun:      cmd.DryRun,
-	}, cmd.MaxPages, func(r apitypes.WebhookRedriveResult) {
+	}, cmd.MaxPages, true, func(r apitypes.WebhookRedriveResult) {
 		updateProgress(redriveProgressLine(r, windowStart, windowEnd, cmd.DryRun))
 	})
 	stopProgress()
@@ -133,7 +136,10 @@ func redriveWindowCoverage(oldestFetched, windowStart, windowEnd string) (int, b
 // requests: the server processes a few delivery pages per request and hands
 // back a cursor, so no single HTTP request can outlive an intermediary
 // timeout no matter how deep the crawl goes. maxPages is the total page
-// budget per App across all requests; incomplete coverage fails the run.
+// budget per App across all requests. With requireFullCoverage, incomplete
+// coverage fails the run; without it, the caller inspects the per-app
+// ReachedWindowStart/HistoryExhausted facts (best-effort classification
+// passes tolerate a partial crawl).
 //
 // Re-run convergence caveat: the server dedupes already-succeeded redeliveries
 // by GUID, but only within a single request (one cursor chunk). Because this
@@ -144,7 +150,7 @@ func redriveWindowCoverage(oldestFetched, windowStart, windowEnd string) (int, b
 // whose check recompute is idempotent and fail-closed and which never triggers
 // an apply; the worst case is a duplicate plan comment. Running --dry-run first
 // is the operator mitigation.
-func runChunkedWebhookRedrive(ctx context.Context, call func(context.Context, string, apitypes.WebhookRedriveRequest) (*apitypes.WebhookRedriveResponse, error), endpoint string, req apitypes.WebhookRedriveRequest, maxPages int, progress func(apitypes.WebhookRedriveResult)) (*apitypes.WebhookRedriveResponse, error) {
+func runChunkedWebhookRedrive(ctx context.Context, call func(context.Context, string, apitypes.WebhookRedriveRequest) (*apitypes.WebhookRedriveResponse, error), endpoint string, req apitypes.WebhookRedriveRequest, maxPages int, requireFullCoverage bool, progress func(apitypes.WebhookRedriveResult)) (*apitypes.WebhookRedriveResponse, error) {
 	if progress == nil {
 		progress = func(apitypes.WebhookRedriveResult) {}
 	}
@@ -184,7 +190,7 @@ func runChunkedWebhookRedrive(ctx context.Context, call func(context.Context, st
 			appResult = mergeWebhookRedriveResults(appResult, next.Results[0])
 			progress(appResult)
 		}
-		if !appResult.ReachedWindowStart {
+		if requireFullCoverage && !appResult.ReachedWindowStart {
 			if appResult.HistoryExhausted {
 				return merged, fmt.Errorf("app %q: GitHub's retained delivery history ends at %s, after the requested window start %s; older deliveries are no longer redriveable", appResult.AppName, appResult.OldestFetched, req.WindowStart)
 			}
