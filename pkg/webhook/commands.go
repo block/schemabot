@@ -144,7 +144,7 @@ func NewCommandParser() *CommandParser {
 		allowUnsafeRegex:  regexp.MustCompile(`(?i)--allow-unsafe\b`),
 		forceRegex:        regexp.MustCompile(`(?i)--force\b`),
 		autoConfirmRegex:  regexp.MustCompile(`(?i)(?:--yes\b|-y\b)`),
-		volumeFlagRegex:   regexp.MustCompile(`(?i)(?:^|\s)(?:--volume|-v)(?:[ \t]+([^\s]+))?`),
+		volumeFlagRegex:   regexp.MustCompile(`(?i)(?:^|\s)(?:--volume|-v)(?:[ \t]+([^\s]+))?(?:\s|$)`),
 	}
 }
 

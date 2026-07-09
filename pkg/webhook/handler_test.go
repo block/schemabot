@@ -461,6 +461,7 @@ func TestWebhookControlCommandMissingApplyID(t *testing.T) {
 		{name: "start", comment: "schemabot start -e staging", action: "start"},
 		{name: "cutover", comment: "schemabot cutover -e staging", action: "cutover"},
 		{name: "volume", comment: "schemabot volume -e staging -v 8", action: "volume"},
+		{name: "volume without level", comment: "schemabot volume -e staging", action: "volume"},
 	}
 
 	for _, tt := range tests {

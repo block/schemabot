@@ -369,7 +369,10 @@ func (h *Handler) handleVolumeCommand(repo string, pr int, installationID int64,
 	ctx, cancel := h.commandContext(commandTimeout)
 	defer cancel()
 
-	if !volumeCommandLevelValid(result) {
+	// A missing apply ID takes precedence over level validation so the
+	// command posts the standard missing-apply-ID guidance shared by all
+	// apply-scoped control commands (runControlCommand handles that case).
+	if result.ApplyID != "" && !volumeCommandLevelValid(result) {
 		h.logger.Warn("volume PR command rejected because the level is missing or invalid",
 			"repo", repo,
 			"pr", pr,

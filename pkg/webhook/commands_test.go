@@ -352,6 +352,39 @@ func TestParseVolumeCommand(t *testing.T) {
 				IsMention:   true,
 			},
 		},
+		{
+			name: "flag prefix of a longer flag is not a volume flag",
+			body: "schemabot volume apply_abc123 -e staging --volume-level 5",
+			expected: CommandResult{
+				Action:      action.Volume,
+				ApplyID:     "apply_abc123",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "word starting with -v is not a volume flag",
+			body: "schemabot volume apply_abc123 -e staging -verbose",
+			expected: CommandResult{
+				Action:      action.Volume,
+				ApplyID:     "apply_abc123",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "level attached to the flag without a space is not parsed",
+			body: "schemabot volume apply_abc123 -e staging -v8",
+			expected: CommandResult{
+				Action:      action.Volume,
+				ApplyID:     "apply_abc123",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
 	}
 
 	for _, tc := range tests {
