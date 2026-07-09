@@ -134,6 +134,16 @@ func redriveWindowCoverage(oldestFetched, windowStart, windowEnd string) (int, b
 // back a cursor, so no single HTTP request can outlive an intermediary
 // timeout no matter how deep the crawl goes. maxPages is the total page
 // budget per App across all requests; incomplete coverage fails the run.
+//
+// Re-run convergence caveat: the server dedupes already-succeeded redeliveries
+// by GUID, but only within a single request (one cursor chunk). Because this
+// loop spreads a large window across independent requests, a re-run over a
+// window big enough that a delivery's successful-redelivery record and its
+// failed original fall in different chunks can redeliver that original again.
+// This is safe — a re-redelivered event only re-enters the auto-plan flow,
+// whose check recompute is idempotent and fail-closed and which never triggers
+// an apply; the worst case is a duplicate plan comment. Running --dry-run first
+// is the operator mitigation.
 func runChunkedWebhookRedrive(ctx context.Context, call func(context.Context, string, apitypes.WebhookRedriveRequest) (*apitypes.WebhookRedriveResponse, error), endpoint string, req apitypes.WebhookRedriveRequest, maxPages int, progress func(apitypes.WebhookRedriveResult)) (*apitypes.WebhookRedriveResponse, error) {
 	if progress == nil {
 		progress = func(apitypes.WebhookRedriveResult) {}
