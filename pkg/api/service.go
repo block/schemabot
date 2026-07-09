@@ -129,7 +129,11 @@ type Service struct {
 	routingTernClient *tern.RoutingClient
 	ternMu            sync.Mutex // protects tern client caches and engineFactories
 	logger            *slog.Logger
-	clock             clock.Clock
+	// checkRunBackfiller replays the auto-plan flow for a PR to recreate
+	// missing Check Runs; wired from the webhook handler at serve startup,
+	// nil when no GitHub webhook runtime exists.
+	checkRunBackfiller CheckRunBackfiller
+	clock              clock.Clock
 
 	// engineFactories holds engine implementations for database types this build
 	// does not provide natively, registered by an embedding service via
@@ -448,6 +452,13 @@ func (s *Service) RegisterTernClient(deployment, environment string, client tern
 // TargetRouter so the durable-apply operator and routing client resolve the
 // connection from each request's target — the dynamic-resolution counterpart to
 // RegisterTernClient, without needing one registration per deployment.
+// SetCheckRunBackfiller wires the webhook handler's Check Run backfill entry
+// point into the API service, so the checks operator endpoints can replay the
+// auto-plan flow for a PR. Set once during serve startup, before traffic.
+func (s *Service) SetCheckRunBackfiller(b CheckRunBackfiller) {
+	s.checkRunBackfiller = b
+}
+
 func (s *Service) SetDefaultTernClient(client tern.Client) {
 	s.ternMu.Lock()
 	defer s.ternMu.Unlock()
@@ -696,6 +707,8 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 	handle("GET /api/logs/{database}", s.handleLogs)
 	handle("GET /api/logs", s.handleLogsWithoutDatabase)
 	handle("POST /api/webhooks/redrive", s.handleWebhookRedrive)
+	handle("POST /api/checks/scan", s.handleChecksScan)
+	handle("POST /api/checks/synthesize", s.handleChecksSynthesize)
 
 	// Lock API (database-level locking)
 	handle("POST /api/locks/acquire", s.handleLockAcquire)

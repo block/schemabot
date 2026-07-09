@@ -32,6 +32,10 @@ const (
 	// webhookRedriveMaxPagesPerRequest bounds one redrive request's listing so
 	// each HTTP request finishes in seconds; callers continue via the cursor.
 	webhookRedriveMaxPagesPerRequest = 25
+
+	// webhookScanPRPageSize bounds one scan request to a single page of open
+	// PRs; callers continue via next_page.
+	webhookScanPRPageSize = 30
 )
 
 // webhookOpsRequestError marks a failure caused by the request itself
@@ -71,6 +75,79 @@ type WebhookRedriveRequest = apitypes.WebhookRedriveRequest
 type WebhookRedriveResponse = apitypes.WebhookRedriveResponse
 type WebhookRedriveResult = apitypes.WebhookRedriveResult
 type WebhookRedriveSelection = apitypes.WebhookRedriveSelection
+type ChecksScanRequest = apitypes.ChecksScanRequest
+type ChecksScanResponse = apitypes.ChecksScanResponse
+type MissingCheckPR = apitypes.MissingCheckPR
+
+// CheckRunBackfiller replays the auto-plan flow for a PR to recreate missing
+// Check Runs, exactly as the check-creating webhook delivery would have. The
+// webhook handler implements it; the API service holds it so the checks
+// operator endpoints can reach the webhook pipeline.
+type CheckRunBackfiller interface {
+	BackfillPRCheckRuns(ctx context.Context, repo string, pr int, installationID int64) (string, error)
+}
+
+type ChecksSynthesizeRequest = apitypes.ChecksSynthesizeRequest
+type ChecksSynthesizeResponse = apitypes.ChecksSynthesizeResponse
+type ChecksSynthesizeResult = apitypes.ChecksSynthesizeResult
+
+// checksSynthesizeMaxPRsPerRequest bounds one synthesize request; each PR's
+// heavy plan work runs asynchronously, so a chunk only pays discovery.
+const checksSynthesizeMaxPRsPerRequest = 10
+
+func (s *Service) handleChecksSynthesize(w http.ResponseWriter, r *http.Request) {
+	var req ChecksSynthesizeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeBodyDecodeError(w, err)
+		return
+	}
+	ctx, cancel := s.extendWebhookOpsDeadline(w, r)
+	defer cancel()
+	response, err := executeChecksSynthesize(ctx, s.config, s.checkRunBackfiller, req, s.logger)
+	if err != nil {
+		s.writeWebhookOpsError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, response)
+}
+
+func executeChecksSynthesize(ctx context.Context, cfg *ServerConfig, backfiller CheckRunBackfiller, req ChecksSynthesizeRequest, logger *slog.Logger) (*ChecksSynthesizeResponse, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("server config is nil")
+	}
+	if req.Repo == "" {
+		return nil, webhookOpsRequestErrorf("repo is required")
+	}
+	if len(req.PRs) == 0 {
+		return nil, webhookOpsRequestErrorf("prs is required")
+	}
+	if len(req.PRs) > checksSynthesizeMaxPRsPerRequest {
+		return nil, webhookOpsRequestErrorf("at most %d prs per request; send the rest in follow-up requests", checksSynthesizeMaxPRsPerRequest)
+	}
+	if backfiller == nil {
+		return nil, fmt.Errorf("check run backfill is unavailable: no GitHub webhook runtime is configured")
+	}
+	if logger == nil {
+		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	}
+	_, installationID, err := resolveRepoInstallationClient(ctx, cfg, req.Repo, logger)
+	if err != nil {
+		return nil, err
+	}
+	response := &ChecksSynthesizeResponse{Repo: req.Repo}
+	for _, pr := range req.PRs {
+		outcome, err := backfiller.BackfillPRCheckRuns(ctx, req.Repo, pr, installationID)
+		result := ChecksSynthesizeResult{PR: pr, Outcome: outcome}
+		if err != nil {
+			// Each PR's backfill is independent; report the failure and keep
+			// going so one bad PR does not strand the rest of the batch.
+			logger.Warn("check run backfill failed for PR", "repo", req.Repo, "pr", pr, "error", err)
+			result.Error = err.Error()
+		}
+		response.Results = append(response.Results, result)
+	}
+	return response, nil
+}
 
 type webhookRedriveDeliveryClient interface {
 	ListHookDeliveries(ctx context.Context, opts *gh.ListCursorOptions) ([]*gh.HookDelivery, *gh.Response, error)
@@ -100,7 +177,26 @@ func (s *Service) handleWebhookRedrive(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, response)
 }
 
+func (s *Service) handleChecksScan(w http.ResponseWriter, r *http.Request) {
+	var req ChecksScanRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeBodyDecodeError(w, err)
+		return
+	}
+	ctx, cancel := s.extendWebhookOpsDeadline(w, r)
+	defer cancel()
+	response, err := executeChecksScan(ctx, s.config, req, s.logger)
+	if err != nil {
+		s.writeWebhookOpsError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, response)
+}
+
 func executeWebhookRedrive(ctx context.Context, cfg *ServerConfig, req WebhookRedriveRequest, logger *slog.Logger) (*WebhookRedriveResponse, error) {
+	if len(req.DeliveryIDs) > 0 {
+		return executeWebhookRedriveByIDs(ctx, cfg, req, logger)
+	}
 	if req.MaxPages <= 0 {
 		return nil, webhookOpsRequestErrorf("max_pages must be positive")
 	}
@@ -142,6 +238,100 @@ func executeWebhookRedrive(ctx context.Context, cfg *ServerConfig, req WebhookRe
 		response.Results = append(response.Results, result)
 	}
 	return response, nil
+}
+
+func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanRequest, logger *slog.Logger) (*ChecksScanResponse, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("server config is nil")
+	}
+	if req.Repo == "" {
+		return nil, webhookOpsRequestErrorf("repo is required")
+	}
+	if req.Page < 0 {
+		return nil, webhookOpsRequestErrorf("page must be non-negative")
+	}
+	if logger == nil {
+		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	}
+	installationClient, _, err := resolveRepoInstallationClient(ctx, cfg, req.Repo, logger)
+	if err != nil {
+		return nil, err
+	}
+	return scanWebhookMissingChecks(ctx, installationClient, req.Repo, webhookMissingCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page)
+}
+
+// resolveRepoInstallationClient builds an installation-scoped GitHub client
+// for the App that serves repo, from the server config's App credentials.
+func resolveRepoInstallationClient(ctx context.Context, cfg *ServerConfig, repo string, logger *slog.Logger) (*ghclient.InstallationClient, int64, error) {
+	app, err := cfg.ResolveGitHubAppForRepo(repo)
+	if err != nil {
+		return nil, 0, err
+	}
+	appID := app.Config.ResolveAppID()
+	if appID == 0 {
+		return nil, 0, fmt.Errorf("app %q has empty or unparseable app-id", app.Name)
+	}
+	privateKey, err := app.Config.ResolvePrivateKey()
+	if err != nil {
+		return nil, 0, fmt.Errorf("resolve private key for app %q: %w", app.Name, err)
+	}
+	if privateKey == "" {
+		return nil, 0, fmt.Errorf("app %q private key resolved to empty value", app.Name)
+	}
+	client := ghclient.NewClient(appID, []byte(privateKey), logger,
+		ghclient.WithTrustedCheckAppSlugs(app.Config.TrustedCheckAppSlugs))
+	installationID, err := client.InstallationIDForRepo(ctx, repo)
+	if err != nil {
+		return nil, 0, fmt.Errorf("resolve GitHub App installation for %s: %w", repo, err)
+	}
+	installationClient, err := client.ForInstallation(installationID)
+	if err != nil {
+		return nil, 0, fmt.Errorf("create installation client for %s: %w", repo, err)
+	}
+	return installationClient, installationID, nil
+}
+
+// executeWebhookRedriveByIDs redelivers exactly the requested deliveries for
+// one App, skipping the window listing — the caller already identified the
+// failed deliveries (for example a checks backfill classification pass).
+func executeWebhookRedriveByIDs(ctx context.Context, cfg *ServerConfig, req WebhookRedriveRequest, logger *slog.Logger) (*WebhookRedriveResponse, error) {
+	if req.App == "" {
+		return nil, webhookOpsRequestErrorf("delivery_ids redelivery requires app to be set")
+	}
+	if req.Cursor != "" {
+		return nil, webhookOpsRequestErrorf("delivery_ids and cursor are mutually exclusive")
+	}
+	if req.DryRun {
+		return nil, webhookOpsRequestErrorf("delivery_ids redelivery has no dry run; the listing pass already reported the selection")
+	}
+	apps, err := webhookRedriveApps(cfg, req.App)
+	if err != nil {
+		return nil, err
+	}
+	if logger == nil {
+		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	}
+	app := apps[0]
+	client, err := newWebhookRedriveGitHubClient(app, logger)
+	if err != nil {
+		return nil, err
+	}
+	result := WebhookRedriveResult{AppName: app.name, ReachedWindowStart: true}
+	for i, id := range req.DeliveryIDs {
+		result.Selected = append(result.Selected, WebhookRedriveSelection{ID: id})
+		if _, _, err := client.Apps.RedeliverHookDelivery(ctx, id); err != nil {
+			result.Failed++
+			logger.Warn("GitHub webhook redelivery failed", "app_name", app.name, "delivery_id", id, "error", err)
+			continue
+		}
+		result.Redelivered++
+		if i < len(req.DeliveryIDs)-1 {
+			if err := waitWebhookRedriveDelay(ctx); err != nil {
+				return nil, fmt.Errorf("wait between GitHub webhook redeliveries for app %q: %w", app.name, err)
+			}
+		}
+	}
+	return &WebhookRedriveResponse{Results: []WebhookRedriveResult{result}}, nil
 }
 
 func webhookRedriveApps(cfg *ServerConfig, onlyApp string) ([]webhookRedriveApp, error) {
@@ -437,4 +627,59 @@ func webhookRedrivePayloadMetadata(delivery *gh.HookDelivery) (webhookRedrivePay
 		appendPR(pr.Number)
 	}
 	return webhookRedrivePayload{repo: payload.Repository.FullName, prs: prs}, nil
+}
+
+func webhookMissingCheckNames(cfg *ServerConfig, repo, environment, override string) []string {
+	if override != "" {
+		return []string{override}
+	}
+	base := cfg.GitHubCheckNameBaseForRepo(repo)
+	if environment != "" {
+		return []string{fmt.Sprintf("%s (%s)", base, environment)}
+	}
+	if len(cfg.AllowedEnvironments) > 0 {
+		out := make([]string, 0, len(cfg.AllowedEnvironments))
+		for _, env := range cfg.AllowedEnvironments {
+			out = append(out, fmt.Sprintf("%s (%s)", base, env))
+		}
+		return out
+	}
+	return []string{base}
+}
+
+type webhookMissingCheckScanClient interface {
+	ListOpenPullRequestsPage(ctx context.Context, repo string, page, perPage int) ([]ghclient.OpenPullRequest, int, error)
+	FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error)
+}
+
+func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, repo string, checkNames []string, page int) (*ChecksScanResponse, error) {
+	prs, nextPage, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookScanPRPageSize)
+	if err != nil {
+		return nil, err
+	}
+	result := &ChecksScanResponse{Repo: repo, CheckNames: checkNames, Scanned: len(prs), NextPage: nextPage}
+	for _, pr := range prs {
+		var missing []string
+		for _, checkName := range checkNames {
+			run, _, err := client.FindCheckRunByName(ctx, repo, pr.HeadSHA, checkName)
+			if err != nil {
+				return nil, fmt.Errorf("scan %s#%d for check %q at %s: %w", repo, pr.Number, checkName, pr.HeadSHA, err)
+			}
+			if run == nil {
+				missing = append(missing, checkName)
+			}
+		}
+		if len(missing) == 0 {
+			continue
+		}
+		result.Missing = append(result.Missing, MissingCheckPR{
+			Number:       pr.Number,
+			URL:          fmt.Sprintf("https://github.com/%s/pull/%d", repo, pr.Number),
+			Title:        pr.Title,
+			HeadSHA:      pr.HeadSHA,
+			HeadRef:      pr.HeadRef,
+			MissingNames: missing,
+		})
+	}
+	return result, nil
 }

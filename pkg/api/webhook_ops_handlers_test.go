@@ -12,6 +12,8 @@ import (
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	ghclient "github.com/block/schemabot/pkg/github"
 )
 
 type fakeWebhookRedriveDeliveryClient struct {
@@ -368,4 +370,129 @@ func webhookRedriveTestDeliveryDetail(id int64, repo string, pr int) *gh.HookDel
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+type fakeCheckRunBackfiller struct {
+	calls    []int
+	failPR   int
+	outcomes map[int]string
+}
+
+func (f *fakeCheckRunBackfiller) BackfillPRCheckRuns(_ context.Context, _ string, pr int, _ int64) (string, error) {
+	f.calls = append(f.calls, pr)
+	if pr == f.failPR {
+		return "", errors.New("boom")
+	}
+	if outcome, ok := f.outcomes[pr]; ok {
+		return outcome, nil
+	}
+	return "auto-plan started", nil
+}
+
+// Synthesize requests are validated before any GitHub work: request-shaped
+// problems are reported as such, and an instance without a webhook runtime
+// cannot backfill at all.
+func TestExecuteChecksSynthesizeValidation(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{}
+	backfiller := &fakeCheckRunBackfiller{}
+
+	_, err := executeChecksSynthesize(t.Context(), cfg, backfiller, ChecksSynthesizeRequest{PRs: []int{1}}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "repo is required")
+
+	_, err = executeChecksSynthesize(t.Context(), cfg, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo"}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "prs is required")
+
+	tooMany := make([]int, checksSynthesizeMaxPRsPerRequest+1)
+	_, err = executeChecksSynthesize(t.Context(), cfg, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo", PRs: tooMany}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "per request")
+
+	_, err = executeChecksSynthesize(t.Context(), cfg, nil, ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1}}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no GitHub webhook runtime")
+}
+
+// Redelivery by explicit delivery IDs is a precise continuation of a prior
+// listing pass; it refuses request shapes that would silently change meaning.
+func TestExecuteWebhookRedriveByIDsValidation(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{GitHub: GitHubConfig{AppID: "1", PrivateKey: "key"}}
+
+	_, err := executeWebhookRedrive(t.Context(), cfg, WebhookRedriveRequest{DeliveryIDs: []int64{1}}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires app")
+
+	_, err = executeWebhookRedrive(t.Context(), cfg, WebhookRedriveRequest{DeliveryIDs: []int64{1}, App: "default", Cursor: "c1"}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mutually exclusive")
+
+	_, err = executeWebhookRedrive(t.Context(), cfg, WebhookRedriveRequest{DeliveryIDs: []int64{1}, App: "default", DryRun: true}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no dry run")
+}
+
+type fakeWebhookMissingCheckScanClient struct {
+	prs  []ghclient.OpenPullRequest
+	runs map[string]*ghclient.CheckRunResult
+}
+
+func (f fakeWebhookMissingCheckScanClient) ListOpenPullRequestsPage(_ context.Context, _ string, page, perPage int) ([]ghclient.OpenPullRequest, int, error) {
+	if page <= 0 {
+		page = 1
+	}
+	start := (page - 1) * perPage
+	if start >= len(f.prs) {
+		return nil, 0, nil
+	}
+	end := min(start+perPage, len(f.prs))
+	nextPage := 0
+	if end < len(f.prs) {
+		nextPage = page + 1
+	}
+	return f.prs[start:end], nextPage, nil
+}
+
+func (f fakeWebhookMissingCheckScanClient) FindCheckRunByName(_ context.Context, _ string, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error) {
+	return f.runs[headSHA+"/"+checkName], nil, nil
+}
+
+func TestWebhookMissingCheckNamesUsesConfiguredEnvironmentNames(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{
+		GitHub:              GitHubConfig{CheckName: "SchemaBot X"},
+		AllowedEnvironments: []string{"staging", "production"},
+	}
+
+	assert.Equal(t, []string{"SchemaBot X (staging)", "SchemaBot X (production)"}, webhookMissingCheckNames(cfg, "octo/repo", "", ""))
+	assert.Equal(t, []string{"SchemaBot X (production)"}, webhookMissingCheckNames(cfg, "octo/repo", "production", ""))
+	assert.Equal(t, []string{"Custom Check"}, webhookMissingCheckNames(cfg, "octo/repo", "production", "Custom Check"))
+}
+
+func TestScanWebhookMissingChecksReportsOpenPRsMissingConfiguredChecks(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 1, Title: "has check", HeadSHA: "sha1", HeadRef: "feature-1"},
+			{Number: 2, Title: "missing check", HeadSHA: "sha2", HeadRef: "feature-2"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha1/SchemaBot (production)": {ID: 10, Name: "SchemaBot (production)", Status: "completed", Conclusion: "success"},
+		},
+	}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0)
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, result.Scanned)
+	require.Len(t, result.Missing, 1)
+	assert.Equal(t, 2, result.Missing[0].Number)
+	assert.Equal(t, "https://github.com/octo/repo/pull/2", result.Missing[0].URL)
+	assert.Equal(t, []string{"SchemaBot (production)"}, result.Missing[0].MissingNames)
 }

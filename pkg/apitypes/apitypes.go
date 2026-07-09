@@ -57,6 +57,10 @@ type WebhookRedriveRequest struct {
 	// processes a bounded number of pages so it finishes well within any
 	// intermediary HTTP timeout; the caller loops until next_cursor is empty.
 	Cursor string `json:"cursor,omitempty"`
+	// DeliveryIDs redelivers exactly these deliveries for App, skipping the
+	// window listing entirely — for callers that already identified the
+	// failed deliveries (for example a checks backfill classification pass).
+	DeliveryIDs []int64 `json:"delivery_ids,omitempty"`
 }
 
 type WebhookRedriveResponse struct {
@@ -94,6 +98,53 @@ type WebhookRedriveSelection struct {
 	StatusCode  int    `json:"status_code"`
 	Repo        string `json:"repo,omitempty"`
 	PR          int    `json:"pr,omitempty"`
+}
+
+type ChecksScanRequest struct {
+	Repo        string `json:"repo"`
+	Environment string `json:"environment,omitempty"`
+	CheckName   string `json:"check_name,omitempty"`
+	// Page selects one bounded page of open PRs (1-based; 0 means the first
+	// page). Each request scans a single page so it finishes well within any
+	// intermediary HTTP timeout; the caller loops until next_page is 0.
+	Page int `json:"page,omitempty"`
+}
+
+type ChecksScanResponse struct {
+	Repo       string           `json:"repo"`
+	CheckNames []string         `json:"check_names"`
+	Scanned    int              `json:"scanned"`
+	NextPage   int              `json:"next_page,omitempty"`
+	Missing    []MissingCheckPR `json:"missing"`
+}
+
+// ChecksSynthesizeRequest asks the server to recreate missing Check Runs for
+// specific PRs by replaying the auto-plan flow, as if the check-creating
+// webhook delivery had arrived. Used for PRs with no delivery to redrive
+// (for example PRs opened before check enablement).
+type ChecksSynthesizeRequest struct {
+	Repo string `json:"repo"`
+	PRs  []int  `json:"prs"`
+}
+
+type ChecksSynthesizeResponse struct {
+	Repo    string                   `json:"repo"`
+	Results []ChecksSynthesizeResult `json:"results"`
+}
+
+type ChecksSynthesizeResult struct {
+	PR      int    `json:"pr"`
+	Outcome string `json:"outcome"`
+	Error   string `json:"error,omitempty"`
+}
+
+type MissingCheckPR struct {
+	Number       int      `json:"number"`
+	URL          string   `json:"url"`
+	Title        string   `json:"title"`
+	HeadSHA      string   `json:"head_sha"`
+	HeadRef      string   `json:"head_ref"`
+	MissingNames []string `json:"missing_check_names"`
 }
 
 // =============================================================================
