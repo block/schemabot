@@ -19,7 +19,10 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// handleReapply handles POST /api/reapply requests.
+// handleReapply handles POST /api/reapply requests. Reapply is an
+// operator-only control surface: it is reached through the Admin CLI and
+// direct API calls, gated at the write tier, and is deliberately not exposed
+// as a PR comment command — it acts on a failed apply outside the PR workflow.
 func (s *Service) handleReapply(w http.ResponseWriter, r *http.Request) {
 	var req apitypes.ControlRequest
 	decoder := json.NewDecoder(r.Body)
