@@ -142,6 +142,28 @@ func TestParseTenantFlag(t *testing.T) {
 			},
 		},
 		{
+			name: "equals form",
+			body: "schemabot plan -e staging --tenant=alpha",
+			result: CommandResult{
+				Action:      action.Plan,
+				Environment: "staging",
+				Tenant:      "alpha",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "short flag equals form",
+			body: "schemabot plan -e staging -t=alpha",
+			result: CommandResult{
+				Action:      action.Plan,
+				Environment: "staging",
+				Tenant:      "alpha",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
 			name: "help command",
 			body: "schemabot help --tenant alpha",
 			result: CommandResult{
@@ -200,6 +222,46 @@ func TestParseTenantFlag(t *testing.T) {
 				Environment: "staging",
 				TenantError: true,
 				AllowUnsafe: true,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "equals form with empty value",
+			body: "schemabot plan -e staging --tenant=",
+			result: CommandResult{
+				Action:      action.Plan,
+				Environment: "staging",
+				TenantError: true,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			// A space between the flag and an equals sign leaves no readable
+			// tenant name, so the flag stays a tenant error instead of routing
+			// to a tenant literally named "=alpha".
+			name: "space then equals-prefixed value",
+			body: "schemabot plan -e staging --tenant =alpha",
+			result: CommandResult{
+				Action:      action.Plan,
+				Environment: "staging",
+				TenantError: true,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			// A -t-prefixed word must stay a tenant error rather than silently
+			// becoming an untargeted command: untargeted work commands are
+			// executed by deployments that never saw the intended routing
+			// target, so the flag match fails closed.
+			name: "t-prefixed word stays a tenant error",
+			body: "schemabot plan -e staging -typo",
+			result: CommandResult{
+				Action:      action.Plan,
+				Environment: "staging",
+				TenantError: true,
 				Found:       true,
 				IsMention:   true,
 			},

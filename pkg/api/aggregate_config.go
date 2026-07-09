@@ -96,6 +96,25 @@ func (c *ServerConfig) ExpectedTenantsForPR(repo string, changedFiles []string) 
 	return names
 }
 
+// AggregateTenantsForRepo returns the names of every tenant expected to
+// participate on repo, regardless of which files a PR touches. Only the
+// aggregate leader holds the expected-tenant set, so it returns nil when this
+// deployment is not the leader for repo or the repo has no aggregate config.
+func (c *ServerConfig) AggregateTenantsForRepo(repo string) []string {
+	if c == nil {
+		return nil
+	}
+	repoConfig, ok := c.Repos[repo]
+	if !ok || !repoConfig.Aggregate.isLeader() {
+		return nil
+	}
+	names := make([]string, 0, len(repoConfig.Aggregate.ExpectedTenants))
+	for _, tenant := range repoConfig.Aggregate.ExpectedTenants {
+		names = append(names, tenant.Tenant)
+	}
+	return names
+}
+
 // ExpectedParticipantChecksForPR returns the full expected-tenant entries
 // (tenant, paths, and participant check-name base) that the leader must gate on
 // for a PR touching changedFiles: the subset of the repo's expected-tenant set

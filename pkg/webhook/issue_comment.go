@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -124,6 +125,18 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	}
 
 	if result.TenantError {
+		// A broken tenant flag names no deployment, so on a shared repo every
+		// deployment would otherwise stay silent. The aggregate leader posts the
+		// one visible answer; everyone else leaves only its log.
+		if h.leaderAnswersTenantRoutingErrors(repo) {
+			h.logger.Info("aggregate leader posting feedback for command with invalid tenant flag",
+				"repo", repo, "pr", pr, "action", result.Action)
+			h.postComment(repo, pr, installationID, templates.RenderInvalidTenantFlag())
+			h.writeJSON(w, http.StatusOK, map[string]string{
+				"message": "invalid tenant flag",
+			})
+			return
+		}
 		h.logger.Info("ignoring command with invalid tenant flag",
 			"repo", repo, "pr", pr, "action", result.Action)
 		h.writeJSON(w, http.StatusOK, map[string]string{
@@ -135,6 +148,29 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	// When a command names a tenant, only the matching isolated deployment should
 	// react or post comments. This mirrors allowed_environments routing for -e.
 	if result.Tenant != "" && h.service != nil && !h.service.Config().ShouldRespondToTenant(result.Tenant) {
+		// A tenant no deployment serves would otherwise leave every deployment
+		// silent, so the aggregate leader — the one deployment that knows the
+		// repo's full expected-tenant set — posts the one visible answer. A
+		// known tenant stays silent here: the owning deployment responds from
+		// its own webhook delivery.
+		if h.leaderAnswersTenantRoutingErrors(repo) {
+			knownTenants := h.knownTenantsForRepo(repo)
+			if slices.Contains(knownTenants, result.Tenant) {
+				h.logger.Info("aggregate leader staying silent for a tenant owned by another deployment; the owner will respond",
+					"repo", repo, "pr", pr, "tenant", result.Tenant, "action", result.Action)
+				h.writeJSON(w, http.StatusOK, map[string]string{
+					"message": "tenant handled by another instance",
+				})
+				return
+			}
+			h.logger.Info("aggregate leader posting feedback for command targeting an unknown tenant",
+				"repo", repo, "pr", pr, "tenant", result.Tenant, "action", result.Action, "known_tenants", knownTenants)
+			h.postComment(repo, pr, installationID, templates.RenderUnknownTenant(result.Tenant, knownTenants))
+			h.writeJSON(w, http.StatusOK, map[string]string{
+				"message": "unknown tenant",
+			})
+			return
+		}
 		h.logger.Info("ignoring command for non-owned tenant",
 			"repo", repo, "pr", pr, "tenant", result.Tenant, "action", result.Action)
 		h.writeJSON(w, http.StatusOK, map[string]string{
@@ -358,6 +394,34 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 
 func commandRequiresTenantTarget(result CommandResult) bool {
 	return !result.IsHelp && (result.Found || result.MissingEnv)
+}
+
+// leaderAnswersTenantRoutingErrors reports whether this deployment should post
+// the single visible answer for a tenant-routing problem on repo — a tenant
+// flag with no readable name, or a tenant no deployment serves. Every
+// deployment on a shared repo receives the same webhook, so only the aggregate
+// leader answers to avoid duplicate comments. Repos without an aggregate
+// config have no leader, so single-instance deployments never take this path.
+func (h *Handler) leaderAnswersTenantRoutingErrors(repo string) bool {
+	if h.service == nil {
+		return false
+	}
+	return h.service.Config().IsAggregateLeaderForRepo(repo)
+}
+
+// knownTenantsForRepo returns the tenant names commands on repo can be routed
+// to, as far as this deployment can tell: the repo's expected-tenant set (held
+// only by the aggregate leader) plus this deployment's own configured tenant.
+func (h *Handler) knownTenantsForRepo(repo string) []string {
+	config := h.config()
+	if config == nil {
+		return nil
+	}
+	known := config.AggregateTenantsForRepo(repo)
+	if config.Tenant != "" && !slices.Contains(known, config.Tenant) {
+		known = append(known, config.Tenant)
+	}
+	return known
 }
 
 // fansOutUnscopedCommand reports whether this deployment should self-serve an

@@ -38,6 +38,35 @@ func TestRenderUnsupportedDatabaseFlagRollbackConfirm(t *testing.T) {
 	assert.Equal(t, "The `-d` flag is not supported for `rollback-confirm`.", rendered)
 }
 
+func TestRenderInvalidTenantFlag(t *testing.T) {
+	rendered := RenderInvalidTenantFlag()
+	assert.Contains(t, rendered, "## Invalid Tenant Flag")
+	assert.Contains(t, rendered, "no deployment will run this command")
+	assert.Contains(t, rendered, "`--tenant <name>`")
+	assert.Contains(t, rendered, "`-t <name>`")
+	assert.Contains(t, rendered, "omit the flag to run the command untargeted")
+}
+
+func TestRenderUnknownTenant(t *testing.T) {
+	t.Run("lists the known tenants", func(t *testing.T) {
+		rendered := RenderUnknownTenant("gamma", []string{"tenant-a", "tenant-b"})
+		assert.Contains(t, rendered, "## Unknown Tenant")
+		assert.Contains(t, rendered, "serves tenant `gamma`")
+		assert.Contains(t, rendered, "no deployment will run this command")
+		assert.Contains(t, rendered, "Known tenants:")
+		assert.Contains(t, rendered, "- `tenant-a`")
+		assert.Contains(t, rendered, "- `tenant-b`")
+		assert.Contains(t, rendered, "`--tenant <name>`")
+	})
+
+	t.Run("omits the tenant list when none are known", func(t *testing.T) {
+		rendered := RenderUnknownTenant("gamma", nil)
+		assert.Contains(t, rendered, "## Unknown Tenant")
+		assert.Contains(t, rendered, "serves tenant `gamma`")
+		assert.NotContains(t, rendered, "Known tenants:")
+	})
+}
+
 func TestRenderControlMissingApplyID(t *testing.T) {
 	rendered := RenderControlMissingApplyID("stop")
 	assert.Contains(t, rendered, "Missing Apply ID")

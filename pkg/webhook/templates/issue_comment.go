@@ -2,6 +2,7 @@ package templates
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
 )
@@ -37,6 +38,39 @@ func RenderUnsupportedAutoConfirm(action string) string {
 // supplied to a command that does not support database scoping.
 func RenderUnsupportedDatabaseFlag(action string) string {
 	return fmt.Sprintf("The `-d` flag is not supported for `%s`.", action)
+}
+
+// RenderInvalidTenantFlag renders the message posted when a command carries a
+// `--tenant`/`-t` flag SchemaBot cannot read a tenant name from. Posted only
+// by the aggregate-check leader, so a repo shared by several deployments gets
+// exactly one answer.
+func RenderInvalidTenantFlag() string {
+	return "## Invalid Tenant Flag\n\n" +
+		"The command names a tenant, but SchemaBot could not read a tenant name from the flag, " +
+		"so no deployment will run this command.\n\n" +
+		"Usage: `--tenant <name>` or `-t <name>`\n\n" +
+		"Tenant names start with a letter or digit and may contain letters, digits, `_`, and `-`. " +
+		"Re-run the command with a valid tenant name, or omit the flag to run the command untargeted."
+}
+
+// RenderUnknownTenant renders the message posted when a command targets a
+// tenant no deployment on this repository serves. Posted only by the
+// aggregate-check leader — the one deployment that knows the full expected
+// tenant set — so a repo shared by several deployments gets exactly one answer.
+func RenderUnknownTenant(tenant string, knownTenants []string) string {
+	var body strings.Builder
+	body.WriteString(fmt.Sprintf("## Unknown Tenant\n\n"+
+		"No SchemaBot deployment on this repository serves tenant `%s`, "+
+		"so no deployment will run this command.\n", tenant))
+	if len(knownTenants) > 0 {
+		body.WriteString("\nKnown tenants:\n")
+		for _, name := range knownTenants {
+			body.WriteString(fmt.Sprintf("- `%s`\n", name))
+		}
+	}
+	body.WriteString("\nRe-run the command with `--tenant <name>` naming one of the known tenants, " +
+		"or omit the tenant flag to run the command untargeted.")
+	return body.String()
 }
 
 // StopCommandAcceptedData contains data for a PR comment stop acknowledgement.

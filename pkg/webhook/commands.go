@@ -128,7 +128,7 @@ func NewCommandParser() *CommandParser {
 		environmentRegex:  regexp.MustCompile(`(?i)-e\s+([a-z0-9][a-z0-9_-]*)`),
 		databaseRegex:     regexp.MustCompile(`(?i)-d\s+([a-zA-Z0-9_-]+)`),
 		tenantRegex:       regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`),
-		tenantFlagRegex:   regexp.MustCompile(`(?i)(?:^|\s)(?:--tenant|-t)(?:[ \t]+([^\s]+))?`),
+		tenantFlagRegex:   regexp.MustCompile(`(?i)(?:^|\s)(?:--tenant|-t)(?:(?:[ \t]+|=)([^\s]+))?`),
 		skipRevertRegex:   regexp.MustCompile(`(?i)--skip-revert\b`),
 		deferCutoverRegex: regexp.MustCompile(`(?i)--defer-cutover\b`),
 		allowUnsafeRegex:  regexp.MustCompile(`(?i)--allow-unsafe\b`),
@@ -208,6 +208,12 @@ func (p *CommandParser) firstDirectiveLine(body string) (string, bool) {
 	return "", false
 }
 
+// extractTenant returns the tenant named by a `--tenant`/`-t` flag and whether
+// the flag was present without a usable tenant name. The flag match
+// deliberately has no token boundary: any `-t`-prefixed word without a
+// readable value is a tenant error rather than an untargeted command, because
+// untargeted work commands are executed by deployments that never saw the
+// intended routing target.
 func (p *CommandParser) extractTenant(body string) (string, bool) {
 	match := p.tenantFlagRegex.FindStringSubmatch(body)
 	if len(match) == 0 {

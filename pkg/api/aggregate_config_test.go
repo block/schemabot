@@ -110,6 +110,33 @@ func TestExpectedParticipantChecksForPR(t *testing.T) {
 	})
 }
 
+// The leader can enumerate every tenant expected on a repo independent of any
+// PR's changed files — used to tell a user which tenants a command can target.
+// Non-leaders return nil since only the leader holds the expected set.
+func TestAggregateTenantsForRepo(t *testing.T) {
+	c := leaderConfig()
+
+	t.Run("leader returns every expected tenant name", func(t *testing.T) {
+		assert.Equal(t, []string{"tenant-a", "tenant-b", "tenant-c"}, c.AggregateTenantsForRepo("octocat/shared-repo"))
+	})
+
+	t.Run("unknown repo returns nil", func(t *testing.T) {
+		assert.Nil(t, c.AggregateTenantsForRepo("octocat/unknown"))
+	})
+
+	t.Run("participant returns nil", func(t *testing.T) {
+		participant := &ServerConfig{Repos: map[string]RepoConfig{
+			"octocat/shared-repo": {Aggregate: &AggregateConfig{Role: AggregateRoleParticipant}},
+		}}
+		assert.Nil(t, participant.AggregateTenantsForRepo("octocat/shared-repo"))
+	})
+
+	t.Run("nil config returns nil", func(t *testing.T) {
+		var nilConfig *ServerConfig
+		assert.Nil(t, nilConfig.AggregateTenantsForRepo("octocat/shared-repo"))
+	})
+}
+
 func TestValidateAggregateConfig(t *testing.T) {
 	t.Run("nil is allowed", func(t *testing.T) {
 		require.NoError(t, validateAggregateConfig("octocat/r", nil))
