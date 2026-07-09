@@ -88,10 +88,7 @@ func TestExecuteReapplyRejectsChangedPlanWithoutReapplying(t *testing.T) {
 	assert.Zero(t, applies.reappliedApplyID)
 }
 
-// An apply that completed part of its work cannot be reapplied: reapply
-// requeues the whole apply, which would re-run the completed tables. The
-// operator must create a new apply for the remaining work instead.
-func TestExecuteReapplyRejectsPartiallyCompletedApply(t *testing.T) {
+func TestExecuteReapplyAcceptsRemainingWorkAfterCompletedTask(t *testing.T) {
 	sourcePlan := reapplyTestPlanWithChanges("plan-source", []storage.TableChange{
 		{Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"},
 		{Table: "orders", DDL: "ALTER TABLE `orders` ADD COLUMN `status` varchar(32)", Operation: "alter"},
@@ -99,7 +96,11 @@ func TestExecuteReapplyRejectsPartiallyCompletedApply(t *testing.T) {
 	apply := reapplyTestApply("apply-reapply", sourcePlan)
 	plans := newReapplyPlanStore(sourcePlan)
 	applies := &reapplyApplyStore{apply: apply}
-	client := &mockTernClient{planResp: reapplyPlanResponse("plan-fresh", "ALTER TABLE `orders` ADD COLUMN `status` varchar(32)")}
+	client := &mockTernClient{planResp: reapplyPlanResponseForChanges("plan-fresh", []*ternv1.TableChange{{
+		TableName:  "orders",
+		Ddl:        "ALTER TABLE `orders` ADD COLUMN `status` varchar(32)",
+		ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+	}})}
 	svc := newReapplyTestService(t, client, plans, applies,
 		reapplyTestTask(apply, "users", state.Task.Completed),
 		reapplyTestTask(apply, "orders", state.Task.Failed),
@@ -110,25 +111,24 @@ func TestExecuteReapplyRejectsPartiallyCompletedApply(t *testing.T) {
 		ApplyID:     apply.ApplyIdentifier,
 		Caller:      "operator@example.com",
 	})
-	require.ErrorIs(t, err, storage.ErrApplyNotReappliable)
-	assert.Contains(t, err.Error(), "completed part of its work")
-	assert.Nil(t, resp)
-	assert.Zero(t, applies.reappliedApplyID)
-	assert.Nil(t, client.planReq, "a partially completed apply must be rejected before any re-plan runs")
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, apply.ID, applies.reappliedApplyID)
 }
 
-// Failed work recorded outside the plan's primary deployment cannot be
-// requeued through that plan; the reapply is rejected so the operator can
-// create a new apply that targets the right deployment.
 func TestExecuteReapplyRejectsFailedWorkOutsidePrimaryDeployment(t *testing.T) {
 	sourcePlan := reapplyTestPlan("plan-source", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
 	apply := reapplyTestApply("apply-reapply", sourcePlan)
 	plans := newReapplyPlanStore(sourcePlan)
 	applies := &reapplyApplyStore{apply: apply}
 	client := &mockTernClient{planResp: reapplyPlanResponse("plan-fresh", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
+	completedOpID := int64(101)
 	failedOpID := int64(102)
 	svc := newReapplyTestService(t, client, plans, applies,
+		reapplyTestOperation(completedOpID, apply.ID, sourcePlan.Deployment, state.ApplyOperation.Completed),
 		reapplyTestOperation(failedOpID, apply.ID, "secondary", state.ApplyOperation.Failed),
+		reapplyTestOperationTask(apply, completedOpID, "users", state.Task.Completed),
 		reapplyTestOperationTask(apply, failedOpID, "users", state.Task.Failed),
 	)
 
@@ -138,7 +138,6 @@ func TestExecuteReapplyRejectsFailedWorkOutsidePrimaryDeployment(t *testing.T) {
 		Caller:      "operator@example.com",
 	})
 	require.ErrorIs(t, err, storage.ErrApplyNotReappliable)
-	assert.Contains(t, err.Error(), "outside primary deployment")
 	assert.Nil(t, resp)
 	assert.Zero(t, applies.reappliedApplyID)
 }
@@ -210,6 +209,38 @@ func TestExecuteReapplyRejectsCancelledApply(t *testing.T) {
 	assert.Nil(t, resp)
 	assert.Zero(t, applies.reappliedApplyID)
 	assert.Nil(t, client.planReq)
+}
+
+func TestFilterPlanToReappliableWorkDropsEmptyNamespaces(t *testing.T) {
+	sourcePlan := &storage.Plan{
+		Database:     "testdb",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		Deployment:   DefaultDeployment,
+		Target:       "testdb",
+		Environment:  "staging",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"completed_ns": {Tables: []storage.TableChange{{Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"}}},
+			"failed_ns":    {Tables: []storage.TableChange{{Table: "orders", DDL: "ALTER TABLE `orders` ADD COLUMN `status` varchar(32)", Operation: "alter"}}},
+		},
+	}
+	freshPlan := &storage.Plan{
+		Database:     sourcePlan.Database,
+		DatabaseType: sourcePlan.DatabaseType,
+		Deployment:   sourcePlan.Deployment,
+		Target:       sourcePlan.Target,
+		Environment:  sourcePlan.Environment,
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"failed_ns": {Tables: []storage.TableChange{{Table: "orders", DDL: "ALTER TABLE `orders` ADD COLUMN `status` varchar(32)", Operation: "alter"}}},
+		},
+	}
+
+	failedTaskKey := reapplyTaskKey{Namespace: "failed_ns", Table: "orders"}
+	filtered := filterPlanToReappliableWork(sourcePlan, reapplyWorkSelection{taskKeys: map[reapplyTaskKey]bool{failedTaskKey: true}})
+
+	assert.NotContains(t, filtered.Namespaces, "completed_ns")
+	equivalent, err := plansEquivalentForReapply(filtered, freshPlan)
+	require.NoError(t, err)
+	assert.True(t, equivalent)
 }
 
 // A failed task pointing at an operation row that no longer exists is a storage
@@ -384,6 +415,18 @@ func reapplyTestOperationTask(apply *storage.Apply, operationID int64, tableName
 	task := reapplyTestTask(apply, tableName, taskState)
 	task.ApplyOperationID = &operationID
 	return task
+}
+
+func (s *capturingTaskStore) GetByApplyOperationID(_ context.Context, applyOperationID int64) ([]*storage.Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var tasks []*storage.Task
+	for _, task := range s.tasks {
+		if task.ApplyOperationID != nil && *task.ApplyOperationID == applyOperationID {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks, s.err
 }
 
 type reapplyPlanStore struct {

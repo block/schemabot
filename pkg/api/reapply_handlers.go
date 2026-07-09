@@ -9,6 +9,7 @@ import (
 	"maps"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -106,9 +107,8 @@ func (s *Service) ExecuteReapply(ctx context.Context, req apitypes.ControlReques
 }
 
 // executeReapplyForApply runs the reapply decision for a loaded apply: it
-// verifies the apply is a fresh terminal failure whose work can be requeued
-// wholesale, re-plans the stored desired schema, and requeues the failed apply
-// only when the fresh plan still matches the stored plan.
+// verifies the apply is a fresh terminal failure, re-plans the stored desired
+// schema, and requeues the failed work only when the fresh plan still matches.
 func (s *Service) executeReapplyForApply(ctx context.Context, req apitypes.ControlRequest, apply *storage.Apply, caller string) (*apitypes.ReapplyResponse, error) {
 	if apply.Environment != req.Environment {
 		return nil, controlHTTPErrorf(http.StatusBadRequest, "apply %q belongs to environment %q, not %q", req.ApplyID, apply.Environment, req.Environment)
@@ -125,10 +125,6 @@ func (s *Service) executeReapplyForApply(ctx context.Context, req apitypes.Contr
 		return nil, fmt.Errorf("plan %d not found for reapply apply %s: %w", apply.PlanID, apply.ApplyIdentifier, storage.ErrPlanNotFound)
 	}
 
-	if err := s.validateReapplyWorkShape(ctx, apply, sourcePlan); err != nil {
-		return nil, err
-	}
-
 	freshPlanResp, err := s.ExecutePlan(ctx, reapplyPlanRequest(sourcePlan))
 	if err != nil {
 		return nil, fmt.Errorf("re-plan apply %s for reapply: %w", apply.ApplyIdentifier, err)
@@ -141,7 +137,11 @@ func (s *Service) executeReapplyForApply(ctx context.Context, req apitypes.Contr
 		return nil, fmt.Errorf("reapply plan %s was not stored for apply %s: %w", freshPlanResp.PlanID, apply.ApplyIdentifier, storage.ErrPlanNotFound)
 	}
 
-	equivalent, err := plansEquivalentForReapply(sourcePlan, freshPlan)
+	expectedPlan, err := s.reapplyRemainingPlan(ctx, apply, sourcePlan)
+	if err != nil {
+		return nil, err
+	}
+	equivalent, err := plansEquivalentForReapply(expectedPlan, freshPlan)
 	if err != nil {
 		return nil, fmt.Errorf("compare reapply plans for apply %s: %w", apply.ApplyIdentifier, err)
 	}
@@ -188,24 +188,24 @@ func validateReapplyCandidate(apply *storage.Apply) error {
 	return nil
 }
 
-// validateReapplyWorkShape verifies the apply's recorded work is a shape a
-// reapply can requeue wholesale. Reapply requeues the entire apply, so every
-// piece of its work must be failed and belong to the source plan's primary
-// deployment:
-//
-//   - No task may be completed. An apply that completed part of its work would
-//     re-run the completed tables on reapply, so the operator must create a new
-//     apply for the remainder instead.
-//   - At least one task or operation must be failed; otherwise there is no
-//     failed work to requeue.
-//   - Every failed task and operation must belong to the plan's primary
-//     deployment (a task with no operation row is primary-deployment work).
-//     Failed work in another deployment cannot be requeued through the primary
-//     plan, so the operator must create a new apply instead.
-func (s *Service) validateReapplyWorkShape(ctx context.Context, apply *storage.Apply, sourcePlan *storage.Plan) error {
+func (s *Service) reapplyRemainingPlan(ctx context.Context, apply *storage.Apply, sourcePlan *storage.Plan) (*storage.Plan, error) {
+	selection, err := s.reappliableWorkSelection(ctx, apply, sourcePlan)
+	if err != nil {
+		return nil, err
+	}
+	return filterPlanToReappliableWork(sourcePlan, selection), nil
+}
+
+func (s *Service) reappliableWorkSelection(ctx context.Context, apply *storage.Apply, sourcePlan *storage.Plan) (reapplyWorkSelection, error) {
+	selection := reapplyWorkSelection{
+		taskKeys:            make(map[reapplyTaskKey]bool),
+		finalizerNamespaces: make(map[string]bool),
+		deployments:         make(map[string]bool),
+	}
+
 	operations, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
-		return fmt.Errorf("load operations for reapply apply %s: %w", apply.ApplyIdentifier, err)
+		return selection, fmt.Errorf("load operations for reapply apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	operationsByID := make(map[int64]*storage.ApplyOperation, len(operations))
 	for _, operation := range operations {
@@ -214,17 +214,10 @@ func (s *Service) validateReapplyWorkShape(ctx context.Context, apply *storage.A
 
 	applyTasks, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
-		return fmt.Errorf("load tasks for reapply apply %s: %w", apply.ApplyIdentifier, err)
+		return selection, fmt.Errorf("load tasks for reapply apply %s: %w", apply.ApplyIdentifier, err)
 	}
-
-	hasFailedWork := false
 	for _, task := range applyTasks {
-		if state.IsState(task.State, state.Task.Completed) {
-			return fmt.Errorf("apply %s completed part of its work, so a reapply would re-run finished tables; create a new apply instead: %w", apply.ApplyIdentifier, storage.ErrApplyNotReappliable)
-		}
 		if !state.IsState(task.State, state.Task.Failed, state.Task.Cancelled) {
-			// Neither completed nor failed work: nothing for this task to prove
-			// or violate about the reapply shape.
 			continue
 		}
 		if task.ApplyOperationID != nil {
@@ -236,31 +229,126 @@ func (s *Service) validateReapplyWorkShape(ctx context.Context, apply *storage.A
 				// reapply while the task stays permanently failed (the storage reset's
 				// join excludes it), or yield a misleading "no failed work" rejection.
 				// Surface it so an operator can investigate.
-				return fmt.Errorf("reapply apply %s: failed task references missing operation row %d; resolve the storage inconsistency before reapply", apply.ApplyIdentifier, *task.ApplyOperationID)
+				return selection, fmt.Errorf("reapply apply %s: failed task references missing operation row %d; resolve the storage inconsistency before reapply", apply.ApplyIdentifier, *task.ApplyOperationID)
 			}
-			if operation.Deployment != sourcePlan.Deployment {
-				return fmt.Errorf("apply %s has failed work outside primary deployment %q; create a new apply instead: %w", apply.ApplyIdentifier, sourcePlan.Deployment, storage.ErrApplyNotReappliable)
+			if !state.IsState(operation.State, state.ApplyOperation.Failed) {
+				// The task's operation isn't failed, so its deployment isn't part of
+				// the reappliable set.
+				continue
 			}
+			selection.deployments[operation.Deployment] = true
+		} else {
+			selection.deployments[sourcePlan.Deployment] = true
 		}
-		hasFailedWork = true
+		selection.taskKeys[reapplyTaskKeyFor(task)] = true
 	}
 
 	for _, operation := range operations {
 		if !state.IsState(operation.State, state.ApplyOperation.Failed) {
-			// Only failed operations constrain the reapply shape; the whole-apply
-			// requeue re-drives the rest either way.
 			continue
 		}
-		if operation.Deployment != sourcePlan.Deployment {
-			return fmt.Errorf("apply %s has failed work outside primary deployment %q; create a new apply instead: %w", apply.ApplyIdentifier, sourcePlan.Deployment, storage.ErrApplyNotReappliable)
+		selection.deployments[operation.Deployment] = true
+		tasks, err := s.storage.Tasks().GetByApplyOperationID(ctx, operation.ID)
+		if err != nil {
+			return selection, fmt.Errorf("load operation %d tasks for reapply apply %s: %w", operation.ID, apply.ApplyIdentifier, err)
 		}
-		hasFailedWork = true
+		if len(tasks) == 0 && operation.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+			namespace, ok := reapplyFinalizerNamespace(operation.OperationKey)
+			if !ok {
+				return selection, fmt.Errorf("operation %d has malformed finalizer key %q for reapply apply %s: %w", operation.ID, operation.OperationKey, apply.ApplyIdentifier, storage.ErrApplyNotReappliable)
+			}
+			selection.finalizerNamespaces[namespace] = true
+		}
+		for _, task := range tasks {
+			if state.IsState(task.State, state.Task.Failed, state.Task.Cancelled) {
+				selection.taskKeys[reapplyTaskKeyFor(task)] = true
+			}
+		}
 	}
 
-	if !hasFailedWork {
-		return fmt.Errorf("apply %s has no failed work to reapply: %w", apply.ApplyIdentifier, storage.ErrApplyNotReappliable)
+	if len(selection.deployments) == 0 {
+		return selection, fmt.Errorf("apply %s has no failed work to reapply: %w", apply.ApplyIdentifier, storage.ErrApplyNotReappliable)
 	}
-	return nil
+	if len(selection.deployments) > 1 || !selection.deployments[sourcePlan.Deployment] {
+		return selection, fmt.Errorf("apply %s has failed work outside primary deployment %q; create a new apply instead: %w", apply.ApplyIdentifier, sourcePlan.Deployment, storage.ErrApplyNotReappliable)
+	}
+	return selection, nil
+}
+
+type reapplyWorkSelection struct {
+	taskKeys            map[reapplyTaskKey]bool
+	finalizerNamespaces map[string]bool
+	deployments         map[string]bool
+}
+
+type reapplyTaskKey struct {
+	Namespace string
+	Shard     string
+	Table     string
+}
+
+func reapplyTaskKeyFor(task *storage.Task) reapplyTaskKey {
+	return reapplyTaskKey{Namespace: task.Namespace, Shard: task.Shard, Table: task.TableName}
+}
+
+func filterPlanToReappliableWork(plan *storage.Plan, selection reapplyWorkSelection) *storage.Plan {
+	filtered := *plan
+	filtered.Namespaces = make(map[string]*storage.NamespacePlanData, len(plan.Namespaces))
+	for namespace, nsData := range plan.Namespaces {
+		if nsData == nil {
+			continue
+		}
+		filteredNS := filterReappliableNamespaceWork(namespace, nsData, selection)
+		if len(filteredNS.Tables) > 0 || len(filteredNS.Artifacts) > 0 {
+			filtered.Namespaces[namespace] = filteredNS
+		}
+	}
+
+	filtered.Shards = make([]storage.ShardPlan, 0, len(plan.Shards))
+	for _, shard := range plan.Shards {
+		changes := make([]storage.TableChange, 0, len(shard.Changes))
+		for _, change := range shard.Changes {
+			if selection.taskKeys[reapplyTaskKey{Namespace: shard.Namespace, Shard: shard.Shard, Table: change.Table}] {
+				changes = append(changes, change)
+			}
+		}
+		if len(changes) == 0 {
+			continue
+		}
+		filtered.Shards = append(filtered.Shards, storage.ShardPlan{Namespace: shard.Namespace, Shard: shard.Shard, Changes: changes})
+	}
+	return &filtered
+}
+
+func filterReappliableNamespaceWork(namespace string, nsData *storage.NamespacePlanData, selection reapplyWorkSelection) *storage.NamespacePlanData {
+	filtered := &storage.NamespacePlanData{}
+	if selection.finalizerNamespaces[namespace] {
+		filtered.Artifacts = copyStringMap(nsData.Artifacts)
+	}
+	for _, change := range nsData.Tables {
+		if selection.taskKeys[reapplyTaskKey{Namespace: namespace, Table: change.Table}] {
+			filtered.Tables = append(filtered.Tables, change)
+		}
+	}
+	return filtered
+}
+
+func reapplyFinalizerNamespace(operationKey string) (string, bool) {
+	const suffix = "/group_finalizer"
+	if !strings.HasSuffix(operationKey, suffix) {
+		return "", false
+	}
+	namespace := strings.TrimSuffix(operationKey, suffix)
+	return namespace, namespace != ""
+}
+
+func copyStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	maps.Copy(out, in)
+	return out
 }
 
 func reapplyPlanRequest(plan *storage.Plan) PlanRequest {
@@ -346,6 +434,7 @@ func reapplyPlanFingerprintFor(plan *storage.Plan) reapplyPlanFingerprint {
 		})
 		// Canonicalize empty artifacts to nil so a nil vs empty map (which marshal
 		// to null vs {}) doesn't make an otherwise-identical plan compare unequal.
+		// This matches filterPlanToReappliableWork, which treats empty as absent.
 		artifacts := nsData.Artifacts
 		if len(artifacts) == 0 {
 			artifacts = nil
