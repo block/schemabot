@@ -101,25 +101,30 @@ func main() {
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	runCtx, cancelRun := context.WithCancel(context.Background())
+	// runDone signals the watcher that the command finished — kept separate
+	// from runCtx so the second select waits for a genuine second signal
+	// rather than the just-cancelled runCtx.
+	runDone := make(chan struct{})
 	go func() {
 		select {
 		case <-sigCh:
 			cancelRun()
-		case <-runCtx.Done():
+		case <-runDone:
 			return
 		}
 		select {
 		case <-sigCh:
 			os.Exit(130)
-		case <-runCtx.Done():
+		case <-runDone:
 		}
 	}()
 	ctx.BindTo(runCtx, (*context.Context)(nil))
 
 	err = ctx.Run(&cli.Globals)
-	// Stop intercepting signals and release the watcher goroutine now that the
-	// command is done; explicit rather than deferred, since the os.Exit below
-	// would skip a deferred call.
+	// Release the watcher and stop intercepting signals now that the command
+	// is done; explicit rather than deferred, since the os.Exit below would
+	// skip a deferred call.
+	close(runDone)
 	signal.Stop(sigCh)
 	cancelRun()
 	if err != nil {

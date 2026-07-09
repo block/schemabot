@@ -91,15 +91,25 @@ func TestRedriveWebhooksResolveWindowRequiresWindow(t *testing.T) {
 
 // A redrive that reports failed redeliveries must fail the command, so
 // scripted redrives detect partial failure from the exit code.
-func TestWriteRedriveWebhookResponseFailsOnFailedRedeliveries(t *testing.T) {
-	err := writeRedriveWebhookResponse(&apitypes.WebhookRedriveResponse{
+// A run with failed redeliveries or skipped (detail-unresolved) eligible
+// deliveries did not fully cover the window, so the command fails so a
+// scripted caller detects the under-coverage; a clean run succeeds.
+func TestWriteRedriveWebhookResponseFailsOnIncompleteCoverage(t *testing.T) {
+	failed := writeRedriveWebhookResponse(&apitypes.WebhookRedriveResponse{
 		Results: []apitypes.WebhookRedriveResult{
 			{AppName: "default", Redelivered: 2, Failed: 1},
 		},
 	}, false)
+	require.Error(t, failed)
+	require.Contains(t, failed.Error(), "1 redeliveries failed")
 
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "1 webhook redeliveries failed")
+	skipped := writeRedriveWebhookResponse(&apitypes.WebhookRedriveResponse{
+		Results: []apitypes.WebhookRedriveResult{
+			{AppName: "default", Redelivered: 2, Skipped: 3},
+		},
+	}, false)
+	require.Error(t, skipped)
+	require.Contains(t, skipped.Error(), "3 eligible deliveries skipped")
 
 	require.NoError(t, writeRedriveWebhookResponse(&apitypes.WebhookRedriveResponse{
 		Results: []apitypes.WebhookRedriveResult{

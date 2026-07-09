@@ -98,6 +98,9 @@ func redriveProgressLine(r apitypes.WebhookRedriveResult, windowStart, windowEnd
 	if r.Failed > 0 {
 		line += fmt.Sprintf(", %d failed", r.Failed)
 	}
+	if r.Skipped > 0 {
+		line += fmt.Sprintf(", %d skipped", r.Skipped)
+	}
 	return line
 }
 
@@ -142,7 +145,7 @@ func runChunkedWebhookRedrive(ctx context.Context, call func(context.Context, st
 	if err != nil {
 		return merged, err
 	}
-	for _, result := range first.Results {
+	for i, result := range first.Results {
 		appResult := result
 		progress(appResult)
 		for appResult.NextCursor != "" && appResult.Pages < maxPages {
@@ -157,9 +160,12 @@ func runChunkedWebhookRedrive(ctx context.Context, call func(context.Context, st
 				Cursor:      appResult.NextCursor,
 			})
 			if err != nil {
-				// Keep the work completed for this app so far, then surface the
-				// error (a cancellation is reported to the operator by Run).
+				// Keep every app's work completed so far — this app's partial
+				// plus the untouched first-chunk results of the apps not yet
+				// reached (their first request already redelivered) — then
+				// surface the error (a cancellation is reported by Run).
 				merged.Results = append(merged.Results, appResult)
+				merged.Results = append(merged.Results, first.Results[i+1:]...)
 				return merged, fmt.Errorf("continue webhook redrive for app %q: %w", appResult.AppName, err)
 			}
 			if len(next.Results) != 1 {
@@ -271,8 +277,10 @@ func writeRedriveWebhookResponse(response *apitypes.WebhookRedriveResponse, dryR
 		return nil
 	}
 	totalFailed := 0
+	totalSkipped := 0
 	for _, result := range response.Results {
 		totalFailed += result.Failed
+		totalSkipped += result.Skipped
 		// The per-delivery detail is the dry-run's selection preview and can be
 		// very large on a wide window, so print it only for --dry-run; a real
 		// redrive reports the per-app redelivered/failed summary below.
@@ -289,16 +297,20 @@ func writeRedriveWebhookResponse(response *apitypes.WebhookRedriveResponse, dryR
 		}
 		var err error
 		if dryRun {
-			_, err = fmt.Fprintf(os.Stderr, "app=%s dry_run_selected=%d\n", result.AppName, len(result.Selected))
+			_, err = fmt.Fprintf(os.Stderr, "app=%s dry_run_selected=%d skipped=%d\n", result.AppName, len(result.Selected), result.Skipped)
 		} else {
-			_, err = fmt.Fprintf(os.Stdout, "app=%s redelivered=%d failed=%d\n", result.AppName, result.Redelivered, result.Failed)
+			_, err = fmt.Fprintf(os.Stdout, "app=%s redelivered=%d failed=%d skipped=%d\n", result.AppName, result.Redelivered, result.Failed, result.Skipped)
 		}
 		if err != nil {
 			return err
 		}
 	}
-	if totalFailed > 0 {
-		return fmt.Errorf("%d webhook redeliveries failed; see the per-app counts above and the server logs", totalFailed)
+	// A skipped delivery is an in-window eligible delivery whose detail could
+	// not be resolved for filtering — it may have needed redriving but was
+	// dropped, so the window is not fully covered. Fail like a redelivery
+	// failure so a scripted run detects the under-coverage and can re-run.
+	if totalFailed > 0 || totalSkipped > 0 {
+		return fmt.Errorf("webhook redrive incomplete: %d redeliveries failed, %d eligible deliveries skipped (detail unresolved); see the per-app counts above and the server logs", totalFailed, totalSkipped)
 	}
 	return nil
 }
