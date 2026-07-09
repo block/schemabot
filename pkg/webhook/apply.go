@@ -32,6 +32,7 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display 
 		VSchemaChanges:   display.VSchema,
 		DeployRequestURL: display.DeployRequestURL,
 		RevertExpiresAt:  display.RevertExpiresAt,
+		Volume:           apply.GetOptions().Volume,
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)

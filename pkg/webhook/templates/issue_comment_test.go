@@ -161,6 +161,34 @@ func TestRenderCutoverCommandAcceptedAlreadyInProgress(t *testing.T) {
 	assert.Contains(t, rendered, "Cutover is already in progress")
 }
 
+// TestRenderVolumeCommandAccepted verifies the volume acknowledgement states
+// the queued semantics — the driver applies the level at its next progress
+// check — rather than claiming the change already took effect, and carries the
+// apply id, environment, requester, and requested level.
+func TestRenderVolumeCommandAccepted(t *testing.T) {
+	rendered := RenderVolumeCommandAccepted(VolumeCommandAcceptedData{
+		ApplyID:     "apply_abc123",
+		Environment: "staging",
+		RequestedBy: "alice",
+		Volume:      8,
+	})
+	assert.Contains(t, rendered, "Volume Request Accepted")
+	assert.Contains(t, rendered, "`apply_abc123`")
+	assert.Contains(t, rendered, "`staging`")
+	assert.Contains(t, rendered, "@alice")
+	assert.Contains(t, rendered, "Volume change to 8 queued; the driver applies it at its next progress check")
+}
+
+// TestRenderVolumeInvalidLevel verifies the rejection posted for a missing,
+// non-numeric, or out-of-range -v value tells the user the exact syntax and
+// the valid range.
+func TestRenderVolumeInvalidLevel(t *testing.T) {
+	rendered := RenderVolumeInvalidLevel()
+	assert.Contains(t, rendered, "Missing or Invalid Volume Level")
+	assert.Contains(t, rendered, "`schemabot volume <apply-id> -e <environment> -v <level>`")
+	assert.Contains(t, rendered, "between 1 (slowest) and 11 (fastest)")
+}
+
 func TestRenderRevertCommandAccepted(t *testing.T) {
 	rendered := RenderRevertCommandAccepted(RevertCommandAcceptedData{
 		ApplyID:     "apply-957642f96d634694",

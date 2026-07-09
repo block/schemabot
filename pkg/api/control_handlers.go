@@ -1928,28 +1928,55 @@ func (s *Service) handleVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := client.Volume(r.Context(), &ternv1.VolumeRequest{
-		ApplyId:     applyID,
-		Environment: apply.Environment,
-		Volume:      req.Volume,
-	})
+	resp, err := s.executeVolumeForApply(r.Context(), client, apply, applyID, req.Caller, req.Volume)
 	if err != nil {
-		metrics.RecordControlOperation(r.Context(), "volume", apply.Database, apply.Deployment, apply.Environment, "error")
 		s.writeControlError(w, "volume", apply, err)
 		return
 	}
-	metrics.RecordControlOperation(r.Context(), "volume", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
+	s.writeJSON(w, http.StatusOK, resp)
+}
+
+// ExecuteVolume queues a durable volume adjustment for an apply. The driving
+// instance retunes the engine at its next progress tick. It resolves the
+// apply's data-plane client and proxies the request, so the HTTP handler and
+// the PR-comment command share one path — the tern client owns the gating
+// (terminal apply, conflicting pending level, multi-deployment apply).
+func (s *Service) ExecuteVolume(ctx context.Context, req apitypes.ControlRequest, volume int32) (*apitypes.VolumeResponse, error) {
+	if volume < storage.MinVolume || volume > storage.MaxVolume {
+		return nil, controlHTTPErrorf(http.StatusBadRequest, "volume must be between %d and %d", storage.MinVolume, storage.MaxVolume)
+	}
+	client, apply, ternApplyID, err := s.controlTarget(ctx, "volume", req.ApplyID, req.Environment)
+	if err != nil {
+		return nil, err
+	}
+	return s.executeVolumeForApply(ctx, client, apply, ternApplyID, req.Caller, volume)
+}
+
+// executeVolumeForApply proxies the volume adjustment to the apply's tern
+// client, which queues a durable control request for the driver, and records
+// an apply log entry when the queue accepts the level.
+func (s *Service) executeVolumeForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string, volume int32) (*apitypes.VolumeResponse, error) {
+	resp, err := client.Volume(ctx, &ternv1.VolumeRequest{
+		ApplyId:     ternApplyID,
+		Environment: apply.Environment,
+		Volume:      volume,
+	})
+	if err != nil {
+		metrics.RecordControlOperation(ctx, "volume", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, fmt.Errorf("queue volume change to %d for apply %s: %w", volume, apply.ApplyIdentifier, err)
+	}
+	metrics.RecordControlOperation(ctx, "volume", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
-		s.logControlOperationForApply(r.Context(), apply, resolveCaller(r.Context(), req.Caller), storage.LogEventVolumeRequested,
-			fmt.Sprintf("Volume change to %d queued; the driver applies it at its next progress check", req.Volume))
+		s.logControlOperationForApply(ctx, apply, resolveCaller(ctx, caller), storage.LogEventVolumeRequested,
+			fmt.Sprintf("Volume change to %d queued; the driver applies it at its next progress check", volume))
 	}
 
-	s.writeJSON(w, http.StatusOK, &apitypes.VolumeResponse{
+	return &apitypes.VolumeResponse{
 		Accepted:       resp.Accepted,
 		ErrorMessage:   resp.ErrorMessage,
 		PreviousVolume: resp.PreviousVolume,
 		NewVolume:      resp.NewVolume,
-	})
+	}, nil
 }
 
 // RevertRequest is the HTTP request body for POST /api/revert.

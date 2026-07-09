@@ -85,6 +85,11 @@ type ApplyStatusCommentData struct {
 	// comment shows the time remaining before the change becomes permanent.
 	// Empty outside the revert window or for engines without one.
 	RevertExpiresAt string
+
+	// Volume is the apply's current volume level (1=slowest, 11=fastest) from
+	// its stored options. Zero means the engine default is in effect and the
+	// comment renders no volume.
+	Volume int
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -207,6 +212,12 @@ func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
 		if countdown := revertWindowCountdown(data.RevertExpiresAt); countdown != "" {
 			detail += " | " + countdown
 		}
+	}
+	// The volume level only matters while the engine is actively copying; on
+	// other states (stopped, waiting for cutover, terminal) it carries no
+	// signal, so the status line stays quiet.
+	if data.Volume > 0 && state.IsState(data.State, state.Apply.Running, state.Apply.RunningDegraded) {
+		detail += fmt.Sprintf(" | Volume: %d/%d", data.Volume, storage.MaxVolume)
 	}
 	fmt.Fprintf(sb, "\n**Status**: %s\n", detail)
 }
@@ -1376,6 +1387,7 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 		ErrorMessage: resp.ErrorMessage,
 		StartedAt:    resp.StartedAt,
 		CompletedAt:  resp.CompletedAt,
+		Volume:       int(resp.Volume),
 	}
 	data.RevertExpiresAt = resp.Metadata["revert_expires_at"]
 

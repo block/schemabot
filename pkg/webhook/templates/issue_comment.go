@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // RenderRollbackMissingArguments renders the message posted when `schemabot rollback`
@@ -91,6 +92,16 @@ func RenderControlMissingApplyID(action string) string {
 	return fmt.Sprintf("## Missing Apply ID\n\n"+
 		"Usage: `schemabot %s <apply-id> -e <environment>`\n\n"+
 		"Use `schemabot status -e <environment>` to find the apply ID.", action)
+}
+
+// RenderVolumeInvalidLevel renders the message posted when a volume command
+// is missing the `-v` flag, carries a non-numeric value, or names a level
+// outside the supported range.
+func RenderVolumeInvalidLevel() string {
+	return fmt.Sprintf("## Missing or Invalid Volume Level\n\n"+
+		"Usage: `schemabot volume <apply-id> -e <environment> -v <level>`\n\n"+
+		"The `-v` flag is required and must be a number between %d (slowest) and %d (fastest).",
+		storage.MinVolume, storage.MaxVolume)
 }
 
 // RenderStopCommandAccepted renders the acknowledgement posted when a PR
@@ -237,6 +248,30 @@ func PreviewCommentStartCommandAlreadyRequested() string {
 		StartedCount: 1,
 		SkippedCount: 0,
 	})
+}
+
+// VolumeCommandAcceptedData contains data for a PR comment volume acknowledgement.
+type VolumeCommandAcceptedData struct {
+	ApplyID     string
+	Environment string
+	RequestedBy string
+	// Volume is the queued target level (1=slowest, 11=fastest).
+	Volume int32
+}
+
+// RenderVolumeCommandAccepted renders the acknowledgement posted when a PR
+// comment volume command queues a durable volume adjustment. The wording keeps
+// the queued semantics explicit: the driver retunes the engine at its next
+// progress check, so the new level is not yet in effect when this posts.
+func RenderVolumeCommandAccepted(data VolumeCommandAcceptedData) string {
+	body := "## Volume Request Accepted\n\n" +
+		fmt.Sprintf("**Apply**: `%s`\n", data.ApplyID) +
+		fmt.Sprintf("**Environment**: `%s`\n", data.Environment)
+	if data.RequestedBy != "" {
+		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
+	}
+	body += fmt.Sprintf("\nVolume change to %d queued; the driver applies it at its next progress check. Status remains available from the PR progress comment or CLI.\n", data.Volume)
+	return body
 }
 
 // RenderCutoverCommandAccepted renders the acknowledgement posted when a PR

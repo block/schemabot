@@ -340,6 +340,11 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.handleCutoverCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "cutover started"})
+	case action.Volume:
+		h.goSafe(repo, pr, installationID, func() {
+			h.handleVolumeCommand(repo, pr, installationID, requestedBy, result)
+		})
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "volume started"})
 	case action.SkipRevert:
 		h.goSafe(repo, pr, installationID, func() {
 			h.handleSkipRevertCommand(repo, pr, installationID, requestedBy, result)
@@ -380,7 +385,8 @@ func (h *Handler) fansOutUnscopedCommand(repo string) bool {
 // own share of a shared PR; unlock releases only the participant's own database
 // locks (locks are keyed by database, not by apply). Commands that target a
 // single apply owned by one tenant — rollback and the lifecycle controls (stop,
-// cancel, start, release, cutover, skip-revert, revert) — are not in this set:
+// cancel, start, release, cutover, volume, skip-revert, revert) — are not in
+// this set:
 // an unscoped one would reach every participant and all but the owner would
 // report "apply not found", so they require an explicit -t instead.
 func actionFansOutUnscoped(a string) bool {

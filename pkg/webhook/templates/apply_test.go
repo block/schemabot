@@ -356,6 +356,42 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 	assert.Contains(t, result, "Queued")
 }
 
+// TestRenderApplyStatusComment_Volume verifies that a running apply with a
+// volume level set on its stored options shows the level compactly on the
+// Status line, and that an apply without a level (engine default) renders no
+// volume text at all.
+func TestRenderApplyStatusComment_Volume(t *testing.T) {
+	newData := func(applyState, tableStatus string, volume int) ApplyStatusCommentData {
+		return ApplyStatusCommentData{
+			Database:    "testapp",
+			Environment: "staging",
+			RequestedBy: "aparajon",
+			State:       applyState,
+			Engine:      "Spirit",
+			Volume:      volume,
+			Tables: []TableProgressData{
+				{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: tableStatus, RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45},
+			},
+		}
+	}
+
+	t.Run("running apply with volume shows level on the status line", func(t *testing.T) {
+		result := RenderApplyStatusComment(newData("running", "running", 8))
+		assert.Contains(t, result, "**Status**: In Progress | Volume: 8/11")
+	})
+
+	t.Run("running apply without volume renders no volume text", func(t *testing.T) {
+		result := RenderApplyStatusComment(newData("running", "running", 0))
+		assert.Contains(t, result, "**Status**: In Progress")
+		assert.NotContains(t, result, "Volume")
+	})
+
+	t.Run("stopped apply with volume renders no volume text", func(t *testing.T) {
+		result := RenderApplyStatusComment(newData("stopped", "stopped", 8))
+		assert.NotContains(t, result, "Volume")
+	})
+}
+
 // A Vitess/PlanetScale apply labels its namespace group "Keyspace" (not "Schema"),
 // so the engine-aware label selection is exercised distinctly from the MySQL case.
 func TestRenderApplyStatusComment_VitessUsesKeyspaceLabel(t *testing.T) {
