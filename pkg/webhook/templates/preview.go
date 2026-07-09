@@ -1052,6 +1052,23 @@ func PreviewCommentApplyFailed() string {
 	return RenderApplyStatusComment(data)
 }
 
+// PreviewCommentApplyRetrying renders an apply comment where the middle table
+// was interrupted by a retryable failure and the driver is redispatching it,
+// with the attempt counter showing how much of the retry budget is used.
+func PreviewCommentApplyRetrying() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.FailedRetryable
+	tables[1].RowsCopied = 439870
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 30
+	tables[1].ErrorMessage = PreviewErrorMiddleFailed
+	tables[2].Status = state.Task.Pending
+	data := sampleApplyData(state.Apply.FailedRetryable, tables)
+	data.Attempt = 1
+	return RenderApplyStatusComment(data)
+}
+
 // PreviewCommentApplyStopped renders a sample apply-stopped comment.
 func PreviewCommentApplyStopped() string {
 	tables := sampleApplyTables()[:2]

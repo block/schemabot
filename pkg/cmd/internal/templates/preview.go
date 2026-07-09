@@ -137,6 +137,7 @@ const (
 	PreviewCommentApplyEstimateExceeded PreviewType = "comment_apply_estimate_exceeded" // Apply in progress after row estimate was exceeded
 	PreviewCommentApplyCompleted        PreviewType = "comment_apply_completed"         // Apply completed (all tables done)
 	PreviewCommentApplyFailed           PreviewType = "comment_apply_failed"            // Apply failed (1 done, 1 failed, 1 cancelled)
+	PreviewCommentApplyRetrying         PreviewType = "comment_apply_retrying"          // Apply interrupted, retrying automatically (attempt counter)
 	PreviewCommentApplyStopped          PreviewType = "comment_apply_stopped"           // Apply stopped (1 done, 1 stopped)
 	PreviewCommentApplyWaitingCutover   PreviewType = "comment_apply_waiting_cutover"   // Waiting for cutover
 	PreviewCommentApplyCuttingOver      PreviewType = "comment_apply_cutting_over"      // Cutting over
