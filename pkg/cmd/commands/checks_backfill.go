@@ -44,6 +44,10 @@ type checksBackfillAction struct {
 	Title        string   `json:"title"`
 	HeadSHA      string   `json:"head_sha"`
 	MissingNames []string `json:"missing_names"`
+	// UntrustedConflictNames are missing checks whose slot is already held by
+	// an untrusted app's Check Run; backfill recreates the trusted check but
+	// the operator likely also needs to resolve the conflicting one.
+	UntrustedConflictNames []string `json:"untrusted_conflict_names,omitempty"`
 	// Classification is "redrive" when GitHub still retains a failed
 	// check-creating delivery for the PR, otherwise "synthesize".
 	Classification string  `json:"classification"`
@@ -127,12 +131,13 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 		report.Scanned += chunk.Scanned
 		for _, missing := range chunk.Missing {
 			action := checksBackfillAction{
-				PR:             missing.Number,
-				URL:            missing.URL,
-				Title:          missing.Title,
-				HeadSHA:        missing.HeadSHA,
-				MissingNames:   missing.MissingNames,
-				Classification: "synthesize",
+				PR:                     missing.Number,
+				URL:                    missing.URL,
+				Title:                  missing.Title,
+				HeadSHA:                missing.HeadSHA,
+				MissingNames:           missing.MissingNames,
+				UntrustedConflictNames: missing.UntrustedConflictNames,
+				Classification:         "synthesize",
 			}
 			if hits, ok := redriveable[missing.Number]; ok {
 				action.Classification = "redrive"
@@ -318,6 +323,13 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 	}
 	if err := tw.Flush(); err != nil {
 		return err
+	}
+	for _, action := range report.Actions {
+		if len(action.UntrustedConflictNames) > 0 {
+			if _, err := fmt.Fprintf(w, "Note: PR #%d has checks held by an untrusted app (%s); backfill recreates the trusted check, but resolve the conflicting one too.\n", action.PR, strings.Join(action.UntrustedConflictNames, ", ")); err != nil {
+				return err
+			}
+		}
 	}
 	if failed > 0 {
 		return fmt.Errorf("%d Check Run backfills failed; see the outcomes above", failed)
