@@ -28,6 +28,7 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display 
 		State:            apply.State,
 		Engine:           apply.Engine,
 		ErrorMessage:     apply.ErrorMessage,
+		Attempt:          apply.Attempt,
 		VSchemaChanges:   display.VSchema,
 		DeployRequestURL: display.DeployRequestURL,
 		RevertExpiresAt:  display.RevertExpiresAt,

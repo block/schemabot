@@ -61,9 +61,13 @@ type ApplyStatusCommentData struct {
 	State        string // canonical lowercase apply state
 	Engine       string
 	ErrorMessage string
-	StartedAt    string // RFC3339 format
-	CompletedAt  string // RFC3339 format
-	Tables       []TableProgressData
+
+	// Attempt is the apply's operator redispatch count so far; the retry the
+	// comment announces is Attempt+1 of storage.MaxRecoveryAttempts.
+	Attempt     int
+	StartedAt   string // RFC3339 format
+	CompletedAt string // RFC3339 format
+	Tables      []TableProgressData
 
 	// VSchemaChanges holds per-keyspace VSchema application state, surfaced from
 	// the engine's display metadata rather than as a per-table task. Empty when
@@ -505,7 +509,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 				renderResumingTable(sb, table)
 				continue
 			}
-			renderTableProgress(sb, table)
+			renderTableProgress(sb, table, data.Attempt)
 		}
 	}
 }
@@ -567,7 +571,7 @@ func tableStatePriority(tableStatus string) int {
 
 // renderTableProgress renders a single table's progress as markdown.
 // Mirrors the CLI's writeTableProgressWithState logic but outputs markdown instead of ANSI.
-func renderTableProgress(sb *strings.Builder, table TableProgressData) {
+func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAttempt int) {
 	// Normalize to canonical Task state for consistent matching.
 	status := state.NormalizeTaskStatus(table.Status)
 
@@ -630,7 +634,8 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData) {
 
 	case state.Task.FailedRetryable:
 		bar := ui.ProgressBarStopped(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
-		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically\n", table.TableName, bar)
+		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically (attempt %d/%d)\n",
+			table.TableName, bar, applyAttempt+1, storage.MaxRecoveryAttempts)
 		writeDDLLine(sb, table.DDL)
 		if table.ErrorMessage != "" {
 			writeTableErrorLine(sb, table.ErrorMessage)

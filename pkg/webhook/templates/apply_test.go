@@ -817,8 +817,9 @@ func TestRenderApplyStatusComment_FailedRetryable(t *testing.T) {
 	assert.NotContains(t, result, "failed_retryable")
 	// The retryable state is communicated on the always-present Status line.
 	assert.Contains(t, result, "**Status**: Retrying")
-	// The retry detail lives on the affected table, not in the headline.
-	assert.Contains(t, result, "🔄 Interrupted — retrying automatically")
+	// The retry detail lives on the affected table, not in the headline, and
+	// counts the upcoming retry against the operator redispatch budget.
+	assert.Contains(t, result, "🔄 Interrupted — retrying automatically (attempt 1/10)")
 	assert.Contains(t, result, "> ⚠️ Last error: remote deployment unavailable")
 	assert.Contains(t, result, "🟧") // orange bar for the interrupted table
 	// Progress summary counts the retrying table.
@@ -830,6 +831,32 @@ func TestRenderApplyStatusComment_FailedRetryable(t *testing.T) {
 	assert.Contains(t, result, "schemabot stop apply-abc123 -e staging")
 	assert.NotContains(t, result, "transient")
 	assert.NotContains(t, result, "schemabot apply -e staging")
+}
+
+// A retryable apply that has already been redispatched shows how much of the
+// operator retry budget the next attempt consumes, so a watcher can tell a
+// transient blip (attempt 2/10) from an apply that is about to exhaust its
+// retries (attempt 9/10).
+func TestRenderApplyStatusComment_FailedRetryableCountsAttempts(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.FailedRetryable,
+		Engine:      "Spirit",
+		ApplyID:     "apply-abc123",
+		Attempt:     4,
+		Tables: []TableProgressData{
+			{
+				TableName: "users",
+				DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+				Status:    state.Task.FailedRetryable,
+			},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "🔄 Interrupted — retrying automatically (attempt 5/10)")
 }
 
 // Every apply state must render a human-readable headline. Raw snake_case

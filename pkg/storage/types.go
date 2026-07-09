@@ -11,6 +11,13 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 )
 
+// MaxRecoveryAttempts is the operator retry budget for failed_retryable
+// applies: how many automatic redispatches an interrupted apply gets before it
+// is terminalized as failed. The original apply attempt is separate. Surfaced
+// in operator-facing progress (the PR comment's retry counter) and enforced by
+// the storage claim/expiry paths.
+const MaxRecoveryAttempts = 10
+
 // Cutover policies control how a multi-deployment rollout sequences the copy
 // and cutover phases of its deployments. The value is resolved from the
 // environment config at apply-create time and persisted on each apply_operations

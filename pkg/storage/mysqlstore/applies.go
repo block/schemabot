@@ -35,9 +35,9 @@ const applyColumnsForApplyAlias = `a.id, a.apply_identifier, a.lock_id, a.plan_i
 	a.created_at, a.started_at, a.completed_at, a.updated_at, a.revert_skipped_at`
 
 const (
-	// maxRecoveryAttempts is the retry budget for failed_retryable applies. The
-	// original apply attempt is separate; this counts operator redispatches.
-	maxRecoveryAttempts = 10
+	// maxRecoveryAttempts is the retry budget for failed_retryable applies,
+	// shared with operator-facing progress rendering via the exported constant.
+	maxRecoveryAttempts = storage.MaxRecoveryAttempts
 
 	// retryableRecoveryFreshnessDays prevents old retryable failures from
 	// being redispatched unexpectedly after retry policy or attempt budgets
