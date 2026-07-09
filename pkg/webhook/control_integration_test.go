@@ -839,7 +839,7 @@ func TestE2EVolumeCommandQueuesDurableRequest(t *testing.T) {
 	assert.Contains(t, comment, "Volume Request Accepted")
 	assert.Contains(t, comment, "`"+applyIdentifier+"`")
 	assert.Contains(t, comment, "@alice")
-	assert.Contains(t, comment, "Volume change to 8 queued; the driver applies it at its next progress check")
+	assert.Contains(t, comment, "Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly")
 
 	controlReq, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationVolume)
 	require.NoError(t, err)

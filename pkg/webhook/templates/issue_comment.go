@@ -260,9 +260,10 @@ type VolumeCommandAcceptedData struct {
 }
 
 // RenderVolumeCommandAccepted renders the acknowledgement posted when a PR
-// comment volume command queues a durable volume adjustment. The wording keeps
-// the queued semantics explicit: the driver retunes the engine at its next
-// progress check, so the new level is not yet in effect when this posts.
+// comment volume command queues a durable volume adjustment. The wording says
+// "shortly" rather than implying an immediate change: the new level takes
+// effect at the next progress check, so it is not yet in effect when this
+// posts.
 func RenderVolumeCommandAccepted(data VolumeCommandAcceptedData) string {
 	body := "## Volume Request Accepted\n\n" +
 		fmt.Sprintf("**Apply**: `%s`\n", data.ApplyID) +
@@ -270,7 +271,7 @@ func RenderVolumeCommandAccepted(data VolumeCommandAcceptedData) string {
 	if data.RequestedBy != "" {
 		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
 	}
-	body += fmt.Sprintf("\nVolume change to %d queued; the driver applies it at its next progress check. Status remains available from the PR progress comment or CLI.\n", data.Volume)
+	body += fmt.Sprintf("\nVolume change to %d requested. SchemaBot will adjust the speed of this schema change shortly; status remains available from the PR progress comment or CLI.\n", data.Volume)
 	return body
 }
 

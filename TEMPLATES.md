@@ -3032,7 +3032,7 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 **Environment**: `staging`
 **Requested by**: @alice
 
-Volume change to 8 queued; the driver applies it at its next progress check. Status remains available from the PR progress comment or CLI.
+Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly; status remains available from the PR progress comment or CLI.
 
 </details>
 
@@ -5497,7 +5497,7 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 **Environment**: `staging`
 **Requested by**: @alice
 
-Volume change to 8 queued; the driver applies it at its next progress check. Status remains available from the PR progress comment or CLI.
+Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly; status remains available from the PR progress comment or CLI.
 
 
 </details>
