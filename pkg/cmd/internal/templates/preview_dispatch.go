@@ -273,6 +273,10 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted())
 	case PreviewCommentCutoverActive:
 		fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress())
+	case PreviewCommentVolumeAccepted:
+		fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted())
+	case PreviewCommentVolumeInvalid:
+		fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel())
 	case PreviewCommentApplyAllType:
 		previewApplyCommandAllOutput()
 	// Paired aggregate previews (PR + CLI subsections)

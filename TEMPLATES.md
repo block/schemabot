@@ -1884,6 +1884,37 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="single-table-running-volume-tuned"></a><strong>Single Table: Running (Volume Tuned)</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress | Volume: 8/11
+
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="single-table-completed"></a><strong>Single Table: Completed</strong></summary>
 
 
@@ -2989,6 +3020,31 @@ Cutover request accepted. SchemaBot will complete this schema change; status rem
 
 Cutover is already in progress. SchemaBot will keep reporting progress from the existing apply.
 
+</details>
+
+<details>
+<summary><a name="volume-command-accepted"></a><strong>Volume Command Accepted</strong></summary>
+
+
+## Volume Request Accepted
+
+**Apply**: `apply-a1b2c3d4e5f67890`
+**Environment**: `staging`
+**Requested by**: @alice
+
+Volume change to 8 queued; the driver applies it at its next progress check. Status remains available from the PR progress comment or CLI.
+
+</details>
+
+<details>
+<summary><a name="volume-command-invalid-level"></a><strong>Volume Command Invalid Level</strong></summary>
+
+
+## Missing or Invalid Volume Level
+
+Usage: `schemabot volume <apply-id> -e <environment> -v <level>`
+
+The `-v` flag is required and must be a number between 1 (slowest) and 11 (fastest).
 </details>
 
 <details>
@@ -5428,6 +5484,33 @@ Cutover request accepted. SchemaBot will complete this schema change; status rem
 
 Cutover is already in progress. SchemaBot will keep reporting progress from the existing apply.
 
+
+</details>
+
+<details>
+<summary><a name="volume-command-accepted"></a><strong>Volume Command Accepted</strong></summary>
+
+
+## Volume Request Accepted
+
+**Apply**: `apply-a1b2c3d4e5f67890`
+**Environment**: `staging`
+**Requested by**: @alice
+
+Volume change to 8 queued; the driver applies it at its next progress check. Status remains available from the PR progress comment or CLI.
+
+
+</details>
+
+<details>
+<summary><a name="volume-command-invalid-level"></a><strong>Volume Command Invalid Level</strong></summary>
+
+
+## Missing or Invalid Volume Level
+
+Usage: `schemabot volume <apply-id> -e <environment> -v <level>`
+
+The `-v` flag is required and must be a number between 1 (slowest) and 11 (fastest).
 
 </details>
 

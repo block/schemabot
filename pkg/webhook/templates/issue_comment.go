@@ -274,6 +274,23 @@ func RenderVolumeCommandAccepted(data VolumeCommandAcceptedData) string {
 	return body
 }
 
+// PreviewCommentVolumeCommandAccepted renders a sample volume command
+// acknowledgement comment.
+func PreviewCommentVolumeCommandAccepted() string {
+	return RenderVolumeCommandAccepted(VolumeCommandAcceptedData{
+		ApplyID:     "apply-a1b2c3d4e5f67890",
+		Environment: "staging",
+		RequestedBy: "alice",
+		Volume:      8,
+	})
+}
+
+// PreviewCommentVolumeInvalidLevel renders the usage comment posted when a
+// volume command carries a missing or invalid level.
+func PreviewCommentVolumeInvalidLevel() string {
+	return RenderVolumeInvalidLevel()
+}
+
 // RenderCutoverCommandAccepted renders the acknowledgement posted when a PR
 // comment cutover command records durable cutover intent.
 func RenderCutoverCommandAccepted(data CutoverCommandAcceptedData) string {

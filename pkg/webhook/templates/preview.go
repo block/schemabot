@@ -1409,6 +1409,20 @@ func PreviewCommentApplySingleProgress() string {
 	return RenderApplyStatusComment(sampleSingleApplyData(state.Apply.Running, table))
 }
 
+// PreviewCommentApplySingleProgressVolume renders a single-table apply in
+// progress with a tuned volume level shown on the status line.
+func PreviewCommentApplySingleProgressVolume() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.Running
+	table.RowsCopied = 3500000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 48
+	table.ETASeconds = 330
+	data := sampleSingleApplyData(state.Apply.Running, table)
+	data.Volume = 8
+	return RenderApplyStatusComment(data)
+}
+
 // PreviewCommentApplySingleCompleted renders a single-table apply completed.
 func PreviewCommentApplySingleCompleted() string {
 	table := sampleSingleTable()

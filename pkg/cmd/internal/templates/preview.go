@@ -192,5 +192,7 @@ const (
 	PreviewCommentStartPending          PreviewType = "comment_start_pending"                // Start command when start is already pending
 	PreviewCommentCutoverAccepted       PreviewType = "comment_cutover_accepted"             // Cutover command accepted
 	PreviewCommentCutoverActive         PreviewType = "comment_cutover_active"               // Cutover command when cutover is already in progress
+	PreviewCommentVolumeAccepted        PreviewType = "comment_volume_accepted"              // Volume command accepted
+	PreviewCommentVolumeInvalid         PreviewType = "comment_volume_invalid"               // Volume command with a missing or invalid level
 	PreviewCommentApplyAllType          PreviewType = "comment_apply_all"                    // Show all apply comment previews
 )

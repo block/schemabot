@@ -114,7 +114,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentActorNotAuthorized, templates.PreviewCommentActorAuthUnavailable,
 		templates.PreviewCommentDatabaseNotConfigured,
 		templates.PreviewCommentStartAccepted, templates.PreviewCommentStartPending,
-		templates.PreviewCommentCutoverAccepted, templates.PreviewCommentCutoverActive:
+		templates.PreviewCommentCutoverAccepted, templates.PreviewCommentCutoverActive,
+		templates.PreviewCommentVolumeAccepted, templates.PreviewCommentVolumeInvalid:
 		templates.PreviewCLIOutput(previewType)
 	// Paired aggregate types (PR + CLI subsections)
 	case templates.PreviewCommentPlanAll, templates.PreviewCommentLockingAll,
@@ -301,6 +302,8 @@ Apply Command Comments (GitHub PR apply commands):
   comment_start_pending         Start already pending
   comment_cutover_accepted      Cutover request accepted
   comment_cutover_active        Cutover already in progress
+  comment_volume_accepted       Volume request accepted
+  comment_volume_invalid        Volume command with a missing or invalid level
   comment_apply_all             Show all apply command previews
 
 Aggregate Types (grouped PR + CLI pairs):
