@@ -651,6 +651,11 @@ func (s *Service) HandleStart(w http.ResponseWriter, r *http.Request) {
 	s.handleStart(w, r)
 }
 
+// HandleReapply is the HTTP handler for POST /api/reapply.
+func (s *Service) HandleReapply(w http.ResponseWriter, r *http.Request) {
+	s.handleReapply(w, r)
+}
+
 // HandleVolume is the HTTP handler for POST /api/volume.
 func (s *Service) HandleVolume(w http.ResponseWriter, r *http.Request) {
 	s.handleVolume(w, r)
@@ -724,6 +729,7 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 	handle("POST /api/cancel", s.handleCancel)
 	handle("POST /api/start", s.handleStart)
 	handle("POST /api/release", s.handleRelease)
+	handle("POST /api/reapply", s.handleReapply)
 	handle("POST /api/volume", s.handleVolume)
 	handle("POST /api/revert", s.handleRevert)
 	handle("POST /api/skip-revert", s.handleSkipRevert)

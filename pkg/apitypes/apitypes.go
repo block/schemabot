@@ -408,7 +408,7 @@ type ApplyRequest struct {
 }
 
 // ControlRequest is the HTTP request body for control operations
-// (stop, start, cutover, revert, skip-revert).
+// (stop, start, cutover, revert, skip-revert, reapply).
 type ControlRequest struct {
 	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id"`
@@ -738,6 +738,20 @@ type ApplyResponse struct {
 	Accepted     bool   `json:"accepted"`
 	ApplyID      string `json:"apply_id,omitempty"`
 	ErrorCode    string `json:"error_code,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
+}
+
+const (
+	ReapplyStatusReapplied = "reapplied"
+)
+
+// ReapplyResponse is the HTTP response for POST /api/reapply.
+type ReapplyResponse struct {
+	Accepted     bool   `json:"accepted"`
+	Status       string `json:"status"`
+	ApplyID      string `json:"apply_id,omitempty"`
+	PlanID       string `json:"plan_id,omitempty"`
+	Message      string `json:"message,omitempty"`
 	ErrorMessage string `json:"error_message,omitempty"`
 }
 
