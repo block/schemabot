@@ -364,3 +364,169 @@ func TestLocalClient_VolumeRejectsTerminalApplyAndInvalidLevel(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, req, "a rejected volume request must record nothing")
 }
+
+// insertSiblingOperation adds a second apply_operation row for a different
+// deployment, giving the apply the multi-deployment fan-out shape where each
+// operation's driver holds its own engine.
+func insertSiblingOperation(t *testing.T, stor storage.Storage, applyID int64) {
+	t.Helper()
+	_, err := stor.ApplyOperations().Insert(t.Context(), &storage.ApplyOperation{
+		ApplyID:    applyID,
+		Deployment: "testdb-sibling",
+		Target:     "testdb-sibling",
+		State:      state.ApplyOperation.Pending,
+	})
+	require.NoError(t, err)
+}
+
+// A multi-deployment (fan-out) apply runs one engine per operation, so an
+// apply-scoped volume request could only ever retune the first operation
+// driver's deployment while reporting the adjustment as applied everywhere.
+// The request is rejected at queue time with nothing recorded, and a request
+// that reached storage anyway is failed by the driver without retuning any
+// engine.
+func TestLocalClient_VolumeRejectsMultiDeploymentApply(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, eng := newVolumeControlClient(t, dsn, stor)
+
+	apply := dispatchQueuedApplyWithOptions(t, stor, client, nil)
+	insertSiblingOperation(t, stor, apply.ID)
+
+	rejected, err := client.Volume(ctx, &ternv1.VolumeRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+		Volume:      9,
+	})
+	require.NoError(t, err)
+	assert.False(t, rejected.Accepted, "a fan-out apply must not accept an apply-scoped volume adjustment")
+	assert.Contains(t, rejected.ErrorMessage, "multi-deployment")
+
+	req, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationVolume)
+	require.NoError(t, err)
+	assert.Nil(t, req, "a queue-time rejection must record nothing")
+
+	// A request that reached storage anyway (recorded before fan-out gating
+	// could see the sibling operation) is failed by the driver's tick without
+	// retuning any engine.
+	metadata, err := storage.EncodeVolumeControlRequestMetadata(9)
+	require.NoError(t, err)
+	_, _, err = stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationVolume,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "test",
+		Metadata:    metadata,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, client.processPendingVolumeControlRequest(ctx, apply, eng, nil, nil))
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationVolume, storage.ControlRequestFailed)
+	assert.Empty(t, eng.recordedVolumes(), "no engine may be retuned for a fan-out apply")
+}
+
+// A volume request races the drive settling: the state check passes while the
+// apply is still running, the driver settles the apply and runs its terminal
+// pending-request sweep, and only then does the request row land. The queue
+// path re-checks after the insert, sweeps its own request, and rejects — so no
+// pending row lingers forever with no driver left to service it.
+func TestLocalClient_VolumeQueuedAfterSettleIsSweptAndRejected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, eng := newVolumeControlClient(t, dsn, stor)
+
+	apply := dispatchQueuedApplyWithOptions(t, stor, client, nil)
+
+	// Nudge the tracking engine past its running phase so the drive settles
+	// without needing a queued volume adjustment.
+	eng.mu.Lock()
+	eng.volumeAttempts = 1
+	eng.mu.Unlock()
+	driveNextQueuedApply(t, stor, client)
+
+	// The dispatch-time apply snapshot still reads as non-terminal, modelling a
+	// state check that passed just before the driver settled the apply.
+	rejected, err := client.queueVolumeRequest(ctx, apply, 5)
+	require.NoError(t, err)
+	assert.False(t, rejected.Accepted, "a request that raced the settle must not be accepted")
+	assert.Contains(t, rejected.ErrorMessage, "volume can only be adjusted while it is running")
+
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationVolume, storage.ControlRequestCompleted)
+	assert.Empty(t, eng.recordedVolumes(), "a swept request must never reach an engine")
+}
+
+// Engine volume lives with each running schema change, so on a sequential
+// multi-table apply a task started after the adjustment would run at the
+// engine default while stored options, progress, and the CLI report the
+// adjusted level. Each newly started task converges to the apply's stored
+// level, so the display stays true for the whole drive.
+func TestLocalClient_VolumeConvergesLaterTasksToStoredLevel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, eng := newVolumeControlClient(t, dsn, stor)
+
+	apply := dispatchQueuedApply(t, stor, client, []storage.TableChange{
+		{
+			Namespace: "testdb",
+			Table:     "users",
+			DDL:       "ALTER TABLE `users` ADD COLUMN volume_note VARCHAR(255)",
+			Operation: "alter",
+		},
+		{
+			Namespace: "testdb",
+			Table:     "orders",
+			DDL:       "ALTER TABLE `orders` ADD COLUMN volume_note VARCHAR(255)",
+			Operation: "alter",
+		},
+	})
+
+	volumeResp, err := client.Volume(ctx, &ternv1.VolumeRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+		Volume:      9,
+	})
+	require.NoError(t, err)
+	require.True(t, volumeResp.Accepted)
+
+	driveNextQueuedApply(t, stor, client)
+
+	assert.Equal(t, []int32{9, 9}, eng.recordedVolumes(),
+		"the first task is retuned by the pending request and the second converges to the stored level at start")
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationVolume, storage.ControlRequestCompleted)
+	requireStoredVolume(t, stor, apply.ID, 9)
+
+	settled, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, state.Apply.Completed, settled.State)
+}

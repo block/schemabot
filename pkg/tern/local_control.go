@@ -1461,6 +1461,27 @@ func (c *LocalClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*t
 		}, nil
 	}
 
+	// A volume request is apply-scoped, but a multi-deployment (fan-out) apply
+	// runs one engine per operation: whichever operation driver ticked first
+	// would retune only its own deployment's schema change and complete the
+	// request, leaving sibling deployments copying at the old level while the
+	// request row, progress, and the CLI all report the adjustment as applied.
+	// Reject the shape outright until volume requests are scoped per operation.
+	// Operation rows are created at dispatch and never grow while an apply
+	// runs, so this queue-time check cannot be raced by fan-out.
+	operations, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load operations for apply %s to gate volume request: %w", apply.ApplyIdentifier, err)
+	}
+	if len(operations) > 1 {
+		c.logger.Warn("volume rejected: apply fans out to multiple deployments",
+			"apply_id", apply.ApplyIdentifier, "operation_count", len(operations), "volume", req.Volume)
+		return &ternv1.VolumeResponse{
+			Accepted:     false,
+			ErrorMessage: fmt.Sprintf("Apply %s fans out to %d deployments; volume adjustment is not supported for multi-deployment applies", apply.ApplyIdentifier, len(operations)),
+		}, nil
+	}
+
 	return c.queueVolumeRequest(ctx, apply, req.Volume)
 }
 
@@ -1490,6 +1511,32 @@ func (c *LocalClient) queueVolumeRequest(ctx context.Context, apply *storage.App
 	})
 	if err != nil {
 		return nil, fmt.Errorf("record volume control request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	// The apply's state was checked before this insert, and the driver may have
+	// settled the apply — and run its terminal pending-request sweep — in
+	// between. A request recorded after that sweep would linger pending forever
+	// with no driver left to service it, so re-check and sweep it here.
+	storedApply, err := c.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("reload apply %s after recording volume request: %w", apply.ApplyIdentifier, err)
+	}
+	if storedApply == nil {
+		return nil, fmt.Errorf("reload apply %s after recording volume request: apply row not found", apply.ApplyIdentifier)
+	}
+	if state.IsTerminalApplyState(storedApply.State) {
+		c.logger.Info("volume request arrived as the apply settled; sweeping it and rejecting",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"state", storedApply.State,
+			"volume", volume)
+		if sweepErr := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationVolume); sweepErr != nil {
+			return nil, fmt.Errorf("sweep volume request for settled apply %s: %w", apply.ApplyIdentifier, sweepErr)
+		}
+		return &ternv1.VolumeResponse{
+			Accepted:     false,
+			ErrorMessage: fmt.Sprintf("Schema change %s is %s; volume can only be adjusted while it is running", apply.ApplyIdentifier, storedApply.State),
+		}, nil
 	}
 	if alreadyPending {
 		pendingVolume, decodeErr := storage.DecodeVolumeControlRequestMetadata(controlReq.Metadata)
@@ -1556,6 +1603,22 @@ func (c *LocalClient) processPendingVolumeControlRequest(ctx context.Context, ap
 		return nil
 	}
 	caller := controlRequestCaller(controlReq)
+	// A fan-out apply runs one engine per operation, so an apply-scoped volume
+	// request cannot be delivered to every deployment's schema change from one
+	// driver's tick. Fail it closed rather than retune a single deployment and
+	// report the adjustment as applied everywhere. Queue-time gating rejects
+	// this shape before a request is recorded; this guard covers a request that
+	// reached storage anyway.
+	operations, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("load operations for apply %s to service volume request: %w", apply.ApplyIdentifier, err)
+	}
+	if len(operations) > 1 {
+		c.logger.Warn("pending volume request targets a multi-deployment apply; failing it without retuning any engine",
+			append(apply.LogAttrs(), "operation_count", len(operations), "requested_by", caller)...)
+		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationVolume,
+			fmt.Sprintf("apply fans out to %d deployments; volume adjustment is not supported for multi-deployment applies", len(operations)))
+	}
 	volume, err := storage.DecodeVolumeControlRequestMetadata(controlReq.Metadata)
 	if err != nil {
 		c.logger.Warn("pending volume request has invalid metadata; failing the request and continuing at the current volume",
@@ -1623,6 +1686,50 @@ func (c *LocalClient) recordAppliedVolume(ctx context.Context, apply *storage.Ap
 	}
 	apply.Options = stored.Options
 	return nil
+}
+
+// convergeTaskVolumeToStoredLevel retunes a newly started task's schema change
+// to the apply's stored volume level. Engine volume lives with each running
+// schema change, so a task started after an operator adjusted the volume — a
+// later table in a sequential drive, or a resumed apply — would otherwise run
+// at the engine default while stored options, progress, and the CLI all report
+// the adjusted level. Volume is a tuning knob, not a safety operation: a
+// rejection is logged and the task continues at the engine default rather than
+// failing the drive.
+func (c *LocalClient) convergeTaskVolumeToStoredLevel(ctx context.Context, apply *storage.Apply, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState) {
+	volume := int32(apply.GetOptions().Volume)
+	if volume == 0 {
+		c.logger.Debug("no stored volume level on apply options; task starts at the engine default",
+			"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier)
+		return
+	}
+	if volume < storage.MinVolume || volume > storage.MaxVolume {
+		c.logger.Warn("stored volume level is out of range; task starts at the engine default",
+			append(task.LogAttrs(), "volume", volume)...)
+		return
+	}
+	result, err := c.getEngine().Volume(ctx, &engine.VolumeRequest{
+		Database:    apply.Database,
+		Volume:      volume,
+		ResumeState: resumeState,
+		Credentials: creds,
+	})
+	if err != nil {
+		c.logger.Warn("engine rejected converging task to the stored volume level; task continues at the engine default",
+			append(task.LogAttrs(), "volume", volume, "error", err)...)
+		return
+	}
+	if result == nil || !result.Accepted {
+		message := "not accepted"
+		if result != nil && result.Message != "" {
+			message = result.Message
+		}
+		c.logger.Warn("engine did not accept converging task to the stored volume level; task continues at the engine default",
+			append(task.LogAttrs(), "volume", volume, "message", message)...)
+		return
+	}
+	c.logger.Info("task volume converged to the apply's stored level",
+		append(task.LogAttrs(), "volume", volume)...)
 }
 
 // Revert reverts a completed schema change during the revert window.

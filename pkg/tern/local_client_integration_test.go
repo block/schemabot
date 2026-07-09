@@ -3093,7 +3093,7 @@ func TestLocalClient_Start_NoStoppedMigration(t *testing.T) {
 	assert.Contains(t, err.Error(), "no stopped schema change")
 }
 
-func TestLocalClient_Volume_NoActiveMigration(t *testing.T) {
+func TestLocalClient_Volume_NoActiveSchemaChange(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}

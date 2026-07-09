@@ -212,6 +212,8 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	c.transitionTaskState(ctx, task, 0, state.Task.Running, "")
 	c.logger.Info("task running", "task_id", task.TaskIdentifier, "table", task.TableName)
 
+	c.convergeTaskVolumeToStoredLevel(ctx, apply, task, taskCreds, result.ResumeState)
+
 	// Poll to completion. Thread the engine's returned resume state into the
 	// poll: a sharded engine (Strata) identifies the operation to report on from
 	// ResumeState.Metadata and errors without it, so Progress must carry what
