@@ -411,9 +411,26 @@ func TestExecuteChecksSynthesizeValidation(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "per request")
 
+	_, err = executeChecksSynthesize(t.Context(), cfg, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1, 0, 2}}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "pr numbers must be positive")
+
 	_, err = executeChecksSynthesize(t.Context(), cfg, nil, ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1}}, discardLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no GitHub webhook runtime")
+}
+
+// A stale or mistyped environment is rejected as a request error before any
+// GitHub work, rather than scanning for a check name that can never exist and
+// reporting every PR as missing it.
+func TestExecuteChecksScanRejectsDisallowedEnvironment(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{AllowedEnvironments: []string{"staging", "production"}}
+
+	_, err := executeChecksScan(t.Context(), cfg, ChecksScanRequest{Repo: "octo/repo", Environment: "prod"}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `environment "prod" is not one this instance handles`)
 }
 
 // Redelivery by explicit delivery IDs is a precise continuation of a prior
@@ -439,6 +456,9 @@ func TestExecuteWebhookRedriveByIDsValidation(t *testing.T) {
 type fakeWebhookMissingCheckScanClient struct {
 	prs  []ghclient.OpenPullRequest
 	runs map[string]*ghclient.CheckRunResult
+	// untrusted maps headSHA+"/"+checkName to app slugs that published a
+	// same-named check but are not trusted.
+	untrusted map[string][]string
 }
 
 func (f fakeWebhookMissingCheckScanClient) ListOpenPullRequestsPage(_ context.Context, _ string, page, perPage int) ([]ghclient.OpenPullRequest, int, error) {
@@ -458,7 +478,7 @@ func (f fakeWebhookMissingCheckScanClient) ListOpenPullRequestsPage(_ context.Co
 }
 
 func (f fakeWebhookMissingCheckScanClient) FindCheckRunByName(_ context.Context, _ string, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error) {
-	return f.runs[headSHA+"/"+checkName], nil, nil
+	return f.runs[headSHA+"/"+checkName], f.untrusted[headSHA+"/"+checkName], nil
 }
 
 func TestWebhookMissingCheckNamesUsesConfiguredEnvironmentNames(t *testing.T) {
@@ -495,4 +515,28 @@ func TestScanWebhookMissingChecksReportsOpenPRsMissingConfiguredChecks(t *testin
 	assert.Equal(t, 2, result.Missing[0].Number)
 	assert.Equal(t, "https://github.com/octo/repo/pull/2", result.Missing[0].URL)
 	assert.Equal(t, []string{"SchemaBot (production)"}, result.Missing[0].MissingNames)
+	assert.Empty(t, result.Missing[0].UntrustedConflictNames)
+}
+
+// A missing check whose name is already taken by an untrusted app's Check Run
+// is reported distinctly, so the operator knows backfill alone leaves a
+// conflicting check to resolve.
+func TestScanWebhookMissingChecksSurfacesUntrustedConflicts(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 5, Title: "untrusted conflict", HeadSHA: "sha5", HeadRef: "feature-5"},
+		},
+		untrusted: map[string][]string{
+			"sha5/SchemaBot (production)": {"some-other-app"},
+		},
+	}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0)
+
+	require.NoError(t, err)
+	require.Len(t, result.Missing, 1)
+	assert.Equal(t, []string{"SchemaBot (production)"}, result.Missing[0].MissingNames)
+	assert.Equal(t, []string{"SchemaBot (production)"}, result.Missing[0].UntrustedConflictNames)
 }

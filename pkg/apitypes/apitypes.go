@@ -145,6 +145,11 @@ type MissingCheckPR struct {
 	HeadSHA      string   `json:"head_sha"`
 	HeadRef      string   `json:"head_ref"`
 	MissingNames []string `json:"missing_check_names"`
+	// UntrustedConflictNames are missing check names for which a same-named
+	// Check Run already exists but was created by an untrusted app. Backfill
+	// still recreates the trusted check, but the operator likely also needs to
+	// remove/rename the conflicting check or adjust the trusted-app config.
+	UntrustedConflictNames []string `json:"untrusted_conflict_check_names,omitempty"`
 }
 
 // =============================================================================

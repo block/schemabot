@@ -609,6 +609,11 @@ func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo
 	if page <= 0 {
 		page = 1
 	}
+	// GitHub caps page size at 100; clamp so a caller's 0/negative/oversized
+	// value behaves predictably.
+	if perPage <= 0 || perPage > 100 {
+		perPage = 100
+	}
 	opts := &gh.PullRequestListOptions{
 		State:     "open",
 		Sort:      "updated",
@@ -618,9 +623,17 @@ func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo
 			Page:    page,
 		},
 	}
-	ghPRs, resp, err := ic.client.PullRequests.List(ctx, owner, repoName, opts)
+	var resp *gh.Response
+	ghPRs, err := retryGitHubUnavailableRead(ctx, ic.logger, "list open pull requests", []any{"repo", repo, "page", page}, func(ctx context.Context) ([]*gh.PullRequest, error) {
+		list, listResp, listErr := ic.client.PullRequests.List(ctx, owner, repoName, opts)
+		if listErr != nil {
+			return nil, classifyGitHubAPIError(listErr)
+		}
+		resp = listResp
+		return list, nil
+	})
 	if err != nil {
-		return nil, 0, fmt.Errorf("list open pull requests for %s page %d: %w", repo, page, classifyGitHubAPIError(err))
+		return nil, 0, fmt.Errorf("list open pull requests for %s page %d: %w", repo, page, err)
 	}
 	for _, pr := range ghPRs {
 		prs = append(prs, OpenPullRequest{

@@ -124,6 +124,11 @@ func executeChecksSynthesize(ctx context.Context, cfg *ServerConfig, backfiller 
 	if len(req.PRs) > checksSynthesizeMaxPRsPerRequest {
 		return nil, webhookOpsRequestErrorf("at most %d prs per request; send the rest in follow-up requests", checksSynthesizeMaxPRsPerRequest)
 	}
+	for _, pr := range req.PRs {
+		if pr <= 0 {
+			return nil, webhookOpsRequestErrorf("pr numbers must be positive; got %d", pr)
+		}
+	}
 	if backfiller == nil {
 		return nil, fmt.Errorf("check run backfill is unavailable: no GitHub webhook runtime is configured")
 	}
@@ -249,6 +254,12 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanReq
 	}
 	if req.Page < 0 {
 		return nil, webhookOpsRequestErrorf("page must be non-negative")
+	}
+	// A stale or mistyped environment would otherwise scan for a check name
+	// that can never exist and report every PR as missing it; reject it as a
+	// request error instead.
+	if req.Environment != "" && !cfg.IsEnvironmentAllowed(req.Environment) {
+		return nil, webhookOpsRequestErrorf("environment %q is not one this instance handles", req.Environment)
 	}
 	if logger == nil {
 		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
@@ -660,25 +671,34 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 	result := &ChecksScanResponse{Repo: repo, CheckNames: checkNames, Scanned: len(prs), NextPage: nextPage}
 	for _, pr := range prs {
 		var missing []string
+		var untrustedConflicts []string
 		for _, checkName := range checkNames {
-			run, _, err := client.FindCheckRunByName(ctx, repo, pr.HeadSHA, checkName)
+			run, untrustedApps, err := client.FindCheckRunByName(ctx, repo, pr.HeadSHA, checkName)
 			if err != nil {
 				return nil, fmt.Errorf("scan %s#%d for check %q at %s: %w", repo, pr.Number, checkName, pr.HeadSHA, err)
 			}
-			if run == nil {
-				missing = append(missing, checkName)
+			if run != nil {
+				continue
+			}
+			missing = append(missing, checkName)
+			// No trusted check exists, but a same-named one from an untrusted
+			// app does: backfill will still create the trusted check, yet the
+			// operator likely also needs to resolve the conflicting check.
+			if len(untrustedApps) > 0 {
+				untrustedConflicts = append(untrustedConflicts, checkName)
 			}
 		}
 		if len(missing) == 0 {
 			continue
 		}
 		result.Missing = append(result.Missing, MissingCheckPR{
-			Number:       pr.Number,
-			URL:          fmt.Sprintf("https://github.com/%s/pull/%d", repo, pr.Number),
-			Title:        pr.Title,
-			HeadSHA:      pr.HeadSHA,
-			HeadRef:      pr.HeadRef,
-			MissingNames: missing,
+			Number:                 pr.Number,
+			URL:                    fmt.Sprintf("https://github.com/%s/pull/%d", repo, pr.Number),
+			Title:                  pr.Title,
+			HeadSHA:                pr.HeadSHA,
+			HeadRef:                pr.HeadRef,
+			MissingNames:           missing,
+			UntrustedConflictNames: untrustedConflicts,
 		})
 	}
 	return result, nil
