@@ -1202,6 +1202,11 @@ type EngineResumeState struct {
 	Metadata         string
 }
 
+// Durable webhook event providers.
+const (
+	WebhookProviderGitHub = "github"
+)
+
 // Durable webhook event states.
 const (
 	WebhookEventPending         = "pending"
@@ -1211,16 +1216,17 @@ const (
 	WebhookEventFailed          = "failed"
 )
 
-// WebhookEvent is a durable inbox row for one GitHub webhook delivery.
+// WebhookEvent is a durable inbox row for one SCM/webhook delivery.
 type WebhookEvent struct {
 	ID             int64
+	Provider       string
 	DeliveryID     string
 	Event          string
 	Action         string
 	Repository     string
 	PullRequest    int
 	HeadSHA        string
-	InstallationID int64
+	TenantID       string
 	Payload        []byte
 	State          string
 	Attempts       int

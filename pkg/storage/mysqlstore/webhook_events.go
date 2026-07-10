@@ -13,7 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-const webhookEventColumns = `id, delivery_id, event, action, repository, pull_request, head_sha, installation_id,
+const webhookEventColumns = `id, provider, delivery_id, event, action, repository, pull_request, head_sha, tenant_id,
 	payload, state, attempts, lease_owner, lease_token, lease_expires_at, retry_after, last_error,
 	received_at, started_at, completed_at, created_at, updated_at`
 
@@ -27,6 +27,10 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 	}
 	if event.Event == "" {
 		return false, fmt.Errorf("webhook event type is required")
+	}
+	provider := event.Provider
+	if provider == "" {
+		provider = storage.WebhookProviderGitHub
 	}
 	payload := event.Payload
 	if len(payload) == 0 {
@@ -43,10 +47,10 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 
 	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO webhook_events (
-			delivery_id, event, action, repository, pull_request, head_sha, installation_id,
+			provider, delivery_id, event, action, repository, pull_request, head_sha, tenant_id,
 			payload, state, attempts, received_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, event.DeliveryID, event.Event, event.Action, event.Repository, event.PullRequest, event.HeadSHA, event.InstallationID,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, provider, event.DeliveryID, event.Event, event.Action, event.Repository, event.PullRequest, event.HeadSHA, event.TenantID,
 		string(payload), state, event.Attempts, receivedAt)
 	if err != nil {
 		if isDuplicateKeyError(err) {
@@ -59,24 +63,28 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 		return false, err
 	}
 	event.ID = id
+	event.Provider = provider
 	event.State = state
 	event.Payload = payload
 	event.ReceivedAt = receivedAt
 	return true, nil
 }
 
-func (s *webhookEventStore) GetByDeliveryID(ctx context.Context, deliveryID string) (*storage.WebhookEvent, error) {
+func (s *webhookEventStore) GetByDeliveryID(ctx context.Context, provider, deliveryID string) (*storage.WebhookEvent, error) {
+	if provider == "" {
+		provider = storage.WebhookProviderGitHub
+	}
 	row := s.db.QueryRowContext(ctx, `
 		SELECT `+webhookEventColumns+`
 		FROM webhook_events
-		WHERE delivery_id = ?
-	`, deliveryID)
+		WHERE provider = ? AND delivery_id = ?
+	`, provider, deliveryID)
 	return scanWebhookEvent(row)
 }
 
 func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDuration time.Duration) (*storage.WebhookEvent, error) {
 	if owner == "" {
-		return nil, fmt.Errorf("webhook worker owner is required: %w", storage.ErrWebhookEventLeaseLost)
+		return nil, fmt.Errorf("webhook driver owner is required")
 	}
 	if leaseDuration <= 0 {
 		return nil, fmt.Errorf("webhook lease duration must be positive")
@@ -194,8 +202,8 @@ func scanWebhookEventInto(row scanner) (*storage.WebhookEvent, error) {
 	var leaseOwner, leaseToken, lastError sql.NullString
 	var leaseExpiresAt, retryAfter, startedAt, completedAt sql.NullTime
 	err := row.Scan(
-		&event.ID, &event.DeliveryID, &event.Event, &event.Action, &event.Repository, &event.PullRequest,
-		&event.HeadSHA, &event.InstallationID, &event.Payload, &event.State, &event.Attempts,
+		&event.ID, &event.Provider, &event.DeliveryID, &event.Event, &event.Action, &event.Repository, &event.PullRequest,
+		&event.HeadSHA, &event.TenantID, &event.Payload, &event.State, &event.Attempts,
 		&leaseOwner, &leaseToken, &leaseExpiresAt, &retryAfter, &lastError,
 		&event.ReceivedAt, &startedAt, &completedAt, &event.CreatedAt, &event.UpdatedAt,
 	)
@@ -234,7 +242,7 @@ func (s *webhookEventStore) checkWebhookEventLeaseResult(ctx context.Context, re
 		if missingOK {
 			return nil
 		}
-		return storage.ErrWebhookEventLeaseLost
+		return storage.ErrWebhookEventNotFound
 	}
 	if err != nil {
 		return err

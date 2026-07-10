@@ -20,14 +20,14 @@ func TestWebhookEventStore_CreateDeduplicatesDeliveryID(t *testing.T) {
 	store := New(testDB)
 
 	event := &storage.WebhookEvent{
-		DeliveryID:     "delivery-1",
-		Event:          "pull_request",
-		Action:         "opened",
-		Repository:     "block/example",
-		PullRequest:    123,
-		HeadSHA:        "abc123",
-		InstallationID: 456,
-		Payload:        []byte(`{"action":"opened"}`),
+		DeliveryID:  "delivery-1",
+		Event:       "pull_request",
+		Action:      "opened",
+		Repository:  "block/example",
+		PullRequest: 123,
+		HeadSHA:     "abc123",
+		TenantID:    "456",
+		Payload:     []byte(`{"action":"opened"}`),
 	}
 	inserted, err := store.WebhookEvents().Create(ctx, event)
 	require.NoError(t, err)
@@ -42,13 +42,31 @@ func TestWebhookEventStore_CreateDeduplicatesDeliveryID(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, inserted)
 
-	got, err := store.WebhookEvents().GetByDeliveryID(ctx, "delivery-1")
+	got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
 	require.NoError(t, err)
 	require.NotNil(t, got)
+	assert.Equal(t, storage.WebhookProviderGitHub, got.Provider)
 	assert.Equal(t, storage.WebhookEventPending, got.State)
 	assert.Equal(t, "block/example", got.Repository)
 	assert.Equal(t, 123, got.PullRequest)
+	assert.Equal(t, "456", got.TenantID)
 	assert.JSONEq(t, `{"action":"opened"}`, string(got.Payload))
+}
+
+func TestWebhookEventStore_CreateDeduplicatesByProviderAndDeliveryID(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.True(t, inserted)
+	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.False(t, inserted)
+	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{Provider: "gitlab", DeliveryID: "delivery-1", Event: "merge_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.True(t, inserted)
 }
 
 func TestWebhookEventStore_FindNextClaimsOldestPendingEvent(t *testing.T) {
@@ -123,7 +141,7 @@ func TestWebhookEventStore_MarkFailedRetryableAndCompleted(t *testing.T) {
 	retryAfter := time.Now().Add(-time.Minute)
 	require.NoError(t, store.WebhookEvents().MarkFailed(ctx, claimed.ID, claimed.LeaseToken, "temporary failure", &retryAfter))
 
-	retryable, err := store.WebhookEvents().GetByDeliveryID(ctx, "delivery-1")
+	retryable, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
 	require.NoError(t, err)
 	require.NotNil(t, retryable)
 	assert.Equal(t, storage.WebhookEventFailedRetryable, retryable.State)
@@ -136,7 +154,7 @@ func TestWebhookEventStore_MarkFailedRetryableAndCompleted(t *testing.T) {
 	require.NotNil(t, reclaimed)
 	require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, reclaimed.ID, reclaimed.LeaseToken))
 
-	completed, err := store.WebhookEvents().GetByDeliveryID(ctx, "delivery-1")
+	completed, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
 	require.NoError(t, err)
 	require.NotNil(t, completed)
 	assert.Equal(t, storage.WebhookEventCompleted, completed.State)

@@ -44,6 +44,9 @@ type Storage interface {
 	// Settings returns the settings store.
 	Settings() SettingsStore
 
+	// WebhookEvents returns the durable webhook event inbox store.
+	WebhookEvents() WebhookEventStore
+
 	// Ping verifies the database connection is alive.
 	Ping(ctx context.Context) error
 
@@ -191,15 +194,15 @@ type SettingsStore interface {
 
 // WebhookEventStore manages durable webhook inbox rows. It is the storage
 // primitive behind fast webhook acknowledgement: handlers can persist a delivery
-// before returning 2xx, and workers can claim/retry the stored event after the
+// before returning 2xx, and drivers can claim/retry the stored event after the
 // HTTP request has finished.
 type WebhookEventStore interface {
-	// Create records a webhook delivery. Returns inserted=false when the delivery
-	// GUID already exists, so callers can deduplicate GitHub redeliveries.
+	// Create records a webhook delivery. Returns inserted=false when provider +
+	// delivery GUID already exists, so callers can deduplicate redeliveries.
 	Create(ctx context.Context, event *WebhookEvent) (inserted bool, err error)
 
-	// GetByDeliveryID returns a webhook event by GitHub's delivery GUID, or nil if not found.
-	GetByDeliveryID(ctx context.Context, deliveryID string) (*WebhookEvent, error)
+	// GetByDeliveryID returns a webhook event by provider + delivery GUID, or nil if not found.
+	GetByDeliveryID(ctx context.Context, provider, deliveryID string) (*WebhookEvent, error)
 
 	// FindNext atomically claims one pending, retryable, or lease-expired event.
 	// The claim rotates lease_owner/lease_token, increments attempts, and sets a
