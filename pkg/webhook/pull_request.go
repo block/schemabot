@@ -101,6 +101,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 	h.goSafe(repo, pr, installationID, func() {
 		ctx, cancel, client, err := h.autoPlanBootstrap(repo, installationID)
 		if err != nil {
+			metrics.RecordWebhookEvent(context.Background(), metricApp, "pull_request", payload.Action, repo, "auto_plan_bootstrap_failed")
 			h.logger.Error("failed to bootstrap auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
 			return
 		}
