@@ -764,7 +764,7 @@ func verifyHMAC(signature string, body, secret []byte) bool {
 func (h *Handler) recoverPanic(repo string, pr int, installationID int64) {
 	if r := recover(); r != nil {
 		stack := debug.Stack()
-		h.logger.Error("goroutine panic", "error", r, "stack", string(stack))
+		h.logger.Error("goroutine panic", "repo", repo, "pr", pr, "installation_id", installationID, "error", r, "stack", string(stack))
 		h.postComment(repo, pr, installationID,
 			fmt.Sprintf("**Internal error: goroutine panic. This is a bug — please report it.**\n```\n%v\n```", r))
 	}

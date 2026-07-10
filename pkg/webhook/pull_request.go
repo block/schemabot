@@ -106,8 +106,8 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			return
 		}
 		defer cancel()
-		message := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before)
-		h.logger.Info("auto-plan finished",
+		message := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before, deliveryID)
+		h.logger.Info("auto-plan dispatched",
 			"action", payload.Action,
 			"repo", repo,
 			"pr", pr,
@@ -155,12 +155,12 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 	return false
 }
 
-func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string) string {
+func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string, deliveryID string) string {
 	// Fetch the changed files once so the same list drives both config discovery
 	// and the server-managed-directory safety check below.
 	files, err := client.FetchPRFiles(ctx, repo, pr)
 	if err != nil {
-		h.logger.Error("failed to fetch PR files for auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "error", err)
+		h.logger.Error("failed to fetch PR files for auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
 		return "config discovery failed"
 	}
@@ -168,7 +168,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// Discover all configs matching changed schema files in this PR
 	configs, err := client.FindConfigsForPRFiles(ctx, repo, headSHA, files)
 	if err != nil {
-		h.logger.Error("failed to discover configs for PR", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "error", err)
+		h.logger.Error("failed to discover configs for PR", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
 		return "config discovery failed"
 	}
@@ -203,7 +203,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	})
 
 	if len(configs) == 0 {
-		h.logger.Info("no schema files in PR, skipping auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source)
+		h.logger.Info("no schema files in PR, skipping auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
 		// An aggregate participant does not own the required check for the repo —
 		// the leader does — so on a PR that touches none of this deployment's
 		// schema it has nothing to report and stays silent, rather than posting a
@@ -213,7 +213,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// protection (its check is non-required by the aggregate contract).
 		if h.isAggregateParticipant(repo) {
 			h.logger.Info("aggregate participant staying silent on PR with no managed schema changes",
-				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source)
+				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 				Operation:  "aggregate_participant_skip",
 				Repository: repo,
@@ -230,14 +230,14 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// Check Run events arrive, converging to passing once they succeed.
 		if h.leaderExpectsParticipantsForPR(repo, files) {
 			h.logger.Info("no leader-managed schema in PR but expected participant paths are touched; aggregate gate will block until participants report",
-				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source)
+				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
 			h.goSafe(repo, pr, installationID, func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				c, err := h.clientForRepo(repo, installationID)
 				if err != nil {
 					h.logger.Error("failed to create GitHub client for participant-gated aggregate",
-						"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+						"repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
 					return
 				}
 				h.updateAggregateCheck(ctx, c, repo, pr, headSHA)
@@ -255,7 +255,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 			defer cancel()
 			c, err := h.clientForRepo(repo, installationID)
 			if err != nil {
-				h.logger.Error("failed to create GitHub client for passing aggregate", "error", err)
+				h.logger.Error("failed to create GitHub client for passing aggregate", "repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
 				return
 			}
 			h.postPassingAggregates(ctx, c, repo, pr, headSHA)
