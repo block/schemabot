@@ -11,7 +11,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3
 	github.com/block/spirit v0.15.2-0.20260702163828-5b931ace8482
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
-	github.com/charmbracelet/bubbles v1.0.0
+	github.com/charmbracelet/bubbles/v2 v2.1.1
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/coreos/go-oidc/v3 v3.18.0
