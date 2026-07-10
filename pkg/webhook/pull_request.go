@@ -98,16 +98,12 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		"delivery_id", deliveryID,
 	)
 
-	ctx, cancel, client, err := h.autoPlanBootstrap(repo, installationID)
-	if err != nil {
-		h.logger.Error("failed to bootstrap auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
-		h.writeError(w, http.StatusInternalServerError, "failed to initialize GitHub client")
-		return
-	}
-
-	// autoPlanBootstrap returns a request-independent bounded context, so the
-	// auto-plan can finish after this webhook response is acknowledged.
 	h.goSafe(repo, pr, installationID, func() {
+		ctx, cancel, client, err := h.autoPlanBootstrap(repo, installationID)
+		if err != nil {
+			h.logger.Error("failed to bootstrap auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
+			return
+		}
 		defer cancel()
 		message := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before)
 		h.logger.Info("auto-plan finished",

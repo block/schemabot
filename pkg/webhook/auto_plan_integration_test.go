@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -489,11 +490,67 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 	case <-time.After(webhookIntegrationCheckRunDeadline):
 		t.Fatal("timed out waiting for no-schema passing aggregate check run")
 	}
+	var check *storage.Check
+	var checkErr error
+	require.Eventually(t, func() bool {
+		check, checkErr = svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+		return checkErr == nil && check != nil
+	}, webhookIntegrationCheckRunDeadline, 100*time.Millisecond, "no-schema auto-plan should store a passing aggregate check")
+	require.NoError(t, checkErr)
+	require.NotNil(t, check)
+	assert.Equal(t, "abc123", check.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionSuccess, check.Conclusion)
 	select {
 	case body := <-comments:
 		t.Fatalf("expected no plan comment for no-schema auto-plan, got: %s", body)
 	case <-time.After(250 * time.Millisecond):
 	}
+}
+
+// TestE2EAutoPlanBootstrapDoesNotBlockWebhookAck verifies that pull-request
+// auto-plan acknowledges the webhook before GitHub client construction runs.
+// Client construction can perform remote GitHub calls, so the response path must
+// not depend on it being fast or available.
+func TestE2EAutoPlanBootstrapDoesNotBlockWebhookAck(t *testing.T) {
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	bootstrapStarted := make(chan struct{})
+	bootstrapRelease := make(chan struct{})
+	factory := &fakeClientFactory{
+		forInstallationStarted: bootstrapStarted,
+		forInstallationRelease: bootstrapRelease,
+		forInstallationErr:     errors.New("github unavailable"),
+	}
+
+	h := NewHandler(svc, factory, nil, logger)
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	served := make(chan struct{})
+	go func() {
+		h.ServeHTTP(rr, req)
+		close(served)
+	}()
+
+	select {
+	case <-served:
+	case <-time.After(time.Second):
+		require.FailNow(t, "webhook response waited for auto-plan bootstrap")
+	}
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	select {
+	case <-bootstrapStarted:
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		require.FailNow(t, "timed out waiting for async auto-plan bootstrap")
+	}
+	close(bootstrapRelease)
 }
 
 // TestE2EGitHubUnavailableDuringConfigDiscoveryPublishesFailingAggregates
