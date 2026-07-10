@@ -1743,8 +1743,15 @@ func TestEngine_Volume_PreservesProgress(t *testing.T) {
 		tableProgress := progressResult.Tables[0]
 		t.Logf("Progress after volume change: state=%v, rows_copied=%d/%d",
 			progressResult.State, tableProgress.RowsCopied, tableProgress.RowsTotal)
-		if tableProgress.RowsTotal == 0 {
-			t.Logf("Progress after volume change is still in runner setup: state=%v", progressResult.State)
+		// During the resume window the new runner can publish a table row with a
+		// known RowsTotal while RowsCopied is momentarily 0, before the checkpoint
+		// is re-applied. Skip those samples and wait for the first checkpoint-backed
+		// one. A genuine restart from the beginning is still caught: it re-copies
+		// from 0 and its first non-zero sample lands far below minExpected, and if it
+		// never republishes progress the timeout guard below fails the test.
+		if tableProgress.RowsTotal == 0 || tableProgress.RowsCopied == 0 {
+			t.Logf("Progress after volume change is still in runner setup: state=%v, rows_copied=%d/%d",
+				progressResult.State, tableProgress.RowsCopied, tableProgress.RowsTotal)
 			continue
 		}
 
