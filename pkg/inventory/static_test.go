@@ -205,6 +205,57 @@ func TestStaticResolverDSNFromResolvesPerRequest(t *testing.T) {
 	assert.Equal(t, "new-pass", secondCfg.Passwd)
 }
 
+// Both config_ref and password_ref support the "{target}" placeholder, so a
+// single target entry can name its per-target secrets by the request target.
+func TestStaticResolverDSNFromSubstitutesTargetPlaceholder(t *testing.T) {
+	t.Setenv("CONFIG_apse2-prod", `{"host":"db.example","port":3306}`)
+	t.Setenv("PASSWORD_apse2-prod", "s3cret")
+	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+		"apse2-prod": {
+			DatabaseType: "mysql",
+			DSNFrom: &StaticDSNFromConfig{
+				ConfigRef:   "env:CONFIG_{target}",
+				Username:    "m_spirit",
+				PasswordRef: "env:PASSWORD_{target}",
+			},
+		},
+	}})
+	require.NoError(t, err)
+
+	got, err := resolver.ResolveTarget(t.Context(), Request{Target: "apse2-prod"})
+	require.NoError(t, err)
+
+	cfg, err := mysql.ParseDSN(got.DSN)
+	require.NoError(t, err)
+	assert.Equal(t, "db.example:3306", cfg.Addr)
+	assert.Equal(t, "s3cret", cfg.Passwd)
+}
+
+// A host value with surrounding whitespace is trimmed so it can't produce a DSN
+// that only fails at dial time.
+func TestStaticResolverDSNFromTrimsHost(t *testing.T) {
+	t.Setenv("TARGET_CONFIG", `{"host":" db.example ","port":3306}`)
+	t.Setenv("TARGET_PASSWORD", "s3cret")
+	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+		"target-1": {
+			DatabaseType: "mysql",
+			DSNFrom: &StaticDSNFromConfig{
+				ConfigRef:   "env:TARGET_CONFIG",
+				Username:    "m_spirit",
+				PasswordRef: "env:TARGET_PASSWORD",
+			},
+		},
+	}})
+	require.NoError(t, err)
+
+	got, err := resolver.ResolveTarget(t.Context(), Request{Target: "target-1"})
+	require.NoError(t, err)
+
+	cfg, err := mysql.ParseDSN(got.DSN)
+	require.NoError(t, err)
+	assert.Equal(t, "db.example:3306", cfg.Addr)
+}
+
 func TestNewStaticResolverValidatesDSNFromConfig(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -344,7 +395,7 @@ func TestNewStaticResolverValidatesConfig(t *testing.T) {
 		{
 			name:    "missing dsn",
 			config:  StaticConfig{Targets: map[string]StaticTarget{"target-1": {DatabaseType: "mysql"}}},
-			wantErr: "target \"target-1\" missing dsn",
+			wantErr: "target \"target-1\" missing dsn or dsn_from",
 		},
 	}
 

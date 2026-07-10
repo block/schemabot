@@ -51,15 +51,18 @@ type StaticTarget struct {
 // assembled DSN carries none (a DSN with a database name is rejected).
 type StaticDSNFromConfig struct {
 	// ConfigRef is a secret reference to a JSON document holding the target's
-	// connection metadata (host and port).
+	// connection metadata (host and port). Like PasswordRef it may contain a
+	// "{target}" placeholder, replaced with the request target for per-target
+	// secret naming, and is resolved fresh on every request.
 	ConfigRef string `yaml:"config_ref"`
 	// ConfigPaths selects which keys in ConfigRef hold the host and port,
 	// defaulting to "host" and "port".
 	ConfigPaths StaticDSNFromPaths `yaml:"config_paths,omitempty"`
 	// Username is the database user included in the assembled DSN.
 	Username string `yaml:"username"`
-	// PasswordRef is a secret reference to the database user's password. It is
-	// resolved fresh on every request.
+	// PasswordRef is a secret reference to the database user's password. It may
+	// contain a "{target}" placeholder, replaced with the request target for
+	// per-target secret naming, and is resolved fresh on every request.
 	PasswordRef string `yaml:"password_ref"`
 	// Params are appended as MySQL DSN query parameters (for example TLS
 	// settings).
@@ -156,7 +159,7 @@ func newStaticTargetEntry(target string, entry StaticTarget) (*staticTargetEntry
 	case hasDSN && hasDSNFrom:
 		return nil, fmt.Errorf("target %q cannot configure both dsn and dsn_from", target)
 	case !hasDSN && !hasDSNFrom:
-		return nil, fmt.Errorf("target %q missing dsn", target)
+		return nil, fmt.Errorf("target %q missing dsn or dsn_from", target)
 	}
 	prepared := &staticTargetEntry{
 		target:       target,
@@ -262,7 +265,8 @@ func (c *StaticDSNFromConfig) assemble(ctx context.Context, req Request, databas
 // port from it. The port defaults to 3306 when absent; the database name in the
 // document, if any, is ignored (static target DSNs are namespace-free).
 func (c *StaticDSNFromConfig) resolveEndpoint(target string) (host, port string, err error) {
-	document, err := secrets.Resolve(c.ConfigRef, "")
+	ref := strings.ReplaceAll(c.ConfigRef, "{target}", target)
+	document, err := secrets.Resolve(ref, "")
 	if err != nil {
 		return "", "", fmt.Errorf("resolve config reference for target %q: %w", target, err)
 	}
@@ -295,7 +299,8 @@ func (c *StaticDSNFromConfig) resolveEndpoint(target string) (host, port string,
 	return host, port, nil
 }
 
-// requiredStringField reads a non-empty string field from the config document.
+// requiredStringField reads a string field from the config document, trims
+// surrounding whitespace, and requires the result to be non-empty.
 func requiredStringField(document map[string]any, key string) (string, error) {
 	value, ok := document[key]
 	if !ok {
@@ -305,6 +310,7 @@ func requiredStringField(document map[string]any, key string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("key %q must be a string", key)
 	}
+	text = strings.TrimSpace(text)
 	if text == "" {
 		return "", fmt.Errorf("key %q is empty", key)
 	}
@@ -333,8 +339,6 @@ func optionalNumericField(document map[string]any, key string) (string, error) {
 			return "", fmt.Errorf("key %q must be an integer", key)
 		}
 		return normalizePort(key, strconv.FormatInt(int64(v), 10))
-	case json.Number:
-		return normalizePort(key, strings.TrimSpace(v.String()))
 	default:
 		return "", fmt.Errorf("key %q must be a string or number", key)
 	}
