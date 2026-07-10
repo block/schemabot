@@ -31,6 +31,16 @@ type StaticTarget struct {
 	// so a rotated target credential (for example one re-synced by the External
 	// Secrets Operator) is picked up without restarting the worker. Mutually
 	// exclusive with DSN.
+	//
+	// Intended backend: file: secret references (the ESO-synced case). The
+	// per-request assembly runs before the target router's client-cache lookup,
+	// and on a cache hit the freshly assembled DSN is discarded (the cached client
+	// serves the request), so today dsn_from buys rotation-safety only at the next
+	// cache miss. With secretsmanager: refs that means every routed request pays a
+	// GetSecretValue call (two, for the split config/password refs) and gains a
+	// per-request dependency on secret-backend availability with no offsetting
+	// benefit until the DSN-aware client cache lands; with file: refs the cost and
+	// availability risk are negligible. Prefer file: refs until that follow-up.
 	DSNFrom  *StaticDSNFromConfig `yaml:"dsn_from,omitempty"`
 	Metadata map[string]string    `yaml:"metadata,omitempty"`
 }
