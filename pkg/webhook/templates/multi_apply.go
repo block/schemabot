@@ -41,6 +41,11 @@ type MultiDeploymentApplyData struct {
 	// comment data (its tables, error, timing, database). Each deployment's
 	// <details> body is rendered from its entry via RenderApplyStatusComment.
 	Details map[string]ApplyStatusCommentData
+
+	// Tenant is the deployment's tenant identity, appended as --tenant to every
+	// pasteable command hint so copied commands address this deployment in
+	// tenant mode. Empty on single-tenant deployments, leaving hints unchanged.
+	Tenant string
 }
 
 // RenderMultiDeploymentApplyComment renders the PR comment for an apply that
@@ -168,14 +173,14 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 	case presentation.NextActionCutover:
 		writeFooterAction(sb,
 			fmt.Sprintf("To cut over `%s`:", na.Deployment),
-			fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment))
+			appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case presentation.NextActionResume:
-		writeFooterAction(sb, "Paused — to resume from where it stopped:", fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment))
+		writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case presentation.NextActionReviewFailure:
 		// revert applies only to a deployment still in its post-cutover revert
 		// window, not to a failure; the recovery path for a failed apply is a
 		// retry, matching the single-deployment failed footer.
-		writeFooterAction(sb, "To retry:", fmt.Sprintf("schemabot apply -e %s", data.Environment))
+		writeFooterAction(sb, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	case presentation.NextActionNone:
 		// No operator action is pending; nothing to render.
 	}

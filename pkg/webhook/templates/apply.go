@@ -90,6 +90,11 @@ type ApplyStatusCommentData struct {
 	// its stored options. Zero means the engine default is in effect and the
 	// comment renders no volume.
 	Volume int
+
+	// Tenant is the deployment's tenant identity, appended as --tenant to every
+	// pasteable command hint so copied commands address this deployment in
+	// tenant mode. Empty on single-tenant deployments, leaving hints unchanged.
+	Tenant string
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -297,7 +302,7 @@ func writeStopOrCancelFooterAction(sb *strings.Builder, data ApplyStatusCommentD
 	if command == "cancel" {
 		prefix = cancelPrefix
 	}
-	writeFooterAction(sb, prefix, fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment))
+	writeFooterAction(sb, prefix, appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment), data.Tenant))
 }
 
 // revertWindowCountdown returns the time remaining before the revert window
@@ -895,9 +900,9 @@ func writeRowsAndETA(sb *strings.Builder, table TableProgressData) {
 func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	switch data.State {
 	case state.Apply.WaitingForDeploy:
-		writeFooterAction(sb, "To deploy:", fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment))
+		writeFooterAction(sb, "To deploy:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.WaitingForCutover:
-		writeFooterAction(sb, "To proceed with cutover:", fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment))
+		writeFooterAction(sb, "To proceed with cutover:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.Recovering:
 		sb.WriteString("\n---\n\n")
 		if pct, ok := recoveringCopyPercent(data.Tables); ok {
@@ -921,16 +926,16 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:",
 			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To cancel it:")
 	case state.Apply.Stopped:
-		writeFooterAction(sb, "Paused — to resume from where it stopped:", fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment))
+		writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.Cancelled:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.\n")
 	case state.Apply.Failed:
-		writeFooterAction(sb, "To retry:", fmt.Sprintf("schemabot apply -e %s", data.Environment))
+		writeFooterAction(sb, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	case state.Apply.RevertWindow:
 		// Skip-revert (finalize) is the common path, so it leads; revert (undo) follows.
-		writeFooterAction(sb, "To skip revert and keep changes:", fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment))
-		fmt.Fprintf(sb, "\nTo revert:\n```\nschemabot revert %s -e %s\n```\n", data.ApplyID, data.Environment)
+		writeFooterAction(sb, "To skip revert and keep changes:", appendTenantFlag(fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		fmt.Fprintf(sb, "\nTo revert:\n```\n%s\n```\n", appendTenantFlag(fmt.Sprintf("schemabot revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.SkippingRevert:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Skip-revert was requested — closing the revert window and making this schema change permanent. This can no longer be reverted.\n")
@@ -1016,7 +1021,7 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 	}
 
 	writeSummaryTableList(sb, data)
-	writeFooterAction(sb, "To retry:", fmt.Sprintf("schemabot apply -e %s", data.Environment))
+	writeFooterAction(sb, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 }
 
 func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, completedCount int, totalTables int) {
@@ -1028,7 +1033,7 @@ func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, compl
 	}
 
 	writeSummaryTableList(sb, data)
-	writeFooterAction(sb, "Paused — to resume from where it stopped:", fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment))
+	writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 }
 
 // writeSummaryCancelled renders the terminal summary for a cancelled schema

@@ -953,7 +953,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		pending := *apply
 		pending.State = state.Apply.Pending
 		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID,
-			formatProgressComment(&pending, nil, nil))
+			formatProgressComment(&pending, nil, nil, ""))
 
 		var created commentCreate
 		select {
@@ -991,7 +991,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		require.NoError(t, st.ApplyComments().IncrementEditCount(ctx, apply.ID, state.Comment.Progress))
 
 		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID,
-			formatProgressComment(apply, nil, nil))
+			formatProgressComment(apply, nil, nil, ""))
 
 		select {
 		case <-capture.creates:
@@ -1012,7 +1012,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		h, capture := newHandler(t)
 
 		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID,
-			formatProgressComment(apply, nil, nil))
+			formatProgressComment(apply, nil, nil, ""))
 
 		select {
 		case <-capture.creates:

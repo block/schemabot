@@ -214,6 +214,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 					ApplyID:        apply.ID,
 					ApplyLease:     apply.Lease(),
 					SupportChannel: h.supportChannel(),
+					Tenant:         h.deploymentTenant(),
 					Logger:         logger,
 					OnTerminalHook: func(a *storage.Apply) {
 						h.refreshChecksForTerminalApply(context.Background(), a, "recovered apply")
@@ -250,6 +251,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 				InstallationID: apply.InstallationID,
 				ApplyID:        apply.ID,
 				SupportChannel: h.supportChannel(),
+				Tenant:         h.deploymentTenant(),
 				Logger:         logger,
 				OnTerminalHook: func(a *storage.Apply) {
 					h.refreshChecksForTerminalApply(context.Background(), a, "aggregate terminal apply")
@@ -427,7 +429,7 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 			ops = nil
 		}
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
-		summaryBody := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil)
+		summaryBody := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, h.deploymentTenant())
 		h.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID, state.Comment.Summary, summaryBody)
 	}
 }

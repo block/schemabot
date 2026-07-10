@@ -76,7 +76,7 @@ func isShardedApply(ops []*storage.ApplyOperation) bool {
 // ("waiting for `-40`", "halted — `-40` failed") reference shards. Finalizer
 // (VSchema) operations are not shard work and are omitted from the shard view;
 // their outcome is still reflected in the aggregate headline state.
-func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task) templates.ShardedApplyData {
+func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, tenant string) templates.ShardedApplyData {
 	tasksByOp := groupTasksByOperation(tasks)
 	// Tasks arrive in created_at DESC order with no id tiebreaker. Sort each
 	// operation's tasks by id so the joined DDL (and the change signature derived
@@ -128,6 +128,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		RequestedBy: actorFromCaller(apply.Caller),
 		Shards:      shardStatuses(shardOrder, opsByShard, released, tasksByOp),
 		Cells:       cells,
+		Tenant:      tenant,
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)
