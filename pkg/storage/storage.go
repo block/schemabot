@@ -189,6 +189,35 @@ type SettingsStore interface {
 	Delete(ctx context.Context, key string) error
 }
 
+// WebhookEventStore manages durable webhook inbox rows. It is the storage
+// primitive behind fast webhook acknowledgement: handlers can persist a delivery
+// before returning 2xx, and workers can claim/retry the stored event after the
+// HTTP request has finished.
+type WebhookEventStore interface {
+	// Create records a webhook delivery. Returns inserted=false when the delivery
+	// GUID already exists, so callers can deduplicate GitHub redeliveries.
+	Create(ctx context.Context, event *WebhookEvent) (inserted bool, err error)
+
+	// GetByDeliveryID returns a webhook event by GitHub's delivery GUID, or nil if not found.
+	GetByDeliveryID(ctx context.Context, deliveryID string) (*WebhookEvent, error)
+
+	// FindNext atomically claims one pending, retryable, or lease-expired event.
+	// The claim rotates lease_owner/lease_token, increments attempts, and sets a
+	// lease expiry in the same transaction. Returns nil when no event is claimable.
+	FindNext(ctx context.Context, owner string, leaseDuration time.Duration) (*WebhookEvent, error)
+
+	// Heartbeat extends the current lease. It is a silent no-op when the event no
+	// longer exists, and returns ErrWebhookEventLeaseLost when the token is stale.
+	Heartbeat(ctx context.Context, id int64, leaseToken string, leaseDuration time.Duration) error
+
+	// MarkCompleted marks a claimed event terminal-successful.
+	MarkCompleted(ctx context.Context, id int64, leaseToken string) error
+
+	// MarkFailed marks a claimed event failed. A non-nil retryAfter keeps it
+	// retryable after that time; nil makes the failure terminal.
+	MarkFailed(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error
+}
+
 // PlanStore manages schema change plans.
 // Plans are created by Plan() and stored for Apply() and staleness detection.
 // Both GRPCClient and LocalClient are stateless - SchemaBot owns plan storage.

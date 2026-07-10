@@ -1201,3 +1201,37 @@ type EngineResumeState struct {
 	MigrationContext string
 	Metadata         string
 }
+
+// Durable webhook event states.
+const (
+	WebhookEventPending         = "pending"
+	WebhookEventProcessing      = "processing"
+	WebhookEventCompleted       = "completed"
+	WebhookEventFailedRetryable = "failed_retryable"
+	WebhookEventFailed          = "failed"
+)
+
+// WebhookEvent is a durable inbox row for one GitHub webhook delivery.
+type WebhookEvent struct {
+	ID             int64
+	DeliveryID     string
+	Event          string
+	Action         string
+	Repository     string
+	PullRequest    int
+	HeadSHA        string
+	InstallationID int64
+	Payload        []byte
+	State          string
+	Attempts       int
+	LeaseOwner     string
+	LeaseToken     string
+	LeaseExpiresAt *time.Time
+	RetryAfter     *time.Time
+	LastError      string
+	ReceivedAt     time.Time
+	StartedAt      *time.Time
+	CompletedAt    *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
