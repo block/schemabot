@@ -542,7 +542,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleCheckRun(ctx, w, body)
 		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
 	case "pull_request":
-		h.handlePullRequest(ctx, metricApp, w, body)
+		h.handlePullRequest(ctx, metricApp, w, body, r.Header.Get(headerDeliveryID))
 		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
 	case "merge_group":
 		h.handleMergeGroup(ctx, metricApp, w, body)

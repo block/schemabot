@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -436,13 +437,26 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 	})
 
 	// PR changed files — only non-schema files
+	filesFetched := make(chan struct{})
+	var filesFetchedOnce sync.Once
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, r *http.Request) {
+		filesFetchedOnce.Do(func() { close(filesFetched) })
 		files := []*gh.CommitFile{
 			{Filename: new("README.md"), Status: new("modified")},
 			{Filename: new("main.go"), Status: new("modified")},
 		}
 		_ = json.NewEncoder(w).Encode(files)
 	})
+	checkRuns := make(chan checkRunCapture, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+	comments := make(chan string, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
@@ -461,6 +475,25 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "auto-plan started")
+	select {
+	case <-filesFetched:
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for no-schema auto-plan discovery")
+	}
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
+		assert.Equal(t, "abc123", cr.HeadSHA)
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for no-schema passing aggregate check run")
+	}
+	select {
+	case body := <-comments:
+		t.Fatalf("expected no plan comment for no-schema auto-plan, got: %s", body)
+	case <-time.After(250 * time.Millisecond):
+	}
 }
 
 // TestE2EGitHubUnavailableDuringConfigDiscoveryPublishesFailingAggregates
@@ -540,12 +573,13 @@ func TestE2EGitHubUnavailableDuringConfigDiscoveryPublishesFailingAggregates(t *
 	// reason so operators can distinguish this from a schema/config error.
 	for _, env := range []string{"staging", "production"} {
 		var check *storage.Check
+		var checkErr error
 		require.Eventually(t, func() bool {
-			var err error
-			check, err = svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, env, aggregateSentinel, aggregateSentinel)
-			require.NoError(t, err)
-			return check != nil
+			check, checkErr = svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, env, aggregateSentinel, aggregateSentinel)
+			return checkErr == nil && check != nil
 		}, webhookIntegrationCheckRunDeadline, 100*time.Millisecond, "stored aggregate check should be visible for %s", env)
+		require.NoError(t, checkErr)
+		require.NotNil(t, check)
 		assert.Equal(t, githubConfigDiscoveryUnavailableBlock.blockingReason, check.BlockingReason)
 		assert.Contains(t, check.ErrorMessage, githubConfigDiscoveryUnavailableBlock.message)
 	}
@@ -566,7 +600,10 @@ func TestE2EGitHubUnavailableDuringAutoPlanDoesNotPublishCheckRun(t *testing.T) 
 
 	// The initial PR lookup fails, so SchemaBot does not know which commit SHA
 	// a check run should target.
+	prFetchAttempted := make(chan struct{})
+	var prFetchAttemptedOnce sync.Once
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		prFetchAttemptedOnce.Do(func() { close(prFetchAttempted) })
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 
@@ -592,6 +629,11 @@ func TestE2EGitHubUnavailableDuringAutoPlanDoesNotPublishCheckRun(t *testing.T) 
 
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "auto-plan started")
+	select {
+	case <-prFetchAttempted:
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for auto-plan to verify PR head")
+	}
 
 	// Publishing a check run without a verified head SHA could mark the wrong
 	// commit, so no GitHub or stored aggregate check should be created.
@@ -963,12 +1005,13 @@ func TestE2EAutoPlanManagedDirMissingConfigBlocks(t *testing.T) {
 	assert.Contains(t, aggregateCheck.Output.Summary, "allowed_dirs")
 
 	var check *storage.Check
+	var checkErr error
 	require.Eventually(t, func() bool {
-		var err error
-		check, err = svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
-		require.NoError(t, err)
-		return check != nil
+		check, checkErr = svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+		return checkErr == nil && check != nil
 	}, webhookIntegrationCheckRunDeadline, 100*time.Millisecond, "managed-dir-missing-config auto-plan must store a failing aggregate check")
+	require.NoError(t, checkErr)
+	require.NotNil(t, check)
 	assert.Equal(t, "abc123", check.HeadSHA)
 	assert.Equal(t, "completed", check.Status)
 	assert.Equal(t, "failure", check.Conclusion)

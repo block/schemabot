@@ -38,7 +38,7 @@ type pullRequestPayload struct {
 
 // handlePullRequest processes GitHub pull_request webhook events.
 // On PR open/synchronize/reopen, it auto-plans all databases with schema changes.
-func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte) {
+func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte, deliveryID string) {
 	var payload pullRequestPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid pull_request payload")
@@ -95,15 +95,18 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		"repo", repo,
 		"pr", pr,
 		"head_sha", headSHA,
+		"delivery_id", deliveryID,
 	)
 
 	ctx, cancel, client, err := h.autoPlanBootstrap(repo, installationID)
 	if err != nil {
-		h.logger.Error("failed to bootstrap auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+		h.logger.Error("failed to bootstrap auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
 		h.writeError(w, http.StatusInternalServerError, "failed to initialize GitHub client")
 		return
 	}
 
+	// autoPlanBootstrap returns a request-independent bounded context, so the
+	// auto-plan can finish after this webhook response is acknowledged.
 	h.goSafe(repo, pr, installationID, func() {
 		defer cancel()
 		message := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before)
@@ -112,6 +115,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			"repo", repo,
 			"pr", pr,
 			"head_sha", headSHA,
+			"delivery_id", deliveryID,
 			"message", message,
 		)
 	})

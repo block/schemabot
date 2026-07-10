@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -637,12 +638,9 @@ func TestE2EParticipantSilentOnNonSchemaPR(t *testing.T) {
 
 	// PR changed files — no schema files.
 	filesFetched := make(chan struct{})
+	var filesFetchedOnce sync.Once
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
-		select {
-		case <-filesFetched:
-		default:
-			close(filesFetched)
-		}
+		filesFetchedOnce.Do(func() { close(filesFetched) })
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
 			{Filename: new("README.md"), Status: new("modified")},
 		})
