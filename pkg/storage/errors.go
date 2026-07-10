@@ -62,6 +62,6 @@ var (
 	// ErrWebhookEventNotFound is returned when a durable webhook event does not exist.
 	ErrWebhookEventNotFound = errors.New("webhook event not found")
 
-	// ErrWebhookEventLeaseLost is returned when a worker no longer owns a durable webhook event.
+	// ErrWebhookEventLeaseLost is returned when a driver no longer owns a durable webhook event.
 	ErrWebhookEventLeaseLost = errors.New("webhook event lease lost")
 )

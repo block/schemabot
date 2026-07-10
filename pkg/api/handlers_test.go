@@ -42,6 +42,7 @@ func (m *mockStorage) ApplyComments() storage.ApplyCommentStore     { return nil
 func (m *mockStorage) ApplyOperations() storage.ApplyOperationStore { return nil }
 func (m *mockStorage) Checks() storage.CheckStore                   { return nil }
 func (m *mockStorage) Settings() storage.SettingsStore              { return nil }
+func (m *mockStorage) WebhookEvents() storage.WebhookEventStore     { return nil }
 func (m *mockStorage) Ping(ctx context.Context) error               { return m.pingErr }
 func (m *mockStorage) Close() error                                 { return nil }
 
