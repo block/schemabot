@@ -245,7 +245,7 @@ func (c *StaticDSNFromConfig) validate(target string) error {
 // MySQL assembler and the fail-closed secret-ref credential resolver so a rotated
 // password or empty secret is handled identically to the Etre data-plane path.
 func (c *StaticDSNFromConfig) assemble(ctx context.Context, req Request, databaseType string) (string, error) {
-	host, port, err := c.resolveEndpoint(req.Target)
+	host, port, err := c.resolveEndpoint(ctx, req.Target)
 	if err != nil {
 		return "", err
 	}
@@ -264,9 +264,9 @@ func (c *StaticDSNFromConfig) assemble(ctx context.Context, req Request, databas
 // resolveEndpoint resolves the config document and reads the target host and
 // port from it. The port defaults to 3306 when absent; the database name in the
 // document, if any, is ignored (static target DSNs are namespace-free).
-func (c *StaticDSNFromConfig) resolveEndpoint(target string) (host, port string, err error) {
+func (c *StaticDSNFromConfig) resolveEndpoint(ctx context.Context, target string) (host, port string, err error) {
 	ref := strings.ReplaceAll(c.ConfigRef, "{target}", target)
-	document, err := secrets.Resolve(ref, "")
+	document, err := secrets.ResolveContext(ctx, ref, "")
 	if err != nil {
 		return "", "", fmt.Errorf("resolve config reference for target %q: %w", target, err)
 	}

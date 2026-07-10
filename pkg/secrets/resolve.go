@@ -77,7 +77,20 @@ func Unregister(prefix string) {
 //   - Direct value is returned as-is
 //
 // If value is empty, falls back to the fallbackEnvVar environment variable.
+//
+// Resolve uses a background context for any network-backed lookup. Callers on a
+// request path that want the resolution bounded by the request deadline should
+// use ResolveContext.
 func Resolve(value string, fallbackEnvVar string) (string, error) {
+	return ResolveContext(context.Background(), value, fallbackEnvVar)
+}
+
+// ResolveContext is Resolve with a caller-supplied context. The context bounds
+// network-backed lookups (AWS Secrets Manager) so a per-request resolution is
+// cancelled by the caller's deadline instead of only a fixed background timeout.
+// The env:, file:, literal, and custom-resolver paths do no cancellable I/O and
+// ignore the context.
+func ResolveContext(ctx context.Context, value string, fallbackEnvVar string) (string, error) {
 	if value == "" {
 		return os.Getenv(fallbackEnvVar), nil
 	}
@@ -105,7 +118,7 @@ func Resolve(value string, fallbackEnvVar string) (string, error) {
 
 	// Check for "secretsmanager:" prefix
 	if strings.HasPrefix(value, "secretsmanager:") {
-		return resolveSecretsManager(value[15:])
+		return resolveSecretsManager(ctx, value[15:])
 	}
 
 	return value, nil
@@ -123,12 +136,16 @@ func resolveFile(path string) (string, error) {
 
 // resolveSecretsManager fetches a secret from AWS Secrets Manager.
 // Format: "secret-name" or "secret-name#json-key"
-func resolveSecretsManager(ref string) (string, error) {
+//
+// The fetch is bounded by the caller's context and a 10s cap, whichever is
+// sooner, so a per-request resolution honors the request deadline instead of
+// always waiting the full background timeout.
+func resolveSecretsManager(ctx context.Context, ref string) (string, error) {
 	// Parse secret name and optional JSON key
 	secretName, jsonKey, _ := strings.Cut(ref, "#")
 
 	// Create AWS config (uses default credential chain: env vars, IAM role, etc.)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	cfg, err := config.LoadDefaultConfig(ctx)
