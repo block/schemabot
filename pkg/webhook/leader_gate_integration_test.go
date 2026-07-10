@@ -473,7 +473,7 @@ func TestE2ELeaderNonSchemaPRTouchingParticipantPathBlocks(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "aggregate folds expected participants")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
 	for _, env := range []string{"staging", "production"} {
 		cr := collectAggregate(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", env))
@@ -621,7 +621,7 @@ func TestE2ELeaderNonSchemaPROutsideParticipantPathsPasses(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "no schema files in PR")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 	assert.NotContains(t, rr.Body.String(), "aggregate folds expected participants")
 
 	for _, env := range []string{"staging", "production"} {

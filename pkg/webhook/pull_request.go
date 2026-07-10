@@ -103,10 +103,19 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		h.writeError(w, http.StatusInternalServerError, "failed to initialize GitHub client")
 		return
 	}
-	defer cancel()
 
-	message := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before)
-	h.writeJSON(w, http.StatusOK, map[string]string{"message": message})
+	h.goSafe(repo, pr, installationID, func() {
+		defer cancel()
+		message := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before)
+		h.logger.Info("auto-plan finished",
+			"action", payload.Action,
+			"repo", repo,
+			"pr", pr,
+			"head_sha", headSHA,
+			"message", message,
+		)
+	})
+	h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan started"})
 }
 
 func (h *Handler) autoPlanBootstrap(repo string, installationID int64) (context.Context, context.CancelFunc, *ghclient.InstallationClient, error) {

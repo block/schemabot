@@ -460,7 +460,7 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "no schema files in PR")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 }
 
 // TestE2EGitHubUnavailableDuringConfigDiscoveryPublishesFailingAggregates
@@ -519,7 +519,7 @@ func TestE2EGitHubUnavailableDuringConfigDiscoveryPublishesFailingAggregates(t *
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "config discovery failed")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
 	seen := map[string]bool{}
 	for i := range 2 {
@@ -539,9 +539,13 @@ func TestE2EGitHubUnavailableDuringConfigDiscoveryPublishesFailingAggregates(t *
 	// Each aggregate stores a machine-readable GitHub-unavailable blocking
 	// reason so operators can distinguish this from a schema/config error.
 	for _, env := range []string{"staging", "production"} {
-		check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, env, aggregateSentinel, aggregateSentinel)
-		require.NoError(t, err)
-		require.NotNil(t, check)
+		var check *storage.Check
+		require.Eventually(t, func() bool {
+			var err error
+			check, err = svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, env, aggregateSentinel, aggregateSentinel)
+			require.NoError(t, err)
+			return check != nil
+		}, webhookIntegrationCheckRunDeadline, 100*time.Millisecond, "stored aggregate check should be visible for %s", env)
 		assert.Equal(t, githubConfigDiscoveryUnavailableBlock.blockingReason, check.BlockingReason)
 		assert.Contains(t, check.ErrorMessage, githubConfigDiscoveryUnavailableBlock.message)
 	}
@@ -587,7 +591,7 @@ func TestE2EGitHubUnavailableDuringAutoPlanDoesNotPublishCheckRun(t *testing.T) 
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "config discovery failed")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
 	// Publishing a check run without a verified head SHA could mark the wrong
 	// commit, so no GitHub or stored aggregate check should be created.
@@ -943,7 +947,7 @@ func TestE2EAutoPlanManagedDirMissingConfigBlocks(t *testing.T) {
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "schema change under managed directory has no config")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
 	var aggregateCheck checkRunCapture
 	select {
@@ -958,9 +962,13 @@ func TestE2EAutoPlanManagedDirMissingConfigBlocks(t *testing.T) {
 	assert.Contains(t, aggregateCheck.Output.Summary, "schemabot.yaml")
 	assert.Contains(t, aggregateCheck.Output.Summary, "allowed_dirs")
 
-	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
-	require.NoError(t, err)
-	require.NotNil(t, check, "managed-dir-missing-config auto-plan must store a failing aggregate check")
+	var check *storage.Check
+	require.Eventually(t, func() bool {
+		var err error
+		check, err = svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+		require.NoError(t, err)
+		return check != nil
+	}, webhookIntegrationCheckRunDeadline, 100*time.Millisecond, "managed-dir-missing-config auto-plan must store a failing aggregate check")
 	assert.Equal(t, "abc123", check.HeadSHA)
 	assert.Equal(t, "completed", check.Status)
 	assert.Equal(t, "failure", check.Conclusion)
