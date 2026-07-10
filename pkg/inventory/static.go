@@ -302,7 +302,10 @@ func requiredStringField(document map[string]any, key string) (string, error) {
 }
 
 // optionalNumericField reads an optional port field, accepting a string or a
-// JSON number. A missing field returns an empty string.
+// JSON number. A missing or blank field returns an empty string (the caller
+// applies the default). A value that is present must be a base-10 integer in the
+// valid TCP port range; anything else fails closed with a clear config error
+// rather than producing a confusing downstream failure (or host:0).
 func optionalNumericField(document map[string]any, key string) (string, error) {
 	value, ok := document[key]
 	if !ok {
@@ -310,15 +313,32 @@ func optionalNumericField(document map[string]any, key string) (string, error) {
 	}
 	switch v := value.(type) {
 	case string:
-		return v, nil
+		text := strings.TrimSpace(v)
+		if text == "" {
+			return "", nil
+		}
+		return normalizePort(key, text)
 	case float64:
 		if v != float64(int64(v)) {
 			return "", fmt.Errorf("key %q must be an integer", key)
 		}
-		return strconv.FormatInt(int64(v), 10), nil
+		return normalizePort(key, strconv.FormatInt(int64(v), 10))
 	case json.Number:
-		return v.String(), nil
+		return normalizePort(key, strings.TrimSpace(v.String()))
 	default:
 		return "", fmt.Errorf("key %q must be a string or number", key)
 	}
+}
+
+// normalizePort validates that text is a base-10 integer in the valid TCP port
+// range and returns its canonical form.
+func normalizePort(key, text string) (string, error) {
+	n, err := strconv.Atoi(text)
+	if err != nil {
+		return "", fmt.Errorf("key %q must be an integer port: %w", key, err)
+	}
+	if n < 1 || n > 65535 {
+		return "", fmt.Errorf("key %q must be a port between 1 and 65535, got %d", key, n)
+	}
+	return strconv.Itoa(n), nil
 }

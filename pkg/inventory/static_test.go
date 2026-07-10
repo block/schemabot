@@ -294,6 +294,30 @@ func TestStaticResolverDSNFromFailsClosed(t *testing.T) {
 		_, err := newResolver(t).ResolveTarget(t.Context(), Request{Target: "target-1"})
 		assert.ErrorContains(t, err, "must be a string or number")
 	})
+
+	t.Run("non-numeric string port", func(t *testing.T) {
+		t.Setenv("TARGET_CONFIG", `{"host":"db.example","port":"not-a-port"}`)
+		t.Setenv("TARGET_PASSWORD", "s3cret")
+		_, err := newResolver(t).ResolveTarget(t.Context(), Request{Target: "target-1"})
+		assert.ErrorContains(t, err, "must be an integer port")
+	})
+
+	t.Run("out-of-range port", func(t *testing.T) {
+		t.Setenv("TARGET_CONFIG", `{"host":"db.example","port":70000}`)
+		t.Setenv("TARGET_PASSWORD", "s3cret")
+		_, err := newResolver(t).ResolveTarget(t.Context(), Request{Target: "target-1"})
+		assert.ErrorContains(t, err, "between 1 and 65535")
+	})
+
+	t.Run("whitespace string port is trimmed", func(t *testing.T) {
+		t.Setenv("TARGET_CONFIG", `{"host":"db.example","port":" 3307 "}`)
+		t.Setenv("TARGET_PASSWORD", "s3cret")
+		got, err := newResolver(t).ResolveTarget(t.Context(), Request{Target: "target-1"})
+		require.NoError(t, err)
+		cfg, err := mysql.ParseDSN(got.DSN)
+		require.NoError(t, err)
+		assert.Equal(t, "db.example:3307", cfg.Addr)
+	})
 }
 
 func TestNewStaticResolverValidatesConfig(t *testing.T) {

@@ -172,23 +172,23 @@ storage:
   dsn: env:MYSQL_DSN
 target_resolver:
   targets:
-    apse2-prod:
+    example-target:
       type: mysql
       dsn_from:
-        config_ref: secretsmanager:/pe/aurora/schemabot-pilot-prod-apse2/spirit_credentials
-        password_ref: secretsmanager:/pe/aurora/schemabot-pilot-prod-apse2/spirit_credentials#password
-        username: m_spirit
+        config_ref: secretsmanager:/example/schemabot/target-credentials
+        password_ref: secretsmanager:/example/schemabot/target-credentials#password
+        username: schemabot
 `
 	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644), "write config file")
 
 	cfg, err := LoadServerConfigFromFile(configPath)
 	require.NoError(t, err)
-	target := cfg.TargetResolver.Targets["apse2-prod"]
+	target := cfg.TargetResolver.Targets["example-target"]
 	assert.Equal(t, "mysql", target.DatabaseType)
 	require.NotNil(t, target.DSNFrom)
-	assert.Equal(t, "m_spirit", target.DSNFrom.Username)
-	assert.Equal(t, "secretsmanager:/pe/aurora/schemabot-pilot-prod-apse2/spirit_credentials", target.DSNFrom.ConfigRef)
-	assert.Equal(t, "secretsmanager:/pe/aurora/schemabot-pilot-prod-apse2/spirit_credentials#password", target.DSNFrom.PasswordRef)
+	assert.Equal(t, "schemabot", target.DSNFrom.Username)
+	assert.Equal(t, "secretsmanager:/example/schemabot/target-credentials", target.DSNFrom.ConfigRef)
+	assert.Equal(t, "secretsmanager:/example/schemabot/target-credentials#password", target.DSNFrom.PasswordRef)
 }
 
 func TestLoadServerConfigFromFile_NotFound(t *testing.T) {
