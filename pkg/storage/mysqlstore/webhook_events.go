@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,13 +33,13 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 	if provider == "" {
 		provider = storage.WebhookProviderGitHub
 	}
-	payload := event.Payload
-	if len(payload) == 0 {
-		payload = []byte("{}")
-	}
+	payload := nullJSON(event.Payload)
 	state := event.State
 	if state == "" {
 		state = storage.WebhookEventPending
+	}
+	if !isKnownWebhookEventState(state) {
+		return false, fmt.Errorf("create webhook event (delivery_id=%s): unknown state %q", event.DeliveryID, state)
 	}
 	receivedAt := event.ReceivedAt
 	if receivedAt.IsZero() {
@@ -51,21 +52,21 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 			payload, state, attempts, received_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, provider, event.DeliveryID, event.Event, event.Action, event.Repository, event.PullRequest, event.HeadSHA, event.TenantID,
-		string(payload), state, event.Attempts, receivedAt)
+		payload, state, event.Attempts, receivedAt)
 	if err != nil {
 		if isDuplicateKeyError(err) {
 			return false, nil
 		}
-		return false, err
+		return false, fmt.Errorf("insert webhook event (provider=%s, delivery_id=%s): %w", provider, event.DeliveryID, err)
 	}
 	id, err := result.LastInsertId()
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("read webhook event last insert id (delivery_id=%s): %w", event.DeliveryID, err)
 	}
 	event.ID = id
 	event.Provider = provider
 	event.State = state
-	event.Payload = payload
+	event.Payload = []byte(payload)
 	event.ReceivedAt = receivedAt
 	return true, nil
 }
@@ -100,7 +101,7 @@ func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDur
 		FROM webhook_events
 		WHERE state = ?
 			OR (state = ? AND (retry_after IS NULL OR retry_after <= NOW()))
-			OR (state = ? AND lease_expires_at <= NOW())
+			OR (state = ? AND lease_expires_at <= NOW(6))
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
@@ -115,41 +116,52 @@ func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDur
 	}
 
 	leaseToken := uuid.NewString()
+	now := time.Now()
+	leaseExpiresAt := now.Add(leaseDuration)
 	_, err = tx.ExecContext(ctx, `
 		UPDATE webhook_events
 		SET state = ?, attempts = attempts + 1, lease_owner = ?, lease_token = ?,
-			lease_expires_at = DATE_ADD(NOW(), INTERVAL ? MICROSECOND),
+			lease_expires_at = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND),
 			retry_after = NULL, started_at = COALESCE(started_at, NOW()), updated_at = NOW()
 		WHERE id = ?
 	`, storage.WebhookEventProcessing, owner, leaseToken, leaseDuration.Microseconds(), event.ID)
 	if err != nil {
 		return nil, fmt.Errorf("claim webhook event %d: %w", event.ID, err)
 	}
-	event, err = scanWebhookEventInto(tx.QueryRowContext(ctx, `
-		SELECT `+webhookEventColumns+`
-		FROM webhook_events
-		WHERE id = ?
-	`, event.ID))
-	if err != nil {
-		return nil, fmt.Errorf("reload claimed webhook event %d: %w", event.ID, err)
-	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit claim webhook event %d: %w", event.ID, err)
 	}
+
+	// Reflect the committed claim on the scanned row instead of reloading it,
+	// avoiding a second round trip that would re-transfer the full payload. The
+	// row was held under FOR UPDATE for the whole transaction, so no other writer
+	// could have changed it. lease_expires_at is the application-clock estimate of
+	// the database's NOW(6)+leaseDuration; callers schedule heartbeats from
+	// leaseDuration, not from this absolute value.
+	event.State = storage.WebhookEventProcessing
+	event.Attempts++
+	event.LeaseOwner = owner
+	event.LeaseToken = leaseToken
+	event.LeaseExpiresAt = &leaseExpiresAt
+	event.RetryAfter = nil
+	if event.StartedAt == nil {
+		event.StartedAt = &now
+	}
+	event.UpdatedAt = now
 
 	return event, nil
 }
 
 func (s *webhookEventStore) Heartbeat(ctx context.Context, id int64, leaseToken string, leaseDuration time.Duration) error {
 	if leaseToken == "" {
-		return fmt.Errorf("webhook event lease token is required: %w", storage.ErrWebhookEventLeaseLost)
+		return fmt.Errorf("webhook event lease token is required")
 	}
 	if leaseDuration <= 0 {
 		return fmt.Errorf("webhook lease duration must be positive")
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE webhook_events
-		SET lease_expires_at = DATE_ADD(NOW(), INTERVAL ? MICROSECOND), updated_at = NOW()
+		SET lease_expires_at = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW()
 		WHERE id = ? AND lease_token = ?
 	`, leaseDuration.Microseconds(), id, leaseToken)
 	if err != nil {
@@ -158,11 +170,17 @@ func (s *webhookEventStore) Heartbeat(ctx context.Context, id int64, leaseToken 
 	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken, true)
 }
 
+// MarkCompleted marks a claimed event terminal-successful.
+//
+// Idempotent: the lease token is retained (not cleared) and completed_at is
+// COALESCE-preserved, so a retry after a committed-but-unacknowledged first
+// attempt still matches the row and is a no-op that returns nil, rather than
+// misreporting the completion as a lost lease. A genuine reclaim rotates the
+// token, so a write with a stale token still returns ErrWebhookEventLeaseLost.
 func (s *webhookEventStore) MarkCompleted(ctx context.Context, id int64, leaseToken string) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE webhook_events
-		SET state = ?, completed_at = NOW(), lease_owner = NULL, lease_token = NULL,
-			lease_expires_at = NULL, retry_after = NULL, updated_at = NOW()
+		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
 		WHERE id = ? AND lease_token = ?
 	`, storage.WebhookEventCompleted, id, leaseToken)
 	if err != nil {
@@ -171,6 +189,14 @@ func (s *webhookEventStore) MarkCompleted(ctx context.Context, id int64, leaseTo
 	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken, false)
 }
 
+// MarkFailed marks a claimed event failed. A non-nil retryAfter keeps it
+// retryable after that time; nil makes the failure terminal.
+//
+// Idempotent for the same lease token, on the same rationale as MarkCompleted:
+// the token is retained and completed_at is COALESCE-preserved for terminal
+// failures. A retryable failure keeps completed_at NULL; the row becomes
+// claimable again via retry_after, and FindNext rotates a fresh token on the
+// next claim so the retained token cannot be reused to claim.
 func (s *webhookEventStore) MarkFailed(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error {
 	state := storage.WebhookEventFailed
 	if retryAfter != nil {
@@ -178,8 +204,8 @@ func (s *webhookEventStore) MarkFailed(ctx context.Context, id int64, leaseToken
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE webhook_events
-		SET state = ?, last_error = ?, retry_after = ?, lease_owner = NULL, lease_token = NULL,
-			lease_expires_at = NULL, completed_at = CASE WHEN ? THEN NOW() ELSE completed_at END,
+		SET state = ?, last_error = ?, retry_after = ?,
+			completed_at = CASE WHEN ? THEN COALESCE(completed_at, NOW()) ELSE completed_at END,
 			updated_at = NOW()
 		WHERE id = ? AND lease_token = ?
 	`, state, nullString(errMsg), retryAfter, retryAfter == nil, id, leaseToken)
@@ -231,7 +257,7 @@ func scanWebhookEventInto(row scanner) (*storage.WebhookEvent, error) {
 func (s *webhookEventStore) checkWebhookEventLeaseResult(ctx context.Context, result sql.Result, id int64, leaseToken string, missingOK bool) error {
 	rows, err := result.RowsAffected()
 	if err != nil {
-		return err
+		return fmt.Errorf("read webhook event %d lease write rows affected: %w", id, err)
 	}
 	if rows > 0 {
 		return nil
@@ -240,15 +266,30 @@ func (s *webhookEventStore) checkWebhookEventLeaseResult(ctx context.Context, re
 	err = s.db.QueryRowContext(ctx, `SELECT lease_token FROM webhook_events WHERE id = ?`, id).Scan(&currentToken)
 	if errors.Is(err, sql.ErrNoRows) {
 		if missingOK {
+			slog.WarnContext(ctx, "webhook event heartbeat skipped: row no longer exists", "webhook_event_id", id)
 			return nil
 		}
 		return storage.ErrWebhookEventNotFound
 	}
 	if err != nil {
-		return err
+		return fmt.Errorf("verify webhook event %d lease token: %w", id, err)
 	}
 	if currentToken.Valid && currentToken.String == leaseToken {
 		return nil
 	}
 	return storage.ErrWebhookEventLeaseLost
+}
+
+// isKnownWebhookEventState reports whether s is a valid webhook_events.state
+// value. Create rejects unknown states so a typo cannot persist a permanently
+// unclaimable row that dedup then drops forever.
+func isKnownWebhookEventState(s string) bool {
+	switch s {
+	case storage.WebhookEventPending, storage.WebhookEventProcessing,
+		storage.WebhookEventCompleted, storage.WebhookEventFailedRetryable,
+		storage.WebhookEventFailed:
+		return true
+	default:
+		return false
+	}
 }

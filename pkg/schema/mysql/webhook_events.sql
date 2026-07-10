@@ -13,7 +13,7 @@ CREATE TABLE `webhook_events` (
   `attempts` int unsigned NOT NULL DEFAULT '0',
   `lease_owner` varchar(255) DEFAULT NULL,
   `lease_token` varchar(64) DEFAULT NULL,
-  `lease_expires_at` datetime DEFAULT NULL,
+  `lease_expires_at` datetime(6) DEFAULT NULL,
   `retry_after` datetime DEFAULT NULL,
   `last_error` text,
   `received_at` datetime NOT NULL,

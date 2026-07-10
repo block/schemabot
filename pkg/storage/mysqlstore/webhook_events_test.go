@@ -171,7 +171,9 @@ func TestWebhookEventStore_MarkFailedRetryableAndCompleted(t *testing.T) {
 	require.NotNil(t, completed)
 	assert.Equal(t, storage.WebhookEventCompleted, completed.State)
 	assert.NotNil(t, completed.CompletedAt)
-	assert.Empty(t, completed.LeaseToken)
+	// The lease token is retained on terminal rows so a committed-but-unacked
+	// retry of MarkCompleted stays idempotent rather than reporting a lost lease.
+	assert.Equal(t, reclaimed.LeaseToken, completed.LeaseToken)
 }
 
 func TestWebhookEventStore_LeaseTokenGuardsWrites(t *testing.T) {
@@ -218,6 +220,7 @@ func TestWebhookEventStore_HeartbeatTreatsUnchangedMatchingLeaseAsSuccess(t *tes
 
 	db, err := sql.Open("mysql", testDSNChangedRows)
 	require.NoError(t, err)
+	require.NoError(t, db.PingContext(ctx))
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
@@ -237,4 +240,62 @@ func TestWebhookEventStore_HeartbeatTreatsUnchangedMatchingLeaseAsSuccess(t *tes
 	// heartbeat matches the row but writes the same second-precision values.
 	// It must still count as a live lease, not a lost lease.
 	require.NoError(t, store.WebhookEvents().Heartbeat(ctx, claimed.ID, claimed.LeaseToken, time.Minute))
+}
+
+// A committed-but-unacknowledged terminal write, retried within the same
+// DATETIME second under production changed-rows semantics, must remain an
+// idempotent success rather than misreporting the driver's own completion as a
+// lost lease.
+func TestWebhookEventStore_TerminalWritesAreIdempotentOnRetry(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+
+	db, err := sql.Open("mysql", testDSNChangedRows)
+	require.NoError(t, err)
+	require.NoError(t, db.PingContext(ctx))
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	store := New(db)
+	_, err = db.ExecContext(ctx, `SET timestamp = 1700000000`)
+	require.NoError(t, err)
+
+	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-complete", Event: "pull_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.True(t, inserted)
+	completeClaim, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, completeClaim)
+	require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, completeClaim.ID, completeClaim.LeaseToken))
+	require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, completeClaim.ID, completeClaim.LeaseToken))
+
+	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-fail", Event: "pull_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.True(t, inserted)
+	failClaim, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, failClaim)
+	require.NoError(t, store.WebhookEvents().MarkFailed(ctx, failClaim.ID, failClaim.LeaseToken, "boom", nil))
+	require.NoError(t, store.WebhookEvents().MarkFailed(ctx, failClaim.ID, failClaim.LeaseToken, "boom", nil))
+}
+
+// A sub-second lease must not collapse to an already-expired lease: a second
+// driver must not immediately reclaim an event the first driver is processing.
+func TestWebhookEventStore_SubSecondLeaseIsNotImmediatelyReclaimable(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-a", 200*time.Millisecond)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	none, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
+	require.NoError(t, err)
+	assert.Nil(t, none)
 }

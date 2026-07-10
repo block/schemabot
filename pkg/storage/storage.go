@@ -209,7 +209,7 @@ type WebhookEventStore interface {
 	// lease expiry in the same transaction. Returns nil when no event is claimable.
 	FindNext(ctx context.Context, owner string, leaseDuration time.Duration) (*WebhookEvent, error)
 
-	// Heartbeat extends the current lease. It is a silent no-op when the event no
+	// Heartbeat extends the current lease. It is a logged no-op when the event no
 	// longer exists, and returns ErrWebhookEventLeaseLost when the token is stale.
 	Heartbeat(ctx context.Context, id int64, leaseToken string, leaseDuration time.Duration) error
 

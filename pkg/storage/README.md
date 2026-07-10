@@ -16,6 +16,7 @@ type Storage interface {
     ControlRequests() ControlRequestStore
     Checks()          CheckStore
     Settings()        SettingsStore
+    WebhookEvents()   WebhookEventStore
     Ping(ctx)         error
     Close()           error
 }
@@ -31,6 +32,7 @@ type Storage interface {
 | `ControlRequestStore` | Durable user control intent that can be recovered by drivers |
 | `CheckStore` | GitHub status check state |
 | `SettingsStore` | Admin-level key-value settings |
+| `WebhookEventStore` | Durable webhook inbox rows, dedup + lease-based claim/retry |
 
 ## Lock Coordination
 
