@@ -69,6 +69,9 @@ const (
 	hookTargetTypeApp    = "integration"
 	hookTargetTypeRepo   = "repository"
 	maxWebhookBodyBytes  = 10 << 20
+
+	defaultDurableWebhookPollInterval  = 1 * time.Second
+	defaultDurableWebhookLeaseDuration = 1 * time.Minute
 )
 
 // Handler processes GitHub webhook events.
@@ -121,6 +124,21 @@ type Handler struct {
 	// (single- and multi-App) unchanged.
 	repoWebhookSecret []byte
 
+	durableWebhookDispatch      bool
+	durableWebhookDriverCount   int
+	durableWebhookPollInterval  time.Duration
+	durableWebhookLeaseDuration time.Duration
+	durableWebhookMu            sync.Mutex
+	durableWebhookStop          chan struct{}
+	durableWebhookCancel        context.CancelFunc
+	durableWebhookWake          chan struct{}
+	durableWebhookWg            sync.WaitGroup
+	// durableWebhookProcessOverride is a test seam that replaces
+	// processDurableWebhookEvent so driver finish-path behavior (for example
+	// refusing to complete a delivery after lease loss) can be exercised
+	// deterministically. Production code never sets it.
+	durableWebhookProcessOverride func(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error)
+
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
 	priorEnvCheckRetryInterval time.Duration
@@ -138,6 +156,15 @@ func WithRepoWebhookSecret(secret []byte) HandlerOption {
 		if len(secret) > 0 {
 			h.repoWebhookSecret = secret
 		}
+	}
+}
+
+// WithDurableWebhookDispatch enables the durable webhook inbox path for events
+// that have been moved out of the request path. Unsupported events keep using
+// their existing synchronous or fire-and-forget handlers.
+func WithDurableWebhookDispatch() HandlerOption {
+	return func(h *Handler) {
+		h.durableWebhookDispatch = true
 	}
 }
 
@@ -172,13 +199,15 @@ func NewHandlerWithClientSet(service *api.Service, ghClients github.ClientSet, w
 // for legacy single-secret behavior (used internally by NewHandler).
 func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, webhookSecretsByApp map[string][]byte, webhookAppByID map[int64]string, logger *slog.Logger, opts ...HandlerOption) *Handler {
 	h := &Handler{
-		service:                    service,
-		ghClients:                  ghClients,
-		webhookSecretsByApp:        maps.Clone(webhookSecretsByApp),
-		webhookAppByID:             maps.Clone(webhookAppByID),
-		logger:                     logger,
-		priorEnvCheckMaxAttempts:   defaultPriorEnvCheckMaxAttempts,
-		priorEnvCheckRetryInterval: defaultPriorEnvCheckRetryInterval,
+		service:                     service,
+		ghClients:                   ghClients,
+		webhookSecretsByApp:         maps.Clone(webhookSecretsByApp),
+		webhookAppByID:              maps.Clone(webhookAppByID),
+		logger:                      logger,
+		durableWebhookPollInterval:  defaultDurableWebhookPollInterval,
+		durableWebhookLeaseDuration: defaultDurableWebhookLeaseDuration,
+		priorEnvCheckMaxAttempts:    defaultPriorEnvCheckMaxAttempts,
+		priorEnvCheckRetryInterval:  defaultPriorEnvCheckRetryInterval,
 	}
 	for _, opt := range opts {
 		opt(h)

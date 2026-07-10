@@ -98,15 +98,55 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		"delivery_id", deliveryID,
 	)
 
+	if h.durableWebhookDispatch {
+		inserted, err := h.enqueueDurablePullRequest(ctx, payload, body, deliveryID, installationID)
+		if err != nil {
+			h.logger.Error("failed to enqueue durable pull_request auto-plan",
+				"action", payload.Action,
+				"repo", repo,
+				"pr", pr,
+				"head_sha", headSHA,
+				"delivery_id", deliveryID,
+				"error", err,
+			)
+			metrics.RecordWebhookEvent(ctx, metricApp, "pull_request", payload.Action, repo, "durable_enqueue_failed")
+			h.writeError(w, http.StatusInternalServerError, "failed to enqueue webhook delivery")
+			return
+		}
+		if !inserted {
+			h.logger.Info("durable pull_request delivery already queued",
+				"action", payload.Action,
+				"repo", repo,
+				"pr", pr,
+				"head_sha", headSHA,
+				"delivery_id", deliveryID,
+			)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan already queued"})
+			return
+		}
+		h.logger.Info("durable pull_request auto-plan queued",
+			"action", payload.Action,
+			"repo", repo,
+			"pr", pr,
+			"head_sha", headSHA,
+			"delivery_id", deliveryID,
+		)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan queued"})
+		return
+	}
+
 	h.goSafe(repo, pr, installationID, func() {
-		ctx, cancel, client, err := h.autoPlanBootstrap(repo, installationID)
+		ctx, cancel, client, err := h.autoPlanBootstrap(context.Background(), repo, installationID)
 		if err != nil {
 			metrics.RecordWebhookEvent(context.Background(), metricApp, "pull_request", payload.Action, repo, "auto_plan_bootstrap_failed")
 			h.logger.Error("failed to bootstrap auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
 			return
 		}
 		defer cancel()
-		message := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before, deliveryID)
+		// The discovery error is already logged and posted as a failing check
+		// inside runAutoPlanForPR; the fire-and-forget request path has no
+		// durable row to retry, so the error is intentionally dropped here.
+		message, _ := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before, deliveryID)
 		h.logger.Info("auto-plan dispatched",
 			"action", payload.Action,
 			"repo", repo,
@@ -119,8 +159,12 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan started"})
 }
 
-func (h *Handler) autoPlanBootstrap(repo string, installationID int64) (context.Context, context.CancelFunc, *ghclient.InstallationClient, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// autoPlanBootstrap derives a bounded work context from parent and resolves the
+// GitHub client for repo. Request-path callers pass context.Background() so the
+// work is detached from the HTTP request lifetime; the durable webhook driver
+// passes its run context so lease loss and shutdown cancel in-flight work.
+func (h *Handler) autoPlanBootstrap(parent context.Context, repo string, installationID int64) (context.Context, context.CancelFunc, *ghclient.InstallationClient, error) {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	// Dedupe FetchPullRequest calls within this webhook delivery.
 	ctx = ghclient.WithPRInfoCache(ctx)
 
@@ -155,14 +199,20 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 	return false
 }
 
-func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string, deliveryID string) string {
+// runAutoPlanForPR discovers schema configs for the PR and launches auto-plan
+// work. The returned message describes the dispatch outcome. The returned error
+// is non-nil only for discovery failures (typically transient GitHub API
+// errors), so durable callers can retry the delivery; request-path callers may
+// ignore it because the failure is already logged and posted as a failing
+// check here.
+func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string, deliveryID string) (string, error) {
 	// Fetch the changed files once so the same list drives both config discovery
 	// and the server-managed-directory safety check below.
 	files, err := client.FetchPRFiles(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to fetch PR files for auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
-		return "config discovery failed"
+		return "config discovery failed", fmt.Errorf("fetch PR files for %s#%d: %w", repo, pr, err)
 	}
 
 	// Discover all configs matching changed schema files in this PR
@@ -170,7 +220,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	if err != nil {
 		h.logger.Error("failed to discover configs for PR", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
-		return "config discovery failed"
+		return "config discovery failed", fmt.Errorf("discover configs for %s#%d: %w", repo, pr, err)
 	}
 
 	// Fail closed when the PR changes schema files under a directory the server
@@ -179,7 +229,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// not silently unmanage a server-owned schema directory.
 	if unmanaged := h.unmanagedServerManagedSchemaChanges(repo, files, configs); len(unmanaged) > 0 {
 		h.failClosedOnUnmanagedSchemaDir(ctx, client, repo, pr, headSHA, source, unmanaged)
-		return "schema change under managed directory has no config"
+		return "schema change under managed directory has no config", nil
 	}
 
 	configs = h.filterManagedDiscoveredConfigs(ctx, repo, pr, headSHA, source, configs)
@@ -219,7 +269,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 				Repository: repo,
 				Status:     "skipped",
 			})
-			return "no schema files in PR (aggregate participant, staying silent)"
+			return "no schema files in PR (aggregate participant, staying silent)", nil
 		}
 		// A PR with no leader-managed schema can still touch schema owned by
 		// expected participant deployments. The leader's aggregate is the
@@ -242,7 +292,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 				}
 				h.updateAggregateCheck(ctx, c, repo, pr, headSHA)
 			})
-			return "no schema files in PR (aggregate folds expected participants)"
+			return "no schema files in PR (aggregate folds expected participants)", nil
 		}
 		// Post passing aggregates on the current HEAD SHA so branch protection
 		// isn't blocked on PRs that don't touch schema files. Always post —
@@ -260,7 +310,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 			}
 			h.postPassingAggregates(ctx, c, repo, pr, headSHA)
 		})
-		return "no schema files in PR"
+		return "no schema files in PR", nil
 	}
 	postPlanComment := h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA)
 
@@ -276,7 +326,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		})
 	}
 
-	return "auto-plan started"
+	return "auto-plan started", nil
 }
 
 func (h *Handler) filterManagedDiscoveredConfigs(ctx context.Context, repo string, pr int, headSHA, source string, configs []ghclient.DiscoveredConfig) []ghclient.DiscoveredConfig {

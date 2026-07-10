@@ -84,6 +84,8 @@ func WithBuildInfo(version, commit, date string) Option {
 
 type webhookRuntime struct {
 	handler                         http.Handler
+	startDurableWebhookDispatch     func(context.Context)
+	stopDurableWebhookDispatch      func()
 	reconcileMissingSummaryComments func(context.Context)
 }
 
@@ -480,6 +482,9 @@ func (s *Server) Handler() http.Handler {
 // first.
 func (s *Server) Start(ctx context.Context) {
 	s.webhook.StartMissingSummaryReconciliation(ctx, s.logger)
+	if s.webhook.startDurableWebhookDispatch != nil {
+		s.webhook.startDurableWebhookDispatch(ctx)
+	}
 	s.svc.StartOperator(ctx)
 	s.svc.StartRemoteDeploymentHealthMonitor(ctx)
 	s.svc.StartPendingDropsCleaner(ctx)
@@ -495,6 +500,9 @@ func (s *Server) Start(ctx context.Context) {
 // after Start.
 func (s *Server) Close() error {
 	s.svc.StopPendingDropsCleaner()
+	if s.webhook.stopDurableWebhookDispatch != nil {
+		s.webhook.stopDurableWebhookDispatch()
+	}
 	// Stop the operator before closing the gRPC client below: RegisterGRPC set
 	// that client as the service's default, so until the drivers drain, a claim
 	// of a queued apply can route to it — closing it first would hand a
@@ -668,12 +676,15 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs),
 		ghclient.WithConfigDirHints(serverConfig))
 	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger,
-		webhook.WithRepoWebhookSecret([]byte(repoWebhookSecret)))
+		webhook.WithRepoWebhookSecret([]byte(repoWebhookSecret)),
+		webhook.WithDurableWebhookDispatch())
 	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub webhook endpoint registered",
 		"app_id", appID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs,
 		"repo_webhook_dispatch", repoWebhookSecret != "")
 	return webhookRuntime{
+		startDurableWebhookDispatch:     handler.StartDurableWebhookDispatch,
+		stopDurableWebhookDispatch:      handler.StopDurableWebhookDispatch,
 		handler:                         handler,
 		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,
 	}, nil
@@ -743,10 +754,13 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 		secretsByApp,
 		appByID,
 		logger,
+		webhook.WithDurableWebhookDispatch(),
 	)
 	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub multi-App webhook endpoint registered", "apps", len(serverConfig.Apps))
 	return webhookRuntime{
+		startDurableWebhookDispatch:     handler.StartDurableWebhookDispatch,
+		stopDurableWebhookDispatch:      handler.StopDurableWebhookDispatch,
 		handler:                         handler,
 		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,
 	}, nil
