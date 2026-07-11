@@ -78,18 +78,20 @@ func Unregister(prefix string) {
 //
 // If value is empty, falls back to the fallbackEnvVar environment variable.
 //
-// Resolve uses a background context for any network-backed lookup. Callers on a
-// request path that want the resolution bounded by the request deadline should
-// use ResolveContext.
+// Resolve uses a background context for the built-in AWS Secrets Manager lookup.
+// Callers on a request path that want that lookup bounded by the request deadline
+// should use ResolveContext. Custom resolvers never receive a context (see
+// ResolverFunc), so their I/O is not bounded either way.
 func Resolve(value string, fallbackEnvVar string) (string, error) {
 	return ResolveContext(context.Background(), value, fallbackEnvVar)
 }
 
 // ResolveContext is Resolve with a caller-supplied context. The context bounds
-// network-backed lookups (AWS Secrets Manager) so a per-request resolution is
+// the built-in AWS Secrets Manager lookup so a per-request resolution is
 // cancelled by the caller's deadline instead of only a fixed background timeout.
-// The env:, file:, literal, and custom-resolver paths do no cancellable I/O and
-// ignore the context.
+// The env:, file:, and literal paths do only local, non-cancellable work and
+// ignore the context. Custom resolvers may perform network I/O, but ResolverFunc
+// takes no context, so that I/O is not cancelled by ctx either.
 func ResolveContext(ctx context.Context, value string, fallbackEnvVar string) (string, error) {
 	if value == "" {
 		return os.Getenv(fallbackEnvVar), nil
