@@ -43,6 +43,11 @@ type Client interface {
 	// Returns a plan_id that can be used with Apply.
 	Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error)
 
+	// PlanDiff computes a deployment's desired-vs-live diff without persisting a
+	// plan. Its result is not applyable (no plan_id); it is the read-only
+	// producer the control plane runs per deployment to detect review-time drift.
+	PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error)
+
 	// Apply executes a previously generated plan.
 	// Validates that the schema hasn't changed since Plan was called.
 	Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error)

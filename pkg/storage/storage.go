@@ -94,7 +94,13 @@ type CheckStore interface {
 	// released only by apply completion (CompleteForApply), rollback completion
 	// (MarkActionRequiredForApply), or the explicit same-head no-op recovery
 	// path (RecoverApplyOwnedCheckWithNoOpPlan).
-	UpsertPlanResult(ctx context.Context, check *Check) error
+	//
+	// drift declares how this write treats a review-time deployment drift block:
+	// a write from a path that re-ran the drift rollup can clear a stale block
+	// (PlanDriftClean) or set one (PlanDriftBlocked); a write from a path that
+	// did not evaluate drift (PlanDriftNotEvaluated, e.g. an apply-time plan)
+	// must preserve any existing drift block rather than silently clearing it.
+	UpsertPlanResult(ctx context.Context, check *Check, drift PlanDriftState) error
 
 	// RecoverApplyOwnedCheckWithNoOpPlan updates same-head apply-owned stored check state
 	// from in_progress to a successful no-op plan result. Returns true when recovery occurred.
@@ -106,6 +112,14 @@ type CheckStore interface {
 	// apply that began after stale cleanup read the row keeps blocking the PR.
 	// Returns true when the row was marked successful.
 	MarkStalePlanSuccessful(ctx context.Context, check *Check) (bool, error)
+
+	// ClearAggregateBlock clears the blocking reason on stored aggregate check
+	// state after the PR-level guards re-verified that the blocking condition
+	// no longer applies. The update is conditional on the head SHA and blocking
+	// reason the caller read, so a block recorded concurrently by another
+	// writer (for example for a newer commit) is never erased. Returns true
+	// when the row was cleared.
+	ClearAggregateBlock(ctx context.Context, check *Check) (bool, error)
 
 	// CompleteForApply updates stored check state to a terminal state only if
 	// it still belongs to the given apply and no newer apply exists for the
@@ -136,12 +150,26 @@ type CheckStore interface {
 	// Delete removes stored check state by ID.
 	Delete(ctx context.Context, id int64) error
 
-	// DeleteByPRExcludingApplyOwned removes stored check state for a PR,
-	// except rows owned by an in-flight apply (apply_id set and status
-	// in_progress). Used for cleanup when a PR is closed or merged:
-	// apply-owned rows must keep blocking until the apply reaches a terminal
-	// state, even across a close and reopen.
-	DeleteByPRExcludingApplyOwned(ctx context.Context, repo string, pr int) error
+	// DeleteByPRRetainingBlockingApplyOwned removes stored check state for a
+	// closed PR, retaining apply-owned rows the close must not unblock. Once
+	// an apply has started, its stored check state stays authoritative across
+	// a close and reopen until an operator reconciles the target environment.
+	// Plan-only rows (no apply_id) are always deleted. Apply-owned rows are
+	// handled by close kind:
+	//
+	//   - merged close: rows that are in_progress or whose conclusion is
+	//     anything but success are retained; rows that concluded successfully
+	//     are deleted, because the merged PR carries the applied schema and
+	//     nothing remains for the row to block.
+	//   - unmerged close: every apply-owned row is retained, including rows
+	//     whose conclusion is success. A stored success only proves the
+	//     database matched the PR when the row was last written — a commit
+	//     that removed the applied change may not have been reconciled into
+	//     the row yet, and the unmerged branch means the change never landed.
+	//     Reopen-time stale cleanup converges the retained row: it converts
+	//     it to action_required when the schema change is gone from the PR,
+	//     or a fresh plan result replaces it when the change is still present.
+	DeleteByPRRetainingBlockingApplyOwned(ctx context.Context, repo string, pr int, merged bool) error
 }
 
 // SettingsStore manages admin-level SchemaBot settings (global config).

@@ -16,7 +16,7 @@ import (
 )
 
 // handlePlanCommand handles the "schemabot plan -e <env>" command.
-func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, environment, databaseName, tenant string, installationID int64, requestedBy string) {
+func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, environment, databaseName, tenant string, installationID int64, requestedBy string, commentID int64) {
 	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
 		h.logger.Error("plan: failed to bootstrap command", "error", err)
@@ -43,9 +43,17 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 
+	ackedEarly := h.acknowledgeCommandEarlyIfOwned(ctx, client, repo, pr, databaseName, tenant, installationID, commentID)
+
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Plan)
 	if err != nil {
+		if h.skipUnownedUnscopedCommand(repo, tenant, err) {
+			h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
+				"repo", repo, "pr", pr, "environment", environment, "error", err)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unowned unscoped command skipped"})
+			return
+		}
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Plan, err)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema request error handled"})
 		return
@@ -54,6 +62,9 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Plan, err)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema request error handled"})
 		return
+	}
+	if !ackedEarly {
+		h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
 	}
 
 	// Reject if the PR HEAD advanced after discovery loaded schema files.
@@ -70,6 +81,13 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	}
 	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, freshPRInfo.HeadSHA, environment, requestedBy, action.Plan); rejected {
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan rejected: schema discovery stale"})
+		return
+	}
+
+	// A user-issued plan reads the resolved database's live schema, so it
+	// requires that database's configured principals.
+	if h.planForResolvedDatabaseBlocked(ctx, repo, pr, installationID, requestedBy, schemaResult.Database, environment) {
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan blocked by actor authorization"})
 		return
 	}
 
@@ -99,7 +117,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	}
 
 	// Execute plan via the service
-	planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)
+	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
 	if err != nil {
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "error", err)
 		metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "error")
@@ -112,13 +130,17 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 
+	// Roll up every deployment's diff against the reviewed plan so drift on a
+	// non-primary deployment fails the check closed at review time.
+	drift := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
+
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy)
 
 	metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "success")
 
 	// Store per-database check record and update aggregate
-	headSHA, recoveredApplyOwnedCheckState, checkErr := h.storeManualPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
+	headSHA, recoveredApplyOwnedCheckState, checkErr := h.storeManualPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, drift)
 	if checkErr != nil {
 		h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "error", checkErr)
 	}
@@ -127,7 +149,15 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Post plan comment
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 
-	if headSHA != "" {
+	// When drift blocked the check but its record could not be persisted, the
+	// aggregate must not be recomputed from stale (possibly passing) stored rows.
+	// Post a failing aggregate carrying the drift block from the in-memory result
+	// so the gate still blocks closed. This is best-effort visibility: with the
+	// per-database row unstored, a later recompute has no durable drift row to
+	// read, so the store error is logged above and not treated as a safe update.
+	if drift.blocks() && checkErr != nil {
+		h.postFailingAggregatesWithBlock(ctx, client, repo, pr, schemaResult.HeadSHA, map[string]string{environment: drift.summary}, reviewTimeDeploymentDriftBlock)
+	} else if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
 
@@ -137,9 +167,43 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	})
 }
 
+// planForResolvedDatabaseBlocked enforces actor authorization once a
+// user-issued plan has resolved which database it targets. A plan reads the
+// database's live schema, so it requires the same configured principals as
+// the mutating commands — the database's operator teams/users and the
+// instance admins. A plan that resolves no managed database (the stuck-check
+// rescue on a no-schema-changes PR) never reaches this gate, and databases
+// not configured on this deployment defer to the downstream ownership
+// handling so fan-out deployments stay silent. When blocked, the
+// authorization path has already posted the rejection comment.
+func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo string, pr int, installationID int64, requestedBy, databaseName, environment string) bool {
+	if databaseName == "" {
+		h.logger.Debug("plan resolved no database; no authorization gate", "repo", repo, "pr", pr)
+		return false
+	}
+	dbConfig := h.service.Config().Database(databaseName)
+	if dbConfig == nil {
+		h.logger.Debug("plan database is not configured on this deployment; deferring to downstream ownership handling",
+			"repo", repo, "pr", pr, "database", databaseName)
+		return false
+	}
+	authzClient, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, databaseName, environment, action.Plan)
+	if blocked {
+		return true
+	}
+	if authzClient == nil {
+		h.logger.Debug("PR command authorization disabled; plan proceeds ungated",
+			"repo", repo, "pr", pr, "database", databaseName, "requested_by", requestedBy)
+		return false
+	}
+	return h.enforcePRCommandActorAuthorization(ctx, authzClient, repo, pr, installationID, requestedBy, databaseName, dbConfig.Type, environment, action.Plan)
+}
+
 // handleMultiEnvPlan runs plan for all configured environments and posts a single combined comment.
 // When isAutoPlan is true and no environments have changes or errors, the comment is skipped to reduce PR noise.
-func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, postPlanComment bool) {
+// commentID is the command comment to acknowledge once discovery commits this
+// deployment to acting; auto-plans pass zero (no comment to acknowledge).
+func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, postPlanComment bool, commentID int64) {
 	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
 		h.logger.Error("multi-env plan: failed to bootstrap command", "error", err)
@@ -152,6 +216,20 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, "Failed to reconcile stale status checks: "+err.Error())
 		return
+	}
+
+	// A user-issued plan on a PR with no managed schema changes converges the
+	// checks (or explains apply-owned state) instead of searching the whole
+	// repo for a config. Auto-plan skips this: it is only dispatched for
+	// configs already discovered from the PR's changed files.
+	if !isAutoPlan {
+		if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Plan, "", databaseName, requestedBy); err != nil {
+			h.logger.Error("failed to check whether plan command needs schema change reconciliation", "repo", repo, "pr", pr, "database", databaseName, "error", err)
+			h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, err.Error())
+			return
+		} else if handled {
+			return
+		}
 	}
 
 	// Find config to get the database identity. Environments are server-owned.
@@ -179,6 +257,13 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 		schemaDatabase = config.Database
 	}
+	// A user-issued plan reads the resolved database's live schema, so it
+	// requires that database's configured principals. Auto-plans are
+	// system-triggered with no actor to authorize.
+	if !isAutoPlan && h.planForResolvedDatabaseBlocked(ctx, repo, pr, installationID, requestedBy, schemaDatabase, "") {
+		return
+	}
+
 	configuredEnvironments, envErr := h.configuredDatabaseEnvironments(schemaDatabase)
 	if envErr != nil {
 		if isAutoPlan {
@@ -195,6 +280,13 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, envErr)
 		return
 	}
+	// Ownership is only fully decided once the discovered database resolves in
+	// this deployment's registry: config discovery alone can pass on a repo with
+	// no schema-dir allowlist even when the database belongs to another
+	// deployment, and acknowledging there would promise work a fan-out silent
+	// skip never does. The registry lookups above are in-memory, so the
+	// acknowledgment is still immediate.
+	h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
 	configuredEnvironments = append([]string(nil), configuredEnvironments...)
 	allowedEnvironments := append([]string(nil), h.service.Config().AllowedEnvironments...)
 
@@ -224,6 +316,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 	// Collect plans for all environments
 	var headSHA string
+	// Environments whose drift-blocking check record could not be persisted, kept
+	// so a failing aggregate can be posted from the in-memory drift result rather
+	// than letting the post-loop aggregate recompute from stale stored rows.
+	driftBlockUnstored := map[string]string{}
 	multiEnvData := templates.MultiEnvPlanCommentData{
 		RequestedBy:  requestedBy,
 		Tenant:       tenant,
@@ -286,24 +382,31 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			SourceTrusted: true,
 		}
 
-		planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)
+		planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
 		if err != nil {
 			h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "env", env, "error", err)
 			multiEnvData.Errors[env] = userFacingError(err)
 			continue
 		}
 
+		// Roll up every deployment's diff against the reviewed plan so drift on a
+		// non-primary deployment fails the check closed at review time.
+		drift := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
+
 		// Store per-database check record per environment
 		var recoveredApplyOwnedCheckState bool
 		var sha string
 		var checkErr error
 		if isAutoPlan {
-			sha, checkErr = h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, env)
+			sha, checkErr = h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, env, drift)
 		} else {
-			sha, recoveredApplyOwnedCheckState, checkErr = h.storeManualPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, env)
+			sha, recoveredApplyOwnedCheckState, checkErr = h.storeManualPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, env, drift)
 		}
 		if checkErr != nil {
 			h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "env", env, "error", checkErr)
+			if drift.blocks() {
+				driftBlockUnstored[env] = drift.summary
+			}
 		}
 		if sha != "" {
 			headSHA = sha
@@ -327,6 +430,19 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		} else {
 			h.postFailingAggregates(ctx, client, repo, pr, prInfo.HeadSHA, multiEnvData.Errors)
 		}
+	}
+
+	// For any environment whose drift-blocking check record could not be
+	// persisted, post a failing aggregate from the in-memory drift result after
+	// the stored-row aggregate sync so a stale passing row cannot leave the gate
+	// open. Posted last so it wins over updateAggregateCheck for these envs.
+	if len(driftBlockUnstored) > 0 && multiEnvData.HeadSHA != "" {
+		h.postFailingAggregatesWithBlock(ctx, client, repo, pr, multiEnvData.HeadSHA, driftBlockUnstored, reviewTimeDeploymentDriftBlock)
+	} else if len(driftBlockUnstored) > 0 {
+		h.logger.Warn("deployment drift blocked one or more environments but no head SHA is known; the fallback failing aggregate was not posted, so an operator must re-run plan to re-establish the merge-gate block",
+			"repo", repo,
+			"pr", pr,
+			"environments", len(driftBlockUnstored))
 	}
 
 	// Auto-plan: skip comment if no changes and no errors (reduce PR noise)

@@ -102,7 +102,7 @@ func TestFormatApplyStatusComment_ShardedFailedSurfacesError(t *testing.T) {
 
 	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil)
 
-	assert.Contains(t, out, "❌ Schema Change Failed", "uses the shard-unit failed headline")
+	assert.Contains(t, out, "## Schema Change Status", "uses the stable in-place status headline")
 	assert.Contains(t, out, "**Shards**:", "counts shards, not deployments")
 	assert.NotContains(t, out, "**Deployments**:", "must not use the deployment-unit layout")
 	assert.Contains(t, out, failErr, "the failed shard's error is surfaced (the bug fix)")

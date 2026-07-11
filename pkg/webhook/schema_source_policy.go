@@ -2,12 +2,71 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 )
+
+// skipUnownedUnscopedCommand reports whether a "schema not owned by this
+// deployment" error should be silently ignored instead of reported on the PR.
+// On an aggregate repo (leader or participant), an unscoped command (no -t) is a
+// fan-out broadcast every installed deployment receives; a deployment that owns
+// none of the changed schema is expected to do nothing while the deployment that
+// does own it handles the command. Posting "config not authorized" or "database
+// not configured" from every non-owning deployment would be exactly the noise
+// fan-out removes. Scoped to the not-owned error classes only — real failures
+// still surface. A -t-scoped command (tenant != "") always reports, since it
+// named a specific deployment.
+func (h *Handler) skipUnownedUnscopedCommand(repo, tenant string, err error) bool {
+	if tenant != "" {
+		return false
+	}
+	config, ok := h.serverConfig()
+	if !ok || config.AggregateRoleForRepo(repo) == "" {
+		return false
+	}
+	return isSchemaUnownedByDeploymentError(err)
+}
+
+// isSchemaUnownedByDeploymentError reports whether err means the command
+// resolved to schema another deployment owns: either the schema config lives
+// outside this server's allowed_dirs, or the discovered database has no entry
+// in this server's databases registry at all. Under the aggregate contract both
+// mean the same thing — this deployment is not the owner — so on unscoped
+// fan-out both are silently skipped rather than reported. Anything else is a
+// real failure and must still surface.
+func isSchemaUnownedByDeploymentError(err error) bool {
+	var notOwned *schemaConfigOutsideAllowedDirsError
+	if errors.As(err, &notOwned) {
+		return true
+	}
+	var notConfigured *api.DatabaseNotConfiguredError
+	return errors.As(err, &notConfigured)
+}
+
+// silentOnUnscopedFanOut reports whether a "nothing to do on this deployment"
+// outcome for an unscoped (no -t) command should be a logged silent skip rather
+// than a PR comment. On an aggregate repo (leader or participant) an unscoped
+// command fans out to every deployment, so one that finds no pending work — for
+// example apply-confirm after this deployment's own databases already
+// auto-applied and released their locks — must stay quiet; only the deployment
+// that actually has work to confirm responds. A -t-scoped command (tenant != "")
+// named a specific deployment, so its "nothing to do" answer is useful and still
+// surfaces.
+func (h *Handler) silentOnUnscopedFanOut(repo, tenant string) bool {
+	if tenant != "" {
+		return false
+	}
+	config, ok := h.serverConfig()
+	if !ok {
+		return false
+	}
+	return config.AggregateRoleForRepo(repo) != ""
+}
 
 type schemaConfigOutsideAllowedDirsError struct {
 	Database     string

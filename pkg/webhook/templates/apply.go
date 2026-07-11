@@ -61,9 +61,13 @@ type ApplyStatusCommentData struct {
 	State        string // canonical lowercase apply state
 	Engine       string
 	ErrorMessage string
-	StartedAt    string // RFC3339 format
-	CompletedAt  string // RFC3339 format
-	Tables       []TableProgressData
+
+	// Attempt is the apply's operator redispatch count so far; the retry the
+	// comment announces is Attempt+1 of storage.MaxRecoveryAttempts.
+	Attempt     int
+	StartedAt   string // RFC3339 format
+	CompletedAt string // RFC3339 format
+	Tables      []TableProgressData
 
 	// VSchemaChanges holds per-keyspace VSchema application state, surfaced from
 	// the engine's display metadata rather than as a per-table task. Empty when
@@ -81,6 +85,11 @@ type ApplyStatusCommentData struct {
 	// comment shows the time remaining before the change becomes permanent.
 	// Empty outside the revert window or for engines without one.
 	RevertExpiresAt string
+
+	// Volume is the apply's current volume level (1=slowest, 11=fastest) from
+	// its stored options. Zero means the engine default is in effect and the
+	// comment renders no volume.
+	Volume int
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -98,17 +107,15 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 
 	// Metadata line
 	writeApplyMetadata(&sb, data, renderedAt)
-	writeApplyStatusDetail(&sb, data.State)
+
+	// Status line. For the revert window it carries the countdown to permanence
+	// inline (e.g. "Revert Window | Closes in 28m 30s") so the operator sees the
+	// state and its deadline in one place rather than on a separate line.
+	writeApplyStatusDetail(&sb, data)
 
 	// Deploy-request link (PlanetScale) — the operator's entry point into the
 	// deploy request's own progress, which the comment does not otherwise surface.
 	writeDeployRequestLink(&sb, data)
-
-	// Revert-window countdown (PlanetScale) — how long until the change becomes
-	// permanent, so the operator knows the window to revert or skip.
-	if state.IsState(data.State, state.Apply.RevertWindow) {
-		writeRevertWindowDeadline(&sb, data.RevertExpiresAt)
-	}
 
 	// Cutover readiness summary
 	if data.State == state.Apply.WaitingForCutover || data.State == state.Apply.CuttingOver {
@@ -138,39 +145,23 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	return sb.String()
 }
 
+// writeApplyStatusHeader writes the headline for an in-place apply status
+// comment. The title is intentionally state-independent — always "Schema Change
+// Status — <env>" — so the headline stays stable as the apply moves through its
+// states (running → revert window → applied); the current state is conveyed by
+// the Status line and the per-table progress, not the headline. The single-,
+// multi-deployment, and sharded status comments all use this so their headline
+// vocabulary is identical. Terminal summary/notification comments use
+// writeApplyHeader, which keeps a state-specific title.
 func writeApplyStatusHeader(sb *strings.Builder, data ApplyStatusCommentData) {
-	if state.IsTerminalApplyState(data.State) {
-		writeEnvironmentTitle(sb, "Schema Change Status", data.Environment)
-		return
-	}
-	writeApplyHeader(sb, data)
+	writeEnvironmentTitle(sb, "Schema Change Status", data.Environment)
 }
 
-// writeApplyHeader writes the comment header with a state-specific title.
+// writeApplyHeader writes the state-specific title for a terminal summary or
+// notification comment (the separate comment posted when an apply reaches a
+// terminal state), distinct from the stable in-place status headline.
 func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	switch data.State {
-	case state.Apply.Pending,
-		state.Apply.Running,
-		state.Apply.RunningDegraded,
-		state.Apply.FailedRetryable,
-		state.Apply.WaitingForDeploy,
-		state.Apply.WaitingForCutover,
-		state.Apply.Recovering,
-		state.Apply.Resuming,
-		state.Apply.CuttingOver,
-		state.Apply.PreparingBranch,
-		state.Apply.ApplyingBranchChanges,
-		state.Apply.ValidatingBranch,
-		state.Apply.CreatingDeployRequest,
-		state.Apply.ValidatingDeployRequest:
-		// running_degraded is a continue rollout still in flight past a failed
-		// sibling: the change is still in progress, and the failed deployment is
-		// surfaced in the per-deployment breakdown, not the headline.
-		writeEnvironmentTitle(sb, "Schema Change In Progress", data.Environment)
-	case state.Apply.RevertWindow:
-		writeEnvironmentTitle(sb, "Schema Change Applied (Pending Revert)", data.Environment)
-	case state.Apply.SkippingRevert:
-		writeEnvironmentTitle(sb, "Skipping Revert — Finalizing", data.Environment)
 	case state.Apply.Completed:
 		writeEnvironmentTitle(sb, "✅ Schema Change Applied", data.Environment)
 	case state.Apply.Failed:
@@ -182,11 +173,7 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.Cancelled:
 		writeEnvironmentTitle(sb, "🚫 Schema Change Cancelled", data.Environment)
 	default:
-		if state.IsTerminalApplyState(data.State) {
-			writeEnvironmentTitle(sb, fmt.Sprintf("Schema Change: %s", humanizeState(data.State)), data.Environment)
-		} else {
-			writeEnvironmentTitle(sb, "Schema Change In Progress", data.Environment)
-		}
+		writeEnvironmentTitle(sb, fmt.Sprintf("Schema Change: %s", humanizeState(data.State)), data.Environment)
 	}
 }
 
@@ -216,10 +203,21 @@ func startedAtDisplay(startedAt, fallback string) string {
 	return t.UTC().Format("2006-01-02 15:04:05 UTC")
 }
 
-func writeApplyStatusDetail(sb *strings.Builder, applyState string) {
-	detail := applyStatusDetail(applyState)
+func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
+	detail := applyStatusDetail(data.State)
 	if detail == "" {
 		return
+	}
+	if state.IsState(data.State, state.Apply.RevertWindow) {
+		if countdown := revertWindowCountdown(data.RevertExpiresAt); countdown != "" {
+			detail += " | " + countdown
+		}
+	}
+	// The volume level only matters while the engine is actively copying; on
+	// other states (stopped, waiting for cutover, terminal) it carries no
+	// signal, so the status line stays quiet.
+	if data.Volume > 0 && state.IsState(data.State, state.Apply.Running, state.Apply.RunningDegraded) {
+		detail += fmt.Sprintf(" | Volume: %d/%d", data.Volume, storage.MaxVolume)
 	}
 	fmt.Fprintf(sb, "\n**Status**: %s\n", detail)
 }
@@ -237,8 +235,16 @@ func applyStatusDetail(applyState string) string {
 		return "Reverted"
 	case state.Apply.Cancelled:
 		return "Cancelled"
+	case state.Apply.RevertWindow:
+		return "Revert Window"
+	case state.Apply.Reverting:
+		return "Reverting"
 	case state.Apply.Pending:
 		return "Starting"
+	case state.Apply.Running, state.Apply.RunningDegraded:
+		return "In Progress"
+	case state.Apply.FailedRetryable:
+		return "Retrying"
 	case state.Apply.WaitingForDeploy:
 		return "Waiting for Deploy"
 	case state.Apply.WaitingForCutover:
@@ -260,7 +266,7 @@ func applyStatusDetail(applyState string) string {
 	case state.Apply.ValidatingDeployRequest:
 		return "Validating Deploy Request"
 	default:
-		if applyState == "" || state.IsTerminalApplyState(applyState) || state.IsState(applyState, state.Apply.Running, state.Apply.RunningDegraded, state.Apply.FailedRetryable) {
+		if applyState == "" || state.IsTerminalApplyState(applyState) {
 			return ""
 		}
 		return humanizeState(applyState)
@@ -294,24 +300,24 @@ func writeStopOrCancelFooterAction(sb *strings.Builder, data ApplyStatusCommentD
 	writeFooterAction(sb, prefix, fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment))
 }
 
-// writeRevertWindowDeadline writes the time remaining before the revert window
-// closes, when a deadline is known and still in the future. An unset or
-// past-due deadline renders nothing so the comment never shows a stale or
-// negative countdown.
-func writeRevertWindowDeadline(sb *strings.Builder, revertExpiresAt string) {
+// revertWindowCountdown returns the time remaining before the revert window
+// closes, phrased for the status line (e.g. "Closes in 28m 30s"). It returns ""
+// when the deadline is unset, unparseable, or already past, so the status line
+// never shows a stale or negative countdown.
+func revertWindowCountdown(revertExpiresAt string) string {
 	if revertExpiresAt == "" {
-		return
+		return ""
 	}
 	expires, err := time.Parse(time.RFC3339, revertExpiresAt)
 	if err != nil {
-		return
+		return ""
 	}
 	// NowFunc (not time.Now) so previews and tests render a deterministic countdown.
 	remaining := expires.Sub(NowFunc())
 	if remaining <= 0 {
-		return
+		return ""
 	}
-	fmt.Fprintf(sb, "\n⏳ **Revert window closes in**: %s\n", formatDuration(remaining))
+	return fmt.Sprintf("Closes in %s", formatDuration(remaining))
 }
 
 // writeCutoverSummary writes a readiness summary for cutover states,
@@ -514,7 +520,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 				renderResumingTable(sb, table)
 				continue
 			}
-			renderTableProgress(sb, table)
+			renderTableProgress(sb, table, data.Attempt)
 		}
 	}
 }
@@ -576,7 +582,7 @@ func tableStatePriority(tableStatus string) int {
 
 // renderTableProgress renders a single table's progress as markdown.
 // Mirrors the CLI's writeTableProgressWithState logic but outputs markdown instead of ANSI.
-func renderTableProgress(sb *strings.Builder, table TableProgressData) {
+func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAttempt int) {
 	// Normalize to canonical Task state for consistent matching.
 	status := state.NormalizeTaskStatus(table.Status)
 
@@ -639,7 +645,8 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData) {
 
 	case state.Task.FailedRetryable:
 		bar := ui.ProgressBarStopped(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
-		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically\n", table.TableName, bar)
+		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically (attempt %d/%d)\n",
+			table.TableName, bar, applyAttempt+1, storage.MaxRecoveryAttempts)
 		writeDDLLine(sb, table.DDL)
 		if table.ErrorMessage != "" {
 			writeTableErrorLine(sb, table.ErrorMessage)
@@ -652,6 +659,11 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData) {
 	case state.Task.RevertWindow:
 		bar := ui.ProgressBarWaitingCutover()
 		fmt.Fprintf(sb, "**`%s`**: %s \u2713 Complete (pending revert)\n", table.TableName, bar)
+		writeDDLLine(sb, table.DDL)
+
+	case state.Task.Reverting:
+		bar := ui.ProgressBarWaitingCutover()
+		fmt.Fprintf(sb, "**`%s`**: %s \u21a9\ufe0f Reverting\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Stopped:
@@ -916,8 +928,9 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.Failed:
 		writeFooterAction(sb, "To retry:", fmt.Sprintf("schemabot apply -e %s", data.Environment))
 	case state.Apply.RevertWindow:
-		writeFooterAction(sb, "To revert:", fmt.Sprintf("schemabot revert %s -e %s", data.ApplyID, data.Environment))
-		fmt.Fprintf(sb, "\nTo skip revert and keep changes:\n```\nschemabot skip-revert %s -e %s\n```\n", data.ApplyID, data.Environment)
+		// Skip-revert (finalize) is the common path, so it leads; revert (undo) follows.
+		writeFooterAction(sb, "To skip revert and keep changes:", fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment))
+		fmt.Fprintf(sb, "\nTo revert:\n```\nschemabot revert %s -e %s\n```\n", data.ApplyID, data.Environment)
 	case state.Apply.SkippingRevert:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Skip-revert was requested — closing the revert window and making this schema change permanent. This can no longer be reverted.\n")
@@ -1110,7 +1123,7 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 
 	fmt.Fprintf(sb, "\n<details><summary>%s</summary>\n\n", completedSummaryDetailsLabel(data))
 	if data.ApplyID != "" {
-		fmt.Fprintf(sb, "**Apply ID**: `%s`\n\n", data.ApplyID)
+		fmt.Fprintf(sb, "_Apply ID: `%s`_\n\n", data.ApplyID)
 	}
 	writeCompletedNamespaceSummary(sb, data)
 	if len(data.Tables) > 0 {
@@ -1257,6 +1270,16 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 	}
 
 	collapsed := collapseNamespaceGroups && len(data.Tables) > 5
+	// Per-namespace status emojis only carry information when outcomes differ
+	// across namespaces (some failed, some succeeded). When every namespace
+	// succeeded, the repeated ✅ is noise, so the headers omit the emoji.
+	showGroupEmoji := false
+	for _, g := range groups {
+		if groupStateEmoji(g.tables) != "✅" {
+			showGroupEmoji = true
+			break
+		}
+	}
 	// Skip namespace header when there's only one group and it's "default" or
 	// matches the database name — the header is redundant with the metadata line.
 	singleGroup := len(groups) == 1
@@ -1270,13 +1293,16 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 				header = data.Database
 			}
 
-			groupEmoji := groupStateEmoji(g.tables)
+			emojiPrefix := ""
+			if showGroupEmoji {
+				emojiPrefix = groupStateEmoji(g.tables) + " "
+			}
 
 			if groupCollapsed {
 				sb.WriteString("\n<details><summary>")
-				fmt.Fprintf(sb, "%s <strong>%s</strong> (%d tables)</summary>\n\n", groupEmoji, header, len(g.tables))
+				fmt.Fprintf(sb, "%s<strong>%s</strong> (%d tables)</summary>\n\n", emojiPrefix, header, len(g.tables))
 			} else {
-				fmt.Fprintf(sb, "\n### %s %s\n\n", groupEmoji, header)
+				fmt.Fprintf(sb, "\n### %s%s\n\n", emojiPrefix, header)
 			}
 		} else {
 			sb.WriteString("\n")
@@ -1361,6 +1387,7 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 		ErrorMessage: resp.ErrorMessage,
 		StartedAt:    resp.StartedAt,
 		CompletedAt:  resp.CompletedAt,
+		Volume:       int(resp.Volume),
 	}
 	data.RevertExpiresAt = resp.Metadata["revert_expires_at"]
 

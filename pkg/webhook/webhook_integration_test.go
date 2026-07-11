@@ -723,6 +723,14 @@ func e2eContainerName(base string) string {
 // posting without needing to plan).
 func setupE2EServiceWithAllowedEnvs(t *testing.T, allowedEnvs []string) *api.Service {
 	t.Helper()
+	return setupE2EServiceWithConfig(t, &api.ServerConfig{AllowedEnvironments: allowedEnvs})
+}
+
+// setupE2EServiceWithConfig builds an E2E service against the shared schemabot
+// test database using the given server config, so tests can exercise
+// repo-scoped behavior (e.g. aggregate roles) beyond just allowed environments.
+func setupE2EServiceWithConfig(t *testing.T, serverConfig *api.ServerConfig) *api.Service {
+	t.Helper()
 
 	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
@@ -735,10 +743,6 @@ func setupE2EServiceWithAllowedEnvs(t *testing.T, allowedEnvs []string) *api.Ser
 		"DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
 	_, _ = schemabotDB.ExecContext(t.Context(),
 		"DELETE FROM locks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
-
-	serverConfig := &api.ServerConfig{
-		AllowedEnvironments: allowedEnvs,
-	}
 
 	svc := api.New(st, serverConfig, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
 	t.Cleanup(func() { _ = svc.Close() })

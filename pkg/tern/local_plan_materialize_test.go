@@ -62,6 +62,8 @@ func (e fakePlanEngine) Plan(ctx context.Context, req *engine.PlanRequest) (*eng
 	return e.planFn(ctx, req)
 }
 
+func (e fakePlanEngine) Name() string { return "spirit" }
+
 // newPlanMaterializeClientWithPlan returns a materialize client whose drift
 // guard recomputes the given plan result against "live" schema. The DB-bearing
 // TargetDSN keeps planWithEngine on the single-namespace path.

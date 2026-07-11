@@ -77,6 +77,7 @@ func (s targetRouterApplyStore) GetByApplyIdentifier(_ context.Context, applyIde
 type targetRouterRecordingClient struct {
 	pullReq            *ternv1.PullSchemaRequest
 	planReq            *ternv1.PlanRequest
+	planDiffReq        *ternv1.PlanRequest
 	applyReq           *ternv1.ApplyRequest
 	progressReq        *ternv1.ProgressRequest
 	resumeApply        *storage.Apply
@@ -95,6 +96,11 @@ func (c *targetRouterRecordingClient) PullSchema(_ context.Context, req *ternv1.
 func (c *targetRouterRecordingClient) Plan(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
 	c.planReq = req
 	return &ternv1.PlanResponse{PlanId: "plan-routed"}, nil
+}
+
+func (c *targetRouterRecordingClient) PlanDiff(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	c.planDiffReq = req
+	return &ternv1.PlanDiffResponse{Engine: ternv1.Engine_ENGINE_PLANETSCALE}, nil
 }
 
 func (c *targetRouterRecordingClient) Apply(_ context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
@@ -206,6 +212,29 @@ func TestTargetRouterRoutesPlanThroughStaticTarget(t *testing.T) {
 	_, err = router.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders-logical", Type: storage.DatabaseTypeMySQL, Environment: "production", Target: "dsid-orders-prod"})
 	require.NoError(t, err)
 	assert.Len(t, created, 1, "the router should cache LocalClients by resolved target route and namespace")
+}
+
+func TestTargetRouterRoutesPlanDiffThroughStaticTarget(t *testing.T) {
+	resolver := newStaticResolver(t)
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	resp, err := router.PlanDiff(t.Context(), &ternv1.PlanRequest{
+		Database:    "orders-logical",
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: "production",
+		Target:      "dsid-orders-prod",
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, ternv1.Engine_ENGINE_PLANETSCALE, resp.Engine)
+	client := created["orders-logical"]
+	require.NotNil(t, client)
+	require.NotNil(t, client.planDiffReq)
+	assert.Equal(t, "orders-logical", client.planDiffReq.Database)
+	assert.Equal(t, storage.DatabaseTypeMySQL, client.planDiffReq.Type)
+	assert.Equal(t, "dsid-orders-prod", client.planDiffReq.Target)
+	assert.Equal(t, "root@tcp(localhost:3306)/", client.targetDSN)
 }
 
 func TestTargetRouterApplyUsesTargetScopedPendingObserver(t *testing.T) {

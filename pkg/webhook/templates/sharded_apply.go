@@ -84,7 +84,7 @@ func RenderShardedApplyComment(data ShardedApplyData) string {
 	var sb strings.Builder
 	renderedAt := currentTimestamp()
 
-	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.State, Environment: data.Environment})
+	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.State, Environment: data.Environment})
 	writeShardedMetadata(&sb, data, renderedAt)
 
 	writeShardCounts(&sb, data.Shards)

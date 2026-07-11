@@ -347,6 +347,49 @@ func TestTenantScopedWorkCommandRouting(t *testing.T) {
 		require.Equal(t, http.StatusOK, rr.Code)
 		assert.Contains(t, rr.Body.String(), "help posted")
 	})
+
+	// A participant fans out unscoped apply/plan, but commands that target a
+	// single apply owned by one tenant must not: an unscoped rollback or control
+	// op requires an explicit -t so only the owning tenant acts. Critically, a
+	// participant that does not own the targeted apply stays silent — it must not
+	// post "apply not found" for a database owned by another tenant.
+	t.Run("participant requires -t for rollback and control ops without erroring", func(t *testing.T) {
+		for _, comment := range []string{
+			"schemabot rollback apply_a1b2c3 -e staging",
+			"schemabot stop apply_a1b2c3 -e staging",
+			"schemabot cancel apply_a1b2c3 -e staging",
+		} {
+			client, mux := setupGitHubServer(t)
+			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(http.ResponseWriter, *http.Request) {
+				t.Errorf("participant must not post a comment for unscoped %q on an unowned apply", comment)
+			})
+			mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(http.ResponseWriter, *http.Request) {
+				t.Errorf("participant must not react to unscoped %q on an unowned apply", comment)
+			})
+			factory := &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}
+
+			service := api.New(nil, &api.ServerConfig{
+				Tenant: "alpha",
+				Repos: map[string]api.RepoConfig{
+					"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}},
+				},
+			}, nil, testLogger())
+
+			h := &Handler{
+				service:   service,
+				ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+				logger:    testLogger(),
+			}
+
+			req := buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil)
+			rr := httpResponseRecorder()
+			h.ServeHTTP(rr, req)
+
+			require.Equal(t, http.StatusOK, rr.Code)
+			assert.Contains(t, rr.Body.String(), "tenant target required",
+				"unscoped %q must require -t on a participant", comment)
+		}
+	})
 }
 
 //go:fix inline

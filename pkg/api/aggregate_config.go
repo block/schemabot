@@ -45,6 +45,14 @@ type AggregateConfig struct {
 type ExpectedTenant struct {
 	Tenant string   `yaml:"tenant"`
 	Paths  []string `yaml:"paths"`
+
+	// CheckName is the participant's aggregate check-name base (e.g.
+	// "SchemaBot BB Block"). The leader env-scopes it with
+	// aggregateCheckNameForEnv to find the participant's per-environment Check
+	// Run and fold it into the aggregate. It is required on a leader's expected
+	// tenants: the leader cannot gate on a participant whose Check Run name it
+	// cannot resolve, so a missing name is a fail-closed configuration error.
+	CheckName string `yaml:"check_name"`
 }
 
 func (a *AggregateConfig) isLeader() bool {
@@ -77,6 +85,25 @@ func (c *ServerConfig) IsAggregateLeaderForRepo(repo string) bool {
 // terminal-success before the check can pass. Returns nil when this deployment
 // is not the leader for repo, since only the leader holds the expected set.
 func (c *ServerConfig) ExpectedTenantsForPR(repo string, changedFiles []string) []string {
+	expected := c.ExpectedParticipantChecksForPR(repo, changedFiles)
+	if expected == nil {
+		return nil
+	}
+	names := make([]string, 0, len(expected))
+	for _, tenant := range expected {
+		names = append(names, tenant.Tenant)
+	}
+	return names
+}
+
+// ExpectedParticipantChecksForPR returns the full expected-tenant entries
+// (tenant, paths, and participant check-name base) that the leader must gate on
+// for a PR touching changedFiles: the subset of the repo's expected-tenant set
+// whose managed path prefixes cover at least one changed file. The leader
+// env-scopes each returned CheckName to find the participant's per-environment
+// Check Run and fold it into the aggregate. Returns nil when this deployment is
+// not the leader for repo, since only the leader holds the expected set.
+func (c *ServerConfig) ExpectedParticipantChecksForPR(repo string, changedFiles []string) []ExpectedTenant {
 	if c == nil {
 		return nil
 	}
@@ -84,10 +111,10 @@ func (c *ServerConfig) ExpectedTenantsForPR(repo string, changedFiles []string) 
 	if !ok || !repoConfig.Aggregate.isLeader() {
 		return nil
 	}
-	var expected []string
+	var expected []ExpectedTenant
 	for _, tenant := range repoConfig.Aggregate.ExpectedTenants {
 		if anyPathCovered(tenant.Paths, changedFiles) {
-			expected = append(expected, tenant.Tenant)
+			expected = append(expected, tenant)
 		}
 	}
 	return expected
@@ -141,6 +168,9 @@ func validateAggregateConfig(repo string, agg *AggregateConfig) error {
 			return fmt.Errorf("repos.%s.aggregate.expected_tenants contains duplicate tenant %q", repo, name)
 		}
 		seen[name] = struct{}{}
+		if strings.TrimSpace(tenant.CheckName) == "" {
+			return fmt.Errorf("repos.%s.aggregate.expected_tenants[%q].check_name is required for role %q", repo, name, AggregateRoleLeader)
+		}
 		if len(tenant.Paths) == 0 {
 			return fmt.Errorf("repos.%s.aggregate.expected_tenants[%q].paths is empty", repo, name)
 		}

@@ -113,6 +113,8 @@ const (
 	PreviewCommentPlanTenant            PreviewType = "comment_plan_tenant"             // Tenant-targeted plan comment
 	PreviewCommentPlanEmpty             PreviewType = "comment_plan_empty"              // Plan comment with no changes
 	PreviewCommentNoManagedSchema       PreviewType = "comment_no_managed_schema"       // No managed schema changes in current PR
+	PreviewCommentChecksRefreshed       PreviewType = "comment_checks_refreshed"        // Plan on no-schema-changes PR recreated passing checks
+	PreviewCommentChecksRefreshedTenant PreviewType = "comment_checks_refreshed_tenant" // Checks refreshed but gated on tenant deployments
 	PreviewCommentReconcileInProgress   PreviewType = "comment_reconcile_in_progress"   // Empty diff with in-progress apply-owned state
 	PreviewCommentReconcileCompleted    PreviewType = "comment_reconcile_completed"     // Empty diff with completed apply-owned state
 	PreviewCommentMultiEnv              PreviewType = "comment_multi_env"               // Multi-env plan (identical, deduplicated)
@@ -135,6 +137,7 @@ const (
 	PreviewCommentApplyEstimateExceeded PreviewType = "comment_apply_estimate_exceeded" // Apply in progress after row estimate was exceeded
 	PreviewCommentApplyCompleted        PreviewType = "comment_apply_completed"         // Apply completed (all tables done)
 	PreviewCommentApplyFailed           PreviewType = "comment_apply_failed"            // Apply failed (1 done, 1 failed, 1 cancelled)
+	PreviewCommentApplyRetrying         PreviewType = "comment_apply_retrying"          // Apply interrupted, retrying automatically (attempt counter)
 	PreviewCommentApplyStopped          PreviewType = "comment_apply_stopped"           // Apply stopped (1 done, 1 stopped)
 	PreviewCommentApplyWaitingCutover   PreviewType = "comment_apply_waiting_cutover"   // Waiting for cutover
 	PreviewCommentApplyCuttingOver      PreviewType = "comment_apply_cutting_over"      // Cutting over
@@ -149,6 +152,7 @@ const (
 	PreviewCLIMultiDeployCompleted      PreviewType = "cli_multi_deploy_completed"       // All deployments completed
 	PreviewCLIMultiDeployAll            PreviewType = "cli_multi_deploy_all"             // Show all CLI multi-deployment apply previews
 	PreviewCommentShardedAll            PreviewType = "comment_sharded_all"              // Show all sharded apply + plan previews
+	PreviewAggregateCheckSummary        PreviewType = "aggregate_check_summary"          // Aggregate check Details summary (own databases + tenant deployments)
 
 	// Single-table apply comment previews (most common case)
 	PreviewCommentSingleProgress           PreviewType = "comment_single_progress"             // Single table running
@@ -188,5 +192,7 @@ const (
 	PreviewCommentStartPending          PreviewType = "comment_start_pending"                // Start command when start is already pending
 	PreviewCommentCutoverAccepted       PreviewType = "comment_cutover_accepted"             // Cutover command accepted
 	PreviewCommentCutoverActive         PreviewType = "comment_cutover_active"               // Cutover command when cutover is already in progress
+	PreviewCommentVolumeAccepted        PreviewType = "comment_volume_accepted"              // Volume command accepted
+	PreviewCommentVolumeInvalid         PreviewType = "comment_volume_invalid"               // Volume command with a missing or invalid level
 	PreviewCommentApplyAllType          PreviewType = "comment_apply_all"                    // Show all apply comment previews
 )

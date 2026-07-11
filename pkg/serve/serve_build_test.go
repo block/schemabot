@@ -71,3 +71,75 @@ func TestServerHandlerServesMetrics(t *testing.T) {
 	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
 	assert.Equal(t, http.StatusOK, rec.Code, "the handler serves /metrics through the auth middleware")
 }
+
+// Enabling auth.type: forward_auth wires the forward-auth authorizer into the
+// real HTTP handler so the API enforces the read/write tiers per request: an
+// unauthenticated caller is rejected, an authenticated read-tier caller cannot
+// write, and an authenticated write-tier caller passes the auth gate. This
+// exercises the full config → buildAuthorizer → middleware → tier path, not just
+// the authorizer in isolation.
+func TestForwardAuthEnforcedThroughServerHandler(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	cfg := &api.ServerConfig{
+		Auth: api.AuthConfig{
+			Type: "forward_auth",
+			ForwardAuth: api.ForwardAuthSettings{
+				// httptest's default RemoteAddr (192.0.2.1) falls in this range,
+				// so it is the trusted proxy; other sources are untrusted.
+				TrustedProxyCIDRs: []string{"192.0.2.0/24"},
+				GroupsHeader:      "X-Forwarded-Capabilities",
+				WriteGroups:       []string{"owners"},
+			},
+		},
+	}
+	svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
+	webhook, err := buildWebhookRuntime(cfg, svc, logger)
+	require.NoError(t, err)
+	authz, err := buildAuthorizer(t.Context(), cfg.Auth, nil, logger)
+	require.NoError(t, err)
+	telemetry, err := api.SetupTelemetry(logger)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		_ = telemetry.Shutdown(shutdownCtx)
+	})
+
+	srv := &Server{cfg: cfg, svc: svc, logger: logger, webhook: webhook, telemetry: telemetry, authz: authz}
+	handler := srv.Handler()
+
+	const trusted = "192.0.2.1:1234"
+	const untrusted = "203.0.113.5:1234"
+
+	t.Run("unauthenticated request is rejected with 401", func(t *testing.T) {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+		req.RemoteAddr = untrusted
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
+
+	t.Run("authenticated read-tier caller is denied a write with 403", func(t *testing.T) {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", nil)
+		req.RemoteAddr = trusted
+		req.Header.Set("X-Forwarded-User", "alice")
+		req.Header.Set("X-Forwarded-Capabilities", "readers")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+	})
+
+	t.Run("authenticated write-tier caller is authorized and reaches the write handler", func(t *testing.T) {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", nil)
+		req.RemoteAddr = trusted
+		req.Header.Set("X-Forwarded-User", "bob")
+		req.Header.Set("X-Forwarded-Capabilities", "owners")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		// The write is authorized — not rejected at auth — so it reaches the plan
+		// handler, which rejects this empty body with 400. The contrast with the
+		// read-tier caller above (403, blocked before the handler) is the proof
+		// that a write-group member is permitted to perform the write.
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+}

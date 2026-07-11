@@ -711,6 +711,21 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		ps.stateEnteredAt = now
 	}
 
+	// Surface once, at Warn, when a sharded engine reached an active state but
+	// could not report per-shard/row-copy progress for a reason that persists for
+	// the whole apply (a missing vtgate DSN). Only the persistent reason warns:
+	// the transient reasons (schema-change context still being discovered, shard
+	// rows not yet registered at copy start) can self-heal on a later poll, so a
+	// one-shot warning for them would be a false alarm that latches forever; they
+	// stay visible in the engine's per-poll Debug. Warn (not Debug) so the
+	// degraded visibility is always in Datadog without enabling debug logging.
+	if result.PerShardProgressUnavailable == engine.PerShardUnavailableNoVtgateDSN && !ps.warnedPerShardUnavailable &&
+		state.IsState(newState, state.Task.Running, state.Task.WaitingForCutover, state.Task.RevertWindow) {
+		c.logger.Warn("per-shard progress unavailable: per-shard and row-copy progress will not be reported for this apply",
+			append(apply.LogAttrs(), "reason", result.PerShardProgressUnavailable, "task_state", newState)...)
+		ps.warnedPerShardUnavailable = true
+	}
+
 	// Log progress every 10 seconds
 	c.logAtomicProgress(ctx, apply, result, ps, now)
 
@@ -727,6 +742,18 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		c.logger.Warn("pending cutover request processing failed after progress sync; current apply owner will exit for operator retry",
 			"apply_id", apply.ApplyIdentifier, "error", err)
 		return true
+	}
+	// A volume failure never aborts the drive: the copy continues at its
+	// current volume and a still-pending request is retried at the next tick.
+	// A lost lease is the exception — this owner must stop driving.
+	if err := c.processPendingVolumeControlRequest(ctx, apply, eng, creds, resumeState); err != nil {
+		if errors.Is(err, storage.ErrApplyLeaseLost) {
+			c.logger.Warn("pending volume request processing lost the apply lease; current apply owner will exit for operator retry",
+				"apply_id", apply.ApplyIdentifier, "error", err)
+			return true
+		}
+		c.logger.Warn("pending volume request processing failed; the drive continues and retries at the next progress tick",
+			"apply_id", apply.ApplyIdentifier, "error", err)
 	}
 
 	opts := storage.ApplyOptionsFromMap(options)
@@ -826,9 +853,34 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 	}
 
+	// A durable revert control request (the interactive "revert" command) was
+	// queued; honor it. This is the apply owner's retry path: the API's immediate
+	// revert attempt may have failed or its process may have died, leaving the
+	// request pending for the drive.
+	revertedByControlRequest := false
+	if result.State == engine.StateRevertWindow && !ps.revertSkipped {
+		if pending, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationRevert); err != nil {
+			c.logger.Warn("could not load pending revert control request", "apply_id", apply.ApplyIdentifier, "error", err)
+		} else if pending != nil {
+			c.logger.Info("revert requested by user; reverting schema change", "apply_id", apply.ApplyIdentifier, "requested_by", controlRequestCaller(pending))
+			if _, err := eng.Revert(ctx, controlReq); err != nil {
+				// Leave the request pending so the next drive tick retries.
+				c.logger.Error("revert (control request) failed; will retry", "error", err, "apply_id", apply.ApplyIdentifier)
+			} else {
+				revertedByControlRequest = true
+				if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert); err != nil {
+					c.logger.Warn("failed to complete revert control request", "apply_id", apply.ApplyIdentifier, "error", err)
+				}
+				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventRevertTriggered, storage.LogSourceSchemaBot,
+					fmt.Sprintf("Revert triggered by user%s", callerApplyLogSuffix(controlRequestCaller(pending))), state.Apply.RevertWindow, state.Apply.Reverting)
+			}
+		}
+	}
+
 	// Revert window enabled (default): auto-skip based on deployed_at + configured duration.
-	// Falls back to stateEnteredAt if deployed_at is unavailable.
-	if result.State == engine.StateRevertWindow && !opts.SkipRevert && !ps.revertSkipped {
+	// Falls back to stateEnteredAt if deployed_at is unavailable. A user revert
+	// this tick takes precedence — do not also auto-skip the window shut.
+	if result.State == engine.StateRevertWindow && !opts.SkipRevert && !ps.revertSkipped && !revertedByControlRequest {
 		revertDeadline := c.revertWindowDeadline(result.ResumeState, ps.stateEnteredAt)
 		if !revertDeadline.IsZero() && now.After(revertDeadline) {
 			c.logger.Info("revert window expired, skipping", "apply_id", apply.ApplyIdentifier, "deadline", revertDeadline)
@@ -911,8 +963,8 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			"stored_state", freshApply.State,
 			"progress_state", apply.State)
 		*apply = *freshApply
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-			c.logger.Warn("failed to complete pending stop request for terminal apply; current apply owner will exit for operator retry",
+		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
+			c.logger.Warn("failed to complete pending control requests for terminal apply; current apply owner will exit for operator retry",
 				"apply_id", apply.ApplyIdentifier, "error", err)
 			return true
 		}
@@ -958,8 +1010,8 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 				"apply_id", apply.ApplyIdentifier, "expected_state", expectedState, "derived_state", apply.State)
 			return true
 		}
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-			c.logger.Warn("failed to complete pending stop request after terminal progress reconciliation; current apply owner will exit for operator retry",
+		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
+			c.logger.Warn("failed to complete pending control requests after terminal progress reconciliation; current apply owner will exit for operator retry",
 				"apply_id", apply.ApplyIdentifier, "error", err)
 			return true
 		}
@@ -1180,9 +1232,10 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 // of a live re-query. It runs only inside the operator's lease-held drive: a
 // multi-operation fan-out drive holds the operation lease, a single-operation
 // (whole-apply) drive holds the apply lease, and UpsertShardProgress accepts
-// either. Read-path callers carry neither lease and skip, so a plain progress
-// read never writes. A failed shard write is logged, not fatal — the next
-// reconcile re-applies it.
+// either. Every drive runs under an operator claim, so a poll context without
+// a lease is an invariant violation: the per-shard breakdown would silently
+// stop persisting, which is warned loudly rather than skipped quietly. A
+// failed shard write is logged, not fatal — the next reconcile re-applies it.
 func (c *LocalClient) writeShardProgress(ctx context.Context, table *storage.Task, tp *engine.TableProgress, now time.Time) {
 	if len(tp.Shards) == 0 {
 		return
@@ -1190,6 +1243,8 @@ func (c *LocalClient) writeShardProgress(ctx context.Context, table *storage.Tas
 	_, hasOpLease := storage.OperationLeaseFromContext(ctx)
 	_, hasApplyLease := storage.ApplyLeaseFromContext(ctx)
 	if !hasOpLease && !hasApplyLease {
+		c.logger.Warn("per-shard progress will not be persisted: drive context carries no operation or apply lease",
+			append(table.LogAttrs(), "namespace", table.Namespace, "shard_count", len(tp.Shards))...)
 		return
 	}
 	var operationID int64

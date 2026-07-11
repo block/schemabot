@@ -113,16 +113,16 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	}
 	defer utils.CloseAndLog(srv)
 
-	// A configured GRPC_PORT means this process serves the data plane over its
-	// inline LocalClient drive, which does not maintain apply_operations state —
-	// so default operator claiming to the apply level (unless config set it
-	// explicitly). This is a Run convenience, not a server mode: an embedder
-	// sets ServerConfig.OperatorClaimOperations directly. Applied before Start
+	// A configured GRPC_PORT means this process serves the data plane, whose
+	// LocalClient drives claim at the apply level — so default operator claiming
+	// to the apply level (unless config set it explicitly). This is a Run
+	// convenience, not a server mode: an embedder sets
+	// ServerConfig.OperatorClaimOperations directly. Applied before Start
 	// (which launches the operator) so the operator reads the resolved value.
 	if applyDataPlaneClaimDefault(cfg, grpcPort != "") {
 		srv.logger.Info("data-plane gRPC mode: defaulting operator claiming to the apply level", "grpc_port", grpcPort)
 	} else if grpcPort != "" && cfg.ShouldClaimOperations() {
-		srv.logger.Warn("data-plane gRPC mode has operation-level operator claiming enabled; the inline LocalClient drive does not maintain apply_operations state, so stop/start resume will not recover", "grpc_port", grpcPort)
+		srv.logger.Warn("data-plane gRPC mode has operation-level operator claiming enabled; data-plane drives hold apply-level leases, so stop/start resume will not recover", "grpc_port", grpcPort)
 	}
 
 	// Optionally start a gRPC server for the Tern proto (used by
@@ -256,7 +256,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 			return nil, fmt.Errorf("ensure schema after %d attempts: %w", maxRetries, err)
 		}
 
-		db, err = mysqlconn.Open(dsn)
+		db, err = mysqlconn.OpenReloadable(dsn, cfg.StorageDSN)
 		if err != nil {
 			return nil, fmt.Errorf("open database: %w", err)
 		}
@@ -394,9 +394,16 @@ func (s *Server) RegisterGRPC(ctx context.Context, gs *grpc.Server) error {
 		if err != nil {
 			return fmt.Errorf("build grpc tern client: %w", err)
 		}
-		// Owned by the Server (not the service's default client), so Close
-		// releases it.
+		// Owned by the Server (Close releases it; the service does not close its
+		// default client).
 		s.grpcClient = built
+		// A dispatched apply is queued for this data plane's own operator, which
+		// routes each claim by the apply's deployment/environment. A dispatch can
+		// carry an environment the static database config does not list, so the
+		// operator must fall back to the same client the gRPC transport serves —
+		// without it, every claim of a queued apply would fail "tern deployment
+		// not configured" and the apply would sit re-claimable forever.
+		s.svc.SetDefaultTernClient(built)
 		client = built
 	}
 	tern.NewServer(client).Register(gs)
@@ -439,14 +446,22 @@ func (s *Server) Start(ctx context.Context) {
 	s.svc.StartPendingDropsCleaner(ctx)
 }
 
-// Close releases the resources the Server owns and returns the first cleanup
-// error encountered. svc.Close stops the operator and health monitor and closes
-// the service's clients and storage (the database pool), so Close only stops the
-// pending-drops cleaner, shuts down telemetry, closes the service, and closes the
-// gRPC fallback client it built itself. It does not stop any gRPC server the
-// embedder owns. Safe to call once after Start.
+// Close releases the resources the Server owns and returns all cleanup errors
+// encountered, joined together. It stops the pending-drops cleaner, stops the
+// operator (before closing the gRPC client it built, see below), shuts down
+// telemetry, closes that gRPC fallback client, and closes the service. svc.Close
+// stops the health monitor and closes the service's clients and storage (the
+// database pool); it repeats StopOperator, which is idempotent, so that is a
+// no-op. It does not stop any gRPC server the embedder owns. Safe to call once
+// after Start.
 func (s *Server) Close() error {
 	s.svc.StopPendingDropsCleaner()
+	// Stop the operator before closing the gRPC client below: RegisterGRPC set
+	// that client as the service's default, so until the drivers drain, a claim
+	// of a queued apply can route to it — closing it first would hand a
+	// shutdown-window drive a closed client. StopOperator waits for in-flight
+	// drivers and is idempotent, so svc.Close repeating it is a no-op.
+	s.svc.StopOperator()
 
 	var errs []error
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -611,9 +626,11 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 
 	appID := serverConfig.GitHub.ResolveAppID()
 	ghClient := ghclient.NewClient(appID, []byte(ghPrivateKey), logger,
-		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs))
+		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs),
+		ghclient.WithConfigDirHints(serverConfig))
 	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger,
 		webhook.WithRepoWebhookSecret([]byte(repoWebhookSecret)))
+	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub webhook endpoint registered",
 		"app_id", appID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs,
 		"repo_webhook_dispatch", repoWebhookSecret != "")
@@ -672,7 +689,8 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 		}
 
 		clients[e.name] = ghclient.NewClient(e.id, []byte(privateKey), logger,
-			ghclient.WithTrustedCheckAppSlugs(e.cfg.TrustedCheckAppSlugs))
+			ghclient.WithTrustedCheckAppSlugs(e.cfg.TrustedCheckAppSlugs),
+			ghclient.WithConfigDirHints(serverConfig))
 		secretsByApp[e.name] = []byte(secret)
 		appByID[e.id] = e.name
 
@@ -687,6 +705,7 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 		appByID,
 		logger,
 	)
+	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub multi-App webhook endpoint registered", "apps", len(serverConfig.Apps))
 	return webhookRuntime{
 		handler:                         handler,
@@ -743,6 +762,33 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups []stri
 			logger.Warn("OIDC authentication enabled with no admin groups configured: all write operations will be denied (read and plan still work). Set pr_command_authorization.admin_teams to allow writes.")
 		}
 		logger.Info("OIDC authentication enabled", "issuer", cfg.Issuer)
+		return authz, nil
+	case "forward_auth":
+		fa := cfg.ForwardAuth
+		logger.Info("initializing forward-auth authentication",
+			"trusted_proxy_cidrs", len(fa.TrustedProxyCIDRs),
+			"trusted_proxy_spiffe", len(fa.TrustedProxySPIFFE),
+			"read_groups", len(fa.ReadGroups),
+			"write_groups", len(fa.WriteGroups))
+		authz, err := auth.NewForwardAuthAuthorizer(auth.ForwardAuthConfig{
+			UserHeader:         fa.UserHeader,
+			GroupsHeader:       fa.GroupsHeader,
+			GroupsDelimiter:    fa.GroupsDelimiter,
+			TrustedProxySPIFFE: fa.TrustedProxySPIFFE,
+			TrustedProxyCIDRs:  fa.TrustedProxyCIDRs,
+			ReadGroups:         fa.ReadGroups,
+			WriteGroups:        fa.WriteGroups,
+		}, logger)
+		if err != nil {
+			return nil, err
+		}
+		if len(fa.WriteGroups) == 0 {
+			logger.Warn("forward-auth enabled with no write groups configured: all write operations will be denied (read still works). Set auth.forward_auth.write_groups to allow writes.")
+		}
+		if len(fa.ReadGroups) == 0 {
+			logger.Info("forward-auth enabled with no read groups configured: read operations are open to any authenticated caller from the trusted proxy. Set auth.forward_auth.read_groups to restrict reads.")
+		}
+		logger.Info("forward-auth authentication enabled")
 		return authz, nil
 	default:
 		return nil, fmt.Errorf("auth type %q is not yet supported", cfg.Type)

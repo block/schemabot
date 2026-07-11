@@ -4,12 +4,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -245,6 +247,72 @@ func TestFindAllConfigsForPRDiscoversChangedConfigFile(t *testing.T) {
 	require.Len(t, configs, 1)
 	assert.Equal(t, "widgets", configs[0].Config.Database)
 	assert.Equal(t, "apps/widgets/schema", configs[0].SchemaDir)
+}
+
+// TestFindConfigsForPRFilesProbesEachDirectoryOnce exercises discovery for a
+// PR that touches many schema files under shared directory trees — the shape
+// of an onboarding PR that adds a declarative schema root while deleting a
+// legacy SQL tree. Discovery must fetch each candidate directory's
+// schemabot.yaml at most once, so the GitHub call volume is bounded by the
+// number of unique directories rather than changed files × directory depth,
+// and large PRs complete within the webhook processing deadline.
+func TestFindConfigsForPRFilesProbesEachDirectoryOnce(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+
+	var files []*gh.CommitFile
+	for i := range 40 {
+		files = append(files, &gh.CommitFile{
+			Filename: new(fmt.Sprintf("apps/widgets/service/resources/legacy-sql/v%04d__change.sql", i)),
+			Status:   new("removed"),
+		})
+	}
+	for i := range 10 {
+		files = append(files, &gh.CommitFile{
+			Filename: new(fmt.Sprintf("apps/widgets/service/resources/schema/widgets/table_%d.sql", i)),
+			Status:   new("added"),
+		})
+	}
+	registerPullRequestFiles(t, mux, files)
+
+	var mu sync.Mutex
+	probesByPath := make(map[string]int)
+	countProbe := func(r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		probesByPath[r.URL.Path]++
+	}
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/apps/widgets/service/resources/schema/schemabot.yaml", func(w http.ResponseWriter, r *http.Request) {
+		countProbe(r)
+		require.NoError(t, json.NewEncoder(w).Encode(gh.RepositoryContent{
+			Type:     new("file"),
+			Encoding: new("base64"),
+			Content:  new(base64.StdEncoding.EncodeToString([]byte("database: widgets\ntype: mysql\n"))),
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/", func(w http.ResponseWriter, r *http.Request) {
+		countProbe(r)
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	configs, err := ic.FindAllConfigsForPR(t.Context(), "octocat/hello-world", 1)
+
+	require.NoError(t, err)
+	require.Len(t, configs, 1)
+	assert.Equal(t, "widgets", configs[0].Config.Database)
+	assert.Equal(t, "apps/widgets/service/resources/schema", configs[0].SchemaDir)
+
+	// Every candidate directory between the changed files and the repo root,
+	// deduplicated: the two file trees share ancestors, so the probe count
+	// must not scale with the number of changed files.
+	mu.Lock()
+	defer mu.Unlock()
+	for probePath, count := range probesByPath {
+		assert.Equalf(t, 1, count, "directory probed more than once: %s", probePath)
+	}
+	assert.Len(t, probesByPath, 8)
 }
 
 func TestFindConfigForPRDiscoversChangedConfigFile(t *testing.T) {
@@ -643,4 +711,382 @@ func registerDirectoryContent(t *testing.T, mux *http.ServeMux, endpointPath str
 	mux.HandleFunc("GET "+endpointPath, func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(contents))
 	})
+}
+
+// registerTruncatedRepoWithSchemaSubtree registers git-tree handlers for a
+// repository whose whole-repo recursive listing is truncated but whose
+// subtrees resolve: shallow fetches of the root and intermediate levels return
+// directory entries, and the apps/widgets/schema subtree lists subtreeEntries
+// (paths relative to that directory).
+// registerConfigTestPullRequest serves PR #1 with head SHA abc123, matching
+// the tree fixtures used by the truncated-repo config tests.
+func registerConfigTestPullRequest(t *testing.T, mux *http.ServeMux) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"head": map[string]any{"ref": "feature", "sha": "abc123"},
+			"base": map[string]any{"ref": "main", "sha": "def456"},
+			"user": map[string]any{"login": "mona"},
+		}))
+	})
+}
+
+func registerTruncatedRepoWithSchemaSubtree(t *testing.T, mux *http.ServeMux, subtreeEntries []map[string]any) {
+	t.Helper()
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("recursive") == "1" {
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"truncated": true,
+				"tree":      []any{},
+			}))
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"tree": []any{
+			map[string]any{"path": "apps", "type": "tree", "sha": "tree-apps"},
+			map[string]any{"path": "README.md", "type": "blob", "sha": "blob-readme"},
+		}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/tree-apps", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"tree": []any{
+			map[string]any{"path": "widgets", "type": "tree", "sha": "tree-widgets"},
+		}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/tree-widgets", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"tree": []any{
+			map[string]any{"path": "schema", "type": "tree", "sha": "tree-schema"},
+		}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/tree-schema", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"tree": subtreeEntries}))
+	})
+}
+
+func registerGitBlob(t *testing.T, mux *http.ServeMux, sha, content string) {
+	t.Helper()
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/blobs/"+sha, func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Blob{
+			Content:  new(base64.StdEncoding.EncodeToString([]byte(content))),
+			Encoding: new("base64"),
+		}))
+	})
+}
+
+// testConfigDirHints implements ConfigDirHints for tests: the repo-wide scan
+// and every database-scoped lookup return the same directories.
+type testConfigDirHints struct {
+	t          *testing.T
+	dirs       []string
+	exhaustive bool
+}
+
+func (h testConfigDirHints) SchemaDirHintsForRepo(repo string) ([]string, bool) {
+	require.Equal(h.t, "octocat/hello-world", repo)
+	return h.dirs, h.exhaustive
+}
+
+func (h testConfigDirHints) SchemaDirHintsForDatabase(repo, _ string) ([]string, bool) {
+	require.Equal(h.t, "octocat/hello-world", repo)
+	return h.dirs, h.exhaustive
+}
+
+func widgetsConfigDirHints(t *testing.T, dirs ...string) ConfigDirHints {
+	t.Helper()
+	return testConfigDirHints{t: t, dirs: dirs, exhaustive: true}
+}
+
+// A repo-root schema path cannot be recovered through a subtree fetch when
+// the repository tree is truncated — the root tree is the truncated listing
+// itself — so schema-file loading keeps the truncation error instead of
+// misreporting an empty schema directory.
+func TestFetchSchemaFilesFromTreeTruncatedRepoRootFailsClosed(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, nil)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	_, err := ic.fetchSchemaFilesFromTree(t.Context(), "octocat/hello-world", "abc123", ".")
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrGitTreeTruncated)
+}
+
+func TestFindAllConfigsTruncatedTreeFallsBackToConfigDirHints(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+		{"path": "main/widgets.sql", "type": "blob", "sha": "blob-sql", "mode": "100644"},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(widgetsConfigDirHints(t, "apps/widgets/schema"))
+
+	result, err := ic.FindAllConfigs(t.Context(), "octocat/hello-world", "abc123")
+
+	require.NoError(t, err)
+	require.Len(t, result.ValidConfigs, 1)
+	assert.Equal(t, "widgets", result.ValidConfigs[0].Config.Database)
+	assert.Equal(t, "apps/widgets/schema", result.ValidConfigs[0].SchemaDir)
+	assert.Equal(t, "apps/widgets/schema/schemabot.yaml", result.ValidConfigs[0].Path)
+	assert.Empty(t, result.InvalidConfigs)
+}
+
+func TestFindAllConfigsTruncatedTreeFindsConfigNestedBelowHintDir(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "payments/schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+		{"path": "payments/transactions.sql", "type": "blob", "sha": "blob-sql", "mode": "100644"},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/payments/schemabot.yaml", "database: payments\ntype: mysql\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(widgetsConfigDirHints(t, "apps/widgets/schema"))
+
+	result, err := ic.FindAllConfigs(t.Context(), "octocat/hello-world", "abc123")
+
+	require.NoError(t, err)
+	require.Len(t, result.ValidConfigs, 1)
+	assert.Equal(t, "payments", result.ValidConfigs[0].Config.Database)
+	assert.Equal(t, "apps/widgets/schema/payments", result.ValidConfigs[0].SchemaDir)
+}
+
+func TestFindAllConfigsTruncatedTreeSkipsMissingHintDir(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(widgetsConfigDirHints(t, "apps/gone/schema", "apps/widgets/schema"))
+
+	result, err := ic.FindAllConfigs(t.Context(), "octocat/hello-world", "abc123")
+
+	require.NoError(t, err)
+	require.Len(t, result.ValidConfigs, 1)
+	assert.Equal(t, "widgets", result.ValidConfigs[0].Config.Database)
+}
+
+func TestFindAllConfigsTruncatedTreeFailsClosedWhenHintDirsHaveNoConfigs(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "main/widgets.sql", "type": "blob", "sha": "blob-sql", "mode": "100644"},
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(widgetsConfigDirHints(t, "apps/widgets/schema"))
+
+	_, err := ic.FindAllConfigs(t.Context(), "octocat/hello-world", "abc123")
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrGitTreeTruncated)
+}
+
+func TestFindAllConfigsTruncatedTreeFailsClosedWhenNoHintsForRepo(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, nil)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(widgetsConfigDirHints(t))
+
+	_, err := ic.FindAllConfigs(t.Context(), "octocat/hello-world", "abc123")
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrGitTreeTruncated)
+}
+
+// A database-scoped lookup on a truncated repo probes only the named
+// database's configured directories: the config is found without scanning
+// every configured directory in the repo.
+func TestFindConfigByDatabaseNameInRepoTruncatedUsesScopedProbe(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+	registerConfigTestPullRequest(t, mux)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(widgetsConfigDirHints(t, "apps/widgets/schema"))
+
+	config, configDir, err := ic.FindConfigByDatabaseNameInRepo(t.Context(), "octocat/hello-world", 1, "widgets")
+
+	require.NoError(t, err)
+	assert.Equal(t, "widgets", config.Database)
+	assert.Equal(t, "apps/widgets/schema", configDir)
+}
+
+// A scoped probe that lists the database's configured directories completely
+// and finds no config for it is authoritative: the caller gets a clear
+// not-found error, with no misleading available-databases list (other
+// databases were never enumerated).
+func TestFindConfigByDatabaseNameInRepoTruncatedScopedProbeNotFound(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+	registerConfigTestPullRequest(t, mux)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(widgetsConfigDirHints(t, "apps/widgets/schema"))
+
+	_, _, err := ic.FindConfigByDatabaseNameInRepo(t.Context(), "octocat/hello-world", 1, "payments")
+
+	var notFound *DatabaseNotFoundError
+	require.ErrorAs(t, err, &notFound)
+	assert.Equal(t, "payments", notFound.DatabaseName)
+	assert.Empty(t, notFound.AvailableDatabases)
+	assert.NotContains(t, err.Error(), "Available databases")
+}
+
+// A database whose own directories cannot be probed exhaustively keeps the
+// fail-closed truncation error for scoped lookups, exactly like the
+// repo-wide scan.
+func TestFindConfigByDatabaseNameInRepoTruncatedNotExhaustiveFailsClosed(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, nil)
+	registerConfigTestPullRequest(t, mux)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(testConfigDirHints{t: t, dirs: []string{"apps/widgets/schema"}, exhaustive: false})
+
+	_, _, err := ic.FindConfigByDatabaseNameInRepo(t.Context(), "octocat/hello-world", 1, "widgets")
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrGitTreeTruncated)
+}
+
+// A database that allows configs outside every probe-able directory (no
+// allowed_dirs, a wildcard, or a repo-root entry) makes the hint list
+// non-exhaustive: a partial probe could return a confidently wrong result, so
+// discovery must keep the truncation error even when other hinted directories
+// would have yielded configs.
+func TestFindAllConfigsTruncatedTreeFailsClosedWhenHintsNotExhaustive(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(testConfigDirHints{t: t, dirs: []string{"apps/widgets/schema"}, exhaustive: false})
+
+	_, err := ic.FindAllConfigs(t.Context(), "octocat/hello-world", "abc123")
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrGitTreeTruncated)
+}
+
+func TestFindAllConfigsTruncatedTreeReportsInvalidHintDirConfig(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "type: mysql\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(widgetsConfigDirHints(t, "apps/widgets/schema"))
+
+	result, err := ic.FindAllConfigs(t.Context(), "octocat/hello-world", "abc123")
+
+	require.NoError(t, err)
+	assert.Empty(t, result.ValidConfigs)
+	require.Len(t, result.InvalidConfigs, 1)
+	assert.Equal(t, "apps/widgets/schema/schemabot.yaml", result.InvalidConfigs[0].Path)
+	assert.Contains(t, result.InvalidConfigs[0].Error, "database is required")
+}
+
+func TestFindConfigByDatabaseNameTruncatedTreeUsesConfigDirHints(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("docs/readme.md"),
+		Status:   new("modified"),
+	}})
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(widgetsConfigDirHints(t, "apps/widgets/schema"))
+
+	config, schemaDir, err := ic.FindConfigByDatabaseName(t.Context(), "octocat/hello-world", 1, "widgets")
+
+	require.NoError(t, err)
+	assert.Equal(t, "widgets", config.Database)
+	assert.Equal(t, "apps/widgets/schema", schemaDir)
+}
+
+func TestFetchSchemaFilesFromTreeTruncatedRootUsesSchemaSubtree(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+		{"path": "main/widgets.sql", "type": "blob", "sha": "blob-sql", "mode": "100644"},
+	})
+	registerGitBlob(t, mux, "blob-sql", "CREATE TABLE `widgets` (`id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY);")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	files, err := ic.fetchSchemaFilesFromTree(t.Context(), "octocat/hello-world", "abc123", "apps/widgets/schema")
+
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	assert.Equal(t, "apps/widgets/schema/main/widgets.sql", files[0].Path)
+	assert.Equal(t, "widgets.sql", files[0].Name)
+	assert.Contains(t, files[0].Content, "CREATE TABLE")
+	assert.Contains(t, files[0].Content, "widgets")
+}
+
+func TestFetchSchemaFilesFromTreeTruncatedRootFailsClosedOnSubtreeSymlink(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "linked", "type": "blob", "sha": "blob-link", "mode": "120000"},
+		{"path": "main/widgets.sql", "type": "blob", "sha": "blob-sql", "mode": "100644"},
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, err := ic.fetchSchemaFilesFromTree(t.Context(), "octocat/hello-world", "abc123", "apps/widgets/schema")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "symlink")
+}
+
+func TestFetchSchemaFilesFromTreeTruncatedRootMissingSchemaDirReturnsNoFiles(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, nil)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	files, err := ic.fetchSchemaFilesFromTree(t.Context(), "octocat/hello-world", "abc123", "apps/gone/schema")
+
+	require.NoError(t, err)
+	assert.Empty(t, files)
+}
+
+func TestFetchSchemaFilesFromTreeFailsClosedWhenSubtreeAlsoTruncated(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("recursive") == "1" {
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"truncated": true, "tree": []any{}}))
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"tree": []any{
+			map[string]any{"path": "apps", "type": "tree", "sha": "tree-huge"},
+		}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/tree-huge", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("recursive") == "1" {
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"truncated": true, "tree": []any{}}))
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"tree": []any{}}))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, err := ic.fetchSchemaFilesFromTree(t.Context(), "octocat/hello-world", "abc123", "apps")
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrGitTreeTruncated)
 }

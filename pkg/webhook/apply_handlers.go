@@ -34,15 +34,25 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		return
 	}
 
+	ackedEarly := h.acknowledgeCommandEarlyIfOwned(ctx, client, repo, pr, databaseName, result.Tenant, installationID, result.CommentID)
+
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Apply)
 	if err != nil {
+		if h.skipUnownedUnscopedCommand(repo, result.Tenant, err) {
+			h.logger.Debug("unscoped fan-out apply touches no schema this deployment owns; staying silent",
+				"repo", repo, "pr", pr, "environment", environment, "error", err)
+			return
+		}
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err)
 		return
 	}
 	if err := h.attachServerEnvironments(schemaResult, environment); err != nil {
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err)
 		return
+	}
+	if !ackedEarly {
+		h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 	}
 
 	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.Apply); blocked {
@@ -310,6 +320,11 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	// Discover database config from PR's schemabot.yaml
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.ApplyConfirm)
 	if err != nil {
+		if h.skipUnownedUnscopedCommand(repo, result.Tenant, err) {
+			h.logger.Debug("unscoped fan-out apply-confirm touches no schema this deployment owns; staying silent",
+				"repo", repo, "pr", pr, "environment", environment, "error", err)
+			return
+		}
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err)
 		return
 	}
@@ -378,6 +393,11 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 		return
 	}
 	if existingLock == nil {
+		if h.silentOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("unscoped fan-out apply-confirm found no pending confirmation on this deployment; staying silent",
+				"repo", repo, "pr", pr, "database", database, "environment", environment)
+			return
+		}
 		h.logger.Info("apply-confirm rejected: no lock held", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderApplyConfirmNoLock(database, environment))
 		return
@@ -402,6 +422,7 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 			"This lock belongs to a rollback plan. Use `schemabot rollback-confirm` to execute it, or `schemabot unlock` to cancel it.")
 		return
 	}
+	h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 
 	// Cross-delivery freshness check: reject if the confirmation plan (the one
 	// the user reviewed) was rendered against a commit that is no longer the
@@ -474,6 +495,7 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 		h.postComment(repo, pr, installationID, templates.RenderNoLocksFound())
 		return
 	}
+	h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 
 	// Unlock mutates lock state for every matched database, including
 	// force-releasing CLI-owned locks, so the actor must be an authorized

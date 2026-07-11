@@ -94,6 +94,29 @@ func PreviewCommentNoManagedSchemaChanges() string {
 	})
 }
 
+// PreviewCommentNoManagedSchemaChangesChecksRefreshed renders the plan-command
+// outcome for a PR with no managed schema changes and no apply-owned state:
+// the SchemaBot checks were recreated as passing on the current head.
+func PreviewCommentNoManagedSchemaChangesChecksRefreshed() string {
+	return RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-03-15 14:30:00",
+		HeadSHA:     previewHeadSHA,
+	})
+}
+
+// PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants renders
+// the aggregate-leader variant of the checks-refreshed comment: the refreshed
+// check gates on tenant deployments' own checks for the touched schema paths.
+func PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants() string {
+	return RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
+		RequestedBy:    previewRequestedBy,
+		Timestamp:      "2026-03-15 14:30:00",
+		HeadSHA:        previewHeadSHA,
+		GatedOnTenants: true,
+	})
+}
+
 // PreviewCommentSchemaReconciliationInProgress renders the reconciliation
 // comment for a PR whose current diff no longer contains managed schema files
 // while a stored apply from that PR is still running.
@@ -1029,6 +1052,23 @@ func PreviewCommentApplyFailed() string {
 	return RenderApplyStatusComment(data)
 }
 
+// PreviewCommentApplyRetrying renders an apply comment where the middle table
+// was interrupted by a retryable failure and the driver is redispatching it,
+// with the attempt counter showing how much of the retry budget is used.
+func PreviewCommentApplyRetrying() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.FailedRetryable
+	tables[1].RowsCopied = 439870
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 30
+	tables[1].ErrorMessage = PreviewErrorMiddleFailed
+	tables[2].Status = state.Task.Pending
+	data := sampleApplyData(state.Apply.FailedRetryable, tables)
+	data.Attempt = 1
+	return RenderApplyStatusComment(data)
+}
+
 // PreviewCommentApplyStopped renders a sample apply-stopped comment.
 func PreviewCommentApplyStopped() string {
 	tables := sampleApplyTables()[:2]
@@ -1111,6 +1151,20 @@ func PreviewCommentApplySkippingRevert() string {
 		tables[i].Status = state.Task.RevertWindow
 	}
 	data := sampleApplyData(state.Apply.SkippingRevert, tables)
+	data.Engine = "PlanetScale"
+	data.DeployRequestURL = "https://app.planetscale.com/acme/myapp/deploy-requests/42"
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyReverting renders a PlanetScale apply while its revert is in
+// progress: the change is being undone, which can take minutes, so it surfaces
+// as reverting rather than an ordinary in-progress apply.
+func PreviewCommentApplyReverting() string {
+	tables := sampleApplyTables()
+	for i := range tables {
+		tables[i].Status = state.Task.Reverting
+	}
+	data := sampleApplyData(state.Apply.Reverting, tables)
 	data.Engine = "PlanetScale"
 	data.DeployRequestURL = "https://app.planetscale.com/acme/myapp/deploy-requests/42"
 	return RenderApplyStatusComment(data)
@@ -1353,6 +1407,20 @@ func PreviewCommentApplySingleProgress() string {
 	table.PercentComplete = 48
 	table.ETASeconds = 330
 	return RenderApplyStatusComment(sampleSingleApplyData(state.Apply.Running, table))
+}
+
+// PreviewCommentApplySingleProgressVolume renders a single-table apply in
+// progress with a tuned volume level shown on the status line.
+func PreviewCommentApplySingleProgressVolume() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.Running
+	table.RowsCopied = 3500000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 48
+	table.ETASeconds = 330
+	data := sampleSingleApplyData(state.Apply.Running, table)
+	data.Volume = 8
+	return RenderApplyStatusComment(data)
 }
 
 // PreviewCommentApplySingleCompleted renders a single-table apply completed.

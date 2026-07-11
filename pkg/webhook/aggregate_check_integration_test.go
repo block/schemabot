@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -590,7 +591,7 @@ func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "no schema files in PR")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
 	// Wait for both passing aggregates (staging + production)
 	seen := map[string]bool{}
@@ -606,6 +607,90 @@ func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 	}
 	assert.True(t, seen["SchemaBot (staging)"], "expected SchemaBot (staging) check")
 	assert.True(t, seen["SchemaBot (production)"], "expected SchemaBot (production) check")
+}
+
+// An aggregate participant does not own the required check on a repo — the
+// leader does. On a PR that touches none of its schema, a participant posts no
+// check run at all (rather than a passing "No managed schema changes" aggregate
+// that would add a per-tenant row near the merge button).
+func TestE2EParticipantSilentOnNonSchemaPR(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, &api.ServerConfig{
+		AllowedEnvironments: []string{"staging", "production"},
+		Repos: map[string]api.RepoConfig{
+			"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}},
+		},
+	})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("abc123")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+
+	// PR changed files — no schema files.
+	filesFetched := make(chan struct{})
+	var filesFetchedOnce sync.Once
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		filesFetchedOnce.Do(func() { close(filesFetched) })
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+			{Filename: new("README.md"), Status: new("modified")},
+		})
+	})
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.Tree{SHA: new("abc123"), Entries: []*gh.TreeEntry{}, Truncated: new(false)})
+	})
+
+	// Any check-run POST here is a failure — a participant must stay silent.
+	checkRuns := make(chan checkRunCapture, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	// Wait until async config discovery reads the PR files, then drain
+	// briefly to confirm the participant stayed silent instead of publishing an
+	// aggregate on a PR with no managed schema changes.
+	select {
+	case <-filesFetched:
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for participant auto-plan discovery")
+	}
+	select {
+	case cr := <-checkRuns:
+		t.Fatalf("participant posted a check run on a non-schema PR: %q", cr.Name)
+	case <-time.After(2 * time.Second):
+	}
 }
 
 // TestE2ECheckRunRerequestReplansCurrentPR verifies that rerunning a SchemaBot
@@ -1076,7 +1161,7 @@ func TestE2EPassingAggregateOnSQLWithoutSchemabotYAML(t *testing.T) {
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "no schema files in PR")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
 	// Should post passing aggregate even though .sql files changed
 	select {
@@ -1154,7 +1239,7 @@ func TestE2EPassingAggregateWithoutAllowedEnvs(t *testing.T) {
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "no schema files in PR")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
 	// Single-instance mode posts a global "SchemaBot" passing aggregate
 	select {
@@ -1221,5 +1306,248 @@ func TestE2EFailingAggregateOnPlanError(t *testing.T) {
 		assert.Equal(t, "failure", cr.Conclusion)
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for failing aggregate check run")
+	}
+}
+
+// setupFakeGitHubHeadAndCheckRuns registers a fake PR endpoint that always
+// reports headSHA as the PR HEAD, plus check-run create/update capture.
+func setupFakeGitHubHeadAndCheckRuns(t *testing.T, mux *http.ServeMux, headSHA string) chan checkRunCapture {
+	t.Helper()
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new(headSHA)},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+
+	checkRuns := make(chan checkRunCapture, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 300})
+	})
+	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 300})
+	})
+	return checkRuns
+}
+
+// A PR-level guard failure (for example a schema change under a managed
+// directory whose schemabot.yaml was removed) records a blocking reason on the
+// stored aggregate state. A later recompute that does not re-verify the guard
+// — an apply finishing on another database in the same PR is the typical
+// trigger — must not replace the failing aggregate with a passing one. The
+// fold skips publishing entirely: no Check Run write, no storage write, and
+// the stored block stays authoritative until the auto-plan guards re-verify
+// the PR.
+func TestE2EAggregateBlockedStateSurvivesRecompute(t *testing.T) {
+	dbName := "webhook_agg_blocked_recompute"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// The guard's failing aggregate, blocked on the current commit.
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:     "octocat/hello-world",
+		PullRequest:    1,
+		HeadSHA:        "abc123",
+		Environment:    aggregateSentinel,
+		DatabaseType:   aggregateSentinel,
+		DatabaseName:   aggregateSentinel,
+		CheckRunID:     200,
+		HasChanges:     false,
+		Status:         checkStatusCompleted,
+		Conclusion:     checkConclusionFailure,
+		BlockingReason: managedDirMissingConfigBlock.blockingReason,
+		ErrorMessage:   managedDirMissingConfigBlock.message,
+	}))
+	// Another database in the PR applied successfully on the same commit. On
+	// its own this row would fold to a passing aggregate.
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   100,
+		HasChanges:   false,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionSuccess,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+	checkRuns := setupFakeGitHubHeadAndCheckRuns(t, mux, "abc123")
+
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+
+	h.updateAggregateCheck(ctx, installClient, "octocat/hello-world", 1, "abc123")
+
+	// updateAggregateCheck is synchronous: any Check Run write would already be
+	// on the channel. Nothing may be published over the blocked state.
+	select {
+	case cr := <-checkRuns:
+		t.Fatalf("aggregate check run published over blocked stored state: %+v", cr)
+	default:
+	}
+
+	stored, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1,
+		aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, managedDirMissingConfigBlock.blockingReason, stored.BlockingReason)
+	assert.Equal(t, managedDirMissingConfigBlock.message, stored.ErrorMessage)
+	assert.Equal(t, checkConclusionFailure, stored.Conclusion)
+	assert.Equal(t, "abc123", stored.HeadSHA)
+}
+
+// Stored per-database results are keyed to the commit they were computed for.
+// When the aggregate is recomputed on a newer commit — for example a CI
+// check_run completion arriving right after a push, before auto-plan has
+// stored anything for the new commit — rows from the previous commit must not
+// carry their old conclusions forward: they hold the aggregate open as
+// blocking in-progress placeholders until the new commit's own plan or apply
+// results land.
+func TestE2EAggregateStaleCommitRowsHoldAggregateOpen(t *testing.T) {
+	dbName := "webhook_agg_stale_sha"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// A successful result recorded for the previous commit.
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   100,
+		HasChanges:   false,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionSuccess,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+	checkRuns := setupFakeGitHubHeadAndCheckRuns(t, mux, "newsha222")
+
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+
+	h.updateAggregateCheck(ctx, installClient, "octocat/hello-world", 1, "newsha222")
+
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, "newsha222", cr.HeadSHA)
+		assert.Equal(t, checkStatusInProgress, cr.Status)
+		assert.Empty(t, cr.Conclusion, "a conclusion computed for a previous commit must not pass the aggregate on the current one")
+		require.NotNil(t, cr.Output)
+		assert.Equal(t, awaitingCurrentCommitTitle, cr.Output.Title)
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for blocking aggregate check run on the new commit")
+	}
+
+	stored, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1,
+		aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, "newsha222", stored.HeadSHA)
+	assert.Equal(t, checkStatusInProgress, stored.Status)
+	assert.Empty(t, stored.Conclusion)
+
+	// The previous commit's row is untouched — only its fold contribution is
+	// normalized, so the apply history stays intact.
+	dbCheck, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, dbCheck)
+	assert.Equal(t, "oldsha111", dbCheck.HeadSHA)
+	assert.Equal(t, checkConclusionSuccess, dbCheck.Conclusion)
+}
+
+// A stored aggregate block is released only by the auto-plan guard path: when
+// a commit passes config discovery, the managed-directory guard, and
+// environment coverage, the block is cleared and the fresh plan results drive
+// the aggregate again. This keeps a previously blocked PR from being stuck
+// forever once the author fixes the configuration and pushes (or re-runs the
+// checks).
+func TestE2EAggregateBlockClearedByReplan(t *testing.T) {
+	dbName := "webhook_agg_block_clear"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// The guard's failing aggregate from the previous commit.
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:     "octocat/hello-world",
+		PullRequest:    1,
+		HeadSHA:        "oldsha111",
+		Environment:    aggregateSentinel,
+		DatabaseType:   aggregateSentinel,
+		DatabaseName:   aggregateSentinel,
+		CheckRunID:     200,
+		HasChanges:     false,
+		Status:         checkStatusCompleted,
+		Conclusion:     checkConclusionFailure,
+		BlockingReason: managedDirMissingConfigBlock.blockingReason,
+		ErrorMessage:   managedDirMissingConfigBlock.message,
+	}))
+
+	// The new commit restores the config: discovery now finds schema files and
+	// a valid schemabot.yaml at the PR HEAD ("abc123").
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+	setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "synchronize",
+		headSHA: "abc123",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// The guards release the block and the new commit's plan result drives the
+	// aggregate: pending changes on the new HEAD, no blocking reason.
+	deadline := time.After(webhookIntegrationPollDeadline)
+	for {
+		stored, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1,
+			aggregateSentinel, aggregateSentinel, aggregateSentinel)
+		require.NoError(t, err)
+		if stored != nil && stored.HeadSHA == "abc123" && stored.BlockingReason == "" &&
+			stored.Conclusion == checkConclusionActionRequired {
+			assert.Equal(t, checkStatusCompleted, stored.Status)
+			assert.Empty(t, stored.ErrorMessage)
+			assert.True(t, stored.HasChanges)
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for the aggregate block to clear and the re-plan result to land; last stored state: %+v", stored)
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }

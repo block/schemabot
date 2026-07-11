@@ -57,7 +57,7 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStartRequested, storage.LogSourceSchemaBot,
 			"Start request queued for apply owner", "", "")
 	}
-	c.wakeOperatorForControlRequest(apply)
+	c.wakeOperator(apply)
 	return &ternv1.StartResponse{
 		Accepted:     true,
 		StartedCount: startedCount,
@@ -324,7 +324,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		// between re-plan (which reads schema) and Spirit's cutover (which renames
 		// the shadow table). If Spirit completed the cutover after the re-plan read
 		// the schema, the table already has the desired changes.
-		needsChange, err := c.tableStillNeedsChange(ctx, apply, plan, task)
+		replannedDDL, needsChange, err := c.tableStillNeedsChange(ctx, apply, plan, task)
 		if err != nil {
 			c.logger.Warn("could not verify table schema state, proceeding with apply",
 				"task_id", task.TaskIdentifier, "table", task.TableName, "error", err)
@@ -337,6 +337,15 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
 				fmt.Sprintf("Task %s already completed (cutover raced with re-plan)", task.TaskIdentifier))
 			continue
+		} else if err := verifyReplannedTaskDDL(task, replannedDDL); err != nil {
+			// Live schema drifted since resume began: the DDL this shard now
+			// needs no longer matches what was reviewed. Fail closed rather than
+			// apply unreviewed DDL.
+			c.logger.Error("resume aborting task: live schema drifted from the reviewed plan",
+				append(task.LogAttrs(), "error", err)...)
+			c.markTaskFailed(ctx, task, err.Error())
+			failedTask = task
+			break
 		}
 
 		action = c.runEngineTask(ctx, apply, task, options, creds)
@@ -393,16 +402,19 @@ func replanShardTableDDL(result *engine.PlanResult) map[shardTableKey]string {
 	return out
 }
 
-// tableStillNeedsChange does a quick re-plan to check if a task's table on its
-// own shard still needs schema changes. Returns false if it already has the
-// desired schema (e.g., Spirit's cutover completed during the stop sequence).
-func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.Apply, plan *storage.Plan, task *storage.Task) (bool, error) {
+// tableStillNeedsChange re-plans the full schema set and then looks up whether
+// this task's table still needs a change on its (namespace, shard). Returns
+// false if it already has the desired schema (e.g., Spirit's cutover completed
+// during the stop sequence). When the table still needs changes, it also returns
+// the DDL the re-plan would now apply so the caller can confirm it still matches
+// the reviewed DDL before applying it.
+func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.Apply, plan *storage.Plan, task *storage.Task) (string, bool, error) {
 	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{}, apply.Database, plan.SchemaFiles)
 	if err != nil {
-		return false, fmt.Errorf("re-plan check failed: %w", err)
+		return "", false, fmt.Errorf("re-plan check failed: %w", err)
 	}
-	_, stillNeeded := replanShardTableDDL(result)[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
-	return stillNeeded, nil
+	ddl, stillNeeded := replanShardTableDDL(result)[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
+	return ddl, stillNeeded, nil
 }
 
 // replanResult holds the result of replanAndFilterTasks.
@@ -439,19 +451,63 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 		}
 		ddl, stillNeeded := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
 		if !stillNeeded {
-			// This shard's table is no longer in the diff — it already completed.
+			// The re-plan diffs the reviewed target (plan.SchemaFiles) against
+			// this shard's live schema. A table dropping out of that diff means
+			// live already matches the reviewed target, so there is no remaining
+			// resume work for it — treat it as completed rather than drifted.
 			task.ProgressPercent = 100
 			task.CompletedAt = &now
 			c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
-				fmt.Sprintf("Task %s already completed (re-plan shows no remaining changes)", task.TaskIdentifier))
+				fmt.Sprintf("Task %s already completed (live schema matches the reviewed target)", task.TaskIdentifier))
 			completedCount++
 		} else {
+			// Fail closed if the re-plan would apply DDL this task was not
+			// reviewed with: the re-plan recomputes the delta against live
+			// schema, so on a drifted deployment it can produce unreviewed DDL
+			// that overwriting task.DDL would silently apply.
+			if err := verifyReplannedTaskDDL(task, ddl); err != nil {
+				return nil, err
+			}
 			task.DDL = ddl
 			activeTasks = append(activeTasks, task)
 		}
 	}
 
 	return &replanResult{ActiveTasks: activeTasks, CompletedCount: completedCount}, nil
+}
+
+// verifyReplannedTaskDDL fails closed when the DDL a resume re-plan would now
+// apply for a task differs from the DDL the task was reviewed with. The resume
+// re-plan recomputes each deployment's own delta against its live schema; on a
+// deployment whose schema has drifted, that recomputed delta is DDL no human
+// reviewed, and overwriting task.DDL with it would apply it silently. Comparing
+// canonical forms tolerates incidental formatting differences so only a real
+// semantic divergence trips the guard. A task with no reviewed DDL carries no
+// reference to compare against (only the legacy synthetic VSchema tasks, which
+// the engine-change builder already skips), so it is left to existing handling.
+func verifyReplannedTaskDDL(task *storage.Task, replannedDDL string) error {
+	if task.DDL == "" {
+		return nil
+	}
+	reviewedCanon, err := canonicalDDLForDrift(task.DDL)
+	if err != nil {
+		return fmt.Errorf("reviewed DDL for task %s: %w", task.TaskIdentifier, err)
+	}
+	replannedCanon, err := canonicalDDLForDrift(replannedDDL)
+	if err != nil {
+		return fmt.Errorf("re-planned DDL for task %s: %w", task.TaskIdentifier, err)
+	}
+	if reviewedCanon == replannedCanon {
+		return nil
+	}
+	loc := formatDriftLocation(driftChangeKey{
+		namespace: task.Namespace,
+		shard:     task.Shard,
+		table:     task.TableName,
+		operation: task.DDLAction,
+	})
+	return fmt.Errorf("local schema has drifted from the reviewed plan; resume would apply unreviewed DDL for %s: reviewed %q, re-planned %q",
+		loc, reviewedCanon, replannedCanon)
 }
 
 // prepareRetryableTasksForResume queues only the task work that previously
@@ -868,22 +924,54 @@ func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan) []engine.Sc
 }
 
 func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*storage.Task) {
-	if obs := c.getObserver(apply.ID); obs != nil {
+	// takeObserver (remove-then-notify, atomically) rather than get/notify/clear:
+	// the drive's terminal path can race deliverTerminalIfSettled's re-check, and
+	// OnTerminal must fire exactly once.
+	if obs := c.takeObserver(apply.ID); obs != nil {
 		obs.OnTerminal(apply, tasks)
-		c.clearObserver(apply.ID)
 	}
+}
+
+// guardDriveScope fails closed when a claimed apply does not belong to the
+// database this client is bound to. Operators claim from whatever Tern storage
+// they poll and resolve the drive client afterwards, and that resolution can
+// fall back to a database-bound default client (RegisterGRPC wires the gRPC
+// transport's client as the service-wide fallback) — so in a storage database
+// shared by more than one tern, a claim of another tern's apply would
+// otherwise run that apply's DDL against this client's target. Every
+// legitimate drive reaches a client whose database matches the apply's
+// deployment (Apply stamps Deployment from the creating client's database;
+// routing resolves operation drives by their deployment) or the apply's
+// database (the target router builds per-target clients keyed by it), so a
+// claim matching neither is foreign work. The refused apply stays claimable
+// by an operator whose client matches once its lease goes stale.
+func (c *LocalClient) guardDriveScope(apply *storage.Apply) error {
+	if apply == nil {
+		return fmt.Errorf("stored apply is required")
+	}
+	if apply.Deployment == c.config.Database || apply.Database == c.config.Database {
+		return nil
+	}
+	return fmt.Errorf("apply %s (database %q, deployment %q) is outside this client's database scope (%q); refusing to drive it against the wrong target",
+		apply.ApplyIdentifier, apply.Database, apply.Deployment, c.config.Database)
 }
 
 // ResumeApply starts or resumes an apply claimed by an operator driver.
 // Pending applies are dispatched for the first time; stale applies use the
 // engine's resume metadata to continue after a missed heartbeat.
 func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
+	if err := c.guardDriveScope(apply); err != nil {
+		return err
+	}
 	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
 		return fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	// Whole-apply scope has no single operation to order, so the stored apply
-	// options govern the drive directly (no automatic barrier park).
+	// options govern the drive directly (no automatic barrier park). A task-less
+	// apply is handled inside the shared resume path: VSchema-only plans are
+	// re-driven so the VSchema is applied, and any other task-less shape (e.g. a
+	// sharded dispatch whose shard already matches) completes as a no-op.
 	return c.resumeApplyWithTasks(ctx, apply, tasks, apply.GetOptions().Map(), false, false)
 }
 
@@ -893,6 +981,9 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 // are loaded scoped to the operation rather than the whole apply, so a driver
 // can advance one deployment independently of its siblings.
 func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	if err := c.guardDriveScope(apply); err != nil {
+		return err
+	}
 	op, err := c.storage.ApplyOperations().Get(ctx, applyOperationID)
 	if err != nil {
 		return fmt.Errorf("get apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
@@ -952,6 +1043,9 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
 	if apply == nil {
 		return fmt.Errorf("stored apply is required to drive apply_operation %d cutover", applyOperationID)
+	}
+	if err := c.guardDriveScope(apply); err != nil {
+		return err
 	}
 	op, err := c.storage.ApplyOperations().Get(ctx, applyOperationID)
 	if err != nil {

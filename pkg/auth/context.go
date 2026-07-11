@@ -7,6 +7,11 @@ package auth
 
 import "context"
 
+// AnonymousSubject is the subject NoneAuthorizer assigns when API auth is
+// disabled. It is a placeholder, not a real identity, so callers that attribute
+// actions to an authenticated user must not treat it as one.
+const AnonymousSubject = "anonymous"
+
 type contextKey struct{}
 
 // User represents an authenticated caller extracted from a request.
@@ -28,4 +33,17 @@ func WithUser(ctx context.Context, user *User) context.Context {
 func UserFromContext(ctx context.Context) *User {
 	user, _ := ctx.Value(contextKey{}).(*User)
 	return user
+}
+
+// AuthenticatedSubject returns the caller's subject and true only when the
+// request carries a real authenticated identity — a user is present and is not
+// the synthetic anonymous user NoneAuthorizer sets when auth is disabled. Use it
+// to attribute an action to the authenticated caller without falling back to the
+// anonymous placeholder.
+func AuthenticatedSubject(ctx context.Context) (string, bool) {
+	u := UserFromContext(ctx)
+	if u == nil || u.Subject == "" || u.Subject == AnonymousSubject {
+		return "", false
+	}
+	return u.Subject, true
 }

@@ -371,3 +371,98 @@ func createControlRequestTestApply(t *testing.T, store *Storage, applyIdentifier
 	require.NoError(t, err)
 	return applyID
 }
+
+// A volume control request carries its desired level in the row's metadata so
+// the driving instance can retune the engine from storage alone. The level
+// must survive the full request/pending/complete lifecycle, and re-requesting
+// after resolution must reset the row with the new level — a completed
+// adjustment never pins the payload of a later one.
+func TestControlRequestStore_VolumeRequestLifecycleRoundTripsLevel(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	applyID := createControlRequestTestApply(t, store, "apply_control_request_volume")
+	firstMetadata, err := storage.EncodeVolumeControlRequestMetadata(3)
+	require.NoError(t, err)
+	first, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     applyID,
+		Operation:   storage.ControlOperationVolume,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator-a",
+		Metadata:    firstMetadata,
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	pending, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationVolume)
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+	level, err := storage.DecodeVolumeControlRequestMetadata(pending.Metadata)
+	require.NoError(t, err)
+	assert.Equal(t, int32(3), level)
+
+	require.NoError(t, store.ControlRequests().CompletePending(ctx, applyID, storage.ControlOperationVolume))
+	pending, err = store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationVolume)
+	require.NoError(t, err)
+	assert.Nil(t, pending)
+	completed := getControlRequestByID(t, store, first.ID)
+	require.NotNil(t, completed)
+	assert.Equal(t, storage.ControlRequestCompleted, completed.Status)
+
+	secondMetadata, err := storage.EncodeVolumeControlRequestMetadata(9)
+	require.NoError(t, err)
+	second, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     applyID,
+		Operation:   storage.ControlOperationVolume,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator-b",
+		Metadata:    secondMetadata,
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+	assert.Equal(t, first.ID, second.ID)
+	assert.Equal(t, storage.ControlRequestPending, second.Status)
+	level, err = storage.DecodeVolumeControlRequestMetadata(second.Metadata)
+	require.NoError(t, err)
+	assert.Equal(t, int32(9), level)
+}
+
+// While a volume request is pending it is immutable: a second request returns
+// the existing row and its original level untouched. The tern layer relies on
+// this to reject a different-level request instead of silently changing the
+// level the driver is about to read, apply, and complete.
+func TestControlRequestStore_VolumeRequestPendingKeepsOriginalLevel(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	applyID := createControlRequestTestApply(t, store, "apply_control_request_volume_pending")
+	firstMetadata, err := storage.EncodeVolumeControlRequestMetadata(5)
+	require.NoError(t, err)
+	first, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     applyID,
+		Operation:   storage.ControlOperationVolume,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator-a",
+		Metadata:    firstMetadata,
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	secondMetadata, err := storage.EncodeVolumeControlRequestMetadata(11)
+	require.NoError(t, err)
+	second, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     applyID,
+		Operation:   storage.ControlOperationVolume,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator-b",
+		Metadata:    secondMetadata,
+	})
+	require.NoError(t, err)
+	require.True(t, alreadyPending)
+	assert.Equal(t, first.ID, second.ID)
+	level, err := storage.DecodeVolumeControlRequestMetadata(second.Metadata)
+	require.NoError(t, err)
+	assert.Equal(t, int32(5), level, "a pending volume request must keep the level it was queued with")
+}

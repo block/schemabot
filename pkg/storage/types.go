@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -9,6 +10,13 @@ import (
 
 	"github.com/block/schemabot/pkg/schema"
 )
+
+// MaxRecoveryAttempts is the operator retry budget for failed_retryable
+// applies: how many automatic redispatches an interrupted apply gets before it
+// is terminalized as failed. The original apply attempt is separate. Surfaced
+// in operator-facing progress (the PR comment's retry counter) and enforced by
+// the storage claim/expiry paths.
+const MaxRecoveryAttempts = 10
 
 // Cutover policies control how a multi-deployment rollout sequences the copy
 // and cutover phases of its deployments. The value is resolved from the
@@ -59,9 +67,11 @@ const (
 	// deployment instead of stopping at the first failure.
 	OnFailureContinue = "continue"
 
-	// OnFailurePause holds the rollout after a failure until a human releases
-	// it. It is a known value but not yet supported; config validation rejects
-	// it until the release machinery lands.
+	// OnFailurePause holds the rollout after a failure until a human releases it
+	// (via the release control op) so the remaining deployments proceed; to
+	// abort instead, use the separate stop/cancel control op. Until released,
+	// later deployments do not start and the apply reports the non-terminal
+	// paused state; the merge gate stays fail-closed on the failed deployment.
 	OnFailurePause = "pause"
 )
 
@@ -127,6 +137,34 @@ type Lock struct {
 // updates the visible GitHub Check Run, then writes an aggregate stored state
 // row whose CheckRunID points at that GitHub object. Later GitHub check_run
 // webhooks use CheckRunID to find the matching stored state.
+
+// PlanDriftState declares how a plan-result write treats a stored review-time
+// deployment drift block. It lets UpsertPlanResult tell "the drift rollup ran
+// and this deployment set is clean" apart from "drift was not evaluated on this
+// write" — two cases that both carry an empty BlockingReason but must clear vs
+// preserve an existing drift block respectively.
+type PlanDriftState int
+
+const (
+	// PlanDriftNotEvaluated means the write did not run the drift rollup (e.g. an
+	// apply-time plan). It is the zero value so an unset drift argument fails
+	// safe: an existing drift block is preserved, never silently cleared.
+	PlanDriftNotEvaluated PlanDriftState = iota
+	// PlanDriftClean means the rollup ran and every deployment matched the
+	// reviewed plan, so a stale drift block may be cleared.
+	PlanDriftClean
+	// PlanDriftBlocked means the rollup ran and a deployment diverged or could
+	// not be confirmed, so the write records the drift block.
+	PlanDriftBlocked
+)
+
+// ReviewTimeDeploymentDriftBlockingReason is the stable Check.BlockingReason
+// value for a review-time deployment drift block. It is defined here so the
+// plan-result write guard and the webhook block reason share one source of
+// truth: UpsertPlanResult preserves a row carrying this reason on a
+// not-evaluated write instead of clearing it.
+const ReviewTimeDeploymentDriftBlockingReason = "review_time_deployment_drift"
+
 type Check struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
 	ID int64
@@ -175,6 +213,12 @@ type Check struct {
 	// ErrorMessage contains a human-readable explanation when the check state fails.
 	// Displayed in the GitHub Check Run details and PR comment.
 	ErrorMessage string
+
+	// ChangeSummary is a human-readable per-database summary of the planned
+	// schema change (e.g. "5 created, 3 altered · 2 vschema updates"). It is set
+	// at plan time and preserved across apply-state transitions. Empty for
+	// aggregate rows and for rows recorded before this field existed.
+	ChangeSummary string
 
 	// CreatedAt is when the check was created.
 	CreatedAt time.Time
@@ -744,6 +788,12 @@ const (
 	ControlOperationCancel ControlOperation = "cancel"
 	// ControlOperationCutover triggers deferred cutover.
 	ControlOperationCutover ControlOperation = "cutover"
+	// ControlOperationRevert undoes a completed PlanetScale schema change during
+	// its revert window. Durable so a comment-driven revert survives the API
+	// process dying before the engine call lands, and so the apply owner (which
+	// for a remote apply is the data-plane operator, not the webhook pod) drives
+	// it to completion.
+	ControlOperationRevert ControlOperation = "revert"
 	// ControlOperationSkipRevert closes the revert window, making a PlanetScale
 	// schema change permanent. Durable so a comment-driven skip-revert survives
 	// the API process dying before the engine call lands, and so the apply owner
@@ -756,7 +806,59 @@ const (
 	// 'start': 'start' resumes stopped work and carries no claim-ordering
 	// clause, so it cannot release a paused rollout.
 	ControlOperationRelease ControlOperation = "release"
+	// ControlOperationVolume adjusts the speed/concurrency of a running schema
+	// change. Durable because only the instance driving the apply holds the
+	// engine state for the running schema change, and a volume RPC can land on
+	// any instance sharing the route's storage. The desired level travels in
+	// the request metadata (see VolumeControlRequestMetadata); the driver
+	// retunes the engine at its next progress tick.
+	ControlOperationVolume ControlOperation = "volume"
 )
+
+// MinVolume and MaxVolume bound the volume scale shared by every engine:
+// 1 = maximum throttle (least production impact), 11 = no throttle (fastest).
+const (
+	MinVolume int32 = 1
+	MaxVolume int32 = 11
+)
+
+// VolumeControlRequestMetadata is the JSON payload stored on a volume control
+// request. The row carries the desired level so the driving instance can
+// retune the engine without a synchronous exchange with the requester.
+type VolumeControlRequestMetadata struct {
+	Volume int32 `json:"volume"`
+}
+
+// EncodeVolumeControlRequestMetadata serializes the desired volume level for
+// storage on a volume control request, rejecting out-of-range levels so an
+// invalid request is refused at write time rather than discovered by the
+// driver.
+func EncodeVolumeControlRequestMetadata(volume int32) ([]byte, error) {
+	if volume < MinVolume || volume > MaxVolume {
+		return nil, fmt.Errorf("volume %d is out of range: must be between %d and %d", volume, MinVolume, MaxVolume)
+	}
+	data, err := json.Marshal(VolumeControlRequestMetadata{Volume: volume})
+	if err != nil {
+		return nil, fmt.Errorf("encode volume control request metadata for level %d: %w", volume, err)
+	}
+	return data, nil
+}
+
+// DecodeVolumeControlRequestMetadata parses the desired volume level from a
+// volume control request's metadata, validating the shared volume range.
+func DecodeVolumeControlRequestMetadata(metadata []byte) (int32, error) {
+	if len(metadata) == 0 {
+		return 0, fmt.Errorf("volume control request metadata is empty")
+	}
+	var payload VolumeControlRequestMetadata
+	if err := json.Unmarshal(metadata, &payload); err != nil {
+		return 0, fmt.Errorf("decode volume control request metadata: %w", err)
+	}
+	if payload.Volume < MinVolume || payload.Volume > MaxVolume {
+		return 0, fmt.Errorf("volume %d in control request metadata is out of range: must be between %d and %d", payload.Volume, MinVolume, MaxVolume)
+	}
+	return payload.Volume, nil
+}
 
 // ControlRequestStatus is the durable processing status for a control request.
 type ControlRequestStatus string
@@ -1032,6 +1134,7 @@ const (
 	LogEventCancelRequested     = "cancel_requested"
 	LogEventStartRequested      = "start_requested"
 	LogEventReleaseRequested    = "release_requested"
+	LogEventVolumeRequested     = "volume_requested"
 	LogEventDeployTriggered     = "deploy_triggered"
 	LogEventCutoverTriggered    = "cutover_triggered"
 	LogEventSkipRevertTriggered = "skip_revert_triggered"

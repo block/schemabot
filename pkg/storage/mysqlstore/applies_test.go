@@ -2071,6 +2071,51 @@ func TestApplyStore_FindNextApplyRequiresTasksForPendingApply(t *testing.T) {
 	assert.Equal(t, state.Apply.Running, persisted.State)
 }
 
+// A VSchema-only apply carries an apply_operations row but no tasks — the
+// VSchema application is the whole apply. Its dual-written operation row proves
+// the create committed fully, so the pending claim must accept it; gating the
+// claim on tasks alone would strand every queued VSchema-only apply pending
+// forever.
+func TestApplyStore_FindNextApplyClaimsTasklessPendingApplyWithOperation(t *testing.T) {
+	newTasklessApply := func(t *testing.T, store *Storage, database, applyID string) *storage.Apply {
+		t.Helper()
+		lock := createTestLock(t, store, database, storage.DatabaseTypeVitess, "staging")
+		apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, 503, state.Apply.Pending, "staging")
+		now := time.Now()
+		_, err := store.ApplyOperations().Insert(t.Context(), &storage.ApplyOperation{
+			ApplyID:    apply.ID,
+			Deployment: apply.Database,
+			State:      state.ApplyOperation.Pending,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		})
+		require.NoError(t, err)
+		return apply
+	}
+
+	t.Run("FindNextApply claims it", func(t *testing.T) {
+		clearTables(t)
+		store := New(testDB)
+		apply := newTasklessApply(t, store, "testdb", "apply_vschema_only")
+
+		claimed, err := store.Applies().FindNextApply(t.Context(), "test-owner")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "a task-less pending apply with an operation row must be claimable")
+		assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+	})
+
+	t.Run("ClaimApplyByID acquires the parent lease", func(t *testing.T) {
+		clearTables(t)
+		store := New(testDB)
+		apply := newTasklessApply(t, store, "testdb", "apply_vschema_only_byid")
+
+		claimed, err := store.Applies().ClaimApplyByID(t.Context(), apply.ID, "test-owner")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "the operation-claim path must acquire the parent lease for a task-less pending apply")
+		assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+	})
+}
+
 func TestApplyStore_FindNextApplyClaimsPendingControlRequestWithoutTasks(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

@@ -145,7 +145,7 @@ func TestFormatStatusCommentRoutesSingleDeployment(t *testing.T) {
 
 	body := o.formatStatusComment(runningApply(), nil)
 
-	assert.Contains(t, body, "## Schema Change In Progress")
+	assert.Contains(t, body, "## Schema Change Status")
 	assert.NotContains(t, body, "**Deployments**:")
 }
 
@@ -156,7 +156,7 @@ func TestFormatStatusCommentFallsBackOnLoadError(t *testing.T) {
 
 	body := o.formatStatusComment(runningApply(), nil)
 
-	assert.Contains(t, body, "## Schema Change In Progress")
+	assert.Contains(t, body, "## Schema Change Status")
 	assert.NotContains(t, body, "**Deployments**:")
 }
 

@@ -123,6 +123,7 @@ func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int
 			fmt.Sprintf("Apply %s belongs to environment %q, not %q", result.ApplyID, apply.Environment, result.Environment))
 		return nil, false
 	}
+	h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 	return apply, true
 }
 
@@ -351,6 +352,64 @@ func (h *Handler) handleCutoverCommand(repo string, pr int, installationID int64
 	}))
 }
 
+// volumeCommandLevelValid reports whether the parsed command carries a usable
+// volume level: the `-v` flag was present with a numeric value inside the
+// shared volume range. An absent flag parses as level 0, which the range
+// check rejects.
+func volumeCommandLevelValid(result CommandResult) bool {
+	return !result.VolumeLevelError &&
+		result.VolumeLevel >= storage.MinVolume &&
+		result.VolumeLevel <= storage.MaxVolume
+}
+
+// handleVolumeCommand handles the "schemabot volume <apply-id> -e <env> -v <level>"
+// PR comment command by queueing a durable volume adjustment that the driver
+// applies at its next progress check.
+func (h *Handler) handleVolumeCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
+	ctx, cancel := h.commandContext(commandTimeout)
+	defer cancel()
+
+	// A missing apply ID takes precedence over level validation so the
+	// command posts the standard missing-apply-ID guidance shared by all
+	// apply-scoped control commands (runControlCommand handles that case).
+	if result.ApplyID != "" && !volumeCommandLevelValid(result) {
+		h.logger.Warn("volume PR command rejected because the level is missing or invalid",
+			"repo", repo,
+			"pr", pr,
+			"apply_id", result.ApplyID,
+			"environment", result.Environment,
+			"requested_by", requestedBy,
+			"volume", result.VolumeLevel,
+			"volume_flag_error", result.VolumeLevelError)
+		h.postComment(repo, pr, installationID, templates.RenderVolumeInvalidLevel())
+		return
+	}
+
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Volume,
+		func(ctx context.Context, req apitypes.ControlRequest) (*apitypes.VolumeResponse, error) {
+			return h.service.ExecuteVolume(ctx, req, result.VolumeLevel)
+		},
+		func(r *apitypes.VolumeResponse) bool { return r.Accepted },
+		func(r *apitypes.VolumeResponse) string { return r.ErrorMessage })
+	if resp == nil {
+		return
+	}
+
+	h.logger.Info("volume PR command accepted",
+		"repo", repo,
+		"pr", pr,
+		"apply_id", result.ApplyID,
+		"environment", result.Environment,
+		"requested_by", requestedBy,
+		"volume", result.VolumeLevel)
+	h.postComment(repo, pr, installationID, templates.RenderVolumeCommandAccepted(templates.VolumeCommandAcceptedData{
+		ApplyID:     result.ApplyID,
+		Environment: result.Environment,
+		RequestedBy: requestedBy,
+		Volume:      result.VolumeLevel,
+	}))
+}
+
 func (h *Handler) handleSkipRevertCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
 	ctx, cancel := h.commandContext(commandTimeout)
 	defer cancel()
@@ -370,6 +429,31 @@ func (h *Handler) handleSkipRevertCommand(repo string, pr int, installationID in
 		"environment", result.Environment,
 		"requested_by", requestedBy)
 	h.postComment(repo, pr, installationID, templates.RenderSkipRevertCommandAccepted(templates.SkipRevertCommandAcceptedData{
+		ApplyID:     result.ApplyID,
+		Environment: result.Environment,
+		RequestedBy: requestedBy,
+	}))
+}
+
+func (h *Handler) handleRevertCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
+	ctx, cancel := h.commandContext(commandTimeout)
+	defer cancel()
+
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Revert,
+		h.service.ExecuteRevert,
+		func(r *apitypes.ControlResponse) bool { return r.Accepted },
+		func(r *apitypes.ControlResponse) string { return r.ErrorMessage })
+	if resp == nil {
+		return
+	}
+
+	h.logger.Info("revert PR command accepted",
+		"repo", repo,
+		"pr", pr,
+		"apply_id", result.ApplyID,
+		"environment", result.Environment,
+		"requested_by", requestedBy)
+	h.postComment(repo, pr, installationID, templates.RenderRevertCommandAccepted(templates.RevertCommandAcceptedData{
 		ApplyID:     result.ApplyID,
 		Environment: result.Environment,
 		RequestedBy: requestedBy,

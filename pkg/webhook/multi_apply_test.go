@@ -23,7 +23,7 @@ func runningApply() *storage.Apply {
 // the single-deployment comment unchanged — no aggregate header.
 func TestFormatApplyStatusComment_NoOperationsRendersSingle(t *testing.T) {
 	out := formatApplyStatusComment(runningApply(), nil, false, nil, nil, nil)
-	assert.Contains(t, out, "## Schema Change In Progress")
+	assert.Contains(t, out, "## Schema Change Status")
 	assert.NotContains(t, out, "**Deployments**:")
 }
 
@@ -46,7 +46,7 @@ func TestFormatApplyStatusComment_MultipleOperationsRendersMulti(t *testing.T) {
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier},
 	}
 	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil)
-	assert.Contains(t, out, "## Schema Change In Progress")
+	assert.Contains(t, out, "## Schema Change Status")
 	assert.Contains(t, out, "**Deployments**: 1 completed, 1 running")
 	assert.Contains(t, out, "- ✅ eu — completed")
 	assert.Contains(t, out, "- 🔄 us — running table copy")
@@ -161,13 +161,17 @@ func TestBuildMultiApplyData_ScopesShardsByOperation(t *testing.T) {
 }
 
 // The per-deployment section reflects the operation's own state and error, not
-// the parent apply's aggregate state.
+// the parent apply's aggregate state. Redispatch is apply-level, so the parent
+// apply's attempt count carries into each deployment's retry counter.
 func TestBuildDeploymentDetail_UsesOperationStateAndError(t *testing.T) {
 	op := &storage.ApplyOperation{ID: 1, Deployment: "us", State: state.ApplyOperation.Failed, ErrorMessage: "lock wait timeout"}
-	detail := buildDeploymentDetail(runningApply(), op, nil, operationDisplay{}, nil)
+	apply := runningApply()
+	apply.Attempt = 3
+	detail := buildDeploymentDetail(apply, op, nil, operationDisplay{}, nil)
 	assert.Equal(t, state.Apply.Failed, detail.State)
 	assert.Equal(t, "lock wait timeout", detail.ErrorMessage)
 	assert.Equal(t, "payments", detail.Database)
+	assert.Equal(t, 3, detail.Attempt)
 }
 
 // The storage→presentation boundary resolves the rollout policies: barrier flips

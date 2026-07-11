@@ -14,8 +14,9 @@ func commandReference() string {
 | ` + "`schemabot start <apply-id> -e <env>`" + ` | Resume a stopped deployment |
 | ` + "`schemabot release <apply-id> -e <env>`" + ` | Release a paused rollout to proceed |
 | ` + "`schemabot cutover <apply-id> -e <env>`" + ` | Complete a deferred cutover |
-| ` + "`schemabot rollback <apply-id> -e <env>`" + ` | Generate a rollback plan |
-| ` + "`schemabot rollback-confirm -e <env>`" + ` | Execute a rollback |
+| ` + "`schemabot volume <apply-id> -e <env> -v <level>`" + ` | Adjust schema change speed (1=slowest, 11=fastest) |
+| ` + "`schemabot rollback <apply-id> -e <env> [-t <tenant>]`" + ` | Generate a rollback plan |
+| ` + "`schemabot rollback-confirm -e <env> [-t <tenant>]`" + ` | Execute a rollback |
 
 **Options**: ` + "`-e <env>`" + ` environment, ` + "`-d <db>`" + ` database, ` + "`-t, --tenant <name>`" + ` deployment routing, ` + "`--defer-cutover`" + `, ` + "`--allow-unsafe`" + `, ` + "`--skip-revert`" + ` (Vitess)
 

@@ -14,9 +14,9 @@ func leaderConfig() *ServerConfig {
 				Aggregate: &AggregateConfig{
 					Role: AggregateRoleLeader,
 					ExpectedTenants: []ExpectedTenant{
-						{Tenant: "tenant-a", Paths: []string{"services/a"}},
-						{Tenant: "tenant-b", Paths: []string{"services/b"}},
-						{Tenant: "tenant-c", Paths: []string{"services/c"}},
+						{Tenant: "tenant-a", Paths: []string{"services/a"}, CheckName: "SchemaBot Tenant A"},
+						{Tenant: "tenant-b", Paths: []string{"services/b"}, CheckName: "SchemaBot Tenant B"},
+						{Tenant: "tenant-c", Paths: []string{"services/c"}, CheckName: "SchemaBot Tenant C"},
 					},
 				},
 			},
@@ -27,7 +27,7 @@ func leaderConfig() *ServerConfig {
 func TestAggregateRoleAccessors(t *testing.T) {
 	c := &ServerConfig{
 		Repos: map[string]RepoConfig{
-			"octocat/shared-repo": {Aggregate: &AggregateConfig{Role: AggregateRoleLeader, ExpectedTenants: []ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"services/b"}}}}},
+			"octocat/shared-repo": {Aggregate: &AggregateConfig{Role: AggregateRoleLeader, ExpectedTenants: []ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"services/b"}, CheckName: "SchemaBot Tenant B"}}}},
 			"octocat/other-repo":  {Aggregate: &AggregateConfig{Role: AggregateRoleParticipant}},
 			"octocat/plain":       {},
 		},
@@ -80,6 +80,36 @@ func TestExpectedTenantsForPR(t *testing.T) {
 	})
 }
 
+// The leader resolves each expected participant's Check Run name from the
+// expected-tenant entry, so ExpectedParticipantChecksForPR must carry the
+// check-name base through alongside the tenant and its paths.
+func TestExpectedParticipantChecksForPR(t *testing.T) {
+	c := leaderConfig()
+
+	t.Run("returns full entries with check name", func(t *testing.T) {
+		got := c.ExpectedParticipantChecksForPR("octocat/shared-repo", []string{
+			"services/a/schema/users.sql",
+			"services/b/schema/orders.sql",
+		})
+		assert.ElementsMatch(t, []ExpectedTenant{
+			{Tenant: "tenant-a", Paths: []string{"services/a"}, CheckName: "SchemaBot Tenant A"},
+			{Tenant: "tenant-b", Paths: []string{"services/b"}, CheckName: "SchemaBot Tenant B"},
+		}, got)
+	})
+
+	t.Run("no tenant paths touched", func(t *testing.T) {
+		got := c.ExpectedParticipantChecksForPR("octocat/shared-repo", []string{"docs/README.md"})
+		assert.Empty(t, got)
+	})
+
+	t.Run("not the leader returns nil", func(t *testing.T) {
+		participant := &ServerConfig{Repos: map[string]RepoConfig{
+			"octocat/shared-repo": {Aggregate: &AggregateConfig{Role: AggregateRoleParticipant}},
+		}}
+		assert.Nil(t, participant.ExpectedParticipantChecksForPR("octocat/shared-repo", []string{"services/b/x.sql"}))
+	})
+}
+
 func TestValidateAggregateConfig(t *testing.T) {
 	t.Run("nil is allowed", func(t *testing.T) {
 		require.NoError(t, validateAggregateConfig("octocat/r", nil))
@@ -88,7 +118,7 @@ func TestValidateAggregateConfig(t *testing.T) {
 	t.Run("valid leader", func(t *testing.T) {
 		require.NoError(t, validateAggregateConfig("octocat/r", &AggregateConfig{
 			Role:            AggregateRoleLeader,
-			ExpectedTenants: []ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"services/b"}}},
+			ExpectedTenants: []ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"services/b"}, CheckName: "SchemaBot Tenant B"}},
 		}))
 	})
 
@@ -111,30 +141,35 @@ func TestValidateAggregateConfig(t *testing.T) {
 		{"leader without expected_tenants", &AggregateConfig{Role: AggregateRoleLeader}, "expected_tenants is required"},
 		{
 			"leader with empty tenant",
-			&AggregateConfig{Role: AggregateRoleLeader, ExpectedTenants: []ExpectedTenant{{Tenant: "  ", Paths: []string{"a"}}}},
+			&AggregateConfig{Role: AggregateRoleLeader, ExpectedTenants: []ExpectedTenant{{Tenant: "  ", Paths: []string{"a"}, CheckName: "X"}}},
 			"empty tenant",
 		},
 		{
 			"leader with duplicate tenant",
 			&AggregateConfig{Role: AggregateRoleLeader, ExpectedTenants: []ExpectedTenant{
-				{Tenant: "tenant-b", Paths: []string{"a"}},
-				{Tenant: "tenant-b", Paths: []string{"b"}},
+				{Tenant: "tenant-b", Paths: []string{"a"}, CheckName: "X"},
+				{Tenant: "tenant-b", Paths: []string{"b"}, CheckName: "Y"},
 			}},
 			"duplicate tenant",
 		},
 		{
+			"leader with empty check_name",
+			&AggregateConfig{Role: AggregateRoleLeader, ExpectedTenants: []ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"a"}, CheckName: "   "}}},
+			"check_name is required",
+		},
+		{
 			"leader with empty paths",
-			&AggregateConfig{Role: AggregateRoleLeader, ExpectedTenants: []ExpectedTenant{{Tenant: "tenant-b"}}},
+			&AggregateConfig{Role: AggregateRoleLeader, ExpectedTenants: []ExpectedTenant{{Tenant: "tenant-b", CheckName: "X"}}},
 			"paths is empty",
 		},
 		{
 			"leader with absolute path",
-			&AggregateConfig{Role: AggregateRoleLeader, ExpectedTenants: []ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"/etc"}}}},
+			&AggregateConfig{Role: AggregateRoleLeader, ExpectedTenants: []ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"/etc"}, CheckName: "X"}}},
 			"invalid value",
 		},
 		{
 			"leader with escaping path",
-			&AggregateConfig{Role: AggregateRoleLeader, ExpectedTenants: []ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"../secrets"}}}},
+			&AggregateConfig{Role: AggregateRoleLeader, ExpectedTenants: []ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"../secrets"}, CheckName: "X"}}},
 			"invalid value",
 		},
 	}

@@ -562,7 +562,8 @@ type DatabaseConfig struct {
 
 // PRCommandAuthorizationConfig configures actor authorization for mutating
 // SchemaBot GitHub PR comment commands (apply, stop, cutover, rollback,
-// unlock, and their confirmation variants).
+// unlock, and their confirmation variants), and for user-issued plan
+// commands that resolve to a configured database.
 type PRCommandAuthorizationConfig struct {
 	// Enabled turns on fail-closed actor authorization for mutating PR
 	// commands.
@@ -648,12 +649,12 @@ type EnvironmentConfig struct {
 	// terminally fails. "halt" (the default, also used when unset) stops the
 	// rollout — later deployments in deployment_order are not started. "continue"
 	// drops a terminal-failed deployment as a blocker so the rollout attempts
-	// every deployment instead of stopping at the first failure. "pause" is a
-	// known value reserved for a future release-gate behaviour and is rejected
-	// at validation until that machinery lands. It governs only rollout
-	// continuation; the apply's pass/fail verdict and the merge gate stay
-	// fail-closed on any failed deployment. Only meaningful alongside a
-	// Deployments map.
+	// every deployment instead of stopping at the first failure. "pause" holds
+	// the rollout after a failure until a human releases it (via the release
+	// control op) so the remaining deployments proceed; to abort instead, use
+	// the separate stop/cancel control op. It governs only rollout continuation;
+	// the apply's pass/fail verdict and the merge gate stay fail-closed on any
+	// failed deployment. Only meaningful alongside a Deployments map.
 	OnFailure string `yaml:"on_failure,omitempty"`
 
 	// For PlanetScale/Vitess:
@@ -715,6 +716,118 @@ type RepoConfig struct {
 	// set of tenants expected to report). Nil means the repository uses the
 	// standard single-deployment check behavior.
 	Aggregate *AggregateConfig `yaml:"aggregate,omitempty"`
+
+	// AdminTeams are GitHub teams whose members may run mutating PR comment
+	// commands and whose PR approvals satisfy the review gate for every
+	// database managed through this repository. Scoped between the global
+	// admin policy (every database) and per-database operators (one database).
+	AdminTeams []string `yaml:"admin_teams,omitempty"`
+
+	// AdminUsers are GitHub users with the same repository-scoped authority
+	// as AdminTeams.
+	AdminUsers []string `yaml:"admin_users,omitempty"`
+}
+
+// RepoAdmins returns the repository-scoped admin principals configured for
+// repo. A repository with no config entry has no repo admins.
+func (c *ServerConfig) RepoAdmins(repo string) (teams, users []string) {
+	repoConfig, ok := c.Repos[repo]
+	if !ok {
+		return nil, nil
+	}
+	return repoConfig.AdminTeams, repoConfig.AdminUsers
+}
+
+// SchemaDirHintsForRepo returns the configured schema directories of every
+// database that accepts changes from repo, sorted and deduplicated. Config
+// discovery uses these as probe targets when GitHub truncates the repository
+// tree (repos beyond the Trees API response cap), where a whole-repo scan is
+// impossible. A database with no allowed_repos restriction accepts any
+// trusted repo, so its directories are always included.
+//
+// exhaustive reports whether the returned directories cover every location a
+// policy-valid config could live in. A database with no allowed_dirs
+// restriction, or with a wildcard ("*") or repo-root (".") entry, accepts a
+// config in directories no hint list can cover — for such a repo the
+// truncated-tree fallback must keep failing closed, because a partial probe
+// could return a confidently wrong result (a single config where a full scan
+// would find several, or a "database not found" for a config that exists).
+// SchemaDirHintsForDatabase returns the configured schema directories of the
+// named database when it accepts changes from repo, sorted and deduplicated.
+// A database-scoped truncated-tree probe only needs this database's
+// directories, so a repo with hundreds of configured databases costs a few
+// API calls instead of a scan of every configured directory.
+//
+// exhaustive reports whether the returned directories cover every location
+// this database's policy-valid config could live in. It is true with no
+// directories when the database does not exist or does not accept the repo —
+// no policy-valid config location exists, so an empty probe result is
+// authoritative. It is false when the database has no allowed_dirs
+// restriction or a wildcard ("*") or repo-root (".") entry, where the config
+// could live anywhere and the probe must keep failing closed.
+func (c *ServerConfig) SchemaDirHintsForDatabase(repo, database string) (dirs []string, exhaustive bool) {
+	db, ok := c.Databases[database]
+	if !ok {
+		return nil, true
+	}
+	if len(db.AllowedRepos) > 0 && !repoAllowed(db.AllowedRepos, repo) {
+		return nil, true
+	}
+	if len(db.AllowedDirs) == 0 {
+		return nil, false
+	}
+	seen := make(map[string]struct{})
+	exhaustive = true
+	for _, dir := range db.AllowedDirs {
+		normalized, err := normalizeSchemaPath(dir)
+		if err != nil || normalized == "*" || normalized == "." {
+			exhaustive = false
+			continue
+		}
+		if _, dup := seen[normalized]; dup {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		dirs = append(dirs, normalized)
+	}
+	slices.Sort(dirs)
+	return dirs, exhaustive
+}
+
+func (c *ServerConfig) SchemaDirHintsForRepo(repo string) (dirs []string, exhaustive bool) {
+	seen := make(map[string]struct{})
+	exhaustive = true
+	for _, db := range c.Databases {
+		if len(db.AllowedRepos) > 0 && !repoAllowed(db.AllowedRepos, repo) {
+			continue
+		}
+		if len(db.AllowedDirs) == 0 {
+			// The allowed_dirs policy only restricts databases that configure
+			// it; this database accepts a config anywhere in the repo.
+			exhaustive = false
+			continue
+		}
+		for _, dir := range db.AllowedDirs {
+			// Normalize exactly like the allowed_dirs policy checks so the
+			// probed directories match what the policy would accept.
+			normalized, err := normalizeSchemaPath(dir)
+			if err != nil || normalized == "*" || normalized == "." {
+				// Wildcard and repo-root entries accept configs that no
+				// directory probe can cover. (Invalid entries are rejected at
+				// config load; treating them as non-exhaustive here costs
+				// nothing and stays fail-closed.)
+				exhaustive = false
+				continue
+			}
+			if _, ok := seen[normalized]; ok {
+				continue
+			}
+			seen[normalized] = struct{}{}
+			dirs = append(dirs, normalized)
+		}
+	}
+	slices.Sort(dirs)
+	return dirs, exhaustive
 }
 
 // DeploymentTarget is one entry in EnvironmentConfig.Deployments. It carries
@@ -842,11 +955,9 @@ func (c *ServerConfig) Validate() error {
 					return fmt.Errorf("database %q environment %q sets on_failure without a deployments map", name, env)
 				}
 				switch envConfig.OnFailure {
-				case storage.OnFailureHalt, storage.OnFailureContinue:
-				case storage.OnFailurePause:
-					return fmt.Errorf("database %q environment %q sets on_failure %q which is not yet supported; use %q or %q", name, env, storage.OnFailurePause, storage.OnFailureHalt, storage.OnFailureContinue)
+				case storage.OnFailureHalt, storage.OnFailureContinue, storage.OnFailurePause:
 				default:
-					return fmt.Errorf("database %q environment %q has invalid on_failure %q (want %q or %q)", name, env, envConfig.OnFailure, storage.OnFailureHalt, storage.OnFailureContinue)
+					return fmt.Errorf("database %q environment %q has invalid on_failure %q (want %q, %q, or %q)", name, env, envConfig.OnFailure, storage.OnFailureHalt, storage.OnFailureContinue, storage.OnFailurePause)
 				}
 			}
 			switch {
@@ -905,6 +1016,9 @@ func (c *ServerConfig) Validate() error {
 		if err := validateAggregateConfig(repo, repoConfig.Aggregate); err != nil {
 			return err
 		}
+		if err := validateRepoActorAuthorization(repo, repoConfig); err != nil {
+			return err
+		}
 	}
 
 	if err := c.validateNoLocalRemoteRouteCollision(); err != nil {
@@ -941,7 +1055,8 @@ func (c *ServerConfig) Validate() error {
 // When Type is empty or "none" (the default), authentication is disabled and
 // all requests are allowed — unchanged from deployments without this config.
 type AuthConfig struct {
-	// Type selects the authenticator: "none" (or "", the default) or "oidc".
+	// Type selects the authenticator: "none" (or "", the default), "oidc", or
+	// "forward_auth".
 	Type string `yaml:"type"`
 
 	// Issuer is the OIDC provider's issuer URL. Required when Type is "oidc".
@@ -955,6 +1070,44 @@ type AuthConfig struct {
 	// GroupsClaim is the JWT claim carrying group memberships. Defaults to
 	// "groups" when empty.
 	GroupsClaim string `yaml:"groups_claim"`
+
+	// ForwardAuth configures the "forward_auth" authenticator, used when
+	// SchemaBot runs behind an authenticating reverse proxy that forwards the
+	// verified identity as HTTP headers.
+	ForwardAuth ForwardAuthSettings `yaml:"forward_auth,omitempty"`
+}
+
+// ForwardAuthSettings configures the forward-auth authenticator. The proxy's
+// identity is the trust anchor (a source CIDR, and optionally a SPIFFE ID from
+// the Envoy X-Forwarded-Client-Cert header); only then are the forwarded user
+// and group headers honored.
+type ForwardAuthSettings struct {
+	// UserHeader carries the authenticated user identity (default
+	// "X-Forwarded-User").
+	UserHeader string `yaml:"user_header,omitempty"`
+
+	// GroupsHeader carries the caller's groups (default "X-Forwarded-Groups").
+	GroupsHeader string `yaml:"groups_header,omitempty"`
+
+	// GroupsDelimiter splits a single groups-header value (default ",").
+	GroupsDelimiter string `yaml:"groups_delimiter,omitempty"`
+
+	// TrustedProxySPIFFE lists SPIFFE IDs allowed to act as the proxy, read from
+	// the XFCC header. SPIFFE-only (no TrustedProxyCIDRs) is safe only when the
+	// proxy sanitizes inbound XFCC and the server is not directly reachable — a
+	// service mesh; pair it with TrustedProxyCIDRs for defense in depth otherwise.
+	TrustedProxySPIFFE []string `yaml:"trusted_proxy_spiffe,omitempty"`
+
+	// TrustedProxyCIDRs lists source networks allowed to act as the proxy.
+	TrustedProxyCIDRs []string `yaml:"trusted_proxy_cidrs,omitempty"`
+
+	// ReadGroups are the groups granted the read tier. Empty means any
+	// authenticated caller from the trusted proxy may read.
+	ReadGroups []string `yaml:"read_groups,omitempty"`
+
+	// WriteGroups are the groups granted the write tier. Empty means no caller
+	// can perform write-tier operations.
+	WriteGroups []string `yaml:"write_groups,omitempty"`
 }
 
 // Validate checks the auth configuration. Unknown types are rejected so a
@@ -974,9 +1127,41 @@ func (a *AuthConfig) Validate() error {
 			return fmt.Errorf("audience is required when auth type is oidc")
 		}
 		return nil
+	case "forward_auth":
+		return a.ForwardAuth.validate()
 	default:
-		return fmt.Errorf("unknown auth type %q (supported: none, oidc)", a.Type)
+		return fmt.Errorf("unknown auth type %q (supported: none, oidc, forward_auth)", a.Type)
 	}
+}
+
+// validate checks the forward-auth settings so a misconfigured trust anchor
+// fails closed at startup: it requires at least one anchor (a SPIFFE ID or a
+// CIDR) and checks CIDR syntax so a typo is caught before serving. SPIFFE-only
+// (no CIDR) is allowed for mesh deployments; the authorizer warns about the XFCC
+// precondition at startup.
+func (f *ForwardAuthSettings) validate() error {
+	trimmedCIDRs := make([]string, 0, len(f.TrustedProxyCIDRs))
+	for _, c := range f.TrustedProxyCIDRs {
+		if c = strings.TrimSpace(c); c != "" {
+			trimmedCIDRs = append(trimmedCIDRs, c)
+		}
+	}
+	trimmedSPIFFE := make([]string, 0, len(f.TrustedProxySPIFFE))
+	for _, s := range f.TrustedProxySPIFFE {
+		if s = strings.TrimSpace(s); s != "" {
+			trimmedSPIFFE = append(trimmedSPIFFE, s)
+		}
+	}
+
+	if len(trimmedCIDRs) == 0 && len(trimmedSPIFFE) == 0 {
+		return fmt.Errorf("forward_auth requires at least one trust anchor (trusted_proxy_spiffe or trusted_proxy_cidrs)")
+	}
+	for _, c := range trimmedCIDRs {
+		if _, _, err := net.ParseCIDR(c); err != nil {
+			return fmt.Errorf("forward_auth trusted_proxy_cidrs entry %q is not a valid CIDR: %w", c, err)
+		}
+	}
+	return nil
 }
 
 func validateSupportChannel(c SupportChannelConfig) error {
@@ -1229,15 +1414,29 @@ func (c *ServerConfig) OnFailure(database, environment string) string {
 	return env.OnFailure
 }
 
+// DatabaseNotConfiguredError reports that a database has no entry in this
+// server's databases registry. Callers use it to distinguish "this server does
+// not own the database" from other configuration failures — on repos where
+// deployments share PR commands, a database missing from the registry means
+// another deployment owns the work.
+type DatabaseNotConfiguredError struct {
+	Database string
+}
+
+func (e *DatabaseNotConfiguredError) Error() string {
+	return fmt.Sprintf("database %q is not configured on this server", e.Database)
+}
+
 // DatabaseEnvironments returns the environments configured server-side for a
-// database, ordered by the server-owned promotion order.
+// database, ordered by the server-owned promotion order. Returns
+// *DatabaseNotConfiguredError when the database has no registry entry.
 func (c *ServerConfig) DatabaseEnvironments(database string) ([]string, error) {
 	if c == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
 	db := c.Database(database)
 	if db == nil {
-		return nil, fmt.Errorf("database %q is not configured on this server", database)
+		return nil, &DatabaseNotConfiguredError{Database: database}
 	}
 	environments := make([]string, 0, len(db.Environments))
 	for environment := range db.Environments {
@@ -1445,6 +1644,20 @@ func (c *ServerConfig) AreChecksEnabled(repo string) bool {
 type ResolvedGitHubApp struct {
 	Name   string
 	Config GitHubAppConfig
+}
+
+// TrustedCheckAppSlugsForRepo returns the trusted sibling SchemaBot App slugs
+// configured for the App that owns repo, or nil when the repo resolves to no
+// App. Callers use this to recognize a sibling deployment by its bot identity
+// (login "<slug>[bot]") with the same trust set that gates Check Run reads.
+func (c *ServerConfig) TrustedCheckAppSlugsForRepo(repo string) []string {
+	app, err := c.ResolveGitHubAppForRepo(repo)
+	if err != nil {
+		slog.Warn("no GitHub App resolves for repo; treating its trusted check App slugs as empty",
+			"repo", repo, "error", err)
+		return nil
+	}
+	return app.Config.TrustedCheckAppSlugs
 }
 
 // ResolveGitHubAppForRepo returns the GitHub App that owns webhooks and

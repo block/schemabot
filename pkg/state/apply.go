@@ -24,6 +24,7 @@ var Apply = struct {
 	CuttingOver       string
 	RevertWindow      string
 	SkippingRevert    string
+	Reverting         string
 	Completed         string
 	Failed            string
 	FailedRetryable   string
@@ -51,6 +52,7 @@ var Apply = struct {
 	CuttingOver:       "cutting_over",
 	RevertWindow:      "revert_window",
 	SkippingRevert:    "skipping_revert",
+	Reverting:         "reverting",
 	Completed:         "completed",
 	Failed:            "failed",
 	FailedRetryable:   "failed_retryable",
@@ -105,6 +107,9 @@ func DeriveApplyState(taskStates []string) string {
 	}
 	if counts[Apply.Stopped] > 0 {
 		return Apply.Stopped
+	}
+	if counts[Apply.Reverting] > 0 {
+		return Apply.Reverting
 	}
 	if counts[Apply.Reverted] > 0 {
 		return Apply.Reverted
@@ -296,6 +301,8 @@ func normalizeApplyState(raw string) string {
 		return Apply.CuttingOver
 	case "REVERT_WINDOW":
 		return Apply.RevertWindow
+	case "REVERTING":
+		return Apply.Reverting
 	case "COMPLETED", "COMPLETE":
 		return Apply.Completed
 	case "FAILED":

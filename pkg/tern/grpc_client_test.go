@@ -129,8 +129,12 @@ type flakyTernServer struct {
 	mu          sync.Mutex
 	planCalls   int
 	applyCalls  int
+	pullCalls   int
+	healthCalls int
 	failPlans   int
 	failApplies int
+	failPulls   int
+	failHealths int
 }
 
 func (s *flakyTernServer) Plan(context.Context, *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
@@ -153,10 +157,36 @@ func (s *flakyTernServer) Apply(context.Context, *ternv1.ApplyRequest) (*ternv1.
 	return &ternv1.ApplyResponse{Accepted: true, ApplyId: "remote-apply-1"}, nil
 }
 
+func (s *flakyTernServer) PullSchema(context.Context, *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pullCalls++
+	if s.pullCalls <= s.failPulls {
+		return nil, status.Error(codes.Unavailable, "upstream connect error")
+	}
+	return &ternv1.PullSchemaResponse{Database: "testdb"}, nil
+}
+
+func (s *flakyTernServer) Health(context.Context, *ternv1.HealthRequest) (*ternv1.HealthResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.healthCalls++
+	if s.healthCalls <= s.failHealths {
+		return nil, status.Error(codes.Unavailable, "upstream connect error")
+	}
+	return &ternv1.HealthResponse{Status: "ok"}, nil
+}
+
 func (s *flakyTernServer) calls() (plans, applies int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.planCalls, s.applyCalls
+}
+
+func (s *flakyTernServer) readCalls() (pulls, healths int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pullCalls, s.healthCalls
 }
 
 // newRetryTestClient starts an in-process Tern gRPC server and connects a
@@ -199,19 +229,34 @@ func TestGRPCClientRetriesPlanOnUnavailable(t *testing.T) {
 	assert.Equal(t, 2, plans, "client should retry the failed plan attempt")
 }
 
-// Retries are bounded: a deployment that stays unavailable surfaces
-// UNAVAILABLE to the caller after the retry budget instead of retrying
-// forever.
-func TestGRPCClientPlanRetriesAreBounded(t *testing.T) {
-	server := &flakyTernServer{failPlans: 10}
+// A data-plane pod restart or mesh drain lasts seconds, not milliseconds. A
+// caller-facing read must ride out a sustained blip — several consecutive
+// UNAVAILABLE attempts — and still return the response a human is waiting on.
+func TestGRPCClientPullSchemaRidesOutSustainedUnavailable(t *testing.T) {
+	server := &flakyTernServer{failPulls: 3}
 	client := newRetryTestClient(t, server)
 
-	_, err := client.Plan(t.Context(), &ternv1.PlanRequest{Database: "testdb"})
+	resp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "testdb"})
+
+	require.NoError(t, err)
+	assert.Equal(t, "testdb", resp.GetDatabase())
+	pulls, _ := server.readCalls()
+	assert.Equal(t, 4, pulls, "the caller-facing read budget must survive a sustained blip, not just a single reset")
+}
+
+// Retries are bounded, and the fast-poll budget stays small: Health feeds the
+// remote-deployment outage monitor, which must observe an outage promptly
+// rather than ride it out.
+func TestGRPCClientHealthRetriesFailFast(t *testing.T) {
+	server := &flakyTernServer{failHealths: 10}
+	client := newRetryTestClient(t, server)
+
+	err := client.Health(t.Context())
 
 	require.Error(t, err)
 	assert.Equal(t, codes.Unavailable, status.Code(err))
-	plans, _ := server.calls()
-	assert.Equal(t, 3, plans, "client should stop after the configured attempt budget")
+	_, healths := server.readCalls()
+	assert.Equal(t, 3, healths, "fast polls must stop after the small attempt budget so outages surface promptly")
 }
 
 // Apply is state-changing, so the client surfaces a transient UNAVAILABLE
@@ -467,6 +512,7 @@ type capturingTernServer struct {
 	startApplyID      string
 	cutoverApplyID    string
 	skipRevertApplyID string
+	revertApplyID     string
 	progressApplyID   string
 	progressReq       *ternv1.ProgressRequest
 	progressState     ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
@@ -547,6 +593,13 @@ func (s *capturingTernServer) SkipRevert(_ context.Context, req *ternv1.SkipReve
 	return &ternv1.SkipRevertResponse{Accepted: true}, nil
 }
 
+func (s *capturingTernServer) Revert(_ context.Context, req *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
+	s.mu.Lock()
+	s.revertApplyID = req.ApplyId
+	s.mu.Unlock()
+	return &ternv1.RevertResponse{Accepted: true}, nil
+}
+
 func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	s.mu.Lock()
 	s.progressReq = &ternv1.ProgressRequest{
@@ -596,6 +649,12 @@ func (s *capturingTernServer) getSkipRevertApplyID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.skipRevertApplyID
+}
+
+func (s *capturingTernServer) getRevertApplyID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revertApplyID
 }
 
 func (s *capturingTernServer) getCutoverApplyID() string {
@@ -4612,6 +4671,58 @@ func TestGRPCClient_ProcessPendingSkipRevert(t *testing.T) {
 		require.NoError(t, err)
 		assert.Empty(t, server.getSkipRevertApplyID(), "no engine call once the revert window is gone")
 		pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationSkipRevert)
+		require.NoError(t, err)
+		assert.Nil(t, pending, "moot request completed")
+	})
+}
+
+func TestGRPCClient_ProcessPendingRevert(t *testing.T) {
+	newApply := func(s string) *storage.Apply {
+		return &storage.Apply{
+			ID: 1, ApplyIdentifier: "apply-revert-grpc",
+			Database: "testdb", DatabaseType: storage.DatabaseTypeVitess,
+			Environment: "staging", Engine: storage.EnginePlanetScale,
+			ExternalID: "remote-revert-grpc", State: s,
+		}
+	}
+	newStore := func(apply *storage.Apply) (*mockStorage, *testControlRequestStore) {
+		controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+			ApplyID: apply.ID, Operation: storage.ControlOperationRevert,
+			Status: storage.ControlRequestPending, RequestedBy: "cli:alice",
+		}}}
+		stored := *apply
+		applies := &mockApplyStore{apply: &stored}
+		return &mockStorage{applies: applies, tasks: &mockTaskStore{}, logs: &mockApplyLogStore{}, controlRequests: controlRequests}, controlRequests
+	}
+
+	t.Run("revert window: proxies revert and completes the request", func(t *testing.T) {
+		server := &capturingTernServer{}
+		client, cleanup := testCapturingGRPCClient(t, server)
+		defer cleanup()
+		apply := newApply(state.Apply.RevertWindow)
+		store, controlRequests := newStore(apply)
+		client.storage = store
+
+		err := client.processPendingRevertControlRequest(t.Context(), apply, apply.ExternalID)
+		require.NoError(t, err)
+		assert.Equal(t, "remote-revert-grpc", server.getRevertApplyID(), "revert proxied to the data plane")
+		pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationRevert)
+		require.NoError(t, err)
+		assert.Nil(t, pending, "request completed after a successful revert")
+	})
+
+	t.Run("apply already left the revert window: completes without an engine call", func(t *testing.T) {
+		server := &capturingTernServer{}
+		client, cleanup := testCapturingGRPCClient(t, server)
+		defer cleanup()
+		apply := newApply(state.Apply.Completed)
+		store, controlRequests := newStore(apply)
+		client.storage = store
+
+		err := client.processPendingRevertControlRequest(t.Context(), apply, apply.ExternalID)
+		require.NoError(t, err)
+		assert.Empty(t, server.getRevertApplyID(), "no engine call once the revert window is gone")
+		pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationRevert)
 		require.NoError(t, err)
 		assert.Nil(t, pending, "moot request completed")
 	})

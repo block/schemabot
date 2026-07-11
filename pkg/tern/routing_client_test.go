@@ -53,6 +53,7 @@ type routingRecordingClient struct {
 
 	pullSchemaReq            *ternv1.PullSchemaRequest
 	planReq                  *ternv1.PlanRequest
+	planDiffReq              *ternv1.PlanRequest
 	applyReq                 *ternv1.ApplyRequest
 	applyErr                 error
 	progressReq              *ternv1.ProgressRequest
@@ -73,6 +74,11 @@ func (c *routingRecordingClient) PullSchema(_ context.Context, req *ternv1.PullS
 func (c *routingRecordingClient) Plan(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
 	c.planReq = req
 	return &ternv1.PlanResponse{PlanId: "plan-routed"}, nil
+}
+
+func (c *routingRecordingClient) PlanDiff(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	c.planDiffReq = req
+	return &ternv1.PlanDiffResponse{Engine: ternv1.Engine_ENGINE_SPIRIT}, nil
 }
 
 func (c *routingRecordingClient) Apply(_ context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
@@ -235,6 +241,40 @@ func TestRoutingClientPlanResolvesSingleExecutionTarget(t *testing.T) {
 	assert.Equal(t, "staging", clients["east/staging"].planReq.Environment)
 	assert.Equal(t, storage.DatabaseTypeMySQL, clients["east/staging"].planReq.Type)
 	assert.Equal(t, "target-123", clients["east/staging"].planReq.Target)
+}
+
+func TestRoutingClientPlanDiffResolvesSingleExecutionTarget(t *testing.T) {
+	clients := map[string]*routingRecordingClient{
+		"east/staging": {},
+	}
+	routingClient := newTestRoutingClient(t, RoutingClientConfig{
+		Resolver: routingResolverFunc(func(_ context.Context, req routing.Request) ([]routing.ExecutionTarget, error) {
+			assert.Equal(t, routing.Request{Database: "logical-db", Environment: "staging"}, req)
+			return []routing.ExecutionTarget{{
+				DatabaseType: storage.DatabaseTypeMySQL,
+				Deployment:   "east",
+				Target:       "target-123",
+			}}, nil
+		}),
+		PlanLookup:          routingPlanLookup{},
+		ApplyLookup:         routingApplyLookup{},
+		ClientForDeployment: testDeploymentClientFunc(clients),
+	})
+
+	resp, err := routingClient.PlanDiff(t.Context(), &ternv1.PlanRequest{
+		Database:    "logical-db",
+		Environment: "staging",
+		Type:        storage.DatabaseTypeVitess,
+		Target:      "caller-supplied-target",
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, ternv1.Engine_ENGINE_SPIRIT, resp.Engine)
+	require.NotNil(t, clients["east/staging"].planDiffReq)
+	assert.Equal(t, "logical-db", clients["east/staging"].planDiffReq.Database)
+	assert.Equal(t, "staging", clients["east/staging"].planDiffReq.Environment)
+	assert.Equal(t, storage.DatabaseTypeMySQL, clients["east/staging"].planDiffReq.Type)
+	assert.Equal(t, "target-123", clients["east/staging"].planDiffReq.Target)
 }
 
 func TestRoutingClientPlanRejectsMultiTargetRoute(t *testing.T) {

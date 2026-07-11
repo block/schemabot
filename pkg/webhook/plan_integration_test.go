@@ -22,6 +22,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
@@ -289,6 +290,9 @@ func TestE2EPlanNoChanges(t *testing.T) {
 	assert.Equal(t, "success", check.Conclusion)
 }
 
+// TestE2EPlanConfigNotFound verifies that a plan command on a PR that changes
+// schema files with no schemabot.yaml anywhere in the repository fails with
+// the config-not-found error rather than planning unmanaged schema.
 func TestE2EPlanConfigNotFound(t *testing.T) {
 	dbName := "webhook_plan_noconfig"
 	svc := setupE2EService(t, dbName)
@@ -300,8 +304,11 @@ func TestE2EPlanConfigNotFound(t *testing.T) {
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	// No schemabot.yaml config — empty schema files, no config
-	result := setupFakeGitHubForPlan(t, mux, map[string]string{}, "", dbName)
+	// The PR changes a schema file, but no schemabot.yaml config exists.
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, "", dbName)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
@@ -326,6 +333,141 @@ func TestE2EPlanConfigNotFound(t *testing.T) {
 		assert.Contains(t, body, "No SchemaBot Configuration Found")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for error comment")
+	}
+}
+
+// TestE2EPlanCleansStalePlanOnlyChecksBeforeConvergingAggregates verifies the
+// check-refresh path of a plan command on a PR with no managed schema changes
+// when an earlier commit left behind a stale plan-only blocking check (for
+// example the PR reverted its schema change after a plan ran). The stale
+// per-database check must be cleaned up to passing on the current head — the
+// aggregate would otherwise stay blocked and contradict the refresh comment.
+func TestE2EPlanCleansStalePlanOnlyChecksBeforeConvergingAggregates(t *testing.T) {
+	dbName := "webhook_plan_stale_converge"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   100,
+		HasChanges:   true,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionActionRequired,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{}, "", dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "no managed schema changes handled")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "No Managed Schema Changes")
+		assert.Contains(t, body, "refreshed as passing")
+		assert.Contains(t, body, "abc123")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for check refresh comment")
+	}
+
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check, "expected stored per-database check to survive cleanup")
+	assert.Equal(t, "abc123", check.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionSuccess, check.Conclusion)
+	assert.False(t, check.HasChanges)
+}
+
+// TestE2EPlanScopedToOneEnvironmentBlocksOnOtherEnvironmentApply verifies that
+// a plan command scoped with -e cannot convert a PR's checks to passing while
+// an apply in a different environment still owns the PR's state: the check
+// refresh spans every environment's aggregate, so apply-owned state anywhere
+// must block it with the reconciliation comment instead.
+func TestE2EPlanScopedToOneEnvironmentBlocksOnOtherEnvironmentApply(t *testing.T) {
+	dbName := "webhook_plan_cross_env_apply"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-cross-env",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "production",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Running,
+		Engine:          "spirit",
+	}
+	applyID, err := svc.Storage().Applies().Create(ctx, apply)
+	require.NoError(t, err)
+
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  "production",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   100,
+		ApplyID:      applyID,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{}, "", dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Schema Change Reconciliation Required")
+		assert.Contains(t, body, "production")
+		assert.NotContains(t, body, "refreshed as passing")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for reconciliation comment")
 	}
 }
 

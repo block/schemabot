@@ -460,6 +460,8 @@ func TestWebhookControlCommandMissingApplyID(t *testing.T) {
 		{name: "cancel", comment: "schemabot cancel -e staging", action: "cancel"},
 		{name: "start", comment: "schemabot start -e staging", action: "start"},
 		{name: "cutover", comment: "schemabot cutover -e staging", action: "cutover"},
+		{name: "volume", comment: "schemabot volume -e staging -v 8", action: "volume"},
+		{name: "volume without level", comment: "schemabot volume -e staging", action: "volume"},
 	}
 
 	for _, tt := range tests {
@@ -483,6 +485,48 @@ func TestWebhookControlCommandMissingApplyID(t *testing.T) {
 				assert.Contains(t, body, "schemabot "+tt.action+" <apply-id> -e <environment>")
 			case <-time.After(2 * time.Second):
 				t.Fatal("timed out waiting for missing apply ID comment")
+			}
+		})
+	}
+}
+
+// TestWebhookVolumeCommandInvalidLevel verifies that a volume command with a
+// missing, non-numeric, or out-of-range -v level posts a usage comment naming
+// the valid range and exact syntax instead of silently dropping the command.
+func TestWebhookVolumeCommandInvalidLevel(t *testing.T) {
+	tests := []struct {
+		name    string
+		comment string
+	}{
+		{name: "missing -v flag", comment: "schemabot volume apply_abc123 -e staging"},
+		{name: "-v without value", comment: "schemabot volume apply_abc123 -e staging -v"},
+		{name: "non-numeric level", comment: "schemabot volume apply_abc123 -e staging -v fast"},
+		{name: "level below range", comment: "schemabot volume apply_abc123 -e staging -v 0"},
+		{name: "level above range", comment: "schemabot volume apply_abc123 -e staging -v 12"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, comments, _ := newTestHandler(t)
+
+			req := buildWebhookRequest(t, webhookPayloadOpts{
+				comment: tt.comment,
+				isPR:    true,
+			}, nil)
+
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+
+			require.Equal(t, http.StatusOK, rr.Code)
+			assert.Contains(t, rr.Body.String(), "volume started")
+
+			select {
+			case body := <-comments:
+				assert.Contains(t, body, "Missing or Invalid Volume Level")
+				assert.Contains(t, body, "schemabot volume <apply-id> -e <environment> -v <level>")
+				assert.Contains(t, body, "between 1 (slowest) and 11 (fastest)")
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for invalid volume level comment")
 			}
 		})
 	}
@@ -581,11 +625,12 @@ func TestWebhookIgnoresSchemaBotProse(t *testing.T) {
 	}
 }
 
-func TestWebhookEyesReaction(t *testing.T) {
+// On a repo with no aggregate role this deployment is the only SchemaBot, so
+// the acknowledgment fires at dispatch — the user sees the eyes reaction
+// immediately, before schema discovery runs.
+func TestWebhookEyesReactionAtDispatchForSingleDeploymentRepo(t *testing.T) {
 	h, _, reactions := newTestHandler(t)
 
-	// Use an env-scoped command that reaches the reaction point (after all
-	// skip/filter checks). Help returns before the reaction fires.
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
 		isPR:    true,
@@ -600,42 +645,64 @@ func TestWebhookEyesReaction(t *testing.T) {
 	case reaction := <-reactions:
 		assert.Equal(t, "eyes", reaction)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for eyes reaction")
+		t.Fatal("timed out waiting for the dispatch acknowledgment reaction")
 	}
 }
 
-func TestWebhookPhase2CommandNotYetAvailable(t *testing.T) {
-	h, comments, _ := newTestHandler(t)
+// A bare "schemabot plan" (no -e) fans out to every configured environment,
+// but the acknowledgment contract is the same as its scoped siblings: on a
+// repo with no aggregate role this deployment is the only SchemaBot, so the
+// eyes reaction fires at dispatch, before any discovery runs.
+func TestWebhookEyesReactionAtDispatchForBareMultiEnvPlan(t *testing.T) {
+	h, _, reactions := newTestHandler(t)
 
-	// revert is the only remaining Phase 2 command not yet available via PR
-	// comments (apply, apply-confirm, unlock, stop, start, cutover, and skip-revert
-	// are now implemented).
-	cmds := []struct {
-		comment string
-		action  string
-	}{
-		{"schemabot revert -e staging", "revert"},
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the bare-plan dispatch acknowledgment")
 	}
+}
 
-	for _, cmd := range cmds {
-		req := buildWebhookRequest(t, webhookPayloadOpts{
-			comment: cmd.comment,
-			isPR:    true,
-		}, nil)
+// A -t-scoped command names its actor, so the addressed tenant acknowledges
+// at dispatch — instantly, before any schema discovery — even on an
+// aggregate-role repo.
+func TestWebhookEyesReactionAtDispatchForTenantScopedCommand(t *testing.T) {
+	h, _, reactions := newTestHandler(t)
+	cfg := h.service.Config()
+	cfg.Tenant = "tenant-b"
+	repoCfg := cfg.Repos["octocat/hello-world"]
+	repoCfg.Aggregate = &api.AggregateConfig{Role: api.AggregateRoleParticipant}
+	if cfg.Repos == nil {
+		cfg.Repos = map[string]api.RepoConfig{}
+	}
+	cfg.Repos["octocat/hello-world"] = repoCfg
 
-		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, req)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging -t tenant-b",
+		isPR:    true,
+	}, nil)
 
-		require.Equal(t, http.StatusOK, rr.Code)
-		assert.Contains(t, rr.Body.String(), "not yet implemented")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
 
-		select {
-		case body := <-comments:
-			assert.Contains(t, body, "not yet available via PR comments")
-			assert.Contains(t, body, cmd.action)
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for comment for %q", cmd.comment)
-		}
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the scoped-command dispatch acknowledgment")
 	}
 }
 

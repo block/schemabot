@@ -29,7 +29,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 
 	applyID := result.ApplyID
 	if applyID == "" {
-		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID())
+		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.deploymentTenant()))
 		return
 	}
 
@@ -40,23 +40,32 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 
 	stor := h.service.Storage()
 	if stor == nil {
-		h.logger.Error("storage not configured for rollback", "repo", repo, "pr", pr, "applyID", applyID)
+		h.logger.Error("storage not configured for rollback", "repo", repo, "pr", pr, "apply_id", applyID)
 		h.postCommandError(repo, pr, installationID, action.Rollback, result.Environment, requestedBy, "Storage is not available")
 		return
 	}
 	applyStore := stor.Applies()
 	if applyStore == nil {
-		h.logger.Error("apply store not configured for rollback", "repo", repo, "pr", pr, "applyID", applyID)
+		h.logger.Error("apply store not configured for rollback", "repo", repo, "pr", pr, "apply_id", applyID)
 		h.postCommandError(repo, pr, installationID, action.Rollback, result.Environment, requestedBy, "Apply store is not available")
 		return
 	}
 	apply, err := applyStore.GetByApplyIdentifier(ctx, applyID)
 	if err != nil {
-		h.logger.Error("failed to look up rollback apply", "repo", repo, "pr", pr, "applyID", applyID, "error", err)
+		h.logger.Error("failed to look up rollback apply", "repo", repo, "pr", pr, "apply_id", applyID, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Rollback, result.Environment, requestedBy, "Failed to look up apply: "+err.Error())
 		return
 	}
 	if apply == nil {
+		// On an aggregate repo an unscoped rollback fans out to every
+		// deployment, but the apply lives in exactly one tenant's storage. A
+		// deployment that doesn't have it is not the owner and stays silent so
+		// only the owning deployment answers.
+		if h.silentOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("unscoped fan-out rollback targets an apply not stored on this deployment; staying silent so the owning deployment responds",
+				"repo", repo, "pr", pr, "apply_id", applyID, "environment", result.Environment)
+			return
+		}
 		h.postComment(repo, pr, installationID, templates.RenderRollbackApplyNotFound(applyID))
 		return
 	}
@@ -70,9 +79,10 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	// the comment delivery and can react to the same rollback request.
 	if h.service != nil && !h.service.Config().IsEnvironmentAllowed(environment) {
 		h.logger.Info("ignoring rollback for non-allowed environment",
-			"repo", repo, "pr", pr, "applyID", applyID, "environment", environment)
+			"repo", repo, "pr", pr, "apply_id", applyID, "environment", environment)
 		return
 	}
+	h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 
 	// Rollback executes DDL against the target database, so the actor must be an
 	// authorized admin/operator before SchemaBot reveals any lock or plan detail
@@ -103,7 +113,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	// Check for existing lock
 	lockStore := stor.Locks()
 	if lockStore == nil {
-		h.logger.Error("lock store not configured for rollback", "repo", repo, "pr", pr, "applyID", applyID, "database", database, "database_type", dbType)
+		h.logger.Error("lock store not configured for rollback", "repo", repo, "pr", pr, "apply_id", applyID, "database", database, "database_type", dbType)
 		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, "Lock store is not available")
 		return
 	}
@@ -119,7 +129,8 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	if existingLock != nil && existingLock.Owner != lockOwner {
 		h.postComment(repo, pr, installationID, templates.RenderRollbackBlockedByLock(
 			database, environment,
-			existingLock.Owner, existingLock.Repository, existingLock.PullRequest))
+			existingLock.Owner, existingLock.Repository, existingLock.PullRequest,
+			h.deploymentTenant()))
 		return
 	}
 
@@ -148,7 +159,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	}); err != nil {
 		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
 		h.logger.Warn("rollback rejected by source apply guardrails after lock acquisition",
-			"repo", repo, "pr", pr, "applyID", applyID,
+			"repo", repo, "pr", pr, "apply_id", applyID,
 			"environment", result.Environment, "database", database, "error", err)
 		h.postRollbackRejected(repo, pr, installationID, apply, applyID, environment, database, err.Error())
 		return
@@ -165,7 +176,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 			h.postComment(repo, pr, installationID, templates.RenderRollbackNoCompletedApply(database, environment))
 			return
 		}
-		h.logger.Error("rollback plan failed", "repo", repo, "pr", pr, "applyID", applyID, "error", err)
+		h.logger.Error("rollback plan failed", "repo", repo, "pr", pr, "apply_id", applyID, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, errMsg)
 		return
 	}
@@ -204,6 +215,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		DatabaseType: dbType,
 		IsMySQL:      dbType == "mysql",
 		ApplyID:      apply.ApplyIdentifier,
+		Tenant:       h.deploymentTenant(),
 	}
 
 	for _, sc := range planResp.Changes {
@@ -239,13 +251,13 @@ func (h *Handler) handleRollbackSourceError(repo string, pr int, installationID 
 	}
 	if status >= http.StatusInternalServerError {
 		h.logger.Error("rollback source validation failed",
-			"repo", repo, "pr", pr, "applyID", applyID,
+			"repo", repo, "pr", pr, "apply_id", applyID,
 			"environment", environment, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, err.Error())
 		return
 	}
 	h.logger.Warn("rollback rejected by source apply guardrails",
-		"repo", repo, "pr", pr, "applyID", applyID,
+		"repo", repo, "pr", pr, "apply_id", applyID,
 		"environment", environment, "error", err)
 	h.postRollbackRejected(repo, pr, installationID, apply, applyID, environment, "", err.Error())
 }
@@ -294,9 +306,19 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 		return
 	}
 	if existingLock == nil || rollbackPlan == nil {
-		h.postComment(repo, pr, installationID, templates.RenderRollbackConfirmNoLock("", environment))
+		// On an aggregate repo an unscoped rollback-confirm fans out to every
+		// deployment, but only the deployment holding the pinned rollback lock
+		// has anything to confirm. One with no pending rollback stays silent so
+		// only the owning deployment answers.
+		if h.silentOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("unscoped fan-out rollback-confirm found no pending rollback on this deployment; staying silent so the owning deployment responds",
+				"repo", repo, "pr", pr, "environment", environment)
+			return
+		}
+		h.postComment(repo, pr, installationID, templates.RenderRollbackConfirmNoLock("", environment, h.deploymentTenant()))
 		return
 	}
+	h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 
 	database := rollbackPlan.Database
 	dbType := rollbackPlan.DatabaseType
@@ -323,7 +345,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 				"database_type", dbType, "environment", environment,
 				"lock_owner", lockOwner, "error", err)
 			h.postComment(repo, pr, installationID,
-				templates.RenderRollbackAlreadyRolledBackLockHeld(database, environment, lockOwner))
+				templates.RenderRollbackAlreadyRolledBackLockHeld(database, environment, lockOwner, h.deploymentTenant()))
 			return
 		}
 		h.postComment(repo, pr, installationID,
@@ -476,7 +498,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 	// omitted on this first comment — the observer refreshes it from engine
 	// display metadata on the next progress tick.
 	progressBody := formatProgressComment(apply, nil, nil)
-	h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, progressBody)
+	h.postInitialProgressComment(ctx, repo, pr, installationID, applyID, progressBody)
 }
 
 func (h *Handler) rollbackConfirmPlanForPR(ctx context.Context, repo string, pr int, environment, lockOwner string) (*storage.Lock, *storage.Plan, error) {

@@ -41,6 +41,8 @@ func engineStateToStorage(es engine.State) string {
 		return state.Task.CuttingOver
 	case engine.StateRevertWindow:
 		return state.Task.RevertWindow
+	case engine.StateReverting:
+		return state.Task.Reverting
 	case engine.StateCompleted:
 		return state.Task.Completed
 	case engine.StateFailed:
@@ -99,6 +101,8 @@ func storageStateToProto(ts string) ternv1.State {
 		return ternv1.State_STATE_CUTTING_OVER
 	case state.Task.RevertWindow:
 		return ternv1.State_STATE_REVERT_WINDOW
+	case state.Task.Reverting, state.Apply.Reverting:
+		return ternv1.State_STATE_REVERTING
 	case state.Task.Completed:
 		return ternv1.State_STATE_COMPLETED
 	case state.Task.Failed:
@@ -207,6 +211,8 @@ func ProtoStateToStorage(ps ternv1.State) string {
 		return state.Apply.CuttingOver
 	case ternv1.State_STATE_REVERT_WINDOW:
 		return state.Apply.RevertWindow
+	case ternv1.State_STATE_REVERTING:
+		return state.Apply.Reverting
 	case ternv1.State_STATE_COMPLETED:
 		return state.Apply.Completed
 	case ternv1.State_STATE_FAILED:

@@ -570,6 +570,9 @@ type mockTernClient struct {
 	planResp                 *ternv1.PlanResponse
 	planErr                  error
 	planReq                  *ternv1.PlanRequest
+	planDiffResp             *ternv1.PlanDiffResponse
+	planDiffErr              error
+	planDiffReq              *ternv1.PlanRequest
 	pullSchemaResp           *ternv1.PullSchemaResponse
 	pullSchemaErr            error
 	pullSchemaReq            *ternv1.PullSchemaRequest
@@ -632,6 +635,13 @@ func (m *mockTernClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*te
 		return m.planResp, m.planErr
 	}
 	return nil, m.planErr
+}
+func (m *mockTernClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	m.planDiffReq = req
+	if m.planDiffResp != nil {
+		return m.planDiffResp, m.planDiffErr
+	}
+	return nil, m.planDiffErr
 }
 func (m *mockTernClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
 	m.applyReq = req
@@ -3722,12 +3732,14 @@ func TestTernHealth(t *testing.T) {
 }
 
 func TestVolumeHandler(t *testing.T) {
-	t.Run("success returns volume values", func(t *testing.T) {
+	// A volume adjustment is queued as a durable control request for the
+	// driving instance, so the accepted response carries the queued target
+	// level; the previous level is only known to the driver and stays unset.
+	t.Run("accepted queue returns target volume", func(t *testing.T) {
 		mock := &mockTernClient{
 			volumeResp: &ternv1.VolumeResponse{
-				Accepted:       true,
-				PreviousVolume: 3,
-				NewVolume:      11,
+				Accepted:  true,
+				NewVolume: 11,
 			},
 		}
 		svc := newControlTestService(mock, activeTestApply("apply-vol123"))
@@ -3746,16 +3758,16 @@ func TestVolumeHandler(t *testing.T) {
 		err := json.NewDecoder(w.Body).Decode(&resp)
 		require.NoError(t, err, "failed to decode response")
 
-		// Verify the response includes volume values (not zeros)
 		assert.Equal(t, true, resp["accepted"])
 		prevVol, _ := resp["previous_volume"].(float64) // JSON numbers are float64
 		newVol, _ := resp["new_volume"].(float64)
-		assert.Equal(t, float64(3), prevVol)
+		assert.Equal(t, float64(0), prevVol)
 		assert.Equal(t, float64(11), newVol)
 
 		require.NotNil(t, mock.volumeReq, "expected volume request to be captured")
 		assert.Equal(t, "apply-vol123", mock.volumeReq.ApplyId)
 		assert.Equal(t, "staging", mock.volumeReq.Environment)
+		assert.Equal(t, int32(11), mock.volumeReq.Volume)
 	})
 
 	t.Run("invalid volume range", func(t *testing.T) {
@@ -5048,7 +5060,12 @@ func TestRevertHandler(t *testing.T) {
 		mock := &mockTernClient{
 			revertResp: &ternv1.RevertResponse{Accepted: true},
 		}
-		svc := newControlTestService(mock, activeTestApply("apply-rev123"))
+		// Revert is only accepted while the apply is in its revert window.
+		apply := activeTestApply("apply-rev123")
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EnginePlanetScale
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		svc := newControlTestService(mock, apply)
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -5177,6 +5194,64 @@ func TestSkipRevertHandler(t *testing.T) {
 		assert.Equal(t, http.StatusAccepted, second.Code, second.Body.String())
 		assert.Contains(t, second.Body.String(), apitypes.ControlStatusAlreadyRequested)
 		assert.Nil(t, mock.skipRevertReq, "a duplicate request must not re-drive the engine")
+	})
+}
+
+// Revert and skip-revert are contradictory intents for the same revert window —
+// one undoes the change, the other makes it permanent. Once either has a
+// pending durable request, the opposite command is rejected with a conflict
+// that names the intent already in flight, instead of recording a second,
+// contradictory request for the drive to arbitrate.
+func TestRevertWindowCommandsRejectContradiction(t *testing.T) {
+	revertWindowApply := func(id string) *storage.Apply {
+		apply := activeTestApply(id)
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EnginePlanetScale
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		return apply
+	}
+	post := func(t *testing.T, mux *http.ServeMux, path, applyID string) *httptest.ResponseRecorder {
+		t.Helper()
+		body := fmt.Sprintf(`{"environment": "staging", "apply_id": %q}`, applyID)
+		req := httptest.NewRequestWithContext(t.Context(), "POST", path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w
+	}
+
+	t.Run("revert rejected while skip-revert is pending", func(t *testing.T) {
+		// The immediate skip attempt fails, so the durable skip-revert request
+		// stays pending for the apply owner.
+		mock := &mockTernClient{skipRevertErr: errors.New("data plane unavailable")}
+		svc := newControlTestService(mock, revertWindowApply("apply-conflict-rv"))
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		first := post(t, mux, "/api/skip-revert", "apply-conflict-rv")
+		require.Equal(t, http.StatusAccepted, first.Code, first.Body.String())
+
+		second := post(t, mux, "/api/revert", "apply-conflict-rv")
+		assert.Equal(t, http.StatusConflict, second.Code, second.Body.String())
+		assert.Contains(t, second.Body.String(), "skip-revert is already pending")
+		assert.Nil(t, mock.revertReq, "the contradictory revert must not reach the data plane")
+	})
+
+	t.Run("skip-revert rejected while revert is pending", func(t *testing.T) {
+		// The immediate revert attempt fails, so the durable revert request
+		// stays pending for the apply owner.
+		mock := &mockTernClient{revertErr: errors.New("data plane unavailable")}
+		svc := newControlTestService(mock, revertWindowApply("apply-conflict-sr"))
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		first := post(t, mux, "/api/revert", "apply-conflict-sr")
+		require.Equal(t, http.StatusAccepted, first.Code, first.Body.String())
+
+		second := post(t, mux, "/api/skip-revert", "apply-conflict-sr")
+		assert.Equal(t, http.StatusConflict, second.Code, second.Body.String())
+		assert.Contains(t, second.Body.String(), "revert is already pending")
+		assert.Nil(t, mock.skipRevertReq, "the contradictory skip-revert must not reach the data plane")
 	})
 }
 

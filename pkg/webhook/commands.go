@@ -3,6 +3,7 @@ package webhook
 import (
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -48,6 +49,13 @@ type CommandSpec struct {
 
 	// SupportsForce means `--force` is recognized.
 	SupportsForce bool
+
+	// SupportsVolumeLevel means `-v <level>` / `--volume <level>` is recognized.
+	// The parser extracts the numeric level into CommandResult.VolumeLevel and
+	// flags a present-but-unparseable value via VolumeLevelError; range
+	// validation stays with the dispatcher so the rejection comment can cite
+	// the valid range.
+	SupportsVolumeLevel bool
 }
 
 // commandSpecs is the registry of all SchemaBot commands. Order does not
@@ -68,9 +76,10 @@ var commandSpecs = []CommandSpec{
 	{Name: action.Cancel, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Start, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Release, RequiresEnv: true, HasApplyID: true},
-	{Name: action.Revert, RequiresEnv: true},
-	{Name: action.SkipRevert, RequiresEnv: true},
+	{Name: action.Revert, RequiresEnv: true, HasApplyID: true},
+	{Name: action.SkipRevert, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Cutover, RequiresEnv: true, HasApplyID: true},
+	{Name: action.Volume, RequiresEnv: true, HasApplyID: true, SupportsVolumeLevel: true},
 	{Name: action.Rollback, RequiresEnv: true, HasApplyID: true},
 	{Name: action.RollbackConfirm, RequiresEnv: true, SupportsDeferCutover: true},
 }
@@ -116,6 +125,7 @@ type CommandParser struct {
 	allowUnsafeRegex  *regexp.Regexp
 	forceRegex        *regexp.Regexp
 	autoConfirmRegex  *regexp.Regexp
+	volumeFlagRegex   *regexp.Regexp
 }
 
 // NewCommandParser creates a new command parser.
@@ -125,7 +135,7 @@ func NewCommandParser() *CommandParser {
 		mentionRegex:      regexp.MustCompile(`(?im)^ {0,3}schemabot(?:[ \t]+|$)`),
 		helpRegex:         regexp.MustCompile(`(?im)^ {0,3}schemabot[ \t]+help\b`),
 		applyIDRegex:      regexp.MustCompile(`(?i)\b(apply[_-][a-f0-9]+)\b`),
-		environmentRegex:  regexp.MustCompile(`(?i)-e\s+(staging|production)`),
+		environmentRegex:  regexp.MustCompile(`(?i)-e\s+([a-z0-9][a-z0-9_-]*)`),
 		databaseRegex:     regexp.MustCompile(`(?i)-d\s+([a-zA-Z0-9_-]+)`),
 		tenantRegex:       regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`),
 		tenantFlagRegex:   regexp.MustCompile(`(?i)(?:^|\s)(?:--tenant|-t)(?:[ \t]+([^\s]+))?`),
@@ -134,12 +144,17 @@ func NewCommandParser() *CommandParser {
 		allowUnsafeRegex:  regexp.MustCompile(`(?i)--allow-unsafe\b`),
 		forceRegex:        regexp.MustCompile(`(?i)--force\b`),
 		autoConfirmRegex:  regexp.MustCompile(`(?i)(?:--yes\b|-y\b)`),
+		volumeFlagRegex:   regexp.MustCompile(`(?i)(?:^|\s)(?:--volume|-v)(?:[ \t]+([^\s]+))?(?:\s|$)`),
 	}
 }
 
 // CommandResult represents the result of parsing a command.
 type CommandResult struct {
-	Action       string
+	Action string
+	// CommentID is the PR comment that carried this command. Handlers
+	// acknowledge it with a reaction once they commit to acting, so on a
+	// fan-out only the deployments actually doing work acknowledge.
+	CommentID    int64
 	ApplyID      string // Positional apply identifier for apply-scoped commands.
 	Environment  string
 	Database     string // Optional -d flag value
@@ -150,10 +165,17 @@ type CommandResult struct {
 	AllowUnsafe  bool
 	Force        bool
 	AutoConfirm  bool
-	Found        bool
-	IsHelp       bool
-	IsMention    bool
-	MissingEnv   bool
+	// VolumeLevel is the numeric level from `-v` / `--volume` on commands whose
+	// spec opts into SupportsVolumeLevel. Zero means the flag was absent.
+	VolumeLevel int32
+	// VolumeLevelError is true when `-v` / `--volume` is present without a
+	// numeric value, so the dispatcher can post a usage comment instead of
+	// treating the command as flagless.
+	VolumeLevelError bool
+	Found            bool
+	IsHelp           bool
+	IsMention        bool
+	MissingEnv       bool
 }
 
 // ParseCommand parses a SchemaBot command from a comment body.
@@ -202,6 +224,24 @@ func (p *CommandParser) firstDirectiveLine(body string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// extractVolumeLevel returns the numeric level from `-v` / `--volume` and
+// whether the flag was present but unusable (missing value or non-numeric).
+// An absent flag returns (0, false); range validation is the dispatcher's job.
+func (p *CommandParser) extractVolumeLevel(body string) (int32, bool) {
+	match := p.volumeFlagRegex.FindStringSubmatch(body)
+	if len(match) == 0 {
+		return 0, false
+	}
+	if len(match) < 2 || match[1] == "" {
+		return 0, true
+	}
+	level, err := strconv.ParseInt(match[1], 10, 32)
+	if err != nil {
+		return 0, true
+	}
+	return int32(level), false
 }
 
 func (p *CommandParser) extractTenant(body string) (string, bool) {
@@ -271,6 +311,9 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 	}
 	if spec.SupportsAutoConfirm {
 		result.AutoConfirm = p.autoConfirmRegex.MatchString(body)
+	}
+	if spec.SupportsVolumeLevel {
+		result.VolumeLevel, result.VolumeLevelError = p.extractVolumeLevel(body)
 	}
 
 	if m := p.environmentRegex.FindStringSubmatch(body); len(m) >= 2 {

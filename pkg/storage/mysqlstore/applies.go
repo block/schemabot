@@ -35,9 +35,9 @@ const applyColumnsForApplyAlias = `a.id, a.apply_identifier, a.lock_id, a.plan_i
 	a.created_at, a.started_at, a.completed_at, a.updated_at, a.revert_skipped_at`
 
 const (
-	// maxRecoveryAttempts is the retry budget for failed_retryable applies. The
-	// original apply attempt is separate; this counts operator redispatches.
-	maxRecoveryAttempts = 10
+	// maxRecoveryAttempts is the retry budget for failed_retryable applies,
+	// shared with operator-facing progress rendering via the exported constant.
+	maxRecoveryAttempts = storage.MaxRecoveryAttempts
 
 	// retryableRecoveryFreshnessDays prevents old retryable failures from
 	// being redispatched unexpectedly after retry policy or attempt budgets
@@ -1131,11 +1131,19 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 	// Apply creation/update enforces at most one active apply per
 	// database/type/environment. The claim query only needs to find stale work;
 	// FOR UPDATE SKIP LOCKED prevents concurrent drivers from claiming the same row.
+	//
+	// The pending clause requires child rows so a half-created apply is never
+	// claimed. Creation dual-writes tasks and the apply_operations row in one
+	// transaction, so either proves the create committed fully; a VSchema-only
+	// apply carries an operation row but no tasks, so tasks alone would strand it.
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM applies a
 		WHERE (
-				(a.state = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id))
+				(a.state = ? AND (
+					EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id)
+					OR EXISTS (SELECT 1 FROM apply_operations ao WHERE ao.apply_id = a.id)
+				))
 				OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL 1 MINUTE)
 				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= NOW() - INTERVAL ? DAY)
 				OR (
@@ -1238,7 +1246,10 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 		FROM applies a
 		WHERE a.id = ?
 			AND (
-				(a.state = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id))
+				(a.state = ? AND (
+					EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id)
+					OR EXISTS (SELECT 1 FROM apply_operations ao WHERE ao.apply_id = a.id)
+				))
 				OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL 1 MINUTE)
 				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= NOW() - INTERVAL ? DAY)
 				OR (

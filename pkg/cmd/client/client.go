@@ -72,6 +72,30 @@ func ListDatabases(endpoint string, opts ListDatabasesOptions) (*apitypes.Databa
 	return &result, nil
 }
 
+func RedriveWebhooks(ctx context.Context, endpoint string, req apitypes.WebhookRedriveRequest) (*apitypes.WebhookRedriveResponse, error) {
+	var result apitypes.WebhookRedriveResponse
+	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/webhooks/redrive", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func ChecksScan(ctx context.Context, endpoint string, req apitypes.ChecksScanRequest) (*apitypes.ChecksScanResponse, error) {
+	var result apitypes.ChecksScanResponse
+	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/checks/scan", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func ChecksSynthesize(ctx context.Context, endpoint string, req apitypes.ChecksSynthesizeRequest) (*apitypes.ChecksSynthesizeResponse, error) {
+	var result apitypes.ChecksSynthesizeResponse
+	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/checks/synthesize", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // PullSchemaOptions controls optional live schema pull request fields.
 type PullSchemaOptions struct {
 	Namespaces    []string

@@ -106,7 +106,7 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 
 	// Engine says terminal — update storage and unblock.
 	// IMPORTANT: Only trust terminal states, NOT "No active schema change".
-	// "No active schema change" just means Spirit has no runningMigration,
+	// "No active schema change" just means Spirit has no runningSchemaChange,
 	// which could mean completed, never started, or crashed.
 	if result.State.IsTerminal() {
 		c.logger.Info("conflict check: engine reports terminal state",
@@ -310,14 +310,6 @@ func (c *LocalClient) cancelApplyHandle(handle applyCancelHandle) {
 		c.cancelApply = nil
 	}
 	c.cancelMu.Unlock()
-}
-
-func (c *LocalClient) startApplyExecution(ctx context.Context, cancelGeneration uint64, cancel context.CancelFunc, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
-	go func() {
-		defer c.clearApplyCancel(cancelGeneration)
-		defer cancel()
-		c.runApplyExecution(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier)
-	}()
 }
 
 func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {

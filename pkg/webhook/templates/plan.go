@@ -128,9 +128,12 @@ func RenderPlanComment(data PlanCommentData) string {
 	// Detailed changes
 	writeKeyspaceChanges(&sb, data)
 
-	// Unsafe changes warning
-	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 {
-		writeUnsafeWarning(&sb, data.UnsafeChanges, data.AllowUnsafe, data.IsMySQL)
+	// Unsafe changes warning — shown on the plan comment for review, omitted on
+	// the locked apply comment: unsafe changes only reach an apply after the
+	// operator acknowledged them with --allow-unsafe (apply-confirm re-checks
+	// and blocks otherwise), so repeating them there is noise.
+	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && !data.IsLocked {
+		writeUnsafeWarning(&sb, data.UnsafeChanges, data.IsMySQL)
 	}
 
 	// Lint violations — shown on the plan comment for review, omitted on the
@@ -318,6 +321,48 @@ func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
 	}
 }
 
+// SummarizeChanges renders a compact one-line summary of a plan's changes for
+// the aggregate check's Change column, e.g. "5 creates, 3 alters, 1 drop ·
+// 2 vschema updates". Each category is a pluralized noun so the phrasing stays
+// consistent with the vschema clause. Zero categories are omitted. The vschema
+// clause is only included for non-MySQL engines, matching the plan comment's
+// summary. Returns "" only when the plan has no changes at all. The
+// create/alter/drop and vschema counting is identical to the plan comment's
+// summary (countStatementTypes / countChanges) so the two always agree.
+func SummarizeChanges(data PlanCommentData) string {
+	creates, alters, drops := countStatementTypes(data.Changes)
+	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
+
+	var parts []string
+	if creates > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", creates, pluralize("create", creates)))
+	}
+	if alters > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", alters, pluralize("alter", alters)))
+	}
+	if drops > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", drops, pluralize("drop", drops)))
+	}
+	ddlSummary := strings.Join(parts, ", ")
+
+	// Fallback matching the plan comment: statements that classify as none of
+	// create/alter/drop — or per-shard-only DDL that countStatementTypes does not
+	// walk — still count. Report the raw statement total so the Change column
+	// never implies "no changes" for a plan that has them.
+	if ddlSummary == "" && totalStatements > 0 {
+		ddlSummary = fmt.Sprintf("%d DDL %s", totalStatements, pluralize("statement", totalStatements))
+	}
+
+	if keyspacesWithVSchema > 0 && !data.IsMySQL {
+		vschemaSummary := fmt.Sprintf("%d vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema))
+		if ddlSummary == "" {
+			return vschemaSummary
+		}
+		return ddlSummary + " · " + vschemaSummary
+	}
+	return ddlSummary
+}
+
 // countStatementTypes counts CREATE, ALTER, and DROP statements across all keyspaces.
 func countStatementTypes(changes []KeyspaceChangeData) (creates, alters, drops int) {
 	for _, ks := range changes {
@@ -479,12 +524,9 @@ func planShardList(shards []string) string {
 	return "shards " + strings.Join(quoted, ", ")
 }
 
-func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, allowUnsafe bool, isMySQL bool) {
-	if allowUnsafe {
-		sb.WriteString("**🚨 Unsafe Changes** (`--allow-unsafe` enabled):\n")
-	} else {
-		sb.WriteString("**⛔ Unsafe Changes Detected:**\n")
-	}
+func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
+	n := len(changes)
+	fmt.Fprintf(sb, "⚠️ **Issues**: **%d** unsafe %s detected\n", n, pluralize("change", n))
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -773,12 +815,18 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 		return
 	}
 
-	// Detailed changes
-	writeKeyspaceChanges(sb, *plan)
+	// Detailed changes. A single change is small enough to show inline; more
+	// than one is collapsed so the DDL doesn't dominate the comment while the
+	// unsafe/lint warnings and summary below stay visible at a glance.
+	if totalChanges == 1 {
+		writeKeyspaceChanges(sb, *plan)
+	} else {
+		writeCollapsibleKeyspaceChanges(sb, *plan, totalStatements)
+	}
 
 	// Unsafe changes warning
 	if plan.HasUnsafeChanges && len(plan.UnsafeChanges) > 0 {
-		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.AllowUnsafe, plan.IsMySQL)
+		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.IsMySQL)
 	}
 
 	// Lint violations
@@ -793,6 +841,20 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 
 	// Summary (after DDL, matching CLI layout)
 	writePlanSummary(sb, *plan, totalStatements, keyspacesWithVSchema)
+}
+
+// writeCollapsibleKeyspaceChanges renders a plan's changes — DDL, plus VSchema
+// diffs for non-MySQL keyspaces — inside a collapsed <details> block. The
+// summary line carries the statement count so reviewers can gauge the size of
+// the change without expanding it.
+func writeCollapsibleKeyspaceChanges(sb *strings.Builder, plan PlanCommentData, totalStatements int) {
+	summary := "Show changes"
+	if totalStatements > 0 {
+		summary = fmt.Sprintf("Show SQL (%d %s)", totalStatements, pluralize("statement", totalStatements))
+	}
+	fmt.Fprintf(sb, "<details>\n<summary>%s</summary>\n\n", summary)
+	writeKeyspaceChanges(sb, plan)
+	sb.WriteString("</details>\n\n")
 }
 
 // writeMultiEnvFooter writes the footer with apply commands and error guidance.
@@ -835,11 +897,18 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 }
 
 func tenantCommand(baseCommand, environment, tenant string) string {
-	command := fmt.Sprintf("%s -e %s", baseCommand, environment)
-	if tenant != "" {
-		command += fmt.Sprintf(" --tenant %s", tenant)
+	return appendTenantFlag(fmt.Sprintf("%s -e %s", baseCommand, environment), tenant)
+}
+
+// appendTenantFlag appends the --tenant flag to a pasteable command hint when
+// tenant is set. In tenant mode, commands without an explicit tenant target
+// are ignored, so every command hint a user may copy-paste must carry the
+// deployment's tenant.
+func appendTenantFlag(command, tenant string) string {
+	if tenant == "" {
+		return command
 	}
-	return command
+	return fmt.Sprintf("%s --tenant %s", command, tenant)
 }
 
 // allPlansIdentical returns true if all environments have identical changes.

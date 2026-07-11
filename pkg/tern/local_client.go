@@ -148,9 +148,10 @@ type LocalConfig struct {
 	// quarantine so DROP TABLE executes directly).
 	Metadata map[string]string
 
-	// WakeOperator notifies the owner loop after an external control request is
-	// recorded. The callback must not execute control actions itself; it only
-	// nudges the storage-claiming operator to process durable intent promptly.
+	// WakeOperator notifies the owner loop after durable work is recorded — a
+	// queued apply from a dispatch, or an external control request. The callback
+	// must not execute the work itself; it only nudges the storage-claiming
+	// operator to pick it up promptly instead of waiting out the poll interval.
 	WakeOperator func(applyIdentifier, database, environment string)
 
 	// EngineFactories supplies engine implementations for database types this
@@ -196,7 +197,9 @@ type LocalClient struct {
 	observers  map[int64]ProgressObserver // keyed by apply ID
 
 	// pendingObserver is consumed by the next direct Apply() call and registered
-	// before Spirit starts.
+	// under the created apply's ID before the operator picks the apply up; the
+	// operator drives through this same client instance, so the drive finds the
+	// observer in the registry.
 	// Protected by observerMu.
 	pendingObserver ProgressObserver
 }
@@ -271,9 +274,31 @@ func (c *LocalClient) IsRemote() bool { return false }
 // Endpoint returns the database name for this local client.
 func (c *LocalClient) Endpoint() string { return c.config.Database }
 
-func (c *LocalClient) wakeOperatorForControlRequest(apply *storage.Apply) {
+// wakeOperator nudges the storage-claiming operator to pick up a durable
+// control request recorded for the apply promptly instead of waiting out the
+// poll interval. A skipped control-request wake only delays processing — the
+// request is serviced when the operator next claims the (already claimable)
+// apply — so the skip is expected in library and test use and logged at Debug.
+// Queued applies use wakeOperatorForQueuedApply, whose skip can strand work.
+func (c *LocalClient) wakeOperator(apply *storage.Apply) {
 	if c.config.WakeOperator == nil {
-		c.logger.Debug("operator wake skipped because no wake callback is configured",
+		c.logger.Debug("operator wake skipped because no wake callback is configured; the control request will be processed when an operator next claims this apply",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment)
+		return
+	}
+	c.config.WakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+}
+
+// wakeOperatorForQueuedApply nudges the operator to claim a newly queued apply.
+// Unlike a control-request wake, a skipped wake here is not benign: every drive
+// runs under an operator claim, so a queued apply makes no progress until an
+// operator polling this storage claims it — and in an embedding that runs no
+// operator at all, it will never be driven.
+func (c *LocalClient) wakeOperatorForQueuedApply(apply *storage.Apply) {
+	if c.config.WakeOperator == nil {
+		c.logger.Warn("operator wake skipped because no wake callback is configured; the queued apply will not be driven until an operator polling this storage claims it",
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
 			"environment", apply.Environment)
@@ -1253,11 +1278,63 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	}
 	plan.ID = planID
 
-	// Convert engine SchemaChanges to proto SchemaChanges. A sharded engine emits
-	// one SchemaChange per (namespace, shard); collapse them back to one proto
-	// SchemaChange per namespace (deduping repeated tables). Per-shard membership
-	// travels separately on PlanResponse.Shards below.
-	var changes []*ternv1.SchemaChange
+	changes, violations, protoShards := c.planResultToProtoChanges(result)
+	return &ternv1.PlanResponse{
+		PlanId:         result.PlanID,
+		Engine:         c.protoEngine(),
+		Changes:        changes,
+		LintViolations: violations,
+		Shards:         protoShards,
+	}, nil
+}
+
+// PlanDiff computes this deployment's desired-vs-live diff without persisting a
+// plan. It shares the engine planning and proto conversion with Plan but stops
+// before storage, so its result is not applyable (no plan_id). It is the
+// read-only producer the control plane runs per deployment to detect review-time
+// drift.
+func (c *LocalClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("plan diff request is required")
+	}
+	if c.getEngine() == nil {
+		return nil, fmt.Errorf("no engine available for database type %q", c.config.Type)
+	}
+
+	schemaFiles, err := c.normalizeSchemaFiles(protoToSchemaFiles(req.SchemaFiles))
+	if err != nil {
+		return nil, err
+	}
+
+	planLogAttrs := []any{"database", c.config.Database}
+	planLogAttrs = append(planLogAttrs, dsnLogAttrs(c.config.TargetDSN)...)
+	planLogAttrs = append(planLogAttrs, "schema_file_count", len(schemaFiles))
+	c.logger.Info("LocalClient.PlanDiff: calling engine", planLogAttrs...)
+
+	result, err := c.planWithEngine(ctx, req, c.config.Database, schemaFiles)
+	if err != nil {
+		c.logger.Error("plan diff failed", "error", err, "database", c.config.Database)
+		return nil, err // Error already has clear prefix (SQL syntax/usage error)
+	}
+
+	changes, violations, protoShards := c.planResultToProtoChanges(result)
+	return &ternv1.PlanDiffResponse{
+		Engine:         c.protoEngine(),
+		Changes:        changes,
+		LintViolations: violations,
+		Shards:         protoShards,
+	}, nil
+}
+
+// planResultToProtoChanges converts an engine plan result into the proto pieces
+// Plan and PlanDiff both return: namespace-collapsed schema changes, lint
+// violations, and per-shard membership. It has no storage side effects, so both
+// the persisting Plan path and the non-persisting PlanDiff path produce
+// identical change sets for the same engine result. A sharded engine emits one
+// SchemaChange per (namespace, shard); the namespace view collapses them
+// (deduping repeated tables) while per-shard membership travels separately on
+// the response's Shards.
+func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (changes []*ternv1.SchemaChange, violations []*ternv1.LintViolation, shards []*ternv1.ShardPlan) {
 	protoByNS := make(map[string]*ternv1.SchemaChange)
 	protoTableSeen := make(map[string]map[string]bool)
 	for _, sc := range result.Changes {
@@ -1288,10 +1365,25 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 				Namespace:    ns,
 			})
 		}
+		// A SchemaChange with an empty shard targets the whole namespace
+		// (non-sharded engines) and contributes no shard rows.
+		if shardName := strings.TrimSpace(sc.Shard.Name); shardName != "" {
+			protoSP := &ternv1.ShardPlan{Shard: shardName, Namespace: ns}
+			for _, t := range sc.TableChanges {
+				protoSP.Changes = append(protoSP.Changes, &ternv1.TableChange{
+					Namespace:    ns,
+					TableName:    t.Table,
+					Ddl:          t.DDL,
+					ChangeType:   changeTypeToProto(t.Operation),
+					IsUnsafe:     t.IsUnsafe,
+					UnsafeReason: t.UnsafeReason,
+				})
+			}
+			shards = append(shards, protoSP)
+		}
 	}
 
-	// Convert lint violations to proto
-	violations := make([]*ternv1.LintViolation, len(result.LintViolations))
+	violations = make([]*ternv1.LintViolation, len(result.LintViolations))
 	for i, w := range result.LintViolations {
 		violations[i] = &ternv1.LintViolation{
 			Table:    w.Table,
@@ -1302,36 +1394,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		}
 	}
 
-	// Surface per-shard plan metadata on the response too, for parity with the
-	// gRPC path: callers of Plan can display per-shard drift/membership, and the
-	// control plane rebuilds per-shard operation groups from each shard's own
-	// changes.
-	var protoShards []*ternv1.ShardPlan
-	for _, sp := range allShardPlans {
-		protoSP := &ternv1.ShardPlan{
-			Shard:     sp.Shard,
-			Namespace: sp.Namespace,
-		}
-		for _, ch := range sp.Changes {
-			protoSP.Changes = append(protoSP.Changes, &ternv1.TableChange{
-				Namespace:    ch.Namespace,
-				TableName:    ch.Table,
-				Ddl:          ch.DDL,
-				ChangeType:   ddlActionToProtoChangeType(ch.Operation),
-				IsUnsafe:     ch.IsUnsafe,
-				UnsafeReason: ch.UnsafeReason,
-			})
-		}
-		protoShards = append(protoShards, protoSP)
-	}
-
-	return &ternv1.PlanResponse{
-		PlanId:         result.PlanID,
-		Engine:         c.protoEngine(),
-		Changes:        changes,
-		LintViolations: violations,
-		Shards:         protoShards,
-	}, nil
+	return changes, violations, shards
 }
 
 func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanRequest, database string, schemaFiles schema.SchemaFiles) (*engine.PlanResult, error) {
@@ -1505,11 +1568,15 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 		return nil, fmt.Errorf("materialize plan %s: apply request carried no DDL changes or schema files", req.PlanId)
 	}
 
-	// The dispatch carries the reviewed plan's DDL verbatim, so the materialized
-	// plan is the reviewed plan — no re-plan-and-compare here. Drift between when
-	// the plan was reviewed and when it applies is reconciled the same way on
-	// every path: replanAndFilterTasks re-plans against live schema at apply/resume
-	// and drops or updates work, and the engine validates each change at execution.
+	// A non-primary deployment never planned locally, so materializing the
+	// primary's reviewed DDL could silently replay it against a deployment whose
+	// schema has drifted. Recompute this deployment's own diff against its live
+	// schema and refuse unless it exactly matches the dispatched (reviewed) DDL,
+	// keeping unreviewed DDL from being applied. The comparison is shard-aware: a
+	// shard-scoped dispatch is checked against the re-plan restricted to its shard.
+	if err := c.verifyMaterializedPlanMatchesLiveSchema(ctx, req, schemaFiles); err != nil {
+		return nil, fmt.Errorf("materialize plan %s: %w", req.PlanId, err)
+	}
 
 	target := req.Target
 	if target == "" {
@@ -1797,20 +1864,15 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		caller = options["caller"]
 	}
 
-	deferCutover := options["defer_cutover"] == "true"
-	allowUnsafe := options["allow_unsafe"] == "true"
-
-	// Build typed ApplyOptions for storage (booleans, not strings).
-	// Revert window is ON by default — only disabled when skip_revert is explicitly set.
-	skipRevert := options["skip_revert"] == "true"
-	deferDeploy := options["defer_deploy"] == "true"
-	applyOpts := storage.ApplyOptions{
-		DeferCutover: deferCutover,
-		DeferDeploy:  deferDeploy,
-		AllowUnsafe:  allowUnsafe,
-		SkipRevert:   skipRevert,
-		Target:       plan.Target,
-	}
+	// Build typed ApplyOptions for storage from the full wire option map, so
+	// every engine-relevant option the dispatch carried (branch, volume,
+	// rollback, ...) survives the round trip into the stored apply — the queued
+	// operator drive re-derives its options from the stored apply, not from this
+	// request. Revert window is ON by default — only disabled when skip_revert
+	// is explicitly set. The plan's validated target is authoritative over any
+	// target string the request carried.
+	applyOpts := storage.ApplyOptionsFromMap(options)
+	applyOpts.Target = plan.Target
 	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, ddlChanges, applyOpts); err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
@@ -1921,13 +1983,18 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	}
 	apply.ID = applyID
 
-	// Log apply started
+	// Record the queue event in the apply's durable log; the drive itself starts
+	// when an operator claims the apply, which the timeline records separately.
 	c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
-		fmt.Sprintf("Apply started: %s", applyIdentifier), "", state.Apply.Pending)
+		fmt.Sprintf("Apply queued: %s", applyIdentifier), "", state.Apply.Pending)
 
-	// Direct client calls can still register a pending observer before starting
-	// the engine. API-created applies use the service-level observer registry
-	// because operator drivers dispatch them asynchronously.
+	// Register any pending observer under the created apply's ID before queueing.
+	// The observer registry is per-client-instance: in-process dispatchers — the
+	// only callers that set a pending observer — resolve this client from the
+	// same client cache (service client map or target router) the operator's
+	// drive resolves it from, so the drive finds the observer regardless of when
+	// the claim happens. Wire dispatches never set a pending observer, so a
+	// data-plane operator driving through its own client has no observer to lose.
 	if obs := c.consumePendingObserver(); obs != nil {
 		// Set the apply ID on the observer if it supports it (e.g., CommentObserver
 		// needs the ID to look up tracked comments for editing).
@@ -1936,15 +2003,22 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			setter.SetApplyID(apply.ID)
 		}
 		c.SetObserver(apply.ID, obs)
+		// The apply became claimable when the create transaction committed, so a
+		// poll-tick claim can start — and even finish — the drive before the
+		// registration above. A still-running drive finds the observer on its next
+		// progress event; one that already settled will not, so deliver the missed
+		// terminal notification here in that case.
+		c.deliverTerminalIfSettled(ctx, apply.ID)
 	}
 
-	// Start apply in background with cancellable context (Stop() cancels this)
-	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
-	cancelGeneration := c.setApplyCancel(cancelApply)
-	// A fresh dispatch (including a remote gRPC drive) has no operation context,
-	// so it never auto-parks at the cutover barrier; ordered-cutover parking is
-	// driven by the operator's operation-scoped resume path.
-	c.startApplyExecution(applyCtx, cancelGeneration, cancelApply, apply, tasks, plan, options, false)
+	// The apply is queued, not driven here: every drive — the initial dispatch
+	// included — runs under an operator claim, so lease-guarded writes (per-shard
+	// progress write-through, operation state) always hold the capability they
+	// require. The operator's pending-claim picks the apply up; the wake makes
+	// that prompt instead of waiting out the poll interval.
+	c.logger.Info("Apply: queued for operator drive",
+		append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier)...)
+	c.wakeOperatorForQueuedApply(apply)
 
 	return &ternv1.ApplyResponse{
 		Accepted:         true,
@@ -2470,6 +2544,10 @@ func activeTaskProgressRank(taskState string) (int, bool) {
 		return 5, true
 	case state.Task.RevertWindow:
 		return 6, true
+	case state.Task.Reverting:
+		// Undoing the change after the revert window; ranks after RevertWindow so
+		// a reverting table never regresses to the resumable-window phase.
+		return 7, true
 	default:
 		return 0, false
 	}

@@ -15,6 +15,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.plan.duration_seconds` | Histogram | repository, database, environment, status | Plan execution time |
 | `schemabot.applies.total` | Counter | repository, database, environment, status | Total apply operations |
 | `schemabot.apply.duration_seconds` | Histogram | repository, database, environment, status | Apply API call time |
+| `schemabot.deployment_diff.total` | Counter | database, deployment, environment, status | Review-time per-deployment plan diffs by outcome (the fan-out that feeds the drift rollup) |
 | `schemabot.schema_freshness.rejected.total` | Counter | action, environment | Plan/apply/apply-confirm rejected because PR HEAD advanced after discovery loaded schema files |
 | `schemabot.command.rejected_stale_plan.total` | Counter | action, environment | Apply-confirm rejected because PR HEAD advanced after the confirmation plan was posted |
 | `schemabot.source_policy.blocks_total` | Counter | operation, database, environment, reason | Trusted-source plan/apply requests blocked by source policy |
@@ -49,6 +50,8 @@ available, such as `repository`, `github_app`, and `installation_id`.
 **status** (plans): `success`, `error`
 
 **status** (applies): `success`, `error`, `rejected`, `conflict`
+
+**status** (deployment diff): `ok`, `errored`
 
 **action** (schema freshness): `plan`, `apply`, `apply_confirm`, `unknown`
 

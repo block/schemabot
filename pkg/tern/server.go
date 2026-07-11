@@ -67,6 +67,14 @@ func (s *Server) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.Pla
 	return resp, nil
 }
 
+func (s *Server) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	resp, err := s.client.PlanDiff(ctx, req)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return resp, nil
+}
+
 func (s *Server) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
 	resp, err := s.client.Apply(ctx, req)
 	if err != nil {

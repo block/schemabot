@@ -159,12 +159,23 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 			if overallProgress > 0 {
 				result.Progress = overallProgress
 			}
+		} else {
+			// The query ran for a live schema change but returned no shard rows.
+			// The drive surfaces this once per apply so the gap is visible
+			// without reading per-poll debug.
+			result.PerShardProgressUnavailable = engine.PerShardUnavailableNoShardRows
 		}
 	} else {
 		// No per-shard/row-copy progress this poll. A missing vtgate DSN is a target
-		// resolution gap that persists for the whole apply (warned once at apply
-		// start); an unset MigrationContext is transient during setup/recovery.
-		// Either way the comment and CLI fall back to deploy-request state.
+		// resolution gap that persists for the whole apply; a missing schema-change
+		// context is transient during setup/recovery. Either way the comment and CLI
+		// fall back to deploy-request state, and the drive surfaces the reason once
+		// per apply.
+		if !hasVtgateDSN {
+			result.PerShardProgressUnavailable = engine.PerShardUnavailableNoVtgateDSN
+		} else {
+			result.PerShardProgressUnavailable = engine.PerShardUnavailableNoChangeContext
+		}
 		e.logger.Debug("skipping per-shard progress",
 			"database", req.Database,
 			"has_vtgate_dsn", hasVtgateDSN,
@@ -614,6 +625,9 @@ func psDisplayMetadata(meta *psMetadata) map[string]string {
 	}
 	if meta.DeferredDeploy {
 		set("deferred_deploy", "true")
+	}
+	if meta.RevertExpiresAt != nil {
+		set("revert_expires_at", meta.RevertExpiresAt.UTC().Format(time.RFC3339))
 	}
 	// Project per-keyspace VSchema state. A PlanetScale deploy has a single
 	// VSchema phase, so every changed keyspace carries the same deploy-level

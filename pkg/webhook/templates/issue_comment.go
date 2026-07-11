@@ -4,22 +4,27 @@ import (
 	"fmt"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // RenderRollbackMissingArguments renders the message posted when `schemabot rollback`
-// is invoked without an apply ID and without an `-e` flag.
+// is invoked without an apply ID and without an `-e` flag. The usage line keeps
+// the tenant flag in optional form because this message also renders on
+// untenanted deployments.
 func RenderRollbackMissingArguments() string {
 	return "## Missing Arguments\n\n" +
-		"Usage: `schemabot rollback <apply-id> -e <environment>`\n\n" +
+		"Usage: `schemabot rollback <apply-id> -e <environment> [-t <tenant>]`\n\n" +
 		"Rollback requires both an apply ID and the `-e` flag to select the target environment."
 }
 
 // RenderRollbackMissingEnv renders the message posted when `schemabot rollback`
 // is invoked with an apply ID but no `-e` flag. Distinct from RenderMissingEnv —
-// the rollback variant tailors the example usage to rollback semantics.
+// the rollback variant tailors the example usage to rollback semantics. The
+// usage line keeps the tenant flag in optional form because this message also
+// renders on untenanted deployments.
 func RenderRollbackMissingEnv() string {
 	return "## Missing Environment\n\n" +
-		"Usage: `schemabot rollback <apply-id> -e <environment>`\n\n" +
+		"Usage: `schemabot rollback <apply-id> -e <environment> [-t <tenant>]`\n\n" +
 		"The `-e` flag is required to select the target environment."
 }
 
@@ -87,6 +92,16 @@ func RenderControlMissingApplyID(action string) string {
 	return fmt.Sprintf("## Missing Apply ID\n\n"+
 		"Usage: `schemabot %s <apply-id> -e <environment>`\n\n"+
 		"Use `schemabot status -e <environment>` to find the apply ID.", action)
+}
+
+// RenderVolumeInvalidLevel renders the message posted when a volume command
+// is missing the `-v` flag, carries a non-numeric value, or names a level
+// outside the supported range.
+func RenderVolumeInvalidLevel() string {
+	return fmt.Sprintf("## Missing or Invalid Volume Level\n\n"+
+		"Usage: `schemabot volume <apply-id> -e <environment> -v <level>`\n\n"+
+		"The `-v` flag is required and must be a number between %d (slowest) and %d (fastest).",
+		storage.MinVolume, storage.MaxVolume)
 }
 
 // RenderStopCommandAccepted renders the acknowledgement posted when a PR
@@ -190,6 +205,26 @@ func RenderSkipRevertCommandAccepted(data SkipRevertCommandAcceptedData) string 
 	return body
 }
 
+// RevertCommandAcceptedData contains data for a PR comment revert acknowledgement.
+type RevertCommandAcceptedData struct {
+	ApplyID     string
+	Environment string
+	RequestedBy string
+}
+
+// RenderRevertCommandAccepted renders the acknowledgement posted when a PR
+// comment revert command is accepted.
+func RenderRevertCommandAccepted(data RevertCommandAcceptedData) string {
+	body := "## Revert Request Accepted\n\n" +
+		fmt.Sprintf("**Apply**: `%s`\n", data.ApplyID) +
+		fmt.Sprintf("**Environment**: `%s`\n", data.Environment)
+	if data.RequestedBy != "" {
+		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
+	}
+	body += "\nRevert requested. SchemaBot will undo this schema change; status remains available from the PR progress comment or CLI.\n"
+	return body
+}
+
 // PreviewCommentStartCommandAccepted renders a sample start command
 // acknowledgement comment.
 func PreviewCommentStartCommandAccepted() string {
@@ -213,6 +248,48 @@ func PreviewCommentStartCommandAlreadyRequested() string {
 		StartedCount: 1,
 		SkippedCount: 0,
 	})
+}
+
+// VolumeCommandAcceptedData contains data for a PR comment volume acknowledgement.
+type VolumeCommandAcceptedData struct {
+	ApplyID     string
+	Environment string
+	RequestedBy string
+	// Volume is the queued target level (1=slowest, 11=fastest).
+	Volume int32
+}
+
+// RenderVolumeCommandAccepted renders the acknowledgement posted when a PR
+// comment volume command queues a durable volume adjustment. The wording says
+// "shortly" rather than implying an immediate change: the new level takes
+// effect at the next progress check, so it is not yet in effect when this
+// posts.
+func RenderVolumeCommandAccepted(data VolumeCommandAcceptedData) string {
+	body := "## Volume Request Accepted\n\n" +
+		fmt.Sprintf("**Apply**: `%s`\n", data.ApplyID) +
+		fmt.Sprintf("**Environment**: `%s`\n", data.Environment)
+	if data.RequestedBy != "" {
+		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
+	}
+	body += fmt.Sprintf("\nVolume change to %d requested. SchemaBot will adjust the speed of this schema change shortly; the progress comment on this PR shows the current level.\n", data.Volume)
+	return body
+}
+
+// PreviewCommentVolumeCommandAccepted renders a sample volume command
+// acknowledgement comment.
+func PreviewCommentVolumeCommandAccepted() string {
+	return RenderVolumeCommandAccepted(VolumeCommandAcceptedData{
+		ApplyID:     "apply-a1b2c3d4e5f67890",
+		Environment: "staging",
+		RequestedBy: "alice",
+		Volume:      8,
+	})
+}
+
+// PreviewCommentVolumeInvalidLevel renders the usage comment posted when a
+// volume command carries a missing or invalid level.
+func PreviewCommentVolumeInvalidLevel() string {
+	return RenderVolumeInvalidLevel()
 }
 
 // RenderCutoverCommandAccepted renders the acknowledgement posted when a PR
@@ -251,13 +328,4 @@ func PreviewCommentCutoverCommandAlreadyInProgress() string {
 		RequestedBy: "alice",
 		Status:      apitypes.ControlStatusAlreadyInProgress,
 	})
-}
-
-// RenderCommandNotYetAvailable renders the acknowledgement posted when a
-// recognised but not-yet-implemented PR comment command is invoked. It points
-// the user at the CLI fallback for the same action.
-func RenderCommandNotYetAvailable(action, environment string) string {
-	return fmt.Sprintf("The `%s` command is not yet available via PR comments. "+
-		"Use the CLI instead:\n```\nschemabot %s -e %s\n```",
-		action, action, environment)
 }

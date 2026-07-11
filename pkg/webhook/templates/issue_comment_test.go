@@ -10,14 +10,14 @@ import (
 func TestRenderRollbackMissingArguments(t *testing.T) {
 	rendered := RenderRollbackMissingArguments()
 	assert.Contains(t, rendered, "## Missing Arguments")
-	assert.Contains(t, rendered, "schemabot rollback <apply-id> -e <environment>")
+	assert.Contains(t, rendered, "`schemabot rollback <apply-id> -e <environment> [-t <tenant>]`")
 	assert.Contains(t, rendered, "both an apply ID and the `-e` flag")
 }
 
 func TestRenderRollbackMissingEnv(t *testing.T) {
 	rendered := RenderRollbackMissingEnv()
 	assert.Contains(t, rendered, "## Missing Environment")
-	assert.Contains(t, rendered, "schemabot rollback <apply-id> -e <environment>")
+	assert.Contains(t, rendered, "`schemabot rollback <apply-id> -e <environment> [-t <tenant>]`")
 	assert.Contains(t, rendered, "The `-e` flag is required")
 	assert.NotContains(t, rendered, "both an apply ID",
 		"missing-env variant should not say both args are missing")
@@ -161,9 +161,42 @@ func TestRenderCutoverCommandAcceptedAlreadyInProgress(t *testing.T) {
 	assert.Contains(t, rendered, "Cutover is already in progress")
 }
 
-func TestRenderCommandNotYetAvailable(t *testing.T) {
-	rendered := RenderCommandNotYetAvailable("stop", "staging")
-	assert.Contains(t, rendered, "`stop` command is not yet available")
-	assert.Contains(t, rendered, "Use the CLI instead")
-	assert.Contains(t, rendered, "schemabot stop -e staging")
+// TestRenderVolumeCommandAccepted verifies the volume acknowledgement says the
+// speed changes shortly — rather than claiming the change already took effect —
+// and carries the apply id, environment, requester, and requested level.
+func TestRenderVolumeCommandAccepted(t *testing.T) {
+	rendered := RenderVolumeCommandAccepted(VolumeCommandAcceptedData{
+		ApplyID:     "apply_abc123",
+		Environment: "staging",
+		RequestedBy: "alice",
+		Volume:      8,
+	})
+	assert.Contains(t, rendered, "Volume Request Accepted")
+	assert.Contains(t, rendered, "`apply_abc123`")
+	assert.Contains(t, rendered, "`staging`")
+	assert.Contains(t, rendered, "@alice")
+	assert.Contains(t, rendered, "Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly")
+}
+
+// TestRenderVolumeInvalidLevel verifies the rejection posted for a missing,
+// non-numeric, or out-of-range -v value tells the user the exact syntax and
+// the valid range.
+func TestRenderVolumeInvalidLevel(t *testing.T) {
+	rendered := RenderVolumeInvalidLevel()
+	assert.Contains(t, rendered, "Missing or Invalid Volume Level")
+	assert.Contains(t, rendered, "`schemabot volume <apply-id> -e <environment> -v <level>`")
+	assert.Contains(t, rendered, "between 1 (slowest) and 11 (fastest)")
+}
+
+func TestRenderRevertCommandAccepted(t *testing.T) {
+	rendered := RenderRevertCommandAccepted(RevertCommandAcceptedData{
+		ApplyID:     "apply-957642f96d634694",
+		Environment: "staging",
+		RequestedBy: "alice",
+	})
+	assert.Contains(t, rendered, "Revert Request Accepted")
+	assert.Contains(t, rendered, "`apply-957642f96d634694`")
+	assert.Contains(t, rendered, "`staging`")
+	assert.Contains(t, rendered, "@alice")
+	assert.Contains(t, rendered, "SchemaBot will undo this schema change")
 }

@@ -86,13 +86,14 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyPlanUnsafe,
 		templates.PreviewCommentApplyProgress, templates.PreviewCommentApplyCompleted,
 		templates.PreviewCommentApplyEstimateExceeded,
-		templates.PreviewCommentApplyFailed, templates.PreviewCommentApplyStopped,
+		templates.PreviewCommentApplyFailed, templates.PreviewCommentApplyRetrying,
+		templates.PreviewCommentApplyStopped,
 		templates.PreviewCommentApplyWaitingCutover, templates.PreviewCommentApplyCuttingOver,
 		templates.PreviewCommentMultiDeployInProgress, templates.PreviewCommentMultiDeployFailed,
 		templates.PreviewCommentMultiDeployCompleted, templates.PreviewCommentMultiDeployAll,
 		templates.PreviewCLIMultiDeployInProgress, templates.PreviewCLIMultiDeployFailed,
 		templates.PreviewCLIMultiDeployCompleted, templates.PreviewCLIMultiDeployAll,
-		templates.PreviewCommentShardedAll,
+		templates.PreviewCommentShardedAll, templates.PreviewAggregateCheckSummary,
 		templates.PreviewCommentSingleProgress, templates.PreviewCommentSingleComplete,
 		templates.PreviewCommentSingleFailed, templates.PreviewCommentSingleStopped,
 		templates.PreviewCommentSummaryCompleted, templates.PreviewCommentSummaryFailed,
@@ -113,7 +114,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentActorNotAuthorized, templates.PreviewCommentActorAuthUnavailable,
 		templates.PreviewCommentDatabaseNotConfigured,
 		templates.PreviewCommentStartAccepted, templates.PreviewCommentStartPending,
-		templates.PreviewCommentCutoverAccepted, templates.PreviewCommentCutoverActive:
+		templates.PreviewCommentCutoverAccepted, templates.PreviewCommentCutoverActive,
+		templates.PreviewCommentVolumeAccepted, templates.PreviewCommentVolumeInvalid:
 		templates.PreviewCLIOutput(previewType)
 	// Paired aggregate types (PR + CLI subsections)
 	case templates.PreviewCommentPlanAll, templates.PreviewCommentLockingAll,
@@ -260,6 +262,7 @@ Comment Templates (GitHub PR comments):
   comment_apply_estimate_exceeded Multi-table: running after MySQL row estimate was exceeded
   comment_apply_completed       Multi-table: completed (all tables done)
   comment_apply_failed          Multi-table: failed (with error and cancelled tables)
+  comment_apply_retrying        Multi-table: interrupted, retrying automatically (attempt counter)
   comment_apply_stopped         Multi-table: stopped (partial progress)
   comment_apply_waiting_cutover Waiting for cutover
   comment_apply_cutting_over    Cutting over
@@ -299,6 +302,8 @@ Apply Command Comments (GitHub PR apply commands):
   comment_start_pending         Start already pending
   comment_cutover_accepted      Cutover request accepted
   comment_cutover_active        Cutover already in progress
+  comment_volume_accepted       Volume request accepted
+  comment_volume_invalid        Volume command with a missing or invalid level
   comment_apply_all             Show all apply command previews
 
 Aggregate Types (grouped PR + CLI pairs):

@@ -224,7 +224,7 @@ func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Ap
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Cutover request queued for apply owner%s", callerApplyLogSuffix(requestedBy)), "", "")
 	}
-	c.wakeOperatorForControlRequest(apply)
+	c.wakeOperator(apply)
 	return &ternv1.CutoverResponse{Accepted: true}, nil
 }
 
@@ -399,7 +399,7 @@ func (c *LocalClient) requestCancel(ctx context.Context, req *ternv1.CancelReque
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Cancel request queued for apply owner%s", callerApplyLogSuffix(requestedBy)), "", "")
 	}
-	c.wakeOperatorForControlRequest(apply)
+	c.wakeOperator(apply)
 	return &ternv1.CancelResponse{Accepted: true}, nil
 }
 
@@ -458,7 +458,7 @@ func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, 
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Stop request queued for apply owner%s", callerApplyLogSuffix(requestedBy)), "", "")
 	}
-	c.wakeOperatorForControlRequest(apply)
+	c.wakeOperator(apply)
 	return &ternv1.StopResponse{Accepted: true}, nil
 }
 
@@ -551,7 +551,17 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 	}
 
 	if stoppedCount == 0 && skippedCount == 0 {
-		return nil, fmt.Errorf("no active schema change")
+		// No apply was resolved and the database has no targetable tasks: there
+		// is genuinely nothing to stop.
+		if targetApply == nil {
+			return nil, fmt.Errorf("no active schema change")
+		}
+		// A resolved apply with no targetable tasks is the task-less shape (a
+		// queued apply stopped before its first drive created tasks). The apply
+		// row itself is still active work, so settle it directly — erroring here
+		// would leave the durable stop request pending and the apply re-claimed
+		// on every operator poll forever.
+		return c.settleStopForTasklessApply(ctx, targetApply, caller)
 	}
 
 	// Edge case: stop was requested but every targeted task is already
@@ -627,7 +637,18 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 			eventMsg, "", "")
 	}
 	if cancelledCount == 0 && skippedCount == 0 {
-		return nil, fmt.Errorf("no active schema change")
+		// No apply was resolved and the database has no targetable tasks: there
+		// is genuinely nothing to cancel.
+		if targetApply == nil {
+			return nil, fmt.Errorf("no active schema change")
+		}
+		// A resolved apply with no targetable tasks is the task-less shape (a
+		// queued apply cancelled before its first drive created tasks, or a
+		// VSchema-only apply that never has any). The apply row itself is still
+		// active work, so settle it directly — erroring here would leave the
+		// durable cancel request pending and the apply re-claimed on every
+		// operator poll forever.
+		return c.settleCancelForTasklessApply(ctx, targetApply, caller)
 	}
 	if cancelledCount == 0 && skippedCount > 0 && applyID > 0 {
 		if targetApply != nil && state.IsState(targetApply.State, state.Apply.Cancelled) {
@@ -642,6 +663,188 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		CancelledCount: cancelledCount,
 		SkippedCount:   skippedCount,
 	}, nil
+}
+
+// resolveTasklessApplyForSettle reloads a control-targeted apply and confirms
+// it truly owns no tasks, so a stop or cancel that found no task work can
+// settle the apply row directly. A queued apply claimed before its first drive
+// (and a VSchema-only apply, which never has tasks) is exactly this shape: the
+// apply is active work with nothing for the engine or task paths to act on.
+// Returns the freshly loaded apply. Fails closed — settling would abandon live
+// work — when the apply cannot be reloaded or when it does own tasks that this
+// client's database-scoped task read could not see.
+func (c *LocalClient) resolveTasklessApplyForSettle(ctx context.Context, targetApply *storage.Apply, operation string) (*storage.Apply, error) {
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, targetApply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load tasks for apply %s before task-less %s settle: %w", targetApply.ApplyIdentifier, operation, err)
+	}
+	if len(tasks) > 0 {
+		c.logger.Warn(operation+" found no targetable tasks in this client's database scope, but the apply owns tasks; failing closed rather than settling over unseen task work",
+			append(targetApply.LogAttrs(), "task_count", len(tasks), "client_database", c.config.Database)...)
+		return nil, fmt.Errorf("%s cannot settle apply %s: its %d tasks are outside this client's database scope (%s)",
+			operation, targetApply.ApplyIdentifier, len(tasks), c.config.Database)
+	}
+	apply, err := c.storage.Applies().Get(ctx, targetApply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("reload apply %s before task-less %s settle: %w", targetApply.ApplyIdentifier, operation, err)
+	}
+	if apply == nil {
+		return nil, fmt.Errorf("reload apply %s before task-less %s settle: %w", targetApply.ApplyIdentifier, operation, storage.ErrApplyNotFound)
+	}
+	return apply, nil
+}
+
+// settleCancelForTasklessApply terminalizes a cancel whose resolved apply owns
+// no tasks. There is no task or engine work to cancel, but the apply row itself
+// is still active work: it settles to cancelled through the existing
+// markApplyCancelled path so the durable cancel request completes, the terminal
+// observer is notified, and the operator never re-claims the apply — mirroring
+// what the tasked cancel path does after markTasksWithState. Terminal states
+// are never rewritten: an already-cancelled apply is accepted idempotently, and
+// a completed/failed/reverted apply keeps its outcome (only a stopped apply,
+// which cancel may still terminate, is moved to cancelled). The apply's
+// dual-written apply_operations rows settle to cancelled alongside it, so
+// operation-level claiming never sees a live operation under a cancelled apply.
+func (c *LocalClient) settleCancelForTasklessApply(ctx context.Context, targetApply *storage.Apply, caller string) (*ternv1.CancelResponse, error) {
+	apply, err := c.resolveTasklessApplyForSettle(ctx, targetApply, "cancel")
+	if err != nil {
+		return nil, err
+	}
+	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
+		c.logger.Info("cancel found task-less apply already terminal; accepting without a state change",
+			append(apply.LogAttrs(), "requested_by", caller)...)
+		return &ternv1.CancelResponse{Accepted: true}, nil
+	}
+	previousState := apply.State
+	if err := c.markApplyCancelled(ctx, apply.ID); err != nil {
+		return nil, err
+	}
+	eventMsg := "Cancel requested: task-less apply cancelled before any task work started"
+	if caller != "" {
+		eventMsg += callerApplyLogSuffix(caller)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
+		eventMsg, previousState, state.Apply.Cancelled)
+	now := time.Now()
+	apply.State = state.Apply.Cancelled
+	apply.CompletedAt = &now
+	apply.UpdatedAt = now
+	c.logger.Info("cancel settled task-less apply as cancelled",
+		append(apply.LogAttrs(), "previous_state", previousState, "requested_by", caller)...)
+	c.settleOperationRowsForTasklessApply(ctx, apply, state.ApplyOperation.Cancelled)
+	c.notifyTerminalObserver(apply, nil)
+	return &ternv1.CancelResponse{Accepted: true}, nil
+}
+
+// settleOperationRowsForTasklessApply moves the settled apply's dual-written
+// apply_operations rows to the apply's settled state so the operation rows
+// agree with the apply row the task-less settle just wrote. The settle runs
+// inside a claimed drive, so the lease in ctx guards each write and a lost
+// claim fails closed in storage. A load or write failure is logged, never
+// returned: the apply-level settle is the authoritative outcome, and the next
+// operation claim's terminal-parent reconciliation settles any row this pass
+// could not move.
+func (c *LocalClient) settleOperationRowsForTasklessApply(ctx context.Context, apply *storage.Apply, operationState string) {
+	ops, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		c.logger.Error("task-less settle could not load operation rows; the apply is settled and the next operation claim will reconcile them",
+			append(apply.LogAttrs(), "target_operation_state", operationState, "error", err)...)
+		return
+	}
+	for _, op := range ops {
+		if !operationRowSettlesWithTasklessApply(op.State, operationState) {
+			c.logger.Info("task-less settle leaving terminal operation row unchanged",
+				append(apply.LogAttrs(),
+					"apply_operation_id", op.ID,
+					"operation_deployment", op.Deployment,
+					"operation_state", op.State,
+					"target_operation_state", operationState)...)
+			continue
+		}
+		var writeErr error
+		if state.IsState(operationState, state.ApplyOperation.Stopped) {
+			// stopped is resumable: mirror the state but keep completed_at nil,
+			// matching the apply-level convention.
+			writeErr = c.storage.ApplyOperations().UpdateState(ctx, op.ID, operationState)
+		} else {
+			writeErr = c.storage.ApplyOperations().MarkTerminal(ctx, op.ID, operationState)
+		}
+		if writeErr != nil {
+			c.logger.Error("task-less settle could not move operation row to the apply's settled state; the next operation claim will reconcile it",
+				append(apply.LogAttrs(),
+					"apply_operation_id", op.ID,
+					"operation_deployment", op.Deployment,
+					"operation_state", op.State,
+					"target_operation_state", operationState,
+					"error", writeErr)...)
+			continue
+		}
+		c.logger.Info("task-less settle moved operation row to the apply's settled state",
+			append(apply.LogAttrs(),
+				"apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment,
+				"previous_operation_state", op.State,
+				"operation_state", operationState)...)
+	}
+}
+
+// operationRowSettlesWithTasklessApply reports whether a task-less settle may
+// move an operation row from its current state to the apply's settled state.
+// It mirrors the apply-level settle's terminal discipline: a terminal row keeps
+// its outcome, except that a cancel settle still terminalizes a stopped row —
+// stopped is the one terminal state cancel may move, exactly as the apply-level
+// cancel settle moves a stopped apply to cancelled.
+func operationRowSettlesWithTasklessApply(currentState, settledState string) bool {
+	if !state.IsApplyOperationTerminal(currentState) {
+		return true
+	}
+	return state.IsState(settledState, state.ApplyOperation.Cancelled) &&
+		state.IsState(currentState, state.ApplyOperation.Stopped)
+}
+
+// settleStopForTasklessApply terminalizes a stop whose resolved apply owns no
+// tasks. There is no task or engine work to stop, but the apply row itself is
+// still active work: it settles to stopped through the existing
+// markApplyStopped path so the durable stop request completes, the terminal
+// observer is notified, and the operator never re-claims the apply — mirroring
+// what the tasked stop path does after markTasksWithState. The apply settles to
+// stopped (not cancelled): stop is the resumable operator verb, and a stopped
+// task-less apply stays eligible for a later cancel. Terminal states are never
+// rewritten: an already-terminal apply (stopped included) is accepted without a
+// state change so the pending stop request resolves. The apply's dual-written
+// apply_operations rows settle to stopped alongside it, keeping the resumable
+// operation rows consistent with the stopped apply.
+func (c *LocalClient) settleStopForTasklessApply(ctx context.Context, targetApply *storage.Apply, caller string) (*ternv1.StopResponse, error) {
+	apply, err := c.resolveTasklessApplyForSettle(ctx, targetApply, "stop")
+	if err != nil {
+		return nil, err
+	}
+	if state.IsTerminalApplyState(apply.State) {
+		c.logger.Info("stop found task-less apply already terminal; accepting without a state change",
+			append(apply.LogAttrs(), "requested_by", caller)...)
+		return &ternv1.StopResponse{
+			Accepted:     true,
+			ErrorMessage: fmt.Sprintf("Schema change already %s", apply.State),
+		}, nil
+	}
+	previousState := apply.State
+	if err := c.markApplyStopped(ctx, apply.ID); err != nil {
+		return nil, err
+	}
+	eventMsg := "Stop requested: task-less apply stopped before any task work started"
+	if caller != "" {
+		eventMsg += callerApplyLogSuffix(caller)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+		eventMsg, previousState, state.Apply.Stopped)
+	apply.State = state.Apply.Stopped
+	apply.CompletedAt = nil
+	apply.UpdatedAt = time.Now()
+	c.logger.Info("stop settled task-less apply as stopped",
+		append(apply.LogAttrs(), "previous_state", previousState, "requested_by", caller)...)
+	c.settleOperationRowsForTasklessApply(ctx, apply, state.ApplyOperation.Stopped)
+	c.notifyTerminalObserver(apply, nil)
+	return &ternv1.StopResponse{Accepted: true}, nil
 }
 
 // stopHandledUnlessStartPending reports a completed stop as handled unless a
@@ -1224,36 +1427,309 @@ func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Tas
 	return req, nil
 }
 
-// Volume modifies the schema change speed/concurrency in-flight.
+// Volume adjusts the speed/concurrency of an in-flight schema change by
+// queueing a durable volume request. Only the instance driving the apply holds
+// the engine state for the running schema change, and a volume RPC can land on
+// any instance sharing this route's storage — so the request is recorded for
+// the driver, which retunes the engine at its next progress tick. The response
+// reports the queued target level; the previous level is only known to the
+// driver, so PreviousVolume is left unset.
 func (c *LocalClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	if req.Volume < 1 || req.Volume > 11 {
-		return nil, fmt.Errorf("volume must be between 1 and 11")
+	if req.Volume < storage.MinVolume || req.Volume > storage.MaxVolume {
+		return nil, fmt.Errorf("volume must be between %d and %d", storage.MinVolume, storage.MaxVolume)
 	}
-
-	task, creds, eng, err := c.controlSetup(ctx)
+	c.logger.Info("Volume requested", "database", c.config.Database, "type", c.config.Type, "apply_id", req.ApplyId, "environment", req.Environment, "volume", req.Volume)
+	apply, err := c.resolveControlApply(ctx, req.ApplyId, "volume")
 	if err != nil {
 		return nil, err
 	}
-	controlReq, err := c.buildControlRequest(ctx, task, creds, eng, engine.ControlVolume)
-	if err != nil {
-		return nil, fmt.Errorf("build volume request for task %s: %w", task.TaskIdentifier, err)
+	if apply == nil {
+		return nil, fmt.Errorf("no active schema change")
 	}
 
-	result, err := eng.Volume(ctx, &engine.VolumeRequest{
-		Database:    c.config.Database,
-		Volume:      req.Volume,
-		ResumeState: controlReq.ResumeState,
-		Credentials: controlReq.Credentials,
+	// A terminal apply has no running copy to retune; reject synchronously
+	// rather than queue a request no driver will ever service. This includes
+	// stopped applies — resume the schema change first, then adjust volume.
+	// Rejections travel as unaccepted responses (not errors) so callers across
+	// the gRPC boundary can distinguish them from transport or storage failures.
+	if state.IsTerminalApplyState(apply.State) {
+		c.logger.Warn("volume rejected: schema change is not active",
+			"apply_id", apply.ApplyIdentifier, "state", apply.State, "volume", req.Volume)
+		return &ternv1.VolumeResponse{
+			Accepted:     false,
+			ErrorMessage: fmt.Sprintf("Schema change %s is %s; volume can only be adjusted while it is running", apply.ApplyIdentifier, apply.State),
+		}, nil
+	}
+
+	// A volume request is apply-scoped, but a multi-deployment (fan-out) apply
+	// runs one engine per operation: whichever operation driver ticked first
+	// would retune only its own deployment's schema change and complete the
+	// request, leaving sibling deployments copying at the old level while the
+	// request row, progress, and the CLI all report the adjustment as applied.
+	// Reject the shape outright until volume requests are scoped per operation.
+	// Operation rows are created at dispatch and never grow while an apply
+	// runs, so this queue-time check cannot be raced by fan-out.
+	operations, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load operations for apply %s to gate volume request: %w", apply.ApplyIdentifier, err)
+	}
+	if len(operations) > 1 {
+		c.logger.Warn("volume rejected: apply fans out to multiple deployments",
+			"apply_id", apply.ApplyIdentifier, "operation_count", len(operations), "volume", req.Volume)
+		return &ternv1.VolumeResponse{
+			Accepted:     false,
+			ErrorMessage: fmt.Sprintf("Apply %s fans out to %d deployments; volume adjustment is not supported for multi-deployment applies", apply.ApplyIdentifier, len(operations)),
+		}, nil
+	}
+
+	return c.queueVolumeRequest(ctx, apply, req.Volume)
+}
+
+// queueVolumeRequest records a durable volume control request carrying the
+// desired level in its metadata and wakes the operator. A pending volume
+// request is immutable until the driver resolves it: a second request for the
+// same level is an idempotent accept, while a different level is rejected with
+// retry guidance. This keeps the level the driver reads, applies, and completes
+// unambiguous — there is no window where a superseding write could make the
+// driver complete a level it never applied.
+func (c *LocalClient) queueVolumeRequest(ctx context.Context, apply *storage.Apply, volume int32) (*ternv1.VolumeResponse, error) {
+	controlStore := c.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, fmt.Errorf("control request store is not available")
+	}
+	metadata, err := storage.EncodeVolumeControlRequestMetadata(volume)
+	if err != nil {
+		return nil, fmt.Errorf("encode volume request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	requestedBy := "tern-grpc"
+	controlReq, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationVolume,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: requestedBy,
+		Metadata:    metadata,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("volume failed: %w", err)
+		return nil, fmt.Errorf("record volume control request for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-
+	// The apply's state was checked before this insert, and the driver may have
+	// settled the apply — and run its terminal pending-request sweep — in
+	// between. A request recorded after that sweep would linger pending forever
+	// with no driver left to service it, so re-check and sweep it here.
+	storedApply, err := c.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("reload apply %s after recording volume request: %w", apply.ApplyIdentifier, err)
+	}
+	if storedApply == nil {
+		return nil, fmt.Errorf("reload apply %s after recording volume request: apply row not found", apply.ApplyIdentifier)
+	}
+	if state.IsTerminalApplyState(storedApply.State) {
+		c.logger.Info("volume request arrived as the apply settled; sweeping it and rejecting",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"state", storedApply.State,
+			"volume", volume)
+		if sweepErr := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationVolume); sweepErr != nil {
+			return nil, fmt.Errorf("sweep volume request for settled apply %s: %w", apply.ApplyIdentifier, sweepErr)
+		}
+		return &ternv1.VolumeResponse{
+			Accepted:     false,
+			ErrorMessage: fmt.Sprintf("Schema change %s is %s; volume can only be adjusted while it is running", apply.ApplyIdentifier, storedApply.State),
+		}, nil
+	}
+	if alreadyPending {
+		pendingVolume, decodeErr := storage.DecodeVolumeControlRequestMetadata(controlReq.Metadata)
+		if decodeErr != nil {
+			c.logger.Warn("volume rejected: pending volume request has undecodable metadata; the driver will fail it at its next progress tick",
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"environment", apply.Environment,
+				"error", decodeErr)
+			c.wakeOperator(apply)
+			return &ternv1.VolumeResponse{
+				Accepted:     false,
+				ErrorMessage: fmt.Sprintf("A volume adjustment is already queued for apply %s; retry after the driver resolves it", apply.ApplyIdentifier),
+			}, nil
+		}
+		if pendingVolume != volume {
+			c.logger.Info("volume rejected: a different volume adjustment is already queued",
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"environment", apply.Environment,
+				"pending_volume", pendingVolume,
+				"requested_volume", volume)
+			return &ternv1.VolumeResponse{
+				Accepted:     false,
+				ErrorMessage: fmt.Sprintf("A volume adjustment to %d is already queued for apply %s; the driver applies it at its next progress check — retry afterwards", pendingVolume, apply.ApplyIdentifier),
+			}, nil
+		}
+		c.logger.Info("volume request already pending for apply driver",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"volume", volume,
+			"requested_by", requestedBy)
+	} else {
+		c.logger.Info("volume request queued for apply driver",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"volume", volume,
+			"requested_by", requestedBy)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventVolumeRequested, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Volume change to %d queued for apply driver%s", volume, callerApplyLogSuffix(requestedBy)), "", "")
+	}
+	c.wakeOperator(apply)
 	return &ternv1.VolumeResponse{
-		Accepted:       result.Accepted,
-		PreviousVolume: result.PreviousVolume,
-		NewVolume:      result.NewVolume,
+		Accepted:  true,
+		NewVolume: volume,
 	}, nil
+}
+
+// processPendingVolumeControlRequest services a pending volume request from
+// the driving instance's progress tick. The desired level travels in the
+// request's metadata; the driver retunes the engine's running schema change
+// and completes the request. Volume is a tuning knob, not a safety operation:
+// an engine rejection fails the request terminally and the copy continues at
+// its current volume, and a storage error is returned for the caller to log
+// and retry at the next tick without aborting the drive.
+func (c *LocalClient) processPendingVolumeControlRequest(ctx context.Context, apply *storage.Apply, eng engine.Engine, creds *engine.Credentials, resumeState *engine.ResumeState) error {
+	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationVolume)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		return nil
+	}
+	caller := controlRequestCaller(controlReq)
+	// A fan-out apply runs one engine per operation, so an apply-scoped volume
+	// request cannot be delivered to every deployment's schema change from one
+	// driver's tick. Fail it closed rather than retune a single deployment and
+	// report the adjustment as applied everywhere. Queue-time gating rejects
+	// this shape before a request is recorded; this guard covers a request that
+	// reached storage anyway.
+	operations, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("load operations for apply %s to service volume request: %w", apply.ApplyIdentifier, err)
+	}
+	if len(operations) > 1 {
+		c.logger.Warn("pending volume request targets a multi-deployment apply; failing it without retuning any engine",
+			append(apply.LogAttrs(), "operation_count", len(operations), "requested_by", caller)...)
+		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationVolume,
+			fmt.Sprintf("apply fans out to %d deployments; volume adjustment is not supported for multi-deployment applies", len(operations)))
+	}
+	volume, err := storage.DecodeVolumeControlRequestMetadata(controlReq.Metadata)
+	if err != nil {
+		c.logger.Warn("pending volume request has invalid metadata; failing the request and continuing at the current volume",
+			append(apply.LogAttrs(), "requested_by", caller, "error", err)...)
+		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationVolume, fmt.Sprintf("volume request metadata is invalid: %v", err))
+	}
+	result, err := eng.Volume(ctx, &engine.VolumeRequest{
+		Database:    apply.Database,
+		Volume:      volume,
+		ResumeState: resumeState,
+		Credentials: creds,
+	})
+	if err != nil {
+		c.logger.Warn("engine rejected pending volume request; schema change continues at its current volume",
+			append(apply.LogAttrs(), "volume", volume, "requested_by", caller, "error", err)...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Volume change to %d failed: %v; schema change continues at its current volume", volume, err), "", "")
+		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationVolume, err.Error())
+	}
+	if result == nil || !result.Accepted {
+		message := "not accepted"
+		if result != nil && result.Message != "" {
+			message = result.Message
+		}
+		c.logger.Warn("engine did not accept pending volume request; schema change continues at its current volume",
+			append(apply.LogAttrs(), "volume", volume, "requested_by", caller, "message", message)...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Volume change to %d was not accepted: %s; schema change continues at its current volume", volume, message), "", "")
+		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationVolume, message)
+	}
+	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationVolume); err != nil {
+		return err
+	}
+	c.logger.Info("pending volume request applied",
+		append(apply.LogAttrs(), "previous_volume", result.PreviousVolume, "volume", result.NewVolume, "requested_by", caller)...)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Volume changed from %d to %d%s", result.PreviousVolume, result.NewVolume, callerApplyLogSuffix(caller)), "", "")
+	if err := c.recordAppliedVolume(ctx, apply, result.NewVolume); err != nil {
+		c.logger.Warn("failed to record applied volume on apply options; progress will keep reporting the previous volume",
+			append(apply.LogAttrs(), "volume", result.NewVolume, "error", err)...)
+	}
+	return nil
+}
+
+// recordAppliedVolume persists the volume the engine is now running at onto
+// the apply's stored options, which progress and the CLI read the volume from.
+// The apply row is reloaded first so this targeted options write does not
+// clobber state another write advanced past the drive's in-memory copy.
+func (c *LocalClient) recordAppliedVolume(ctx context.Context, apply *storage.Apply, volume int32) error {
+	if volume < storage.MinVolume || volume > storage.MaxVolume {
+		return fmt.Errorf("engine reported applied volume %d out of range for apply %s", volume, apply.ApplyIdentifier)
+	}
+	stored, err := c.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("load apply %s to record applied volume: %w", apply.ApplyIdentifier, err)
+	}
+	if stored == nil {
+		return fmt.Errorf("load apply %s to record applied volume: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
+	}
+	opts := stored.GetOptions()
+	opts.Volume = int(volume)
+	stored.SetOptions(opts)
+	if err := c.storage.Applies().Update(ctx, stored); err != nil {
+		return fmt.Errorf("record applied volume %d on apply %s: %w", volume, apply.ApplyIdentifier, err)
+	}
+	apply.Options = stored.Options
+	return nil
+}
+
+// convergeTaskVolumeToStoredLevel retunes a newly started task's schema change
+// to the apply's stored volume level. Engine volume lives with each running
+// schema change, so a task started after an operator adjusted the volume — a
+// later table in a sequential drive, or a resumed apply — would otherwise run
+// at the engine default while stored options, progress, and the CLI all report
+// the adjusted level. Volume is a tuning knob, not a safety operation: a
+// rejection is logged and the task continues at the engine default rather than
+// failing the drive.
+func (c *LocalClient) convergeTaskVolumeToStoredLevel(ctx context.Context, apply *storage.Apply, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState) {
+	volume := int32(apply.GetOptions().Volume)
+	if volume == 0 {
+		c.logger.Debug("no stored volume level on apply options; task starts at the engine default",
+			"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier)
+		return
+	}
+	if volume < storage.MinVolume || volume > storage.MaxVolume {
+		c.logger.Warn("stored volume level is out of range; task starts at the engine default",
+			append(task.LogAttrs(), "volume", volume)...)
+		return
+	}
+	result, err := c.getEngine().Volume(ctx, &engine.VolumeRequest{
+		Database:    apply.Database,
+		Volume:      volume,
+		ResumeState: resumeState,
+		Credentials: creds,
+	})
+	if err != nil {
+		c.logger.Warn("engine rejected converging task to the stored volume level; task continues at the engine default",
+			append(task.LogAttrs(), "volume", volume, "error", err)...)
+		return
+	}
+	if result == nil || !result.Accepted {
+		message := "not accepted"
+		if result != nil && result.Message != "" {
+			message = result.Message
+		}
+		c.logger.Warn("engine did not accept converging task to the stored volume level; task continues at the engine default",
+			append(task.LogAttrs(), "volume", volume, "message", message)...)
+		return
+	}
+	c.logger.Info("task volume converged to the apply's stored level",
+		append(task.LogAttrs(), "volume", volume)...)
 }
 
 // Revert reverts a completed schema change during the revert window.

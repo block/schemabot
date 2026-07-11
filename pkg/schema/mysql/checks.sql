@@ -13,6 +13,7 @@ CREATE TABLE `checks` (
   `conclusion` varchar(255) DEFAULT NULL,
   `blocking_reason` varchar(255) DEFAULT NULL,
   `error_message` text,
+  `change_summary` varchar(255) DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),

@@ -30,6 +30,36 @@ func (h *Handler) serverConfig() (*api.ServerConfig, bool) {
 	return config, true
 }
 
+// isAggregateParticipant reports whether this deployment is configured as an
+// aggregate participant for repo — a repo where the aggregate leader owns the
+// single required check and this deployment's own check is informational. A
+// participant has nothing to publish on a PR that touches none of its schema,
+// so it stays silent there rather than adding a passing per-tenant row near the
+// merge button. A deployment that is the sole SchemaBot on a repo has no
+// aggregate config (role ""), so this returns false and it keeps posting.
+func (h *Handler) isAggregateParticipant(repo string) bool {
+	config, ok := h.serverConfig()
+	if !ok {
+		return false
+	}
+	return config.AggregateRoleForRepo(repo) == api.AggregateRoleParticipant
+}
+
+// leaderExpectsParticipantsForPR reports whether this deployment is the
+// aggregate leader for repo and the PR's changed files touch at least one
+// expected participant's paths. Such a PR carries schema work owned by another
+// deployment even when the leader itself has none, so the leader's aggregate
+// must fold the participants' Check Runs (fail-closed) rather than pass on
+// "no managed schema changes". Returns false for non-leaders — the expected set
+// only exists on the leader.
+func (h *Handler) leaderExpectsParticipantsForPR(repo string, files []ghclient.PRFile) bool {
+	config, ok := h.serverConfig()
+	if !ok {
+		return false
+	}
+	return len(config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))) > 0
+}
+
 func (h *Handler) aggregateCheckNameForRepo(repo string) string {
 	config, ok := h.serverConfig()
 	if !ok {
@@ -167,6 +197,45 @@ func hasBlockingCheckForEnvironment(checks []*storage.Check, environment string)
 	return false
 }
 
+// awaitingCurrentCommitTitle is the aggregate title shown when only results
+// recorded for another commit hold the aggregate open — nothing is running for
+// the commit the Check Run is published on, and the current commit's own plan
+// or apply results are still pending.
+const awaitingCurrentCommitTitle = "Awaiting results for the latest commit"
+
+// normalizeStaleContributions returns the fold contributions for headSHA.
+// A row stored for a different commit contributes a blocking in-progress
+// placeholder instead of its stored status and conclusion: results computed
+// for another commit say nothing about the current one, so they must hold the
+// aggregate open until the current commit's plan or apply results replace
+// them. Rows for the current commit pass through unchanged.
+func normalizeStaleContributions(checks []*storage.Check, headSHA string) (contributions []*storage.Check, staleCount int) {
+	contributions = make([]*storage.Check, 0, len(checks))
+	for _, c := range checks {
+		if c.HeadSHA == headSHA {
+			contributions = append(contributions, c)
+			continue
+		}
+		stale := *c
+		stale.Status = checkStatusInProgress
+		stale.Conclusion = ""
+		contributions = append(contributions, &stale)
+		staleCount++
+	}
+	return contributions, staleCount
+}
+
+// anyInProgressOnCommit reports whether any check recorded for headSHA is
+// genuinely in progress, as opposed to a stale-row placeholder.
+func anyInProgressOnCommit(checks []*storage.Check, headSHA string) bool {
+	for _, c := range checks {
+		if c.HeadSHA == headSHA && c.Status == checkStatusInProgress {
+			return true
+		}
+	}
+	return false
+}
+
 // computeAggregate determines the aggregate conclusion and status from per-database checks.
 func computeAggregate(checks []*storage.Check) (conclusion, status string) {
 	// in_progress takes precedence — the aggregate should show running
@@ -206,41 +275,187 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 		summary = buildAggregateTable(checks)
 	case checkConclusionActionRequired:
 		pending := 0
+		unresolved := 0
 		for _, c := range checks {
-			if c.Conclusion == checkConclusionActionRequired {
-				pending++
+			if c.Conclusion != checkConclusionActionRequired {
+				continue
+			}
+			pending++
+			if isUnresolvedParticipantCheck(c) {
+				unresolved++
 			}
 		}
-		if pending == 1 {
+		switch {
+		case pending > 0 && unresolved == pending:
+			// Every blocking row is a participant whose Check Run could not be
+			// read; no apply is actually pending, the participants are silent.
+			if pending == 1 {
+				title = "1 participant deployment has not reported"
+			} else {
+				title = fmt.Sprintf("%d participant deployments have not reported", pending)
+			}
+		case pending == 1:
 			title = "1 apply pending"
-		} else {
+		default:
 			title = fmt.Sprintf("%d applies pending", pending)
 		}
 		summary = buildAggregateTable(checks)
 	default:
 		// in_progress — conclusion is empty
-		title = "Apply in progress"
+		inProgress := 0
+		waiting := 0
+		for _, c := range checks {
+			if c.Status != checkStatusInProgress {
+				continue
+			}
+			inProgress++
+			if isUnresolvedParticipantCheck(c) {
+				waiting++
+			}
+		}
+		if inProgress > 0 && waiting == inProgress {
+			// Nothing is applying; the fold is waiting for participant Check
+			// Runs a scheduled re-fold will re-read shortly.
+			if waiting == 1 {
+				title = "Waiting for 1 participant deployment to report"
+			} else {
+				title = fmt.Sprintf("Waiting for %d participant deployments to report", waiting)
+			}
+		} else {
+			title = "Apply in progress"
+		}
 		summary = buildAggregateTable(checks)
 	}
 	return title, summary
 }
 
-// buildAggregateTable builds a markdown table showing the status of each per-database check.
-// Truncates to stay within GitHub's check run output limits.
-func buildAggregateTable(checks []*storage.Check) string {
-	var sb strings.Builder
-	sb.WriteString("| Database | Environment | Status |\n")
-	sb.WriteString("|----------|-------------|--------|\n")
+// isUnresolvedParticipantCheck reports whether a synthesized participant row
+// blocks only because the participant's Check Run could not be read (not
+// reported yet, or a failed Checks API read) — the aggregate should present it
+// as a reporting gap, never as a pending or failed apply.
+func isUnresolvedParticipantCheck(c *storage.Check) bool {
+	return c.BlockingReason == participantUnresolvedBlockingReason
+}
 
-	for i, c := range checks {
-		row := fmt.Sprintf("| `%s` | %s | %s |\n", c.DatabaseName, c.Environment, checkStatusLabel(c))
-		if sb.Len()+len(row) > maxCheckRunTextLength-1000 {
-			fmt.Fprintf(&sb, "\n... and %d more check(s)\n", len(checks)-i)
+// isParticipantCheck reports whether a check is a participant deployment's
+// outcome folded into the leader's aggregate, rather than one of the leader's
+// own per-database checks. Participant outcomes carry the aggregate sentinel as
+// their database type and the tenant name as their database name.
+func isParticipantCheck(c *storage.Check) bool {
+	return c.DatabaseType == aggregateSentinel && c.DatabaseName != aggregateSentinel
+}
+
+// buildAggregateTable renders the aggregate check's summary: the leader's own
+// per-database checks in a Database table, and — when the leader gates on
+// participant deployments — each participant's rolled-up status in a separate
+// Tenant deployments table, so a reader can tell "my databases" from "the other
+// tenants I'm gating on" at a glance. Participant gating is the key information,
+// so the Tenant deployments section is rendered first and its size reserved: it
+// is never dropped, even when many per-database rows would otherwise fill the
+// Check Run text limit — those rows truncate instead.
+func buildAggregateTable(checks []*storage.Check) string {
+	var dbChecks, participantChecks []*storage.Check
+	for _, c := range checks {
+		if isParticipantCheck(c) {
+			participantChecks = append(participantChecks, c)
+		} else {
+			dbChecks = append(dbChecks, c)
+		}
+	}
+
+	tenantSection := renderParticipantSection(participantChecks)
+	dbSection := renderDatabaseSection(dbChecks, maxCheckRunTextLength-1000-len(tenantSection))
+
+	var sb strings.Builder
+	sb.WriteString(dbSection)
+	if tenantSection != "" {
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString(tenantSection)
+	}
+	return sb.String()
+}
+
+// changeSummaryLabel returns the per-database change summary for the aggregate
+// check's Change column, or an em dash when no summary was recorded (aggregate
+// rows, or rows recorded before the summary was stored).
+func changeSummaryLabel(c *storage.Check) string {
+	if c.ChangeSummary == "" {
+		return "—"
+	}
+	return c.ChangeSummary
+}
+
+// renderDatabaseSection renders the leader's own per-database checks as a
+// Database table with each database's type, change summary, and status,
+// truncating to stay within budget bytes. Per-environment aggregates contain a
+// single environment, so the environment is not repeated per row. The global
+// aggregate (no allowed_environments) can fold databases from several
+// environments into one table, so an Environment column is added when the rows
+// span more than one environment — otherwise staging and production rows for the
+// same database would be indistinguishable.
+func renderDatabaseSection(dbChecks []*storage.Check, budget int) string {
+	if len(dbChecks) == 0 {
+		return ""
+	}
+	showEnv := hasMultipleEnvironments(dbChecks)
+	var sb strings.Builder
+	if showEnv {
+		sb.WriteString("| Database | Environment | Type | Change | Status |\n")
+		sb.WriteString("|----------|-------------|------|--------|--------|\n")
+	} else {
+		sb.WriteString("| Database | Type | Change | Status |\n")
+		sb.WriteString("|----------|------|--------|--------|\n")
+	}
+	for i, c := range dbChecks {
+		var row string
+		if showEnv {
+			row = fmt.Sprintf("| `%s` | %s | %s | %s | %s |\n", c.DatabaseName, c.Environment, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c))
+		} else {
+			row = fmt.Sprintf("| `%s` | %s | %s | %s |\n", c.DatabaseName, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c))
+		}
+		if sb.Len()+len(row) > budget {
+			fmt.Fprintf(&sb, "\n... and %d more check(s)\n", len(dbChecks)-i)
 			break
 		}
 		sb.WriteString(row)
 	}
+	return sb.String()
+}
 
+// hasMultipleEnvironments reports whether the per-database checks span more than
+// one distinct environment, which happens for the global aggregate that is not
+// scoped to a single environment.
+func hasMultipleEnvironments(dbChecks []*storage.Check) bool {
+	seen := make(map[string]struct{}, 2)
+	for _, c := range dbChecks {
+		seen[c.Environment] = struct{}{}
+		if len(seen) > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// renderParticipantSection renders the folded participant deployments as a
+// Tenant table keyed by tenant, truncating within the Check Run text limit.
+func renderParticipantSection(participantChecks []*storage.Check) string {
+	if len(participantChecks) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("**Tenant deployments**\n\n")
+	sb.WriteString("| Tenant | Status |\n")
+	sb.WriteString("|--------|--------|\n")
+	for i, c := range participantChecks {
+		row := fmt.Sprintf("| `%s` | %s |\n", c.DatabaseName, checkStatusLabel(c))
+		if sb.Len()+len(row) > maxCheckRunTextLength-1000 {
+			fmt.Fprintf(&sb, "\n... and %d more tenant(s)\n", len(participantChecks)-i)
+			break
+		}
+		sb.WriteString(row)
+	}
 	return sb.String()
 }
 
@@ -259,6 +474,12 @@ func allChecksAreUpToDate(checks []*storage.Check) bool {
 func checkStatusLabel(c *storage.Check) string {
 	if c.Status == checkStatusCompleted && c.Conclusion == checkConclusionSuccess && !c.HasChanges {
 		return "Up to date"
+	}
+	if isUnresolvedParticipantCheck(c) {
+		if c.Status == checkStatusInProgress {
+			return "Waiting to report"
+		}
+		return "Not reported"
 	}
 	return conclusionEmoji(c.Status, c.Conclusion)
 }

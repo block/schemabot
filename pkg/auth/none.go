@@ -10,7 +10,7 @@ type NoneAuthorizer struct{}
 // Middleware passes all requests through with an anonymous user in context.
 func (NoneAuthorizer) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := WithUser(r.Context(), &User{Subject: "anonymous"})
+		ctx := WithUser(r.Context(), &User{Subject: AnonymousSubject})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

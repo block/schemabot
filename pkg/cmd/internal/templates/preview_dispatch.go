@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/block/schemabot/pkg/webhook"
 	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -119,6 +120,10 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges())
 	case PreviewCommentNoManagedSchema:
 		fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChanges())
+	case PreviewCommentChecksRefreshed:
+		fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshed())
+	case PreviewCommentChecksRefreshedTenant:
+		fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants())
 	case PreviewCommentReconcileInProgress:
 		fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationInProgress())
 	case PreviewCommentReconcileCompleted:
@@ -163,6 +168,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentApplyCompleted())
 	case PreviewCommentApplyFailed:
 		fmt.Print(webhooktemplates.PreviewCommentApplyFailed())
+	case PreviewCommentApplyRetrying:
+		fmt.Print(webhooktemplates.PreviewCommentApplyRetrying())
 	case PreviewCommentApplyStopped:
 		fmt.Print(webhooktemplates.PreviewCommentApplyStopped())
 	case PreviewCommentApplyWaitingCutover:
@@ -179,6 +186,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewCommentMultiDeployAllOutput()
 	case PreviewCommentShardedAll:
 		previewCommentShardedAllOutput()
+	case PreviewAggregateCheckSummary:
+		fmt.Print(webhook.PreviewAggregateSummary())
 	case PreviewCLIMultiDeployInProgress:
 		previewCLIMultiDeploymentApplyInProgress()
 	case PreviewCLIMultiDeployFailed:
@@ -264,6 +273,10 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted())
 	case PreviewCommentCutoverActive:
 		fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress())
+	case PreviewCommentVolumeAccepted:
+		fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted())
+	case PreviewCommentVolumeInvalid:
+		fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel())
 	case PreviewCommentApplyAllType:
 		previewApplyCommandAllOutput()
 	// Paired aggregate previews (PR + CLI subsections)

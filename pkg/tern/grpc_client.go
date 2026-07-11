@@ -163,17 +163,31 @@ type Config struct {
 // retryServiceConfig enables client-side retries for idempotent RPCs.
 //
 // The network path to a remote Tern deployment often crosses proxies and
-// service meshes, where brief connection resets or TLS handshake flaps
-// surface as UNAVAILABLE before the request reaches the server. Retrying
-// rides out sub-second blips instead of failing the caller's operation.
+// service meshes, where connection resets or TLS handshake flaps surface as
+// UNAVAILABLE before the request reaches the server. Retrying rides out the
+// blip instead of failing the caller's operation.
 //
-// Only RPCs that are safe to re-send are retried:
-//   - PullSchema: read-only live schema fetch.
-//   - Plan: each attempt produces an independent plan record and only the
-//     returned plan ID is used, so a duplicate attempt is harmless.
-//   - Progress and Health: read-only.
+// Only RPCs that are safe to re-send are retried, in two budgets:
 //
-// State-changing RPCs (Apply, Cutover, Stop, Start, Volume, Revert,
+// Caller-facing reads (PullSchema, Plan, PlanDiff) get a long budget: a
+// human or review workflow is waiting on the response, and a data-plane pod
+// restart or mesh drain lasts seconds — well past a sub-second budget — so
+// these ride out up to roughly fifteen seconds before surfacing UNAVAILABLE.
+// (Plan is retry-safe because each attempt produces an independent plan
+// record and only the returned plan ID is used.) The budget must stay under
+// the API server's 30s response timeout, which bounds these calls end to end.
+// gRPC clamps maxAttempts to 5, so raising it further has no effect. During a
+// sustained outage a multi-environment auto-plan pays this budget per
+// environment (serial Plan + concurrent PlanDiff waves), so the whole flow
+// stays within its command timeout only for a handful of environments — the
+// exhausted calls fail closed either way.
+//
+// Fast polls (Progress, Health) keep a sub-second budget: Progress is called
+// on tight drive loops that own their own failure handling, and Health feeds
+// the remote-deployment outage monitor, which must observe an outage promptly
+// rather than ride it out.
+//
+// State-changing RPCs (Apply, Cutover, Stop, Cancel, Start, Volume, Revert,
 // SkipRevert) are intentionally not retried here: re-sending them could
 // duplicate work or advance an apply twice, and the operator's durable
 // queue already owns redelivery for dispatch failures.
@@ -182,6 +196,17 @@ const retryServiceConfig = `{
 		"name": [
 			{"service": "tern.v1.Tern", "method": "PullSchema"},
 			{"service": "tern.v1.Tern", "method": "Plan"},
+			{"service": "tern.v1.Tern", "method": "PlanDiff"}
+		],
+		"retryPolicy": {
+			"maxAttempts": 5,
+			"initialBackoff": "0.5s",
+			"maxBackoff": "8s",
+			"backoffMultiplier": 3.0,
+			"retryableStatusCodes": ["UNAVAILABLE"]
+		}
+	}, {
+		"name": [
 			{"service": "tern.v1.Tern", "method": "Progress"},
 			{"service": "tern.v1.Tern", "method": "Health"}
 		],
@@ -268,6 +293,10 @@ func (c *GRPCClient) Close() error {
 
 func (c *GRPCClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
 	return c.client.Plan(ctx, req)
+}
+
+func (c *GRPCClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	return c.client.PlanDiff(ctx, req)
 }
 
 func (c *GRPCClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
@@ -615,6 +644,45 @@ func (c *GRPCClient) processPendingSkipRevertControlRequest(ctx context.Context,
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered,
 		fmt.Sprintf("Skip-revert triggered by user%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 	return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationSkipRevert)
+}
+
+// processPendingRevertControlRequest drives a durable revert control request for
+// a remote apply: it proxies Revert to the data plane and completes the request.
+// This is the apply owner's retry path when the API's immediate revert attempt
+// failed or its process died, leaving the request pending. A transient failure
+// returns an error so the drive exits and the operator retries (the request
+// stays pending); a rejected revert fails the request.
+func (c *GRPCClient) processPendingRevertControlRequest(ctx context.Context, apply *storage.Apply, remoteID string) error {
+	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationRevert)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		return nil
+	}
+	// Revert is only meaningful in the revert window. Once the apply has left it
+	// (finalized, reverted, …) the request is moot — complete it so it does not
+	// linger.
+	if !state.IsState(apply.State, state.Apply.RevertWindow) {
+		return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert)
+	}
+	resp, err := c.client.Revert(ctx, &ternv1.RevertRequest{
+		ApplyId:     remoteID,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		return fmt.Errorf("process pending revert for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if !resp.Accepted {
+		message := "revert was not accepted by the data plane"
+		if resp.ErrorMessage != "" {
+			message = fmt.Sprintf("revert was not accepted: %s", resp.ErrorMessage)
+		}
+		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert, message)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventRevertTriggered,
+		fmt.Sprintf("Revert triggered by user%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+	return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert)
 }
 
 // logOperationDriveLeavesParentStop records that a multi-operation
@@ -3051,6 +3119,8 @@ func applyProgressRank(applyState string) int {
 		return 10
 	case state.Apply.SkippingRevert:
 		return 11
+	case state.Apply.Reverting:
+		return 12
 	default:
 		return 0
 	}
@@ -3112,6 +3182,15 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			}
 			if err := c.processPendingSkipRevertControlRequest(ctx, apply, scope.remoteApplyID(apply)); err != nil {
 				slog.Warn("pending gRPC skip-revert request processing failed; current apply owner will exit for operator retry",
+					"apply_id", apply.ApplyIdentifier,
+					"external_id", apply.ExternalID,
+					"database", apply.Database,
+					"environment", apply.Environment,
+					"error", err)
+				return err
+			}
+			if err := c.processPendingRevertControlRequest(ctx, apply, scope.remoteApplyID(apply)); err != nil {
+				slog.Warn("pending gRPC revert request processing failed; current apply owner will exit for operator retry",
 					"apply_id", apply.ApplyIdentifier,
 					"external_id", apply.ExternalID,
 					"database", apply.Database,

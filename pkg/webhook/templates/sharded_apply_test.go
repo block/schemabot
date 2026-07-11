@@ -45,7 +45,7 @@ func TestRenderShardedApplyComment_FailedSurfacesError(t *testing.T) {
 		Cells: []ShardCell{mutesCell("-40"), mutesCell("80-")},
 	})
 
-	assert.Contains(t, out, "❌ Schema Change Failed")
+	assert.Contains(t, out, "## Schema Change Status")
 	assert.Contains(t, out, "> ⚠️ **First failure:** shard <code>-40</code> — "+failErr)
 	assert.Contains(t, out, failErr, "the error also appears in the failed shard's row")
 	assert.Contains(t, out, "To retry:")

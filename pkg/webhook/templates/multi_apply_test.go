@@ -41,7 +41,7 @@ func TestRenderMultiDeploymentApplyComment_BarrierInProgress(t *testing.T) {
 		Environment: "production",
 	})
 
-	assert.Contains(t, out, "## Schema Change In Progress")
+	assert.Contains(t, out, "## Schema Change Status")
 	assert.Contains(t, out, "— Production")
 	assert.Contains(t, out, "**Apply ID**: `apply-123`")
 	assert.Contains(t, out, "_Last updated: <relative-time datetime=\"2026-06-16T19:43:00Z\">2026-06-16 19:43:00 UTC</relative-time> (2026-06-16 19:43:00 UTC)_")
@@ -84,7 +84,7 @@ func TestRenderMultiDeploymentApplyComment_FailedHalt(t *testing.T) {
 		Environment: "production",
 	})
 
-	assert.Contains(t, out, "## ❌ Schema Change Failed")
+	assert.Contains(t, out, "## Schema Change Status")
 	assert.Contains(t, out, "**Deployments**: 1 ready for cutover, 2 halted, 1 failed")
 	// The recovery path for a failed apply is retry, matching the single-deployment
 	// footer. revert is only for a deployment in its post-cutover revert window.
@@ -178,7 +178,7 @@ func TestRenderMultiDeploymentApplyComment_FirstFailureSurfacesError(t *testing.
 	})
 
 	// The rollout is still in progress (running_degraded), not headlined as failed.
-	assert.Contains(t, out, "## Schema Change In Progress")
+	assert.Contains(t, out, "## Schema Change Status")
 	assert.NotContains(t, out, "Schema Change Failed")
 	// A later deployment is still running while siblings have failed.
 	assert.Contains(t, out, "- 🔄 au — running table copy")
@@ -365,7 +365,7 @@ func TestRenderMultiDeploymentApplyComment_NoNextActionWhenCompleted(t *testing.
 		rollingOp("us", so.Completed),
 	})
 	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{Model: model, ApplyID: "apply-123", Environment: "production"})
-	assert.Contains(t, out, "## ✅ Schema Change Applied")
+	assert.Contains(t, out, "## Schema Change Status")
 	assert.NotContains(t, out, "schemabot cutover")
 	assert.NotContains(t, out, "schemabot revert")
 	assert.NotContains(t, out, "To resume:")

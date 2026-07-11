@@ -43,7 +43,7 @@ func TestRenderApplyCommentsIncludeEnvironmentInTitle(t *testing.T) {
 		})
 		firstLine, _, _ := strings.Cut(rendered, "\n")
 
-		assert.Equal(t, "## Schema Change In Progress — Production", firstLine)
+		assert.Equal(t, "## Schema Change Status — Production", firstLine)
 		assert.NotContains(t, rendered, "**Elapsed**")
 	})
 
@@ -171,7 +171,7 @@ func TestRenderApplyStatusComment_Checksumming(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## Schema Change In Progress", "apply stays in progress; checksumming is table-level")
+	assert.Contains(t, result, "## Schema Change Status", "apply stays in progress; checksumming is table-level")
 	assert.Contains(t, result, "**`orders`**")
 	assert.Contains(t, result, "🔍 Checksumming to verify data (21%)")
 	assert.Contains(t, result, "Rows verified: 321,450 / 1,466,232")
@@ -327,7 +327,8 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## Schema Change In Progress")
+	assert.Contains(t, result, "## Schema Change Status")
+	assert.Contains(t, result, "**Status**: In Progress", "the constant title carries no state, so a running apply shows its state in the Status line")
 	assert.Contains(t, result, "@aparajon")
 	assert.Contains(t, result, "`testapp`")
 	assert.Contains(t, result, "— Staging")
@@ -353,6 +354,42 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 
 	assert.Contains(t, result, "**`products`**")
 	assert.Contains(t, result, "Queued")
+}
+
+// TestRenderApplyStatusComment_Volume verifies that a running apply with a
+// volume level set on its stored options shows the level compactly on the
+// Status line, and that an apply without a level (engine default) renders no
+// volume text at all.
+func TestRenderApplyStatusComment_Volume(t *testing.T) {
+	newData := func(applyState, tableStatus string, volume int) ApplyStatusCommentData {
+		return ApplyStatusCommentData{
+			Database:    "testapp",
+			Environment: "staging",
+			RequestedBy: "aparajon",
+			State:       applyState,
+			Engine:      "Spirit",
+			Volume:      volume,
+			Tables: []TableProgressData{
+				{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: tableStatus, RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45},
+			},
+		}
+	}
+
+	t.Run("running apply with volume shows level on the status line", func(t *testing.T) {
+		result := RenderApplyStatusComment(newData("running", "running", 8))
+		assert.Contains(t, result, "**Status**: In Progress | Volume: 8/11")
+	})
+
+	t.Run("running apply without volume renders no volume text", func(t *testing.T) {
+		result := RenderApplyStatusComment(newData("running", "running", 0))
+		assert.Contains(t, result, "**Status**: In Progress")
+		assert.NotContains(t, result, "Volume")
+	})
+
+	t.Run("stopped apply with volume renders no volume text", func(t *testing.T) {
+		result := RenderApplyStatusComment(newData("stopped", "stopped", 8))
+		assert.NotContains(t, result, "Volume")
+	})
 }
 
 // A Vitess/PlanetScale apply labels its namespace group "Keyspace" (not "Schema"),
@@ -521,7 +558,7 @@ func TestRenderApplyStatusComment_ValidatingDeployRequest(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## Schema Change In Progress")
+	assert.Contains(t, result, "## Schema Change Status")
 	assert.Contains(t, result, "**Status**: Validating Deploy Request")
 	assert.Contains(t, result, "To cancel this schema change:")
 	assert.Contains(t, result, "schemabot cancel apply-7aa13cf03496454b -e staging")
@@ -811,11 +848,14 @@ func TestRenderApplyStatusComment_FailedRetryable(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## Schema Change In Progress")
+	assert.Contains(t, result, "## Schema Change Status")
 	assert.NotContains(t, result, "Failed_retryable")
 	assert.NotContains(t, result, "failed_retryable")
-	// The retry detail lives on the affected table, not in the headline.
-	assert.Contains(t, result, "🔄 Interrupted — retrying automatically")
+	// The retryable state is communicated on the always-present Status line.
+	assert.Contains(t, result, "**Status**: Retrying")
+	// The retry detail lives on the affected table, not in the headline, and
+	// counts the upcoming retry against the operator redispatch budget.
+	assert.Contains(t, result, "🔄 Interrupted — retrying automatically (attempt 1/10)")
 	assert.Contains(t, result, "> ⚠️ Last error: remote deployment unavailable")
 	assert.Contains(t, result, "🟧") // orange bar for the interrupted table
 	// Progress summary counts the retrying table.
@@ -827,6 +867,32 @@ func TestRenderApplyStatusComment_FailedRetryable(t *testing.T) {
 	assert.Contains(t, result, "schemabot stop apply-abc123 -e staging")
 	assert.NotContains(t, result, "transient")
 	assert.NotContains(t, result, "schemabot apply -e staging")
+}
+
+// A retryable apply that has already been redispatched shows how much of the
+// operator retry budget the next attempt consumes, so a watcher can tell a
+// transient blip (attempt 2/10) from an apply that is about to exhaust its
+// retries (attempt 9/10).
+func TestRenderApplyStatusComment_FailedRetryableCountsAttempts(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.FailedRetryable,
+		Engine:      "Spirit",
+		ApplyID:     "apply-abc123",
+		Attempt:     4,
+		Tables: []TableProgressData{
+			{
+				TableName: "users",
+				DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+				Status:    state.Task.FailedRetryable,
+			},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "🔄 Interrupted — retrying automatically (attempt 5/10)")
 }
 
 // Every apply state must render a human-readable headline. Raw snake_case
@@ -935,7 +1001,7 @@ func TestRenderApplyStatusComment_Resuming(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## Schema Change In Progress")
+	assert.Contains(t, result, "## Schema Change Status")
 	assert.Contains(t, result, "🔄 Resuming…")
 	assert.NotContains(t, result, "21%", "the indeterminate resume window must not show the stale pre-stop percent")
 	assert.NotContains(t, result, "21,000 / 100,000", "the indeterminate resume window must not show stale row counts")
@@ -1061,7 +1127,7 @@ func TestRenderApplyStatusComment_NoTables(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## Schema Change In Progress")
+	assert.Contains(t, result, "## Schema Change Status")
 }
 
 func TestRenderApplyStatusComment_NoRequestedBy(t *testing.T) {
@@ -1185,7 +1251,7 @@ func TestApplyStatusFromProgress(t *testing.T) {
 func TestPreviewCommentApplyProgress(t *testing.T) {
 	result := PreviewCommentApplyProgress()
 
-	assert.Contains(t, result, "Schema Change In Progress")
+	assert.Contains(t, result, "Schema Change Status")
 	assert.Contains(t, result, "**Schema `testapp`**")
 	assert.Contains(t, result, "**`orders`**")
 	assert.Contains(t, result, "**`users`**")
@@ -1197,7 +1263,7 @@ func TestPreviewCommentApplyProgress(t *testing.T) {
 func TestPreviewCommentApplyEstimateExceeded(t *testing.T) {
 	result := PreviewCommentApplyEstimateExceeded()
 
-	assert.Contains(t, result, "Schema Change In Progress")
+	assert.Contains(t, result, "Schema Change Status")
 	assert.Contains(t, result, "1 running (Active)")
 	assert.Contains(t, result, "Active")
 	assert.Contains(t, result, "Rows copied: 145,000,000 so far")
@@ -1234,7 +1300,7 @@ func TestPreviewCommentApplyStopped(t *testing.T) {
 func TestPreviewCommentApplyResuming(t *testing.T) {
 	result := PreviewCommentApplyResuming()
 
-	assert.Contains(t, result, "Schema Change In Progress")
+	assert.Contains(t, result, "Schema Change Status")
 	assert.Contains(t, result, "🔄 Resuming…")
 	// The indeterminate resume window hides the stale pre-stop percent.
 	assert.NotContains(t, result, "72%")
@@ -1378,7 +1444,7 @@ func TestPreviewCommentSummaryCompletedLargeCollapsesAppliedDetails(t *testing.T
 
 	assert.Contains(t, result, "Applied successfully — your schema changes are live!")
 	assert.Contains(t, result, "<details><summary>Apply details (8 tables)</summary>")
-	assert.Contains(t, result, "**Apply ID**: `apply-a1b2c3d4e5f6`")
+	assert.Contains(t, result, "_Apply ID: `apply-a1b2c3d4e5f6`_")
 	assert.Equal(t, 1, strings.Count(result, "</details>"))
 }
 
@@ -1407,13 +1473,32 @@ func TestRenderApplySummaryCommentCompletedCollapsedDetailsApplyIDInside(t *test
 	result := RenderApplySummaryComment(data)
 
 	assert.Contains(t, result, "<details><summary>Apply details (6 tables)</summary>")
-	assert.Contains(t, result, "### ✅ testapp_primary")
+	// All namespaces succeeded, so the per-namespace header carries no redundant ✅.
+	assert.Contains(t, result, "### testapp_primary")
 	// The Apply ID lives inside the collapsed details block, not as a trailing line.
-	assert.Contains(t, result, "**Apply ID**: `apply-a1b2c3d4e5f6`")
-	assert.NotContains(t, result, "_Apply ID:")
-	idIdx := strings.Index(result, "**Apply ID**: `apply-a1b2c3d4e5f6`")
+	assert.Contains(t, result, "_Apply ID: `apply-a1b2c3d4e5f6`_")
+	idIdx := strings.Index(result, "_Apply ID: `apply-a1b2c3d4e5f6`_")
 	closeIdx := strings.LastIndex(result, "</details>")
 	assert.True(t, idIdx >= 0 && idIdx < closeIdx, "Apply ID should appear inside the details, before the closing tag")
+}
+
+// When namespaces have mixed outcomes, the summary keeps the per-namespace status
+// emoji so the operator can see which keyspace failed and which succeeded.
+func TestRenderApplySummaryCommentMixedNamespacesKeepEmoji(t *testing.T) {
+	data := ApplyStatusCommentData{
+		ApplyID:     "apply-mixed01",
+		Database:    "boardgames",
+		Environment: "staging",
+		State:       state.Apply.Failed,
+		Tables: []TableProgressData{
+			{TableName: "orders", Namespace: "commerce", Status: state.Task.Completed},
+			{TableName: "users", Namespace: "identity", Status: state.Task.Failed},
+		},
+	}
+
+	result := RenderApplySummaryComment(data)
+	assert.Contains(t, result, "### ✅ commerce")
+	assert.Contains(t, result, "### ❌ identity")
 }
 
 func TestPreviewCommentSummaryCompletedVitessTracksVSchema(t *testing.T) {
@@ -1788,10 +1873,16 @@ func TestRenderApplyStatusComment_RevertWindow(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "Pending Revert")
+	assert.Contains(t, result, "## Schema Change Status")
 	assert.Contains(t, result, "Complete (pending revert)")
 	assert.Contains(t, result, "schemabot revert apply-abc123 -e staging")
 	assert.Contains(t, result, "schemabot skip-revert apply-abc123 -e staging")
+	// Skip-revert (finalize) is the likelier action, so it is offered before revert.
+	skipIdx := strings.Index(result, "To skip revert and keep changes:")
+	revertIdx := strings.Index(result, "To revert:")
+	require.GreaterOrEqual(t, skipIdx, 0, "skip-revert footer action should be present")
+	require.GreaterOrEqual(t, revertIdx, 0, "revert footer action should be present")
+	assert.Less(t, skipIdx, revertIdx, "skip-revert should be offered before revert in the revert-window footer")
 }
 
 // Once skip-revert is accepted the apply moves from revert_window to
@@ -1811,16 +1902,17 @@ func TestRenderApplyStatusComment_SkippingRevert(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "Skipping Revert — Finalizing")
+	assert.Contains(t, result, "## Schema Change Status")
 	assert.Contains(t, result, "can no longer be reverted")
 	assert.NotContains(t, result, "schemabot revert apply-abc123 -e staging")
 	assert.NotContains(t, result, "schemabot skip-revert apply-abc123 -e staging")
 }
 
 // In the revert window the comment shows how long the operator has to revert or
-// skip before the change becomes permanent. A future deadline renders a
-// countdown; an absent or past-due deadline renders none rather than a stale or
-// negative value.
+// skip before the change becomes permanent. The countdown folds into the status
+// line ("Revert Window | Closes in …") so the state and its deadline read
+// together. A future deadline renders the countdown; an absent or past-due
+// deadline shows the state alone rather than a stale or negative value.
 func TestRenderApplyStatusComment_RevertWindowDeadline(t *testing.T) {
 	base := ApplyStatusCommentData{
 		ApplyID:     "apply-abc123",
@@ -1832,13 +1924,15 @@ func TestRenderApplyStatusComment_RevertWindowDeadline(t *testing.T) {
 
 	withDeadline := base
 	withDeadline.RevertExpiresAt = time.Now().Add(20 * time.Minute).UTC().Format(time.RFC3339)
-	assert.Contains(t, RenderApplyStatusComment(withDeadline), "Revert window closes in")
+	assert.Contains(t, RenderApplyStatusComment(withDeadline), "**Status**: Revert Window | Closes in")
 
-	// No deadline → no countdown line.
-	assert.NotContains(t, RenderApplyStatusComment(base), "Revert window closes in")
+	// No deadline → status line shows the state alone, no countdown.
+	noDeadline := RenderApplyStatusComment(base)
+	assert.Contains(t, noDeadline, "**Status**: Revert Window")
+	assert.NotContains(t, noDeadline, "Closes in")
 
-	// Past-due deadline → no countdown line (never show a negative countdown).
+	// Past-due deadline → status line shows the state alone (never a negative countdown).
 	pastDue := base
 	pastDue.RevertExpiresAt = time.Now().Add(-1 * time.Minute).UTC().Format(time.RFC3339)
-	assert.NotContains(t, RenderApplyStatusComment(pastDue), "Revert window closes in")
+	assert.NotContains(t, RenderApplyStatusComment(pastDue), "Closes in")
 }

@@ -50,24 +50,27 @@ type Engine struct {
 	spiritLogger *slog.Logger // Logger for Spirit (may filter debug logs)
 	linter       *lint.Linter
 
-	// Configuration
+	// Configuration. targetChunkTime, threads, and lockWaitTimeout are the
+	// configured default Spirit copy settings; they are immutable after New.
+	// Each schema change starts from these defaults and carries its own working
+	// copy on runningSchemaChange, which Volume retunes for that change only.
 	targetChunkTime     time.Duration
 	threads             int
 	lockWaitTimeout     time.Duration
 	debugLogs           bool
 	disablePendingDrops bool
-	cpuHint             int // Inferred CPU count from innodb_buffer_pool_instances (0 = unknown)
+	cpuHint             int // Inferred CPU count from innodb_buffer_pool_instances (0 = unknown); guarded by mu
 
 	// Log callback for routing Spirit logs to ApplyLogStore (with table context)
 	onLog func(level slog.Level, table, msg string)
 
 	// Running schema change state
-	mu               sync.Mutex
-	runningMigration *runningMigration
+	mu                  sync.Mutex
+	runningSchemaChange *runningSchemaChange
 }
 
-// runningMigration tracks the state of an in-progress schema change.
-type runningMigration struct {
+// runningSchemaChange tracks the state of an in-progress schema change.
+type runningSchemaChange struct {
 	database                string            // MySQL database name parsed from DSN
 	tableNamespace          map[string]string // table name → namespace (from ApplyRequest.Changes)
 	tables                  []string
@@ -81,6 +84,15 @@ type runningMigration struct {
 	started                 time.Time
 	deferCutover            bool // Whether to defer cutover until manual trigger
 	volumeRestartInProgress bool // Set while stored stopped state should still be exposed as running progress.
+
+	// Spirit copy settings for this schema change. Initialized from the
+	// engine's configured defaults and retuned by Volume for this change only;
+	// they end with the change, so the next schema change starts from the
+	// configured defaults again.
+	threads         int
+	targetChunkTime time.Duration
+	lockWaitTimeout time.Duration
+	volume          int32 // Explicit volume set via Volume for this change (0 = never set)
 
 	// For resume support
 	cancelFunc context.CancelFunc
@@ -189,7 +201,7 @@ func (e *Engine) DebugLogs() bool {
 // fully released before new operations begin.
 func (e *Engine) Drain() {
 	e.mu.Lock()
-	rm := e.runningMigration
+	rm := e.runningSchemaChange
 	if rm == nil {
 		e.mu.Unlock()
 		return
@@ -199,8 +211,22 @@ func (e *Engine) Drain() {
 	rm.wg.Wait()
 
 	e.mu.Lock()
-	e.runningMigration = nil
+	e.runningSchemaChange = nil
 	e.mu.Unlock()
+}
+
+// copySettings returns the Spirit copy settings for the tracked schema change,
+// falling back to the engine's configured defaults when no change is tracked.
+// Each schema change starts from the configured defaults and may be retuned by
+// Volume; the defaults themselves never change, so a volume set on one schema
+// change never affects a later one.
+func (e *Engine) copySettings() (threads int, chunkTime, lockTimeout time.Duration) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if rm := e.runningSchemaChange; rm != nil {
+		return rm.threads, rm.targetChunkTime, rm.lockWaitTimeout
+	}
+	return e.threads, e.targetChunkTime, e.lockWaitTimeout
 }
 
 // Plan computes the schema changes needed by diffing current schema against desired.
@@ -388,8 +414,14 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	e.Drain()
 
 	// Query CPU hint for volume scaling (best-effort, falls back to fixed counts)
-	if e.cpuHint == 0 {
-		e.cpuHint = e.queryCPUHint(ctx, req.Credentials.DSN)
+	e.mu.Lock()
+	cpuHint := e.cpuHint
+	e.mu.Unlock()
+	if cpuHint == 0 {
+		cpuHint = e.queryCPUHint(ctx, req.Credentials.DSN)
+		e.mu.Lock()
+		e.cpuHint = cpuHint
+		e.mu.Unlock()
 	}
 
 	// Initialize running state and start background execution.
@@ -405,19 +437,22 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		}
 	}
 
-	rm := &runningMigration{
-		database:       database,
-		tableNamespace: tableNamespace,
-		tables:         nil, // Tables will be populated by executeMigration
-		originalDDLs:   req.FlatDDL(),
-		state:          engine.StateRunning,
-		started:        time.Now(),
-		deferCutover:   deferCutover,
-		host:           host,
-		username:       username,
-		password:       password,
+	rm := &runningSchemaChange{
+		database:        database,
+		tableNamespace:  tableNamespace,
+		tables:          nil, // Tables will be populated by executeSchemaChange
+		originalDDLs:    req.FlatDDL(),
+		state:           engine.StateRunning,
+		started:         time.Now(),
+		deferCutover:    deferCutover,
+		host:            host,
+		username:        username,
+		password:        password,
+		threads:         e.threads,
+		targetChunkTime: e.targetChunkTime,
+		lockWaitTimeout: e.lockWaitTimeout,
 	}
-	e.runningMigration = rm
+	e.runningSchemaChange = rm
 	e.mu.Unlock()
 
 	// Start schema change in background with cancellable context.
@@ -428,11 +463,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 		defer cancel()
 		e.mu.Lock()
-		if e.runningMigration != nil {
-			e.runningMigration.cancelFunc = cancel
+		if e.runningSchemaChange != nil {
+			e.runningSchemaChange.cancelFunc = cancel
 		}
 		e.mu.Unlock()
-		e.executeMigration(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover)
+		e.executeSchemaChange(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover)
 	})
 
 	return &engine.ApplyResult{
@@ -448,14 +483,14 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.runningMigration == nil {
+	if e.runningSchemaChange == nil {
 		return &engine.ProgressResult{
 			State:   engine.StatePending,
 			Message: "No active schema change",
 		}, nil
 	}
 
-	rm := e.runningMigration
+	rm := e.runningSchemaChange
 
 	// Get progress from the single runner (handles all tables together)
 	message := fmt.Sprintf("Schema change %s", rm.state)
@@ -576,7 +611,7 @@ func buildSpiritTableProgress(prog status.Progress, stateStr string, ddlByTable,
 // surfacing the sentinel wait for a deferred cutover. A stopped tracked state
 // with a volume restart in flight reports running because the schema change
 // is restarting with new settings.
-func progressState(rm *runningMigration, spiritState status.State) engine.State {
+func progressState(rm *runningSchemaChange, spiritState status.State) engine.State {
 	state := rm.state
 	if state == engine.StateStopped && rm.volumeRestartInProgress {
 		state = engine.StateRunning

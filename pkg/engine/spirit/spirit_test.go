@@ -18,13 +18,13 @@ import (
 func TestProgressState(t *testing.T) {
 	tests := []struct {
 		name        string
-		rm          *runningMigration
+		rm          *runningSchemaChange
 		spiritState status.State
 		want        engine.State
 	}{
 		{
 			name: "completed is never downgraded by sentinel wait",
-			rm: &runningMigration{
+			rm: &runningSchemaChange{
 				state:        engine.StateCompleted,
 				deferCutover: true,
 			},
@@ -33,7 +33,7 @@ func TestProgressState(t *testing.T) {
 		},
 		{
 			name: "completed is not re-derived from a closing runner",
-			rm: &runningMigration{
+			rm: &runningSchemaChange{
 				state: engine.StateCompleted,
 			},
 			spiritState: status.Close,
@@ -41,7 +41,7 @@ func TestProgressState(t *testing.T) {
 		},
 		{
 			name: "failed is never downgraded by sentinel wait",
-			rm: &runningMigration{
+			rm: &runningSchemaChange{
 				state:        engine.StateFailed,
 				deferCutover: true,
 			},
@@ -50,7 +50,7 @@ func TestProgressState(t *testing.T) {
 		},
 		{
 			name: "stopped stays stopped while the runner tears down",
-			rm: &runningMigration{
+			rm: &runningSchemaChange{
 				state:        engine.StateStopped,
 				deferCutover: true,
 			},
@@ -59,7 +59,7 @@ func TestProgressState(t *testing.T) {
 		},
 		{
 			name: "cancelled stays cancelled while the runner tears down",
-			rm: &runningMigration{
+			rm: &runningSchemaChange{
 				state:        engine.StateCancelled,
 				deferCutover: true,
 			},
@@ -68,7 +68,7 @@ func TestProgressState(t *testing.T) {
 		},
 		{
 			name: "closing runner does not imply completion",
-			rm: &runningMigration{
+			rm: &runningSchemaChange{
 				state: engine.StateRunning,
 			},
 			spiritState: status.Close,
@@ -76,7 +76,7 @@ func TestProgressState(t *testing.T) {
 		},
 		{
 			name: "sentinel wait surfaces deferred cutover",
-			rm: &runningMigration{
+			rm: &runningSchemaChange{
 				state:        engine.StateRunning,
 				deferCutover: true,
 			},
@@ -85,7 +85,7 @@ func TestProgressState(t *testing.T) {
 		},
 		{
 			name: "sentinel wait without deferred cutover stays running",
-			rm: &runningMigration{
+			rm: &runningSchemaChange{
 				state: engine.StateRunning,
 			},
 			spiritState: status.WaitingOnSentinelTable,
@@ -93,7 +93,7 @@ func TestProgressState(t *testing.T) {
 		},
 		{
 			name: "volume restart reports stopped state as running",
-			rm: &runningMigration{
+			rm: &runningSchemaChange{
 				state:                   engine.StateStopped,
 				volumeRestartInProgress: true,
 			},
@@ -102,7 +102,7 @@ func TestProgressState(t *testing.T) {
 		},
 		{
 			name: "volume restart still surfaces deferred cutover",
-			rm: &runningMigration{
+			rm: &runningSchemaChange{
 				state:                   engine.StateStopped,
 				volumeRestartInProgress: true,
 				deferCutover:            true,

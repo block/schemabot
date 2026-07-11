@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -84,6 +85,12 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 	}
 
 	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
+		// False covers a transient PR-fetch failure as well as a genuinely
+		// newer head; either way a leader's next re-fold fetches the
+		// then-current head, so arming a bounded re-fold converges the
+		// aggregate instead of stranding one waiting on a participant re-read.
+		// verifyHeadSHAStillCurrentForPR already logged the reason.
+		h.scheduleLeaderRefoldIfConfigured(ctx, repo, pr, client.InstallationID())
 		return
 	}
 
@@ -95,6 +102,10 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 			Status:     "error",
 		})
 		h.logger.Error("failed to fetch checks for aggregate", "repo", repo, "pr", pr, "error", err)
+		// A storage blip must not end a leader's retry chain while its
+		// aggregate renders unresolved participants as in_progress; the
+		// bounded re-fold retries the read.
+		h.scheduleLeaderRefoldIfConfigured(ctx, repo, pr, client.InstallationID())
 		return
 	}
 
@@ -106,20 +117,62 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 		}
 	}
 
+	config := h.service.Config()
+
+	// The aggregate-check leader gates its per-environment aggregate on the
+	// Check Runs published by participant deployments, so it must fold those in
+	// even when it has no per-database checks of its own. Non-leaders (and repos
+	// with no aggregate config) never fetch files or fold — their behavior is
+	// unchanged.
+	var expectedParticipants []api.ExpectedTenant
+	if config.IsAggregateLeaderForRepo(repo) {
+		files, err := client.FetchPRFiles(ctx, repo, pr)
+		if err != nil {
+			// The leader cannot determine which participants a PR requires without
+			// the changed files. Fail closed: do not publish an aggregate at all,
+			// which leaves any existing (still-blocking) aggregate in place rather
+			// than downgrading it to a passing success we cannot justify. The read
+			// failure is as transient as a failed participant Checks read, so arm
+			// a bounded re-fold — otherwise one API blip strands the aggregate
+			// until an external event re-folds it.
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:  "aggregate_check_sync",
+				Repository: repo,
+				Status:     "error",
+			})
+			h.logger.Error("aggregate leader cannot fetch PR files, not publishing aggregate",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+			h.scheduleParticipantRefold(ctx, repo, pr, client.InstallationID())
+			return
+		}
+		expectedParticipants = config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))
+	}
+
 	// No per-database checks means the PR doesn't touch schema files (or all check
-	// records were already deleted by PR close cleanup). No aggregate to create.
-	if len(dbChecks) == 0 {
+	// records were already deleted by PR close cleanup). With no expected
+	// participants to fold either, there is no aggregate to create.
+	if len(dbChecks) == 0 && len(expectedParticipants) == 0 {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "aggregate_check_sync",
 			Repository: repo,
 			Status:     "noop",
 		})
-		h.logger.Debug("no per-database checks for aggregate", "repo", repo, "pr", pr)
+		h.logger.Debug("no per-database checks or expected participants for aggregate", "repo", repo, "pr", pr)
 		return
 	}
 
-	config := h.service.Config()
 	checkNameBase := h.aggregateCheckNameForRepo(repo)
+
+	// A retriable participant outcome (not reported yet, or a failed Checks
+	// API read) can newly resolve on a later re-read. Participants with no
+	// schema work publish their check but never comment, so no nudge will
+	// arrive — the leader must re-fold on its own schedule or the aggregate
+	// stays blocked on a participant that already reported green. While the
+	// re-fold budget lasts, unresolved participants render as in_progress
+	// (equally merge-blocking) so the wait is not mislabeled as pending
+	// applies.
+	participantsRetriable := false
+	retryPending := h.participantRefoldBudgetRemaining(repo, pr)
 
 	if len(config.AllowedEnvironments) > 0 {
 		// Per-environment aggregates: create one aggregate per allowed environment.
@@ -127,7 +180,12 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 		// between environments (e.g., staging vs production aggregates).
 		for _, env := range config.AllowedEnvironments {
 			envChecks := filterChecksByEnvironment(dbChecks, env)
+			participantChecks, retriable := h.participantCheckOutcomes(ctx, client, repo, pr, env, headSHA, expectedParticipants, retryPending)
+			participantsRetriable = participantsRetriable || retriable
+			envChecks = append(envChecks, participantChecks...)
 			if len(envChecks) == 0 {
+				h.logger.Debug("no checks or expected participants for aggregate environment",
+					"repo", repo, "pr", pr, "environment", env)
 				continue
 			}
 			checkName := aggregateCheckNameForEnv(checkNameBase, env)
@@ -136,8 +194,29 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 	} else {
 		// Single aggregate. Uses aggregateSentinel for the environment field
 		// since there is no per-environment scoping.
-		h.upsertAggregateCheckRun(ctx, client, repo, pr, headSHA, dbChecks, checkNameBase, aggregateSentinel)
+		participantChecks, retriable := h.participantCheckOutcomes(ctx, client, repo, pr, aggregateSentinel, headSHA, expectedParticipants, retryPending)
+		participantsRetriable = retriable
+		aggChecks := make([]*storage.Check, 0, len(dbChecks)+len(participantChecks))
+		aggChecks = append(aggChecks, dbChecks...)
+		aggChecks = append(aggChecks, participantChecks...)
+		h.upsertAggregateCheckRun(ctx, client, repo, pr, headSHA, aggChecks, checkNameBase, aggregateSentinel)
 	}
+
+	if participantsRetriable {
+		h.scheduleParticipantRefold(ctx, repo, pr, client.InstallationID())
+	} else {
+		h.clearParticipantRefoldBudget(repo, pr)
+	}
+}
+
+// prFilePaths extracts the changed-file paths from a PR file listing for
+// expected-participant matching.
+func prFilePaths(files []ghclient.PRFile) []string {
+	paths := make([]string, 0, len(files))
+	for _, f := range files {
+		paths = append(paths, f.Filename)
+	}
+	return paths
 }
 
 // upsertAggregateCheckRun computes the aggregate conclusion from the given checks
@@ -146,13 +225,66 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 // The environment parameter controls the storage key: for per-environment aggregates
 // it is the real environment name (e.g., "staging"), for the global aggregate it is
 // aggregateSentinel. DatabaseType and DatabaseName always use aggregateSentinel.
+//
+// Two fail-closed rules shape the fold:
+//   - Stored aggregate state carrying a blocking reason is never replaced by a
+//     recompute. Blocking reasons record PR-level guard failures (config
+//     discovery, managed-directory coverage, environment coverage) and are
+//     released only after the auto-plan guards re-verify the PR
+//     (clearAggregateBlocksForVerifiedPR).
+//   - Per-database rows recorded for a different commit contribute a blocking
+//     in-progress placeholder instead of their stored conclusion, so results
+//     computed for a previous commit can never pass the aggregate on the
+//     current one.
 func (h *Handler) upsertAggregateCheckRun(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, headSHA string,
 	dbChecks []*storage.Check, checkName string, environment string,
 ) {
-	conclusion, status := computeAggregate(dbChecks)
-	title, summary := aggregateSummary(dbChecks, conclusion)
+	// Look up existing aggregate check state using the environment-specific key.
+	existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, environment, aggregateSentinel, aggregateSentinel)
+	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:   "aggregate_check_sync",
+			Repository:  repo,
+			Environment: environment,
+			Status:      "error",
+		})
+		h.logger.Error("failed to look up aggregate check", "repo", repo, "pr", pr, "environment", environment, "error", err)
+		return
+	}
+
+	// A stored blocking reason means a PR-level guard failed the aggregate
+	// closed. Recompute paths (apply completion, participant Check Run events,
+	// manual plans, stale cleanup) do not re-verify the guard condition, so
+	// they must leave both the stored state and the failing Check Run in place.
+	if existing != nil && existing.BlockingReason != "" {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:   "aggregate_check_sync",
+			Repository:  repo,
+			Environment: environment,
+			Status:      "blocked",
+		})
+		h.logger.Info("aggregate recompute skipped: stored aggregate state is blocked; the aggregate check will keep blocking merge until auto-plan guards re-verify the PR",
+			"repo", repo, "pr", pr, "check_name", checkName,
+			"environment", environment, "head_sha", headSHA,
+			"blocked_head_sha", existing.HeadSHA,
+			"blocking_reason", existing.BlockingReason,
+			"check_run_id", existing.CheckRunID)
+		return
+	}
+
+	contributions, staleCount := normalizeStaleContributions(dbChecks, headSHA)
+	conclusion, status := computeAggregate(contributions)
+	title, summary := aggregateSummary(contributions, conclusion)
+	if staleCount > 0 {
+		h.logger.Info("aggregate fold holds rows recorded for another commit as blocking until results land for the current commit",
+			"repo", repo, "pr", pr, "check_name", checkName,
+			"environment", environment, "head_sha", headSHA, "stale_rows", staleCount)
+		if status == checkStatusInProgress && !anyInProgressOnCommit(dbChecks, headSHA) {
+			title = awaitingCurrentCommitTitle
+		}
+	}
 
 	opts := ghclient.CheckRunOptions{
 		Name:   checkName,
@@ -165,19 +297,6 @@ func (h *Handler) upsertAggregateCheckRun(
 	// GitHub requires conclusion only when status is "completed"
 	if status == checkStatusCompleted {
 		opts.Conclusion = conclusion
-	}
-
-	// Look up existing aggregate check state using the environment-specific key.
-	existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, environment, aggregateSentinel, aggregateSentinel)
-	if err != nil {
-		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:   "aggregate_check_sync",
-			Repository:  repo,
-			Environment: environment,
-			Status:      "error",
-		})
-		h.logger.Error("failed to look up aggregate check", "repo", repo, "pr", pr, "environment", environment, "error", err)
-		return
 	}
 
 	// Create a new check run if no existing record, or if the HEAD SHA changed
@@ -486,6 +605,37 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 			}
 		}
 
+		blockingReason := block.blockingReason
+		errorMessage := ""
+		if blockingReason != "" {
+			errorMessage = summary
+		} else {
+			existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, ec.environment, aggregateSentinel, aggregateSentinel)
+			if err != nil {
+				metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+					Operation:   "aggregate_check_sync",
+					Repository:  repo,
+					Environment: ec.environment,
+					Status:      "error",
+				})
+				h.logger.Error("failed to look up stored aggregate state before failing aggregate; not publishing so any stored block stays authoritative",
+					"repo", repo, "pr", pr, "check_name", ec.name,
+					"environment", ec.environment, "head_sha", headSHA, "error", err)
+				continue
+			}
+			if existing != nil && existing.BlockingReason != "" {
+				// A generic failure must not replace a stored blocking reason —
+				// carry it forward so the block keeps gating until the auto-plan
+				// guards re-verify the PR.
+				blockingReason = existing.BlockingReason
+				errorMessage = existing.ErrorMessage
+				h.logger.Info("failing aggregate carries forward stored blocking reason",
+					"repo", repo, "pr", pr, "check_name", ec.name,
+					"environment", ec.environment, "head_sha", headSHA,
+					"blocking_reason", blockingReason)
+			}
+		}
+
 		opts := ghclient.CheckRunOptions{
 			Name:       ec.name,
 			Status:     checkStatusCompleted,
@@ -509,20 +659,18 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 		}
 
 		aggCheck := &storage.Check{
-			Repository:   repo,
-			PullRequest:  pr,
-			HeadSHA:      headSHA,
-			Environment:  ec.environment,
-			DatabaseType: aggregateSentinel,
-			DatabaseName: aggregateSentinel,
-			CheckRunID:   id,
-			HasChanges:   false,
-			Status:       checkStatusCompleted,
-			Conclusion:   checkConclusionFailure,
-		}
-		if block.blockingReason != "" {
-			aggCheck.BlockingReason = block.blockingReason
-			aggCheck.ErrorMessage = summary
+			Repository:     repo,
+			PullRequest:    pr,
+			HeadSHA:        headSHA,
+			Environment:    ec.environment,
+			DatabaseType:   aggregateSentinel,
+			DatabaseName:   aggregateSentinel,
+			CheckRunID:     id,
+			HasChanges:     false,
+			Status:         checkStatusCompleted,
+			Conclusion:     checkConclusionFailure,
+			BlockingReason: blockingReason,
+			ErrorMessage:   errorMessage,
 		}
 		if err := h.service.Storage().Checks().Upsert(ctx, aggCheck); err != nil {
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -543,5 +691,97 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 		})
 		h.logger.Info("posted failing aggregate",
 			"repo", repo, "pr", pr, "check_name", ec.name, "env", ec.environment)
+	}
+}
+
+// clearAggregateBlocksForVerifiedPR releases stored aggregate blocking reasons
+// after the auto-plan guards re-verified the PR at headSHA: config discovery
+// succeeded, every schema change under a server-managed directory resolved a
+// config, and — re-checked here — every discovered database resolves to at
+// least one allowed environment. Recompute paths never release blocks, so this
+// is the only way a blocked aggregate can start passing again; the auto-plan
+// that follows publishes the fresh aggregate state.
+//
+// The storage clear is conditional on the head SHA and reason of the row that
+// was read, so a block recorded concurrently (for example by a newer commit's
+// guards on another pod) stays authoritative.
+func (h *Handler) clearAggregateBlocksForVerifiedPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, configs []ghclient.DiscoveredConfig) {
+	for _, cfg := range configs {
+		environments, err := h.allowedDatabaseEnvironments(cfg.Config.Database)
+		if err != nil {
+			h.logger.Warn("stored aggregate blocks retained: cannot re-verify allowed environments for database; the aggregate check will keep blocking merge",
+				"repo", repo, "pr", pr, "head_sha", headSHA,
+				"database", cfg.Config.Database, "error", err)
+			return
+		}
+		if len(environments) == 0 {
+			h.logger.Info("stored aggregate blocks retained: database has no allowed configured environments; the aggregate check will keep blocking merge",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "database", cfg.Config.Database)
+			return
+		}
+	}
+
+	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_block_clear") {
+		return
+	}
+
+	for _, target := range h.aggregateCheckTargetsForRepo(repo) {
+		existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, target.environment, aggregateSentinel, aggregateSentinel)
+		if err != nil {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_block_clear",
+				Repository:  repo,
+				Environment: target.environment,
+				Status:      "error",
+			})
+			h.logger.Error("failed to look up aggregate check for block clear; any stored block stays in place",
+				"repo", repo, "pr", pr, "environment", target.environment,
+				"head_sha", headSHA, "error", err)
+			continue
+		}
+		if existing == nil || existing.BlockingReason == "" {
+			h.logger.Debug("no stored aggregate block to clear",
+				"repo", repo, "pr", pr, "environment", target.environment, "head_sha", headSHA)
+			continue
+		}
+		cleared, err := h.service.Storage().Checks().ClearAggregateBlock(ctx, existing)
+		if err != nil {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_block_clear",
+				Repository:  repo,
+				Environment: target.environment,
+				Status:      "error",
+			})
+			h.logger.Error("failed to clear aggregate block after guard re-verification; the aggregate check will keep blocking merge",
+				"repo", repo, "pr", pr, "environment", target.environment,
+				"head_sha", headSHA, "blocking_reason", existing.BlockingReason, "error", err)
+			continue
+		}
+		if !cleared {
+			// The row changed between the read and the conditional write —
+			// another writer re-blocked or moved the aggregate. That newer
+			// stored state stays authoritative.
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_block_clear",
+				Repository:  repo,
+				Environment: target.environment,
+				Status:      "noop",
+			})
+			h.logger.Info("aggregate block not cleared because stored state changed concurrently; the newer stored state stays authoritative",
+				"repo", repo, "pr", pr, "environment", target.environment,
+				"head_sha", headSHA, "blocked_head_sha", existing.HeadSHA,
+				"blocking_reason", existing.BlockingReason)
+			continue
+		}
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:   "aggregate_block_clear",
+			Repository:  repo,
+			Environment: target.environment,
+			Status:      "success",
+		})
+		h.logger.Info("cleared aggregate block after guards re-verified the PR",
+			"repo", repo, "pr", pr, "environment", target.environment,
+			"head_sha", headSHA, "blocked_head_sha", existing.HeadSHA,
+			"blocking_reason", existing.BlockingReason)
 	}
 }

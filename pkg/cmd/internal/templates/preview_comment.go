@@ -41,6 +41,10 @@ func previewCommentAllOutput() {
 		{"PLAN COMMENT (TENANT TARGET)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanTenant()) }},
 		{"PLAN COMMENT (NO CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges()) }},
 		{"NO MANAGED SCHEMA CHANGES", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChanges()) }},
+		{"NO MANAGED SCHEMA CHANGES (CHECKS REFRESHED)", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshed()) }},
+		{"NO MANAGED SCHEMA CHANGES (GATED ON TENANTS)", func() {
+			fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants())
+		}},
 		{"RECONCILIATION REQUIRED (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationInProgress()) }},
 		{"RECONCILIATION REQUIRED (COMPLETED)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationCompleted()) }},
 		{"SCHEMA CHANGE APPLY (AUTOMATIC)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlan()) }},
@@ -65,12 +69,15 @@ func previewCommentAllOutput() {
 		{"APPLY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyProgress()) }},
 		{"APPLY ESTIMATE EXCEEDED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyEstimateExceeded()) }},
 		{"APPLY COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCompleted()) }},
+		{"APPLY RETRYING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyRetrying()) }},
 		{"APPLY FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFailed()) }},
 		{"APPLY STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStopped()) }},
 		{"APPLY WAITING FOR CUTOVER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutover()) }},
 		{"APPLY CUTTING OVER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCuttingOver()) }},
 		{"CUTOVER COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted()) }},
 		{"CUTOVER COMMAND ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress()) }},
+		{"VOLUME COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted()) }},
+		{"VOLUME COMMAND INVALID LEVEL", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel()) }},
 		{"SUMMARY: COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompleted()) }},
 		{"SUMMARY: FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailed()) }},
 		{"SUMMARY: STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryStopped()) }},
@@ -119,6 +126,8 @@ func previewApplyCommandAllOutput() {
 		{"START COMMAND ALREADY PENDING", func() { fmt.Print(webhooktemplates.PreviewCommentStartCommandAlreadyRequested()) }},
 		{"CUTOVER COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted()) }},
 		{"CUTOVER COMMAND ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress()) }},
+		{"VOLUME COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted()) }},
+		{"VOLUME COMMAND INVALID LEVEL", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel()) }},
 		{"CHECKS GATE: NOT PASSING", func() {
 			fmt.Print(webhooktemplates.RenderApplyBlockedByNonPassingChecks("staging", []webhooktemplates.BlockingCheck{
 				{Name: "CI / unit-tests", State: "failure"},
@@ -157,6 +166,10 @@ func previewCommentPlanAllOutput() {
 		{"MYSQL PLAN (TENANT TARGET)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanTenant()) }},
 		{"MYSQL PLAN (NO CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges()) }},
 		{"NO MANAGED SCHEMA CHANGES", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChanges()) }},
+		{"NO MANAGED SCHEMA CHANGES (CHECKS REFRESHED)", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshed()) }},
+		{"NO MANAGED SCHEMA CHANGES (GATED ON TENANTS)", func() {
+			fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants())
+		}},
 		{"RECONCILIATION REQUIRED (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationInProgress()) }},
 		{"RECONCILIATION REQUIRED (COMPLETED)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationCompleted()) }},
 		{"VITESS PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentVitessPlan()) }},
@@ -212,6 +225,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"APPLY STARTED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStarted()) }},
 		// Single-table (most common case)
 		{"SINGLE TABLE: RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplySingleProgress()) }},
+		{"SINGLE TABLE: RUNNING (VOLUME TUNED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplySingleProgressVolume()) }},
 		{"SINGLE TABLE: COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentApplySingleCompleted()) }},
 		{"SINGLE TABLE: FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentApplySingleFailed()) }},
 		{"SINGLE TABLE: STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentApplySingleStopped()) }},
@@ -229,6 +243,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"VITESS: VSCHEMA ONLY", func() { fmt.Print(webhooktemplates.PreviewCommentApplyVitessVSchemaOnly()) }},
 		{"VITESS: DDL + VSCHEMA", func() { fmt.Print(webhooktemplates.PreviewCommentApplyVitessDDLWithVSchema()) }},
 		{"VITESS: MULTI-KEYSPACE VSCHEMA", func() { fmt.Print(webhooktemplates.PreviewCommentApplyVitessMultiKeyspaceVSchema()) }},
+		{"MIDDLE TABLE RETRYING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyRetrying()) }},
 		{"FIRST TABLE FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFirstFailed()) }},
 		{"MIDDLE TABLE FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFailed()) }},
 		{"STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStopped()) }},
@@ -240,10 +255,13 @@ func previewCommentApplyFlowAllOutput() {
 		// Revert-window states (PlanetScale): deployed-but-revertable, then finalizing.
 		{"REVERT WINDOW", func() { fmt.Print(webhooktemplates.PreviewCommentApplyRevertWindow()) }},
 		{"SKIPPING REVERT", func() { fmt.Print(webhooktemplates.PreviewCommentApplySkippingRevert()) }},
+		{"REVERTING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyReverting()) }},
 		{"START COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentStartCommandAccepted()) }},
 		{"START COMMAND ALREADY PENDING", func() { fmt.Print(webhooktemplates.PreviewCommentStartCommandAlreadyRequested()) }},
 		{"CUTOVER COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted()) }},
 		{"CUTOVER COMMAND ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress()) }},
+		{"VOLUME COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted()) }},
+		{"VOLUME COMMAND INVALID LEVEL", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel()) }},
 		// Summaries
 		{"SUMMARY: COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompleted()) }},
 		{"SUMMARY: FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailed()) }},

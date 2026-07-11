@@ -561,6 +561,15 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
+	case state.Apply.Reverting:
+		bar := ui.ProgressBarWaitingCutover() // yellow — undoing the change
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ↩️ Reverting\n", t.TableName, bar)
+		if t.DDL != "" {
+			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		b.WriteString("\n")
+		b.WriteString(FormatShardProgress(t.Shards))
+		return b.String()
 	case state.Apply.Cancelled:
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
 			cancelledPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
@@ -1231,6 +1240,8 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSIYellow)
 	case state.Apply.SkippingRevert:
 		return colorWrap(ANSICyan)
+	case state.Apply.Reverting:
+		return colorWrap(ANSIYellow) // matches the yellow "undoing the change" table bar
 	default:
 		return nil
 	}

@@ -69,6 +69,9 @@ var applyMetadata = map[string]ApplyStateInfo{
 	Apply.SkippingRevert: {
 		Label: "Skipping revert",
 	},
+	Apply.Reverting: {
+		Label: "Reverting",
+	},
 	Apply.Completed: {
 		Label:    "Completed",
 		Terminal: true,

@@ -17,6 +17,9 @@
 - [Repository Allowlist](#repository-allowlist)
 - [PR Checks Gate](#pr-checks-gate)
 - [Review Gate](#review-gate)
+- [Authentication](#authentication)
+  - [OIDC (Bearer tokens)](#oidc-bearer-tokens)
+  - [Forward-auth (authenticating proxy)](#forward-auth-authenticating-proxy)
 - [Multi-Environment Deployment](#multi-environment-deployment)
   - [Staging Instance](#staging-instance)
   - [Production Instance](#production-instance)
@@ -271,6 +274,8 @@ Increase `drivers` when one SchemaBot server should make operator progress acros
 
 A driver claim means selecting one stale apply and refreshing its heartbeat in the same storage transaction. That heartbeat refresh is the driver's lease while it reloads state and drives the apply to a terminal state.
 
+**Sizing:** each driver drives one claimed apply synchronously to a terminal state, and that includes waiting states such as deferred cutovers and revert windows, so a server's effective apply concurrency is `drivers × replicas`. Size that product to the number of applies you expect to be in flight at once, counting parked ones — a deferred cutover holds its driver for the full wait. A control plane that dispatches to remote servers bounds end-to-end concurrency with its own driver pool the same way.
+
 ## Pending Drops
 
 For MySQL databases executed by the Spirit engine, `DROP TABLE` statements are
@@ -415,6 +420,13 @@ review_policy:
   include_database_operators: true   # default: true
   include_codeowners: false          # default: false
 
+repos:
+  myorg/monorepo:
+    admin_teams:
+      - myorg/monorepo-maintainers
+    admin_users:
+      - some-maintainer
+
 databases:
   payments:
     type: mysql
@@ -428,8 +440,13 @@ databases:
 When enabled, SchemaBot checks PR approval before proceeding. A satisfying review can come from:
 
 1. `review_policy.admin_teams` or `review_policy.admin_users`, which apply to every configured database.
-2. The target database's `operator_teams` or `operator_users` when `include_database_operators` is true.
-3. Matching CODEOWNERS when `include_codeowners` is true.
+2. The PR repository's `admin_teams` or `admin_users` (under `repos:`), which apply to every database managed through that repository.
+3. The target database's `operator_teams` or `operator_users` when `include_database_operators` is true.
+4. Matching CODEOWNERS when `include_codeowners` is true.
+
+Repo admins sit between the global admin policy and per-database operators: they hold authority over every database whose schema changes flow through their repository — useful for monorepo maintainers — without gaining authority over databases managed through other repositories. The same principals may also run mutating PR comment commands when `pr_command_authorization` is enabled.
+
+> **Note:** a populated `repos:` map doubles as a repository allowlist — once any repository is listed, only listed repositories may use SchemaBot. If you add a repo entry solely to configure its admins, make sure every other repository this deployment serves is also listed, or they will be rejected as unregistered.
 
 The PR author's own approval never counts, even if they match one of the configured principals. If the GitHub API fails while checking reviews or team membership, SchemaBot blocks the apply and posts an error comment.
 
@@ -442,6 +459,54 @@ CODEOWNERS support is opt-in because CODEOWNERS is repo-controlled while review 
 The base branch is used, not the PR's head branch, to prevent a PR from relaxing its own approval requirements by modifying CODEOWNERS.
 
 Approval is checked at the time of `schemabot apply` and `schemabot apply-confirm`. Once an apply is executing, there is no ongoing approval check. If a PR is force-pushed after approval, GitHub may dismiss approvals; `apply-confirm` re-checks the gate and blocks if the approval no longer satisfies the policy. Team membership and CODEOWNERS are evaluated fresh at each gate check.
+
+## Authentication
+
+By default (`auth.type: none` or unset) the SchemaBot API is unauthenticated — every request is allowed, which suits local development and deployments where the network is the only boundary. Setting `auth.type` turns on per-request authentication and a two-tier authorization model:
+
+- **Read tier** — visibility: `status`, `progress`, `logs`, `locks` (list), history, database discovery, and `pull` (read a live schema).
+- **Write tier** — anything that stages or makes a change: `plan`, `apply`, controls (`stop`/`start`/`cutover`/`volume`/`revert`/`skip-revert`/`rollback`), `unlock`, and settings mutation. `plan` is a write because it stages a change against a database.
+
+Any unclassified `/api` route is treated as write (fail-closed). The `/webhook` and health/metrics endpoints are exempt — webhooks authenticate themselves via HMAC. Two authenticators are available.
+
+### OIDC (Bearer tokens)
+
+The server validates a JWT on each request against the issuer's public keys (JWKS) — it never calls the provider at request time, so it works with any OIDC provider.
+
+```yaml
+auth:
+  type: oidc
+  issuer: "https://issuer.example.com"   # required
+  audience: "schemabot"                   # required — the expected aud claim
+  groups_claim: "groups"                  # optional (default "groups")
+```
+
+A valid token clears the read tier. The write tier additionally requires the token's groups to include an admin team from `pr_command_authorization.admin_teams`. Machine callers pass a token via `--token` / `SCHEMABOT_TOKEN`; a group-less service token (client-credentials grant) gets read access.
+
+### Forward-auth (authenticating proxy)
+
+Use this when SchemaBot runs behind an authenticating reverse proxy that has already verified the caller and forwards the identity as HTTP headers — the pattern used by the Kubernetes API server's authenticating proxy, Grafana's auth proxy, and oauth2-proxy.
+
+```yaml
+auth:
+  type: forward_auth
+  forward_auth:
+    user_header: X-Forwarded-User        # optional (default)
+    groups_header: X-Forwarded-Groups     # optional (default)
+    groups_delimiter: ","                 # optional (default)
+    # Trust anchor — configure at least one (neither is individually required):
+    trusted_proxy_spiffe:                 # proxy SPIFFE IDs, read from the Envoy XFCC header
+      - spiffe://example.org/ns/ingress/sa/proxy
+    trusted_proxy_cidrs:                  # and/or source networks allowed to be the proxy
+      - 127.0.0.1/32
+    read_groups: [readers]                # groups granted read (empty = any authenticated caller)
+    write_groups: [operators]             # groups granted write (empty = no writes)
+```
+
+The authorizer proves the request came from the trusted proxy, then reads the forwarded identity:
+
+- **Trust anchor (required, fail-closed).** With neither `trusted_proxy_cidrs` nor `trusted_proxy_spiffe` set, the server refuses to start. There are three modes: **CIDR only** (trust any request whose source IP is in a trusted network), **SPIFFE only** (trust any request whose XFCC carries a trusted SPIFFE ID), or **both** (require the source CIDR *and* a matching XFCC SPIFFE ID — defense in depth). `X-Forwarded-Client-Cert` (XFCC) is a spoofable HTTP header, so SPIFFE-only is safe only when the proxy sanitizes inbound XFCC and the server is not directly reachable (a service mesh) — the server logs a startup warning in that mode.
+- **Tiers.** Reads are open to any authenticated caller unless `read_groups` is set; writes require membership in `write_groups`. Only the canonical header is read, so a smuggled underscore variant (`X_Forwarded_User`) is ignored.
 
 ## Multi-Environment Deployment
 

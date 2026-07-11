@@ -212,6 +212,8 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	c.transitionTaskState(ctx, task, 0, state.Task.Running, "")
 	c.logger.Info("task running", "task_id", task.TaskIdentifier, "table", task.TableName)
 
+	c.convergeTaskVolumeToStoredLevel(ctx, apply, task, taskCreds, result.ResumeState)
+
 	// Poll to completion. Thread the engine's returned resume state into the
 	// poll: a sharded engine (Strata) identifies the operation to report on from
 	// ResumeState.Metadata and errors without it, so Progress must carry what
@@ -259,6 +261,11 @@ type atomicPollState struct {
 	// consecutiveErrors tracks progress poll failures to fail fast when the
 	// engine is unreachable (e.g., branch deleted mid-apply).
 	consecutiveErrors int
+
+	// warnedPerShardUnavailable is set after the drive warns that a sharded
+	// engine could not report per-shard/row-copy progress, so the warning is
+	// emitted once per apply rather than on every poll.
+	warnedPerShardUnavailable bool
 }
 
 // startApplyHeartbeat starts a background goroutine that heartbeats the apply
@@ -323,10 +330,23 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
 				return taskAbort
 			}
+			// A volume failure never aborts the drive: the copy continues at
+			// its current volume and a still-pending request is retried at the
+			// next tick. A lost lease is the exception — this owner must stop
+			// driving.
+			if err := c.processPendingVolumeControlRequest(ctx, apply, eng, creds, resumeState); err != nil {
+				if errors.Is(err, storage.ErrApplyLeaseLost) {
+					c.logger.Warn("pending volume request processing lost the apply lease; current apply owner will exit for operator retry",
+						"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
+					return taskAbort
+				}
+				c.logger.Warn("pending volume request processing failed; the drive continues and retries at the next progress tick",
+					"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
+			}
 
 			// Re-fetch task state from storage to detect external changes (e.g., Stop).
 			// This also guards against a race where a new apply starts and the engine's
-			// runningMigration no longer corresponds to this task.
+			// runningSchemaChange no longer corresponds to this task.
 			freshTask, fetchErr := c.storage.Tasks().Get(ctx, task.TaskIdentifier)
 			if fetchErr == nil && freshTask != nil && state.IsTerminalTaskState(freshTask.State) {
 				// Task was already marked terminal externally — stop polling
@@ -468,8 +488,8 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 			"apply_id", apply.ApplyIdentifier,
 			"stored_state", freshApply.State)
 		*apply = *freshApply
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-			c.logger.Warn("failed to complete pending stop request for terminal sequential apply",
+		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
+			c.logger.Warn("failed to complete pending control requests for terminal sequential apply",
 				"apply_id", apply.ApplyIdentifier, "error", err)
 		}
 		return
@@ -499,8 +519,8 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
 	}
 	if state.IsTerminalApplyState(apply.State) {
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-			c.logger.Warn("failed to complete pending stop request after sequential finalization",
+		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
+			c.logger.Warn("failed to complete pending control requests after sequential finalization",
 				append(apply.LogAttrs(), "error", err)...)
 			return
 		}

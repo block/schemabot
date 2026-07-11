@@ -96,3 +96,51 @@ func TestOpenNormalizesRDSDSNBeforeOpening(t *testing.T) {
 	require.NoError(t, parseErr)
 	assert.Equal(t, "rds", cfg.TLSConfig)
 }
+
+func TestOpenReloadableUsesHotswapDriver(t *testing.T) {
+	originalOpenSQL := openSQL
+	t.Cleanup(func() { openSQL = originalOpenSQL })
+
+	openErr := errors.New("stop before network connection")
+	var gotDriver string
+	openSQL = func(driverName, _ string) (*sql.DB, error) {
+		gotDriver = driverName
+		return nil, openErr
+	}
+
+	_, err := OpenReloadable("spirit:secret@tcp(127.0.0.1:3306)/app", func() (string, error) {
+		return "", nil
+	})
+
+	require.ErrorIs(t, err, openErr)
+	assert.Equal(t, hotswapDriverName, gotDriver)
+}
+
+func TestReloadConnectionDSN(t *testing.T) {
+	t.Run("re-applies RDS transport to the reloaded DSN", func(t *testing.T) {
+		got := reloadConnectionDSN(func() (string, error) {
+			return "spirit:rotated@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app", nil
+		})
+
+		cfg, err := mysql.ParseDSN(got)
+		require.NoError(t, err)
+		assert.Equal(t, "rotated", cfg.Passwd)
+		assert.Equal(t, "rds", cfg.TLSConfig)
+	})
+
+	t.Run("keeps current DSN when reload fails", func(t *testing.T) {
+		got := reloadConnectionDSN(func() (string, error) {
+			return "", errors.New("secret file unreadable")
+		})
+
+		assert.Empty(t, got)
+	})
+
+	t.Run("keeps current DSN when the reloaded DSN is unparseable", func(t *testing.T) {
+		got := reloadConnectionDSN(func() (string, error) {
+			return "not-a-valid-dsn", nil
+		})
+
+		assert.Empty(t, got)
+	})
+}

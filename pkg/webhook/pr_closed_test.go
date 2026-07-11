@@ -62,11 +62,13 @@ func (s *failingPRApplyLookupStore) GetByPR(_ context.Context, _ string, _ int) 
 
 type prClosedCheckStore struct {
 	storage.CheckStore
-	deleteCalls int
+	deleteCalls  int
+	deleteMerged []bool
 }
 
-func (s *prClosedCheckStore) DeleteByPRExcludingApplyOwned(_ context.Context, _ string, _ int) error {
+func (s *prClosedCheckStore) DeleteByPRRetainingBlockingApplyOwned(_ context.Context, _ string, _ int, merged bool) error {
 	s.deleteCalls++
+	s.deleteMerged = append(s.deleteMerged, merged)
 	return nil
 }
 
@@ -118,7 +120,7 @@ func TestPRClosedRetainsLockAndChecksForInFlightApply(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	h.handlePRClosed("octocat/hello-world", 1, 12345)
+	h.handlePRClosed("octocat/hello-world", 1, 12345, true)
 
 	assert.Empty(t, lockStore.released, "lock for a database with an in-flight apply must not be released on PR close")
 	assert.Equal(t, 0, checkStore.deleteCalls, "stored check state must not be deleted while an apply is in flight")
@@ -142,7 +144,7 @@ func TestPRClosedReleasesOnlyLocksWithoutInFlightApply(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	h.handlePRClosed("octocat/hello-world", 1, 12345)
+	h.handlePRClosed("octocat/hello-world", 1, 12345, true)
 
 	assert.Equal(t, []string{"billing"}, lockStore.released, "only the lock without an in-flight apply is released")
 	assert.Equal(t, 0, checkStore.deleteCalls, "stored check state must not be deleted while any apply is in flight")
@@ -164,15 +166,19 @@ func TestPRClosedCleansUpWhenAllAppliesTerminal(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	h.handlePRClosed("octocat/hello-world", 1, 12345)
+	h.handlePRClosed("octocat/hello-world", 1, 12345, true)
 
 	assert.Equal(t, []string{"orders", "billing"}, lockStore.released, "all locks are released when applies are terminal")
 	assert.Equal(t, 1, checkStore.deleteCalls, "stored check state is deleted when applies are terminal")
+	assert.Equal(t, []bool{true}, checkStore.deleteMerged, "the storage delete must run in merged mode for a merged close")
 }
 
 // TestPRClosedCleansUpWhenPRHasNoApplies verifies that a PR with no recorded
 // applies (e.g., plan-only PRs) gets full cleanup on close: locks released and
-// stored check state deleted.
+// stored check state deleted. An unmerged close must run the storage delete in
+// unmerged mode so apply-owned rows — including success rows whose stored
+// conclusion may predate a commit that removed the applied change — are
+// retained.
 func TestPRClosedCleansUpWhenPRHasNoApplies(t *testing.T) {
 	lockStore := &prClosedLockStore{locks: []*storage.Lock{prClosedLock("orders")}}
 	checkStore := &prClosedCheckStore{}
@@ -183,10 +189,11 @@ func TestPRClosedCleansUpWhenPRHasNoApplies(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	h.handlePRClosed("octocat/hello-world", 1, 12345)
+	h.handlePRClosed("octocat/hello-world", 1, 12345, false)
 
 	assert.Equal(t, []string{"orders"}, lockStore.released, "locks are released when the PR has no applies")
 	assert.Equal(t, 1, checkStore.deleteCalls, "stored check state is deleted when the PR has no applies")
+	assert.Equal(t, []bool{false}, checkStore.deleteMerged, "the storage delete must run in unmerged mode for a close without merge")
 }
 
 // TestPRClosedSkipsCleanupWhenApplyLookupFails verifies that PR-close cleanup
@@ -203,7 +210,7 @@ func TestPRClosedSkipsCleanupWhenApplyLookupFails(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	h.handlePRClosed("octocat/hello-world", 1, 12345)
+	h.handlePRClosed("octocat/hello-world", 1, 12345, true)
 
 	assert.Empty(t, lockStore.released, "no lock is released when apply state is unknown")
 	assert.Equal(t, 0, checkStore.deleteCalls, "no check state is deleted when apply state is unknown")

@@ -18,6 +18,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -79,6 +80,24 @@ type Handler struct {
 	// request that failed with transient remote unavailability. Zero means
 	// the package default.
 	transientPlanRetryDelay time.Duration
+
+	// participantNudgeRefoldDelay overrides the pause before the second
+	// aggregate re-fold after a participant-comment nudge. Zero means the
+	// package default.
+	participantNudgeRefoldDelay time.Duration
+
+	// participantRefoldDelayOverride overrides the backoff before each
+	// self-scheduled aggregate re-fold armed while expected participants
+	// remain unresolved. Test-only: when set it applies to every attempt.
+	// Zero means the package backoff schedule.
+	participantRefoldDelayOverride time.Duration
+
+	// participantRefoldAttempts tracks, per repo#pr, how many self-scheduled
+	// aggregate re-folds have been armed while expected participants remain
+	// unresolved. Bounded by maxParticipantRefoldAttempts and cleared when a
+	// fold resolves every participant. Guarded by participantRefoldMu.
+	participantRefoldMu       sync.Mutex
+	participantRefoldAttempts map[string]int
 
 	// webhookSecretsByApp maps each configured App's logical name to its
 	// HMAC webhook secret. In legacy single-App mode there is exactly one
@@ -337,6 +356,18 @@ func (h *Handler) config() *api.ServerConfig {
 	return h.service.Config()
 }
 
+// deploymentTenant returns this deployment's own tenant, or "" when the
+// deployment is untenanted or the service is not wired. Command hints posted
+// back to the PR carry it so pasted commands address this deployment: in
+// tenant mode, commands without an explicit tenant target are ignored.
+func (h *Handler) deploymentTenant() string {
+	cfg := h.config()
+	if cfg == nil {
+		return ""
+	}
+	return cfg.Tenant
+}
+
 // clientForRepo returns an installation-scoped GitHub client for the App
 // that owns the given repository. Callers that already have a factory in
 // scope should use it directly; this is the convenience for the common
@@ -511,10 +542,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleCheckRun(ctx, w, body)
 		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
 	case "pull_request":
-		h.handlePullRequest(ctx, metricApp, w, body)
+		h.handlePullRequest(ctx, metricApp, w, body, r.Header.Get(headerDeliveryID))
 		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
 	case "merge_group":
 		h.handleMergeGroup(ctx, metricApp, w, body)
+		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
+	case "push":
+		h.handlePush(ctx, metricApp, w, body)
 		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
 	default:
 		h.logger.Info("webhook ignored",
@@ -730,7 +764,7 @@ func verifyHMAC(signature string, body, secret []byte) bool {
 func (h *Handler) recoverPanic(repo string, pr int, installationID int64) {
 	if r := recover(); r != nil {
 		stack := debug.Stack()
-		h.logger.Error("goroutine panic", "error", r, "stack", string(stack))
+		h.logger.Error("goroutine panic", "repo", repo, "pr", pr, "installation_id", installationID, "error", r, "stack", string(stack))
 		h.postComment(repo, pr, installationID,
 			fmt.Sprintf("**Internal error: goroutine panic. This is a bug — please report it.**\n```\n%v\n```", r))
 	}

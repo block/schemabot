@@ -130,6 +130,22 @@ func RecordPlanDuration(ctx context.Context, duration time.Duration, repo, datab
 	)
 }
 
+// RecordDeploymentDiff counts one deployment's review-time desired-vs-live diff
+// outcome. status is "ok" when the diff was computed and reported no planning
+// errors, or "errored" when the PlanDiff RPC failed or the diff itself reported
+// errors — the branch that makes a deployment block the review-time drift rollup
+// closed. Alert on the errored count so an unreachable or un-diffable deployment
+// gating merges is investigable without waiting on the rollup layer.
+func RecordDeploymentDiff(ctx context.Context, database, deployment, environment, status string) {
+	addCounter(ctx, "schemabot.deployment_diff.total",
+		"Total number of review-time per-deployment plan diffs by outcome", "{diff}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("status", status),
+	)
+}
+
 // RecordApply increments the applies counter with database, deployment, environment, and status attributes.
 // Status should be "success", "error", "rejected", or "conflict".
 func RecordApply(ctx context.Context, repo, database, deployment, environment, status string) {
@@ -260,6 +276,35 @@ func RecordTransientPlanRetry(ctx context.Context, database, environment, outcom
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
 		attribute.String("outcome", outcome),
+	)
+}
+
+var knownReviewDriftClassifications = map[string]bool{
+	"match":    true,
+	"diverged": true,
+	"errored":  true,
+}
+
+// RecordReviewDrift increments the counter for a deployment's review-time drift
+// classification against the reviewed primary plan. A spike with
+// classification="diverged" means a deployment's live schema no longer matches
+// what was reviewed — an operator must reconcile that deployment before the PR
+// can apply. classification="errored" means the deployment could not be diffed
+// or compared and is failing the check closed; investigate connectivity to that
+// deployment or the plan input.
+func RecordReviewDrift(ctx context.Context, database, environment, deployment, classification string) {
+	if !knownReviewDriftClassifications[classification] {
+		// An unrecognized classification is a coding gap, not a drift signal.
+		// Coercing it to "errored" would inflate the blocking-failure count, so
+		// bucket it as "unknown" and keep the real failure classes accurate.
+		classification = "unknown"
+	}
+	addCounter(ctx, "schemabot.review_drift.total",
+		"review-time per-deployment drift classifications against the reviewed primary plan", "{deployment}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("deployment", deployment),
+		attribute.String("classification", classification),
 	)
 }
 
@@ -403,6 +448,10 @@ const (
 	CheckTrustGatePassingChecks = "passing_checks"
 	// CheckTrustGatePromotion is the prior-environment promotion gate.
 	CheckTrustGatePromotion = "promotion"
+	// CheckTrustGateLeaderFold is the cross-tenant aggregate-leader fold gate,
+	// where the leader reads a participant deployment's aggregate Check Run and
+	// folds it into the shared aggregate.
+	CheckTrustGateLeaderFold = "leader_fold"
 )
 
 // RecordUntrustedAggregateNamedCheck counts PR checks that carry a SchemaBot
@@ -423,6 +472,51 @@ func RecordUntrustedAggregateNamedCheck(ctx context.Context, repository, environ
 		EnvironmentAttribute(environment),
 		attribute.String("app_slug", appSlug),
 		attribute.String("gate", gate),
+	)
+}
+
+// Outcomes for RecordLeaderParticipantGate. Each names why the
+// aggregate leader resolved a participant's Check Run to the given state when
+// folding it into the shared aggregate.
+const (
+	// LeaderParticipantGateSuccess: the participant's Check Run was trusted,
+	// completed, and successful — it does not block the aggregate.
+	LeaderParticipantGateSuccess = "success"
+	// LeaderParticipantGateFailure: the participant's Check Run completed with a
+	// failing conclusion — the aggregate fails.
+	LeaderParticipantGateFailure = "failure"
+	// LeaderParticipantGatePending: the participant's Check Run completed with
+	// action_required — the participant has pending work (typically an apply
+	// awaiting an operator) and the aggregate blocks as pending.
+	LeaderParticipantGatePending = "pending"
+	// LeaderParticipantGateInProgress: the participant's Check Run is not yet
+	// terminal — the aggregate stays in progress.
+	LeaderParticipantGateInProgress = "in_progress"
+	// LeaderParticipantGateMissing: no trusted participant Check Run exists on the
+	// commit — the aggregate blocks until the participant reports.
+	LeaderParticipantGateMissing = "missing"
+	// LeaderParticipantGateUntrusted: a same-named Check Run exists but only from
+	// untrusted GitHub Apps — the aggregate blocks.
+	LeaderParticipantGateUntrusted = "untrusted"
+	// LeaderParticipantGateError: the GitHub Checks API lookup failed or the
+	// participant's check name could not be resolved — the aggregate blocks.
+	LeaderParticipantGateError = "error"
+)
+
+// RecordLeaderParticipantGate counts, per outcome, how the aggregate leader
+// resolved each expected participant's Check Run when folding it into the shared
+// aggregate. Every outcome other than "success" blocks the aggregate. A spike in
+// "missing", "untrusted", or "error" points an operator at a participant
+// deployment that is not reporting, a trusted-check-app-slugs gap or check-name
+// spoof, or a GitHub API problem, respectively — the matching warn/error logs
+// carry the repo, PR, environment, head SHA, and check name.
+func RecordLeaderParticipantGate(ctx context.Context, repository, environment, tenant, outcome string) {
+	addCounter(ctx, "schemabot.leader_participant_gate_total",
+		"Total participant Check Run resolutions folded into the aggregate leader's check, by outcome", "{gate}",
+		attribute.String("repository", repository),
+		EnvironmentAttribute(environment),
+		attribute.String("tenant", tenant),
+		attribute.String("outcome", outcome),
 	)
 }
 
@@ -1032,15 +1126,23 @@ var knownStatusCheckOperations = map[string]bool{
 	"schema_config_source_policy":          true,
 	"schema_config_environment_validation": true,
 	"managed_dir_missing_config":           true,
+	"aggregate_participant_skip":           true,
+	"aggregate_participant_fanout":         true,
+	"participant_comment_nudge":            true,
+	"participant_refold":                   true,
+	"merge_group_check":                    true,
+	"default_branch_check":                 true,
 }
 
 var knownStatusCheckStatuses = map[string]bool{
-	"success": true,
-	"error":   true,
-	"skipped": true,
-	"stale":   true,
-	"noop":    true,
-	"blocked": true,
+	"success":   true,
+	"error":     true,
+	"skipped":   true,
+	"stale":     true,
+	"noop":      true,
+	"blocked":   true,
+	"scheduled": true,
+	"exhausted": true,
 }
 
 // StatusCheckOperation describes one status-check storage or GitHub operation.

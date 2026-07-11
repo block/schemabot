@@ -18,7 +18,8 @@ type pullRequestPayload struct {
 	Action      string `json:"action"`
 	Before      string `json:"before"`
 	PullRequest struct {
-		Number int `json:"number"`
+		Number int  `json:"number"`
+		Merged bool `json:"merged"`
 		Head   struct {
 			SHA string `json:"sha"`
 			Ref string `json:"ref"`
@@ -37,7 +38,7 @@ type pullRequestPayload struct {
 
 // handlePullRequest processes GitHub pull_request webhook events.
 // On PR open/synchronize/reopen, it auto-plans all databases with schema changes.
-func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte) {
+func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte, deliveryID string) {
 	var payload pullRequestPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid pull_request payload")
@@ -54,7 +55,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		// proceed to auto-plan below
 	case "closed":
 		h.goSafe(payload.Repository.FullName, payload.PullRequest.Number, installationID, func() {
-			h.handlePRClosed(payload.Repository.FullName, payload.PullRequest.Number, installationID)
+			h.handlePRClosed(payload.Repository.FullName, payload.PullRequest.Number, installationID, payload.PullRequest.Merged)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "PR close cleanup started"})
 		return
@@ -94,18 +95,28 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		"repo", repo,
 		"pr", pr,
 		"head_sha", headSHA,
+		"delivery_id", deliveryID,
 	)
 
-	ctx, cancel, client, err := h.autoPlanBootstrap(repo, installationID)
-	if err != nil {
-		h.logger.Error("failed to bootstrap auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
-		h.writeError(w, http.StatusInternalServerError, "failed to initialize GitHub client")
-		return
-	}
-	defer cancel()
-
-	message := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before)
-	h.writeJSON(w, http.StatusOK, map[string]string{"message": message})
+	h.goSafe(repo, pr, installationID, func() {
+		ctx, cancel, client, err := h.autoPlanBootstrap(repo, installationID)
+		if err != nil {
+			metrics.RecordWebhookEvent(context.Background(), metricApp, "pull_request", payload.Action, repo, "auto_plan_bootstrap_failed")
+			h.logger.Error("failed to bootstrap auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
+			return
+		}
+		defer cancel()
+		message := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before, deliveryID)
+		h.logger.Info("auto-plan dispatched",
+			"action", payload.Action,
+			"repo", repo,
+			"pr", pr,
+			"head_sha", headSHA,
+			"delivery_id", deliveryID,
+			"message", message,
+		)
+	})
+	h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan started"})
 }
 
 func (h *Handler) autoPlanBootstrap(repo string, installationID int64) (context.Context, context.CancelFunc, *ghclient.InstallationClient, error) {
@@ -144,12 +155,12 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 	return false
 }
 
-func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string) string {
+func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string, deliveryID string) string {
 	// Fetch the changed files once so the same list drives both config discovery
 	// and the server-managed-directory safety check below.
 	files, err := client.FetchPRFiles(ctx, repo, pr)
 	if err != nil {
-		h.logger.Error("failed to fetch PR files for auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "error", err)
+		h.logger.Error("failed to fetch PR files for auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
 		return "config discovery failed"
 	}
@@ -157,7 +168,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// Discover all configs matching changed schema files in this PR
 	configs, err := client.FindConfigsForPRFiles(ctx, repo, headSHA, files)
 	if err != nil {
-		h.logger.Error("failed to discover configs for PR", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "error", err)
+		h.logger.Error("failed to discover configs for PR", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
 		return "config discovery failed"
 	}
@@ -173,6 +184,12 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 
 	configs = h.filterManagedDiscoveredConfigs(ctx, repo, pr, headSHA, source, configs)
 
+	// Config discovery and the managed-directory guard just re-verified this
+	// commit, and the clear re-checks allowed-environment coverage for every
+	// discovered database. Together those cover every condition that records
+	// an aggregate blocking reason, so a stored block can now be released.
+	h.clearAggregateBlocksForVerifiedPR(ctx, client, repo, pr, headSHA, configs)
+
 	// Collect database names from discovered configs
 	affectedDatabases := make(map[string]bool)
 	for _, cfg := range configs {
@@ -186,7 +203,47 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	})
 
 	if len(configs) == 0 {
-		h.logger.Info("no schema files in PR, skipping auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source)
+		h.logger.Info("no schema files in PR, skipping auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
+		// An aggregate participant does not own the required check for the repo —
+		// the leader does — so on a PR that touches none of this deployment's
+		// schema it has nothing to report and stays silent, rather than posting a
+		// passing check that only adds a per-tenant row near the merge button. The
+		// leader publishes the required check and gates on participants' own
+		// checks when they exist, so a silent participant cannot wedge branch
+		// protection (its check is non-required by the aggregate contract).
+		if h.isAggregateParticipant(repo) {
+			h.logger.Info("aggregate participant staying silent on PR with no managed schema changes",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:  "aggregate_participant_skip",
+				Repository: repo,
+				Status:     "skipped",
+			})
+			return "no schema files in PR (aggregate participant, staying silent)"
+		}
+		// A PR with no leader-managed schema can still touch schema owned by
+		// expected participant deployments. The leader's aggregate is the
+		// required check, so it must gate on those participants' Check Runs —
+		// route through the aggregate fold, which fails closed until every
+		// expected participant reports terminal success, instead of posting an
+		// unconditional passing aggregate. The fold re-runs as participants'
+		// Check Run events arrive, converging to passing once they succeed.
+		if h.leaderExpectsParticipantsForPR(repo, files) {
+			h.logger.Info("no leader-managed schema in PR but expected participant paths are touched; aggregate gate will block until participants report",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
+			h.goSafe(repo, pr, installationID, func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				c, err := h.clientForRepo(repo, installationID)
+				if err != nil {
+					h.logger.Error("failed to create GitHub client for participant-gated aggregate",
+						"repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
+					return
+				}
+				h.updateAggregateCheck(ctx, c, repo, pr, headSHA)
+			})
+			return "no schema files in PR (aggregate folds expected participants)"
+		}
 		// Post passing aggregates on the current HEAD SHA so branch protection
 		// isn't blocked on PRs that don't touch schema files. Always post —
 		// on synchronize events the HEAD SHA changes, so the aggregate must be
@@ -198,7 +255,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 			defer cancel()
 			c, err := h.clientForRepo(repo, installationID)
 			if err != nil {
-				h.logger.Error("failed to create GitHub client for passing aggregate", "error", err)
+				h.logger.Error("failed to create GitHub client for passing aggregate", "repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
 				return
 			}
 			h.postPassingAggregates(ctx, c, repo, pr, headSHA)
@@ -215,7 +272,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	for _, cfg := range configs {
 		database := cfg.Config.Database
 		h.goSafe(repo, pr, installationID, func() {
-			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, postPlanComment)
+			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, postPlanComment, 0)
 		})
 	}
 
@@ -281,11 +338,22 @@ func (h *Handler) aggregateMessagesForAllEnvironments(message string) map[string
 // non-terminal, that apply's database lock is retained so another PR cannot
 // acquire the database mid-apply, and the PR's stored check state is retained
 // so a close-and-reopen cannot convert in-flight apply state into a passing
-// check. If apply state cannot be read, cleanup fails closed and nothing is
-// released or deleted.
-func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
+// check. Apply-owned check state that reached a terminal state without
+// concluding successfully is also retained, so a close-and-reopen cannot
+// bypass a block that requires operator reconciliation. On a close without
+// merge, apply-owned check state that concluded successfully is retained too:
+// the stored success may predate a commit that removed the applied change,
+// and only reopen-time cleanup can re-verify it against the PR contents. If
+// apply state cannot be read, cleanup fails closed and nothing is released
+// or deleted.
+func (h *Handler) handlePRClosed(repo string, pr int, _ int64, merged bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	// A closed PR gets no more scheduled re-folds; drop its budget entry so the
+	// in-memory map does not accumulate one entry per closed PR. A reopen folds
+	// fresh and re-arms with a full budget.
+	h.clearParticipantRefoldBudget(repo, pr)
 
 	applies, err := h.service.Storage().Applies().GetByPR(ctx, repo, pr)
 	if err != nil {
@@ -311,23 +379,35 @@ func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
 		return
 	}
 
-	// Delete stored check state for this PR. Rows owned by an in-flight apply
-	// survive the delete at the storage layer even if the applies table missed
-	// the in-flight work above.
-	if err := h.service.Storage().Checks().DeleteByPRExcludingApplyOwned(ctx, repo, pr); err != nil {
+	// Delete stored check state for this PR. Apply-owned rows that still block
+	// survive the delete at the storage layer: in-flight rows (even if the
+	// applies table missed the in-flight work above) and terminal rows whose
+	// conclusion is not success, such as a schema change removed from the PR
+	// after its apply started. Those blocks require operator reconciliation
+	// and must persist across a close and reopen. On an unmerged close,
+	// apply-owned rows that concluded successfully survive too: the stored
+	// success may predate a commit that removed the applied change, so
+	// reopen-time cleanup must re-verify it before the row can stop blocking.
+	if err := h.service.Storage().Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, repo, pr, merged); err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "pr_close_cleanup",
 			Repository: repo,
 			Status:     "error",
 		})
-		h.logger.Error("failed to delete checks for closed PR", "repo", repo, "pr", pr, "error", err)
+		h.logger.Error("failed to delete checks for closed PR", "repo", repo, "pr", pr, "merged", merged, "error", err)
 	} else {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "pr_close_cleanup",
 			Repository: repo,
 			Status:     "success",
 		})
-		h.logger.Info("deleted checks for closed PR", "repo", repo, "pr", pr)
+		if merged {
+			h.logger.Info("deleted checks for merged PR; apply-owned rows that still block are retained",
+				"repo", repo, "pr", pr)
+		} else {
+			h.logger.Info("deleted plan-only checks for unmerged closed PR; all apply-owned rows are retained",
+				"repo", repo, "pr", pr)
+		}
 	}
 }
 

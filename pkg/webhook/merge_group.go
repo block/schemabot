@@ -80,6 +80,23 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 		return
 	}
 
+	// An aggregate participant's checks are never required — the leader owns
+	// the required aggregate and posts it on the merge-group commit — so a
+	// participant posting here would only re-add the per-tenant rows the
+	// aggregate removes. A silent participant cannot wedge the queue: only
+	// required checks gate a merge-group entry.
+	if h.isAggregateParticipant(repo) {
+		h.logger.Info("aggregate participant staying silent on merge_group; the leader posts the required checks",
+			"repo", repo, "head_sha", headSHA, "installation_id", installationID)
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "merge_group_check",
+			Repository: repo,
+			Status:     "skipped",
+		})
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "merge_group ignored (aggregate participant, staying silent)"})
+		return
+	}
+
 	// When check publishing is disabled for this repo, SchemaBot's check is not
 	// required either, so skipping the merge-group check is correct.
 	if !h.shouldPublishChecks(ctx, repo, "merge_group_check") {
@@ -98,9 +115,16 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 		return
 	}
 
-	if err := h.postMergeGroupChecks(postCtx, client, repo, headSHA); err != nil {
-		// Return 500 so GitHub redelivers. The merge queue blocks until the check
-		// is posted, so a transient failure must be retried, not dropped.
+	if err := h.postPassingAggregateChecks(postCtx, client, repo, headSHA, passingAggregateCheckContent{
+		operation: "merge_group_check",
+		title:     "Schema changes verified before merge queue",
+		summary: "Schema changes in queued pull requests are applied and verified by SchemaBot before " +
+			"they enter the merge queue, so no additional verification is required for this merge group.",
+	}); err != nil {
+		// Return 500 so the delivery is recorded as failed and shows up in the
+		// App's delivery log for redelivery. The merge queue blocks until the
+		// check is posted, so the failure must be visible for retry, not
+		// silently dropped.
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "merge_group_check",
 			Repository: repo,
@@ -115,53 +139,60 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": "merge_group checks posted"})
 }
 
-// postMergeGroupChecks publishes a passing aggregate Check Run on the
-// merge-group head SHA for each environment this instance gates, reusing the
-// same check names as the PR-head aggregates so branch protection's required
-// checks always match.
-func (h *Handler) postMergeGroupChecks(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA string) error {
-	const (
-		title   = "Schema changes verified before merge queue"
-		summary = "Schema changes in queued pull requests are applied and verified by SchemaBot before they enter the merge queue, so no additional verification is required for this merge group."
-	)
+// passingAggregateCheckContent carries the operation name and Check Run output
+// for a passing aggregate published outside the PR-head path (merge-queue
+// heads, default-branch pushes).
+type passingAggregateCheckContent struct {
+	operation string
+	title     string
+	summary   string
+}
 
+// postPassingAggregateChecks publishes a passing aggregate Check Run on
+// headSHA for each environment this instance gates, reusing the same check
+// names as the PR-head aggregates so branch protection's required checks
+// always match.
+func (h *Handler) postPassingAggregateChecks(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA string, content passingAggregateCheckContent) error {
 	for _, target := range h.aggregateCheckTargetsForRepo(repo) {
 		opts := ghclient.CheckRunOptions{
 			Name:       target.name,
 			Status:     checkStatusCompleted,
 			Conclusion: checkConclusionSuccess,
 			Output: &ghclient.CheckRunOutput{
-				Title:   title,
-				Summary: summary,
+				Title:   content.title,
+				Summary: content.summary,
 			},
 		}
-		// Reuse an existing run for this name on the merge-group SHA so a webhook
-		// redelivery updates it rather than creating a duplicate Check Run. The
-		// lookup fails closed when the App slug is unknown; on that error fall
-		// back to creating, which is the safe (if untidy) outcome.
+		// Reuse an existing run for this name on the SHA so a webhook
+		// redelivery updates it rather than creating a duplicate Check Run.
+		// The lookup errors when the App slug is unknown; on any lookup error
+		// fall back to creating a new run — a duplicate Check Run is the safe
+		// outcome, a missing one is not.
 		existing, _, findErr := client.FindCheckRunByName(ctx, repo, headSHA, target.name)
 		if findErr != nil {
-			h.logger.Warn("could not look up existing merge_group check; creating a new one",
-				"repo", repo, "head_sha", headSHA, "check_name", target.name, "error", findErr)
+			h.logger.Warn("could not look up existing check; creating a new one",
+				"repo", repo, "head_sha", headSHA, "check_name", target.name,
+				"operation", content.operation, "error", findErr)
 		}
 		switch {
 		case findErr == nil && existing != nil:
 			if err := client.UpdateCheckRun(ctx, repo, existing.ID, opts); err != nil {
-				return fmt.Errorf("update merge_group check %q on %s: %w", target.name, headSHA, err)
+				return fmt.Errorf("update %s check %q on %s@%s: %w", content.operation, target.name, repo, headSHA, err)
 			}
 		default:
 			if _, err := client.CreateCheckRun(ctx, repo, headSHA, opts); err != nil {
-				return fmt.Errorf("create merge_group check %q on %s: %w", target.name, headSHA, err)
+				return fmt.Errorf("create %s check %q on %s@%s: %w", content.operation, target.name, repo, headSHA, err)
 			}
 		}
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:   "merge_group_check",
+			Operation:   content.operation,
 			Repository:  repo,
 			Environment: target.environment,
 			Status:      "success",
 		})
-		h.logger.Info("merge_group check posted",
-			"repo", repo, "head_sha", headSHA, "check_name", target.name, "environment", target.environment)
+		h.logger.Info("passing aggregate check posted",
+			"repo", repo, "head_sha", headSHA, "check_name", target.name,
+			"environment", target.environment, "operation", content.operation)
 	}
 	return nil
 }

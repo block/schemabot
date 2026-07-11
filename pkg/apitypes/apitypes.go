@@ -45,6 +45,113 @@ type ErrorResponse struct {
 	ErrorCode string `json:"error_code"`
 }
 
+type WebhookRedriveRequest struct {
+	WindowStart string `json:"window_start"`
+	WindowEnd   string `json:"window_end"`
+	App         string `json:"app,omitempty"`
+	Repo        string `json:"repo,omitempty"`
+	PR          int    `json:"pr,omitempty"`
+	MaxPages    int    `json:"max_pages"`
+	DryRun      bool   `json:"dry_run,omitempty"`
+	// Cursor continues a previous request's listing for one App. Each request
+	// processes a bounded number of pages so it finishes well within any
+	// intermediary HTTP timeout; the caller loops until next_cursor is empty.
+	Cursor string `json:"cursor,omitempty"`
+	// DeliveryIDs redelivers exactly these deliveries for App, skipping the
+	// window listing entirely — for callers that already identified the
+	// failed deliveries (for example a checks backfill classification pass).
+	DeliveryIDs []int64 `json:"delivery_ids,omitempty"`
+}
+
+type WebhookRedriveResponse struct {
+	Results []WebhookRedriveResult `json:"results"`
+}
+
+type WebhookRedriveResult struct {
+	AppName            string `json:"app_name"`
+	DryRun             bool   `json:"dry_run"`
+	Fetched            int    `json:"fetched"`
+	Pages              int    `json:"pages"`
+	OldestFetched      string `json:"oldest_fetched,omitempty"`
+	ReachedWindowStart bool   `json:"reached_window_start"`
+	// HistoryExhausted is true when GitHub's retained delivery history ended
+	// before the window start was reached: older deliveries no longer exist.
+	HistoryExhausted bool `json:"history_exhausted,omitempty"`
+	// NextCursor continues the listing in a follow-up request (with app set);
+	// empty when the window is covered or history is exhausted.
+	NextCursor string                    `json:"next_cursor,omitempty"`
+	Selected   []WebhookRedriveSelection `json:"selected"`
+	// Skipped counts in-window eligible deliveries whose detail could not be
+	// resolved for repo/PR filtering; they are left out of Selected rather
+	// than aborting the crawl.
+	Skipped     int `json:"skipped,omitempty"`
+	Redelivered int `json:"redelivered"`
+	Failed      int `json:"failed"`
+}
+
+type WebhookRedriveSelection struct {
+	ID          int64  `json:"id"`
+	DeliveredAt string `json:"delivered_at"`
+	Event       string `json:"event"`
+	Action      string `json:"action"`
+	Status      string `json:"status"`
+	StatusCode  int    `json:"status_code"`
+	Repo        string `json:"repo,omitempty"`
+	PR          int    `json:"pr,omitempty"`
+}
+
+type ChecksScanRequest struct {
+	Repo        string `json:"repo"`
+	Environment string `json:"environment,omitempty"`
+	CheckName   string `json:"check_name,omitempty"`
+	// Page selects one bounded page of open PRs (1-based; 0 means the first
+	// page). Each request scans a single page so it finishes well within any
+	// intermediary HTTP timeout; the caller loops until next_page is 0.
+	Page int `json:"page,omitempty"`
+}
+
+type ChecksScanResponse struct {
+	Repo       string           `json:"repo"`
+	CheckNames []string         `json:"check_names"`
+	Scanned    int              `json:"scanned"`
+	NextPage   int              `json:"next_page,omitempty"`
+	Missing    []MissingCheckPR `json:"missing"`
+}
+
+// ChecksSynthesizeRequest asks the server to recreate missing Check Runs for
+// specific PRs by replaying the auto-plan flow, as if the check-creating
+// webhook delivery had arrived. Used for PRs with no delivery to redrive
+// (for example PRs opened before check enablement).
+type ChecksSynthesizeRequest struct {
+	Repo string `json:"repo"`
+	PRs  []int  `json:"prs"`
+}
+
+type ChecksSynthesizeResponse struct {
+	Repo    string                   `json:"repo"`
+	Results []ChecksSynthesizeResult `json:"results"`
+}
+
+type ChecksSynthesizeResult struct {
+	PR      int    `json:"pr"`
+	Outcome string `json:"outcome"`
+	Error   string `json:"error,omitempty"`
+}
+
+type MissingCheckPR struct {
+	Number       int      `json:"number"`
+	URL          string   `json:"url"`
+	Title        string   `json:"title"`
+	HeadSHA      string   `json:"head_sha"`
+	HeadRef      string   `json:"head_ref"`
+	MissingNames []string `json:"missing_check_names"`
+	// UntrustedConflictNames are missing check names for which a same-named
+	// Check Run already exists but was created by an untrusted app. Backfill
+	// still recreates the trusted check, but the operator likely also needs to
+	// remove/rename the conflicting check or adjust the trusted-app config.
+	UntrustedConflictNames []string `json:"untrusted_conflict_check_names,omitempty"`
+}
+
 // =============================================================================
 // Request Types
 // =============================================================================
@@ -199,14 +306,20 @@ type VolumeRequest struct {
 
 // PlanResponse is the HTTP response for POST /api/plan.
 type PlanResponse struct {
-	PlanID       string                   `json:"plan_id"`
-	Database     string                   `json:"database,omitempty"`
-	DatabaseType string                   `json:"database_type,omitempty"`
-	Environment  string                   `json:"environment,omitempty"`
-	Engine       string                   `json:"engine"`
-	Changes      []*SchemaChangeResponse  `json:"changes"`
-	LintResults  []*LintViolationResponse `json:"lint_violations"`
-	Errors       []string                 `json:"errors"`
+	PlanID       string `json:"plan_id"`
+	Database     string `json:"database,omitempty"`
+	DatabaseType string `json:"database_type,omitempty"`
+	Environment  string `json:"environment,omitempty"`
+	// Deployment is the primary deployment this plan was created against
+	// (rollout index 0 at plan time). The review-time drift rollup carries it
+	// forward so it can verify the plan's baseline still maps to the primary at
+	// rollup time, rather than trusting that current config re-resolves the same
+	// primary.
+	Deployment  string                   `json:"deployment,omitempty"`
+	Engine      string                   `json:"engine"`
+	Changes     []*SchemaChangeResponse  `json:"changes"`
+	LintResults []*LintViolationResponse `json:"lint_violations"`
+	Errors      []string                 `json:"errors"`
 	// Shards carries the per-shard plan for a sharded engine: each changing shard
 	// and the changes it needs. The namespace-level Changes above collapse a
 	// keyspace to one entry, so a keyspace whose shards diverge is represented

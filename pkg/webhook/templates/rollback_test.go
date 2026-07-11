@@ -34,9 +34,39 @@ func TestRenderRollbackPlanComment_WithChanges(t *testing.T) {
 	assert.Contains(t, rendered, "DROP INDEX")
 	assert.Contains(t, rendered, "DROP COLUMN")
 	assert.Contains(t, rendered, "destructive changes")
-	assert.Contains(t, rendered, "schemabot rollback-confirm -e staging")
+	assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging\n```")
 	assert.NotContains(t, rendered, "schemabot rollback-confirm -e staging -d")
-	assert.Contains(t, rendered, "schemabot unlock")
+	assert.NotContains(t, rendered, "--tenant")
+	assert.Contains(t, rendered, "```\nschemabot unlock\n```")
+}
+
+// A rollback plan posted by a tenant deployment must render confirm/cancel
+// hints that carry the deployment's tenant — in tenant mode, a pasted command
+// without an explicit tenant target is ignored.
+func TestRenderRollbackPlanComment_TenantCarriesFlagInHints(t *testing.T) {
+	data := PlanCommentData{
+		Database:    "testapp",
+		Environment: "production",
+		RequestedBy: "testuser",
+		IsMySQL:     true,
+		ApplyID:     "apply_abc123",
+		Tenant:      "acme",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace:   "testapp",
+				Statements: []string{"ALTER TABLE `users` DROP INDEX `idx_email`"},
+			},
+		},
+	}
+
+	rendered := RenderRollbackPlanComment(data)
+	assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e production --tenant acme\n```")
+	assert.Contains(t, rendered, "```\nschemabot unlock --tenant acme\n```")
+	assert.Contains(t, rendered, "**Tenant**: `acme`")
+	assert.NotContains(t, rendered, "```\nschemabot rollback-confirm -e production\n```",
+		"tenant deployments must not hint the unscoped confirm command")
+	assert.NotContains(t, rendered, "```\nschemabot unlock\n```",
+		"tenant deployments must not hint the unscoped unlock command")
 }
 
 func TestRenderRollbackPlanComment_NoChanges(t *testing.T) {
@@ -129,28 +159,48 @@ func TestRenderRollbackNoCompletedApply(t *testing.T) {
 }
 
 func TestRenderRollbackConfirmNoLock(t *testing.T) {
-	rendered := RenderRollbackConfirmNoLock("testapp", "staging")
+	rendered := RenderRollbackConfirmNoLock("testapp", "staging", "")
 	assert.Contains(t, rendered, "## 🔒 No Lock Found")
 	assert.Contains(t, rendered, "`testapp`")
 	assert.Contains(t, rendered, "`staging`")
-	assert.Contains(t, rendered, "schemabot rollback <apply-id> -e staging")
+	assert.Contains(t, rendered, "`schemabot rollback <apply-id> -e staging`")
 }
 
 func TestRenderRollbackConfirmNoLockWithoutDatabase(t *testing.T) {
-	rendered := RenderRollbackConfirmNoLock("", "staging")
+	rendered := RenderRollbackConfirmNoLock("", "staging", "")
 	assert.Contains(t, rendered, "## 🔒 No Lock Found")
 	assert.Contains(t, rendered, "`staging`")
 	assert.Contains(t, rendered, "No rollback lock is held by this PR")
-	assert.Contains(t, rendered, "schemabot rollback <apply-id> -e staging")
+	assert.Contains(t, rendered, "`schemabot rollback <apply-id> -e staging`")
 	assert.NotContains(t, rendered, "**Database**")
 }
 
+// On a tenant deployment, the no-lock hint must suggest a rollback command
+// that carries the deployment's tenant so pasting it addresses this deployment.
+func TestRenderRollbackConfirmNoLockTenant(t *testing.T) {
+	rendered := RenderRollbackConfirmNoLock("testapp", "production", "acme")
+	assert.Contains(t, rendered, "`schemabot rollback <apply-id> -e production --tenant acme`")
+
+	withoutDatabase := RenderRollbackConfirmNoLock("", "production", "acme")
+	assert.Contains(t, withoutDatabase, "`schemabot rollback <apply-id> -e production --tenant acme`")
+}
+
 func TestRenderRollbackMissingApplyID(t *testing.T) {
-	rendered := RenderRollbackMissingApplyID()
+	rendered := RenderRollbackMissingApplyID("")
 	assert.Contains(t, rendered, "## Missing Apply ID")
-	assert.Contains(t, rendered, "schemabot rollback <apply-id> -e <environment>")
-	assert.Contains(t, rendered, "schemabot rollback-confirm -e <environment>")
-	assert.Contains(t, rendered, "schemabot status")
+	assert.Contains(t, rendered, "`schemabot rollback <apply-id> -e <environment>`")
+	assert.Contains(t, rendered, "`schemabot rollback-confirm -e <environment>`")
+	assert.Contains(t, rendered, "`schemabot status`")
+	assert.NotContains(t, rendered, "--tenant")
+}
+
+// On a tenant deployment, the missing-apply-ID usage hints must carry the
+// deployment's tenant so pasting them addresses this deployment.
+func TestRenderRollbackMissingApplyIDTenant(t *testing.T) {
+	rendered := RenderRollbackMissingApplyID("acme")
+	assert.Contains(t, rendered, "`schemabot rollback <apply-id> -e <environment> --tenant acme`")
+	assert.Contains(t, rendered, "`schemabot rollback-confirm -e <environment> --tenant acme`")
+	assert.Contains(t, rendered, "`schemabot status --tenant acme`")
 }
 
 func TestRenderRollbackApplyNotFound(t *testing.T) {
@@ -186,19 +236,25 @@ func TestRenderRollbackRejectedSanitizesReason(t *testing.T) {
 
 func TestRenderRollbackBlockedByLock(t *testing.T) {
 	t.Run("PR-owned lock renders as link", func(t *testing.T) {
-		rendered := RenderRollbackBlockedByLock("testapp", "staging", "block/myapp#42", "block/myapp", 42)
+		rendered := RenderRollbackBlockedByLock("testapp", "staging", "block/myapp#42", "block/myapp", 42, "")
 
 		assert.Contains(t, rendered, "## Rollback Blocked")
 		assert.Contains(t, rendered, "`testapp`")
 		assert.Contains(t, rendered, "`staging`")
 		assert.Contains(t, rendered, "[block/myapp#42](https://github.com/block/myapp/pull/42)")
-		assert.Contains(t, rendered, "schemabot unlock")
+		assert.Contains(t, rendered, "`schemabot unlock`")
+		assert.NotContains(t, rendered, "--tenant")
 		assert.NotContains(t, rendered, "`block/myapp#42`",
 			"PR-link variant should not render the owner as a bare backticked string")
 	})
 
+	t.Run("PR-owned lock on tenant deployment hints tenant-scoped unlock", func(t *testing.T) {
+		rendered := RenderRollbackBlockedByLock("testapp", "production", "block/myapp#42", "block/myapp", 42, "acme")
+		assert.Contains(t, rendered, "`schemabot unlock --tenant acme`")
+	})
+
 	t.Run("non-PR lock renders bare owner", func(t *testing.T) {
-		rendered := RenderRollbackBlockedByLock("testapp", "staging", "cli:alice@laptop", "", 0)
+		rendered := RenderRollbackBlockedByLock("testapp", "staging", "cli:alice@laptop", "", 0, "")
 
 		assert.Contains(t, rendered, "## Rollback Blocked")
 		assert.Contains(t, rendered, "`cli:alice@laptop`")
@@ -210,7 +266,7 @@ func TestRenderRollbackBlockedByLock(t *testing.T) {
 	})
 
 	t.Run("missing repo falls back to bare owner even with PR > 0", func(t *testing.T) {
-		rendered := RenderRollbackBlockedByLock("testapp", "staging", "stale-owner", "", 99)
+		rendered := RenderRollbackBlockedByLock("testapp", "staging", "stale-owner", "", 99, "")
 		assert.Contains(t, rendered, "`stale-owner`")
 		assert.NotContains(t, rendered, "github.com")
 	})
@@ -241,16 +297,25 @@ func TestRenderRollbackAlreadyRolledBack(t *testing.T) {
 }
 
 func TestRenderRollbackAlreadyRolledBackLockHeld(t *testing.T) {
-	rendered := RenderRollbackAlreadyRolledBackLockHeld("testapp", "staging", "block/myapp#42")
+	rendered := RenderRollbackAlreadyRolledBackLockHeld("testapp", "staging", "block/myapp#42", "")
 	assert.Contains(t, rendered, "## Already Rolled Back")
 	assert.Contains(t, rendered, "`testapp`")
 	assert.Contains(t, rendered, "`staging`")
 	assert.Contains(t, rendered, "failed to release the lock held by `block/myapp#42`")
 	assert.Contains(t, rendered, "Applies on this database will be blocked until the lock is released")
-	assert.Contains(t, rendered, "schemabot unlock")
-	assert.Contains(t, rendered, "schemabot unlock -d testapp --force")
+	assert.Contains(t, rendered, "```\nschemabot unlock\n```")
+	assert.Contains(t, rendered, "```\nschemabot unlock -d testapp --force\n```")
+	assert.NotContains(t, rendered, "--tenant")
 	assert.NotContains(t, rendered, "Lock released",
 		"a failed release must not claim the lock was released")
+}
+
+// On a tenant deployment, the stuck-lock release hints must carry the
+// deployment's tenant so pasting them addresses this deployment.
+func TestRenderRollbackAlreadyRolledBackLockHeldTenant(t *testing.T) {
+	rendered := RenderRollbackAlreadyRolledBackLockHeld("testapp", "production", "block/myapp#42", "acme")
+	assert.Contains(t, rendered, "```\nschemabot unlock --tenant acme\n```")
+	assert.Contains(t, rendered, "```\nschemabot unlock -d testapp --force --tenant acme\n```")
 }
 
 func TestRenderRollbackNotAccepted(t *testing.T) {
@@ -263,15 +328,15 @@ func TestRenderRollbackNotAccepted(t *testing.T) {
 
 func TestRollbackTemplates_NoStrayWhitespace(t *testing.T) {
 	for name, body := range map[string]string{
-		"MissingApplyID":            RenderRollbackMissingApplyID(),
+		"MissingApplyID":            RenderRollbackMissingApplyID(""),
 		"ApplyNotFound":             RenderRollbackApplyNotFound("a"),
 		"Rejected":                  RenderRollbackRejected(RollbackRejectedData{ApplyID: "a", Database: "d", Environment: "e", Reason: "r"}),
-		"BlockedByLockPR":           RenderRollbackBlockedByLock("d", "e", "o", "r", 1),
-		"BlockedByLockOwner":        RenderRollbackBlockedByLock("d", "e", "o", "", 0),
+		"BlockedByLockPR":           RenderRollbackBlockedByLock("d", "e", "o", "r", 1, ""),
+		"BlockedByLockOwner":        RenderRollbackBlockedByLock("d", "e", "o", "", 0, ""),
 		"NothingToDo":               RenderRollbackNothingToDo("d", "e", "a"),
 		"LockNotOwned":              RenderRollbackLockNotOwned("d", "e", "o"),
 		"AlreadyRolledBack":         RenderRollbackAlreadyRolledBack("d", "e"),
-		"AlreadyRolledBackLockHeld": RenderRollbackAlreadyRolledBackLockHeld("d", "e", "o"),
+		"AlreadyRolledBackLockHeld": RenderRollbackAlreadyRolledBackLockHeld("d", "e", "o", ""),
 		"NotAccepted":               RenderRollbackNotAccepted("d", "e", "x"),
 	} {
 		assert.False(t, strings.HasPrefix(body, " ") || strings.HasPrefix(body, "\n"),

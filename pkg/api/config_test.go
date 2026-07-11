@@ -33,6 +33,7 @@ func TestServerConfig_OnFailure(t *testing.T) {
 					"unset":    {Target: "payments", Deployment: "payments-a"},
 					"halt":     {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, OnFailure: storage.OnFailureHalt},
 					"continue": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, OnFailure: storage.OnFailureContinue},
+					"pause":    {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, OnFailure: storage.OnFailurePause},
 				},
 			},
 		},
@@ -41,6 +42,7 @@ func TestServerConfig_OnFailure(t *testing.T) {
 	assert.Equal(t, storage.OnFailureHalt, cfg.OnFailure("payments", "unset"), "unset defaults to halting")
 	assert.Equal(t, storage.OnFailureHalt, cfg.OnFailure("payments", "halt"), "explicit halt halts")
 	assert.Equal(t, storage.OnFailureContinue, cfg.OnFailure("payments", "continue"), "explicit continue does not halt")
+	assert.Equal(t, storage.OnFailurePause, cfg.OnFailure("payments", "pause"), "explicit pause resolves to pause")
 	assert.Equal(t, storage.OnFailureHalt, cfg.OnFailure("payments", "missing-env"), "unconfigured env defaults to halting")
 	assert.Equal(t, storage.OnFailureHalt, cfg.OnFailure("missing-db", "continue"), "unconfigured database defaults to halting")
 }
@@ -160,6 +162,33 @@ databases:
 	assert.Equal(t, "endpoints.primary.port", targetDSNFrom.ConfigPaths.Port)
 	assert.Equal(t, "endpoints.primary.database", targetDSNFrom.ConfigPaths.Database)
 	assert.Equal(t, map[string]string{"parseTime": "true"}, targetDSNFrom.Params)
+}
+
+func TestLoadServerConfigFromFile_StaticTargetDSNFrom(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	content := `
+storage:
+  dsn: env:MYSQL_DSN
+target_resolver:
+  targets:
+    example-target:
+      type: mysql
+      dsn_from:
+        config_ref: secretsmanager:/example/schemabot/target-credentials
+        password_ref: secretsmanager:/example/schemabot/target-credentials#password
+        username: schemabot
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644), "write config file")
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+	target := cfg.TargetResolver.Targets["example-target"]
+	assert.Equal(t, "mysql", target.DatabaseType)
+	require.NotNil(t, target.DSNFrom)
+	assert.Equal(t, "schemabot", target.DSNFrom.Username)
+	assert.Equal(t, "secretsmanager:/example/schemabot/target-credentials", target.DSNFrom.ConfigRef)
+	assert.Equal(t, "secretsmanager:/example/schemabot/target-credentials#password", target.DSNFrom.PasswordRef)
 }
 
 func TestLoadServerConfigFromFile_NotFound(t *testing.T) {
@@ -1731,15 +1760,14 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			wantErrSub: `invalid on_failure "warp-speed"`,
 		},
 		{
-			name: "on_failure pause is rejected as not yet supported",
+			name: "on_failure pause with a deployments map is accepted",
 			envConfig: EnvironmentConfig{
 				Deployments: map[string]DeploymentTarget{
 					"payments-a": {Target: "payments"},
 				},
 				OnFailure: storage.OnFailurePause,
 			},
-			tern:       baseTern,
-			wantErrSub: `sets on_failure "pause" which is not yet supported`,
+			tern: baseTern,
 		},
 	}
 
@@ -3274,4 +3302,126 @@ func TestPendingDropsTargetsResolveEachPass(t *testing.T) {
 	require.Len(t, targets, 1)
 	assert.Equal(t, 0, unresolved)
 	assert.Equal(t, pendingdrops.Target{Database: "mydb", Environment: "staging", DSN: dsn}, targets[0])
+}
+
+func TestSchemaDirHintsForRepo(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"widgets": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"apps/widgets/schema", "apps/widgets/legacy/"},
+			},
+			"payments": {
+				AllowedRepos: []string{"octocat/other-repo"},
+				AllowedDirs:  []string{"payments/schema"},
+			},
+			"anyrepo": {
+				AllowedDirs: []string{"shared/schema", "apps/widgets/schema"},
+			},
+			"unbounded": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"*", "", " ", "."},
+			},
+		},
+	}
+
+	hints, exhaustive := cfg.SchemaDirHintsForRepo("octocat/hello-world")
+
+	assert.Equal(t, []string{"apps/widgets/legacy", "apps/widgets/schema", "shared/schema"}, hints)
+	assert.False(t, exhaustive, "the unbounded database accepts configs outside every probe-able directory")
+}
+
+func TestSchemaDirHintsForRepoExhaustiveWhenAllDirsLiteral(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"widgets": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"apps/widgets/schema"},
+			},
+			"payments": {
+				AllowedRepos: []string{"octocat/other-repo"},
+			},
+		},
+	}
+
+	hints, exhaustive := cfg.SchemaDirHintsForRepo("octocat/hello-world")
+
+	assert.Equal(t, []string{"apps/widgets/schema"}, hints)
+	assert.True(t, exhaustive, "every repo-eligible database restricts configs to literal directories")
+}
+
+func TestSchemaDirHintsForRepoNotExhaustiveWhenDatabaseHasNoAllowedDirs(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"widgets": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"apps/widgets/schema"},
+			},
+			"open": {
+				AllowedRepos: []string{"octocat/hello-world"},
+			},
+		},
+	}
+
+	hints, exhaustive := cfg.SchemaDirHintsForRepo("octocat/hello-world")
+
+	assert.Equal(t, []string{"apps/widgets/schema"}, hints)
+	assert.False(t, exhaustive, "a database without allowed_dirs accepts a config anywhere in the repo")
+}
+
+func TestSchemaDirHintsForDatabase(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"widgets": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"apps/widgets/schema", "apps/widgets/legacy/"},
+			},
+			"open": {
+				AllowedRepos: []string{"octocat/hello-world"},
+			},
+			"wild": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"apps/wild/schema", "*"},
+			},
+			"payments": {
+				AllowedRepos: []string{"octocat/other-repo"},
+				AllowedDirs:  []string{"payments/schema"},
+			},
+		},
+	}
+
+	dirs, exhaustive := cfg.SchemaDirHintsForDatabase("octocat/hello-world", "widgets")
+	assert.Equal(t, []string{"apps/widgets/legacy", "apps/widgets/schema"}, dirs)
+	assert.True(t, exhaustive, "every allowed dir is a literal directory")
+
+	dirs, exhaustive = cfg.SchemaDirHintsForDatabase("octocat/hello-world", "open")
+	assert.Empty(t, dirs)
+	assert.False(t, exhaustive, "a database without allowed_dirs accepts a config anywhere")
+
+	dirs, exhaustive = cfg.SchemaDirHintsForDatabase("octocat/hello-world", "wild")
+	assert.Equal(t, []string{"apps/wild/schema"}, dirs)
+	assert.False(t, exhaustive, "a wildcard entry accepts configs outside every probe-able directory")
+
+	dirs, exhaustive = cfg.SchemaDirHintsForDatabase("octocat/hello-world", "payments")
+	assert.Empty(t, dirs)
+	assert.True(t, exhaustive, "a database that does not accept the repo has no policy-valid config location in it")
+
+	dirs, exhaustive = cfg.SchemaDirHintsForDatabase("octocat/hello-world", "unknown")
+	assert.Empty(t, dirs)
+	assert.True(t, exhaustive, "an unconfigured database has no policy-valid config location")
+}
+
+func TestSchemaDirHintsForRepoNoMatches(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				AllowedRepos: []string{"octocat/other-repo"},
+				AllowedDirs:  []string{"payments/schema"},
+			},
+		},
+	}
+
+	hints, exhaustive := cfg.SchemaDirHintsForRepo("octocat/hello-world")
+	assert.Empty(t, hints)
+	assert.True(t, exhaustive, "no repo-eligible database means no policy-valid config location exists")
 }
