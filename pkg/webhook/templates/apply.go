@@ -117,8 +117,10 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	// deploy request's own progress, which the comment does not otherwise surface.
 	writeDeployRequestLink(&sb, data)
 
-	// Cutover readiness summary
-	if data.State == state.Apply.WaitingForCutover || data.State == state.Apply.CuttingOver {
+	// Cutover readiness summary. Only while the apply is parked at the barrier —
+	// readiness answers "can I cut over yet?", a question that no longer exists
+	// once cutover is running, when the per-table rows carry the state.
+	if data.State == state.Apply.WaitingForCutover {
 		writeCutoverSummary(&sb, data.Tables)
 	}
 
@@ -350,7 +352,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		return
 	}
 
-	var completed, running, checksumming, queued, failed, retrying, stopped, waiting, recovering, cutting, cancelled int
+	var completed, running, checksumming, queued, failed, retrying, stopped, readyForCutover, waiting, recovering, cutting, cancelled int
 	var runningPct int
 	var runningEstimateExceeded bool
 
@@ -370,7 +372,14 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		case state.Task.Pending:
 			queued++
 		case state.Task.WaitingForCutover:
-			waiting++
+			// The summary must agree with the per-table rows: a task the
+			// projection marks ready renders as "Ready for cutover", so it
+			// counts as ready here, not as still waiting.
+			if t.ReadyToComplete {
+				readyForCutover++
+			} else {
+				waiting++
+			}
 		case state.Task.Recovering:
 			recovering++
 		case state.Task.CuttingOver:
@@ -415,6 +424,13 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 	}
 	if queued > 0 && multi {
 		parts = append(parts, fmt.Sprintf("%d queued", queued))
+	}
+	if readyForCutover > 0 {
+		if multi {
+			parts = append(parts, fmt.Sprintf("%d ready for cutover", readyForCutover))
+		} else {
+			parts = append(parts, "ready for cutover")
+		}
 	}
 	if waiting > 0 {
 		if multi {

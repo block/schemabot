@@ -2750,7 +2750,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
 **3/3** table(s) ready for cutover
 
-📊 3 waiting for cutover
+📊 3 ready for cutover
 
 **Schema `testapp`**
 
@@ -2795,8 +2795,6 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **Status**: Cutting Over
-
-**0/3** table(s) ready for cutover — waiting on 3
 
 📊 3 cutting over
 
@@ -5596,7 +5594,7 @@ schemabot cutover apply-a1b2c3d4e5f6 -e production
 
 **3/3** table(s) ready for cutover
 
-📊 3 waiting for cutover
+📊 3 ready for cutover
 
 **Schema `testapp`**
 
