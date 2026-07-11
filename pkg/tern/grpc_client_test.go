@@ -519,6 +519,7 @@ type capturingTernServer struct {
 	progressStateSet  bool
 	progressStates    []ternv1.State
 	progressTables    []*ternv1.TableProgress
+	progressVolume    int32
 	progressError     string
 	progressErr       error
 	startErr          error
@@ -615,6 +616,7 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 		psSet = true
 	}
 	tables := s.progressTables
+	volume := s.progressVolume
 	errorMessage := s.progressError
 	err := s.progressErr
 	s.mu.Unlock()
@@ -624,7 +626,7 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 	if !psSet {
 		ps = ternv1.State_STATE_COMPLETED
 	}
-	return &ternv1.ProgressResponse{State: ps, Tables: tables, ErrorMessage: errorMessage}, nil
+	return &ternv1.ProgressResponse{State: ps, Tables: tables, Volume: volume, ErrorMessage: errorMessage}, nil
 }
 
 func (s *capturingTernServer) getStartApplyID() string {
@@ -2999,6 +3001,100 @@ func TestGRPCClient_PollForCompletionReleasesAtCutoverBarrier(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, state.Apply.WaitingForCutover, apply.State)
 	assert.Equal(t, state.Task.WaitingForCutover, task.State)
+}
+
+// A remote apply's volume changes are applied by the data-plane driver against
+// its own apply row, so the control plane only learns the resulting level from
+// progress responses. The copy drive must mirror the reported level onto the
+// control-plane apply options — the PR comment and the control-plane progress
+// API read the level from there — and persist it with the regular progress
+// sync.
+func TestGRPCClient_PollForCompletionMirrorsRemoteVolume(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_RUNNING,
+		progressStateSet: true,
+		progressVolume:   5,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Running,
+			PercentComplete: 40,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              70,
+		ApplyIdentifier: "apply-volume-mirror",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		ExternalID:      "remote-volume-mirror",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             71,
+		TaskIdentifier: "task-volume-mirror",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	applies := &mockApplyStore{apply: &storedApply}
+	client.storage = &mockStorage{
+		applies: applies,
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:    &mockApplyLogStore{},
+	}
+
+	// The drive keeps polling a running remote; the deadline only bounds the
+	// test — the level must be mirrored on the first progress sync.
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Equal(t, 5, apply.GetOptions().Volume)
+	require.NotNil(t, applies.apply)
+	assert.Equal(t, 5, applies.apply.GetOptions().Volume,
+		"the mirrored level must be persisted so the PR comment and progress API can render it")
+}
+
+// mirrorRemoteVolume edge cases: a zero level means the apply never had a
+// volume set and mirrors nothing, an out-of-range level never lands on the
+// stored options, and an unchanged level reports no transition so the drive
+// does not log one every poll.
+func TestMirrorRemoteVolume(t *testing.T) {
+	t.Run("reported level lands on the apply options", func(t *testing.T) {
+		apply := &storage.Apply{ApplyIdentifier: "apply-x"}
+		require.True(t, mirrorRemoteVolume(apply, 5))
+		assert.Equal(t, 5, apply.GetOptions().Volume)
+	})
+
+	t.Run("level change overwrites the stored level", func(t *testing.T) {
+		apply := &storage.Apply{ApplyIdentifier: "apply-x", Options: storage.MarshalApplyOptions(storage.ApplyOptions{Volume: 3})}
+		require.True(t, mirrorRemoteVolume(apply, 5))
+		assert.Equal(t, 5, apply.GetOptions().Volume)
+	})
+
+	t.Run("unchanged level reports no transition", func(t *testing.T) {
+		apply := &storage.Apply{ApplyIdentifier: "apply-x", Options: storage.MarshalApplyOptions(storage.ApplyOptions{Volume: 5})}
+		assert.False(t, mirrorRemoteVolume(apply, 5))
+		assert.Equal(t, 5, apply.GetOptions().Volume)
+	})
+
+	t.Run("zero level mirrors nothing", func(t *testing.T) {
+		apply := &storage.Apply{ApplyIdentifier: "apply-x", Options: storage.MarshalApplyOptions(storage.ApplyOptions{Volume: 3})}
+		assert.False(t, mirrorRemoteVolume(apply, 0))
+		assert.Equal(t, 3, apply.GetOptions().Volume)
+	})
+
+	t.Run("out-of-range level keeps the stored level", func(t *testing.T) {
+		apply := &storage.Apply{ApplyIdentifier: "apply-x", Options: storage.MarshalApplyOptions(storage.ApplyOptions{Volume: 3})}
+		assert.False(t, mirrorRemoteVolume(apply, 12))
+		assert.Equal(t, 3, apply.GetOptions().Volume)
+	})
 }
 
 // The cutover drive (and any non-barrier drive) must NOT release at the barrier:
