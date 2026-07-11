@@ -79,6 +79,10 @@ func (s *recordingWebhookEventStore) MarkFailed(context.Context, int64, string, 
 	return errors.New("MarkFailed not implemented by recordingWebhookEventStore")
 }
 
+func (s *recordingWebhookEventStore) Release(context.Context, int64, string) error {
+	return errors.New("Release not implemented by recordingWebhookEventStore")
+}
+
 func TestDurablePullRequestWebhookQueuesAndAcks(t *testing.T) {
 	events := newRecordingWebhookEventStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -145,6 +149,7 @@ type scriptedWebhookEventStore struct {
 
 	completed chan scriptedWebhookOutcome
 	failed    chan scriptedWebhookFailure
+	released  chan scriptedWebhookOutcome
 }
 
 type scriptedWebhookOutcome struct {
@@ -165,6 +170,7 @@ func newScriptedWebhookEventStore(queue ...*storage.WebhookEvent) *scriptedWebho
 		queue:                      queue,
 		completed:                  make(chan scriptedWebhookOutcome, 8),
 		failed:                     make(chan scriptedWebhookFailure, 8),
+		released:                   make(chan scriptedWebhookOutcome, 8),
 	}
 }
 
@@ -199,6 +205,11 @@ func (s *scriptedWebhookEventStore) MarkCompleted(_ context.Context, id int64, l
 
 func (s *scriptedWebhookEventStore) MarkFailed(_ context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error {
 	s.failed <- scriptedWebhookFailure{id: id, leaseToken: leaseToken, errMsg: errMsg, retryAfter: retryAfter}
+	return nil
+}
+
+func (s *scriptedWebhookEventStore) Release(_ context.Context, id int64, leaseToken string) error {
+	s.released <- scriptedWebhookOutcome{id: id, leaseToken: leaseToken}
 	return nil
 }
 
@@ -375,6 +386,85 @@ func TestDurableWebhookDriverStopsRetryingAtAttemptCap(t *testing.T) {
 		t.Fatal("expected exhausted delivery to be marked failed")
 	}
 	require.Empty(t, store.completed)
+}
+
+func TestDurableWebhookDriverRecoversPanic(t *testing.T) {
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	h := newDurableDriverHandler(t, store, nil, nil)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		panic("poison payload")
+	}
+
+	// Must not crash the process: a panicking delivery stays claimable after
+	// lease expiry, so an unrecovered panic would crash-loop every replica.
+	h.driveNextDurableWebhook(t.Context(), 0)
+
+	select {
+	case failure := <-store.failed:
+		require.NotNil(t, failure.retryAfter, "recovered panic must consume the normal retry budget")
+		require.Contains(t, failure.errMsg, "panic processing durable webhook delivery")
+		require.Contains(t, failure.errMsg, "poison payload")
+	default:
+		t.Fatal("expected recovered panic to be recorded as a delivery failure")
+	}
+	require.Empty(t, store.completed)
+}
+
+func TestDurableWebhookShutdownReleasesClaim(t *testing.T) {
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	h := newDurableDriverHandler(t, store, nil, nil)
+
+	driverCtx, cancelDriver := context.WithCancel(t.Context())
+	defer cancelDriver()
+	h.durableWebhookProcessOverride = func(ctx context.Context, _ *storage.WebhookEvent) (bool, error) {
+		// Simulate shutdown arriving mid-run: the driver context is cancelled
+		// while the delivery is being processed.
+		cancelDriver()
+		<-ctx.Done()
+		return true, fmt.Errorf("auto-plan interrupted: %w", ctx.Err())
+	}
+
+	h.driveNextDurableWebhook(driverCtx, 0)
+
+	select {
+	case released := <-store.released:
+		require.Equal(t, "token-1", released.leaseToken)
+	default:
+		t.Fatal("expected shutdown-cancelled claim to be released")
+	}
+	require.Empty(t, store.failed, "shutdown cancellation must not consume the attempt budget")
+	require.Empty(t, store.completed)
+}
+
+func TestDurableWebhookHeartbeatTransientErrorKeepsRunAlive(t *testing.T) {
+	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
+		Provider:   storage.WebhookProviderGitHub,
+		DeliveryID: "delivery-transient-heartbeat",
+		Event:      "push",
+		Payload:    []byte(`{}`),
+	})
+	store.heartbeatErr = errors.New("transient store blip")
+	h := newDurableDriverHandler(t, store, nil, nil)
+	h.durableWebhookLeaseDuration = 30 * time.Millisecond
+	h.durableWebhookProcessOverride = func(ctx context.Context, _ *storage.WebhookEvent) (bool, error) {
+		// Outlast several failing heartbeats; a transient heartbeat error must
+		// not cancel the run or block completion.
+		select {
+		case <-ctx.Done():
+			return true, fmt.Errorf("run cancelled by transient heartbeat error: %w", ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+			return false, nil
+		}
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0)
+
+	select {
+	case <-store.completed:
+	default:
+		t.Fatal("expected delivery to complete despite transient heartbeat errors")
+	}
+	require.Empty(t, store.failed)
 }
 
 func TestDurableWebhookDispatchLifecycleDrainsQueuedEvent(t *testing.T) {

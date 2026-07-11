@@ -246,6 +246,19 @@ func (s *webhookEventStore) MarkFailed(ctx context.Context, id int64, leaseToken
 	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
 }
 
+func (s *webhookEventStore) Release(ctx context.Context, id int64, leaseToken string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, attempts = GREATEST(attempts - 1, 0), lease_owner = NULL,
+			lease_token = NULL, lease_expires_at = NULL, retry_after = NULL, updated_at = NOW()
+		WHERE id = ? AND lease_token = ?
+	`, storage.WebhookEventPending, id, leaseToken)
+	if err != nil {
+		return fmt.Errorf("release webhook event %d: %w", id, err)
+	}
+	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
+}
+
 func scanWebhookEvent(row *sql.Row) (*storage.WebhookEvent, error) {
 	event, err := scanWebhookEventInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

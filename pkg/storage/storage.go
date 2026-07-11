@@ -234,6 +234,14 @@ type WebhookEventStore interface {
 	// MarkFailed marks a claimed event failed. A non-nil retryAfter keeps it
 	// retryable after that time; nil makes the failure terminal.
 	MarkFailed(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error
+
+	// Release returns a claimed event to pending and refunds the attempt its
+	// claim consumed. Drivers use it when shutdown cancels in-flight
+	// processing: an interrupted claim must not consume retry budget, or
+	// repeated deploy restarts could terminally fail a delivery that never got
+	// a real processing attempt. Returns ErrWebhookEventLeaseLost when the
+	// lease token is stale.
+	Release(ctx context.Context, id int64, leaseToken string) error
 }
 
 // PlanStore manages schema change plans.

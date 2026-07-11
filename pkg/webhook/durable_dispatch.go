@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"time"
 
@@ -20,8 +21,10 @@ const (
 	// maxDurableWebhookAttempts caps how many times a delivery is claimed
 	// before a retryable failure is recorded as terminal. Attempts increment on
 	// claim, so an unclassified permanent error (e.g. a misconfigured GitHub
-	// App) cannot retry forever.
-	maxDurableWebhookAttempts = 5
+	// App) cannot retry forever. It aliases the store's claim ceiling so the
+	// driver terminalizes a delivery on the same attempt at which FindNext
+	// would stop handing it out.
+	maxDurableWebhookAttempts = storage.MaxWebhookEventAttempts
 )
 
 // StartDurableWebhookDispatch starts the durable webhook driver pool. The pool
@@ -162,13 +165,30 @@ func (h *Handler) driveNextDurableWebhook(ctx context.Context, driverID int) {
 	if h.durableWebhookProcessOverride != nil {
 		process = h.durableWebhookProcessOverride
 	}
-	retry, processErr := process(runCtx, event)
+	retry, processErr := h.safeProcessDurableWebhookEvent(runCtx, event, process)
 	heartbeatErr := stopHeartbeat()
 	cancelRun()
 
 	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if processErr != nil {
+		if heartbeatErr == nil && ctx.Err() != nil && errors.Is(processErr, context.Canceled) {
+			// Shutdown (not lease loss) cancelled the run mid-flight. The claim
+			// consumed an attempt when FindNext incremented the counter, but no
+			// real processing happened — refund it, or deploy-churn restarts
+			// that each claim-and-cancel the same delivery would terminally
+			// fail it without a single genuine attempt.
+			if err := store.Release(finishCtx, event.ID, event.LeaseToken); err != nil {
+				h.logger.Warn("durable webhook driver could not release delivery claim on shutdown; lease expiry will hand it to another driver",
+					"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+					"repo", event.Repository, "pr", event.PullRequest, "error", err)
+				return
+			}
+			h.logger.Info("durable webhook driver released delivery claim on shutdown",
+				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+				"repo", event.Repository, "pr", event.PullRequest)
+			return
+		}
 		retryAfter := (*time.Time)(nil)
 		if retry && event.Attempts < maxDurableWebhookAttempts {
 			due := time.Now().Add(durableWebhookRetryDelay)
@@ -180,8 +200,8 @@ func (h *Handler) driveNextDurableWebhook(ctx context.Context, driverID int) {
 				"attempts", event.Attempts, "error", processErr)
 		}
 		if err := store.MarkFailed(finishCtx, event.ID, event.LeaseToken, processErr.Error(), retryAfter); err != nil {
-			if errors.Is(err, storage.ErrWebhookEventLeaseLost) {
-				h.logger.Warn("durable webhook driver lost the delivery lease before recording failure; another driver owns the delivery",
+			if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
+				h.logger.Warn("durable webhook driver lost the delivery lease before recording failure; another driver owns the delivery or the row is gone",
 					"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 					"repo", event.Repository, "pr", event.PullRequest)
 				return
@@ -191,6 +211,11 @@ func (h *Handler) driveNextDurableWebhook(ctx context.Context, driverID int) {
 				"repo", event.Repository, "pr", event.PullRequest, "error", err)
 			return
 		}
+		status := "durable_dispatch_failed"
+		if retryAfter != nil {
+			status = "durable_dispatch_retrying"
+		}
+		metrics.RecordWebhookEvent(finishCtx, h.metricAppForRepo(event.Repository), event.Event, event.Action, event.Repository, status)
 		h.logger.Warn("durable webhook driver recorded delivery failure",
 			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
@@ -210,8 +235,8 @@ func (h *Handler) driveNextDurableWebhook(ctx context.Context, driverID int) {
 		return
 	}
 	if err := store.MarkCompleted(finishCtx, event.ID, event.LeaseToken); err != nil {
-		if errors.Is(err, storage.ErrWebhookEventLeaseLost) {
-			h.logger.Warn("durable webhook driver lost the delivery lease before recording completion; another driver owns the delivery",
+		if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
+			h.logger.Warn("durable webhook driver lost the delivery lease before recording completion; another driver owns the delivery or the row is gone",
 				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 				"repo", event.Repository, "pr", event.PullRequest)
 			return
@@ -221,9 +246,48 @@ func (h *Handler) driveNextDurableWebhook(ctx context.Context, driverID int) {
 			"repo", event.Repository, "pr", event.PullRequest, "error", err)
 		return
 	}
+	metrics.RecordWebhookEvent(finishCtx, h.metricAppForRepo(event.Repository), event.Event, event.Action, event.Repository, "durable_dispatch_completed")
 	h.logger.Info("durable webhook driver completed delivery",
 		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest)
+}
+
+// safeProcessDurableWebhookEvent runs process with panic recovery. The legacy
+// request path ran auto-plan under goSafe/recoverPanic; a driver panic here
+// would kill the whole process, and — because the row stays processing until
+// its lease expires and is then claimable again — every restarted replica
+// would reclaim the same poison delivery and crash-loop the fleet. A recovered
+// panic is reported as a retryable failure, so the normal attempt cap makes a
+// deterministic panic terminal instead.
+func (h *Handler) safeProcessDurableWebhookEvent(ctx context.Context, event *storage.WebhookEvent, process func(context.Context, *storage.WebhookEvent) (bool, error)) (retry bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			h.logger.Error("durable webhook driver recovered from panic while processing delivery",
+				"delivery_id", event.DeliveryID, "event", event.Event, "action", event.Action,
+				"repo", event.Repository, "pr", event.PullRequest,
+				"panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()))
+			retry = true
+			err = fmt.Errorf("panic processing durable webhook delivery %s: %v", event.DeliveryID, r)
+		}
+	}()
+	return process(ctx, event)
+}
+
+// metricAppForRepo resolves the metrics app_name label for repo. Driver work
+// runs outside any HTTP request, so the signed-App identity from webhook
+// verification is gone; derive the owning App from config the same way
+// signature/ownership verification does. Single-App deployments have no
+// per-repo App mapping and always report the default App name.
+func (h *Handler) metricAppForRepo(repo string) string {
+	cfg := h.config()
+	if cfg == nil || len(cfg.Apps) == 0 {
+		return defaultAppName
+	}
+	app, err := cfg.ResolveGitHubAppForRepo(repo)
+	if err != nil {
+		return metricAppName("")
+	}
+	return app.Name
 }
 
 // startDurableWebhookHeartbeat extends the delivery lease on a fixed cadence
@@ -255,12 +319,25 @@ func (h *Handler) startDurableWebhookHeartbeat(ctx context.Context, driverID int
 						// interrupted call is not a lease failure.
 						return
 					}
-					h.logger.Warn("durable webhook heartbeat lost delivery lease; driver will stop",
+					if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
+						// Lease loss and a deleted row are both terminal for
+						// this run: the result has nowhere to land, so stop
+						// instead of finishing work that cannot be recorded.
+						h.logger.Warn("durable webhook heartbeat lost delivery lease or the delivery row is gone; driver will stop",
+							"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+							"repo", event.Repository, "pr", event.PullRequest, "error", err)
+						heartbeatErr = err
+						cancelRun()
+						return
+					}
+					// A transient store error is not lease loss: the lease is
+					// still ours until it expires, so keep working and retry on
+					// the next tick. If the blip outlasts the lease and a peer
+					// claims the row, the next heartbeat returns
+					// ErrWebhookEventLeaseLost and stops the run.
+					h.logger.Warn("durable webhook heartbeat failed; will retry",
 						"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 						"repo", event.Repository, "pr", event.PullRequest, "error", err)
-					heartbeatErr = err
-					cancelRun()
-					return
 				}
 			}
 		}
@@ -305,9 +382,7 @@ func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.
 	// The HTTP handler only enqueues auto-plannable actions, but rows can also
 	// come from replay or future producers; re-validate so a replayed "closed"
 	// action can never trigger an auto-plan.
-	switch payload.Action {
-	case "opened", "synchronize", "reopened":
-	default:
+	if !isAutoPlannablePullRequestAction(payload.Action) {
 		h.logger.Info("durable pull_request delivery ignored because action is not auto-plannable",
 			"delivery_id", event.DeliveryID, "action", payload.Action,
 			"repo", event.Repository, "pr", event.PullRequest)
@@ -332,12 +407,18 @@ func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.
 		h.logger.Warn("durable pull_request delivery from unregistered repository",
 			"delivery_id", event.DeliveryID, "action", payload.Action, "repo", repo, "pr", pr,
 			"installation_id", installationID)
-		metrics.RecordUnregisteredRepositoryWebhook(ctx, "unknown", "pull_request", payload.Action, repo)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "pull_request", payload.Action, repo)
 		return false, nil
 	}
 
+	// Keep the driver's run context: autoPlanBootstrap rebinds ctx to a
+	// timeout-bounded work context, and the post-run cancellation check below
+	// must distinguish "shutdown or lease loss" (runCtx) from "the work outran
+	// its own timeout after already succeeding" (ctx).
+	runCtx := ctx
 	ctx, cancel, client, err := h.autoPlanBootstrap(ctx, repo, installationID)
 	if err != nil {
+		metrics.RecordWebhookEvent(runCtx, h.metricAppForRepo(repo), "pull_request", payload.Action, repo, "auto_plan_bootstrap_failed")
 		return true, fmt.Errorf("bootstrap durable auto-plan delivery %s for %s#%d: %w", event.DeliveryID, repo, pr, err)
 	}
 	defer cancel()
@@ -346,9 +427,11 @@ func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.
 	if planErr != nil {
 		return true, fmt.Errorf("auto-plan for durable delivery %s (%s#%d): %w", event.DeliveryID, repo, pr, planErr)
 	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
+	if ctxErr := runCtx.Err(); ctxErr != nil {
 		// The run was cancelled (shutdown or lease loss) — the dispatch may be
 		// partial, so keep the delivery retryable instead of completing it.
+		// Checking the bootstrap-bounded ctx here would misclassify a slow but
+		// fully successful run as a failure and re-plan it on retry.
 		return true, fmt.Errorf("durable delivery %s run cancelled during auto-plan dispatch: %w", event.DeliveryID, ctxErr)
 	}
 	h.logger.Info("durable pull_request auto-plan dispatched",

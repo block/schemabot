@@ -36,6 +36,19 @@ type pullRequestPayload struct {
 	} `json:"installation"`
 }
 
+// isAutoPlannablePullRequestAction reports whether a pull_request action
+// triggers auto-plan. The HTTP enqueue path and the durable dispatcher must
+// share this predicate: the dispatcher re-validates fail-closed, so an action
+// added to only one side would either never enqueue or — worse — enqueue rows
+// the dispatcher silently completes without planning.
+func isAutoPlannablePullRequestAction(action string) bool {
+	switch action {
+	case "opened", "synchronize", "reopened":
+		return true
+	}
+	return false
+}
+
 // handlePullRequest processes GitHub pull_request webhook events.
 // On PR open/synchronize/reopen, it auto-plans all databases with schema changes.
 func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte, deliveryID string) {
@@ -50,10 +63,10 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 	installationID := h.effectiveInstallationID(ctx, payload.Installation.ID)
 
 	// Route PR actions
-	switch payload.Action {
-	case "opened", "synchronize", "reopened":
+	switch {
+	case isAutoPlannablePullRequestAction(payload.Action):
 		// proceed to auto-plan below
-	case "closed":
+	case payload.Action == "closed":
 		h.goSafe(payload.Repository.FullName, payload.PullRequest.Number, installationID, func() {
 			h.handlePRClosed(payload.Repository.FullName, payload.PullRequest.Number, installationID, payload.PullRequest.Merged)
 		})
@@ -99,6 +112,11 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 	)
 
 	if h.durableWebhookDispatch {
+		// Enqueue failure is a deliberate 500 with no in-process fallback: it
+		// fails loudly (metric below + a red delivery in GitHub's webhook UI)
+		// rather than silently, but GitHub never auto-retries, so the delivery
+		// stays lost until an operator hits "Redeliver" (which re-opens a
+		// terminally failed row) or a new push arrives.
 		inserted, err := h.enqueueDurablePullRequest(ctx, payload, body, deliveryID, installationID)
 		if err != nil {
 			h.logger.Error("failed to enqueue durable pull_request auto-plan",
