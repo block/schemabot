@@ -237,6 +237,16 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
 			return
 		}
+		// An unrecognized unscoped command on an aggregate repo reaches every
+		// installed deployment. A participant cannot know whether a newer
+		// sibling recognizes the verb, so it stays silent and lets the leader
+		// answer — one Invalid Command reply instead of one per deployment.
+		if result.Tenant == "" && h.isAggregateParticipant(repo) {
+			h.logger.Info("unrecognized unscoped command on an aggregate repo; participant stays silent so the leader responds",
+				"repo", repo, "pr", pr)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
+			return
+		}
 		h.postComment(repo, pr, installationID, templates.RenderInvalidCommand())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "invalid command"})
 		return

@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -341,5 +342,92 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 			t.Fatal("a silently skipping deployment must not acknowledge the command")
 		case <-time.After(100 * time.Millisecond):
 		}
+	})
+}
+
+// On an aggregate repo, an unscoped apply-scoped control command (stop, cancel,
+// start, volume, cutover) fans out to every installed deployment, but the apply
+// lives in exactly one deployment's storage. A deployment whose storage has no
+// such apply is not the owner and stays silent so only the owning deployment
+// answers — it must not post "Apply not found" for another deployment's apply.
+// A -t-scoped command and a non-aggregate repo still get the error comment.
+func TestUnscopedControlCommandUnknownApplyStaysSilentOnAggregateRepo(t *testing.T) {
+	stopResult := func(tenant string) CommandResult {
+		return CommandResult{Action: action.Stop, ApplyID: "apply_a1b2c3", Environment: "staging", Tenant: tenant}
+	}
+
+	t.Run("unscoped stop on aggregate repo stays silent", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", stopResult(""))
+
+		assert.Empty(t, comments, "deployment without the apply must not post Apply not found on an unscoped fan-out stop")
+	})
+
+	t.Run("tenant-scoped stop still posts apply not found", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", stopResult("tenant-b"))
+
+		body := requireComment(t, comments, "apply-not-found stop error")
+		assert.Contains(t, body, "Apply not found")
+		assert.Contains(t, body, "apply_a1b2c3")
+	})
+
+	t.Run("non-aggregate repo still posts apply not found", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", stopResult(""))
+
+		body := requireComment(t, comments, "apply-not-found stop error")
+		assert.Contains(t, body, "Apply not found")
+		assert.Contains(t, body, "apply_a1b2c3")
+	})
+}
+
+// An unrecognized unscoped command on an aggregate repo reaches every installed
+// deployment, and a deployment on an older release cannot know whether a newer
+// sibling recognizes the verb. A participant stays silent and lets the leader
+// answer, so the PR gets one Invalid Command reply instead of one per
+// deployment. The leader and a non-aggregate deployment still respond, so a
+// genuine typo always gets an answer.
+func TestUnrecognizedUnscopedCommandParticipantStaysSilent(t *testing.T) {
+	unrecognized := webhookPayloadOpts{comment: "schemabot frobnicate -e staging", isPR: true}
+
+	t.Run("participant stays silent", func(t *testing.T) {
+		cfg := aggregateLeaderConfig()
+		repoCfg := cfg.Repos["octocat/hello-world"]
+		repoCfg.Aggregate = &api.AggregateConfig{Role: api.AggregateRoleParticipant}
+		cfg.Repos["octocat/hello-world"] = repoCfg
+		h, _, comments := newFanOutSkipHandler(t, cfg)
+
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, buildWebhookRequest(t, unrecognized, nil))
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "unscoped command skipped")
+		assert.Empty(t, comments, "a participant must not post Invalid Command for an unscoped unrecognized verb")
+	})
+
+	t.Run("leader still responds", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, buildWebhookRequest(t, unrecognized, nil))
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		body := requireComment(t, comments, "invalid-command reply from the leader")
+		assert.Contains(t, body, "Invalid Command")
+	})
+
+	t.Run("non-aggregate deployment still responds", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, buildWebhookRequest(t, unrecognized, nil))
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		body := requireComment(t, comments, "invalid-command reply from a single-deployment repo")
+		assert.Contains(t, body, "Invalid Command")
 	})
 }
