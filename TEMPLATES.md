@@ -2748,25 +2748,25 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
 **Status**: Waiting for Cutover
 
-**0/3** table(s) ready for cutover — waiting on 3
+**3/3** table(s) ready for cutover
 
 📊 3 waiting for cutover
 
 **Schema `testapp`**
 
-**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✅ Ready for cutover
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✅ Ready for cutover
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✅ Ready for cutover
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -5594,25 +5594,25 @@ schemabot cutover apply-a1b2c3d4e5f6 -e production
 
 **Status**: Waiting for Cutover
 
-**0/3** table(s) ready for cutover — waiting on 3
+**3/3** table(s) ready for cutover
 
 📊 3 waiting for cutover
 
 **Schema `testapp`**
 
-**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✅ Ready for cutover
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✅ Ready for cutover
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✅ Ready for cutover
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);

@@ -1114,6 +1114,7 @@ func PreviewCommentApplyWaitingForCutover() string {
 	tables := sampleApplyTables()
 	for i := range tables {
 		tables[i].Status = state.Task.WaitingForCutover
+		tables[i].ReadyToComplete = true
 	}
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.WaitingForCutover, tables))
 }
@@ -1207,6 +1208,7 @@ func PreviewCommentMultiDeploymentApplyInProgress() string {
 	euTables := sampleApplyTables()
 	for i := range euTables {
 		euTables[i].Status = state.Task.WaitingForCutover
+		euTables[i].ReadyToComplete = true
 	}
 
 	usTables := sampleApplyTables()

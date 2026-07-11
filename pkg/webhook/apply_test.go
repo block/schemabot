@@ -89,6 +89,11 @@ func TestCommentObserverShouldDeferCutoverUsesPersistedApplyOption(t *testing.T)
 	assert.True(t, observer.shouldDeferCutover(apply))
 }
 
+// A defer-cutover apply parks its tasks at the cutover barrier with only the
+// task state to show for it — the driver persists no separate readiness flag.
+// The barrier state alone must mark every parked table ready, so the readiness
+// count agrees with the header and the cutover hint instead of telling the
+// operator the apply is still waiting.
 func TestFormatProgressCommentCutoverState(t *testing.T) {
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-abc123",
@@ -98,8 +103,8 @@ func TestFormatProgressCommentCutoverState(t *testing.T) {
 	}
 
 	tasks := []*storage.Task{
-		{TableName: "users", State: state.Task.WaitingForCutover, ReadyToComplete: true},
-		{TableName: "orders", State: state.Task.WaitingForCutover, ReadyToComplete: true},
+		{TableName: "users", State: state.Task.WaitingForCutover},
+		{TableName: "orders", State: state.Task.WaitingForCutover},
 	}
 
 	body := formatProgressComment(apply, tasks, nil)
@@ -108,6 +113,36 @@ func TestFormatProgressCommentCutoverState(t *testing.T) {
 	assert.Contains(t, body, "testdb")
 	assert.Contains(t, body, "`users`")
 	assert.Contains(t, body, "`orders`")
+	assert.Contains(t, body, "**2/2** table(s) ready for cutover")
+	assert.NotContains(t, body, "waiting on")
+	assert.Contains(t, body, "✅ Ready for cutover")
+	assert.NotContains(t, body, "Waiting for cutover", "a parked table must render as ready, not waiting")
+	assert.Contains(t, body, "📊 2 ready for cutover", "the progress summary must agree with the per-table rows")
+	assert.NotContains(t, body, "waiting for cutover", "no line on the comment may call a parked table waiting")
+}
+
+// While one table is still copying, the readiness summary counts only the
+// tables parked at the barrier so the operator can see what the cutover is
+// still waiting on.
+func TestFormatProgressCommentCutoverReadinessCountsOnlyParkedTables(t *testing.T) {
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-abc123",
+		Database:        "testdb",
+		Environment:     "production",
+		State:           state.Apply.WaitingForCutover,
+	}
+
+	tasks := []*storage.Task{
+		{TableName: "users", State: state.Task.WaitingForCutover},
+		{TableName: "orders", State: state.Task.Running},
+	}
+
+	body := formatProgressComment(apply, tasks, nil)
+
+	assert.Contains(t, body, "**1/2** table(s) ready for cutover — waiting on 1")
+	assert.Contains(t, body, "✅ Ready for cutover")
+	assert.Contains(t, body, "1 ready for cutover", "the progress summary must count the parked table as ready")
+	assert.Contains(t, body, "1 running", "the progress summary must show the table the cutover is waiting on")
 }
 
 func TestFormatSummaryComment(t *testing.T) {
