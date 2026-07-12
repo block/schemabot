@@ -132,7 +132,8 @@ type CheckStore interface {
 	// PR/environment/database. Rows owned by the rollback, by an older apply, or
 	// unowned all qualify: a rollback that never claimed the row must still be
 	// able to block the stale successful check left over from the apply it
-	// reverted. Returns false when a newer apply owns the target.
+	// reverted. Returns false when any apply newer than the rollback exists for
+	// the target, whether or not it has claimed the row.
 	MarkActionRequiredForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// Get returns stored check state by its unique key (PR + env + database), or nil if not found.

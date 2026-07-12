@@ -526,7 +526,14 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 	if !updated {
 		metrics.RecordCheckOwnershipMiss(ctx, operation, repo, apply.Database, apply.DatabaseType, apply.Deployment, apply.Environment)
 		recordOutcome("skipped")
-		h.logger.Warn("skipping check state update because stored state no longer belongs to apply",
+		// The two writes skip for different reasons: the rollback write yields
+		// only to an apply newer than the rollback, while the ordinary completion
+		// requires the row to still be owned by this apply.
+		msg := "skipping check state update because stored state no longer belongs to apply"
+		if isCompletedRollback(apply) {
+			msg = "skipping rollback action_required update because a newer apply supersedes the rollback"
+		}
+		h.logger.Warn(msg,
 			"repo", repo, "pr", pr, "database", apply.Database,
 			"database_type", apply.DatabaseType, "environment", apply.Environment,
 			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
