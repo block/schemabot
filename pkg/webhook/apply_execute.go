@@ -130,41 +130,12 @@ func (h *Handler) executeApply(
 		SupportChannel: h.supportChannel(),
 		Logger:         h.logger,
 		OnTerminalHook: func(apply *storage.Apply) {
-			updated, err := h.updateCheckRecordForApplyResult(context.Background(), repo, pr, apply)
-			if err != nil {
-				h.logger.Error("observer: failed to update check record",
-					append(apply.LogAttrs(), "error", err)...)
-				return
-			}
-			if !updated {
-				h.logger.Debug("observer: skipping aggregate check update, apply no longer owns check state",
-					"repo", repo, "pr", pr, "apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier)
-				return
-			}
-			ghInstClient, err := factory.ForInstallation(installationID)
-			if err != nil {
-				h.logger.Error("observer: failed to create GitHub client",
-					append(apply.LogAttrs(),
-						"installation_id", installationID, "error", err)...)
-				return
-			}
-			checkRecord, err := h.service.Storage().Checks().Get(context.Background(), repo, pr, apply.Environment, apply.DatabaseType, apply.Database)
-			if err != nil {
-				h.logger.Error("observer: failed to load check record for aggregate update",
-					"repo", repo, "pr", pr, "database", apply.Database,
-					"database_type", apply.DatabaseType, "environment", apply.Environment,
-					"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
-					"error", err)
-				return
-			}
-			if checkRecord == nil {
-				h.logger.Warn("observer: check record missing for aggregate update",
-					"repo", repo, "pr", pr, "database", apply.Database,
-					"database_type", apply.DatabaseType, "environment", apply.Environment,
-					"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier)
-				return
-			}
-			h.updateAggregateCheck(context.Background(), ghInstClient, repo, pr, checkRecord.HeadSHA)
+			// refreshChecksForTerminalApply routes a completed rollback straight
+			// to action_required. The observer registered here can be consumed by
+			// a rollback apply (pending observers share a per-target key), so the
+			// terminal ordering must honor the rollback intent from the durable
+			// apply, not from the command that registered the observer.
+			h.refreshChecksForTerminalApply(context.Background(), apply, "apply command")
 		},
 	})
 	h.service.SetPendingObserver(database, "", environment, observer)
