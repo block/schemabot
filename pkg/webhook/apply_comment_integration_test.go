@@ -3,8 +3,10 @@
 package webhook
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -543,7 +545,10 @@ func TestE2EVolumeChangeRotatesProgressComment(t *testing.T) {
 
 	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
+	// svc.Close below owns closing the store's DB; this early-failure safety
+	// close is redundant once svc exists, so discard its guaranteed
+	// already-closed error.
+	t.Cleanup(func() { _ = schemabotDB.Close() })
 
 	st := mysqlstore.New(schemabotDB)
 
@@ -711,6 +716,180 @@ func TestE2EVolumeChangeRotatesProgressComment(t *testing.T) {
 		t.Fatalf("a volume change must rotate exactly once; got another new comment %d", created.ID)
 	case <-time.After(5 * time.Second):
 		t.Fatal("expected an in-place edit of the new progress comment on the next tick")
+	}
+}
+
+// failingCommentUpsertStore wraps an ApplyCommentStore so every Upsert fails,
+// modeling a storage outage between posting a comment and recording its ID.
+type failingCommentUpsertStore struct {
+	storage.ApplyCommentStore
+}
+
+func (s *failingCommentUpsertStore) Upsert(context.Context, *storage.ApplyComment) error {
+	return errors.New("injected comment upsert failure")
+}
+
+// failingCommentUpsertStorage serves the failing comment store while passing
+// every other store through to the real storage.
+type failingCommentUpsertStorage struct {
+	storage.Storage
+}
+
+func (s *failingCommentUpsertStorage) ApplyComments() storage.ApplyCommentStore {
+	return &failingCommentUpsertStore{s.Storage.ApplyComments()}
+}
+
+// A volume-change rotation whose fresh comment posts to the PR but fails to be
+// recorded as the tracked comment must not freeze the prior comment: the
+// tracked row still points at the prior comment, so later progress edits land
+// there, and a frozen "superseded" body would fight those edits. The fresh
+// comment stays a point-in-time snapshot, the prior comment stays live, and no
+// further duplicate comments are posted for the same level.
+func TestE2EVolumeRotationUntrackedFreshCommentLeavesPriorCommentLive(t *testing.T) {
+	ctx := t.Context()
+
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	// svc.Close below owns closing the store's DB; this early-failure safety
+	// close is redundant once svc exists, so discard its guaranteed
+	// already-closed error.
+	t.Cleanup(func() { _ = schemabotDB.Close() })
+
+	st := mysqlstore.New(schemabotDB)
+
+	for _, stmt := range []string{
+		"DELETE FROM apply_comments",
+		"DELETE FROM tasks WHERE repository = 'org/repo-volume-untracked'",
+		"DELETE FROM applies WHERE repository = 'org/repo-volume-untracked'",
+		"DELETE FROM locks WHERE repository = 'org/repo-volume-untracked'",
+	} {
+		_, err = schemabotDB.ExecContext(ctx, stmt)
+		require.NoError(t, err)
+	}
+
+	lock := &storage.Lock{
+		DatabaseName: "e2e_volume_untracked_db",
+		DatabaseType: "mysql",
+		Repository:   "org/repo-volume-untracked",
+		PullRequest:  144,
+		Owner:        "org/repo-volume-untracked#144",
+	}
+	require.NoError(t, st.Locks().Acquire(ctx, lock))
+	lock, err = st.Locks().Get(ctx, "e2e_volume_untracked_db", "mysql")
+	require.NoError(t, err)
+
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply_e2e_volume_untracked_%d", time.Now().UnixNano()),
+		LockID:          lock.ID,
+		PlanID:          1,
+		Database:        "e2e_volume_untracked_db",
+		DatabaseType:    "mysql",
+		Repository:      "org/repo-volume-untracked",
+		PullRequest:     144,
+		Environment:     "staging",
+		InstallationID:  12345,
+		Engine:          "spirit",
+		State:           state.Apply.Running,
+	}
+	apply.SetOptions(storage.ApplyOptions{Volume: 3})
+	applyID, err := st.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+	apply.LeaseOwner = "volume-untracked-test-driver"
+	apply.LeaseToken = "volume-untracked-test-token"
+	leaseAcquiredAt := time.Now()
+	apply.LeaseAcquiredAt = &leaseAcquiredAt
+	_, err = schemabotDB.ExecContext(ctx, `
+		UPDATE applies
+		SET lease_owner = ?, lease_token = ?, lease_acquired_at = ?
+		WHERE id = ?
+	`, apply.LeaseOwner, apply.LeaseToken, leaseAcquiredAt, applyID)
+	require.NoError(t, err)
+
+	now := time.Now()
+	task := &storage.Task{
+		TaskIdentifier:  fmt.Sprintf("task_e2e_volume_untracked_%d", now.UnixNano()),
+		ApplyID:         applyID,
+		PlanID:          1,
+		Database:        "e2e_volume_untracked_db",
+		DatabaseType:    "mysql",
+		Engine:          "spirit",
+		Repository:      "org/repo-volume-untracked",
+		PullRequest:     144,
+		Environment:     "staging",
+		State:           state.Task.Running,
+		TableName:       "users",
+		DDL:             "ALTER TABLE users ADD INDEX idx_email (email)",
+		DDLAction:       "alter",
+		RowsCopied:      500,
+		RowsTotal:       1000,
+		ProgressPercent: 50,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	_, err = st.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+
+	installClient, capture := setupFakeGitHubForComments(t)
+	factory := &fakeClientFactory{client: installClient}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := api.New(st, &api.ServerConfig{}, map[string]tern.Client{}, logger)
+	t.Cleanup(func() { _ = svc.Close() })
+	h := NewHandler(svc, factory, nil, logger)
+
+	// Seed the tracked progress comment at the starting level through the real
+	// store, the way the accepted-apply handler does.
+	startingVolume := 3
+	h.postAndTrackComment(ctx, "org/repo-volume-untracked", 144, 12345, applyID, state.Comment.Progress, "Copying at volume 3", &startingVolume)
+	initialProgressID := requireCommentCreate(t, capture)
+
+	// The observer's comment-tracking writes hit the failing store; reads and
+	// every other store pass through.
+	fake := clock.NewFake(now)
+	obs := NewCommentObserver(CommentObserverConfig{
+		GHClient:       factory,
+		Storage:        &failingCommentUpsertStorage{Storage: st},
+		Repo:           "org/repo-volume-untracked",
+		PR:             144,
+		InstallationID: 12345,
+		ApplyID:        applyID,
+		Logger:         logger,
+		Clock:          fake,
+	})
+
+	// The level change posts the fresh comment, but recording it as the tracked
+	// comment fails — the prior comment must not be frozen.
+	apply.SetOptions(storage.ApplyOptions{Volume: 5})
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	select {
+	case created := <-capture.creates:
+		assert.Contains(t, created.Body, "Volume: 5/11", "the fresh comment renders the new level")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the volume change to post a fresh progress comment")
+	}
+	select {
+	case edited := <-capture.edits:
+		t.Fatalf("no comment may be edited when the fresh comment was not tracked; got an edit of %d: %s", edited.CommentID, edited.Body)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// A later tick does not post a duplicate for the same level, and its
+	// progress edit lands on the prior comment — still the tracked one.
+	task.RowsCopied = 700
+	task.ProgressPercent = 70
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, initialProgressID, edited.CommentID, "progress edits continue on the prior tracked comment")
+		assert.Contains(t, edited.Body, "70%")
+	case created := <-capture.creates:
+		t.Fatalf("an untracked rotation must not repost for the same level; got another new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an in-place edit of the prior tracked comment")
 	}
 }
 
