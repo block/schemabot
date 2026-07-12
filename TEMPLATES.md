@@ -3125,6 +3125,19 @@ To retry:
 schemabot apply -e staging
 ```
 
+<details>
+<summary>Recent logs (5)</summary>
+
+```text
+2026-03-15 14:22:00 UTC [INF] Apply claimed by driver [queued -> running]
+2026-03-15 14:22:15 UTC [INF] Task started: schema change on `users`
+2026-03-15 14:25:00 UTC [WRN] Copy throttled by replication lag (1.2s)
+2026-03-15 14:28:00 UTC [ERR] Task failed: unsafe warning: Field 'name' doesn't have a default value
+2026-03-15 14:29:00 UTC [ERR] Apply failed [running -> failed]
+```
+
+</details>
+
 </details>
 
 <details>
@@ -3377,6 +3390,19 @@ To retry:
 schemabot apply -e staging
 ```
 
+<details>
+<summary>Recent logs (5)</summary>
+
+```text
+2026-03-15 14:22:00 UTC [INF] Apply claimed by driver [queued -> running]
+2026-03-15 14:22:15 UTC [INF] Task started: schema change on `addresses`
+2026-03-15 14:25:00 UTC [WRN] Copy throttled by replication lag (1.2s)
+2026-03-15 14:28:00 UTC [ERR] Task failed: Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'
+2026-03-15 14:29:00 UTC [ERR] Apply failed [running -> failed]
+```
+
+</details>
+
 </details>
 
 <details>
@@ -3433,6 +3459,19 @@ To retry:
 ```
 schemabot apply -e staging
 ```
+
+<details>
+<summary>Recent logs (5)</summary>
+
+```text
+2026-03-15 14:22:00 UTC [INF] Apply claimed by driver [queued -> running]
+2026-03-15 14:22:15 UTC [INF] Task started: schema change on `addresses`
+2026-03-15 14:25:00 UTC [WRN] Copy throttled by replication lag (1.2s)
+2026-03-15 14:28:00 UTC [ERR] Task failed: Error 1205: Lock wait timeout exceeded
+2026-03-15 14:29:00 UTC [ERR] Apply failed [running -> failed]
+```
+
+</details>
 
 </details>
 

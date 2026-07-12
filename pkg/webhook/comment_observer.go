@@ -458,14 +458,28 @@ func (o *CommentObserver) formatTerminalSummaryComment(apply *storage.Apply) str
 // operation rows, applying the same single-deployment fallback as
 // formatTerminalSummaryComment when the load failed. Callers that already hold
 // the operation set (e.g. OnTerminal) use this to avoid re-reading
-// apply_operations.
+// apply_operations. A failed apply's summary carries the collapsed recent-logs
+// section, appended after whichever layout rendered, so triage data lands on
+// the PR without an extra operator step.
 func (o *CommentObserver) summaryCommentFromOps(apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
+	var body string
 	if opsErr != nil {
 		o.logger.Error("observer: failed to load apply operations for summary comment dispatch; rendering single-deployment layout",
 			"apply_id", o.applyID, "error", opsErr)
-		return formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
+		body = formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
+	} else {
+		body = formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant)
 	}
-	return formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant)
+	return body + o.recentFailureLogsSection(apply)
+}
+
+// recentFailureLogsSection loads and renders the failed apply's recent-logs
+// section with a short, independent deadline so a slow storage read degrades
+// to a summary without logs rather than blocking the terminal comment.
+func (o *CommentObserver) recentFailureLogsSection(apply *storage.Apply) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return failureLogsSection(ctx, o.stor, o.logger, apply)
 }
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {

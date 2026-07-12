@@ -1507,7 +1507,8 @@ func PreviewCommentSummaryCompletedVitessVSchemaOnly() string {
 	return RenderApplySummaryComment(data)
 }
 
-// PreviewCommentSummaryFailed renders a sample failed summary comment.
+// PreviewCommentSummaryFailed renders a sample failed summary comment,
+// including the collapsed recent-logs section every failed summary carries.
 func PreviewCommentSummaryFailed() string {
 	tables := sampleApplyTables()
 	tables[0].Status = state.Task.Completed
@@ -1519,7 +1520,8 @@ func PreviewCommentSummaryFailed() string {
 	tables[2].Status = state.Task.Cancelled
 	data := sampleSummaryData(state.Apply.Failed, tables)
 	data.ErrorMessage = "table users failed: schema change failed: unsafe warning: Field 'name' doesn't have a default value"
-	return RenderApplySummaryComment(data)
+	return RenderApplySummaryComment(data) +
+		RenderRecentFailureLogs(sampleFailureLogEntries("users", "unsafe warning: Field 'name' doesn't have a default value"))
 }
 
 // PreviewCommentSummaryStopped renders a sample stopped summary comment.
@@ -1574,7 +1576,8 @@ func PreviewCommentSummaryFailedLarge() string {
 	}
 	data := sampleSummaryDataWithDuration(state.Apply.Failed, tables, 3*time.Hour+30*time.Minute)
 	data.ErrorMessage = "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"
-	return RenderApplySummaryComment(data)
+	return RenderApplySummaryComment(data) +
+		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"))
 }
 
 // PreviewCommentSummaryMultiNamespaceFailed renders a failed summary with tables from multiple namespaces.
@@ -1588,7 +1591,8 @@ func PreviewCommentSummaryMultiNamespaceFailed() string {
 	}
 	data := sampleSummaryData(state.Apply.Failed, tables)
 	data.ErrorMessage = "table customers.addresses failed: Error 1205: Lock wait timeout exceeded"
-	return RenderApplySummaryComment(data)
+	return RenderApplySummaryComment(data) +
+		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1205: Lock wait timeout exceeded"))
 }
 
 // PreviewCommentSummaryMultiNamespaceCompleted renders a completed summary with tables from multiple namespaces.
