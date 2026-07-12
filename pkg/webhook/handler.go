@@ -279,17 +279,6 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 			"context", logCtx,
 		}
 	}
-	// A completed rollback reverted the PR's schema change, so its required check
-	// must land action_required, not success — otherwise the PR could merge with
-	// the change missing. The rollback command registers an observer that does
-	// this, but an operator-driven (multi-operation) or recovery terminal
-	// suppresses that per-driver observer and routes here instead, so the
-	// rollback intent must be honored from the durable apply.
-	if a.IsRollback() && state.IsState(a.State, state.Apply.Completed) {
-		h.logger.Info("refreshing check to action_required for completed rollback", checkFields()...)
-		h.setCheckActionRequired(a.Repository, a.PullRequest, a.InstallationID, a)
-		return
-	}
 	updated, err := h.updateCheckRecordForApplyResult(ctx, a.Repository, a.PullRequest, a)
 	if err != nil {
 		h.logger.Error("observer: failed to update check record for terminal apply",

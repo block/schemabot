@@ -3,7 +3,6 @@ package webhook
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -336,30 +335,6 @@ func (h *Handler) reconcileStaleChecks(ctx context.Context, client *ghclient.Ins
 			"apply_state", apply.State, "check_apply_id", check.ApplyID,
 			"check_head_sha", check.HeadSHA)
 
-		// A completed rollback must reconcile to action_required, not success: its
-		// success is a reverted PR change that must not merge as-is. Route it to the
-		// rollback finalizer instead of the ordinary apply-result update, which
-		// would mark the check successful.
-		if apply.IsRollback() && state.IsState(apply.State, state.Apply.Completed) {
-			// setCheckActionRequired emits its own rollback_finished
-			// success/skipped/error metric; only count the reconciliation as a
-			// success here when the stored check was actually updated, so an
-			// ownership-miss skip does not inflate the stale-reconcile success
-			// count or trigger a spurious aggregate refresh.
-			if h.setCheckActionRequired(repo, pr, apply.InstallationID, apply) {
-				metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-					Operation:    "stale_check_reconciliation",
-					Repository:   repo,
-					Database:     check.DatabaseName,
-					DatabaseType: check.DatabaseType,
-					Environment:  check.Environment,
-					Status:       "success",
-				})
-				reconciled = true
-			}
-			continue
-		}
-
 		updated, err := h.updateCheckRecordForApplyResult(ctx, repo, pr, apply)
 		if err != nil {
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -409,32 +384,47 @@ func (h *Handler) reconcileStaleChecks(ctx context.Context, client *ghclient.Ins
 	return nil
 }
 
+// isCompletedRollback reports whether the apply is a rollback that reached
+// Completed. A completed rollback reverted the PR's schema change from the
+// target environment, so its stored check must land action_required rather
+// than success — the PR must not merge with the change missing.
+func isCompletedRollback(a *storage.Apply) bool {
+	return a.IsRollback() && state.IsState(a.State, state.Apply.Completed)
+}
+
 // updateCheckRecordForApplyResult updates stored check state after an apply
-// reaches a terminal state. The aggregate check is updated separately to reflect
+// reaches a terminal state. A completed rollback lands action_required; other
+// terminal states map to success or failure. The rollback routing lives here —
+// not in callers — because every terminal path (observer, operator-driven
+// drive, recovery, stale reconciliation) must honor the rollback intent from
+// the durable apply row. The aggregate check is updated separately to reflect
 // the new status on the PR.
 func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo string, pr int, apply *storage.Apply) (bool, error) {
-	check, err := h.service.Storage().Checks().Get(ctx, repo, pr, apply.Environment, apply.DatabaseType, apply.Database)
-	if err != nil {
+	// Metrics keep rollback finalization distinct from ordinary apply completion
+	// so operators can alert on the two outcomes separately.
+	operation := "apply_finished"
+	if isCompletedRollback(apply) {
+		operation = "rollback_finished"
+	}
+	recordOutcome := func(status string) {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:    "apply_finished",
+			Operation:    operation,
 			Repository:   repo,
 			Database:     apply.Database,
 			DatabaseType: apply.DatabaseType,
 			Environment:  apply.Environment,
-			Status:       "error",
+			Status:       status,
 		})
+	}
+
+	check, err := h.service.Storage().Checks().Get(ctx, repo, pr, apply.Environment, apply.DatabaseType, apply.Database)
+	if err != nil {
+		recordOutcome("error")
 		return false, fmt.Errorf("look up check for apply result repo %s pr %d environment %s database_type %s database %s: %w",
 			repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
 	}
 	if check == nil {
-		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:    "apply_finished",
-			Repository:   repo,
-			Database:     apply.Database,
-			DatabaseType: apply.DatabaseType,
-			Environment:  apply.Environment,
-			Status:       "error",
-		})
+		recordOutcome("error")
 		return false, fmt.Errorf("no stored check state found to update after apply repo %s pr %d environment %s database_type %s database %s",
 			repo, pr, apply.Environment, apply.DatabaseType, apply.Database)
 	}
@@ -446,14 +436,7 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 	// apply's success can never update it. Leave the check in_progress so the PR
 	// stays blocked while paused and a later resume can complete it.
 	if state.IsState(apply.State, state.Apply.Stopped) {
-		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:    "apply_finished",
-			Repository:   repo,
-			Database:     apply.Database,
-			DatabaseType: apply.DatabaseType,
-			Environment:  apply.Environment,
-			Status:       "noop",
-		})
+		recordOutcome("noop")
 		h.logger.Info("apply stopped; leaving check in_progress so a resume can complete it",
 			"repo", repo, "pr", pr, "database", apply.Database,
 			"database_type", apply.DatabaseType, "environment", apply.Environment,
@@ -462,48 +445,53 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 		return false, nil
 	}
 
-	var conclusion string
-	switch {
-	case state.IsState(apply.State, state.Apply.Completed) && checkBlockedByRemovedSchemaAfterApply(check):
-		conclusion = checkConclusionActionRequired
-	case state.IsState(apply.State, state.Apply.Completed):
-		conclusion = checkConclusionSuccess
-	case state.IsState(apply.State, state.Apply.Failed):
-		conclusion = checkConclusionFailure
-	default:
-		conclusion = checkConclusionFailure
+	var updated bool
+	if isCompletedRollback(apply) {
+		check.Status = checkStatusCompleted
+		check.Conclusion = checkConclusionActionRequired
+		check.HasChanges = true
+		check.BlockingReason = rollbackCompletedBlock.blockingReason
+		check.ErrorMessage = rollbackCompletedBlock.message
+		// MarkActionRequiredForApply releases check ownership (unlike
+		// CompleteForApply, which retains it) so a re-apply of the reverted
+		// change can claim the row.
+		updated, err = h.service.Storage().Checks().MarkActionRequiredForApply(ctx, check, apply)
+		if err != nil {
+			recordOutcome("error")
+			return false, fmt.Errorf("mark stored check state action_required after rollback repo %s pr %d environment %s database_type %s database %s: %w",
+				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
+		}
+	} else {
+		var conclusion string
+		switch {
+		case state.IsState(apply.State, state.Apply.Completed) && checkBlockedByRemovedSchemaAfterApply(check):
+			conclusion = checkConclusionActionRequired
+		case state.IsState(apply.State, state.Apply.Completed):
+			conclusion = checkConclusionSuccess
+		case state.IsState(apply.State, state.Apply.Failed):
+			conclusion = checkConclusionFailure
+		default:
+			conclusion = checkConclusionFailure
+		}
+
+		check.Status = checkStatusCompleted
+		check.Conclusion = conclusion
+		check.HasChanges = conclusion != checkConclusionSuccess
+		if conclusion == checkConclusionSuccess {
+			check.BlockingReason = ""
+			check.ErrorMessage = ""
+		}
+		updated, err = h.service.Storage().Checks().CompleteForApply(ctx, check, apply)
+		if err != nil {
+			recordOutcome("error")
+			return false, fmt.Errorf("update stored check state after apply repo %s pr %d environment %s database_type %s database %s: %w",
+				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
+		}
 	}
 
-	check.Status = checkStatusCompleted
-	check.Conclusion = conclusion
-	check.HasChanges = conclusion != checkConclusionSuccess
-	if conclusion == checkConclusionSuccess {
-		check.BlockingReason = ""
-		check.ErrorMessage = ""
-	}
-	updated, err := h.service.Storage().Checks().CompleteForApply(ctx, check, apply)
-	if err != nil {
-		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:    "apply_finished",
-			Repository:   repo,
-			Database:     apply.Database,
-			DatabaseType: apply.DatabaseType,
-			Environment:  apply.Environment,
-			Status:       "error",
-		})
-		return false, fmt.Errorf("update stored check state after apply repo %s pr %d environment %s database_type %s database %s: %w",
-			repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
-	}
 	if !updated {
-		metrics.RecordCheckOwnershipMiss(ctx, "apply_finished", repo, apply.Database, apply.DatabaseType, apply.Deployment, apply.Environment)
-		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:    "apply_finished",
-			Repository:   repo,
-			Database:     apply.Database,
-			DatabaseType: apply.DatabaseType,
-			Environment:  apply.Environment,
-			Status:       "skipped",
-		})
+		metrics.RecordCheckOwnershipMiss(ctx, operation, repo, apply.Database, apply.DatabaseType, apply.Deployment, apply.Environment)
+		recordOutcome("skipped")
 		h.logger.Warn("skipping check state update because stored state no longer belongs to apply",
 			"repo", repo, "pr", pr, "database", apply.Database,
 			"database_type", apply.DatabaseType, "environment", apply.Environment,
@@ -517,127 +505,8 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 		"repo", repo, "pr", pr, "database", apply.Database,
 		"database_type", apply.DatabaseType, "environment", apply.Environment,
 		"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
-		"apply_state", apply.State, "conclusion", conclusion,
+		"apply_state", apply.State, "conclusion", check.Conclusion,
 		"blocking_reason", check.BlockingReason)
-	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-		Operation:    "apply_finished",
-		Repository:   repo,
-		Database:     apply.Database,
-		DatabaseType: apply.DatabaseType,
-		Environment:  apply.Environment,
-		Status:       "success",
-	})
+	recordOutcome("success")
 	return true, nil
-}
-
-// setCheckActionRequired sets the rollback apply's check back to action_required.
-// Used after a rollback completes because the PR's schema changes need to be re-applied.
-// It reports whether the stored check was actually updated; callers that count
-// their own reconciliation outcome should not record success on a skip (this
-// function already emits its own skipped/ownership-miss metric). It emits its own
-// rollback_finished success/skipped/error metrics regardless.
-func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int64, apply *storage.Apply) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	check, err := h.service.Storage().Checks().Get(ctx, repo, pr, apply.Environment, apply.DatabaseType, apply.Database)
-	if err != nil {
-		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:    "rollback_finished",
-			Repository:   repo,
-			Database:     apply.Database,
-			DatabaseType: apply.DatabaseType,
-			Environment:  apply.Environment,
-			Status:       "error",
-		})
-		h.logger.Error("failed to look up stored check state after rollback",
-			"repo", repo, "pr", pr, "database", apply.Database,
-			"database_type", apply.DatabaseType, "environment", apply.Environment,
-			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
-			"error", err)
-		return false
-	}
-	if check == nil {
-		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:    "rollback_finished",
-			Repository:   repo,
-			Database:     apply.Database,
-			DatabaseType: apply.DatabaseType,
-			Environment:  apply.Environment,
-			Status:       "error",
-		})
-		h.logger.Warn("no stored check state to update after rollback",
-			"repo", repo, "pr", pr, "database", apply.Database,
-			"database_type", apply.DatabaseType, "environment", apply.Environment,
-			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier)
-		return false
-	}
-
-	check.Status = checkStatusCompleted
-	check.Conclusion = checkConclusionActionRequired
-	check.HasChanges = true
-	check.BlockingReason = rollbackCompletedBlock.blockingReason
-	check.ErrorMessage = rollbackCompletedBlock.message
-	updated, err := h.service.Storage().Checks().MarkActionRequiredForApply(ctx, check, apply)
-	if err != nil {
-		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:    "rollback_finished",
-			Repository:   repo,
-			Database:     apply.Database,
-			DatabaseType: apply.DatabaseType,
-			Environment:  apply.Environment,
-			Status:       "error",
-		})
-		h.logger.Error("failed to set check to action_required after rollback",
-			"repo", repo, "pr", pr, "database", apply.Database,
-			"database_type", apply.DatabaseType, "environment", apply.Environment,
-			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
-			"check_apply_id", check.ApplyID, "check_status", check.Status,
-			"check_head_sha", check.HeadSHA, "error", err)
-		return false
-	}
-	if !updated {
-		metrics.RecordCheckOwnershipMiss(ctx, "rollback_finished", repo, apply.Database, apply.DatabaseType, apply.Deployment, apply.Environment)
-		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:    "rollback_finished",
-			Repository:   repo,
-			Database:     apply.Database,
-			DatabaseType: apply.DatabaseType,
-			Environment:  apply.Environment,
-			Status:       "skipped",
-		})
-		h.logger.Warn("skipping rollback action_required update because check no longer belongs to apply",
-			"repo", repo, "pr", pr, "database", apply.Database,
-			"database_type", apply.DatabaseType, "environment", apply.Environment,
-			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
-			"apply_state", apply.State, "check_apply_id", check.ApplyID,
-			"check_status", check.Status, "check_head_sha", check.HeadSHA)
-		return false
-	}
-
-	h.logger.Info("check set to action_required after rollback",
-		"repo", repo, "pr", pr, "database", apply.Database,
-		"database_type", apply.DatabaseType, "environment", apply.Environment,
-		"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
-		"apply_state", apply.State)
-	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-		Operation:    "rollback_finished",
-		Repository:   repo,
-		Database:     apply.Database,
-		DatabaseType: apply.DatabaseType,
-		Environment:  apply.Environment,
-		Status:       "success",
-	})
-
-	// Update the aggregate check to reflect the rollback
-	if aggClient, err := h.clientForRepo(repo, installationID); err == nil {
-		h.updateAggregateCheck(ctx, aggClient, repo, pr, check.HeadSHA)
-	} else {
-		h.logger.Error("failed to create GitHub client for rollback aggregate update",
-			"repo", repo, "pr", pr, "database", apply.Database,
-			"database_type", apply.DatabaseType, "environment", apply.Environment,
-			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
-			"error", err)
-	}
-	return true
 }
