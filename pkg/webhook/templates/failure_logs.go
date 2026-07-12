@@ -58,11 +58,25 @@ func formatLogEntryLine(entry LogEntryData) string {
 	line := fmt.Sprintf("%s %s %s",
 		entry.CreatedAt.UTC().Format("2006-01-02 15:04:05 UTC"),
 		logLevelTag(entry.Level),
-		entry.Message)
+		sanitizeLogText(entry.Message))
 	if entry.OldState != "" && entry.NewState != "" {
-		line += fmt.Sprintf(" [%s -> %s]", entry.OldState, entry.NewState)
+		line += fmt.Sprintf(" [%s -> %s]", sanitizeLogText(entry.OldState), sanitizeLogText(entry.NewState))
 	}
 	return line
+}
+
+// sanitizeLogText makes untrusted log text safe inside the section's fenced
+// code block. Engine log messages pass through verbatim, so they can carry
+// newlines (which would break the one-line-per-entry format and the size
+// accounting) or a ``` sequence (which would close the fence and let the rest
+// of the text render as comment markup). Newlines collapse to spaces; backtick
+// runs are split with a space until no fence marker remains.
+func sanitizeLogText(text string) string {
+	text = strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(text)
+	for strings.Contains(text, "```") {
+		text = strings.ReplaceAll(text, "```", "`` `")
+	}
+	return text
 }
 
 // logLevelTag returns the CLI's bracketed level indicator without colors.

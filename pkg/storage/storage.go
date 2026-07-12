@@ -623,6 +623,12 @@ type ApplyLogStore interface {
 	// GetByApply returns all logs for an apply, ordered by created_at.
 	GetByApply(ctx context.Context, applyID int64) ([]*ApplyLog, error)
 
+	// GetRecentByApply returns the newest limit logs for an apply, ordered by
+	// created_at ascending so the result reads chronologically. The query is
+	// bounded — long-running applies can accumulate far more log rows than a
+	// caller rendering a tail needs.
+	GetRecentByApply(ctx context.Context, applyID int64, limit int) ([]*ApplyLog, error)
+
 	// List returns logs matching the filter criteria, ordered by created_at.
 	List(ctx context.Context, filter ApplyLogFilter) ([]*ApplyLog, error)
 }

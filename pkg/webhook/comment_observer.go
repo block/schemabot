@@ -470,16 +470,7 @@ func (o *CommentObserver) summaryCommentFromOps(apply *storage.Apply, ops []*sto
 	} else {
 		body = formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant)
 	}
-	return body + o.recentFailureLogsSection(apply)
-}
-
-// recentFailureLogsSection loads and renders the failed apply's recent-logs
-// section with a short, independent deadline so a slow storage read degrades
-// to a summary without logs rather than blocking the terminal comment.
-func (o *CommentObserver) recentFailureLogsSection(apply *storage.Apply) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	return failureLogsSection(ctx, o.stor, o.logger, apply)
+	return body + failureLogsSection(context.Background(), o.stor, o.logger, apply)
 }
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {

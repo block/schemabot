@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
@@ -104,6 +105,30 @@ func (s *applyLogStore) GetByApply(ctx context.Context, applyID int64) ([]*stora
 	defer utils.CloseAndLog(rows)
 
 	return scanApplyLogs(rows)
+}
+
+// GetRecentByApply returns the newest limit logs for an apply, ordered by
+// created_at ascending. Ties on created_at (second precision) are broken by
+// id so entries keep their insertion order.
+func (s *applyLogStore) GetRecentByApply(ctx context.Context, applyID int64, limit int) ([]*storage.ApplyLog, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+applyLogColumns+`
+		FROM apply_logs
+		WHERE apply_id = ?
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?
+	`, applyID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer utils.CloseAndLog(rows)
+
+	logs, err := scanApplyLogs(rows)
+	if err != nil {
+		return nil, err
+	}
+	slices.Reverse(logs)
+	return logs, nil
 }
 
 // List returns logs matching the filter criteria, ordered by created_at.

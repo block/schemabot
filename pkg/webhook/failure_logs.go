@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"time"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -13,25 +14,30 @@ import (
 // failure is what an operator triaging from the PR needs.
 const failureSummaryLogLimit = 50
 
+// failureLogsLoadTimeout bounds the log load so a slow storage read degrades
+// to a summary without logs rather than delaying the terminal comment.
+const failureLogsLoadTimeout = 2 * time.Second
+
 // failureLogsSection renders the collapsed recent-logs section for a terminal
 // summary comment. Only a failed apply carries logs — a completed, stopped, or
 // cancelled apply's summary stays clean, so this returns "" for those states.
-// Best-effort: a log-load failure is logged and returns "" so the summary
-// comment still posts; the full logs remain available from the CLI.
+// The load runs under its own short deadline, detached from the caller's
+// cancellation, so the section is decided by storage health alone. Best-effort:
+// a log-load failure is logged and returns "" so the summary comment still
+// posts; the full logs remain available from the CLI.
 func failureLogsSection(ctx context.Context, stor storage.Storage, logger interface {
 	Error(msg string, args ...any)
 }, apply *storage.Apply) string {
 	if !state.IsState(apply.State, state.Apply.Failed) {
 		return ""
 	}
-	logs, err := stor.ApplyLogs().GetByApply(ctx, apply.ID)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failureLogsLoadTimeout)
+	defer cancel()
+	logs, err := stor.ApplyLogs().GetRecentByApply(ctx, apply.ID, failureSummaryLogLimit)
 	if err != nil {
 		logger.Error("failed to load apply logs for failure summary; posting summary without recent logs",
 			append(apply.LogAttrs(), "error", err)...)
 		return ""
-	}
-	if len(logs) > failureSummaryLogLimit {
-		logs = logs[len(logs)-failureSummaryLogLimit:]
 	}
 	entries := make([]templates.LogEntryData, len(logs))
 	for i, entry := range logs {

@@ -36,6 +36,24 @@ func TestRenderRecentFailureLogsEmpty(t *testing.T) {
 	assert.Empty(t, RenderRecentFailureLogs(nil))
 }
 
+// TestRenderRecentFailureLogsSanitizesUntrustedText verifies engine-supplied
+// log text cannot break out of the fenced code block: newlines collapse to
+// spaces so every entry stays on one line, and backtick fences are split so
+// the rest of the comment cannot be reinterpreted as markup.
+func TestRenderRecentFailureLogsSanitizesUntrustedText(t *testing.T) {
+	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
+	rendered := RenderRecentFailureLogs([]LogEntryData{
+		{CreatedAt: at, Level: "error", Message: "line one\r\nline two\nline three"},
+		{CreatedAt: at.Add(time.Second), Level: "error", Message: "fence breakout ```\n# not a heading"},
+		{CreatedAt: at.Add(2 * time.Second), Level: "error", Message: "long run `````x"},
+	})
+
+	assert.Contains(t, rendered, "[ERR] line one line two line three")
+	assert.Contains(t, rendered, "[ERR] fence breakout `` ` # not a heading")
+	assert.Equal(t, 2, strings.Count(rendered, "```"), "only the section's own fence markers survive")
+	assert.Equal(t, strings.Index(rendered, "```text"), strings.Index(rendered, "```"), "first fence marker is the section's opener")
+}
+
 // TestRenderRecentFailureLogsTrimsToSizeBudget verifies that when the rendered
 // log block would blow GitHub's comment size limit, the earliest lines are
 // dropped, the newest are kept, and the fold says how many were omitted.
