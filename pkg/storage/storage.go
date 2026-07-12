@@ -128,9 +128,11 @@ type CheckStore interface {
 	CompleteForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// MarkActionRequiredForApply marks stored check state action_required after
-	// a rollback only if it still belongs to that rollback apply and no newer
-	// apply exists for the same PR/environment/database. Returns false when
-	// another driver changed the stored state first.
+	// a rollback only if no apply newer than the rollback exists for the same
+	// PR/environment/database. Rows owned by the rollback, by an older apply, or
+	// unowned all qualify: a rollback that never claimed the row must still be
+	// able to block the stale successful check left over from the apply it
+	// reverted. Returns false when a newer apply owns the target.
 	MarkActionRequiredForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// Get returns stored check state by its unique key (PR + env + database), or nil if not found.

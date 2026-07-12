@@ -264,6 +264,32 @@ func isApplyNewer(candidate, existing *storage.Apply) bool {
 	return candidate.ID > existing.ID
 }
 
+// checkNeedsTerminalReconcile reports whether stored check state is stale
+// relative to the newest apply for its target and must be repaired from that
+// apply's terminal outcome. Two stale shapes exist:
+//
+//   - an in_progress row whose newest apply is already terminal: the driver
+//     died between finishing the apply and updating stored check state;
+//   - an apply-owned successful row whose newest apply is a completed
+//     rollback: the rollback never claimed the row (its claim failed or the
+//     driver crashed before the claim landed), so the row's success predates
+//     the revert and would let the PR merge with the change missing.
+//
+// Successful rows without apply ownership are left alone: releasing ownership
+// is how a deliberate stale-cleanup unblock records its decision, and
+// re-blocking such a row here would fight the operator.
+func checkNeedsTerminalReconcile(check *storage.Check, apply *storage.Apply) bool {
+	if !state.IsTerminalApplyState(apply.State) {
+		return false
+	}
+	if check.Status == checkStatusInProgress {
+		return true
+	}
+	return check.ApplyID != 0 &&
+		check.Conclusion == checkConclusionSuccess &&
+		isCompletedRollback(apply)
+}
+
 // reconcileStaleChecks repairs stored check state from authoritative apply
 // state. The visible GitHub Check Run is the PR merge gate, but the apply row is
 // the source of truth for whether a schema change is still running. If a driver
@@ -295,9 +321,6 @@ func (h *Handler) reconcileStaleChecks(ctx context.Context, client *ghclient.Ins
 
 	reconciled := false
 	for _, check := range checks {
-		if check.Status != checkStatusInProgress {
-			continue
-		}
 		if isAggregateCheck(check) {
 			continue
 		}
@@ -309,30 +332,41 @@ func (h *Handler) reconcileStaleChecks(ctx context.Context, client *ghclient.Ins
 		}
 		apply := latestApplies[key]
 		if apply == nil {
-			h.logger.Debug("skipping in_progress check without matching apply",
-				"repo", repo, "pr", pr,
-				"database", check.DatabaseName, "database_type", check.DatabaseType,
-				"environment", check.Environment, "check_apply_id", check.ApplyID,
-				"check_head_sha", check.HeadSHA)
+			// A row with no apply for its target is normal for plan-only checks;
+			// only an in_progress row with no apply is worth a trace.
+			if check.Status == checkStatusInProgress {
+				h.logger.Debug("skipping in_progress check without matching apply",
+					"repo", repo, "pr", pr,
+					"database", check.DatabaseName, "database_type", check.DatabaseType,
+					"environment", check.Environment, "check_apply_id", check.ApplyID,
+					"check_head_sha", check.HeadSHA)
+			}
 			continue
 		}
-		if !state.IsTerminalApplyState(apply.State) {
-			h.logger.Debug("skipping in_progress check because latest apply is not terminal",
-				"repo", repo, "pr", pr,
-				"database", check.DatabaseName, "database_type", check.DatabaseType,
-				"environment", check.Environment,
-				"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
-				"apply_state", apply.State, "check_apply_id", check.ApplyID,
-				"check_head_sha", check.HeadSHA)
+		if !checkNeedsTerminalReconcile(check, apply) {
+			// The common case: the stored row already reflects the newest apply's
+			// outcome (or that apply is still running and will write its own
+			// terminal update). An in_progress row that stays behind is the one
+			// worth a trace.
+			if check.Status == checkStatusInProgress {
+				h.logger.Debug("skipping in_progress check because latest apply is not terminal",
+					"repo", repo, "pr", pr,
+					"database", check.DatabaseName, "database_type", check.DatabaseType,
+					"environment", check.Environment,
+					"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
+					"apply_state", apply.State, "check_apply_id", check.ApplyID,
+					"check_head_sha", check.HeadSHA)
+			}
 			continue
 		}
 
-		h.logger.Info("reconciling stale in_progress check",
+		h.logger.Info("reconciling stale check from the latest apply's terminal outcome",
 			"repo", repo, "pr", pr,
 			"database", check.DatabaseName, "database_type", check.DatabaseType,
 			"environment", check.Environment,
 			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
 			"apply_state", apply.State, "check_apply_id", check.ApplyID,
+			"check_status", check.Status, "check_conclusion", check.Conclusion,
 			"check_head_sha", check.HeadSHA)
 
 		updated, err := h.updateCheckRecordForApplyResult(ctx, repo, pr, apply)

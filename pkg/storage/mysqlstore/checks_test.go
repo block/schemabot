@@ -1555,6 +1555,86 @@ func TestCheckStore_MarkActionRequiredForApply(t *testing.T) {
 	require.Equal(t, int64(0), retrieved.ApplyID)
 }
 
+// A rollback that never claimed the stored check row (its claim failed or the
+// driver crashed before it landed) must still be able to block the stale
+// successful row left over from the apply it reverted; only a newer apply
+// protects the row from the rollback's terminal write.
+func TestCheckStore_MarkActionRequiredForApplyConvergesPriorApplyOwnedCheck(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	priorApply := createCheckStoreApply(t, store, "apply-succeeded", state.Apply.Completed)
+	rollbackApply := createCheckStoreApply(t, store, "rollback-unclaimed", state.Apply.Completed)
+	require.Greater(t, rollbackApply.ID, priorApply.ID)
+
+	check := &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		ApplyID:      priorApply.ID,
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.HasChanges = true
+	check.Conclusion = "action_required"
+	updated, err := store.Checks().MarkActionRequiredForApply(ctx, check, rollbackApply)
+	require.NoError(t, err)
+	require.True(t, updated)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "completed", retrieved.Status)
+	assert.Equal(t, "action_required", retrieved.Conclusion)
+	assert.True(t, retrieved.HasChanges)
+	assert.Equal(t, int64(0), retrieved.ApplyID, "the rollback's terminal write releases check ownership")
+}
+
+// An unowned successful row (for example after a deliberate stale-cleanup
+// unblock) still yields to a completed rollback's terminal write when the
+// rollback is the newest apply for the target.
+func TestCheckStore_MarkActionRequiredForApplyConvergesUnownedCheck(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	rollbackApply := createCheckStoreApply(t, store, "rollback-unclaimed", state.Apply.Completed)
+
+	check := &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.HasChanges = true
+	check.Conclusion = "action_required"
+	updated, err := store.Checks().MarkActionRequiredForApply(ctx, check, rollbackApply)
+	require.NoError(t, err)
+	require.True(t, updated)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "completed", retrieved.Status)
+	assert.Equal(t, "action_required", retrieved.Conclusion)
+	assert.True(t, retrieved.HasChanges)
+	assert.Equal(t, int64(0), retrieved.ApplyID)
+}
+
 func TestCheckStore_MarkActionRequiredForApplyLeaseGuard(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
