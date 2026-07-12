@@ -378,9 +378,12 @@ type checkWrite struct {
 	conclusion string
 }
 
-// recordingCheckStore records every stored check state write that lands for
-// one database's check row. Recording starts when StartRecording is called so
-// a test can scope the observation window to the flow under test.
+// recordingCheckStore records every conclusion-writing stored check state
+// operation that lands for one database's check row. Operations that clear or
+// delete check state without writing a status/conclusion pass through
+// unrecorded; tests assert on the final stored row to cover those. Recording
+// starts when StartRecording is called so a test can scope the observation
+// window to the flow under test.
 type recordingCheckStore struct {
 	storage.CheckStore
 	databaseName string
@@ -433,7 +436,7 @@ func (s *recordingCheckStore) UpsertPlanResult(ctx context.Context, check *stora
 func (s *recordingCheckStore) RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, check *storage.Check) (bool, error) {
 	updated, err := s.CheckStore.RecoverApplyOwnedCheckWithNoOpPlan(ctx, check)
 	if err == nil && updated {
-		s.record("recover_apply_owned_check", check.DatabaseName, checkStatusCompleted, checkConclusionSuccess)
+		s.record("recover_apply_owned_check", check.DatabaseName, check.Status, check.Conclusion)
 	}
 	return updated, err
 }
@@ -441,7 +444,7 @@ func (s *recordingCheckStore) RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Con
 func (s *recordingCheckStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check) (bool, error) {
 	updated, err := s.CheckStore.MarkStalePlanSuccessful(ctx, check)
 	if err == nil && updated {
-		s.record("mark_stale_plan_successful", check.DatabaseName, checkStatusCompleted, checkConclusionSuccess)
+		s.record("mark_stale_plan_successful", check.DatabaseName, check.Status, check.Conclusion)
 	}
 	return updated, err
 }
@@ -615,9 +618,19 @@ func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
 				"every completed stored check state write during rollback finalization must be action_required (op %s)", w.op)
 		}
 	}
-	terminal := writes[len(writes)-1]
+	// The recorder logs each write after its commit, on the writer's own
+	// goroutine, so recorded order across goroutines is not commit order — the
+	// claim upsert can be recorded after the terminal write it preceded. Assert
+	// on the last completed-status write, which only the terminal path produces.
+	terminalIdx := -1
+	for i, w := range writes {
+		if w.status == checkStatusCompleted {
+			terminalIdx = i
+		}
+	}
+	require.GreaterOrEqual(t, terminalIdx, 0, "recorder should observe the rollback's terminal stored check state write")
+	terminal := writes[terminalIdx]
 	assert.Equal(t, "mark_action_required_for_apply", terminal.op)
-	assert.Equal(t, checkStatusCompleted, terminal.status)
 	assert.Equal(t, checkConclusionActionRequired, terminal.conclusion)
 
 	deadline := time.After(webhookIntegrationPollDeadline)
