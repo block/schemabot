@@ -1099,6 +1099,13 @@ type ApplyComment struct {
 	// GitHubCommentID is the GitHub comment ID for editing.
 	GitHubCommentID int64
 
+	// PostedVolume records the apply's volume level at the moment a progress
+	// comment was posted. The observer compares it against the apply's current
+	// level to detect an applied volume change and rotate in a fresh progress
+	// comment. Nil for comment states where the level is not meaningful and
+	// for rows that predate volume tracking — nil never triggers a rotation.
+	PostedVolume *int
+
 	// EditCount tracks how many times this comment was edited.
 	EditCount int
 

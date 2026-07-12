@@ -555,6 +555,16 @@ func (ic *InstallationClient) CreateIssueComment(ctx context.Context, repo strin
 	return comment.GetID(), nil
 }
 
+// GetIssueComment returns the current body of an existing PR/issue comment.
+func (ic *InstallationClient) GetIssueComment(ctx context.Context, repo string, commentID int64) (string, error) {
+	owner, repoName := splitRepo(repo)
+	comment, _, err := ic.client.Issues.GetComment(ctx, owner, repoName, commentID)
+	if err != nil {
+		return "", fmt.Errorf("get issue comment %d: %w", commentID, err)
+	}
+	return comment.GetBody(), nil
+}
+
 // EditIssueComment edits an existing PR/issue comment.
 func (ic *InstallationClient) EditIssueComment(ctx context.Context, repo string, commentID int64, body string) error {
 	owner, repoName := splitRepo(repo)

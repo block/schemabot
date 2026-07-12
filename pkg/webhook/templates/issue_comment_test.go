@@ -176,6 +176,8 @@ func TestRenderVolumeCommandAccepted(t *testing.T) {
 	assert.Contains(t, rendered, "`staging`")
 	assert.Contains(t, rendered, "@alice")
 	assert.Contains(t, rendered, "Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly")
+	assert.Contains(t, rendered, "a fresh progress comment will track the schema change at the new volume",
+		"the acknowledgement points the operator at the new comment that appears once the level takes effect")
 }
 
 // TestRenderVolumeInvalidLevel verifies the rejection posted for a missing,

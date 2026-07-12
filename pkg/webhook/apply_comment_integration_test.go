@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -31,11 +32,28 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
-// commentCapture records all GitHub comment API calls (creates and edits).
+// commentCapture records all GitHub comment API calls (creates and edits) and
+// remembers the latest body per comment ID so GET reads return what was written.
 type commentCapture struct {
 	creates chan commentCreate
 	edits   chan commentEdit
 	nextID  atomic.Int64
+
+	mu     sync.Mutex
+	bodies map[int64]string
+}
+
+func (c *commentCapture) setBody(commentID int64, body string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.bodies[commentID] = body
+}
+
+func (c *commentCapture) body(commentID int64) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	body, ok := c.bodies[commentID]
+	return body, ok
 }
 
 type commentCreate struct {
@@ -56,6 +74,7 @@ func setupFakeGitHubForComments(t *testing.T) (*ghclient.InstallationClient, *co
 	capture := &commentCapture{
 		creates: make(chan commentCreate, 20),
 		edits:   make(chan commentEdit, 20),
+		bodies:  make(map[int64]string),
 	}
 	capture.nextID.Store(1000)
 
@@ -70,9 +89,27 @@ func setupFakeGitHubForComments(t *testing.T) (*ghclient.InstallationClient, *co
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		id := capture.nextID.Add(1) - 1
+		capture.setBody(id, body.Body)
 		capture.creates <- commentCreate{Body: body.Body, ID: id}
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
+	})
+
+	// Read comment — the observer loads a superseded comment's body before
+	// freezing it into a collapsed details block.
+	mux.HandleFunc("GET /repos/", func(w http.ResponseWriter, r *http.Request) {
+		var commentID int64
+		parts := splitPath(r.URL.Path)
+		if len(parts) >= 6 {
+			_, _ = fmt.Sscanf(parts[5], "%d", &commentID)
+		}
+		body, ok := capture.body(commentID)
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": commentID, "body": body})
 	})
 
 	// Edit comment — match any repo/comment ID via prefix
@@ -89,6 +126,7 @@ func setupFakeGitHubForComments(t *testing.T) (*ghclient.InstallationClient, *co
 			Body string `json:"body"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		capture.setBody(commentID, body.Body)
 		capture.edits <- commentEdit{CommentID: commentID, Body: body.Body}
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": commentID})
@@ -207,7 +245,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	h := NewHandler(svc, factory, nil, logger)
 
 	// Step 1: Post initial progress comment
-	h.postAndTrackComment(ctx, "org/repo", 42, 12345, applyID, state.Comment.Progress, "Initial progress")
+	h.postAndTrackComment(ctx, "org/repo", 42, 12345, applyID, state.Comment.Progress, "Initial progress", nil)
 
 	// Verify create was captured
 	var progressCommentID int64
@@ -257,7 +295,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	assert.Equal(t, progressCommentID, active.GitHubCommentID)
 
 	// Step 4: Post cutover comment (simulating defer_cutover)
-	h.postAndTrackComment(ctx, "org/repo", 42, 12345, applyID, state.Comment.Cutover, "Cutover ready")
+	h.postAndTrackComment(ctx, "org/repo", 42, 12345, applyID, state.Comment.Cutover, "Cutover ready", nil)
 
 	var cutoverCommentID int64
 	select {
@@ -287,7 +325,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	}
 
 	// Step 7: Post summary comment (terminal state)
-	h.postAndTrackComment(ctx, "org/repo", 42, 12345, applyID, state.Comment.Summary, "Schema change completed")
+	h.postAndTrackComment(ctx, "org/repo", 42, 12345, applyID, state.Comment.Summary, "Schema change completed", nil)
 
 	var summaryCommentID int64
 	select {
@@ -412,9 +450,9 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 
 	// Seed the pre-resume comments left by the stop: the progress comment frozen at
 	// "Stopped" and the stopped summary marker that signals a resume is in progress.
-	h.postAndTrackComment(ctx, "org/repo-rotate", 142, 12345, applyID, state.Comment.Progress, "Stopped at 21%")
+	h.postAndTrackComment(ctx, "org/repo-rotate", 142, 12345, applyID, state.Comment.Progress, "Stopped at 21%", nil)
 	stoppedProgressID := requireCommentCreate(t, capture)
-	h.postAndTrackComment(ctx, "org/repo-rotate", 142, 12345, applyID, state.Comment.Summary, "Schema Change Stopped")
+	h.postAndTrackComment(ctx, "org/repo-rotate", 142, 12345, applyID, state.Comment.Summary, "Schema Change Stopped", nil)
 	requireCommentCreate(t, capture)
 
 	fake := clock.NewFake(now)
@@ -490,6 +528,189 @@ func requireCommentCreate(t *testing.T, capture *commentCapture) int64 {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for comment create")
 		return 0
+	}
+}
+
+// When an operator's volume change takes effect on a running apply, the
+// observer posts a fresh progress comment tracking the new level — a new
+// comment at the bottom of the PR timeline is where the operator looks for the
+// effect of the command they just issued. The prior progress comment is frozen
+// into a collapsed details block pointing at its successor, later progress
+// edits land on the new comment, and a tick without a level change does not
+// rotate again.
+func TestE2EVolumeChangeRotatesProgressComment(t *testing.T) {
+	ctx := t.Context()
+
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
+
+	st := mysqlstore.New(schemabotDB)
+
+	for _, stmt := range []string{
+		"DELETE FROM apply_comments",
+		"DELETE FROM tasks WHERE repository = 'org/repo-volume'",
+		"DELETE FROM applies WHERE repository = 'org/repo-volume'",
+		"DELETE FROM locks WHERE repository = 'org/repo-volume'",
+	} {
+		_, err = schemabotDB.ExecContext(ctx, stmt)
+		require.NoError(t, err)
+	}
+
+	lock := &storage.Lock{
+		DatabaseName: "e2e_volume_db",
+		DatabaseType: "mysql",
+		Repository:   "org/repo-volume",
+		PullRequest:  143,
+		Owner:        "org/repo-volume#143",
+	}
+	require.NoError(t, st.Locks().Acquire(ctx, lock))
+	lock, err = st.Locks().Get(ctx, "e2e_volume_db", "mysql")
+	require.NoError(t, err)
+
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply_e2e_volume_%d", time.Now().UnixNano()),
+		LockID:          lock.ID,
+		PlanID:          1,
+		Database:        "e2e_volume_db",
+		DatabaseType:    "mysql",
+		Repository:      "org/repo-volume",
+		PullRequest:     143,
+		Environment:     "staging",
+		InstallationID:  12345,
+		Engine:          "spirit",
+		State:           state.Apply.Running,
+	}
+	apply.SetOptions(storage.ApplyOptions{Volume: 3})
+	applyID, err := st.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+	apply.LeaseOwner = "volume-test-driver"
+	apply.LeaseToken = "volume-test-token"
+	leaseAcquiredAt := time.Now()
+	apply.LeaseAcquiredAt = &leaseAcquiredAt
+	_, err = schemabotDB.ExecContext(ctx, `
+		UPDATE applies
+		SET lease_owner = ?, lease_token = ?, lease_acquired_at = ?
+		WHERE id = ?
+	`, apply.LeaseOwner, apply.LeaseToken, leaseAcquiredAt, applyID)
+	require.NoError(t, err)
+
+	now := time.Now()
+	task := &storage.Task{
+		TaskIdentifier:  fmt.Sprintf("task_e2e_volume_%d", now.UnixNano()),
+		ApplyID:         applyID,
+		PlanID:          1,
+		Database:        "e2e_volume_db",
+		DatabaseType:    "mysql",
+		Engine:          "spirit",
+		Repository:      "org/repo-volume",
+		PullRequest:     143,
+		Environment:     "staging",
+		State:           state.Task.Running,
+		TableName:       "users",
+		DDL:             "ALTER TABLE users ADD INDEX idx_email (email)",
+		DDLAction:       "alter",
+		RowsCopied:      500,
+		RowsTotal:       1000,
+		ProgressPercent: 50,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	_, err = st.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+
+	installClient, capture := setupFakeGitHubForComments(t)
+	factory := &fakeClientFactory{client: installClient}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	serverConfig := &api.ServerConfig{}
+	svc := api.New(st, serverConfig, map[string]tern.Client{}, logger)
+	t.Cleanup(func() { _ = svc.Close() })
+	h := NewHandler(svc, factory, nil, logger)
+
+	// Seed the tracked progress comment the apply started with, recording the
+	// starting level the way the accepted-apply handler does.
+	startingVolume := 3
+	h.postAndTrackComment(ctx, "org/repo-volume", 143, 12345, applyID, state.Comment.Progress, "Copying at volume 3", &startingVolume)
+	initialProgressID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(now)
+	obs := NewCommentObserver(CommentObserverConfig{
+		GHClient:       factory,
+		Storage:        st,
+		Repo:           "org/repo-volume",
+		PR:             143,
+		InstallationID: 12345,
+		ApplyID:        applyID,
+		Logger:         logger,
+		Clock:          fake,
+	})
+
+	// A tick at the level the comment was posted with edits in place.
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, initialProgressID, edited.CommentID, "same-level ticks edit the tracked comment in place")
+		assert.Contains(t, edited.Body, "Volume: 3/11")
+	case created := <-capture.creates:
+		t.Fatalf("a tick without a volume change must not post a new comment, got %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an in-place edit of the tracked progress comment")
+	}
+
+	// The driver applied a volume change and recorded the new level on the
+	// apply options. The next tick rotates: a fresh progress comment tracks
+	// the new level.
+	apply.SetOptions(storage.ApplyOptions{Volume: 5})
+	task.RowsCopied = 600
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	var newProgressID int64
+	select {
+	case created := <-capture.creates:
+		newProgressID = created.ID
+		assert.Contains(t, created.Body, "Volume: 5/11", "the fresh comment tracks the new level")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a new progress comment after the volume change")
+	}
+	assert.NotEqual(t, initialProgressID, newProgressID, "the volume change must post a new comment, not reuse the old one")
+
+	// The prior comment is frozen into a collapsed details block pointing at
+	// its successor, with the pre-change body preserved inside the fold.
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, initialProgressID, edited.CommentID, "the freeze edit lands on the superseded comment")
+		assert.Contains(t, edited.Body, "Volume changed to **5/11**")
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", newProgressID), "the frozen comment links to its successor")
+		assert.Contains(t, edited.Body, "<details>")
+		assert.Contains(t, edited.Body, "Volume: 3/11", "the pre-change body is preserved inside the fold")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the superseded progress comment to be frozen")
+	}
+
+	// The progress row tracks the new comment at the new level.
+	prog, err := st.ApplyComments().Get(ctx, applyID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, newProgressID, prog.GitHubCommentID)
+	require.NotNil(t, prog.PostedVolume)
+	assert.Equal(t, 5, *prog.PostedVolume)
+
+	// A later tick without another level change edits the new comment in place.
+	task.RowsCopied = 700
+	task.ProgressPercent = 70
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, newProgressID, edited.CommentID, "later edits land on the new comment")
+		assert.Contains(t, edited.Body, "70%")
+	case created := <-capture.creates:
+		t.Fatalf("a volume change must rotate exactly once; got another new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an in-place edit of the new progress comment on the next tick")
 	}
 }
 
@@ -679,7 +900,7 @@ func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 	h := NewHandler(svc, factory, nil, logger)
 
 	// Resume: post new progress comment (upsert should replace old ID)
-	h.postAndTrackComment(ctx, "org/repo-resume", 43, 12345, applyID, state.Comment.Progress, "Resumed progress")
+	h.postAndTrackComment(ctx, "org/repo-resume", 43, 12345, applyID, state.Comment.Progress, "Resumed progress", nil)
 
 	var newProgressID int64
 	select {
@@ -698,7 +919,7 @@ func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 	assert.NotEqual(t, int64(111), comment.GitHubCommentID, "old comment ID should be replaced")
 
 	// Post new summary (upsert replaces old ID)
-	h.postAndTrackComment(ctx, "org/repo-resume", 43, 12345, applyID, state.Comment.Summary, "Resumed summary")
+	h.postAndTrackComment(ctx, "org/repo-resume", 43, 12345, applyID, state.Comment.Summary, "Resumed summary", nil)
 
 	var newSummaryID int64
 	select {
@@ -952,7 +1173,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 
 		pending := *apply
 		pending.State = state.Apply.Pending
-		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID,
+		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply,
 			formatProgressComment(&pending, nil, nil, ""))
 
 		var created commentCreate
@@ -990,7 +1211,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		}))
 		require.NoError(t, st.ApplyComments().IncrementEditCount(ctx, apply.ID, state.Comment.Progress))
 
-		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID,
+		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply,
 			formatProgressComment(apply, nil, nil, ""))
 
 		select {
@@ -1011,7 +1232,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		apply := newApply(t, state.Apply.Running)
 		h, capture := newHandler(t)
 
-		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID,
+		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply,
 			formatProgressComment(apply, nil, nil, ""))
 
 		select {

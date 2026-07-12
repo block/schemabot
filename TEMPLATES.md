@@ -3030,7 +3030,7 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 **Environment**: `staging`
 **Requested by**: @alice
 
-Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly; the progress comment on this PR shows the current level.
+Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly; once the new level takes effect, a fresh progress comment will track the schema change at the new volume.
 
 </details>
 
@@ -5534,7 +5534,7 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 **Environment**: `staging`
 **Requested by**: @alice
 
-Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly; the progress comment on this PR shows the current level.
+Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly; once the new level takes effect, a fresh progress comment will track the schema change at the new volume.
 
 
 </details>

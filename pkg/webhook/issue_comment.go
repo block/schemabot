@@ -435,9 +435,12 @@ func (h *Handler) postComment(repo string, pr int, installationID int64, body st
 }
 
 // postAndTrackComment creates a PR comment and stores its ID in apply_comments.
+// postedVolume records the apply's volume level on progress comments so the
+// observer can detect a later applied volume change; pass nil for comment
+// states where the level is not meaningful.
 func (h *Handler) postAndTrackComment(
 	ctx context.Context, repo string, pr int, installationID int64,
-	applyID int64, commentState string, body string,
+	applyID int64, commentState string, body string, postedVolume *int,
 ) {
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
@@ -456,6 +459,7 @@ func (h *Handler) postAndTrackComment(
 		ApplyID:         applyID,
 		CommentState:    commentState,
 		GitHubCommentID: commentID,
+		PostedVolume:    postedVolume,
 	}
 	if err := h.service.Storage().ApplyComments().Upsert(ctx, comment); err != nil {
 		h.logger.Error("failed to store comment ID",
@@ -473,8 +477,10 @@ func (h *Handler) postAndTrackComment(
 // apply after the post closes that window from this side — whichever of the
 // observer's terminal edit and this finalize runs last converges the comment
 // on the terminal rendering.
-func (h *Handler) postInitialProgressComment(ctx context.Context, repo string, pr int, installationID int64, applyID int64, body string) {
-	h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, body)
+func (h *Handler) postInitialProgressComment(ctx context.Context, repo string, pr int, installationID int64, apply *storage.Apply, body string) {
+	applyID := apply.ID
+	startingVolume := apply.GetOptions().Volume
+	h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, body, &startingVolume)
 
 	apply, err := h.service.Storage().Applies().Get(ctx, applyID)
 	if err != nil {

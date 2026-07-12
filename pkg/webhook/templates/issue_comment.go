@@ -271,7 +271,7 @@ func RenderVolumeCommandAccepted(data VolumeCommandAcceptedData) string {
 	if data.RequestedBy != "" {
 		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
 	}
-	body += fmt.Sprintf("\nVolume change to %d requested. SchemaBot will adjust the speed of this schema change shortly; the progress comment on this PR shows the current level.\n", data.Volume)
+	body += fmt.Sprintf("\nVolume change to %d requested. SchemaBot will adjust the speed of this schema change shortly; once the new level takes effect, a fresh progress comment will track the schema change at the new volume.\n", data.Volume)
 	return body
 }
 
