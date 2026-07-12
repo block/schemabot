@@ -2,7 +2,6 @@ package webhook
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
@@ -11,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // CommentObserver implements tern.ProgressObserver by posting PR comments.
@@ -726,10 +726,13 @@ func (o *CommentObserver) freezeSupersededProgressComment(apply *storage.Apply, 
 	if !o.leaseStillOwnsObserver(apply, "freeze superseded progress comment") {
 		return
 	}
-	frozen := fmt.Sprintf(
-		"⏩ Volume changed to **%d/%d** — progress continues in [a new progress comment](https://github.com/%s/pull/%d#issuecomment-%d).\n\n"+
-			"<details>\n<summary>Progress before the volume change</summary>\n\n%s\n\n</details>\n",
-		volume, storage.MaxVolume, o.repo, o.pr, newCommentID, oldBody)
+	frozen := templates.RenderVolumeSupersededProgressComment(templates.VolumeSupersededProgressData{
+		Volume:       volume,
+		Repo:         o.repo,
+		PR:           o.pr,
+		NewCommentID: newCommentID,
+		PreviousBody: oldBody,
+	})
 	if err := client.EditIssueComment(ctx, o.repo, oldCommentID, frozen); err != nil {
 		o.logError(apply, "observer: failed to freeze superseded progress comment",
 			"error", err, "github_comment_id", oldCommentID)

@@ -190,6 +190,26 @@ func TestRenderVolumeInvalidLevel(t *testing.T) {
 	assert.Contains(t, rendered, "between 1 (slowest) and 11 (fastest)")
 }
 
+// TestRenderVolumeSupersededProgressComment verifies the frozen body written
+// over an old progress comment after a volume change: it names the new level,
+// links the successor comment, and folds the final pre-change progress into a
+// details block so the record stays on the PR without looking live.
+func TestRenderVolumeSupersededProgressComment(t *testing.T) {
+	rendered := RenderVolumeSupersededProgressComment(VolumeSupersededProgressData{
+		Volume:       8,
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: "## Schema Change Progress\n\nVolume: 3/11",
+	})
+	assert.Contains(t, rendered, "Volume changed to **8/11**")
+	assert.Contains(t, rendered, "https://github.com/acme/testapp/pull/42#issuecomment-2222222222")
+	assert.Contains(t, rendered, "<details>")
+	assert.Contains(t, rendered, "<summary>Progress before the volume change</summary>")
+	assert.Contains(t, rendered, "Volume: 3/11",
+		"the superseded body is preserved inside the fold")
+}
+
 func TestRenderRevertCommandAccepted(t *testing.T) {
 	rendered := RenderRevertCommandAccepted(RevertCommandAcceptedData{
 		ApplyID:     "apply-957642f96d634694",

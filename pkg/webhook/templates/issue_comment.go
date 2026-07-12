@@ -292,6 +292,34 @@ func PreviewCommentVolumeInvalidLevel() string {
 	return RenderVolumeInvalidLevel()
 }
 
+// VolumeSupersededProgressData contains data for freezing a progress comment
+// that a volume change has superseded.
+type VolumeSupersededProgressData struct {
+	// Volume is the new level (1=slowest, 11=fastest) that took effect.
+	Volume int
+	// Repo is the "owner/name" repository, used to link the successor comment.
+	Repo string
+	// PR is the pull request number, used to link the successor comment.
+	PR int
+	// NewCommentID is the GitHub comment ID of the fresh progress comment now
+	// tracking the schema change.
+	NewCommentID int64
+	// PreviousBody is the superseded comment's last rendered body, preserved
+	// inside the folded details block.
+	PreviousBody string
+}
+
+// RenderVolumeSupersededProgressComment renders the frozen body written over a
+// progress comment once a volume change rotates in a fresh one. The old
+// comment's final progress stays on the PR as a record, collapsed into a
+// details block, with a pointer to the comment where progress continues.
+func RenderVolumeSupersededProgressComment(data VolumeSupersededProgressData) string {
+	return fmt.Sprintf(
+		"⏩ Volume changed to **%d/%d** — progress continues in [a new progress comment](https://github.com/%s/pull/%d#issuecomment-%d).\n\n"+
+			"<details>\n<summary>Progress before the volume change</summary>\n\n%s\n\n</details>\n",
+		data.Volume, storage.MaxVolume, data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
+}
+
 // RenderCutoverCommandAccepted renders the acknowledgement posted when a PR
 // comment cutover command records durable cutover intent.
 func RenderCutoverCommandAccepted(data CutoverCommandAcceptedData) string {

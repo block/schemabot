@@ -3046,6 +3046,45 @@ The `-v` flag is required and must be a number between 1 (slowest) and 11 (faste
 </details>
 
 <details>
+<summary><a name="volume-changed-superseded-progress-comment"></a><strong>Volume Changed: Superseded Progress Comment</strong></summary>
+
+
+⏩ Volume changed to **8/11** — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the volume change</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress | Volume: 3/11
+
+**`users`**: 🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 32%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+Rows: 2,300,000 / 7,200,000 · ETA: 13m 0s
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
+</details>
+
+<details>
 <summary><a name="summary-completed"></a><strong>Summary: Completed</strong></summary>
 
 
@@ -5548,6 +5587,46 @@ Volume change to 8 requested. SchemaBot will adjust the speed of this schema cha
 Usage: `schemabot volume <apply-id> -e <environment> -v <level>`
 
 The `-v` flag is required and must be a number between 1 (slowest) and 11 (fastest).
+
+</details>
+
+<details>
+<summary><a name="volume-changed-superseded-progress-comment"></a><strong>Volume Changed: Superseded Progress Comment</strong></summary>
+
+
+⏩ Volume changed to **8/11** — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the volume change</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress | Volume: 3/11
+
+**`users`**: 🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 32%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+Rows: 2,300,000 / 7,200,000 · ETA: 13m 0s
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
 
 </details>
 
