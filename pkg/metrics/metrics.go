@@ -805,6 +805,7 @@ const (
 	GitHubOperationFetchPullRequest              = "fetch_pull_request"
 	GitHubOperationGetCombinedStatus             = "get_combined_status"
 	GitHubOperationGetTeamMembership             = "get_team_membership"
+	GitHubOperationGraphQLMinimizeComment        = "graphql_minimize_comment"
 	GitHubOperationGraphQLStatusCheckRollup      = "graphql_status_check_rollup"
 	GitHubOperationListCheckRunsForRef           = "list_check_runs_for_ref"
 	GitHubOperationListPRFiles                   = "list_pr_files"
@@ -976,6 +977,7 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationFetchPullRequest,
 		GitHubOperationGetCombinedStatus,
 		GitHubOperationGetTeamMembership,
+		GitHubOperationGraphQLMinimizeComment,
 		GitHubOperationGraphQLStatusCheckRollup,
 		GitHubOperationListCheckRunsForRef,
 		GitHubOperationListPRFiles,
