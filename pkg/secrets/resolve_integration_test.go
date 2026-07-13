@@ -3,6 +3,7 @@
 package secrets
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -145,5 +146,15 @@ func TestResolve_SecretsManager_Integration(t *testing.T) {
 	t.Run("nonexistent secret", func(t *testing.T) {
 		_, err := Resolve("secretsmanager:does-not-exist", "")
 		require.Error(t, err)
+	})
+
+	// A per-request resolution is bounded by the caller's context: a cancelled
+	// context fails the Secrets Manager fetch instead of waiting the background
+	// timeout.
+	t.Run("context cancellation is honored", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		_, err := ResolveContext(ctx, "secretsmanager:test-plain-secret", "")
+		require.ErrorIs(t, err, context.Canceled)
 	})
 }

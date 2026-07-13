@@ -22,7 +22,7 @@ func runningApply() *storage.Apply {
 // An apply with no operation rows (legacy, predating apply_operations) renders
 // the single-deployment comment unchanged — no aggregate header.
 func TestFormatApplyStatusComment_NoOperationsRendersSingle(t *testing.T) {
-	out := formatApplyStatusComment(runningApply(), nil, false, nil, nil, nil)
+	out := formatApplyStatusComment(runningApply(), nil, false, nil, nil, nil, "")
 	assert.Contains(t, out, "## Schema Change Status")
 	assert.NotContains(t, out, "**Deployments**:")
 }
@@ -33,7 +33,7 @@ func TestFormatApplyStatusComment_OneOperationRendersSingle(t *testing.T) {
 	ops := []*storage.ApplyOperation{
 		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Running},
 	}
-	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil)
+	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, "")
 	assert.NotContains(t, out, "**Deployments**:")
 	assert.NotContains(t, out, "- 🔄 eu")
 }
@@ -45,7 +45,7 @@ func TestFormatApplyStatusComment_MultipleOperationsRendersMulti(t *testing.T) {
 		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyBarrier},
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier},
 	}
-	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil)
+	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, "")
 	assert.Contains(t, out, "## Schema Change Status")
 	assert.Contains(t, out, "**Deployments**: 1 completed, 1 running")
 	assert.Contains(t, out, "- ✅ eu — completed")
@@ -62,10 +62,10 @@ func TestFormatApplyStatusComment_ReleasedPauseRendersDegradedNotPaused(t *testi
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Pending, OnFailure: storage.OnFailurePause},
 	}
 
-	paused := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil)
+	paused := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, "")
 	assert.Contains(t, paused, "paused — eu failed; release or stop")
 
-	released := formatApplyStatusComment(runningApply(), ops, true, nil, nil, nil)
+	released := formatApplyStatusComment(runningApply(), ops, true, nil, nil, nil, "")
 	assert.NotContains(t, released, "paused — eu failed; release or stop")
 }
 
@@ -78,7 +78,7 @@ func completedApply() *storage.Apply {
 // An apply with no operation rows (legacy) renders the single-deployment summary
 // unchanged — no aggregate header.
 func TestFormatApplySummaryComment_NoOperationsRendersSingle(t *testing.T) {
-	out := formatApplySummaryComment(completedApply(), nil, false, nil, nil, nil)
+	out := formatApplySummaryComment(completedApply(), nil, false, nil, nil, nil, "")
 	assert.Contains(t, out, "## ✅ Schema Change Applied")
 	assert.NotContains(t, out, "**Deployments**:")
 }
@@ -89,7 +89,7 @@ func TestFormatApplySummaryComment_OneOperationRendersSingle(t *testing.T) {
 	ops := []*storage.ApplyOperation{
 		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
 	}
-	out := formatApplySummaryComment(completedApply(), ops, false, nil, nil, nil)
+	out := formatApplySummaryComment(completedApply(), ops, false, nil, nil, nil, "")
 	assert.NotContains(t, out, "**Deployments**:")
 	assert.NotContains(t, out, "- ✅ eu")
 }
@@ -102,7 +102,7 @@ func TestFormatApplySummaryComment_MultipleOperationsRendersMulti(t *testing.T) 
 		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Completed},
 	}
-	out := formatApplySummaryComment(completedApply(), ops, false, nil, nil, nil)
+	out := formatApplySummaryComment(completedApply(), ops, false, nil, nil, nil, "")
 	assert.Contains(t, out, "## ✅ Schema Change Applied")
 	assert.Contains(t, out, "**Deployments**: 2 completed")
 	assert.Contains(t, out, "- ✅ eu — completed")
@@ -120,7 +120,7 @@ func TestBuildMultiApplyData_RoutesTasksByOperation(t *testing.T) {
 		{ApplyOperationID: new(int64(2)), TableName: "orders", State: state.Task.Running},
 		{ApplyOperationID: new(int64(1)), TableName: "customers", State: state.Task.Running},
 	}
-	data := buildMultiApplyData(runningApply(), ops, false, tasks, nil, nil)
+	data := buildMultiApplyData(runningApply(), ops, false, tasks, nil, nil, "")
 
 	require.Len(t, data.Details["eu"].Tables, 1)
 	assert.Equal(t, "customers", data.Details["eu"].Tables[0].TableName)
@@ -150,7 +150,7 @@ func TestBuildMultiApplyData_ScopesShardsByOperation(t *testing.T) {
 		},
 	}
 
-	data := buildMultiApplyData(runningApply(), ops, false, tasks, nil, shardsByTable)
+	data := buildMultiApplyData(runningApply(), ops, false, tasks, nil, shardsByTable, "")
 
 	require.Len(t, data.Details["eu"].Tables, 1)
 	require.Len(t, data.Details["eu"].Tables[0].Shards, 1)
@@ -167,7 +167,7 @@ func TestBuildDeploymentDetail_UsesOperationStateAndError(t *testing.T) {
 	op := &storage.ApplyOperation{ID: 1, Deployment: "us", State: state.ApplyOperation.Failed, ErrorMessage: "lock wait timeout"}
 	apply := runningApply()
 	apply.Attempt = 3
-	detail := buildDeploymentDetail(apply, op, nil, operationDisplay{}, nil)
+	detail := buildDeploymentDetail(apply, op, nil, operationDisplay{}, nil, "")
 	assert.Equal(t, state.Apply.Failed, detail.State)
 	assert.Equal(t, "lock wait timeout", detail.ErrorMessage)
 	assert.Equal(t, "payments", detail.Database)

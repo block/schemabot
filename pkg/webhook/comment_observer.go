@@ -29,6 +29,7 @@ type CommentObserver struct {
 	applyLease     storage.ApplyLease
 	deferCutover   bool
 	supportChannel api.SupportChannelConfig
+	tenant         string
 	logger         interface {
 		Info(msg string, args ...any)
 		Error(msg string, args ...any)
@@ -79,7 +80,13 @@ type CommentObserverConfig struct {
 	ApplyLease     storage.ApplyLease
 	DeferCutover   bool
 	SupportChannel api.SupportChannelConfig
-	Logger         interface {
+
+	// Tenant is the deployment's tenant identity, carried into every pasteable
+	// command hint the observer's comments render. Empty on single-tenant
+	// deployments.
+	Tenant string
+
+	Logger interface {
 		Info(msg string, args ...any)
 		Error(msg string, args ...any)
 	}
@@ -148,6 +155,7 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		applyLease:     cfg.ApplyLease,
 		deferCutover:   cfg.DeferCutover,
 		supportChannel: cfg.SupportChannel,
+		tenant:         cfg.Tenant,
 		logger:         cfg.Logger,
 		OnTerminalHook: cfg.OnTerminalHook,
 		clock:          clk,
@@ -406,9 +414,9 @@ func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*stor
 	if opsErr != nil {
 		o.logger.Error("observer: failed to load apply operations for comment dispatch; rendering single-deployment layout",
 			"apply_id", o.applyID, "error", opsErr)
-		return formatProgressComment(apply, tasks, shardsByTable)
+		return formatProgressComment(apply, tasks, shardsByTable, o.tenant)
 	}
-	return formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable)
+	return formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant)
 }
 
 // resolveDisplay projects the apply's per-operation engine display state (VSchema
@@ -455,9 +463,9 @@ func (o *CommentObserver) summaryCommentFromOps(apply *storage.Apply, ops []*sto
 	if opsErr != nil {
 		o.logger.Error("observer: failed to load apply operations for summary comment dispatch; rendering single-deployment layout",
 			"apply_id", o.applyID, "error", opsErr)
-		return formatSummaryComment(apply, tasks, shardsByTable)
+		return formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
 	}
-	return formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable)
+	return formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant)
 }
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {

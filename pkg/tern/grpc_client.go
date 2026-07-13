@@ -1404,6 +1404,34 @@ func (c *GRPCClient) mirrorRemoteDisplayMetadata(ctx context.Context, apply *sto
 	return blob
 }
 
+// mirrorRemoteVolume copies the volume level the data plane reports on a
+// progress response onto the in-memory apply options, so the poll's regular
+// parent-apply persistence records it. Volume changes are applied by the
+// data-plane driver against its own apply row, and the control plane only
+// learns the resulting level from progress responses — the PR comment and the
+// control-plane progress API both read the level from the control-plane apply
+// options. Returns true when the stored level changed so the caller can log
+// the transition.
+func mirrorRemoteVolume(apply *storage.Apply, remoteVolume int32) bool {
+	if remoteVolume == 0 {
+		// The data plane reports 0 when no volume level was ever set on the
+		// apply; there is nothing to mirror.
+		return false
+	}
+	if remoteVolume < storage.MinVolume || remoteVolume > storage.MaxVolume {
+		slog.Warn("remote progress reported an out-of-range volume level; keeping the stored level",
+			append(apply.LogAttrs(), "remote_volume", remoteVolume)...)
+		return false
+	}
+	opts := apply.GetOptions()
+	if opts.Volume == int(remoteVolume) {
+		return false
+	}
+	opts.Volume = int(remoteVolume)
+	apply.SetOptions(opts)
+	return true
+}
+
 // operationForDisplayMirror loads the apply_operation whose
 // engine_resume_metadata should carry the display projection. An
 // operation-scoped drive already knows its operation id; a whole-apply
@@ -3231,6 +3259,10 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			apply.State = newState
 			apply.ErrorMessage = remoteProgressErrorMessage(apply.State, resp.ErrorMessage, apply.ErrorMessage)
 			apply.UpdatedAt = now
+			if mirrorRemoteVolume(apply, resp.Volume) {
+				slog.Info("mirrored remote volume level onto control-plane apply options",
+					append(apply.LogAttrs(), "volume", resp.Volume)...)
+			}
 
 			terminal := isTerminalProtoState(resp.State)
 			if terminal {

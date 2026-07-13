@@ -164,6 +164,33 @@ databases:
 	assert.Equal(t, map[string]string{"parseTime": "true"}, targetDSNFrom.Params)
 }
 
+func TestLoadServerConfigFromFile_StaticTargetDSNFrom(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	content := `
+storage:
+  dsn: env:MYSQL_DSN
+target_resolver:
+  targets:
+    example-target:
+      type: mysql
+      dsn_from:
+        config_ref: secretsmanager:/example/schemabot/target-credentials
+        password_ref: secretsmanager:/example/schemabot/target-credentials#password
+        username: schemabot
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644), "write config file")
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+	target := cfg.TargetResolver.Targets["example-target"]
+	assert.Equal(t, "mysql", target.DatabaseType)
+	require.NotNil(t, target.DSNFrom)
+	assert.Equal(t, "schemabot", target.DSNFrom.Username)
+	assert.Equal(t, "secretsmanager:/example/schemabot/target-credentials", target.DSNFrom.ConfigRef)
+	assert.Equal(t, "secretsmanager:/example/schemabot/target-credentials#password", target.DSNFrom.PasswordRef)
+}
+
 func TestLoadServerConfigFromFile_NotFound(t *testing.T) {
 	_, err := LoadServerConfigFromFile("/nonexistent/config.yaml")
 	assert.Error(t, err, "expected error for nonexistent file")

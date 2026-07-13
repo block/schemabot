@@ -37,17 +37,17 @@ func releasedForApply(ctx context.Context, stor storage.Storage, apply *storage.
 // ops must be in resolved deployment order (as returned by
 // ApplyOperations().ListByApply); tasks are the apply's tasks across all
 // deployments, regrouped per operation for the multi-deployment layout.
-func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task) string {
+func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, tenant string) string {
 	// A sharded apply fans out across the shards of one keyspace within a single
 	// deployment, so it gets the shard-unit layout rather than the deployment-unit
 	// one — its operations differ by shard, not deployment.
 	if isShardedApply(ops) {
-		return templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, released, tasks))
+		return templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, released, tasks, tenant))
 	}
 	if len(ops) <= 1 {
-		return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks, singleOpDisplay(ops, displayByOp), shardsByTable))
+		return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks, singleOpDisplay(ops, displayByOp), shardsByTable, tenant))
 	}
-	return templates.RenderMultiDeploymentApplyComment(buildMultiApplyData(apply, ops, released, tasks, displayByOp, shardsByTable))
+	return templates.RenderMultiDeploymentApplyComment(buildMultiApplyData(apply, ops, released, tasks, displayByOp, shardsByTable, tenant))
 }
 
 // formatApplySummaryComment renders the terminal summary PR comment for an apply,
@@ -60,17 +60,17 @@ func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperatio
 // ops must be in resolved deployment order (as returned by
 // ApplyOperations().ListByApply); tasks are the apply's tasks across all
 // deployments, regrouped per operation for the multi-deployment layout.
-func formatApplySummaryComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task) string {
+func formatApplySummaryComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, tenant string) string {
 	// The sharded layout is terminal-aware (header, footer, no last-updated line),
 	// so the same renderer serves the terminal summary; only the deployment-unit
 	// path has a distinct summary renderer.
 	if isShardedApply(ops) {
-		return templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, released, tasks))
+		return templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, released, tasks, tenant))
 	}
 	if len(ops) <= 1 {
-		return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks, singleOpDisplay(ops, displayByOp), shardsByTable))
+		return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks, singleOpDisplay(ops, displayByOp), shardsByTable, tenant))
 	}
-	return templates.RenderMultiDeploymentApplySummaryComment(buildMultiApplyData(apply, ops, released, tasks, displayByOp, shardsByTable))
+	return templates.RenderMultiDeploymentApplySummaryComment(buildMultiApplyData(apply, ops, released, tasks, displayByOp, shardsByTable, tenant))
 }
 
 // singleOpDisplay returns the engine display projection for a zero/one-operation
@@ -86,13 +86,13 @@ func singleOpDisplay(ops []*storage.ApplyOperation, displayByOp map[int64]operat
 // buildMultiApplyData assembles the multi-deployment comment input: the derived
 // rollup plus each deployment's own single-deployment comment data, so each
 // deployment's section reuses the existing per-table renderer.
-func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task) templates.MultiDeploymentApplyData {
+func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, tenant string) templates.MultiDeploymentApplyData {
 	tasksByOp := groupTasksByOperation(tasks)
 
 	model := deriveApplyPresentation(ops, released)
 	details := make(map[string]templates.ApplyStatusCommentData, len(ops))
 	for _, op := range ops {
-		details[op.Deployment] = buildDeploymentDetail(apply, op, tasksByOp[op.ID], displayByOp[op.ID], shardsByTable)
+		details[op.Deployment] = buildDeploymentDetail(apply, op, tasksByOp[op.ID], displayByOp[op.ID], shardsByTable, tenant)
 	}
 
 	data := templates.MultiDeploymentApplyData{
@@ -100,6 +100,7 @@ func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, re
 		ApplyID:     apply.ApplyIdentifier,
 		Environment: apply.Environment,
 		Details:     details,
+		Tenant:      tenant,
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)
@@ -149,7 +150,7 @@ func applyOperationToPresentation(op *storage.ApplyOperation, released bool) pre
 // identity and timing, and the deployment's own tasks. The deployment's database
 // target is shown via the section's deployment name; the per-table rows fall back
 // to the apply database for namespace, matching the single-deployment renderer.
-func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tasks []*storage.Task, display operationDisplay, shardsByTable map[string][]*storage.Task) templates.ApplyStatusCommentData {
+func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tasks []*storage.Task, display operationDisplay, shardsByTable map[string][]*storage.Task, tenant string) templates.ApplyStatusCommentData {
 	data := templates.ApplyStatusCommentData{
 		ApplyID:          apply.ApplyIdentifier,
 		Database:         apply.Database,
@@ -162,6 +163,7 @@ func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tas
 		VSchemaChanges:   display.VSchema,
 		DeployRequestURL: display.DeployRequestURL,
 		RevertExpiresAt:  display.RevertExpiresAt,
+		Tenant:           tenant,
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)

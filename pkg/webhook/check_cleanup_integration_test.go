@@ -384,6 +384,86 @@ func TestE2EReconcileStaleInProgressCheckFailure(t *testing.T) {
 	}
 }
 
+// TestE2EReconcileRollbackThatNeverClaimedCheck verifies reconciliation for a
+// rollback that completed without ever claiming the stored check row: the
+// rollback was queued, but the claim failed (or the driver crashed before it
+// landed), so the row still says success and is owned by the apply the
+// rollback reverted. The reverted change is gone from the environment, so the
+// next plan or apply command must converge the row to action_required — the PR
+// must not stay mergeable on the strength of the pre-rollback success.
+func TestE2EReconcileRollbackThatNeverClaimedCheck(t *testing.T) {
+	dbName := "webhook_rollback_unclaimed"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// The original apply completed and its terminal update recorded success while
+	// retaining ownership of the row.
+	priorApply := &storage.Apply{
+		ApplyIdentifier: "apply-before-rollback",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Completed,
+		Engine:          "spirit",
+	}
+	priorApplyID, err := svc.Storage().Applies().Create(ctx, priorApply)
+	require.NoError(t, err)
+
+	// The rollback reached Completed, but no check row points at it.
+	rollbackApply := &storage.Apply{
+		ApplyIdentifier: "rollback-unclaimed",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Completed,
+		Engine:          "spirit",
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{AllowUnsafe: true, Rollback: true}),
+	}
+	rollbackApplyID, err := svc.Storage().Applies().Create(ctx, rollbackApply)
+	require.NoError(t, err)
+	require.Greater(t, rollbackApplyID, priorApplyID)
+
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha999",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   42,
+		ApplyID:      priorApplyID,
+		HasChanges:   false,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionSuccess,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	setupFakeGitHubForPlan(t, mux, nil, "", dbName)
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+
+	require.NoError(t, h.reconcileStaleChecks(ctx, installClient, "octocat/hello-world", 1))
+
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionActionRequired, check.Conclusion, "the pre-rollback success must not keep the PR mergeable")
+	assert.Equal(t, rollbackCompletedBlock.blockingReason, check.BlockingReason)
+	assert.True(t, check.HasChanges, "the PR's reverted change is still outstanding")
+	assert.Zero(t, check.ApplyID, "rollback finalization releases check ownership so a re-apply can take over")
+}
+
 // TestE2EPRCloseReopenRetainsStartedApplyBlock verifies that closing and
 // reopening a PR cannot bypass a block that requires operator reconciliation.
 // Scenario: an apply for the PR completes, then a later commit removes the

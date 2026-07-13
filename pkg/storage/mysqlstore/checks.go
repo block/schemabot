@@ -378,8 +378,13 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 }
 
 // MarkActionRequiredForApply marks stored check state action_required after a
-// rollback only if it still belongs to that rollback apply and no newer apply
-// exists for the same PR/environment/database.
+// rollback only if no apply newer than the rollback exists for the same
+// PR/environment/database. Unlike CompleteForApply, the write does not require
+// the row to be owned by the rollback apply: a rollback that never claimed the
+// row (its claim failed or the driver crashed before it landed) must still be
+// able to block a stale successful check left over from the apply it reverted.
+// Rows owned by an older apply or with no owner qualify; the newer-apply guard
+// is what protects a re-apply that started after the rollback.
 func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
 	var checkRunID any
 	if check.CheckRunID != 0 {
@@ -413,7 +418,7 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 		    change_summary = COALESCE(NULLIF(?, ''), change_summary)
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
-		  AND apply_id = ?
+		  AND (apply_id IS NULL OR apply_id <= ?)
 		  AND NOT EXISTS (
 		    SELECT 1
 		    FROM applies newer

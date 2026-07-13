@@ -58,7 +58,7 @@ func TestRefreshChecksForTerminalApply_CompletedRollbackIsActionRequired(t *test
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := api.New(st, &api.ServerConfig{}, nil, logger)
 
-	// setCheckActionRequired resolves a GitHub client to refresh the aggregate
+	// The terminal refresh resolves a GitHub client to update the aggregate
 	// Check Run after writing stored state. Point it at an unrouted test server:
 	// the stored update (the behavior under test) lands first, and the GitHub
 	// refresh fails gracefully without a real installation.
