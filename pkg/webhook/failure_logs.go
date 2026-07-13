@@ -12,7 +12,8 @@ import (
 // commentChromeHeadroom reserves room under GitHub's comment size cap for
 // markup added to the body after the section is appended (the support-channel
 // footer) plus margin, so the assembled comment never lands exactly at the
-// limit.
+// limit. Config validation caps the support-channel name and URL lengths so
+// the rendered footer always fits inside this reservation.
 const commentChromeHeadroom = 1024
 
 // failureSummaryLogLimit bounds the log load for a failed apply's summary
@@ -46,6 +47,14 @@ func failureLogsSection(ctx context.Context, stor storage.Storage, logger interf
 	if !state.IsState(apply.State, state.Apply.Failed) {
 		return ""
 	}
+	// Check the room before touching storage: a summary body that leaves no
+	// renderable space makes the load pure waste.
+	available := templates.GitHubIssueCommentMaxChars - commentChromeHeadroom - len(baseBody)
+	if available < templates.MinFailureLogsSectionChars {
+		logger.Error("summary body leaves no room for the recent-logs section under the GitHub comment size limit; posting summary without recent logs",
+			append(apply.LogAttrs(), "summary_chars", len(baseBody))...)
+		return ""
+	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failureLogsLoadTimeout)
 	defer cancel()
 	// Load one entry beyond the limit so the fold can label itself honestly:
@@ -71,11 +80,5 @@ func failureLogsSection(ctx context.Context, stor storage.Storage, logger interf
 			NewState:  entry.NewState,
 		}
 	}
-	available := templates.GitHubIssueCommentMaxChars - commentChromeHeadroom - len(baseBody)
-	section := templates.RenderRecentFailureLogs(entries, available, hasOlder)
-	if section == "" && len(entries) > 0 {
-		logger.Error("summary body leaves no room for the recent-logs section under the GitHub comment size limit; posting summary without recent logs",
-			append(apply.LogAttrs(), "summary_chars", len(baseBody), "log_entries", len(entries))...)
-	}
-	return section
+	return templates.RenderRecentFailureLogs(entries, available, hasOlder)
 }

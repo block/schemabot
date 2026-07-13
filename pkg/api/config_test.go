@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -3273,6 +3274,20 @@ func TestSupportChannelConfig(t *testing.T) {
 		cfg.SupportChannel = SupportChannelConfig{Name: "#schema-help", URL: "https://example.com/schema-help)"}
 		err := cfg.Validate()
 		assert.ErrorContains(t, err, "support_channel.url contains characters that are unsafe in Markdown links")
+	})
+
+	t.Run("name must fit the comment footer reservation", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SupportChannel = SupportChannelConfig{Name: strings.Repeat("a", maxSupportChannelNameChars+1), URL: "https://example.com/schema-help"}
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "support_channel.name must be at most")
+	})
+
+	t.Run("url must fit the comment footer reservation", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SupportChannel = SupportChannelConfig{Name: "#schema-help", URL: "https://example.com/" + strings.Repeat("a", maxSupportChannelURLChars)}
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "support_channel.url must be at most")
 	})
 }
 

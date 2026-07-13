@@ -298,7 +298,7 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		// aggregate CAS-winner observer re-edits it with the full task set. The
 		// summary marker is always upserted so FindMissingSummaryComment (outbox
 		// query) doesn't false-positive on restart for cutover applies.
-		finalBody := o.summaryCommentFromOps(apply, ops, opsErr, tasks, shardsByTable)
+		finalBody := o.summaryCommentFromOps(ctx, apply, ops, opsErr, tasks, shardsByTable)
 		o.editTrackedComment(apply, activeCommentState, finalBody)
 		o.markSummaryPosted(apply, activeCommentState)
 	} else {
@@ -318,7 +318,7 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		// so a per-driver observer holding one operation's task slice must defer
 		// to it rather than post a duplicate, partial summary.
 		if o.shouldPublishSeparateSummary(apply, ops, opsErr) {
-			summaryBody := o.summaryCommentFromOps(apply, ops, opsErr, tasks, shardsByTable)
+			summaryBody := o.summaryCommentFromOps(ctx, apply, ops, opsErr, tasks, shardsByTable)
 			o.postAndTrackComment(apply, state.Comment.Summary, summaryBody)
 		}
 	}
@@ -451,7 +451,7 @@ func (o *CommentObserver) formatTerminalSummaryComment(apply *storage.Apply) str
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	ops, err := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
-	return o.summaryCommentFromOps(apply, ops, err, nil, o.shardsByTable(ctx, apply, ops))
+	return o.summaryCommentFromOps(ctx, apply, ops, err, nil, o.shardsByTable(ctx, apply, ops))
 }
 
 // summaryCommentFromOps renders the terminal summary from already-loaded
@@ -461,7 +461,7 @@ func (o *CommentObserver) formatTerminalSummaryComment(apply *storage.Apply) str
 // apply_operations. A failed apply's summary carries the collapsed recent-logs
 // section, appended after whichever layout rendered, so triage data lands on
 // the PR without an extra operator step.
-func (o *CommentObserver) summaryCommentFromOps(apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
+func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
 	var body string
 	if opsErr != nil {
 		o.logger.Error("observer: failed to load apply operations for summary comment dispatch; rendering single-deployment layout",
@@ -470,7 +470,7 @@ func (o *CommentObserver) summaryCommentFromOps(apply *storage.Apply, ops []*sto
 	} else {
 		body = formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant)
 	}
-	return body + failureLogsSection(context.Background(), o.stor, o.logger, apply, body)
+	return body + failureLogsSection(ctx, o.stor, o.logger, apply, body)
 }
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {

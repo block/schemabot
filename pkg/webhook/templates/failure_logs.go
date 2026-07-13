@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // LogEntryData is one apply log line rendered into the recent-logs section of
@@ -31,21 +32,23 @@ type LogEntryData struct {
 const GitHubIssueCommentMaxChars = 65536
 
 // MinRenderedLogLineChars is the smallest a rendered log line can be: the UTC
-// timestamp, the bracketed level tag, and at least one message character plus
-// the joining newline. Callers use it to bound how many entries could ever
-// fit in a fold — loading more than budget / MinRenderedLogLineChars entries
-// can never add a rendered line.
-const MinRenderedLogLineChars = len("2006-01-02 15:04:05 UTC [INF] x") + 1
+// timestamp and the bracketed level tag with their separating spaces, plus the
+// joining newline — the degenerate case of an empty level and empty message.
+// Callers use it to bound how many entries could ever fit in a fold — loading
+// more than budget / MinRenderedLogLineChars entries can never add a rendered
+// line.
+const MinRenderedLogLineChars = len("2006-01-02 15:04:05 UTC [] ") + 1
 
 // sectionChromeChars reserves room within the budget for the section's own
 // markup: the details/summary fold, the omitted-entries note, and the code
 // fences.
 const sectionChromeChars = 256
 
-// minFailureLogsSectionChars is the smallest budget worth rendering for — below
-// this, not even one truncated log line would convey anything useful, so the
-// section is dropped entirely.
-const minFailureLogsSectionChars = 512
+// MinFailureLogsSectionChars is the smallest budget worth rendering for —
+// below this, not even one truncated log line would convey anything useful, so
+// the section is dropped entirely. Callers can pre-check their available room
+// against it to skip loading entries that could never render.
+const MinFailureLogsSectionChars = 512
 
 // RenderRecentFailureLogs renders the collapsed logs section appended to a
 // failed apply's summary comment, formatted like the CLI logs output
@@ -61,7 +64,7 @@ func RenderRecentFailureLogs(entries []LogEntryData, available int, hasOlder boo
 	if len(entries) == 0 {
 		return ""
 	}
-	if available < minFailureLogsSectionChars {
+	if available < MinFailureLogsSectionChars {
 		return ""
 	}
 	budget := available
@@ -82,7 +85,11 @@ func RenderRecentFailureLogs(entries []LogEntryData, available int, hasOlder boo
 	}
 	section := fmt.Sprintf("\n<details>\n<summary>%s (%d %s)</summary>\n\n", label, len(lines), noun)
 	if omitted > 0 {
-		section += fmt.Sprintf("_%d earlier entries omitted to fit the comment size limit._\n\n", omitted)
+		note := fmt.Sprintf("_%d earlier entries omitted to fit the comment size limit", omitted)
+		if hasOlder {
+			note += " (older entries also exist)"
+		}
+		section += note + "._\n\n"
 	}
 	section += "```text\n" + strings.Join(lines, "\n") + "\n```\n\n</details>\n"
 	return section
@@ -93,7 +100,7 @@ func RenderRecentFailureLogs(entries []LogEntryData, available int, hasOlder boo
 func formatLogEntryLine(entry LogEntryData) string {
 	line := fmt.Sprintf("%s %s %s",
 		entry.CreatedAt.UTC().Format("2006-01-02 15:04:05 UTC"),
-		logLevelTag(entry.Level),
+		LogLevelTag(entry.Level),
 		sanitizeLogText(entry.Message))
 	if entry.OldState != "" && entry.NewState != "" {
 		line += fmt.Sprintf(" [%s -> %s]", sanitizeLogText(entry.OldState), sanitizeLogText(entry.NewState))
@@ -115,8 +122,11 @@ func sanitizeLogText(text string) string {
 	return text
 }
 
-// logLevelTag returns the CLI's bracketed level indicator without colors.
-func logLevelTag(level string) string {
+// LogLevelTag returns the bracketed apply-log level indicator without colors:
+// [ERR], [WRN], [INF], [DBG], or [LEVEL] for anything else. It is the single
+// source of the tag text — the CLI logs output wraps it in ANSI colors, and
+// the failed-summary fold renders it bare — so the two surfaces cannot drift.
+func LogLevelTag(level string) string {
 	switch strings.ToLower(level) {
 	case "error":
 		return "[ERR]"
@@ -163,16 +173,10 @@ func truncateToBytes(text string, maxBytes int) string {
 		return text
 	}
 	cut := maxBytes
-	for cut > 0 && !isUTF8Start(text[cut]) {
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
 		cut--
 	}
 	return text[:cut]
-}
-
-// isUTF8Start reports whether b is the first byte of a UTF-8 rune (i.e. not a
-// continuation byte).
-func isUTF8Start(b byte) bool {
-	return b&0xC0 != 0x80
 }
 
 // sampleFailureLogEntries returns the log entries shared by the failed-summary

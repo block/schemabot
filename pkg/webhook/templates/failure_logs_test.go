@@ -125,7 +125,7 @@ func TestRenderRecentFailureLogsSkipsWhenNoRoom(t *testing.T) {
 	}
 	assert.Empty(t, RenderRecentFailureLogs(entries, 0, false))
 	assert.Empty(t, RenderRecentFailureLogs(entries, -500, false))
-	assert.Empty(t, RenderRecentFailureLogs(entries, minFailureLogsSectionChars-1, false))
+	assert.Empty(t, RenderRecentFailureLogs(entries, MinFailureLogsSectionChars-1, false))
 }
 
 // TestRenderRecentFailureLogsTruncatesSingleOversizedLine verifies one
