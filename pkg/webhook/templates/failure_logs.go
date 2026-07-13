@@ -22,12 +22,19 @@ type LogEntryData struct {
 	NewState string
 }
 
-// maxFailureLogsSectionChars caps the rendered log block regardless of how
+// MaxFailureLogsSectionChars caps the rendered log block regardless of how
 // much room the summary body leaves, so a short summary never carries an
 // unreadably long fold. When the block would exceed the effective budget, the
 // earliest lines are dropped — the entries closest to the failure are what an
 // operator reading the PR needs.
-const maxFailureLogsSectionChars = 50000
+const MaxFailureLogsSectionChars = 50000
+
+// MinRenderedLogLineChars is the smallest a rendered log line can be: the UTC
+// timestamp, the bracketed level tag, and at least one message character plus
+// the joining newline. Callers use it to bound how many entries could ever
+// fit in a fold — loading more than MaxFailureLogsSectionChars /
+// MinRenderedLogLineChars entries can never add a rendered line.
+const MinRenderedLogLineChars = len("2006-01-02 15:04:05 UTC [INF] x") + 1
 
 // sectionChromeChars reserves room within the budget for the section's own
 // markup: the details/summary fold, the omitted-entries note, and the code
@@ -45,7 +52,7 @@ const minFailureLogsSectionChars = 512
 // "Logs" when it carries the apply's complete log history and "Recent logs"
 // when it is a tail — hasOlder reports that entries older than entries[0]
 // exist but were not loaded. The section spends at most
-// min(available, maxFailureLogsSectionChars) characters — available is the
+// min(available, MaxFailureLogsSectionChars) characters — available is the
 // room the rest of the comment leaves under GitHub's size limit, so a large
 // summary body shrinks the fold instead of pushing the comment over the
 // limit. Returns "" when there are no entries or no meaningful room, so the
@@ -54,7 +61,7 @@ func RenderRecentFailureLogs(entries []LogEntryData, available int, hasOlder boo
 	if len(entries) == 0 {
 		return ""
 	}
-	budget := min(available, maxFailureLogsSectionChars)
+	budget := min(available, MaxFailureLogsSectionChars)
 	if budget < minFailureLogsSectionChars {
 		return ""
 	}

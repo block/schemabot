@@ -9,10 +9,15 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
-// failureSummaryLogLimit is how many log entries a failed apply's summary
-// comment carries. The newest entries are kept — the tail leading up to the
-// failure is what an operator triaging from the PR needs.
-const failureSummaryLogLimit = 50
+// failureSummaryLogLimit bounds the log load for a failed apply's summary
+// comment. It is derived, not a product choice: the fold's byte budget is the
+// real limit, and this is the most entries that could ever render within it.
+// Loading more rows could never add a rendered line, so the query stays
+// bounded (engine log lines flow into apply_logs, so a long apply accumulates
+// far more rows than any comment can carry) without the load bound ever being
+// the reason a line is dropped. The newest entries are kept — the tail leading
+// up to the failure is what an operator triaging from the PR needs.
+const failureSummaryLogLimit = templates.MaxFailureLogsSectionChars / templates.MinRenderedLogLineChars
 
 // failureLogsLoadTimeout bounds the log load so a slow storage read degrades
 // to a summary without logs rather than delaying the terminal comment.
@@ -38,7 +43,7 @@ const commentChromeHeadroom = 1024
 // load runs under its own short deadline, detached from the caller's
 // cancellation, so the section is decided by storage health alone. Best-effort:
 // a log-load failure is logged and returns "" so the summary comment still
-// posts; the full logs remain available from the CLI.
+// posts; the full history remains available from the CLI and the server logs.
 func failureLogsSection(ctx context.Context, stor storage.Storage, logger interface {
 	Error(msg string, args ...any)
 }, apply *storage.Apply, baseBody string) string {

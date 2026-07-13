@@ -20,7 +20,7 @@ func TestRenderRecentFailureLogs(t *testing.T) {
 		{CreatedAt: at, Level: "info", Message: "Apply claimed by driver", OldState: "queued", NewState: "running"},
 		{CreatedAt: at.Add(3 * time.Second), Level: "warn", Message: "Copy throttled by replication lag"},
 		{CreatedAt: at.Add(9 * time.Second), Level: "error", Message: "Lost MySQL connection; retrying"},
-	}, maxFailureLogsSectionChars, false)
+	}, MaxFailureLogsSectionChars, false)
 
 	assert.Contains(t, rendered, "<details>")
 	assert.Contains(t, rendered, "<summary>Logs (3)</summary>")
@@ -39,7 +39,7 @@ func TestRenderRecentFailureLogsTailLabel(t *testing.T) {
 	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
 	rendered := RenderRecentFailureLogs([]LogEntryData{
 		{CreatedAt: at, Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"},
-	}, maxFailureLogsSectionChars, true)
+	}, MaxFailureLogsSectionChars, true)
 
 	assert.Contains(t, rendered, "<summary>Recent logs (1)</summary>")
 }
@@ -47,7 +47,7 @@ func TestRenderRecentFailureLogsTailLabel(t *testing.T) {
 // TestRenderRecentFailureLogsEmpty verifies an apply with no log entries adds
 // nothing to the summary — no empty details block.
 func TestRenderRecentFailureLogsEmpty(t *testing.T) {
-	assert.Empty(t, RenderRecentFailureLogs(nil, maxFailureLogsSectionChars, false))
+	assert.Empty(t, RenderRecentFailureLogs(nil, MaxFailureLogsSectionChars, false))
 }
 
 // TestRenderRecentFailureLogsSanitizesUntrustedText verifies engine-supplied
@@ -60,7 +60,7 @@ func TestRenderRecentFailureLogsSanitizesUntrustedText(t *testing.T) {
 		{CreatedAt: at, Level: "error", Message: "line one\r\nline two\nline three"},
 		{CreatedAt: at.Add(time.Second), Level: "error", Message: "fence breakout ```\n# not a heading"},
 		{CreatedAt: at.Add(2 * time.Second), Level: "error", Message: "long run `````x"},
-	}, maxFailureLogsSectionChars, false)
+	}, MaxFailureLogsSectionChars, false)
 
 	assert.Contains(t, rendered, "[ERR] line one line two line three")
 	assert.Contains(t, rendered, "[ERR] fence breakout `` ` # not a heading")
@@ -82,7 +82,7 @@ func TestRenderRecentFailureLogsTrimsToSizeBudget(t *testing.T) {
 			Message:   strings.Repeat("x", 1000) + " #" + time.Duration(i).String(),
 		}
 	}
-	rendered := RenderRecentFailureLogs(entries, maxFailureLogsSectionChars, false)
+	rendered := RenderRecentFailureLogs(entries, MaxFailureLogsSectionChars, false)
 
 	require.Less(t, len(rendered), 65536, "rendered section must leave room inside GitHub's size limit")
 	assert.Contains(t, rendered, "<summary>Recent logs (")
@@ -136,7 +136,7 @@ func TestRenderRecentFailureLogsTruncatesSingleOversizedLine(t *testing.T) {
 		{
 			CreatedAt: time.Date(2026, 7, 12, 16, 0, 0, 0, time.UTC),
 			Level:     "error",
-			Message:   "Apply failed: " + strings.Repeat("é", maxFailureLogsSectionChars),
+			Message:   "Apply failed: " + strings.Repeat("é", MaxFailureLogsSectionChars),
 		},
 	}
 	available := 4000
