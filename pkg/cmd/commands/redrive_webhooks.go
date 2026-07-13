@@ -16,9 +16,9 @@ import (
 var webhookRedriveNow = func() time.Time { return time.Now().UTC() }
 
 // WebhooksCmd groups GitHub webhook delivery operator commands. Missing
-// Check Runs are handled by `schemabot checks backfill`, which redrives or
-// synthesizes per PR; redrive here is the window-scoped tool for a known
-// delivery outage.
+// Check Runs are handled by `schemabot checks backfill`, which synthesizes
+// per PR; redrive here is the transport-level, window-scoped tool for a
+// known delivery outage.
 type WebhooksCmd struct {
 	Redrive RedriveWebhooksCmd `cmd:"" help:"Redeliver failed GitHub App webhook deliveries from a time window"`
 }
@@ -61,7 +61,7 @@ func (cmd *RedriveWebhooksCmd) Run(ctx context.Context, g *Globals) error {
 		PR:          cmd.PR,
 		MaxPages:    cmd.MaxPages,
 		DryRun:      cmd.DryRun,
-	}, cmd.MaxPages, true, func(r apitypes.WebhookRedriveResult) {
+	}, cmd.MaxPages, func(r apitypes.WebhookRedriveResult) {
 		updateProgress(redriveProgressLine(r, windowStart, windowEnd, cmd.DryRun))
 	})
 	stopProgress()
@@ -136,10 +136,9 @@ func redriveWindowCoverage(oldestFetched, windowStart, windowEnd string) (int, b
 // requests: the server processes a few delivery pages per request and hands
 // back a cursor, so no single HTTP request can outlive an intermediary
 // timeout no matter how deep the crawl goes. maxPages is the total page
-// budget per App across all requests. With requireFullCoverage, incomplete
-// coverage fails the run; without it, the caller inspects the per-app
-// ReachedWindowStart/HistoryExhausted facts (best-effort classification
-// passes tolerate a partial crawl).
+// budget per App across all requests. Incomplete coverage fails the run: a
+// redrive that silently skipped part of the window would leave the operator
+// believing every failed delivery in it was redelivered.
 //
 // Re-run convergence caveat: the server dedupes already-succeeded redeliveries
 // by GUID, but only within a single request (one cursor chunk). Because this
@@ -150,7 +149,7 @@ func redriveWindowCoverage(oldestFetched, windowStart, windowEnd string) (int, b
 // whose check recompute is idempotent and fail-closed and which never triggers
 // an apply; the worst case is a duplicate plan comment. Running --dry-run first
 // is the operator mitigation.
-func runChunkedWebhookRedrive(ctx context.Context, call func(context.Context, string, apitypes.WebhookRedriveRequest) (*apitypes.WebhookRedriveResponse, error), endpoint string, req apitypes.WebhookRedriveRequest, maxPages int, requireFullCoverage bool, progress func(apitypes.WebhookRedriveResult)) (*apitypes.WebhookRedriveResponse, error) {
+func runChunkedWebhookRedrive(ctx context.Context, call func(context.Context, string, apitypes.WebhookRedriveRequest) (*apitypes.WebhookRedriveResponse, error), endpoint string, req apitypes.WebhookRedriveRequest, maxPages int, progress func(apitypes.WebhookRedriveResult)) (*apitypes.WebhookRedriveResponse, error) {
 	if progress == nil {
 		progress = func(apitypes.WebhookRedriveResult) {}
 	}
@@ -190,7 +189,7 @@ func runChunkedWebhookRedrive(ctx context.Context, call func(context.Context, st
 			appResult = mergeWebhookRedriveResults(appResult, next.Results[0])
 			progress(appResult)
 		}
-		if requireFullCoverage && !appResult.ReachedWindowStart {
+		if !appResult.ReachedWindowStart {
 			if appResult.HistoryExhausted {
 				return merged, fmt.Errorf("app %q: GitHub's retained delivery history ends at %s, after the requested window start %s; older deliveries are no longer redriveable", appResult.AppName, appResult.OldestFetched, req.WindowStart)
 			}
@@ -220,9 +219,9 @@ func (cmd *RedriveWebhooksCmd) resolveWindow() (string, string, error) {
 		if cmd.WindowStart != "" || cmd.WindowEnd != "" {
 			return "", "", fmt.Errorf("use either --last or explicit window start/end, not both")
 		}
-		duration, err := parseWebhookRedriveLast(cmd.Last)
+		duration, err := parseOperatorDuration(cmd.Last)
 		if err != nil {
-			return "", "", err
+			return "", "", fmt.Errorf("parse --last: %w", err)
 		}
 		windowEnd := webhookRedriveNow()
 		windowStart := windowEnd.Add(-duration)
@@ -245,28 +244,31 @@ func (cmd *RedriveWebhooksCmd) resolveWindow() (string, string, error) {
 	return cmd.WindowStart, cmd.WindowEnd, nil
 }
 
-func parseWebhookRedriveLast(value string) (time.Duration, error) {
+// parseOperatorDuration parses the human-friendly duration format shared by
+// the operator flags (--last, --delivery-window, --stuck-after). Errors name
+// no flag; the caller wraps with the flag it was parsing.
+func parseOperatorDuration(value string) (time.Duration, error) {
 	trimmed := strings.TrimSpace(strings.ToLower(value))
 	if trimmed == "" {
-		return 0, fmt.Errorf("--last must not be empty")
+		return 0, fmt.Errorf("duration must not be empty")
 	}
 	if duration, err := time.ParseDuration(trimmed); err == nil {
 		if duration <= 0 {
-			return 0, fmt.Errorf("--last must be positive")
+			return 0, fmt.Errorf("duration must be positive")
 		}
 		return duration, nil
 	}
 
 	amountText, unit, ok := strings.Cut(trimmed, " ")
 	if !ok {
-		amountText, unit = splitWebhookRedriveLastAmountAndUnit(trimmed)
+		amountText, unit = splitOperatorDurationAmountAndUnit(trimmed)
 	}
 	amount, err := strconv.Atoi(amountText)
 	if err != nil {
-		return 0, fmt.Errorf("parse --last %q: use a positive duration like 1h, 6h, 2d, or '2 days'", value)
+		return 0, fmt.Errorf("parse duration %q: use a positive duration like 1h, 6h, 2d, or '2 days'", value)
 	}
 	if amount <= 0 {
-		return 0, fmt.Errorf("--last must be positive")
+		return 0, fmt.Errorf("duration must be positive")
 	}
 	switch strings.TrimSpace(unit) {
 	case "d", "day", "days":
@@ -276,10 +278,10 @@ func parseWebhookRedriveLast(value string) (time.Duration, error) {
 	case "m", "min", "mins", "minute", "minutes":
 		return time.Duration(amount) * time.Minute, nil
 	}
-	return 0, fmt.Errorf("parse --last %q: use a positive duration like 1h, 6h, 2d, or '2 days'", value)
+	return 0, fmt.Errorf("parse duration %q: use a positive duration like 1h, 6h, 2d, or '2 days'", value)
 }
 
-func splitWebhookRedriveLastAmountAndUnit(value string) (string, string) {
+func splitOperatorDurationAmountAndUnit(value string) (string, string) {
 	for i, r := range value {
 		if r < '0' || r > '9' {
 			return value[:i], value[i:]

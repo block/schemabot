@@ -21,6 +21,7 @@
 - [Check States](#check-states)
 - [Blocking Reasons](#blocking-reasons)
 - [Operator Guidance](#operator-guidance)
+  - [Backfilling missing Check Runs](#backfilling-missing-check-runs)
 - [SHA Handling](#sha-handling)
 - [Edge Cases](#edge-cases)
   - [PR opened](#pr-opened)
@@ -587,6 +588,68 @@ Common fail-closed scenarios:
 | Stored check ownership miss | A newer plan or apply owns the stored check state for the same PR, environment, and database. Letting the older driver write would overwrite newer safety state. | Inspect the newest apply for that repo/PR/environment/database with the CLI, for example `schemabot status -d <database> -e <environment>` or `schemabot progress <apply-id>`. Let the newest apply finish, or reconcile it with operator commands before retrying PR comments. |
 | Schema changes were removed while an apply may still be running | The live database may still change even though the current PR no longer represents that change. | Inspect the in-flight apply in Tern or with the CLI. If the change reached the live database, either put the schema change back in the PR and comment `schemabot plan -e <environment>` before applying again, or roll back/reconcile the live schema first. |
 | Stale in-progress row after a pod crash | Stored check state says an apply is running, but the watcher may have died before publishing the terminal result. | Comment `schemabot plan -e <environment>` or `schemabot apply -e <environment>` to trigger stale-check reconciliation. If reconciliation fails, inspect SchemaBot storage and the latest apply for that database. |
+
+### Backfilling missing Check Runs
+
+`schemabot checks backfill` converges Check Run state across open PRs — after
+an incident, before enabling required checks on a repository, or as a one-time
+backfill for PRs that predate check enablement. Per open PR it reports heads
+whose expected SchemaBot Check Run is missing and (outside `--dry-run`)
+recreates each by replaying the auto-plan flow server-side. Check Runs that
+exist but never completed are reported for investigation, never acted on — an
+uncompleted run can belong to a genuinely in-flight apply.
+
+**The backfill is scoped to the deployment it runs against.** A SchemaBot
+instance scans with its own GitHub App credentials, its own `repos:` config,
+its own `allowed_environments`, and its own storage, so one run converges only
+the checks that instance owns:
+
+- **Repositories.** `--repo` scans one repository; `--all-repos` scans every
+  repository declared in the instance's `repos:` config. A legacy single-App
+  config declares no repos, so there `--all-repos` is rejected and repositories
+  must be named explicitly.
+- **Apps.** Each repository resolves to the GitHub App that owns it (see
+  [Multi-App Routing](configuration.md#multi-app-routing)); the scan and the
+  recreated Check Runs both use that App's installation. An instance hosting
+  several Apps covers all of them in one `--all-repos` sweep.
+- **Check names and environments.** The expected names are derived per
+  repository: the owning App's check-name base crossed with the instance's
+  `allowed_environments` — `SchemaBot (staging)` and `SchemaBot (production)`
+  for a dual-environment instance, the bare base for an environment-unscoped
+  one. `--environment` narrows the scan to one environment, and an environment
+  the instance does not handle is rejected up front — scanning for a check
+  name that can never exist would report every PR as missing it.
+  `--check-name` overrides the derivation entirely.
+- **Split deployments.** In a
+  [multi-environment deployment](configuration.md#multi-environment-deployment)
+  — separate staging and production instances with separate GitHub Apps — each
+  instance can only see and recreate its own environment's check. Full coverage
+  of a repository means one run against each instance, and the same holds for
+  any fleet of independent deployments: run the backfill once per deployment;
+  nothing spans them.
+
+Presence is decided under the
+[cross-deployment trust model](#cross-deployment-trust-model): a Check Run
+with the expected name created by an untrusted App does not count as present.
+The scan reports it as an untrusted-App conflict rather than silently trusting
+it or replacing it.
+
+Started applies remain authoritative here as everywhere. The server refuses to
+backfill any PR with a non-terminal apply — replaying auto-plan over one could
+replace an apply-owned merge block with a fresh passing plan — and refuses
+when the apply lookup itself fails, since without the apply rows there is no
+proof the PR is safe to re-plan. The CLI additionally holds any missing-check
+PR whose head carries an uncompleted Check Run of any age, because that run
+may belong to a started apply the scanning instance cannot see.
+
+For repositories where several deployments coordinate one shared check
+through a leader/participant aggregate configuration, the same scoping
+applies: a backfill creates only the deployment's own check. Run against a
+participant, it recreates the participant check the leader folds; run against
+the leader, it replays the role-aware auto-plan flow, whose fold fails closed
+on expected participants that have not reported. A missing participant check
+is repaired by running the backfill on that participant's deployment — never
+by the leader.
 
 [github-create-check-run]: https://docs.github.com/en/rest/checks/runs#create-a-check-run
 [github-check-runs]: https://docs.github.com/en/rest/checks/runs

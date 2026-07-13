@@ -108,14 +108,49 @@ type ChecksScanRequest struct {
 	// page). Each request scans a single page so it finishes well within any
 	// intermediary HTTP timeout; the caller loops until next_page is 0.
 	Page int `json:"page,omitempty"`
+	// UpdatedSince, when set (RFC3339), scans only PRs updated at or after
+	// this instant. The open-PR listing is ordered newest-updated first, so
+	// the scan stops paging as soon as it crosses the cutoff — bounding an
+	// incident-window sweep by the window instead of the repo's PR count.
+	UpdatedSince string `json:"updated_since,omitempty"`
 }
 
 type ChecksScanResponse struct {
-	Repo       string           `json:"repo"`
-	CheckNames []string         `json:"check_names"`
-	Scanned    int              `json:"scanned"`
-	NextPage   int              `json:"next_page,omitempty"`
-	Missing    []MissingCheckPR `json:"missing"`
+	Repo       string   `json:"repo"`
+	CheckNames []string `json:"check_names"`
+	Scanned    int      `json:"scanned"`
+	NextPage   int      `json:"next_page,omitempty"`
+	// EstimatedOpenPRs is the repository's total open-PR count as GitHub
+	// reports it for this page's listing — an upper bound while more pages
+	// remain, exact on the final page. Recomputed every page so the caller
+	// can render a progress denominator that stays honest across a long scan.
+	EstimatedOpenPRs int              `json:"estimated_open_prs,omitempty"`
+	Missing          []MissingCheckPR `json:"missing"`
+	// Stuck lists open PRs whose expected Check Run exists but has not
+	// completed. The server reports the raw status and start time; the caller
+	// decides how old is old enough to call stuck, because an uncompleted
+	// check is legitimate while an apply or plan is genuinely in flight.
+	Stuck []StuckCheckPR `json:"stuck,omitempty"`
+	// RateLimit reports the GitHub budget left on the installation that
+	// served this page, so the caller can pace itself instead of starving
+	// the live webhook path that shares the same budget. Nil when the rate
+	// state could not be read (advisory only; the scan itself succeeded).
+	RateLimit *GitHubRateLimit `json:"rate_limit,omitempty"`
+}
+
+// GitHubRateLimit is a point-in-time snapshot of a GitHub installation's
+// core REST budget.
+type GitHubRateLimit struct {
+	Remaining int `json:"remaining"`
+	Limit     int `json:"limit"`
+	// ResetAt is RFC3339; when the budget replenishes.
+	ResetAt string `json:"reset_at"`
+}
+
+// ChecksReposResponse lists the repositories declared in the server's repos
+// config — the inventory a fleet-wide scan iterates.
+type ChecksReposResponse struct {
+	Repos []string `json:"repos"`
 }
 
 // ChecksSynthesizeRequest asks the server to recreate missing Check Runs for
@@ -130,6 +165,9 @@ type ChecksSynthesizeRequest struct {
 type ChecksSynthesizeResponse struct {
 	Repo    string                   `json:"repo"`
 	Results []ChecksSynthesizeResult `json:"results"`
+	// RateLimit mirrors ChecksScanResponse.RateLimit: the installation's
+	// remaining GitHub budget after this batch, for caller-side pacing.
+	RateLimit *GitHubRateLimit `json:"rate_limit,omitempty"`
 }
 
 type ChecksSynthesizeResult struct {
@@ -150,6 +188,27 @@ type MissingCheckPR struct {
 	// still recreates the trusted check, but the operator likely also needs to
 	// remove/rename the conflicting check or adjust the trusted-app config.
 	UntrustedConflictNames []string `json:"untrusted_conflict_check_names,omitempty"`
+}
+
+// StuckCheckPR is an open PR carrying at least one expected SchemaBot Check
+// Run that exists but has not reached a conclusion.
+type StuckCheckPR struct {
+	Number  int                  `json:"number"`
+	URL     string               `json:"url"`
+	Title   string               `json:"title"`
+	HeadSHA string               `json:"head_sha"`
+	HeadRef string               `json:"head_ref"`
+	Checks  []IncompleteCheckRun `json:"checks"`
+}
+
+// IncompleteCheckRun describes one Check Run that exists on the PR head but
+// has not completed.
+type IncompleteCheckRun struct {
+	Name       string `json:"name"`
+	CheckRunID int64  `json:"check_run_id"`
+	Status     string `json:"status"`
+	// StartedAt is RFC3339; empty when GitHub did not report a start time.
+	StartedAt string `json:"started_at,omitempty"`
 }
 
 // =============================================================================

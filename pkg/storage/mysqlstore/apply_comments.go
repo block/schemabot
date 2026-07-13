@@ -13,7 +13,7 @@ import (
 )
 
 // applyCommentColumns lists all columns for SELECT queries.
-const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, edit_count, last_edited_at, superseded_at, created_at, updated_at`
+const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, posted_volume, pending_freeze_github_comment_id, edit_count, last_edited_at, superseded_at, created_at, updated_at`
 
 // applyCommentStore implements storage.ApplyCommentStore using MySQL.
 type applyCommentStore struct {
@@ -21,7 +21,9 @@ type applyCommentStore struct {
 }
 
 // Upsert creates or updates a comment record.
-// On conflict (same apply_id + comment_state), updates the github_comment_id.
+// On conflict (same apply_id + comment_state), updates the github_comment_id,
+// posted_volume, and pending_freeze_github_comment_id so the row always
+// describes the currently tracked comment and the freeze it may still owe.
 func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyComment) error {
 	lease, hasLease, err := applyLeaseFromContext(ctx, comment.ApplyID)
 	if err != nil {
@@ -29,23 +31,27 @@ func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyCo
 	}
 	if !hasLease {
 		_, err := s.db.ExecContext(ctx, `
-			INSERT INTO apply_comments (apply_id, comment_state, github_comment_id)
-			VALUES (?, ?, ?)
+			INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_volume, pending_freeze_github_comment_id)
+			VALUES (?, ?, ?, ?, ?)
 			ON DUPLICATE KEY UPDATE
 				github_comment_id = VALUES(github_comment_id),
+				posted_volume = VALUES(posted_volume),
+				pending_freeze_github_comment_id = VALUES(pending_freeze_github_comment_id),
 				superseded_at = NULL
-		`, comment.ApplyID, comment.CommentState, comment.GitHubCommentID)
+		`, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedVolume, comment.PendingFreezeCommentID)
 		return err
 	}
 
 	result, err := s.db.ExecContext(ctx, `
-		INSERT INTO apply_comments (apply_id, comment_state, github_comment_id)
-		SELECT ?, ?, ? FROM applies a
+		INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_volume, pending_freeze_github_comment_id)
+		SELECT ?, ?, ?, ?, ? FROM applies a
 		WHERE a.id = ? AND a.lease_token = ?
 		ON DUPLICATE KEY UPDATE
 			github_comment_id = VALUES(github_comment_id),
+			posted_volume = VALUES(posted_volume),
+			pending_freeze_github_comment_id = VALUES(pending_freeze_github_comment_id),
 			superseded_at = NULL
-	`, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.ApplyID, lease.Token)
+	`, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedVolume, comment.PendingFreezeCommentID, comment.ApplyID, lease.Token)
 	if err != nil {
 		return err
 	}
@@ -172,6 +178,46 @@ func (s *applyCommentStore) Supersede(ctx context.Context, applyID int64, commen
 	return nil
 }
 
+// ClearPendingFreeze removes the pending-freeze marker for a single
+// (apply_id, comment_state) once the superseded comment's frozen rendering has
+// landed on GitHub. A missing row or an already-clear marker is not an error;
+// with a lease in context, a zero-row update surfaces a lost lease.
+func (s *applyCommentStore) ClearPendingFreeze(ctx context.Context, applyID int64, commentState string) error {
+	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
+	if err != nil {
+		return err
+	}
+	if !hasLease {
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE apply_comments SET pending_freeze_github_comment_id = NULL
+			WHERE apply_id = ? AND comment_state = ? AND pending_freeze_github_comment_id IS NOT NULL
+		`, applyID, commentState)
+		return err
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_comments c
+		JOIN applies a ON a.id = c.apply_id
+		SET c.pending_freeze_github_comment_id = NULL
+		WHERE c.apply_id = ? AND c.comment_state = ? AND c.pending_freeze_github_comment_id IS NOT NULL AND a.lease_token = ?
+	`, applyID, commentState, lease.Token)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read apply comment pending-freeze clear rows affected for apply %d state %s: %w", applyID, commentState, err)
+	}
+	if rows == 0 {
+		// Zero rows can mean the row was missing, the marker was already clear,
+		// or the lease was lost. The first two are benign; surface only a lost
+		// lease.
+		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // scanApplyComment scans a single apply comment row, returning nil if not found.
 func scanApplyComment(row *sql.Row) (*storage.ApplyComment, error) {
 	comment, err := scanApplyCommentInto(row)
@@ -199,8 +245,8 @@ func scanApplyCommentInto(s scanner) (*storage.ApplyComment, error) {
 	var comment storage.ApplyComment
 	err := s.Scan(
 		&comment.ID, &comment.ApplyID, &comment.CommentState,
-		&comment.GitHubCommentID, &comment.EditCount, &comment.LastEditedAt,
-		&comment.SupersededAt, &comment.CreatedAt, &comment.UpdatedAt,
+		&comment.GitHubCommentID, &comment.PostedVolume, &comment.PendingFreezeCommentID, &comment.EditCount,
+		&comment.LastEditedAt, &comment.SupersededAt, &comment.CreatedAt, &comment.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err

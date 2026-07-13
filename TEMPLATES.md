@@ -3030,7 +3030,7 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 **Environment**: `staging`
 **Requested by**: @alice
 
-Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly; the progress comment on this PR shows the current level.
+Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly; once the new level takes effect, a fresh progress comment will track the schema change at the new volume.
 
 </details>
 
@@ -3043,6 +3043,45 @@ Volume change to 8 requested. SchemaBot will adjust the speed of this schema cha
 Usage: `schemabot volume <apply-id> -e <environment> -v <level>`
 
 The `-v` flag is required and must be a number between 1 (slowest) and 11 (fastest).
+</details>
+
+<details>
+<summary><a name="volume-changed-superseded-progress-comment"></a><strong>Volume Changed: Superseded Progress Comment</strong></summary>
+
+
+⏩ Volume changed to **8/11** — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the volume change</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress | Volume: 3/11
+
+**`users`**: 🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 32%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+Rows: 2,300,000 / 7,200,000 · ETA: 13m 0s
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
 </details>
 
 <details>
@@ -3124,6 +3163,19 @@ To retry:
 ```
 schemabot apply -e staging
 ```
+
+<details>
+<summary>Show logs (5 entries)</summary>
+
+```text
+2026-03-15 14:22:00 UTC [INF] Apply claimed by driver [queued -> running]
+2026-03-15 14:22:15 UTC [INF] Task started: schema change on `users`
+2026-03-15 14:25:00 UTC [WRN] Copy throttled by replication lag (1.2s)
+2026-03-15 14:28:00 UTC [ERR] Task failed: unsafe warning: Field 'name' doesn't have a default value
+2026-03-15 14:29:00 UTC [ERR] Apply failed [running -> failed]
+```
+
+</details>
 
 </details>
 
@@ -3377,6 +3429,19 @@ To retry:
 schemabot apply -e staging
 ```
 
+<details>
+<summary>Show logs (5 entries)</summary>
+
+```text
+2026-03-15 14:22:00 UTC [INF] Apply claimed by driver [queued -> running]
+2026-03-15 14:22:15 UTC [INF] Task started: schema change on `addresses`
+2026-03-15 14:25:00 UTC [WRN] Copy throttled by replication lag (1.2s)
+2026-03-15 14:28:00 UTC [ERR] Task failed: Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'
+2026-03-15 14:29:00 UTC [ERR] Apply failed [running -> failed]
+```
+
+</details>
+
 </details>
 
 <details>
@@ -3433,6 +3498,19 @@ To retry:
 ```
 schemabot apply -e staging
 ```
+
+<details>
+<summary>Show logs (5 entries)</summary>
+
+```text
+2026-03-15 14:22:00 UTC [INF] Apply claimed by driver [queued -> running]
+2026-03-15 14:22:15 UTC [INF] Task started: schema change on `addresses`
+2026-03-15 14:25:00 UTC [WRN] Copy throttled by replication lag (1.2s)
+2026-03-15 14:28:00 UTC [ERR] Task failed: Error 1205: Lock wait timeout exceeded
+2026-03-15 14:29:00 UTC [ERR] Apply failed [running -> failed]
+```
+
+</details>
 
 </details>
 
@@ -5495,7 +5573,7 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 **Environment**: `staging`
 **Requested by**: @alice
 
-Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly; the progress comment on this PR shows the current level.
+Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly; once the new level takes effect, a fresh progress comment will track the schema change at the new volume.
 
 
 </details>
@@ -5509,6 +5587,46 @@ Volume change to 8 requested. SchemaBot will adjust the speed of this schema cha
 Usage: `schemabot volume <apply-id> -e <environment> -v <level>`
 
 The `-v` flag is required and must be a number between 1 (slowest) and 11 (fastest).
+
+</details>
+
+<details>
+<summary><a name="volume-changed-superseded-progress-comment"></a><strong>Volume Changed: Superseded Progress Comment</strong></summary>
+
+
+⏩ Volume changed to **8/11** — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the volume change</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress | Volume: 3/11
+
+**`users`**: 🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 32%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+Rows: 2,300,000 / 7,200,000 · ETA: 13m 0s
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
 
 </details>
 

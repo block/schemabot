@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // CommentObserver implements tern.ProgressObserver by posting PR comments.
@@ -60,6 +61,37 @@ type CommentObserver struct {
 	stagnantTicks     int
 	hasCutoverComment bool
 	resumeRotated     bool
+	volumeRotatedTo   int
+
+	// trackedPostedVolume caches the tracked progress comment's recorded level
+	// (valid only when trackedPostedVolumeKnown) so the per-tick volume-change
+	// check answers from memory instead of a storage read under the mutex. The
+	// cache is safe for the duration of a drive: while this observer's apply
+	// holds its lease, the observer is the only writer of the tracked progress
+	// row. A missing row or nil level is never cached — the handler may still
+	// be posting the initial progress comment concurrently with early ticks.
+	trackedPostedVolume      int
+	trackedPostedVolumeKnown bool
+
+	// pendingRotation remembers a fresh progress comment that is live on the PR
+	// but whose tracking write failed, so later ticks adopt it (retry the write
+	// with the known comment ID) instead of posting a duplicate.
+	pendingRotation *pendingProgressRotation
+}
+
+// pendingProgressRotation identifies a volume-rotation progress comment that
+// was posted but not tracked: the comment exists on the PR while the stored
+// row still points at its predecessor. Adoption retries only the tracking
+// write — never another post — so duplicates stay bounded, and a level change
+// while the comment was untracked (an operator reverting the volume) is
+// re-detected against the adopted level on the same tick.
+type pendingProgressRotation struct {
+	// commentID is the posted comment's GitHub ID.
+	commentID int64
+	// volume is the level the comment was posted at.
+	volume int
+	// supersededCommentID is the prior tracked comment, still owed its freeze.
+	supersededCommentID int64
 }
 
 const (
@@ -201,11 +233,14 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	}
 
 	// Post cutover comment when entering cutting_over with defer_cutover,
-	// but only if one hasn't been posted already.
+	// but only if one hasn't been posted already. A failed post leaves
+	// hasCutoverComment unset so the next tick retries, instead of muting the
+	// observer for the rest of the drive over one transient GitHub error.
 	if currentState == state.Apply.CuttingOver && o.shouldDeferCutover(apply) && !o.hasCutoverComment {
 		body := o.formatStatusComment(apply, tasks)
-		o.postAndTrackComment(apply, state.Comment.Cutover, body)
-		o.hasCutoverComment = true
+		if _, posted, _ := o.postAndTrackComment(apply, state.Comment.Cutover, body, nil); posted {
+			o.hasCutoverComment = true
+		}
 		o.lastState = currentState
 		return
 	}
@@ -222,6 +257,17 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	// copy and leave the prior comment frozen at "Stopped" as the record of where
 	// the apply paused.
 	if !state.IsTerminalApplyState(apply.State) && o.rotateProgressCommentForResume(apply, tasks) {
+		o.lastState = currentState
+		o.lastProgressPost = now
+		o.stagnantTicks = 0
+		return
+	}
+
+	// An applied volume change likewise gets a fresh progress comment: a new
+	// comment at the bottom of the PR timeline is where operators look for the
+	// effect of a command they just issued, rather than re-reading an older
+	// comment for an edited level.
+	if !state.IsTerminalApplyState(apply.State) && o.rotateProgressCommentForVolumeChange(apply, tasks) {
 		o.lastState = currentState
 		o.lastProgressPost = now
 		o.stagnantTicks = 0
@@ -298,7 +344,7 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		// aggregate CAS-winner observer re-edits it with the full task set. The
 		// summary marker is always upserted so FindMissingSummaryComment (outbox
 		// query) doesn't false-positive on restart for cutover applies.
-		finalBody := o.summaryCommentFromOps(apply, ops, opsErr, tasks, shardsByTable)
+		finalBody := o.summaryCommentFromOps(ctx, apply, ops, opsErr, tasks, shardsByTable)
 		o.editTrackedComment(apply, activeCommentState, finalBody)
 		o.markSummaryPosted(apply, activeCommentState)
 	} else {
@@ -318,8 +364,8 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		// so a per-driver observer holding one operation's task slice must defer
 		// to it rather than post a duplicate, partial summary.
 		if o.shouldPublishSeparateSummary(apply, ops, opsErr) {
-			summaryBody := o.summaryCommentFromOps(apply, ops, opsErr, tasks, shardsByTable)
-			o.postAndTrackComment(apply, state.Comment.Summary, summaryBody)
+			summaryBody := o.summaryCommentFromOps(ctx, apply, ops, opsErr, tasks, shardsByTable)
+			o.postAndTrackComment(apply, state.Comment.Summary, summaryBody, nil)
 		}
 	}
 
@@ -451,21 +497,26 @@ func (o *CommentObserver) formatTerminalSummaryComment(apply *storage.Apply) str
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	ops, err := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
-	return o.summaryCommentFromOps(apply, ops, err, nil, o.shardsByTable(ctx, apply, ops))
+	return o.summaryCommentFromOps(ctx, apply, ops, err, nil, o.shardsByTable(ctx, apply, ops))
 }
 
 // summaryCommentFromOps renders the terminal summary from already-loaded
 // operation rows, applying the same single-deployment fallback as
 // formatTerminalSummaryComment when the load failed. Callers that already hold
 // the operation set (e.g. OnTerminal) use this to avoid re-reading
-// apply_operations.
-func (o *CommentObserver) summaryCommentFromOps(apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
+// apply_operations. A failed apply's summary carries the collapsed recent-logs
+// section, appended after whichever layout rendered, so triage data lands on
+// the PR without an extra operator step.
+func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
+	var body string
 	if opsErr != nil {
 		o.logger.Error("observer: failed to load apply operations for summary comment dispatch; rendering single-deployment layout",
 			"apply_id", o.applyID, "error", opsErr)
-		return formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
+		body = formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
+	} else {
+		body = formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant)
 	}
-	return formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant)
+	return body + failureLogsSection(ctx, o.stor, o.logger, apply, body)
 }
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {
@@ -611,7 +662,13 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 	}
 
 	body := o.formatStatusComment(apply, tasks)
-	o.postAndTrackComment(apply, state.Comment.Progress, body)
+	if _, posted, _ := o.postAndTrackComment(apply, state.Comment.Progress, body, nil); !posted {
+		// postAndTrackComment logged the failure. The summary marker is left in
+		// place — it is the durable signal that a resume rotation is owed — so
+		// the next tick retries instead of consuming the marker for a comment
+		// that never landed.
+		return false
+	}
 	o.resumeRotated = true
 
 	if err := o.stor.ApplyComments().Supersede(o.contextWithApplyLease(ctx, apply), o.applyID, state.Comment.Summary); err != nil {
@@ -623,9 +680,165 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 	return true
 }
 
-// postAndTrackComment creates a comment and stores its ID.
-func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState string, body string) {
-	if !o.leaseStillOwnsObserver(apply, "create GitHub client before post") {
+// rotateProgressCommentForVolumeChange posts a fresh progress comment when the
+// apply's volume level no longer matches the level the tracked progress comment
+// was posted at — the durable sign that a requested volume change has been
+// applied. The fresh comment is posted and tracked (with the freeze it owes its
+// predecessor recorded in the same write), so a later tick sees matching levels
+// and does not rotate again; the prior comment is frozen with a note pointing
+// at its successor. Returns true when it rotated.
+func (o *CommentObserver) rotateProgressCommentForVolumeChange(apply *storage.Apply, tasks []*storage.Task) bool {
+	currentVolume := apply.GetOptions().Volume
+	if currentVolume == 0 {
+		// The apply has no explicit volume level to compare — nothing changed.
+		return false
+	}
+	if o.pendingRotation != nil {
+		// A prior tick's fresh comment is live on the PR but untracked. Adopt
+		// it before considering another rotation so the tracking write is
+		// retried with the known comment ID instead of posting a duplicate.
+		if !o.adoptPendingRotationComment(apply) {
+			return false
+		}
+		// Fall through: the adopted level may already mismatch again (an
+		// operator changed the volume while the comment was untracked), which
+		// the checks below re-detect against the adopted level.
+	}
+	if o.volumeRotatedTo == currentVolume {
+		// This observer already rotated for this level — answered from memory
+		// without a storage read.
+		return false
+	}
+	if o.trackedPostedVolumeKnown && o.trackedPostedVolume == currentVolume {
+		// The tracked comment already records the current level — the common
+		// path on every progress tick, answered from the cache without a
+		// storage read.
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tracked, err := o.stor.ApplyComments().Get(ctx, o.applyID, state.Comment.Progress)
+	if err != nil {
+		o.logError(apply, "observer: failed to load tracked progress comment before volume rotation", "error", err)
+		return false
+	}
+	if tracked == nil {
+		// No tracked progress comment yet — the handler may still be posting
+		// the initial one. Nothing to rotate away from; the next posted comment
+		// records the current level.
+		o.logInfo(apply, "observer: no tracked progress comment yet; skipping volume-rotation check",
+			"volume", currentVolume)
+		return false
+	}
+	if tracked.PostedVolume == nil {
+		// The row predates volume tracking, so there is no recorded level to
+		// compare. Backfill the current level so the next applied volume change
+		// rotates (and so this check answers from the cache instead of
+		// re-reading storage every tick for the apply's remaining lifetime).
+		backfill := &storage.ApplyComment{
+			ApplyID:         o.applyID,
+			CommentState:    state.Comment.Progress,
+			GitHubCommentID: tracked.GitHubCommentID,
+			PostedVolume:    &currentVolume,
+		}
+		if err := o.stor.ApplyComments().Upsert(o.contextWithApplyLease(ctx, apply), backfill); err != nil {
+			o.logError(apply, "observer: failed to backfill tracked progress comment volume; volume rotation stays disabled for this apply until the backfill lands",
+				"volume", currentVolume, "error", err)
+			return false
+		}
+		o.trackedPostedVolume = currentVolume
+		o.trackedPostedVolumeKnown = true
+		o.logInfo(apply, "observer: backfilled tracked progress comment volume for a row predating volume tracking; the next applied volume change rotates",
+			"volume", currentVolume)
+		return false
+	}
+	if tracked.PendingFreezeCommentID != nil {
+		// A superseded comment from an earlier rotation is still owed its
+		// frozen rendering — the freeze edit failed or the pod died before it
+		// landed. Retry it now; on success the marker is cleared.
+		o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID, *tracked.PostedVolume)
+	}
+	o.trackedPostedVolume = *tracked.PostedVolume
+	o.trackedPostedVolumeKnown = true
+	if *tracked.PostedVolume == currentVolume {
+		// The level is unchanged since the comment was posted — the common
+		// path on the first tick of a drive, before the cache is primed.
+		return false
+	}
+
+	body := o.formatStatusComment(apply, tasks)
+	newCommentID, posted, trackedNew := o.postAndTrackComment(apply, state.Comment.Progress, body, &tracked.GitHubCommentID)
+	if !posted {
+		// postAndTrackComment logged the failure; the level mismatch persists,
+		// so the next tick retries the rotation.
+		return false
+	}
+	if !trackedNew {
+		// The fresh comment is on the PR, but the tracked row still points at
+		// the prior comment. Remember it so later ticks retry only the tracking
+		// write — adoption — instead of posting a duplicate; until it lands,
+		// progress edits continue on the prior comment.
+		o.pendingRotation = &pendingProgressRotation{
+			commentID:           newCommentID,
+			volume:              currentVolume,
+			supersededCommentID: tracked.GitHubCommentID,
+		}
+		o.logError(apply, "observer: fresh progress comment posted for volume change but not tracked; progress edits continue on the prior comment until the next tick adopts it",
+			"volume", currentVolume, "github_comment_id", newCommentID)
+		return true
+	}
+	o.volumeRotatedTo = currentVolume
+	o.logInfo(apply, "observer: posted fresh progress comment for volume change",
+		"previous_volume", *tracked.PostedVolume, "volume", currentVolume)
+	o.freezeSupersededProgressComment(apply, tracked.GitHubCommentID, newCommentID, currentVolume)
+	return true
+}
+
+// adoptPendingRotationComment retries the tracking write for a fresh progress
+// comment that was posted but never recorded, pointing the tracked row (and
+// the freeze owed to its predecessor) at the already-live comment. Returns
+// true when the row now tracks the pending comment; on failure the pending
+// record is kept so the next tick retries — no path posts another comment.
+func (o *CommentObserver) adoptPendingRotationComment(apply *storage.Apply) bool {
+	p := o.pendingRotation
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	comment := &storage.ApplyComment{
+		ApplyID:                o.applyID,
+		CommentState:           state.Comment.Progress,
+		GitHubCommentID:        p.commentID,
+		PostedVolume:           &p.volume,
+		PendingFreezeCommentID: &p.supersededCommentID,
+	}
+	if err := o.stor.ApplyComments().Upsert(o.contextWithApplyLease(ctx, apply), comment); err != nil {
+		o.logError(apply, "observer: failed to adopt posted-but-untracked progress comment; progress edits continue on the prior comment until a retry lands",
+			"github_comment_id", p.commentID, "volume", p.volume, "error", err)
+		return false
+	}
+	o.pendingRotation = nil
+	o.trackedPostedVolume = p.volume
+	o.trackedPostedVolumeKnown = true
+	o.volumeRotatedTo = p.volume
+	o.logInfo(apply, "observer: adopted posted-but-untracked progress comment; progress edits now land on it",
+		"github_comment_id", p.commentID, "volume", p.volume)
+	o.freezeSupersededProgressComment(apply, p.supersededCommentID, p.commentID, p.volume)
+	return true
+}
+
+// freezeSupersededProgressComment collapses a progress comment that is no
+// longer tracked into a folded details block whose summary points readers at
+// the comment that replaced it. Collapsing rather than deleting keeps the
+// pre-change progress on the PR as a record while decluttering the timeline;
+// without the fold a reader has no way to tell a frozen comment from a live
+// one. A failure leaves the tracked row's pending-freeze marker in place (it
+// is written alongside the successor's tracking), so a later tick or a later
+// drive's observer retries; the marker is cleared only once the frozen
+// rendering is on GitHub.
+func (o *CommentObserver) freezeSupersededProgressComment(apply *storage.Apply, oldCommentID, newCommentID int64, volume int) {
+	if !o.leaseStillOwnsObserver(apply, "create GitHub client before freezing superseded comment") {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -633,30 +846,100 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 
 	client, err := o.ghClient.ForInstallation(o.installationID)
 	if err != nil {
-		o.logError(apply, "observer: failed to create GitHub client", "error", err)
+		o.logError(apply, "observer: failed to create GitHub client to freeze superseded progress comment", "error", err)
 		return
+	}
+	oldBody, err := client.GetIssueComment(ctx, o.repo, oldCommentID)
+	if err != nil {
+		o.logError(apply, "observer: failed to load superseded progress comment before freezing it",
+			"error", err, "github_comment_id", oldCommentID)
+		return
+	}
+	if !templates.IsVolumeSupersededProgressComment(oldBody) {
+		// A retry after a failed marker clear sees the frozen body already on
+		// GitHub; re-rendering would fold the frozen body inside another fold.
+		if !o.leaseStillOwnsObserver(apply, "freeze superseded progress comment") {
+			return
+		}
+		frozen := templates.RenderVolumeSupersededProgressComment(templates.VolumeSupersededProgressData{
+			Volume:       volume,
+			Repo:         o.repo,
+			PR:           o.pr,
+			NewCommentID: newCommentID,
+			PreviousBody: oldBody,
+		})
+		if err := client.EditIssueComment(ctx, o.repo, oldCommentID, frozen); err != nil {
+			o.logError(apply, "observer: failed to freeze superseded progress comment; the pending-freeze marker stays set and the next observer pass that reads the tracked row retries",
+				"error", err, "github_comment_id", oldCommentID)
+			return
+		}
+	}
+	if err := o.stor.ApplyComments().ClearPendingFreeze(o.contextWithApplyLease(ctx, apply), o.applyID, state.Comment.Progress); err != nil {
+		o.logError(apply, "observer: failed to clear pending-freeze marker after freezing superseded progress comment; a later retry finds the comment already frozen and clears the marker",
+			"error", err, "github_comment_id", oldCommentID)
+	}
+}
+
+// postAndTrackComment creates a comment and stores its ID, recording the
+// apply's volume level on progress comments so a later applied volume change
+// is detectable. pendingFreezeCommentID, when non-nil, records in the same
+// tracking write that the named predecessor comment is still owed its frozen
+// rendering; pass nil for posts that supersede nothing. Returns the GitHub
+// comment ID, whether the post landed on the PR, and whether the tracking row
+// was updated to point at it — a posted but untracked comment exists on the PR
+// while later edits still target the prior comment.
+func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState string, body string, pendingFreezeCommentID *int64) (commentID int64, posted, tracked bool) {
+	if !o.leaseStillOwnsObserver(apply, "create GitHub client before post") {
+		return 0, false, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	client, err := o.ghClient.ForInstallation(o.installationID)
+	if err != nil {
+		o.logError(apply, "observer: failed to create GitHub client", "error", err)
+		return 0, false, false
 	}
 	if !o.leaseStillOwnsObserver(apply, "post GitHub comment") {
-		return
+		return 0, false, false
 	}
 
-	commentID, err := client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(body))
+	commentID, err = client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(body))
 	if err != nil {
 		o.logError(apply, "observer: failed to post comment", "error", err, "comment_state", commentState)
-		return
+		return 0, false, false
 	}
 	if !o.leaseStillOwnsObserver(apply, "record posted GitHub comment") {
-		return
+		// The comment is live on the PR; only the tracking write is being
+		// skipped. Report it posted-but-untracked — the contract callers use to
+		// bound duplicates — rather than pretending the post never happened.
+		return commentID, true, false
 	}
 
 	comment := &storage.ApplyComment{
-		ApplyID:         o.applyID,
-		CommentState:    commentState,
-		GitHubCommentID: commentID,
+		ApplyID:                o.applyID,
+		CommentState:           commentState,
+		GitHubCommentID:        commentID,
+		PendingFreezeCommentID: pendingFreezeCommentID,
+	}
+	if commentState == state.Comment.Progress {
+		level := apply.GetOptions().Volume
+		comment.PostedVolume = &level
 	}
 	if err := o.stor.ApplyComments().Upsert(o.contextWithApplyLease(ctx, apply), comment); err != nil {
 		o.logError(apply, "observer: failed to store comment ID", "error", err, "comment_state", commentState)
+		if commentState == state.Comment.Progress {
+			// The tracked row still describes the prior comment; drop the
+			// cached level so the next volume check re-reads storage.
+			o.trackedPostedVolumeKnown = false
+		}
+		return commentID, true, false
 	}
+	if commentState == state.Comment.Progress {
+		o.trackedPostedVolume = *comment.PostedVolume
+		o.trackedPostedVolumeKnown = true
+	}
+	return commentID, true, true
 }
 
 func (o *CommentObserver) renderPRComment(body string) string {

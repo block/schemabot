@@ -680,7 +680,10 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 		mux.HandleFunc(pattern, s.limitRequestBody(handler))
 	}
 
-	// Health endpoints
+	// Health endpoints. /livez is process liveness (no dependency checks);
+	// /health is readiness (storage-dependent). See the handler comments for
+	// why the two must not be conflated.
+	handle("GET /livez", s.handleLivez)
 	handle("GET /health", s.handleHealth)
 	handle("GET /tern-health/{deployment}/{environment}", s.handleTernHealth)
 
@@ -709,6 +712,7 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 	handle("POST /api/webhooks/redrive", s.handleWebhookRedrive)
 	handle("POST /api/checks/scan", s.handleChecksScan)
 	handle("POST /api/checks/synthesize", s.handleChecksSynthesize)
+	handle("POST /api/checks/repos", s.handleChecksRepos)
 
 	// Lock API (database-level locking)
 	handle("POST /api/locks/acquire", s.handleLockAcquire)

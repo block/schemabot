@@ -2663,10 +2663,16 @@ func (c *GRPCClient) markRemoteApplyFailedWithOptions(ctx context.Context, remot
 		storedApply.CompletedAt = &now
 	}
 	storedApply.UpdatedAt = now
+	// Append the terminal log line before committing the failed state: watchers
+	// (the comment observer's poller) act the moment the applies row turns
+	// failed, and anything they render from apply_logs — the failure summary's
+	// log fold — must already contain the failure line. A failed update after
+	// the append leaves the row non-terminal and re-drivable; the retry appends
+	// a duplicate line to the event log, which is harmless.
+	c.logApplyStateTransition(ctx, storedApply, storage.LogLevelError, fmt.Sprintf("Remote apply failed: %s", message), oldState)
 	if err := c.storage.Applies().Update(ctx, storedApply); err != nil {
 		return fmt.Errorf("update remote gRPC apply failure %s: %w", storedApply.ApplyIdentifier, err)
 	}
-	c.logApplyStateTransition(ctx, storedApply, storage.LogLevelError, fmt.Sprintf("Remote apply failed: %s", message), oldState)
 	*remoteApply = *storedApply
 	metrics.AdjustActiveApplies(ctx, -1, storedApply.Database, storedApply.Deployment, storedApply.Environment)
 	return nil

@@ -42,6 +42,7 @@ func (m *mockStorage) ApplyComments() storage.ApplyCommentStore     { return nil
 func (m *mockStorage) ApplyOperations() storage.ApplyOperationStore { return nil }
 func (m *mockStorage) Checks() storage.CheckStore                   { return nil }
 func (m *mockStorage) Settings() storage.SettingsStore              { return nil }
+func (m *mockStorage) WebhookEvents() storage.WebhookEventStore     { return nil }
 func (m *mockStorage) Ping(ctx context.Context) error               { return m.pingErr }
 func (m *mockStorage) Close() error                                 { return nil }
 
@@ -3524,6 +3525,47 @@ func TestHealth(t *testing.T) {
 		err := json.NewDecoder(w.Body).Decode(&resp)
 		require.NoError(t, err, "failed to decode response")
 		assert.NotEmpty(t, resp["error"], "expected error message")
+	})
+}
+
+// TestLivez verifies the liveness endpoint reflects process health only: it
+// reports alive even when the storage database is unreachable, so a storage
+// outage pulls instances from the Service (readiness) instead of restarting
+// them and aborting in-flight schema changes.
+func TestLivez(t *testing.T) {
+	t.Run("alive", func(t *testing.T) {
+		svc := newTestService()
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		req := httptest.NewRequestWithContext(t.Context(), "GET", "/livez", nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp map[string]string
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err, "failed to decode response")
+		assert.Equal(t, "alive", resp["status"])
+	})
+
+	t.Run("alive while storage is unreachable", func(t *testing.T) {
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		svc := New(&mockStorage{pingErr: errors.New("connection refused")}, testServerConfig(), nil, logger)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		req := httptest.NewRequestWithContext(t.Context(), "GET", "/livez", nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp map[string]string
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err, "failed to decode response")
+		assert.Equal(t, "alive", resp["status"])
 	})
 }
 

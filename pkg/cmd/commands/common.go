@@ -224,10 +224,33 @@ func withLoading(message string, show bool, fn func() error) error {
 // startLiveProgress renders a spinner with a caller-updated status line on
 // stderr, for chunked operations that report progress between requests.
 // update replaces the status text; stop clears the line. Both are no-ops when
-// show is false or stderr is not a terminal, so scripted runs stay clean.
+// show is false, so JSON output stays clean. When stderr is not a terminal
+// (a scripted run, a log pipe), each new status prints as its own plain line
+// instead — a long sweep must stay observable in a log file, not go silent.
 func startLiveProgress(show bool) (update func(string), stop func()) {
-	if !show || !loadingSpinnerTerminal() {
+	if !show {
 		return func(string) {}, func() {}
+	}
+	if !loadingSpinnerTerminal() {
+		var mu sync.Mutex
+		last := ""
+		broken := false
+		update = func(text string) {
+			mu.Lock()
+			defer mu.Unlock()
+			// The spinner variant repaints the same text every frame; the plain
+			// variant prints only on change so logs record each step once.
+			if broken || text == last {
+				return
+			}
+			last = text
+			if _, err := fmt.Fprintln(loadingSpinnerWriter, text); err != nil {
+				// Progress is advisory; a stderr that stopped accepting writes
+				// stops further updates, matching the spinner goroutine's exit.
+				broken = true
+			}
+		}
+		return update, func() {}
 	}
 
 	var mu sync.Mutex

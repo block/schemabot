@@ -3,6 +3,8 @@ CREATE TABLE `apply_comments` (
   `apply_id` bigint unsigned NOT NULL,
   `comment_state` varchar(50) NOT NULL,
   `github_comment_id` bigint NOT NULL,
+  `posted_volume` int DEFAULT NULL,
+  `pending_freeze_github_comment_id` bigint DEFAULT NULL,
   `edit_count` int NOT NULL DEFAULT '0',
   `last_edited_at` datetime DEFAULT NULL,
   `superseded_at` datetime DEFAULT NULL,

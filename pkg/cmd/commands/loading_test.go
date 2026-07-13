@@ -89,6 +89,37 @@ func TestWithLoadingNonTerminalIsSilent(t *testing.T) {
 	assert.Empty(t, out.String())
 }
 
+// A scripted run (stderr piped to a log, CI) still gets progress: each new
+// status prints as its own plain line, repeated updates with the same text
+// print once, and no ANSI control codes leak into the log.
+func TestStartLiveProgressPrintsPlainLinesWhenNotTerminal(t *testing.T) {
+	var out bytes.Buffer
+	withTestLoadingSpinner(t, &out)
+	loadingSpinnerTerminal = func() bool { return false }
+
+	update, stop := startLiveProgress(true)
+	update("scanning page 1")
+	update("scanning page 1")
+	update("scanning page 2")
+	stop()
+
+	assert.Equal(t, "scanning page 1\nscanning page 2\n", out.String())
+}
+
+// JSON mode stays fully silent even off-terminal, so piped output carries
+// nothing but the payload streams.
+func TestStartLiveProgressDisabledIsSilentOffTerminal(t *testing.T) {
+	var out bytes.Buffer
+	withTestLoadingSpinner(t, &out)
+	loadingSpinnerTerminal = func() bool { return false }
+
+	update, stop := startLiveProgress(false)
+	update("scanning page 1")
+	stop()
+
+	assert.Empty(t, out.String())
+}
+
 func withTestLoadingSpinner(t *testing.T, writer interface{ Write([]byte) (int, error) }) {
 	t.Helper()
 	originalDelay := loadingSpinnerDelay

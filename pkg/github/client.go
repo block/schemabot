@@ -555,6 +555,16 @@ func (ic *InstallationClient) CreateIssueComment(ctx context.Context, repo strin
 	return comment.GetID(), nil
 }
 
+// GetIssueComment returns the current body of an existing PR/issue comment.
+func (ic *InstallationClient) GetIssueComment(ctx context.Context, repo string, commentID int64) (string, error) {
+	owner, repoName := splitRepo(repo)
+	comment, _, err := ic.client.Issues.GetComment(ctx, owner, repoName, commentID)
+	if err != nil {
+		return "", fmt.Errorf("get issue comment %d: %w", commentID, err)
+	}
+	return comment.GetBody(), nil
+}
+
 // EditIssueComment edits an existing PR/issue comment.
 func (ic *InstallationClient) EditIssueComment(ctx context.Context, repo string, commentID int64, body string) error {
 	owner, repoName := splitRepo(repo)
@@ -597,14 +607,20 @@ type OpenPullRequest struct {
 	HeadSHA string
 	BaseRef string
 	User    string
+	// UpdatedAt is the PR's last-activity time. The listing orders by it
+	// (newest first), so a caller sweeping a time window can stop paging once
+	// a page crosses the window start.
+	UpdatedAt time.Time
 }
 
 // ListOpenPullRequestsPage lists one page of open pull requests in a
 // repository, newest updated first. page is 1-based (0 selects the first
-// page). nextPage is 0 when no further pages exist. Fetching one bounded page
-// per call lets operator scans run as many short requests instead of one
-// long one.
-func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo string, page, perPage int) (prs []OpenPullRequest, nextPage int, err error) {
+// page). nextPage is 0 when no further pages exist. lastPage is the final
+// page number GitHub reports for the listing (0 when this page is the last),
+// letting callers derive the repository's total open-PR count for progress
+// denominators. Fetching one bounded page per call lets operator scans run as
+// many short requests instead of one long one.
+func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo string, page, perPage int) (prs []OpenPullRequest, nextPage, lastPage int, err error) {
 	owner, repoName := splitRepo(repo)
 	if page <= 0 {
 		page = 1
@@ -633,22 +649,39 @@ func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo
 		return list, nil
 	})
 	if err != nil {
-		return nil, 0, fmt.Errorf("list open pull requests for %s page %d: %w", repo, page, err)
+		return nil, 0, 0, fmt.Errorf("list open pull requests for %s page %d: %w", repo, page, err)
 	}
 	for _, pr := range ghPRs {
 		prs = append(prs, OpenPullRequest{
-			Number:  pr.GetNumber(),
-			Title:   pr.GetTitle(),
-			HeadRef: pr.GetHead().GetRef(),
-			HeadSHA: pr.GetHead().GetSHA(),
-			BaseRef: pr.GetBase().GetRef(),
-			User:    pr.GetUser().GetLogin(),
+			Number:    pr.GetNumber(),
+			Title:     pr.GetTitle(),
+			HeadRef:   pr.GetHead().GetRef(),
+			HeadSHA:   pr.GetHead().GetSHA(),
+			BaseRef:   pr.GetBase().GetRef(),
+			User:      pr.GetUser().GetLogin(),
+			UpdatedAt: pr.GetUpdatedAt().Time,
 		})
 	}
 	if resp != nil {
 		nextPage = resp.NextPage
+		lastPage = resp.LastPage
 	}
-	return prs, nextPage, nil
+	return prs, nextPage, lastPage, nil
+}
+
+// CoreRateLimit reports the installation's remaining core REST budget. The
+// /rate_limit endpoint does not consume the budget it reports, so pacing
+// checks are free. resetAt is when GitHub replenishes the budget.
+func (ic *InstallationClient) CoreRateLimit(ctx context.Context) (remaining, limit int, resetAt time.Time, err error) {
+	limits, _, err := ic.client.RateLimit.Get(ctx)
+	if err != nil {
+		return 0, 0, time.Time{}, fmt.Errorf("get GitHub core rate limit: %w", err)
+	}
+	core := limits.GetCore()
+	if core == nil {
+		return 0, 0, time.Time{}, fmt.Errorf("get GitHub core rate limit: response carried no core bucket")
+	}
+	return core.Remaining, core.Limit, core.Reset.Time, nil
 }
 
 // IsClosed reports whether the PR is closed (merged or unmerged). Callers that
@@ -931,6 +964,10 @@ type CheckRunResult struct {
 	Name       string
 	Status     string // "queued", "in_progress", "completed"
 	Conclusion string // "success", "failure", "neutral", "action_required"
+	// StartedAt is when the Check Run was started; zero when GitHub did not
+	// report a start time. Lets callers judge how long a run that never
+	// completed has been sitting.
+	StartedAt time.Time
 }
 
 // FindCheckRunByName searches for a check run on a specific commit by name.
@@ -989,6 +1026,7 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 						Name:       run.GetName(),
 						Status:     run.GetStatus(),
 						Conclusion: run.GetConclusion(),
+						StartedAt:  run.GetStartedAt().Time,
 					}
 				}
 			}

@@ -204,7 +204,7 @@ func (h *Handler) executeApply(
 		State:       apply.State,
 		Engine:      schemaResult.Type,
 	})
-	h.postInitialProgressComment(ctx, repo, pr, installationID, applyID, progressBody)
+	h.postInitialProgressComment(ctx, repo, pr, installationID, apply, progressBody)
 
 	// Update stored check state to in_progress (transitions action_required to in_progress).
 	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID); err != nil {
