@@ -212,6 +212,124 @@ func TestWebhookEventStore_TerminalWritesReturnNotFoundAfterDelete(t *testing.T)
 
 	require.ErrorIs(t, store.WebhookEvents().MarkCompleted(ctx, claimed.ID, claimed.LeaseToken), storage.ErrWebhookEventNotFound)
 	require.ErrorIs(t, store.WebhookEvents().MarkFailed(ctx, claimed.ID, claimed.LeaseToken, "failed", nil), storage.ErrWebhookEventNotFound)
+	require.ErrorIs(t, store.WebhookEvents().Heartbeat(ctx, claimed.ID, claimed.LeaseToken, time.Minute), storage.ErrWebhookEventNotFound)
+}
+
+func TestWebhookEventStore_CreateRejectsNonPendingState(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	// A row created directly in "processing" would have NULL lease columns:
+	// never claimable, never expiring, yet deduplicating every future
+	// redelivery. Create must only ever persist pending rows.
+	for _, state := range []string{
+		storage.WebhookEventProcessing,
+		storage.WebhookEventCompleted,
+		storage.WebhookEventFailedRetryable,
+		storage.WebhookEventFailed,
+		"bogus",
+	} {
+		inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+			DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`), State: state,
+		})
+		require.ErrorContains(t, err, "must be pending", "state %q", state)
+		require.False(t, inserted)
+	}
+
+	stored, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
+	require.NoError(t, err)
+	require.Nil(t, stored)
+}
+
+func TestWebhookEventStore_CreateReopensTerminallyFailedDelivery(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":1}`)})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.NoError(t, store.WebhookEvents().MarkFailed(ctx, claimed.ID, claimed.LeaseToken, "permanent failure", nil))
+
+	// GitHub "Redeliver" reuses the original delivery GUID; it must re-open a
+	// terminally failed row instead of being deduplicated into a no-op.
+	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":2}`)})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
+	require.NoError(t, err)
+	require.NotNil(t, reopened)
+	assert.Equal(t, storage.WebhookEventPending, reopened.State)
+	assert.Equal(t, 0, reopened.Attempts)
+	assert.Empty(t, reopened.LeaseToken)
+	assert.Nil(t, reopened.CompletedAt)
+	assert.Nil(t, reopened.StartedAt)
+	assert.JSONEq(t, `{"attempt":2}`, string(reopened.Payload))
+
+	reclaimed, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, reclaimed)
+	require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, reclaimed.ID, reclaimed.LeaseToken))
+
+	// Completed rows must stay deduplicated: redelivery of finished work is a
+	// no-op.
+	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":3}`)})
+	require.NoError(t, err)
+	require.False(t, inserted)
+}
+
+func TestWebhookEventStore_FindNextStopsReclaimingAtAttemptsCeiling(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	// A poison event that hard-kills drivers before MarkFailed leaves an
+	// expired-lease processing row. Once attempts reaches the ceiling it must
+	// stop being reclaimed instead of blocking the queue forever.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, attempts = ?, lease_owner = 'driver-a', lease_token = 'token-a',
+			lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 HOUR)
+		WHERE delivery_id = 'delivery-1'
+	`, storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts)
+	require.NoError(t, err)
+
+	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
+	require.NoError(t, err)
+	require.Nil(t, claimed, "expired-lease row at the attempts ceiling must not be reclaimed")
+
+	// Same ceiling applies to retryable failures.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, retry_after = NULL, lease_expires_at = NULL
+		WHERE delivery_id = 'delivery-1'
+	`, storage.WebhookEventFailedRetryable)
+	require.NoError(t, err)
+
+	claimed, err = store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
+	require.NoError(t, err)
+	require.Nil(t, claimed, "retryable row at the attempts ceiling must not be reclaimed")
+
+	// One attempt below the ceiling is still claimable.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE webhook_events SET attempts = ? WHERE delivery_id = 'delivery-1'
+	`, storage.MaxWebhookEventAttempts-1)
+	require.NoError(t, err)
+
+	claimed, err = store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, storage.MaxWebhookEventAttempts, claimed.Attempts)
 }
 
 func TestWebhookEventStore_HeartbeatTreatsUnchangedMatchingLeaseAsSuccess(t *testing.T) {

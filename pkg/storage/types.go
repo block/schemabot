@@ -18,6 +18,15 @@ import (
 // the storage claim/expiry paths.
 const MaxRecoveryAttempts = 10
 
+// MaxWebhookEventAttempts is the claim budget for webhook inbox rows: how many
+// times FindNext will hand out a given delivery (each claim increments
+// attempts) before the row stops being claimable. It bounds the blast radius
+// of a poison event whose processing hard-kills drivers before MarkFailed can
+// run — without it, such a row's expired lease would be reclaimed forever,
+// ahead of every newer delivery. Rows that exhaust the budget without reaching
+// a terminal state are left for reconciliation/monitoring to surface.
+const MaxWebhookEventAttempts = 5
+
 // Cutover policies control how a multi-deployment rollout sequences the copy
 // and cutover phases of its deployments. The value is resolved from the
 // environment config at apply-create time and persisted on each apply_operations

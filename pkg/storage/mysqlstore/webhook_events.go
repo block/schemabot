@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -34,12 +33,17 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 		provider = storage.WebhookProviderGitHub
 	}
 	payload := nullJSON(event.Payload)
+	// New deliveries are always pending. Accepting any other state here would
+	// let a caller persist a row that no lifecycle path can move — e.g. a
+	// "processing" row with NULL lease columns is never claimable and never
+	// expires, yet its delivery GUID dedups all future redeliveries into
+	// no-ops, silently wedging that delivery forever.
 	state := event.State
 	if state == "" {
 		state = storage.WebhookEventPending
 	}
-	if !isKnownWebhookEventState(state) {
-		return false, fmt.Errorf("create webhook event (delivery_id=%s): unknown state %q", event.DeliveryID, state)
+	if state != storage.WebhookEventPending {
+		return false, fmt.Errorf("create webhook event (delivery_id=%s): new deliveries must be pending, got %q", event.DeliveryID, state)
 	}
 	receivedAt := event.ReceivedAt
 	if receivedAt.IsZero() {
@@ -55,7 +59,7 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 		payload, state, event.Attempts, receivedAt)
 	if err != nil {
 		if isDuplicateKeyError(err) {
-			return false, nil
+			return s.reopenTerminalWebhookEvent(ctx, provider, event.DeliveryID, payload, receivedAt)
 		}
 		return false, fmt.Errorf("insert webhook event (provider=%s, delivery_id=%s): %w", provider, event.DeliveryID, err)
 	}
@@ -69,6 +73,31 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 	event.Payload = []byte(payload)
 	event.ReceivedAt = receivedAt
 	return true, nil
+}
+
+// reopenTerminalWebhookEvent handles the duplicate-GUID branch of Create.
+// GitHub's "Redeliver" reuses the original delivery GUID, so plain dedup would
+// make redelivery a permanent no-op for a terminally failed row — the one case
+// where an operator most needs it to work. Re-open only terminal failures:
+// pending/retryable/processing rows are genuinely in flight (dedup, return
+// false), and completed rows must not re-run. last_error is kept for forensics
+// until the next attempt overwrites it.
+func (s *webhookEventStore) reopenTerminalWebhookEvent(ctx context.Context, provider, deliveryID, payload string, receivedAt time.Time) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, attempts = 0, payload = ?, received_at = ?,
+			lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+			retry_after = NULL, completed_at = NULL, started_at = NULL, updated_at = NOW()
+		WHERE provider = ? AND delivery_id = ? AND state = ?
+	`, storage.WebhookEventPending, payload, receivedAt, provider, deliveryID, storage.WebhookEventFailed)
+	if err != nil {
+		return false, fmt.Errorf("reopen terminally failed webhook delivery (provider=%s, delivery_id=%s): %w", provider, deliveryID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read reopened webhook delivery rows affected (provider=%s, delivery_id=%s): %w", provider, deliveryID, err)
+	}
+	return rows > 0, nil
 }
 
 func (s *webhookEventStore) GetByDeliveryID(ctx context.Context, provider, deliveryID string) (*storage.WebhookEvent, error) {
@@ -100,12 +129,14 @@ func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDur
 		SELECT `+webhookEventColumns+`
 		FROM webhook_events
 		WHERE state = ?
-			OR (state = ? AND (retry_after IS NULL OR retry_after <= NOW()))
-			OR (state = ? AND lease_expires_at <= NOW(6))
+			OR (state = ? AND (retry_after IS NULL OR retry_after <= NOW()) AND attempts < ?)
+			OR (state = ? AND lease_expires_at <= NOW(6) AND attempts < ?)
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, storage.WebhookEventPending, storage.WebhookEventFailedRetryable, storage.WebhookEventProcessing)
+	`, storage.WebhookEventPending,
+		storage.WebhookEventFailedRetryable, storage.MaxWebhookEventAttempts,
+		storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts)
 
 	event, err := scanWebhookEventInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -167,7 +198,7 @@ func (s *webhookEventStore) Heartbeat(ctx context.Context, id int64, leaseToken 
 	if err != nil {
 		return fmt.Errorf("heartbeat webhook event %d: %w", id, err)
 	}
-	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken, true)
+	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
 }
 
 // MarkCompleted marks a claimed event terminal-successful.
@@ -186,7 +217,7 @@ func (s *webhookEventStore) MarkCompleted(ctx context.Context, id int64, leaseTo
 	if err != nil {
 		return fmt.Errorf("mark webhook event %d completed: %w", id, err)
 	}
-	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken, false)
+	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
 }
 
 // MarkFailed marks a claimed event failed. A non-nil retryAfter keeps it
@@ -212,7 +243,7 @@ func (s *webhookEventStore) MarkFailed(ctx context.Context, id int64, leaseToken
 	if err != nil {
 		return fmt.Errorf("mark webhook event %d failed: %w", id, err)
 	}
-	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken, false)
+	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
 }
 
 func scanWebhookEvent(row *sql.Row) (*storage.WebhookEvent, error) {
@@ -254,7 +285,7 @@ func scanWebhookEventInto(row scanner) (*storage.WebhookEvent, error) {
 	return &event, nil
 }
 
-func (s *webhookEventStore) checkWebhookEventLeaseResult(ctx context.Context, result sql.Result, id int64, leaseToken string, missingOK bool) error {
+func (s *webhookEventStore) checkWebhookEventLeaseResult(ctx context.Context, result sql.Result, id int64, leaseToken string) error {
 	rows, err := result.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("read webhook event %d lease write rows affected: %w", id, err)
@@ -265,10 +296,6 @@ func (s *webhookEventStore) checkWebhookEventLeaseResult(ctx context.Context, re
 	var currentToken sql.NullString
 	err = s.db.QueryRowContext(ctx, `SELECT lease_token FROM webhook_events WHERE id = ?`, id).Scan(&currentToken)
 	if errors.Is(err, sql.ErrNoRows) {
-		if missingOK {
-			slog.WarnContext(ctx, "webhook event heartbeat skipped: row no longer exists", "webhook_event_id", id)
-			return nil
-		}
 		return storage.ErrWebhookEventNotFound
 	}
 	if err != nil {
@@ -278,18 +305,4 @@ func (s *webhookEventStore) checkWebhookEventLeaseResult(ctx context.Context, re
 		return nil
 	}
 	return storage.ErrWebhookEventLeaseLost
-}
-
-// isKnownWebhookEventState reports whether s is a valid webhook_events.state
-// value. Create rejects unknown states so a typo cannot persist a permanently
-// unclaimable row that dedup then drops forever.
-func isKnownWebhookEventState(s string) bool {
-	switch s {
-	case storage.WebhookEventPending, storage.WebhookEventProcessing,
-		storage.WebhookEventCompleted, storage.WebhookEventFailedRetryable,
-		storage.WebhookEventFailed:
-		return true
-	default:
-		return false
-	}
 }
