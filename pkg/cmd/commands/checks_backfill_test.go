@@ -11,60 +11,6 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 )
 
-// The classification core: a PR with a failed check-creating delivery in the
-// crawl is redriveable (grouped under its App); everything else synthesizes.
-// A crawl that stopped early marks the search incomplete so the report can
-// say why some PRs synthesize instead of redriving.
-func TestIndexRedriveableDeliveries(t *testing.T) {
-	redriveable, complete := indexRedriveableDeliveries(&apitypes.WebhookRedriveResponse{
-		Results: []apitypes.WebhookRedriveResult{
-			{
-				AppName:            "production",
-				ReachedWindowStart: true,
-				Selected: []apitypes.WebhookRedriveSelection{
-					{ID: 11, PR: 5},
-					{ID: 12, PR: 5},
-					{ID: 13, PR: 9},
-					{ID: 14, PR: 0},
-				},
-			},
-		},
-	})
-
-	require.True(t, complete)
-	require.Len(t, redriveable, 2)
-	assert.Equal(t, map[string][]int64{"production": {11, 12}}, redriveable[5])
-	assert.Equal(t, map[string][]int64{"production": {13}}, redriveable[9])
-
-	_, complete = indexRedriveableDeliveries(&apitypes.WebhookRedriveResponse{
-		Results: []apitypes.WebhookRedriveResult{
-			{AppName: "production", NextCursor: "c1"},
-		},
-	})
-	assert.False(t, complete, "a crawl stopped mid-window cannot prove which PRs are redriveable")
-
-	_, complete = indexRedriveableDeliveries(&apitypes.WebhookRedriveResponse{
-		Results: []apitypes.WebhookRedriveResult{
-			{AppName: "production", HistoryExhausted: true},
-		},
-	})
-	assert.True(t, complete, "exhausted history covered everything GitHub retains")
-}
-
-// A PR with retained failed deliveries in more than one App (for example
-// after an App migration) keeps each App's delivery IDs under that App, so
-// each is later redelivered with its own token rather than mixed.
-func TestIndexRedriveableDeliveriesGroupsMultipleAppsPerPR(t *testing.T) {
-	redriveable, _ := indexRedriveableDeliveries(&apitypes.WebhookRedriveResponse{
-		Results: []apitypes.WebhookRedriveResult{
-			{AppName: "old-app", ReachedWindowStart: true, Selected: []apitypes.WebhookRedriveSelection{{ID: 1, PR: 7}}},
-			{AppName: "new-app", ReachedWindowStart: true, Selected: []apitypes.WebhookRedriveSelection{{ID: 2, PR: 7}}},
-		},
-	})
-
-	assert.Equal(t, map[string][]int64{"old-app": {1}, "new-app": {2}}, redriveable[7])
-}
-
 // A PR title or server error containing tabs/newlines is neutralized so it
 // cannot break the tab-separated report layout.
 func TestSanitizeCell(t *testing.T) {
@@ -117,13 +63,12 @@ func TestStuckChecksPastThreshold(t *testing.T) {
 // are missing at all.
 func TestWriteChecksBackfillReportRendersStuckSection(t *testing.T) {
 	report := &checksBackfillReport{
-		Repos:                  []string{"octo/repo"},
-		CheckNames:             []string{"SchemaBot (production)"},
-		Scanned:                12,
-		Last:                   "1d",
-		DeliverySearchComplete: true,
-		DryRun:                 true,
-		StuckAfter:             "1h",
+		Repos:      []string{"octo/repo"},
+		CheckNames: []string{"SchemaBot (production)"},
+		Scanned:    12,
+		Last:       "1d",
+		DryRun:     true,
+		StuckAfter: "1h",
 		Stuck: []checksStuckCheck{
 			{
 				Repo: "octo/repo", PR: 5, URL: "https://github.com/octo/repo/pull/5", Title: "wedged", HeadSHA: "sha5555555555555",
@@ -146,9 +91,10 @@ func TestWriteChecksBackfillReportRendersStuckSection(t *testing.T) {
 }
 
 // A fleet-wide report summarizes the repo count instead of naming every
-// repository, and a plain synthesize plan does not claim "no retained
-// delivery" when the delivery history was never searched.
-func TestWriteChecksBackfillReportFleetHeadlineAndPlanWording(t *testing.T) {
+// repository, a plain missing-check PR plans a synthesize, and a held PR —
+// one whose head also carries an uncompleted Check Run a started apply may
+// own — is explicitly marked as not acted on.
+func TestWriteChecksBackfillReportFleetHeadlineAndHeldPRs(t *testing.T) {
 	report := &checksBackfillReport{
 		Repos:      []string{"octo/a", "octo/b", "octo/c", "octo/d"},
 		CheckNames: []string{"SchemaBot (production)"},
@@ -156,7 +102,8 @@ func TestWriteChecksBackfillReportFleetHeadlineAndPlanWording(t *testing.T) {
 		DryRun:     true,
 		StuckAfter: "1h",
 		Actions: []checksBackfillAction{
-			{Repo: "octo/b", PR: 7, URL: "https://github.com/octo/b/pull/7", Title: "missing", HeadSHA: "sha7", MissingNames: []string{"SchemaBot (production)"}, Classification: "synthesize"},
+			{Repo: "octo/b", PR: 7, URL: "https://github.com/octo/b/pull/7", Title: "missing", HeadSHA: "sha7", MissingNames: []string{"SchemaBot (production)"}},
+			{Repo: "octo/c", PR: 9, URL: "https://github.com/octo/c/pull/9", Title: "missing but uncompleted sibling", HeadSHA: "sha9", MissingNames: []string{"SchemaBot (production)"}, Held: true},
 		},
 	}
 
@@ -166,7 +113,7 @@ func TestWriteChecksBackfillReportFleetHeadlineAndPlanWording(t *testing.T) {
 	rendered := out.String()
 	assert.Contains(t, rendered, "Scanned 40 open PRs in 4 repositories")
 	assert.Contains(t, rendered, "synthesize via auto-plan")
-	assert.NotContains(t, rendered, "no retained delivery", "the crawl never ran, so its absence is not a finding")
+	assert.Contains(t, rendered, "held: an uncompleted Check Run sits on this head")
 }
 
 // The pacing decision: pause only when the budget snapshot is below the floor

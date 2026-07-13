@@ -25,7 +25,10 @@ type ChecksCmd struct {
 // present, did it complete? Missing checks are recreated by replaying the
 // auto-plan flow server-side; existing-but-uncompleted checks aged past
 // --stuck-after are reported for investigation, never acted on, because an
-// uncompleted check can belong to a genuinely in-flight apply.
+// uncompleted check can belong to a genuinely in-flight apply. For the same
+// reason, a missing-check PR whose head also carries an uncompleted check is
+// held out of the backfill (and the server independently refuses any PR with
+// a non-terminal apply).
 //
 // --all-repos sweeps every repository declared on the server, and --last
 // bounds the sweep to PRs updated within a window — together they make an
@@ -34,28 +37,26 @@ type ChecksCmd struct {
 // backfill for a repository that predates check enablement. --dry-run
 // reports without acting.
 type ChecksBackfillCmd struct {
-	Repo             string `arg:"" optional:"" help:"Repository to backfill, in owner/name form; omit with --all-repos"`
-	AllRepos         bool   `help:"Scan every repository declared in the server's repos config"`
-	Last             string `help:"Only scan PRs updated within this window, for example 1h or 1d; by default every open PR is scanned"`
-	Environment      string `help:"Only backfill this environment's SchemaBot Check Run name"`
-	CheckName        string `help:"Override the SchemaBot Check Run name to look for"`
-	Limit            int    `help:"Maximum open PRs to consider across all scanned repositories; 0 considers all" default:"0"`
-	StuckAfter       string `help:"Report an existing but uncompleted Check Run as stuck once it has been sitting this long, for example 1h or 2d" default:"1h"`
-	RateLimitFloor   int    `help:"Pause whenever the GitHub budget drops below this percentage of its limit, resuming after it resets, so live webhook traffic keeps headroom; 0 disables pacing" default:"20"`
-	Redrive          bool   `help:"Redeliver a missing-check PR's retained failed webhook delivery instead of synthesizing, when GitHub still has one (single repository only; slow: GitHub lists delivery history App-wide)"`
-	DeliveryWindow   string `help:"With --redrive: how far back to search delivery history, for example 6h or 14d" default:"14d"`
-	MaxDeliveryPages int    `help:"With --redrive: maximum delivery pages to search per App" default:"300"`
-	DryRun           bool   `help:"Report missing and stuck Check Runs without redelivering or synthesizing"`
-	JSON             bool   `help:"Output as JSON"`
+	Repo           string `arg:"" optional:"" help:"Repository to backfill, in owner/name form; omit with --all-repos"`
+	AllRepos       bool   `help:"Scan every repository declared in the server's repos config"`
+	Last           string `help:"Only scan PRs updated within this window, for example 1h or 1d; by default every open PR is scanned"`
+	Environment    string `help:"Only backfill this environment's SchemaBot Check Run name"`
+	CheckName      string `help:"Override the SchemaBot Check Run name to look for"`
+	Limit          int    `help:"Maximum open PRs to consider across all scanned repositories; 0 considers all" default:"0"`
+	StuckAfter     string `help:"Report an existing but uncompleted Check Run as stuck once it has been sitting this long, for example 1h or 2d" default:"1h"`
+	RateLimitFloor int    `help:"Pause whenever the GitHub budget drops below this percentage of its limit, resuming after it resets, so live webhook traffic keeps headroom; 0 disables pacing" default:"20"`
+	DryRun         bool   `help:"Report missing and stuck Check Runs without synthesizing"`
+	JSON           bool   `help:"Output as JSON"`
 }
 
 // checksSynthesizeBatchSize matches the server's per-request PR cap.
 const checksSynthesizeBatchSize = 10
 
-// checksRedriveBatchSize bounds the delivery IDs redelivered per request, so
-// the redrive phase stays chunked (like synthesize) and no single request can
-// outlive an intermediary HTTP timeout under the server's per-delivery delay.
-const checksRedriveBatchSize = 50
+// checksBackfillHeldStatus explains a held PR in the action table. The server
+// refuses these too (a non-terminal apply refuses its PR's backfill), but the
+// hold works from the scan's own signal — an uncompleted Check Run on the same
+// head — so the PR never even reaches the server, and the operator sees why.
+const checksBackfillHeldStatus = "held: an uncompleted Check Run sits on this head (a started apply may own it); investigate before backfilling"
 
 // checksBackfillAction is one PR's classification and (after acting) outcome.
 type checksBackfillAction struct {
@@ -69,17 +70,14 @@ type checksBackfillAction struct {
 	// an untrusted app's Check Run; backfill recreates the trusted check but
 	// the operator likely also needs to resolve the conflicting one.
 	UntrustedConflictNames []string `json:"untrusted_conflict_names,omitempty"`
-	// Classification is "redrive" when GitHub still retains a failed
-	// check-creating delivery for the PR (found only under --redrive),
-	// otherwise "synthesize".
-	Classification string `json:"classification"`
-	// RedriveByApp groups the PR's redriveable delivery IDs by the App that
-	// owns them. A repo/PR can have retained failed deliveries in more than
-	// one App (for example after an App migration), and a delivery can only be
-	// redelivered with its own App's token, so the grouping must be preserved.
-	RedriveByApp map[string][]int64 `json:"redrive_by_app,omitempty"`
-	Outcome      string             `json:"outcome,omitempty"`
-	Error        string             `json:"error,omitempty"`
+	// Held marks a missing-check PR the backfill refuses to act on: the same
+	// head also carries an uncompleted Check Run, which a genuinely in-flight
+	// apply may own, and re-planning the PR could replace an apply-owned merge
+	// block with a fresh passing plan. Held PRs are reported, never sent to
+	// the server.
+	Held    bool   `json:"held,omitempty"`
+	Outcome string `json:"outcome,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // checksStuckCheck is one existing-but-uncompleted Check Run on an open PR,
@@ -106,13 +104,11 @@ type checksBackfillReport struct {
 	Scanned    int      `json:"scanned"`
 	// Last echoes the --last window bounding the sweep; empty means every
 	// open PR was scanned.
-	Last                   string                 `json:"last,omitempty"`
-	Redrive                bool                   `json:"redrive"`
-	DeliverySearchComplete bool                   `json:"delivery_search_complete"`
-	DryRun                 bool                   `json:"dry_run"`
-	StuckAfter             string                 `json:"stuck_after"`
-	Actions                []checksBackfillAction `json:"actions"`
-	Stuck                  []checksStuckCheck     `json:"stuck,omitempty"`
+	Last       string                 `json:"last,omitempty"`
+	DryRun     bool                   `json:"dry_run"`
+	StuckAfter string                 `json:"stuck_after"`
+	Actions    []checksBackfillAction `json:"actions"`
+	Stuck      []checksStuckCheck     `json:"stuck,omitempty"`
 }
 
 func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
@@ -121,9 +117,6 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 	}
 	if cmd.Repo != "" && cmd.AllRepos {
 		return fmt.Errorf("use either a repository argument or --all-repos, not both")
-	}
-	if cmd.Redrive && cmd.AllRepos {
-		return fmt.Errorf("--redrive searches one repository's delivery history; use it with a repository argument, not --all-repos")
 	}
 	if cmd.Limit < 0 {
 		return fmt.Errorf("--limit must be non-negative")
@@ -167,54 +160,15 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 		repos = declared.Repos
 	}
 
-	// Optional redrive phase: one crawl of the retained delivery history
-	// builds the redriveable index — proving "no delivery exists" for a PR any
-	// other way would cost a crawl per PR. GitHub lists delivery history
-	// App-wide (there is no repo filter), so the crawl walks every repo's
-	// deliveries and is expensive; it is opt-in because a missing check
-	// synthesizes to the same resulting Check Runs without it.
-	redriveable := map[int]map[string][]int64{}
-	searchComplete := true
-	if cmd.Redrive {
-		windowEnd := webhookRedriveNow()
-		deliveryWindow, err := parseOperatorDuration(cmd.DeliveryWindow)
-		if err != nil {
-			return fmt.Errorf("parse --delivery-window: %w", err)
-		}
-		if cmd.MaxDeliveryPages <= 0 {
-			return fmt.Errorf("--max-delivery-pages must be positive")
-		}
-		windowStart := windowEnd.Add(-deliveryWindow)
-		updateProgress(fmt.Sprintf("searching delivery history for failed deliveries in %s...", cmd.Repo))
-		crawl, err := runChunkedWebhookRedrive(ctx, cmdclient.RedriveWebhooks, endpoint, apitypes.WebhookRedriveRequest{
-			WindowStart: windowStart.Format(time.RFC3339),
-			WindowEnd:   windowEnd.Format(time.RFC3339),
-			Repo:        cmd.Repo,
-			MaxPages:    cmd.MaxDeliveryPages,
-			DryRun:      true,
-		}, cmd.MaxDeliveryPages, false, func(r apitypes.WebhookRedriveResult) {
-			updateProgress(fmt.Sprintf("app %s: %d/%d delivery pages searched, %d failed deliveries found for %s", r.AppName, r.Pages, cmd.MaxDeliveryPages, len(r.Selected), cmd.Repo))
-		})
-		if canceled := backfillCanceledError(err, stopProgress); canceled != nil {
-			return canceled
-		}
-		if err != nil {
-			return fmt.Errorf("search delivery history: %w", err)
-		}
-		redriveable, searchComplete = indexRedriveableDeliveries(crawl)
-	}
-
 	// Scan phase: page through each repository's open PRs and ask the two
 	// questions per PR — is the expected Check Run present, and did it
 	// complete? The listing is newest-updated first, so a --last window stops
 	// each repo's paging as soon as it crosses the window start.
 	report := &checksBackfillReport{
-		Repos:                  repos,
-		Last:                   cmd.Last,
-		Redrive:                cmd.Redrive,
-		DeliverySearchComplete: searchComplete,
-		DryRun:                 cmd.DryRun,
-		StuckAfter:             cmd.StuckAfter,
+		Repos:      repos,
+		Last:       cmd.Last,
+		DryRun:     cmd.DryRun,
+		StuckAfter: cmd.StuckAfter,
 	}
 	checkNamesSeen := map[string]bool{}
 scanning:
@@ -243,8 +197,15 @@ scanning:
 			}
 			repoScanned += chunk.Scanned
 			report.Scanned += chunk.Scanned
+			// Every uncompleted run holds its PR, regardless of how long it has
+			// been sitting — --stuck-after shapes the stuck *report*, but an
+			// uncompleted run of any age could belong to an in-flight apply.
+			uncompleted := make(map[int]bool, len(chunk.Stuck))
+			for _, stuckPR := range chunk.Stuck {
+				uncompleted[stuckPR.Number] = true
+			}
 			for _, missing := range chunk.Missing {
-				action := checksBackfillAction{
+				report.Actions = append(report.Actions, checksBackfillAction{
 					Repo:                   repo,
 					PR:                     missing.Number,
 					URL:                    missing.URL,
@@ -252,13 +213,8 @@ scanning:
 					HeadSHA:                missing.HeadSHA,
 					MissingNames:           missing.MissingNames,
 					UntrustedConflictNames: missing.UntrustedConflictNames,
-					Classification:         "synthesize",
-				}
-				if byApp, ok := redriveable[missing.Number]; ok {
-					action.Classification = "redrive"
-					action.RedriveByApp = byApp
-				}
-				report.Actions = append(report.Actions, action)
+					Held:                   uncompleted[missing.Number],
+				})
 			}
 			report.Stuck = append(report.Stuck, stuckChecksPastThreshold(repo, chunk.Stuck, stuckAfter, webhookRedriveNow())...)
 			updateProgress(fmt.Sprintf("repo %d/%d %s: %d PRs scanned (%d total) — %d missing, %d stuck Check Runs so far", i+1, len(repos), repo, repoScanned, report.Scanned, len(report.Actions), len(report.Stuck)))
@@ -280,8 +236,8 @@ scanning:
 	sort.Strings(report.CheckNames)
 
 	if !cmd.DryRun {
-		// Act phase: redeliver the redriveable PRs' deliveries per App, then
-		// synthesize the rest in server-bounded batches per repository.
+		// Act phase: synthesize the missing checks in server-bounded batches
+		// per repository, skipping held PRs.
 		err := cmd.act(ctx, endpoint, report, updateProgress)
 		if canceled := backfillCanceledError(err, stopProgress); canceled != nil {
 			// Print what completed before the interrupt, then exit non-zero.
@@ -391,38 +347,6 @@ func stuckChecksPastThreshold(repo string, prs []apitypes.StuckCheckPR, stuckAft
 	return out
 }
 
-// indexRedriveableDeliveries maps PR number to its failed check-creating
-// deliveries from the crawl. searchComplete is false when any App's crawl
-// stopped before covering the window (page budget), meaning some redriveable
-// PRs may classify as synthesize instead.
-func indexRedriveableDeliveries(crawl *apitypes.WebhookRedriveResponse) (map[int]map[string][]int64, bool) {
-	redriveable := make(map[int]map[string][]int64)
-	searchComplete := true
-	if crawl == nil {
-		return redriveable, searchComplete
-	}
-	for _, result := range crawl.Results {
-		if !result.ReachedWindowStart && !result.HistoryExhausted {
-			searchComplete = false
-		}
-		for _, selected := range result.Selected {
-			if selected.PR == 0 {
-				continue
-			}
-			byApp := redriveable[selected.PR]
-			if byApp == nil {
-				byApp = make(map[string][]int64)
-				redriveable[selected.PR] = byApp
-			}
-			// Preserve the owning App per delivery: a PR can have deliveries in
-			// more than one App, and each can only be redelivered with its own
-			// App's token.
-			byApp[result.AppName] = append(byApp[result.AppName], selected.ID)
-		}
-	}
-	return redriveable, searchComplete
-}
-
 // repoPR keys a PR within a multi-repo report.
 type repoPR struct {
 	repo string
@@ -430,58 +354,18 @@ type repoPR struct {
 }
 
 func (cmd *ChecksBackfillCmd) act(ctx context.Context, endpoint string, report *checksBackfillReport, updateProgress func(string)) error {
-	// Redeliveries first, grouped per App (a delivery only redelivers with its
-	// own App's token) and chunked so no single request redelivers an
-	// unbounded number of deliveries.
-	idsByApp := make(map[string][]int64)
-	for _, action := range report.Actions {
-		for app, ids := range action.RedriveByApp {
-			idsByApp[app] = append(idsByApp[app], ids...)
-		}
-	}
-	redriveFailedByApp := make(map[string]bool)
-	for _, app := range sortedKeys(idsByApp) {
-		ids := idsByApp[app]
-		for start := 0; start < len(ids); start += checksRedriveBatchSize {
-			batch := ids[start:min(start+checksRedriveBatchSize, len(ids))]
-			updateProgress(fmt.Sprintf("redelivering %d/%d failed deliveries via app %s...", min(start+len(batch), len(ids)), len(ids), app))
-			resp, err := cmdclient.RedriveWebhooks(ctx, endpoint, apitypes.WebhookRedriveRequest{
-				App:         app,
-				DeliveryIDs: batch,
-			})
-			if err != nil {
-				return fmt.Errorf("redeliver failed deliveries via app %q: %w", app, err)
-			}
-			for _, result := range resp.Results {
-				if result.Failed > 0 {
-					redriveFailedByApp[app] = true
-				}
-			}
-		}
-	}
-
-	// Then synthesize, per repository, in server-bounded batches.
+	// Synthesize per repository, in server-bounded batches. Held PRs never
+	// reach the server; their outcome records why.
 	synthesizeByRepo := make(map[string][]int)
 	actionByPR := make(map[repoPR]*checksBackfillAction)
 	for i := range report.Actions {
 		action := &report.Actions[i]
 		actionByPR[repoPR{repo: action.Repo, pr: action.PR}] = action
-		switch action.Classification {
-		case "redrive":
-			anyFailed := false
-			for app := range action.RedriveByApp {
-				if redriveFailedByApp[app] {
-					anyFailed = true
-				}
-			}
-			if anyFailed {
-				action.Outcome = "redelivered (some redeliveries failed; see server logs)"
-			} else {
-				action.Outcome = "redelivered"
-			}
-		case "synthesize":
-			synthesizeByRepo[action.Repo] = append(synthesizeByRepo[action.Repo], action.PR)
+		if action.Held {
+			action.Outcome = checksBackfillHeldStatus
+			continue
 		}
+		synthesizeByRepo[action.Repo] = append(synthesizeByRepo[action.Repo], action.PR)
 	}
 	for _, repo := range sortedKeys(synthesizeByRepo) {
 		prs := synthesizeByRepo[repo]
@@ -525,11 +409,6 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 	if _, err := fmt.Fprintf(w, "Scanned %d open PRs%s in %s for %s.\n", report.Scanned, window, repoScope, strings.Join(report.CheckNames, ", ")); err != nil {
 		return err
 	}
-	if report.Redrive && !report.DeliverySearchComplete {
-		if _, err := fmt.Fprintln(w, "Note: the delivery-history search did not cover the full window; PRs with older failed deliveries are synthesized instead (same resulting Check Runs)."); err != nil {
-			return err
-		}
-	}
 	if err := writeChecksStuckSection(w, report); err != nil {
 		return err
 	}
@@ -548,7 +427,10 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 	}
 	failed := 0
 	for _, action := range report.Actions {
-		status := describeBackfillPlan(action, report.Redrive)
+		status := "synthesize via auto-plan"
+		if action.Held {
+			status = checksBackfillHeldStatus
+		}
 		if !report.DryRun {
 			status = action.Outcome
 			if action.Error != "" {
@@ -607,25 +489,8 @@ func writeChecksStuckSection(w io.Writer, report *checksBackfillReport) error {
 	return err
 }
 
-// describeBackfillPlan renders a dry-run action, naming the remedy the
-// backfill would use for the PR. "no retained delivery" is only a finding
-// when the delivery history was actually searched.
-func describeBackfillPlan(action checksBackfillAction, searchedDeliveries bool) string {
-	if action.Classification == "redrive" {
-		total := 0
-		for _, ids := range action.RedriveByApp {
-			total += len(ids)
-		}
-		return fmt.Sprintf("redrive %d failed deliveries (app %s)", total, strings.Join(sortedKeys(action.RedriveByApp), ", "))
-	}
-	if searchedDeliveries {
-		return "synthesize via auto-plan (no retained delivery)"
-	}
-	return "synthesize via auto-plan"
-}
-
-// sortedKeys returns the map keys in deterministic order, so per-App output
-// (dry-run plan, redrive progress) does not depend on map iteration order.
+// sortedKeys returns the map keys in deterministic order, so per-repo output
+// (synthesize progress, batch order) does not depend on map iteration order.
 func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
