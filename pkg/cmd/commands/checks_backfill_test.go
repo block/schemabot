@@ -30,7 +30,7 @@ func TestChecksScanProgressLine(t *testing.T) {
 		"once the scan reaches the repo's count, the denominator adds nothing")
 }
 
-// A PR title or server error containing tabs/newlines is neutralized so it
+// A server outcome or error containing tabs/newlines is neutralized so it
 // cannot break the tab-separated report layout.
 func TestSanitizeCell(t *testing.T) {
 	assert.Equal(t, "a b c", sanitizeCell("a\tb\nc"))

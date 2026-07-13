@@ -464,9 +464,9 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 	}
 
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	header := "PR\tHEAD SHA\tMISSING CHECKS\tACTION\tTITLE"
+	header := "PR\tHEAD SHA\tMISSING CHECKS\tACTION"
 	if !report.DryRun {
-		header = "PR\tHEAD SHA\tMISSING CHECKS\tOUTCOME\tTITLE"
+		header = "PR\tHEAD SHA\tMISSING CHECKS\tOUTCOME"
 	}
 	if _, err := fmt.Fprintln(tw, header); err != nil {
 		return err
@@ -484,10 +484,9 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 				failed++
 			}
 		}
-		// The status (server outcome/error) and the GitHub-controlled title are
-		// tab-separated cells: strip tabs/newlines so a value containing them
-		// cannot break the table layout.
-		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", action.URL, shortSHA(action.HeadSHA), strings.Join(action.MissingNames, ", "), sanitizeCell(status), sanitizeCell(action.Title)); err != nil {
+		// The status (server outcome/error) is a tab-separated cell: strip
+		// tabs/newlines so a value containing them cannot break the layout.
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", action.URL, shortSHA(action.HeadSHA), strings.Join(action.MissingNames, ", "), sanitizeCell(status)); err != nil {
 			return err
 		}
 	}
@@ -520,11 +519,11 @@ func writeChecksStuckSection(w io.Writer, report *checksBackfillReport) error {
 		return err
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "PR\tHEAD SHA\tCHECK\tSTATUS\tAGE\tTITLE"); err != nil {
+	if _, err := fmt.Fprintln(tw, "PR\tHEAD SHA\tCHECK\tSTATUS\tAGE"); err != nil {
 		return err
 	}
 	for _, stuck := range report.Stuck {
-		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", stuck.URL, shortSHA(stuck.HeadSHA), stuck.CheckName, stuck.Status, stuck.Age, sanitizeCell(stuck.Title)); err != nil {
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", stuck.URL, shortSHA(stuck.HeadSHA), stuck.CheckName, stuck.Status, stuck.Age); err != nil {
 			return err
 		}
 	}
@@ -547,7 +546,7 @@ func sortedKeys[V any](m map[string]V) []string {
 }
 
 // sanitizeCell collapses tabs and newlines to spaces so a caller-influenced
-// value (a PR title, a server error string) cannot break the tab-separated
+// value (a server outcome or error string) cannot break the tab-separated
 // table layout.
 func sanitizeCell(s string) string {
 	return strings.NewReplacer("\t", " ", "\n", " ", "\r", " ").Replace(s)
