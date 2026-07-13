@@ -185,8 +185,9 @@ func (a *OIDCAuthorizer) extractGroups(token *oidc.IDToken) ([]string, error) {
 }
 
 // skipAuth reports paths that bypass OIDC authentication: webhooks have their
-// own HMAC authentication, and health/metrics are unauthenticated
-// infrastructure endpoints.
+// own HMAC authentication, and the probe and telemetry endpoints (/livez,
+// /health, /tern-health, /metrics) are unauthenticated infrastructure
+// endpoints — kubelet probes and scrapers carry no credentials.
 func skipAuth(path string) bool {
 	switch {
 	case path == "/livez":
