@@ -3126,7 +3126,7 @@ schemabot apply -e staging
 ```
 
 <details>
-<summary>Recent logs (5)</summary>
+<summary>Logs (5)</summary>
 
 ```text
 2026-03-15 14:22:00 UTC [INF] Apply claimed by driver [queued -> running]
@@ -3391,7 +3391,7 @@ schemabot apply -e staging
 ```
 
 <details>
-<summary>Recent logs (5)</summary>
+<summary>Logs (5)</summary>
 
 ```text
 2026-03-15 14:22:00 UTC [INF] Apply claimed by driver [queued -> running]
@@ -3461,7 +3461,7 @@ schemabot apply -e staging
 ```
 
 <details>
-<summary>Recent logs (5)</summary>
+<summary>Logs (5)</summary>
 
 ```text
 2026-03-15 14:22:00 UTC [INF] Apply claimed by driver [queued -> running]

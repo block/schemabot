@@ -39,15 +39,18 @@ const sectionChromeChars = 256
 // section is dropped entirely.
 const minFailureLogsSectionChars = 512
 
-// RenderRecentFailureLogs renders the collapsed recent-logs section appended
-// to a failed apply's summary comment, formatted like the CLI logs output
-// (timestamp, level tag, message, state transition). The section spends at
-// most min(available, maxFailureLogsSectionChars) characters — available is
-// the room the rest of the comment leaves under GitHub's size limit, so a
-// large summary body shrinks the fold instead of pushing the comment over the
+// RenderRecentFailureLogs renders the collapsed logs section appended to a
+// failed apply's summary comment, formatted like the CLI logs output
+// (timestamp, level tag, message, state transition). The fold is labeled
+// "Logs" when it carries the apply's complete log history and "Recent logs"
+// when it is a tail — hasOlder reports that entries older than entries[0]
+// exist but were not loaded. The section spends at most
+// min(available, maxFailureLogsSectionChars) characters — available is the
+// room the rest of the comment leaves under GitHub's size limit, so a large
+// summary body shrinks the fold instead of pushing the comment over the
 // limit. Returns "" when there are no entries or no meaningful room, so the
 // summary renders unchanged.
-func RenderRecentFailureLogs(entries []LogEntryData, available int) string {
+func RenderRecentFailureLogs(entries []LogEntryData, available int, hasOlder bool) string {
 	if len(entries) == 0 {
 		return ""
 	}
@@ -62,7 +65,11 @@ func RenderRecentFailureLogs(entries []LogEntryData, available int) string {
 	}
 	lines, omitted := trimLogLinesToBudget(lines, budget-sectionChromeChars)
 
-	section := fmt.Sprintf("\n<details>\n<summary>Recent logs (%d)</summary>\n\n", len(entries))
+	label := "Logs"
+	if hasOlder || omitted > 0 {
+		label = "Recent logs"
+	}
+	section := fmt.Sprintf("\n<details>\n<summary>%s (%d)</summary>\n\n", label, len(lines))
 	if omitted > 0 {
 		section += fmt.Sprintf("_%d earlier entries omitted to fit the comment size limit._\n\n", omitted)
 	}

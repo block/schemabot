@@ -47,11 +47,18 @@ func failureLogsSection(ctx context.Context, stor storage.Storage, logger interf
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failureLogsLoadTimeout)
 	defer cancel()
-	logs, err := stor.ApplyLogs().GetRecentByApply(ctx, apply.ID, failureSummaryLogLimit)
+	// Load one entry beyond the limit so the fold can label itself honestly:
+	// "Logs" when it carries the complete history, "Recent logs" when older
+	// entries exist beyond the tail.
+	logs, err := stor.ApplyLogs().GetRecentByApply(ctx, apply.ID, failureSummaryLogLimit+1)
 	if err != nil {
 		logger.Error("failed to load apply logs for failure summary; posting summary without recent logs",
 			append(apply.LogAttrs(), "error", err)...)
 		return ""
+	}
+	hasOlder := len(logs) > failureSummaryLogLimit
+	if hasOlder {
+		logs = logs[len(logs)-failureSummaryLogLimit:]
 	}
 	entries := make([]templates.LogEntryData, len(logs))
 	for i, entry := range logs {
@@ -64,7 +71,7 @@ func failureLogsSection(ctx context.Context, stor storage.Storage, logger interf
 		}
 	}
 	available := gitHubIssueCommentMaxChars - commentChromeHeadroom - len(baseBody)
-	section := templates.RenderRecentFailureLogs(entries, available)
+	section := templates.RenderRecentFailureLogs(entries, available, hasOlder)
 	if section == "" && len(entries) > 0 {
 		logger.Error("summary body leaves no room for the recent-logs section under the GitHub comment size limit; posting summary without recent logs",
 			append(apply.LogAttrs(), "summary_chars", len(baseBody), "log_entries", len(entries))...)

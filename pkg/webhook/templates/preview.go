@@ -1521,7 +1521,7 @@ func PreviewCommentSummaryFailed() string {
 	data := sampleSummaryData(state.Apply.Failed, tables)
 	data.ErrorMessage = "table users failed: schema change failed: unsafe warning: Field 'name' doesn't have a default value"
 	return RenderApplySummaryComment(data) +
-		RenderRecentFailureLogs(sampleFailureLogEntries("users", "unsafe warning: Field 'name' doesn't have a default value"), maxFailureLogsSectionChars)
+		RenderRecentFailureLogs(sampleFailureLogEntries("users", "unsafe warning: Field 'name' doesn't have a default value"), maxFailureLogsSectionChars, false)
 }
 
 // PreviewCommentSummaryStopped renders a sample stopped summary comment.
@@ -1577,7 +1577,7 @@ func PreviewCommentSummaryFailedLarge() string {
 	data := sampleSummaryDataWithDuration(state.Apply.Failed, tables, 3*time.Hour+30*time.Minute)
 	data.ErrorMessage = "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"
 	return RenderApplySummaryComment(data) +
-		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"), maxFailureLogsSectionChars)
+		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"), maxFailureLogsSectionChars, false)
 }
 
 // PreviewCommentSummaryMultiNamespaceFailed renders a failed summary with tables from multiple namespaces.
@@ -1592,7 +1592,7 @@ func PreviewCommentSummaryMultiNamespaceFailed() string {
 	data := sampleSummaryData(state.Apply.Failed, tables)
 	data.ErrorMessage = "table customers.addresses failed: Error 1205: Lock wait timeout exceeded"
 	return RenderApplySummaryComment(data) +
-		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1205: Lock wait timeout exceeded"), maxFailureLogsSectionChars)
+		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1205: Lock wait timeout exceeded"), maxFailureLogsSectionChars, false)
 }
 
 // PreviewCommentSummaryMultiNamespaceCompleted renders a completed summary with tables from multiple namespaces.
