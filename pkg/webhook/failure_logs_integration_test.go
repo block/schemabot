@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,6 +139,14 @@ func TestE2EFailedApplySummaryCarriesRecentLogs(t *testing.T) {
 	assert.Contains(t, summary, "[INF] Apply claimed by driver [queued -> running]")
 	assert.Contains(t, summary, "[ERR] Apply failed: lost MySQL connection during copy [running -> failed]")
 
+	// A summary body that already fills GitHub's comment budget leaves no room
+	// for the section — it must be dropped so the summary itself still posts.
+	hugeBase := strings.Repeat("x", gitHubIssueCommentMaxChars)
+	noRoom := failureLogsSection(ctx, st,
+		slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})),
+		&terminalApply, hugeBase)
+	assert.Empty(t, noRoom)
+
 	// Completed apply: the summary stays clean even though log entries exist.
 	completedApply := seedApply("done")
 	completedTask := task(completedApply, state.Task.Completed)
@@ -179,7 +188,7 @@ func waitForSummaryCreate(t *testing.T, capture *commentCapture) string {
 	select {
 	case created := <-capture.creates:
 		return created.Body
-	case <-time.After(5 * time.Second):
+	case <-time.After(webhookIntegrationCheckRunDeadline):
 		t.Fatal("timed out waiting for terminal summary comment")
 		return ""
 	}

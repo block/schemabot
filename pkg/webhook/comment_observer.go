@@ -470,7 +470,7 @@ func (o *CommentObserver) summaryCommentFromOps(apply *storage.Apply, ops []*sto
 	} else {
 		body = formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant)
 	}
-	return body + failureLogsSection(context.Background(), o.stor, o.logger, apply)
+	return body + failureLogsSection(context.Background(), o.stor, o.logger, apply, body)
 }
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {

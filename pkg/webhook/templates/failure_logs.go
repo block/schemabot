@@ -22,19 +22,37 @@ type LogEntryData struct {
 	NewState string
 }
 
-// maxFailureLogsSectionChars caps the rendered log block so the summary
-// comment stays under GitHub's comment size limit with headroom for the
-// summary body and fold markup. When the block would exceed it, the earliest
-// lines are dropped — the entries closest to the failure are what an operator
-// reading the PR needs.
+// maxFailureLogsSectionChars caps the rendered log block regardless of how
+// much room the summary body leaves, so a short summary never carries an
+// unreadably long fold. When the block would exceed the effective budget, the
+// earliest lines are dropped — the entries closest to the failure are what an
+// operator reading the PR needs.
 const maxFailureLogsSectionChars = 50000
+
+// sectionChromeChars reserves room within the budget for the section's own
+// markup: the details/summary fold, the omitted-entries note, and the code
+// fences.
+const sectionChromeChars = 256
+
+// minFailureLogsSectionChars is the smallest budget worth rendering for — below
+// this, not even one truncated log line would convey anything useful, so the
+// section is dropped entirely.
+const minFailureLogsSectionChars = 512
 
 // RenderRecentFailureLogs renders the collapsed recent-logs section appended
 // to a failed apply's summary comment, formatted like the CLI logs output
-// (timestamp, level tag, message, state transition). Returns "" when there are
-// no entries so the summary renders unchanged.
-func RenderRecentFailureLogs(entries []LogEntryData) string {
+// (timestamp, level tag, message, state transition). The section spends at
+// most min(available, maxFailureLogsSectionChars) characters — available is
+// the room the rest of the comment leaves under GitHub's size limit, so a
+// large summary body shrinks the fold instead of pushing the comment over the
+// limit. Returns "" when there are no entries or no meaningful room, so the
+// summary renders unchanged.
+func RenderRecentFailureLogs(entries []LogEntryData, available int) string {
 	if len(entries) == 0 {
+		return ""
+	}
+	budget := min(available, maxFailureLogsSectionChars)
+	if budget < minFailureLogsSectionChars {
 		return ""
 	}
 
@@ -42,7 +60,7 @@ func RenderRecentFailureLogs(entries []LogEntryData) string {
 	for i, entry := range entries {
 		lines[i] = formatLogEntryLine(entry)
 	}
-	lines, omitted := trimLogLinesToBudget(lines, maxFailureLogsSectionChars)
+	lines, omitted := trimLogLinesToBudget(lines, budget-sectionChromeChars)
 
 	section := fmt.Sprintf("\n<details>\n<summary>Recent logs (%d)</summary>\n\n", len(entries))
 	if omitted > 0 {
@@ -97,8 +115,9 @@ func logLevelTag(level string) string {
 
 // trimLogLinesToBudget drops the earliest lines until the joined block fits
 // the budget, returning the kept lines and how many were dropped. The newest
-// lines always survive; a single oversized line is kept rather than rendering
-// an empty block.
+// lines always survive; when the last remaining line alone exceeds the budget
+// (a single enormous engine error message), it is truncated to fit rather than
+// carried oversize — the block must never exceed the budget.
 func trimLogLinesToBudget(lines []string, budget int) ([]string, int) {
 	total := 0
 	for _, line := range lines {
@@ -110,7 +129,32 @@ func trimLogLinesToBudget(lines []string, budget int) ([]string, int) {
 		lines = lines[1:]
 		omitted++
 	}
+	if len(lines) == 1 && total > budget {
+		lines[0] = truncateToBytes(lines[0], budget-len("…")-1) + "…"
+	}
 	return lines, omitted
+}
+
+// truncateToBytes cuts text to at most maxBytes without splitting a UTF-8
+// rune, so the truncated line stays valid text.
+func truncateToBytes(text string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(text) <= maxBytes {
+		return text
+	}
+	cut := maxBytes
+	for cut > 0 && !isUTF8Start(text[cut]) {
+		cut--
+	}
+	return text[:cut]
+}
+
+// isUTF8Start reports whether b is the first byte of a UTF-8 rune (i.e. not a
+// continuation byte).
+func isUTF8Start(b byte) bool {
+	return b&0xC0 != 0x80
 }
 
 // sampleFailureLogEntries returns the log entries shared by the failed-summary

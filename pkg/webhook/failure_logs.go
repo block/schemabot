@@ -18,16 +18,30 @@ const failureSummaryLogLimit = 50
 // to a summary without logs rather than delaying the terminal comment.
 const failureLogsLoadTimeout = 2 * time.Second
 
+// gitHubIssueCommentMaxChars is GitHub's hard cap on an issue comment body — a
+// larger body is rejected outright, so anything appended to a summary must fit
+// within what the summary itself leaves free.
+const gitHubIssueCommentMaxChars = 65536
+
+// commentChromeHeadroom reserves room under the GitHub cap for markup added to
+// the body after the section is appended (the support-channel footer) plus
+// margin, so the assembled comment never lands exactly at the limit.
+const commentChromeHeadroom = 1024
+
 // failureLogsSection renders the collapsed recent-logs section for a terminal
-// summary comment. Only a failed apply carries logs — a completed, stopped, or
-// cancelled apply's summary stays clean, so this returns "" for those states.
-// The load runs under its own short deadline, detached from the caller's
+// summary comment whose already-rendered body is baseBody. Only a failed apply
+// carries logs — a completed, stopped, or cancelled apply's summary stays
+// clean, so this returns "" for those states. The section spends only the room
+// baseBody leaves under GitHub's comment size cap: a large summary shrinks the
+// fold, and one that leaves no meaningful room drops it, so appending never
+// pushes the comment over the limit and blocks the summary from posting. The
+// load runs under its own short deadline, detached from the caller's
 // cancellation, so the section is decided by storage health alone. Best-effort:
 // a log-load failure is logged and returns "" so the summary comment still
 // posts; the full logs remain available from the CLI.
 func failureLogsSection(ctx context.Context, stor storage.Storage, logger interface {
 	Error(msg string, args ...any)
-}, apply *storage.Apply) string {
+}, apply *storage.Apply, baseBody string) string {
 	if !state.IsState(apply.State, state.Apply.Failed) {
 		return ""
 	}
@@ -49,5 +63,11 @@ func failureLogsSection(ctx context.Context, stor storage.Storage, logger interf
 			NewState:  entry.NewState,
 		}
 	}
-	return templates.RenderRecentFailureLogs(entries)
+	available := gitHubIssueCommentMaxChars - commentChromeHeadroom - len(baseBody)
+	section := templates.RenderRecentFailureLogs(entries, available)
+	if section == "" && len(entries) > 0 {
+		logger.Error("summary body leaves no room for the recent-logs section under the GitHub comment size limit; posting summary without recent logs",
+			append(apply.LogAttrs(), "summary_chars", len(baseBody), "log_entries", len(entries))...)
+	}
+	return section
 }

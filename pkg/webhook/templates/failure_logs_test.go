@@ -19,7 +19,7 @@ func TestRenderRecentFailureLogs(t *testing.T) {
 		{CreatedAt: at, Level: "info", Message: "Apply claimed by driver", OldState: "queued", NewState: "running"},
 		{CreatedAt: at.Add(3 * time.Second), Level: "warn", Message: "Copy throttled by replication lag"},
 		{CreatedAt: at.Add(9 * time.Second), Level: "error", Message: "Lost MySQL connection; retrying"},
-	})
+	}, maxFailureLogsSectionChars)
 
 	assert.Contains(t, rendered, "<details>")
 	assert.Contains(t, rendered, "<summary>Recent logs (3)</summary>")
@@ -33,7 +33,7 @@ func TestRenderRecentFailureLogs(t *testing.T) {
 // TestRenderRecentFailureLogsEmpty verifies an apply with no log entries adds
 // nothing to the summary — no empty details block.
 func TestRenderRecentFailureLogsEmpty(t *testing.T) {
-	assert.Empty(t, RenderRecentFailureLogs(nil))
+	assert.Empty(t, RenderRecentFailureLogs(nil, maxFailureLogsSectionChars))
 }
 
 // TestRenderRecentFailureLogsSanitizesUntrustedText verifies engine-supplied
@@ -46,7 +46,7 @@ func TestRenderRecentFailureLogsSanitizesUntrustedText(t *testing.T) {
 		{CreatedAt: at, Level: "error", Message: "line one\r\nline two\nline three"},
 		{CreatedAt: at.Add(time.Second), Level: "error", Message: "fence breakout ```\n# not a heading"},
 		{CreatedAt: at.Add(2 * time.Second), Level: "error", Message: "long run `````x"},
-	})
+	}, maxFailureLogsSectionChars)
 
 	assert.Contains(t, rendered, "[ERR] line one line two line three")
 	assert.Contains(t, rendered, "[ERR] fence breakout `` ` # not a heading")
@@ -67,11 +67,69 @@ func TestRenderRecentFailureLogsTrimsToSizeBudget(t *testing.T) {
 			Message:   strings.Repeat("x", 1000) + " #" + time.Duration(i).String(),
 		}
 	}
-	rendered := RenderRecentFailureLogs(entries)
+	rendered := RenderRecentFailureLogs(entries, maxFailureLogsSectionChars)
 
 	require.Less(t, len(rendered), 65536, "rendered section must leave room inside GitHub's size limit")
 	assert.Contains(t, rendered, "<summary>Recent logs (100)</summary>")
 	assert.Contains(t, rendered, "earlier entries omitted")
 	assert.NotContains(t, rendered, "16:00:00 UTC", "earliest entry is dropped first")
 	assert.Contains(t, rendered, "16:01:39 UTC", "newest entry always survives")
+}
+
+// TestRenderRecentFailureLogsShrinksToAvailableRoom verifies a large summary
+// body shrinks the section: with less room available than the default cap, the
+// section trims to what fits so appending it never pushes the assembled
+// comment over GitHub's size limit.
+func TestRenderRecentFailureLogsShrinksToAvailableRoom(t *testing.T) {
+	at := time.Date(2026, 7, 12, 16, 0, 0, 0, time.UTC)
+	entries := make([]LogEntryData, 20)
+	for i := range entries {
+		entries[i] = LogEntryData{
+			CreatedAt: at.Add(time.Duration(i) * time.Second),
+			Level:     "info",
+			Message:   strings.Repeat("x", 200) + " #" + time.Duration(i).String(),
+		}
+	}
+	available := 2000
+	rendered := RenderRecentFailureLogs(entries, available)
+
+	require.NotEmpty(t, rendered)
+	assert.LessOrEqual(t, len(rendered), available, "the section must fit in the room the summary body leaves")
+	assert.Contains(t, rendered, "earlier entries omitted")
+	assert.Contains(t, rendered, "16:00:19 UTC", "newest entry always survives")
+	assert.NotContains(t, rendered, "16:00:00 UTC", "earliest entry is dropped first")
+}
+
+// TestRenderRecentFailureLogsSkipsWhenNoRoom verifies that a summary body
+// leaving no meaningful room under the comment size limit drops the section
+// entirely — the summary must still post, and a fold too small to carry a log
+// line is noise.
+func TestRenderRecentFailureLogsSkipsWhenNoRoom(t *testing.T) {
+	entries := []LogEntryData{
+		{CreatedAt: time.Date(2026, 7, 12, 16, 0, 0, 0, time.UTC), Level: "error", Message: "Apply failed"},
+	}
+	assert.Empty(t, RenderRecentFailureLogs(entries, 0))
+	assert.Empty(t, RenderRecentFailureLogs(entries, -500))
+	assert.Empty(t, RenderRecentFailureLogs(entries, minFailureLogsSectionChars-1))
+}
+
+// TestRenderRecentFailureLogsTruncatesSingleOversizedLine verifies one
+// enormous engine error message cannot blow the budget on its own: the sole
+// surviving line is truncated to fit rather than carried oversize.
+func TestRenderRecentFailureLogsTruncatesSingleOversizedLine(t *testing.T) {
+	entries := []LogEntryData{
+		{
+			CreatedAt: time.Date(2026, 7, 12, 16, 0, 0, 0, time.UTC),
+			Level:     "error",
+			Message:   "Apply failed: " + strings.Repeat("é", maxFailureLogsSectionChars),
+		},
+	}
+	available := 4000
+	rendered := RenderRecentFailureLogs(entries, available)
+
+	require.NotEmpty(t, rendered)
+	assert.LessOrEqual(t, len(rendered), available, "a single oversized line must be truncated to the budget")
+	assert.Contains(t, rendered, "Apply failed: ")
+	assert.Contains(t, rendered, "…", "the truncated line ends with an ellipsis")
+	assert.True(t, strings.HasSuffix(strings.TrimSpace(rendered), "</details>"), "the fold still closes cleanly")
 }
