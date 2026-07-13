@@ -39,11 +39,18 @@ crash-loop backoff on top of the outage. Readiness carries the dependency
 check: an instance that cannot reach storage is pulled from the Service and
 rejoins the moment storage recovers.
 
+Boot is patient for the same reason: a pod that starts (or restarts) during
+the outage retries storage boot inside the startup-probe budget, re-resolving
+the DSN on every attempt so a rotated credential is picked up as soon as the
+mounted secret refreshes, instead of crash-looping until the outage ends.
+
 During a shared-cause outage (every replica loses storage at once), all pods go
 unready together and the Service has no endpoints. Inbound webhooks and API
 calls fail at the connection level for the duration. That is honest — those
-requests need storage — and recoverable: GitHub redelivers webhooks, and the
-reconciling pollers catch up on anything missed.
+requests need storage — and visible: GitHub marks each delivery as failed so an
+operator can redeliver it after recovery (GitHub App webhooks are never
+redelivered automatically), and the reconciling pollers converge poll-driven
+state on their next pass.
 
 ## What happens to an in-flight apply
 
