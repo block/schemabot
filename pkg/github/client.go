@@ -605,10 +605,12 @@ type OpenPullRequest struct {
 
 // ListOpenPullRequestsPage lists one page of open pull requests in a
 // repository, newest updated first. page is 1-based (0 selects the first
-// page). nextPage is 0 when no further pages exist. Fetching one bounded page
-// per call lets operator scans run as many short requests instead of one
-// long one.
-func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo string, page, perPage int) (prs []OpenPullRequest, nextPage int, err error) {
+// page). nextPage is 0 when no further pages exist. lastPage is the final
+// page number GitHub reports for the listing (0 when this page is the last),
+// letting callers derive the repository's total open-PR count for progress
+// denominators. Fetching one bounded page per call lets operator scans run as
+// many short requests instead of one long one.
+func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo string, page, perPage int) (prs []OpenPullRequest, nextPage, lastPage int, err error) {
 	owner, repoName := splitRepo(repo)
 	if page <= 0 {
 		page = 1
@@ -637,7 +639,7 @@ func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo
 		return list, nil
 	})
 	if err != nil {
-		return nil, 0, fmt.Errorf("list open pull requests for %s page %d: %w", repo, page, err)
+		return nil, 0, 0, fmt.Errorf("list open pull requests for %s page %d: %w", repo, page, err)
 	}
 	for _, pr := range ghPRs {
 		prs = append(prs, OpenPullRequest{
@@ -652,8 +654,9 @@ func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo
 	}
 	if resp != nil {
 		nextPage = resp.NextPage
+		lastPage = resp.LastPage
 	}
-	return prs, nextPage, nil
+	return prs, nextPage, lastPage, nil
 }
 
 // CoreRateLimit reports the installation's remaining core REST budget. The

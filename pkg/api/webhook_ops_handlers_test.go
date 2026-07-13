@@ -461,20 +461,24 @@ type fakeWebhookMissingCheckScanClient struct {
 	untrusted map[string][]string
 }
 
-func (f fakeWebhookMissingCheckScanClient) ListOpenPullRequestsPage(_ context.Context, _ string, page, perPage int) ([]ghclient.OpenPullRequest, int, error) {
+func (f fakeWebhookMissingCheckScanClient) ListOpenPullRequestsPage(_ context.Context, _ string, page, perPage int) ([]ghclient.OpenPullRequest, int, int, error) {
 	if page <= 0 {
 		page = 1
 	}
 	start := (page - 1) * perPage
 	if start >= len(f.prs) {
-		return nil, 0, nil
+		return nil, 0, 0, nil
 	}
 	end := min(start+perPage, len(f.prs))
 	nextPage := 0
+	lastPage := 0
 	if end < len(f.prs) {
 		nextPage = page + 1
+		// GitHub's Link header names the last page only while more pages
+		// remain; the final page carries no last rel.
+		lastPage = (len(f.prs) + perPage - 1) / perPage
 	}
-	return f.prs[start:end], nextPage, nil
+	return f.prs[start:end], nextPage, lastPage, nil
 }
 
 func (f fakeWebhookMissingCheckScanClient) FindCheckRunByName(_ context.Context, _ string, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error) {
@@ -516,6 +520,18 @@ func TestScanWebhookMissingChecksReportsOpenPRsMissingConfiguredChecks(t *testin
 	assert.Equal(t, "https://github.com/octo/repo/pull/2", result.Missing[0].URL)
 	assert.Equal(t, []string{"SchemaBot (production)"}, result.Missing[0].MissingNames)
 	assert.Empty(t, result.Missing[0].UntrustedConflictNames)
+	assert.Equal(t, 2, result.EstimatedOpenPRs, "a single-page listing pins the exact open-PR count")
+}
+
+// A scan page carries the repository's open-PR count so the caller can render
+// a progress denominator: GitHub's last-page pointer gives an upper bound
+// while pages remain, and the final page pins the exact count.
+func TestEstimateOpenPRCount(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, 50*webhookScanPRPageSize, estimateOpenPRCount(2, 50, webhookScanPRPageSize), "mid-listing: upper bound from GitHub's last-page pointer")
+	assert.Equal(t, 3*webhookScanPRPageSize+12, estimateOpenPRCount(4, 0, 12), "final page: the pages before it plus the PRs on it")
+	assert.Equal(t, 12, estimateOpenPRCount(0, 0, 12), "an unpaginated listing is the whole repository")
 }
 
 // An expected Check Run that exists but never completed is reported as stuck,

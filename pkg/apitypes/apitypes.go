@@ -116,11 +116,16 @@ type ChecksScanRequest struct {
 }
 
 type ChecksScanResponse struct {
-	Repo       string           `json:"repo"`
-	CheckNames []string         `json:"check_names"`
-	Scanned    int              `json:"scanned"`
-	NextPage   int              `json:"next_page,omitempty"`
-	Missing    []MissingCheckPR `json:"missing"`
+	Repo       string   `json:"repo"`
+	CheckNames []string `json:"check_names"`
+	Scanned    int      `json:"scanned"`
+	NextPage   int      `json:"next_page,omitempty"`
+	// EstimatedOpenPRs is the repository's total open-PR count as GitHub
+	// reports it for this page's listing — an upper bound while more pages
+	// remain, exact on the final page. Recomputed every page so the caller
+	// can render a progress denominator that stays honest across a long scan.
+	EstimatedOpenPRs int              `json:"estimated_open_prs,omitempty"`
+	Missing          []MissingCheckPR `json:"missing"`
 	// Stuck lists open PRs whose expected Check Run exists but has not
 	// completed. The server reports the raw status and start time; the caller
 	// decides how old is old enough to call stuck, because an uncompleted

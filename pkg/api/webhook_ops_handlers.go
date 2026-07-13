@@ -725,16 +725,21 @@ func webhookMissingCheckNames(cfg *ServerConfig, repo, environment, override str
 }
 
 type webhookMissingCheckScanClient interface {
-	ListOpenPullRequestsPage(ctx context.Context, repo string, page, perPage int) ([]ghclient.OpenPullRequest, int, error)
+	ListOpenPullRequestsPage(ctx context.Context, repo string, page, perPage int) (prs []ghclient.OpenPullRequest, nextPage, lastPage int, err error)
 	FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error)
 }
 
 func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, repo string, checkNames []string, page int, updatedSince time.Time) (*ChecksScanResponse, error) {
-	prs, nextPage, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookScanPRPageSize)
+	prs, nextPage, lastPage, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookScanPRPageSize)
 	if err != nil {
 		return nil, err
 	}
-	result := &ChecksScanResponse{Repo: repo, CheckNames: checkNames, NextPage: nextPage}
+	result := &ChecksScanResponse{
+		Repo:             repo,
+		CheckNames:       checkNames,
+		NextPage:         nextPage,
+		EstimatedOpenPRs: estimateOpenPRCount(page, lastPage, len(prs)),
+	}
 	for _, pr := range prs {
 		if !updatedSince.IsZero() && pr.UpdatedAt.Before(updatedSince) {
 			// The listing is ordered newest-updated first, so every PR from
@@ -794,6 +799,22 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		})
 	}
 	return result, nil
+}
+
+// estimateOpenPRCount derives the repository's total open-PR count from one
+// listing page, so a long scan can report progress against a denominator that
+// is recomputed every page instead of feeling unbounded. GitHub reports the
+// listing's last page while more pages remain — an upper bound of
+// lastPage×pageSize — and on the final page (lastPage 0) the count is exact:
+// the PRs before this page plus the PRs on it.
+func estimateOpenPRCount(page, lastPage, pageLen int) int {
+	if lastPage > 0 {
+		return lastPage * webhookScanPRPageSize
+	}
+	if page <= 0 {
+		page = 1
+	}
+	return (page-1)*webhookScanPRPageSize + pageLen
 }
 
 // checkRunCompleted reports whether the Check Run's status is "completed".

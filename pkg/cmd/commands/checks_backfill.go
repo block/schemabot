@@ -171,10 +171,12 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 		StuckAfter: cmd.StuckAfter,
 	}
 	checkNamesSeen := map[string]bool{}
+	held := 0
 scanning:
 	for i, repo := range repos {
 		page := 1
 		repoScanned := 0
+		repoEstimate := 0
 		for {
 			chunk, err := cmdclient.ChecksScan(ctx, endpoint, apitypes.ChecksScanRequest{
 				Repo:         repo,
@@ -197,6 +199,9 @@ scanning:
 			}
 			repoScanned += chunk.Scanned
 			report.Scanned += chunk.Scanned
+			if chunk.EstimatedOpenPRs > 0 {
+				repoEstimate = chunk.EstimatedOpenPRs
+			}
 			// Every uncompleted run holds its PR, regardless of how long it has
 			// been sitting — --stuck-after shapes the stuck *report*, but an
 			// uncompleted run of any age could belong to an in-flight apply.
@@ -205,7 +210,7 @@ scanning:
 				uncompleted[stuckPR.Number] = true
 			}
 			for _, missing := range chunk.Missing {
-				report.Actions = append(report.Actions, checksBackfillAction{
+				action := checksBackfillAction{
 					Repo:                   repo,
 					PR:                     missing.Number,
 					URL:                    missing.URL,
@@ -214,10 +219,14 @@ scanning:
 					MissingNames:           missing.MissingNames,
 					UntrustedConflictNames: missing.UntrustedConflictNames,
 					Held:                   uncompleted[missing.Number],
-				})
+				}
+				if action.Held {
+					held++
+				}
+				report.Actions = append(report.Actions, action)
 			}
 			report.Stuck = append(report.Stuck, stuckChecksPastThreshold(repo, chunk.Stuck, stuckAfter, webhookRedriveNow())...)
-			updateProgress(fmt.Sprintf("repo %d/%d %s: %d PRs scanned (%d total) — %d missing, %d stuck Check Runs so far", i+1, len(repos), repo, repoScanned, report.Scanned, len(report.Actions), len(report.Stuck)))
+			updateProgress(checksScanProgressLine(i+1, len(repos), repo, repoScanned, repoEstimate, report.Scanned, len(report.Actions), held, len(report.Stuck)))
 			if cmd.Limit > 0 && report.Scanned >= cmd.Limit {
 				break scanning
 			}
@@ -251,6 +260,33 @@ scanning:
 	}
 	stopProgress()
 	return cmd.write(report)
+}
+
+// checksScanProgressLine renders one scan progress update. The denominator is
+// GitHub's own open-PR count for the repository, recomputed every page, so a
+// long sweep always reads as progress toward a bound instead of an endless
+// loop; the counts after the dash say what the sweep has found so far. The
+// denominator is an upper bound until the repo's final page (a --last window
+// legitimately stops short of it).
+func checksScanProgressLine(repoIndex, repoCount int, repo string, repoScanned, repoEstimate, totalScanned, missing, held, stuck int) string {
+	var b strings.Builder
+	if repoCount > 1 {
+		fmt.Fprintf(&b, "repo %d/%d ", repoIndex, repoCount)
+	}
+	fmt.Fprintf(&b, "%s: %d", repo, repoScanned)
+	if repoEstimate > repoScanned {
+		fmt.Fprintf(&b, "/~%d", repoEstimate)
+	}
+	b.WriteString(" PRs scanned")
+	if repoCount > 1 {
+		fmt.Fprintf(&b, " (%d across all repos)", totalScanned)
+	}
+	fmt.Fprintf(&b, " — %d missing", missing)
+	if held > 0 {
+		fmt.Fprintf(&b, " (%d held)", held)
+	}
+	fmt.Fprintf(&b, ", %d stuck Check Runs", stuck)
+	return b.String()
 }
 
 // backfillCanceledError maps an operator cancellation (Ctrl+C) to a clean
@@ -367,16 +403,26 @@ func (cmd *ChecksBackfillCmd) act(ctx context.Context, endpoint string, report *
 		}
 		synthesizeByRepo[action.Repo] = append(synthesizeByRepo[action.Repo], action.PR)
 	}
+	failed := 0
 	for _, repo := range sortedKeys(synthesizeByRepo) {
 		prs := synthesizeByRepo[repo]
 		for start := 0; start < len(prs); start += checksSynthesizeBatchSize {
 			batch := prs[start:min(start+checksSynthesizeBatchSize, len(prs))]
-			updateProgress(fmt.Sprintf("synthesizing Check Runs for %d/%d PRs in %s...", min(start+len(batch), len(prs)), len(prs), repo))
+			progressLine := fmt.Sprintf("synthesizing Check Runs for %d/%d PRs in %s...", min(start+len(batch), len(prs)), len(prs), repo)
+			if failed > 0 {
+				// Surface failures as they happen so the operator can interrupt a
+				// failing sweep instead of discovering it in the final table.
+				progressLine += fmt.Sprintf(" (%d failed so far)", failed)
+			}
+			updateProgress(progressLine)
 			resp, err := cmdclient.ChecksSynthesize(ctx, endpoint, apitypes.ChecksSynthesizeRequest{Repo: repo, PRs: batch})
 			if err != nil {
 				return fmt.Errorf("synthesize Check Runs for %s: %w", repo, err)
 			}
 			for _, result := range resp.Results {
+				if result.Error != "" {
+					failed++
+				}
 				if action, ok := actionByPR[repoPR{repo: repo, pr: result.PR}]; ok {
 					action.Outcome = result.Outcome
 					action.Error = result.Error

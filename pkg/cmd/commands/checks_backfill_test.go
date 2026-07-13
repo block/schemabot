@@ -11,6 +11,25 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 )
 
+// The scan progress line always reads as progress toward a bound: PRs scanned
+// against GitHub's own open-PR count for the repository (while the count still
+// exceeds what was scanned), repo position within a fleet sweep, and the
+// findings so far with held PRs called out inside the missing count.
+func TestChecksScanProgressLine(t *testing.T) {
+	assert.Equal(t,
+		"octo/repo: 90/~1500 PRs scanned — 4 missing, 2 stuck Check Runs",
+		checksScanProgressLine(1, 1, "octo/repo", 90, 1500, 90, 4, 0, 2))
+
+	assert.Equal(t,
+		"repo 2/6 octo/repo: 90/~1500 PRs scanned (312 across all repos) — 4 missing (1 held), 2 stuck Check Runs",
+		checksScanProgressLine(2, 6, "octo/repo", 90, 1500, 312, 4, 1, 2))
+
+	assert.Equal(t,
+		"octo/repo: 12 PRs scanned — 0 missing, 0 stuck Check Runs",
+		checksScanProgressLine(1, 1, "octo/repo", 12, 12, 12, 0, 0, 0),
+		"once the scan reaches the repo's count, the denominator adds nothing")
+}
+
 // A PR title or server error containing tabs/newlines is neutralized so it
 // cannot break the tab-separated report layout.
 func TestSanitizeCell(t *testing.T) {
