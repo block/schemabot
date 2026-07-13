@@ -464,9 +464,9 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 	}
 
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	header := "PR\tHEAD SHA\tMISSING CHECKS\tACTION"
+	header := "PR\tMISSING CHECKS\tACTION"
 	if !report.DryRun {
-		header = "PR\tHEAD SHA\tMISSING CHECKS\tOUTCOME"
+		header = "PR\tMISSING CHECKS\tOUTCOME"
 	}
 	if _, err := fmt.Fprintln(tw, header); err != nil {
 		return err
@@ -486,7 +486,7 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 		}
 		// The status (server outcome/error) is a tab-separated cell: strip
 		// tabs/newlines so a value containing them cannot break the layout.
-		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", action.URL, shortSHA(action.HeadSHA), strings.Join(action.MissingNames, ", "), sanitizeCell(status)); err != nil {
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\n", action.URL, strings.Join(action.MissingNames, ", "), sanitizeCell(status)); err != nil {
 			return err
 		}
 	}
@@ -519,11 +519,11 @@ func writeChecksStuckSection(w io.Writer, report *checksBackfillReport) error {
 		return err
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "PR\tHEAD SHA\tCHECK\tSTATUS\tAGE"); err != nil {
+	if _, err := fmt.Fprintln(tw, "PR\tCHECK\tSTATUS\tAGE"); err != nil {
 		return err
 	}
 	for _, stuck := range report.Stuck {
-		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", stuck.URL, shortSHA(stuck.HeadSHA), stuck.CheckName, stuck.Status, stuck.Age); err != nil {
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", stuck.URL, stuck.CheckName, stuck.Status, stuck.Age); err != nil {
 			return err
 		}
 	}
@@ -550,11 +550,4 @@ func sortedKeys[V any](m map[string]V) []string {
 // table layout.
 func sanitizeCell(s string) string {
 	return strings.NewReplacer("\t", " ", "\n", " ", "\r", " ").Replace(s)
-}
-
-func shortSHA(sha string) string {
-	if len(sha) <= 12 {
-		return sha
-	}
-	return sha[:12]
 }
