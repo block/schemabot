@@ -75,8 +75,8 @@ func TestSanitizeCell(t *testing.T) {
 // The stuck filter keeps only uncompleted Check Runs that have sat past the
 // threshold: young runs are legitimately in flight and stay out of the
 // report, aged runs are flattened to one row per (PR, check) with a
-// human-readable age, and a run with no reported start time is always kept —
-// its age cannot prove it is young.
+// human-readable age, and a run whose start time is missing or in the future
+// (clock skew) is always kept — its age cannot prove it is young.
 func TestStuckChecksPastThreshold(t *testing.T) {
 	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
 	stuck := stuckChecksPastThreshold([]apitypes.StuckCheckPR{
@@ -93,14 +93,22 @@ func TestStuckChecksPastThreshold(t *testing.T) {
 				{Name: "SchemaBot (production)", CheckRunID: 60, Status: "queued"},
 			},
 		},
+		{
+			Number: 7, URL: "https://github.com/octo/repo/pull/7", Title: "future start time", HeadSHA: "sha7",
+			Checks: []apitypes.IncompleteCheckRun{
+				{Name: "SchemaBot (production)", CheckRunID: 70, Status: "in_progress", StartedAt: "2026-07-12T13:00:00Z"},
+			},
+		},
 	}, time.Hour, now)
 
-	require.Len(t, stuck, 2)
+	require.Len(t, stuck, 3)
 	assert.Equal(t, 5, stuck[0].PR)
 	assert.Equal(t, "SchemaBot (production)", stuck[0].CheckName)
 	assert.Equal(t, "3h30m0s", stuck[0].Age)
 	assert.Equal(t, 6, stuck[1].PR)
 	assert.Equal(t, "unknown", stuck[1].Age)
+	assert.Equal(t, 7, stuck[2].PR)
+	assert.Equal(t, "unknown", stuck[2].Age, "a start time ahead of the scan clock cannot prove the run is young")
 }
 
 // The report renders stuck Check Runs in their own section, telling the

@@ -725,10 +725,10 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 	return result, nil
 }
 
-// checkRunCompleted reports whether the Check Run has reached a conclusion.
-// Anything else (queued, in_progress, pending) is still holding its slot
-// without gating, which the scan surfaces so an operator can judge whether
-// the run is legitimately in flight or wedged.
+// checkRunCompleted reports whether the Check Run's status is "completed".
+// Any other status (queued, in_progress) is still holding its slot without a
+// conclusion, which the scan surfaces so an operator can judge whether the
+// run is legitimately in flight or wedged.
 func checkRunCompleted(run *ghclient.CheckRunResult) bool {
 	return run.Status == "completed"
 }

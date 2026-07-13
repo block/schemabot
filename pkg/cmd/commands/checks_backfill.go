@@ -106,11 +106,11 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 	if cmd.MaxDeliveryPages <= 0 {
 		return fmt.Errorf("--max-delivery-pages must be positive")
 	}
-	deliveryWindow, err := parseWebhookRedriveLast(cmd.DeliveryWindow)
+	deliveryWindow, err := parseOperatorDuration(cmd.DeliveryWindow)
 	if err != nil {
 		return fmt.Errorf("parse --delivery-window: %w", err)
 	}
-	stuckAfter, err := parseWebhookRedriveLast(cmd.StuckAfter)
+	stuckAfter, err := parseOperatorDuration(cmd.StuckAfter)
 	if err != nil {
 		return fmt.Errorf("parse --stuck-after: %w", err)
 	}
@@ -226,8 +226,9 @@ func backfillCanceledError(err error, stopProgress func()) error {
 
 // stuckChecksPastThreshold flattens the scan's uncompleted Check Runs to one
 // row per (PR, check), keeping only runs that have been sitting longer than
-// stuckAfter. A run with no reported start time is always kept — its age
-// cannot prove it is young, and the scan must not hide it.
+// stuckAfter. A run whose start time is missing, unparseable, or in the
+// future (clock skew) is always kept with an "unknown" age — a start time
+// that cannot prove the run is young must not hide it.
 func stuckChecksPastThreshold(prs []apitypes.StuckCheckPR, stuckAfter time.Duration, now time.Time) []checksStuckCheck {
 	var out []checksStuckCheck
 	for _, pr := range prs {
@@ -235,7 +236,7 @@ func stuckChecksPastThreshold(prs []apitypes.StuckCheckPR, stuckAfter time.Durat
 			age := "unknown"
 			if check.StartedAt != "" {
 				startedAt, err := time.Parse(time.RFC3339, check.StartedAt)
-				if err == nil {
+				if err == nil && !startedAt.After(now) {
 					sitting := now.Sub(startedAt)
 					if sitting < stuckAfter {
 						continue
