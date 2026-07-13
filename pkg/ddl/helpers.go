@@ -1,34 +1,16 @@
 package ddl
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/block/spirit/pkg/statement"
 )
 
 // SplitStatements splits SQL content into individual DDL statements.
-// Uses Spirit's statement package which wraps the TiDB parser for proper parsing.
-// All SQL content must be parseable by the TiDB parser.
+// It delegates to the package's default StatementParser (the TiDB/Spirit
+// implementation), so all SQL content must be parseable by that parser.
 func SplitStatements(content string) ([]string, error) {
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return nil, nil
-	}
-	parsed, err := statement.NewWithOptions(content, statement.Options{
-		AllowMixedStatementTypes: true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse SQL statements: %w", err)
-	}
-	var stmts []string
-	for _, s := range parsed {
-		stmt := strings.TrimSpace(s.Statement)
-		if stmt != "" {
-			stmts = append(stmts, stmt)
-		}
-	}
-	return stmts, nil
+	return defaultParser.Split(content)
 }
 
 // ClassifyStatement classifies a single DDL statement using Spirit's parser.
@@ -40,20 +22,7 @@ func SplitStatements(content string) ([]string, error) {
 // multi-statement input is rejected. Callers with multi-statement content
 // must split it with SplitStatements first.
 func ClassifyStatement(stmt string) (statement.StatementType, string, error) {
-	results, err := statement.Classify(stmt)
-	if err != nil {
-		return statement.StatementUnknown, "", fmt.Errorf("classify statement %q: %w", stmt, err)
-	}
-	if len(results) == 0 {
-		return statement.StatementUnknown, "", fmt.Errorf("no classification result for statement %q", stmt)
-	}
-	if len(results) > 1 {
-		return statement.StatementUnknown, "", fmt.Errorf(
-			"expected a single statement but %q parsed as %d statements; split with SplitStatements before classifying",
-			statementPreview(stmt), len(results),
-		)
-	}
-	return results[0].Type, results[0].Table, nil
+	return defaultParser.Classify(stmt)
 }
 
 // statementPreview returns the leading text of a statement for error messages,
