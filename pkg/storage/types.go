@@ -255,9 +255,10 @@ type Setting struct {
 
 // DatabaseType constants.
 const (
-	DatabaseTypeVitess = "vitess"
-	DatabaseTypeMySQL  = "mysql"
-	DatabaseTypeStrata = "strata"
+	DatabaseTypeVitess   = "vitess"
+	DatabaseTypeMySQL    = "mysql"
+	DatabaseTypeStrata   = "strata"
+	DatabaseTypePostgres = "postgres"
 )
 
 // Engine constants.
@@ -265,6 +266,7 @@ const (
 	EngineSpirit      = "spirit"
 	EnginePlanetScale = "planetscale"
 	EngineStrata      = "strata"
+	EnginePostgres    = "postgres"
 )
 
 // ApplyOperationKind constants classify operation rows by scheduling role.
@@ -280,6 +282,8 @@ func EngineForType(dbType string) string {
 		return EnginePlanetScale
 	case DatabaseTypeStrata:
 		return EngineStrata
+	case DatabaseTypePostgres:
+		return EnginePostgres
 	default:
 		return EngineSpirit
 	}

@@ -46,10 +46,10 @@ func (cmd *DatabasesCmd) Run(g *Globals) error {
 
 func validateDatabaseListType(databaseType string) error {
 	switch databaseType {
-	case "", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata:
+	case "", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
 		return nil
 	default:
-		return fmt.Errorf("--type must be %q, %q, or %q", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata)
+		return fmt.Errorf("--type must be %q, %q, %q, or %q", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres)
 	}
 }
 
