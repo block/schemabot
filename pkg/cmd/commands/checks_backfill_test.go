@@ -79,7 +79,7 @@ func TestSanitizeCell(t *testing.T) {
 // (clock skew) is always kept — its age cannot prove it is young.
 func TestStuckChecksPastThreshold(t *testing.T) {
 	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
-	stuck := stuckChecksPastThreshold([]apitypes.StuckCheckPR{
+	stuck := stuckChecksPastThreshold("octo/repo", []apitypes.StuckCheckPR{
 		{
 			Number: 5, URL: "https://github.com/octo/repo/pull/5", Title: "aged and young", HeadSHA: "sha5",
 			Checks: []apitypes.IncompleteCheckRun{
@@ -102,6 +102,7 @@ func TestStuckChecksPastThreshold(t *testing.T) {
 	}, time.Hour, now)
 
 	require.Len(t, stuck, 3)
+	assert.Equal(t, "octo/repo", stuck[0].Repo)
 	assert.Equal(t, 5, stuck[0].PR)
 	assert.Equal(t, "SchemaBot (production)", stuck[0].CheckName)
 	assert.Equal(t, "3h30m0s", stuck[0].Age)
@@ -116,15 +117,16 @@ func TestStuckChecksPastThreshold(t *testing.T) {
 // are missing at all.
 func TestWriteChecksBackfillReportRendersStuckSection(t *testing.T) {
 	report := &checksBackfillReport{
-		Repo:                   "octo/repo",
+		Repos:                  []string{"octo/repo"},
 		CheckNames:             []string{"SchemaBot (production)"},
 		Scanned:                12,
+		Last:                   "1d",
 		DeliverySearchComplete: true,
 		DryRun:                 true,
 		StuckAfter:             "1h",
 		Stuck: []checksStuckCheck{
 			{
-				PR: 5, URL: "https://github.com/octo/repo/pull/5", Title: "wedged", HeadSHA: "sha5555555555555",
+				Repo: "octo/repo", PR: 5, URL: "https://github.com/octo/repo/pull/5", Title: "wedged", HeadSHA: "sha5555555555555",
 				CheckName: "SchemaBot (production)", CheckRunID: 50, Status: "in_progress", Age: "3h30m0s",
 			},
 		},
@@ -134,10 +136,59 @@ func TestWriteChecksBackfillReportRendersStuckSection(t *testing.T) {
 	require.NoError(t, writeChecksBackfillReport(&out, report))
 
 	rendered := out.String()
+	assert.Contains(t, rendered, "Scanned 12 open PRs updated in the last 1d in octo/repo")
 	assert.Contains(t, rendered, "Stuck Check Runs — uncompleted for over 1h")
 	assert.Contains(t, rendered, "backfill does not act on existing Check Runs")
 	assert.Contains(t, rendered, "https://github.com/octo/repo/pull/5")
 	assert.Contains(t, rendered, "in_progress")
 	assert.Contains(t, rendered, "3h30m0s")
 	assert.Contains(t, rendered, "No missing SchemaBot Check Runs found.")
+}
+
+// A fleet-wide report summarizes the repo count instead of naming every
+// repository, and a plain synthesize plan does not claim "no retained
+// delivery" when the delivery history was never searched.
+func TestWriteChecksBackfillReportFleetHeadlineAndPlanWording(t *testing.T) {
+	report := &checksBackfillReport{
+		Repos:      []string{"octo/a", "octo/b", "octo/c", "octo/d"},
+		CheckNames: []string{"SchemaBot (production)"},
+		Scanned:    40,
+		DryRun:     true,
+		StuckAfter: "1h",
+		Actions: []checksBackfillAction{
+			{Repo: "octo/b", PR: 7, URL: "https://github.com/octo/b/pull/7", Title: "missing", HeadSHA: "sha7", MissingNames: []string{"SchemaBot (production)"}, Classification: "synthesize"},
+		},
+	}
+
+	var out strings.Builder
+	require.NoError(t, writeChecksBackfillReport(&out, report))
+
+	rendered := out.String()
+	assert.Contains(t, rendered, "Scanned 40 open PRs in 4 repositories")
+	assert.Contains(t, rendered, "synthesize via auto-plan")
+	assert.NotContains(t, rendered, "no retained delivery", "the crawl never ran, so its absence is not a finding")
+}
+
+// The pacing decision: pause only when the budget snapshot is below the floor
+// and a future reset exists to wait for. Missing snapshots, disabled pacing,
+// healthy budgets, and already-past resets all proceed without waiting.
+func TestRateLimitPauseDuration(t *testing.T) {
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(10 * time.Minute).Format(time.RFC3339)
+
+	wait, pause := rateLimitPauseDuration(&apitypes.GitHubRateLimit{Remaining: 500, Limit: 5000, ResetAt: reset}, 20, now)
+	require.True(t, pause, "10% remaining is below a 20% floor")
+	assert.Equal(t, 11*time.Minute, wait, "waits out the reset plus a minute of slack")
+
+	_, pause = rateLimitPauseDuration(&apitypes.GitHubRateLimit{Remaining: 2500, Limit: 5000, ResetAt: reset}, 20, now)
+	assert.False(t, pause, "half the budget left is comfortably above the floor")
+
+	_, pause = rateLimitPauseDuration(nil, 20, now)
+	assert.False(t, pause, "no snapshot means nothing to pace against")
+
+	_, pause = rateLimitPauseDuration(&apitypes.GitHubRateLimit{Remaining: 0, Limit: 5000, ResetAt: reset}, 0, now)
+	assert.False(t, pause, "a zero floor disables pacing")
+
+	_, pause = rateLimitPauseDuration(&apitypes.GitHubRateLimit{Remaining: 0, Limit: 5000, ResetAt: now.Add(-time.Minute).Format(time.RFC3339)}, 20, now)
+	assert.False(t, pause, "a past reset means the next request sees a fresh budget")
 }

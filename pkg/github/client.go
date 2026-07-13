@@ -597,6 +597,10 @@ type OpenPullRequest struct {
 	HeadSHA string
 	BaseRef string
 	User    string
+	// UpdatedAt is the PR's last-activity time. The listing orders by it
+	// (newest first), so a caller sweeping a time window can stop paging once
+	// a page crosses the window start.
+	UpdatedAt time.Time
 }
 
 // ListOpenPullRequestsPage lists one page of open pull requests in a
@@ -637,18 +641,34 @@ func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo
 	}
 	for _, pr := range ghPRs {
 		prs = append(prs, OpenPullRequest{
-			Number:  pr.GetNumber(),
-			Title:   pr.GetTitle(),
-			HeadRef: pr.GetHead().GetRef(),
-			HeadSHA: pr.GetHead().GetSHA(),
-			BaseRef: pr.GetBase().GetRef(),
-			User:    pr.GetUser().GetLogin(),
+			Number:    pr.GetNumber(),
+			Title:     pr.GetTitle(),
+			HeadRef:   pr.GetHead().GetRef(),
+			HeadSHA:   pr.GetHead().GetSHA(),
+			BaseRef:   pr.GetBase().GetRef(),
+			User:      pr.GetUser().GetLogin(),
+			UpdatedAt: pr.GetUpdatedAt().Time,
 		})
 	}
 	if resp != nil {
 		nextPage = resp.NextPage
 	}
 	return prs, nextPage, nil
+}
+
+// CoreRateLimit reports the installation's remaining core REST budget. The
+// /rate_limit endpoint does not consume the budget it reports, so pacing
+// checks are free. resetAt is when GitHub replenishes the budget.
+func (ic *InstallationClient) CoreRateLimit(ctx context.Context) (remaining, limit int, resetAt time.Time, err error) {
+	limits, _, err := ic.client.RateLimit.Get(ctx)
+	if err != nil {
+		return 0, 0, time.Time{}, fmt.Errorf("get GitHub core rate limit: %w", err)
+	}
+	core := limits.GetCore()
+	if core == nil {
+		return 0, 0, time.Time{}, fmt.Errorf("get GitHub core rate limit: response carried no core bucket")
+	}
+	return core.Remaining, core.Limit, core.Reset.Time, nil
 }
 
 // IsClosed reports whether the PR is closed (merged or unmerged). Callers that

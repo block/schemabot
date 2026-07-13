@@ -507,7 +507,7 @@ func TestScanWebhookMissingChecksReportsOpenPRsMissingConfiguredChecks(t *testin
 		},
 	}
 
-	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0)
+	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{})
 
 	require.NoError(t, err)
 	assert.Equal(t, 2, result.Scanned)
@@ -537,7 +537,7 @@ func TestScanWebhookMissingChecksReportsUncompletedRuns(t *testing.T) {
 		},
 	}
 
-	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0)
+	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{})
 
 	require.NoError(t, err)
 	assert.Empty(t, result.Missing, "an existing run is not missing, even when uncompleted")
@@ -566,7 +566,7 @@ func TestScanWebhookMissingChecksReportsUncompletedRunWithoutStartTime(t *testin
 		},
 	}
 
-	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0)
+	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{})
 
 	require.NoError(t, err)
 	assert.Empty(t, result.Missing)
@@ -574,6 +574,67 @@ func TestScanWebhookMissingChecksReportsUncompletedRunWithoutStartTime(t *testin
 	require.Len(t, result.Stuck[0].Checks, 1)
 	assert.Equal(t, "queued", result.Stuck[0].Checks[0].Status)
 	assert.Empty(t, result.Stuck[0].Checks[0].StartedAt)
+}
+
+// A windowed sweep stops at the window boundary: the open-PR listing is
+// ordered newest-updated first, so once a PR older than updated_since
+// appears the rest of the repo cannot be in the window — the scan reports
+// only the in-window PRs and clears next_page so the caller stops paging.
+// This bounds an incident sweep by the incident window, not the repo's total
+// open-PR count.
+func TestScanWebhookMissingChecksStopsAtUpdatedSince(t *testing.T) {
+	t.Parallel()
+
+	updatedSince := time.Date(2026, 7, 12, 8, 0, 0, 0, time.UTC)
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 1, Title: "in window, missing check", HeadSHA: "sha1", HeadRef: "f1", UpdatedAt: updatedSince.Add(2 * time.Hour)},
+			{Number: 2, Title: "in window, has check", HeadSHA: "sha2", HeadRef: "f2", UpdatedAt: updatedSince.Add(time.Hour)},
+			{Number: 3, Title: "before window, also missing check", HeadSHA: "sha3", HeadRef: "f3", UpdatedAt: updatedSince.Add(-time.Hour)},
+			{Number: 4, Title: "before window", HeadSHA: "sha4", HeadRef: "f4", UpdatedAt: updatedSince.Add(-2 * time.Hour)},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha2/SchemaBot (production)": {ID: 20, Name: "SchemaBot (production)", Status: "completed", Conclusion: "success"},
+		},
+	}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, updatedSince)
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, result.Scanned, "only the in-window PRs count as scanned")
+	assert.Zero(t, result.NextPage, "crossing the window boundary ends the sweep")
+	require.Len(t, result.Missing, 1)
+	assert.Equal(t, 1, result.Missing[0].Number)
+}
+
+// An unparseable updated_since is a request error, not a full unwindowed scan.
+func TestExecuteChecksScanRejectsInvalidUpdatedSince(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{AllowedEnvironments: []string{"production"}}
+
+	_, err := executeChecksScan(t.Context(), cfg, ChecksScanRequest{Repo: "octo/repo", UpdatedSince: "yesterday"}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "updated_since")
+}
+
+// The repos inventory returns the declared repos config sorted, and a legacy
+// single-App config (which declares no repos) is a request error telling the
+// operator to name a repository — a fleet sweep cannot guess what to scan.
+func TestExecuteChecksRepos(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{
+		Apps:  map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+		Repos: map[string]RepoConfig{"octo/zebra": {GitHubApp: "main"}, "octo/alpha": {GitHubApp: "main"}},
+	}
+	response, err := executeChecksRepos(cfg)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"octo/alpha", "octo/zebra"}, response.Repos)
+
+	_, err = executeChecksRepos(&ServerConfig{GitHub: GitHubConfig{AppID: "1", PrivateKey: "key"}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "declares no repos config")
 }
 
 // A missing check whose name is already taken by an untrusted app's Check Run
@@ -591,7 +652,7 @@ func TestScanWebhookMissingChecksSurfacesUntrustedConflicts(t *testing.T) {
 		},
 	}
 
-	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0)
+	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{})
 
 	require.NoError(t, err)
 	require.Len(t, result.Missing, 1)

@@ -96,6 +96,16 @@ func ChecksSynthesize(ctx context.Context, endpoint string, req apitypes.ChecksS
 	return &result, nil
 }
 
+// ChecksRepos lists the repositories declared in the server's repos config —
+// the inventory a fleet-wide checks scan iterates.
+func ChecksRepos(ctx context.Context, endpoint string) (*apitypes.ChecksReposResponse, error) {
+	var result apitypes.ChecksReposResponse
+	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/checks/repos", struct{}{}, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // PullSchemaOptions controls optional live schema pull request fields.
 type PullSchemaOptions struct {
 	Namespaces    []string

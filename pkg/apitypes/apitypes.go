@@ -108,6 +108,11 @@ type ChecksScanRequest struct {
 	// page). Each request scans a single page so it finishes well within any
 	// intermediary HTTP timeout; the caller loops until next_page is 0.
 	Page int `json:"page,omitempty"`
+	// UpdatedSince, when set (RFC3339), scans only PRs updated at or after
+	// this instant. The open-PR listing is ordered newest-updated first, so
+	// the scan stops paging as soon as it crosses the cutoff — bounding an
+	// incident-window sweep by the window instead of the repo's PR count.
+	UpdatedSince string `json:"updated_since,omitempty"`
 }
 
 type ChecksScanResponse struct {
@@ -121,6 +126,26 @@ type ChecksScanResponse struct {
 	// decides how old is old enough to call stuck, because an uncompleted
 	// check is legitimate while an apply or plan is genuinely in flight.
 	Stuck []StuckCheckPR `json:"stuck,omitempty"`
+	// RateLimit reports the GitHub budget left on the installation that
+	// served this page, so the caller can pace itself instead of starving
+	// the live webhook path that shares the same budget. Nil when the rate
+	// state could not be read (advisory only; the scan itself succeeded).
+	RateLimit *GitHubRateLimit `json:"rate_limit,omitempty"`
+}
+
+// GitHubRateLimit is a point-in-time snapshot of a GitHub installation's
+// core REST budget.
+type GitHubRateLimit struct {
+	Remaining int `json:"remaining"`
+	Limit     int `json:"limit"`
+	// ResetAt is RFC3339; when the budget replenishes.
+	ResetAt string `json:"reset_at"`
+}
+
+// ChecksReposResponse lists the repositories declared in the server's repos
+// config — the inventory a fleet-wide scan iterates.
+type ChecksReposResponse struct {
+	Repos []string `json:"repos"`
 }
 
 // ChecksSynthesizeRequest asks the server to recreate missing Check Runs for
@@ -135,6 +160,9 @@ type ChecksSynthesizeRequest struct {
 type ChecksSynthesizeResponse struct {
 	Repo    string                   `json:"repo"`
 	Results []ChecksSynthesizeResult `json:"results"`
+	// RateLimit mirrors ChecksScanResponse.RateLimit: the installation's
+	// remaining GitHub budget after this batch, for caller-side pacing.
+	RateLimit *GitHubRateLimit `json:"rate_limit,omitempty"`
 }
 
 type ChecksSynthesizeResult struct {

@@ -77,6 +77,7 @@ type WebhookRedriveResult = apitypes.WebhookRedriveResult
 type WebhookRedriveSelection = apitypes.WebhookRedriveSelection
 type ChecksScanRequest = apitypes.ChecksScanRequest
 type ChecksScanResponse = apitypes.ChecksScanResponse
+type ChecksReposResponse = apitypes.ChecksReposResponse
 type MissingCheckPR = apitypes.MissingCheckPR
 type StuckCheckPR = apitypes.StuckCheckPR
 type IncompleteCheckRun = apitypes.IncompleteCheckRun
@@ -137,7 +138,7 @@ func executeChecksSynthesize(ctx context.Context, cfg *ServerConfig, backfiller 
 	if logger == nil {
 		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	}
-	_, installationID, err := resolveRepoInstallationClient(ctx, cfg, req.Repo, logger)
+	installationClient, installationID, err := resolveRepoInstallationClient(ctx, cfg, req.Repo, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +154,29 @@ func executeChecksSynthesize(ctx context.Context, cfg *ServerConfig, backfiller 
 		}
 		response.Results = append(response.Results, result)
 	}
+	response.RateLimit = gitHubRateLimitSnapshot(ctx, installationClient, logger, "checks synthesize batch")
 	return response, nil
+}
+
+// gitHubRateLimitSnapshot reads the installation's remaining core budget so
+// the caller can pace a large backfill instead of starving the live webhook
+// path that shares the same budget. The snapshot is advisory: the operation
+// that produced the response already succeeded, so a read failure is logged
+// and the pacing info omitted rather than failing the request.
+func gitHubRateLimitSnapshot(ctx context.Context, client interface {
+	CoreRateLimit(ctx context.Context) (remaining, limit int, resetAt time.Time, err error)
+}, logger *slog.Logger, operation string) *apitypes.GitHubRateLimit {
+	remaining, limit, resetAt, err := client.CoreRateLimit(ctx)
+	if err != nil {
+		logger.Warn("failed to read GitHub rate limit; response omits pacing info and the caller will not pause",
+			"operation", operation, "error", err)
+		return nil
+	}
+	return &apitypes.GitHubRateLimit{
+		Remaining: remaining,
+		Limit:     limit,
+		ResetAt:   resetAt.UTC().Format(time.RFC3339),
+	}
 }
 
 type webhookRedriveDeliveryClient interface {
@@ -263,6 +286,14 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanReq
 	if req.Environment != "" && !cfg.IsEnvironmentAllowed(req.Environment) {
 		return nil, webhookOpsRequestErrorf("environment %q is not one this instance handles", req.Environment)
 	}
+	var updatedSince time.Time
+	if req.UpdatedSince != "" {
+		var err error
+		updatedSince, err = time.Parse(time.RFC3339, req.UpdatedSince)
+		if err != nil {
+			return nil, webhookOpsRequestErrorf("parse updated_since %q as RFC3339: %v", req.UpdatedSince, err)
+		}
+	}
 	if logger == nil {
 		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	}
@@ -270,7 +301,40 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanReq
 	if err != nil {
 		return nil, err
 	}
-	return scanWebhookMissingChecks(ctx, installationClient, req.Repo, webhookMissingCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page)
+	response, err := scanWebhookMissingChecks(ctx, installationClient, req.Repo, webhookMissingCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page, updatedSince)
+	if err != nil {
+		return nil, err
+	}
+	response.RateLimit = gitHubRateLimitSnapshot(ctx, installationClient, logger, "checks scan page")
+	return response, nil
+}
+
+func (s *Service) handleChecksRepos(w http.ResponseWriter, r *http.Request) {
+	response, err := executeChecksRepos(s.config)
+	if err != nil {
+		s.writeWebhookOpsError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, response)
+}
+
+// executeChecksRepos lists the repositories declared in the server's repos
+// config — the inventory a fleet-wide checks scan iterates. A legacy
+// single-App config declares no repos, so a fleet sweep cannot know what to
+// scan; the operator must name repositories explicitly there.
+func executeChecksRepos(cfg *ServerConfig) (*ChecksReposResponse, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("server config is nil")
+	}
+	if len(cfg.Repos) == 0 {
+		return nil, webhookOpsRequestErrorf("this server declares no repos config; name a repository explicitly instead of scanning all repos")
+	}
+	repos := make([]string, 0, len(cfg.Repos))
+	for repo := range cfg.Repos {
+		repos = append(repos, repo)
+	}
+	sort.Strings(repos)
+	return &ChecksReposResponse{Repos: repos}, nil
 }
 
 // resolveRepoInstallationClient builds an installation-scoped GitHub client
@@ -665,13 +729,20 @@ type webhookMissingCheckScanClient interface {
 	FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error)
 }
 
-func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, repo string, checkNames []string, page int) (*ChecksScanResponse, error) {
+func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, repo string, checkNames []string, page int, updatedSince time.Time) (*ChecksScanResponse, error) {
 	prs, nextPage, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookScanPRPageSize)
 	if err != nil {
 		return nil, err
 	}
-	result := &ChecksScanResponse{Repo: repo, CheckNames: checkNames, Scanned: len(prs), NextPage: nextPage}
+	result := &ChecksScanResponse{Repo: repo, CheckNames: checkNames, NextPage: nextPage}
 	for _, pr := range prs {
+		if !updatedSince.IsZero() && pr.UpdatedAt.Before(updatedSince) {
+			// The listing is ordered newest-updated first, so every PR from
+			// here on is older than the requested window: the sweep is done.
+			result.NextPage = 0
+			break
+		}
+		result.Scanned++
 		var missing []string
 		var untrustedConflicts []string
 		var incomplete []IncompleteCheckRun
