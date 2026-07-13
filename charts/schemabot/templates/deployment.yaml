@@ -66,10 +66,11 @@ spec:
           # Startup gates liveness until the server finishes boot (schema
           # ensure + listeners), allowing a slow start — e.g. waiting out a
           # storage credential rotation — without liveness killing the pod.
-          # The budget must comfortably exceed the storage schema-ensure
-          # bounds (waiting on the cross-pod advisory lock plus the online
-          # DDL timeout, with retries), so a boot that is legitimately busy
-          # applying storage DDL is never killed mid-apply.
+          # The budget must comfortably exceed the server's storage boot
+          # bounds (the boot retry budget plus a final attempt running to the
+          # schema-ensure timeout: cross-pod advisory lock wait plus the
+          # online DDL timeout), so a boot that is legitimately waiting on
+          # storage or applying storage DDL is never killed mid-apply.
           startupProbe:
             httpGet:
               path: /livez

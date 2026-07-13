@@ -240,39 +240,16 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		return nil, fmt.Errorf("storage DSN not configured (set storage.dsn in config or MYSQL_DSN env var)")
 	}
 
-	// Apply storage schema with retries for transient failures (e.g., DNS
-	// not yet available when the container starts in Kubernetes).
+	// Storage boot is patient: failures here are expected transients — DNS may
+	// not resolve yet when the container starts, and during a credential
+	// rotation every new connection is rejected until the mounted secret
+	// catches up with the database password. Retrying inside the startup-probe
+	// budget lets the pod wait the window out instead of crash-looping
+	// through it.
 	logger.Info("ensuring storage schema")
-	var db *sql.DB
-	const maxRetries = 5
-	const pingTimeout = 10 * time.Second
-	for attempt := range maxRetries {
-		if err := api.EnsureSchema(dsn, logger); err != nil {
-			if attempt < maxRetries-1 {
-				logger.Warn("ensure schema failed, retrying", "attempt", attempt+1, "error", err)
-				time.Sleep(2 * time.Second)
-				continue
-			}
-			return nil, fmt.Errorf("ensure schema after %d attempts: %w", maxRetries, err)
-		}
-
-		db, err = mysqlconn.OpenReloadable(dsn, cfg.StorageDSN)
-		if err != nil {
-			return nil, fmt.Errorf("open database: %w", err)
-		}
-		pingCtx, pingCancel := context.WithTimeout(ctx, pingTimeout)
-		pingErr := db.PingContext(pingCtx)
-		pingCancel()
-		if pingErr != nil {
-			utils.CloseAndLog(db)
-			if attempt < maxRetries-1 {
-				logger.Warn("database ping failed, retrying", "attempt", attempt+1, "error", pingErr)
-				time.Sleep(2 * time.Second)
-				continue
-			}
-			return nil, fmt.Errorf("ping database after %d attempts: %w", maxRetries, pingErr)
-		}
-		break
+	db, err := bootStorage(ctx, cfg, logger)
+	if err != nil {
+		return nil, err
 	}
 
 	// On any error past this point, close the resources Build has opened so a
@@ -377,6 +354,68 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		authz:           authz,
 		engines:         o.engines,
 	}, nil
+}
+
+// Storage boot retry policy. The budget is sized so that even a final attempt
+// that runs to the schema-ensure timeout still finishes inside the
+// deployment's startup-probe budget: the HTTP listener (and with it /livez)
+// only starts after boot completes, so the startup probe is what bounds a pod
+// whose storage never becomes reachable.
+const (
+	storageBootRetryBudget   = 8 * time.Minute
+	storageBootRetryInterval = 5 * time.Second
+)
+
+// bootStorage brings up the storage database for a booting server: it applies
+// the storage schema, opens the pool, and verifies connectivity, retrying
+// failed attempts until the boot budget is spent. The DSN is re-resolved on
+// every attempt so file-backed references pick up credentials rotated while
+// the server waits.
+func bootStorage(ctx context.Context, cfg *api.ServerConfig, logger *slog.Logger) (*sql.DB, error) {
+	deadline := time.Now().Add(storageBootRetryBudget)
+	for attempt := 1; ; attempt++ {
+		db, err := connectStorage(ctx, cfg, logger)
+		if err == nil {
+			return db, nil
+		}
+		if time.Until(deadline) < storageBootRetryInterval {
+			return nil, fmt.Errorf("storage not ready after %d attempts over %s: %w", attempt, storageBootRetryBudget, err)
+		}
+		logger.Warn("storage not ready, retrying",
+			"attempt", attempt,
+			"retry_in", storageBootRetryInterval,
+			"budget_remaining", time.Until(deadline).Round(time.Second),
+			"error", err)
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("storage boot canceled after %d attempts: %w", attempt, ctx.Err())
+		case <-time.After(storageBootRetryInterval):
+		}
+	}
+}
+
+// connectStorage runs a single storage boot attempt: resolve the DSN, apply
+// the storage schema, open the pool, and verify it with a ping.
+func connectStorage(ctx context.Context, cfg *api.ServerConfig, logger *slog.Logger) (*sql.DB, error) {
+	const pingTimeout = 10 * time.Second
+	dsn, err := cfg.StorageDSN()
+	if err != nil {
+		return nil, fmt.Errorf("resolve storage DSN: %w", err)
+	}
+	if err := api.EnsureSchema(dsn, logger); err != nil {
+		return nil, fmt.Errorf("ensure storage schema: %w", err)
+	}
+	db, err := mysqlconn.OpenReloadable(dsn, cfg.StorageDSN)
+	if err != nil {
+		return nil, fmt.Errorf("open storage database: %w", err)
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
+	defer cancel()
+	if err := db.PingContext(pingCtx); err != nil {
+		utils.CloseAndLog(db)
+		return nil, fmt.Errorf("ping storage database: %w", err)
+	}
+	return db, nil
 }
 
 // Service returns the underlying API service for embedders that need direct
