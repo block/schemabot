@@ -49,8 +49,8 @@ func failureLogsSection(ctx context.Context, stor storage.Storage, logger interf
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failureLogsLoadTimeout)
 	defer cancel()
 	// Load one entry beyond the limit so the fold can label itself honestly:
-	// "Logs" when it carries the complete history, "Recent logs" when older
-	// entries exist beyond the tail.
+	// "Show logs" when it carries the complete history, "Show recent logs"
+	// when older entries exist beyond the tail.
 	logs, err := stor.ApplyLogs().GetRecentByApply(ctx, apply.ID, failureSummaryLogLimit+1)
 	if err != nil {
 		logger.Error("failed to load apply logs for failure summary; posting summary without recent logs",

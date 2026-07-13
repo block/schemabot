@@ -136,7 +136,7 @@ func TestE2EFailedApplySummaryCarriesRecentLogs(t *testing.T) {
 	observer.OnTerminal(&terminalApply, []*storage.Task{failedTask})
 
 	summary := waitForSummaryCreate(t, capture)
-	assert.Contains(t, summary, "<summary>Logs (2)</summary>")
+	assert.Contains(t, summary, "<summary>Show logs (2 entries)</summary>")
 	assert.Contains(t, summary, "[INF] Apply claimed by driver [queued -> running]")
 	assert.Contains(t, summary, "[ERR] Apply failed: lost MySQL connection during copy [running -> failed]")
 
@@ -178,8 +178,8 @@ func TestE2EFailedApplySummaryCarriesRecentLogs(t *testing.T) {
 	observer2.OnTerminal(&terminalDone, []*storage.Task{completedTask})
 
 	doneSummary := waitForSummaryCreate(t, capture2)
-	assert.NotContains(t, doneSummary, "<summary>Logs (")
-	assert.NotContains(t, doneSummary, "Recent logs")
+	assert.NotContains(t, doneSummary, "<summary>Show logs (")
+	assert.NotContains(t, doneSummary, "Show recent logs")
 }
 
 // waitForSummaryCreate reads created comments until the terminal summary

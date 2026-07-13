@@ -50,9 +50,9 @@ const minFailureLogsSectionChars = 512
 // RenderRecentFailureLogs renders the collapsed logs section appended to a
 // failed apply's summary comment, formatted like the CLI logs output
 // (timestamp, level tag, message, state transition). The fold is labeled
-// "Logs" when it carries the apply's complete log history and "Recent logs"
-// when it is a tail — hasOlder reports that entries older than entries[0]
-// exist but were not loaded. The section spends at most available characters —
+// "Show logs" when it carries the apply's complete log history and "Show
+// recent logs" when it is a tail — hasOlder reports that entries older than
+// entries[0] exist but were not loaded. The section spends at most available characters —
 // the room the rest of the comment leaves under GitHub's size limit, so a
 // large summary body shrinks the fold instead of pushing the comment over the
 // limit. Returns "" when there are no entries or no meaningful room, so the
@@ -72,11 +72,15 @@ func RenderRecentFailureLogs(entries []LogEntryData, available int, hasOlder boo
 	}
 	lines, omitted := trimLogLinesToBudget(lines, budget-sectionChromeChars)
 
-	label := "Logs"
+	label := "Show logs"
 	if hasOlder || omitted > 0 {
-		label = "Recent logs"
+		label = "Show recent logs"
 	}
-	section := fmt.Sprintf("\n<details>\n<summary>%s (%d)</summary>\n\n", label, len(lines))
+	noun := "entries"
+	if len(lines) == 1 {
+		noun = "entry"
+	}
+	section := fmt.Sprintf("\n<details>\n<summary>%s (%d %s)</summary>\n\n", label, len(lines), noun)
 	if omitted > 0 {
 		section += fmt.Sprintf("_%d earlier entries omitted to fit the comment size limit._\n\n", omitted)
 	}

@@ -12,8 +12,8 @@ import (
 // TestRenderRecentFailureLogs verifies the logs section appended to a failed
 // apply's summary folds the entries into a details block and formats each
 // line like the CLI logs output: UTC timestamp, bracketed level tag, message,
-// and state transition when set. A complete history is labeled "Logs" — no
-// entries were left out, so the fold must not suggest a subset.
+// and state transition when set. A complete history is labeled "Show logs" —
+// no entries were left out, so the fold must not suggest a subset.
 func TestRenderRecentFailureLogs(t *testing.T) {
 	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
 	rendered := RenderRecentFailureLogs([]LogEntryData{
@@ -23,8 +23,8 @@ func TestRenderRecentFailureLogs(t *testing.T) {
 	}, GitHubIssueCommentMaxChars, false)
 
 	assert.Contains(t, rendered, "<details>")
-	assert.Contains(t, rendered, "<summary>Logs (3)</summary>")
-	assert.NotContains(t, rendered, "Recent logs")
+	assert.Contains(t, rendered, "<summary>Show logs (3 entries)</summary>")
+	assert.NotContains(t, rendered, "Show recent logs")
 	assert.Contains(t, rendered, "```text")
 	assert.Contains(t, rendered, "2026-07-12 16:32:01 UTC [INF] Apply claimed by driver [queued -> running]")
 	assert.Contains(t, rendered, "2026-07-12 16:32:04 UTC [WRN] Copy throttled by replication lag")
@@ -33,15 +33,15 @@ func TestRenderRecentFailureLogs(t *testing.T) {
 }
 
 // TestRenderRecentFailureLogsTailLabel verifies that when older entries exist
-// beyond the loaded tail, the fold is labeled "Recent logs" so the operator
-// knows they are seeing a subset, not the full history.
+// beyond the loaded tail, the fold is labeled "Show recent logs" so the
+// operator knows they are seeing a subset, not the full history.
 func TestRenderRecentFailureLogsTailLabel(t *testing.T) {
 	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
 	rendered := RenderRecentFailureLogs([]LogEntryData{
 		{CreatedAt: at, Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"},
 	}, GitHubIssueCommentMaxChars, true)
 
-	assert.Contains(t, rendered, "<summary>Recent logs (1)</summary>")
+	assert.Contains(t, rendered, "<summary>Show recent logs (1 entry)</summary>")
 }
 
 // TestRenderRecentFailureLogsEmpty verifies an apply with no log entries adds
@@ -71,7 +71,7 @@ func TestRenderRecentFailureLogsSanitizesUntrustedText(t *testing.T) {
 // TestRenderRecentFailureLogsTrimsToSizeBudget verifies that when the rendered
 // log block would blow GitHub's comment size limit, the earliest lines are
 // dropped, the newest are kept, the fold says how many were omitted, and the
-// label flips to "Recent logs" because a subset is shown.
+// label flips to "Show recent logs" because a subset is shown.
 func TestRenderRecentFailureLogsTrimsToSizeBudget(t *testing.T) {
 	at := time.Date(2026, 7, 12, 16, 0, 0, 0, time.UTC)
 	entries := make([]LogEntryData, 100)
@@ -85,7 +85,7 @@ func TestRenderRecentFailureLogsTrimsToSizeBudget(t *testing.T) {
 	rendered := RenderRecentFailureLogs(entries, GitHubIssueCommentMaxChars, false)
 
 	require.Less(t, len(rendered), 65536, "rendered section must leave room inside GitHub's size limit")
-	assert.Contains(t, rendered, "<summary>Recent logs (")
+	assert.Contains(t, rendered, "<summary>Show recent logs (")
 	assert.Contains(t, rendered, "earlier entries omitted")
 	assert.NotContains(t, rendered, "16:00:00 UTC", "earliest entry is dropped first")
 	assert.Contains(t, rendered, "16:01:39 UTC", "newest entry always survives")
