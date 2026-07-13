@@ -9,29 +9,25 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
+// commentChromeHeadroom reserves room under GitHub's comment size cap for
+// markup added to the body after the section is appended (the support-channel
+// footer) plus margin, so the assembled comment never lands exactly at the
+// limit.
+const commentChromeHeadroom = 1024
+
 // failureSummaryLogLimit bounds the log load for a failed apply's summary
-// comment. It is derived, not a product choice: the fold's byte budget is the
-// real limit, and this is the most entries that could ever render within it.
-// Loading more rows could never add a rendered line, so the query stays
+// comment. It is derived, not a product choice: the comment's byte budget is
+// the real limit, and this is the most entries that could ever render within
+// it. Loading more rows could never add a rendered line, so the query stays
 // bounded (engine log lines flow into apply_logs, so a long apply accumulates
 // far more rows than any comment can carry) without the load bound ever being
 // the reason a line is dropped. The newest entries are kept — the tail leading
 // up to the failure is what an operator triaging from the PR needs.
-const failureSummaryLogLimit = templates.MaxFailureLogsSectionChars / templates.MinRenderedLogLineChars
+const failureSummaryLogLimit = (templates.GitHubIssueCommentMaxChars - commentChromeHeadroom) / templates.MinRenderedLogLineChars
 
 // failureLogsLoadTimeout bounds the log load so a slow storage read degrades
 // to a summary without logs rather than delaying the terminal comment.
 const failureLogsLoadTimeout = 2 * time.Second
-
-// gitHubIssueCommentMaxChars is GitHub's hard cap on an issue comment body — a
-// larger body is rejected outright, so anything appended to a summary must fit
-// within what the summary itself leaves free.
-const gitHubIssueCommentMaxChars = 65536
-
-// commentChromeHeadroom reserves room under the GitHub cap for markup added to
-// the body after the section is appended (the support-channel footer) plus
-// margin, so the assembled comment never lands exactly at the limit.
-const commentChromeHeadroom = 1024
 
 // failureLogsSection renders the collapsed recent-logs section for a terminal
 // summary comment whose already-rendered body is baseBody. Only a failed apply
@@ -75,7 +71,7 @@ func failureLogsSection(ctx context.Context, stor storage.Storage, logger interf
 			NewState:  entry.NewState,
 		}
 	}
-	available := gitHubIssueCommentMaxChars - commentChromeHeadroom - len(baseBody)
+	available := templates.GitHubIssueCommentMaxChars - commentChromeHeadroom - len(baseBody)
 	section := templates.RenderRecentFailureLogs(entries, available, hasOlder)
 	if section == "" && len(entries) > 0 {
 		logger.Error("summary body leaves no room for the recent-logs section under the GitHub comment size limit; posting summary without recent logs",

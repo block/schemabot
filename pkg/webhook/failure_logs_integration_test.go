@@ -14,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
+	"github.com/block/schemabot/pkg/webhook/templates"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -141,7 +142,7 @@ func TestE2EFailedApplySummaryCarriesRecentLogs(t *testing.T) {
 
 	// A summary body that already fills GitHub's comment budget leaves no room
 	// for the section — it must be dropped so the summary itself still posts.
-	hugeBase := strings.Repeat("x", gitHubIssueCommentMaxChars)
+	hugeBase := strings.Repeat("x", templates.GitHubIssueCommentMaxChars)
 	noRoom := failureLogsSection(ctx, st,
 		slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})),
 		&terminalApply, hugeBase)

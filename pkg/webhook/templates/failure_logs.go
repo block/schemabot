@@ -22,18 +22,19 @@ type LogEntryData struct {
 	NewState string
 }
 
-// MaxFailureLogsSectionChars caps the rendered log block regardless of how
-// much room the summary body leaves, so a short summary never carries an
-// unreadably long fold. When the block would exceed the effective budget, the
-// earliest lines are dropped — the entries closest to the failure are what an
-// operator reading the PR needs.
-const MaxFailureLogsSectionChars = 50000
+// GitHubIssueCommentMaxChars is GitHub's hard cap on an issue comment body —
+// a larger body is rejected outright, so everything rendered into a comment
+// must fit under it. This is the only size limit on the logs section: the
+// fold spends whatever room the rest of the comment leaves, and when the
+// block would exceed that, the earliest lines are dropped — the entries
+// closest to the failure are what an operator reading the PR needs.
+const GitHubIssueCommentMaxChars = 65536
 
 // MinRenderedLogLineChars is the smallest a rendered log line can be: the UTC
 // timestamp, the bracketed level tag, and at least one message character plus
 // the joining newline. Callers use it to bound how many entries could ever
-// fit in a fold — loading more than MaxFailureLogsSectionChars /
-// MinRenderedLogLineChars entries can never add a rendered line.
+// fit in a fold — loading more than budget / MinRenderedLogLineChars entries
+// can never add a rendered line.
 const MinRenderedLogLineChars = len("2006-01-02 15:04:05 UTC [INF] x") + 1
 
 // sectionChromeChars reserves room within the budget for the section's own
@@ -51,20 +52,19 @@ const minFailureLogsSectionChars = 512
 // (timestamp, level tag, message, state transition). The fold is labeled
 // "Logs" when it carries the apply's complete log history and "Recent logs"
 // when it is a tail — hasOlder reports that entries older than entries[0]
-// exist but were not loaded. The section spends at most
-// min(available, MaxFailureLogsSectionChars) characters — available is the
-// room the rest of the comment leaves under GitHub's size limit, so a large
-// summary body shrinks the fold instead of pushing the comment over the
+// exist but were not loaded. The section spends at most available characters —
+// the room the rest of the comment leaves under GitHub's size limit, so a
+// large summary body shrinks the fold instead of pushing the comment over the
 // limit. Returns "" when there are no entries or no meaningful room, so the
 // summary renders unchanged.
 func RenderRecentFailureLogs(entries []LogEntryData, available int, hasOlder bool) string {
 	if len(entries) == 0 {
 		return ""
 	}
-	budget := min(available, MaxFailureLogsSectionChars)
-	if budget < minFailureLogsSectionChars {
+	if available < minFailureLogsSectionChars {
 		return ""
 	}
+	budget := available
 
 	lines := make([]string, len(entries))
 	for i, entry := range entries {
