@@ -495,6 +495,12 @@ type ApplyCommentStore interface {
 	// Upsert for the same state clears superseded_at. A missing or already-
 	// superseded row is not an error.
 	Supersede(ctx context.Context, applyID int64, commentState string) error
+
+	// ClearPendingFreeze removes the pending-freeze marker for a single
+	// (apply_id, comment_state) once the superseded comment's frozen rendering
+	// has landed on GitHub. A missing row or an already-clear marker is not an
+	// error.
+	ClearPendingFreeze(ctx context.Context, applyID int64, commentState string) error
 }
 
 // ApplyOperationStore manages per-(apply, deployment, operation_key) child rows

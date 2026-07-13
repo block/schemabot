@@ -2,6 +2,7 @@ package templates
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/storage"
@@ -309,15 +310,27 @@ type VolumeSupersededProgressData struct {
 	PreviousBody string
 }
 
+// volumeSupersededPrefix opens every frozen superseded-progress body;
+// IsVolumeSupersededProgressComment keys on it so a freeze retry can tell an
+// already-frozen comment from a live one.
+const volumeSupersededPrefix = "⏩ Volume changed to"
+
 // RenderVolumeSupersededProgressComment renders the frozen body written over a
 // progress comment once a volume change rotates in a fresh one. The old
 // comment's final progress stays on the PR as a record, collapsed into a
 // details block, with a pointer to the comment where progress continues.
 func RenderVolumeSupersededProgressComment(data VolumeSupersededProgressData) string {
 	return fmt.Sprintf(
-		"⏩ Volume changed to **%d/%d** — progress continues in [a new progress comment](https://github.com/%s/pull/%d#issuecomment-%d).\n\n"+
+		volumeSupersededPrefix+" **%d/%d** — progress continues in [a new progress comment](https://github.com/%s/pull/%d#issuecomment-%d).\n\n"+
 			"<details>\n<summary>Progress before the volume change</summary>\n\n%s\n\n</details>\n",
 		data.Volume, storage.MaxVolume, data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
+}
+
+// IsVolumeSupersededProgressComment reports whether a comment body is already
+// the frozen rendering written by RenderVolumeSupersededProgressComment, so a
+// freeze retry does not wrap a frozen body in a second fold.
+func IsVolumeSupersededProgressComment(body string) bool {
+	return strings.HasPrefix(body, volumeSupersededPrefix)
 }
 
 // RenderCutoverCommandAccepted renders the acknowledgement posted when a PR
