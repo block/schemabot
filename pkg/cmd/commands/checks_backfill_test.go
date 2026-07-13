@@ -1,7 +1,9 @@
 package commands
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -68,4 +70,66 @@ func TestIndexRedriveableDeliveriesGroupsMultipleAppsPerPR(t *testing.T) {
 func TestSanitizeCell(t *testing.T) {
 	assert.Equal(t, "a b c", sanitizeCell("a\tb\nc"))
 	assert.Equal(t, "plain", sanitizeCell("plain"))
+}
+
+// The stuck filter keeps only uncompleted Check Runs that have sat past the
+// threshold: young runs are legitimately in flight and stay out of the
+// report, aged runs are flattened to one row per (PR, check) with a
+// human-readable age, and a run with no reported start time is always kept —
+// its age cannot prove it is young.
+func TestStuckChecksPastThreshold(t *testing.T) {
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	stuck := stuckChecksPastThreshold([]apitypes.StuckCheckPR{
+		{
+			Number: 5, URL: "https://github.com/octo/repo/pull/5", Title: "aged and young", HeadSHA: "sha5",
+			Checks: []apitypes.IncompleteCheckRun{
+				{Name: "SchemaBot (production)", CheckRunID: 50, Status: "in_progress", StartedAt: "2026-07-12T08:30:00Z"},
+				{Name: "SchemaBot (staging)", CheckRunID: 51, Status: "in_progress", StartedAt: "2026-07-12T11:50:00Z"},
+			},
+		},
+		{
+			Number: 6, URL: "https://github.com/octo/repo/pull/6", Title: "no start time", HeadSHA: "sha6",
+			Checks: []apitypes.IncompleteCheckRun{
+				{Name: "SchemaBot (production)", CheckRunID: 60, Status: "queued"},
+			},
+		},
+	}, time.Hour, now)
+
+	require.Len(t, stuck, 2)
+	assert.Equal(t, 5, stuck[0].PR)
+	assert.Equal(t, "SchemaBot (production)", stuck[0].CheckName)
+	assert.Equal(t, "3h30m0s", stuck[0].Age)
+	assert.Equal(t, 6, stuck[1].PR)
+	assert.Equal(t, "unknown", stuck[1].Age)
+}
+
+// The report renders stuck Check Runs in their own section, telling the
+// operator backfill does not act on them, and still prints it when no checks
+// are missing at all.
+func TestWriteChecksBackfillReportRendersStuckSection(t *testing.T) {
+	report := &checksBackfillReport{
+		Repo:                   "octo/repo",
+		CheckNames:             []string{"SchemaBot (production)"},
+		Scanned:                12,
+		DeliverySearchComplete: true,
+		DryRun:                 true,
+		StuckAfter:             "1h",
+		Stuck: []checksStuckCheck{
+			{
+				PR: 5, URL: "https://github.com/octo/repo/pull/5", Title: "wedged", HeadSHA: "sha5555555555555",
+				CheckName: "SchemaBot (production)", CheckRunID: 50, Status: "in_progress", Age: "3h30m0s",
+			},
+		},
+	}
+
+	var out strings.Builder
+	require.NoError(t, writeChecksBackfillReport(&out, report))
+
+	rendered := out.String()
+	assert.Contains(t, rendered, "Stuck Check Runs — uncompleted for over 1h")
+	assert.Contains(t, rendered, "backfill does not act on existing Check Runs")
+	assert.Contains(t, rendered, "https://github.com/octo/repo/pull/5")
+	assert.Contains(t, rendered, "in_progress")
+	assert.Contains(t, rendered, "3h30m0s")
+	assert.Contains(t, rendered, "No missing SchemaBot Check Runs found.")
 }

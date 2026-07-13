@@ -116,6 +116,11 @@ type ChecksScanResponse struct {
 	Scanned    int              `json:"scanned"`
 	NextPage   int              `json:"next_page,omitempty"`
 	Missing    []MissingCheckPR `json:"missing"`
+	// Stuck lists open PRs whose expected Check Run exists but has not
+	// completed. The server reports the raw status and start time; the caller
+	// decides how old is old enough to call stuck, because an uncompleted
+	// check is legitimate while an apply or plan is genuinely in flight.
+	Stuck []StuckCheckPR `json:"stuck,omitempty"`
 }
 
 // ChecksSynthesizeRequest asks the server to recreate missing Check Runs for
@@ -150,6 +155,27 @@ type MissingCheckPR struct {
 	// still recreates the trusted check, but the operator likely also needs to
 	// remove/rename the conflicting check or adjust the trusted-app config.
 	UntrustedConflictNames []string `json:"untrusted_conflict_check_names,omitempty"`
+}
+
+// StuckCheckPR is an open PR carrying at least one expected SchemaBot Check
+// Run that exists but has not reached a conclusion.
+type StuckCheckPR struct {
+	Number  int                  `json:"number"`
+	URL     string               `json:"url"`
+	Title   string               `json:"title"`
+	HeadSHA string               `json:"head_sha"`
+	HeadRef string               `json:"head_ref"`
+	Checks  []IncompleteCheckRun `json:"checks"`
+}
+
+// IncompleteCheckRun describes one Check Run that exists on the PR head but
+// has not completed.
+type IncompleteCheckRun struct {
+	Name       string `json:"name"`
+	CheckRunID int64  `json:"check_run_id"`
+	Status     string `json:"status"`
+	// StartedAt is RFC3339; empty when GitHub did not report a start time.
+	StartedAt string `json:"started_at,omitempty"`
 }
 
 // =============================================================================

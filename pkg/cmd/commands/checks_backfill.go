@@ -17,13 +17,17 @@ import (
 
 // ChecksCmd groups SchemaBot Check Run operator commands.
 type ChecksCmd struct {
-	Backfill ChecksBackfillCmd `cmd:"" help:"Find open PRs missing SchemaBot Check Runs and recreate them"`
+	Backfill ChecksBackfillCmd `cmd:"" help:"Find open PRs with missing or stuck SchemaBot Check Runs; recreate the missing ones"`
 }
 
 // ChecksBackfillCmd finds open PRs missing SchemaBot Check Runs and recreates
 // them, choosing the right remedy per PR: redeliver the PR's failed webhook
 // delivery when GitHub still retains one, otherwise replay the auto-plan flow
-// server-side. --dry-run prints the per-PR classification without acting.
+// server-side. It also reports Check Runs that exist but never completed
+// (stuck in queued/in_progress past --stuck-after) — those are surfaced for
+// investigation, never acted on, because an uncompleted check can belong to a
+// genuinely in-flight apply. --dry-run prints the per-PR classification
+// without acting.
 type ChecksBackfillCmd struct {
 	Repo             string `arg:"" help:"Repository to backfill, in owner/name form"`
 	Environment      string `help:"Only backfill this environment's SchemaBot Check Run name"`
@@ -31,6 +35,7 @@ type ChecksBackfillCmd struct {
 	Limit            int    `help:"Maximum open PRs to consider; 0 considers all" default:"0"`
 	DeliveryWindow   string `help:"How far back to search delivery history for redriveable deliveries, for example 6h or 14d" default:"14d"`
 	MaxDeliveryPages int    `help:"Maximum delivery pages to search per App" default:"300"`
+	StuckAfter       string `help:"Report an existing but uncompleted Check Run as stuck once it has been sitting this long, for example 1h or 2d" default:"1h"`
 	DryRun           bool   `help:"Print the per-PR classification without redelivering or synthesizing"`
 	JSON             bool   `help:"Output as JSON"`
 }
@@ -66,13 +71,32 @@ type checksBackfillAction struct {
 	Error        string             `json:"error,omitempty"`
 }
 
+// checksStuckCheck is one existing-but-uncompleted Check Run on an open PR,
+// aged past --stuck-after. Reported for investigation only; the backfill
+// never acts on a check that already exists.
+type checksStuckCheck struct {
+	PR         int    `json:"pr"`
+	URL        string `json:"url"`
+	Title      string `json:"title"`
+	HeadSHA    string `json:"head_sha"`
+	CheckName  string `json:"check_name"`
+	CheckRunID int64  `json:"check_run_id"`
+	Status     string `json:"status"`
+	StartedAt  string `json:"started_at,omitempty"`
+	// Age is how long the run has been sitting uncompleted at scan time;
+	// "unknown" when GitHub did not report a start time.
+	Age string `json:"age"`
+}
+
 type checksBackfillReport struct {
 	Repo                   string                 `json:"repo"`
 	CheckNames             []string               `json:"check_names"`
 	Scanned                int                    `json:"scanned"`
 	DeliverySearchComplete bool                   `json:"delivery_search_complete"`
 	DryRun                 bool                   `json:"dry_run"`
+	StuckAfter             string                 `json:"stuck_after"`
 	Actions                []checksBackfillAction `json:"actions"`
+	Stuck                  []checksStuckCheck     `json:"stuck,omitempty"`
 }
 
 func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
@@ -85,6 +109,10 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 	deliveryWindow, err := parseWebhookRedriveLast(cmd.DeliveryWindow)
 	if err != nil {
 		return fmt.Errorf("parse --delivery-window: %w", err)
+	}
+	stuckAfter, err := parseWebhookRedriveLast(cmd.StuckAfter)
+	if err != nil {
+		return fmt.Errorf("parse --stuck-after: %w", err)
 	}
 	endpoint, err := g.Resolve()
 	if err != nil {
@@ -120,8 +148,10 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 	redriveable, searchComplete := indexRedriveableDeliveries(crawl)
 
 	// Phase 2: page through open PRs missing the configured Check Runs and
-	// classify each against the delivery index.
-	report := &checksBackfillReport{Repo: cmd.Repo, DeliverySearchComplete: searchComplete, DryRun: cmd.DryRun}
+	// classify each against the delivery index. The scan also returns Check
+	// Runs that exist but never completed; those aged past --stuck-after are
+	// reported for investigation.
+	report := &checksBackfillReport{Repo: cmd.Repo, DeliverySearchComplete: searchComplete, DryRun: cmd.DryRun, StuckAfter: cmd.StuckAfter}
 	page := 1
 	for {
 		chunk, err := cmdclient.ChecksScan(ctx, endpoint, apitypes.ChecksScanRequest{
@@ -154,7 +184,8 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 			}
 			report.Actions = append(report.Actions, action)
 		}
-		updateProgress(fmt.Sprintf("scanned %d open PRs in %s, %d missing Check Runs so far", report.Scanned, cmd.Repo, len(report.Actions)))
+		report.Stuck = append(report.Stuck, stuckChecksPastThreshold(chunk.Stuck, stuckAfter, webhookRedriveNow())...)
+		updateProgress(fmt.Sprintf("scanned %d open PRs in %s, %d missing and %d stuck Check Runs so far", report.Scanned, cmd.Repo, len(report.Actions), len(report.Stuck)))
 		if chunk.NextPage == 0 || (cmd.Limit > 0 && report.Scanned >= cmd.Limit) {
 			break
 		}
@@ -191,6 +222,41 @@ func backfillCanceledError(err error, stopProgress func()) error {
 	stopProgress()
 	fmt.Fprintln(os.Stderr, "checks backfill canceled")
 	return ErrSilent
+}
+
+// stuckChecksPastThreshold flattens the scan's uncompleted Check Runs to one
+// row per (PR, check), keeping only runs that have been sitting longer than
+// stuckAfter. A run with no reported start time is always kept — its age
+// cannot prove it is young, and the scan must not hide it.
+func stuckChecksPastThreshold(prs []apitypes.StuckCheckPR, stuckAfter time.Duration, now time.Time) []checksStuckCheck {
+	var out []checksStuckCheck
+	for _, pr := range prs {
+		for _, check := range pr.Checks {
+			age := "unknown"
+			if check.StartedAt != "" {
+				startedAt, err := time.Parse(time.RFC3339, check.StartedAt)
+				if err == nil {
+					sitting := now.Sub(startedAt)
+					if sitting < stuckAfter {
+						continue
+					}
+					age = sitting.Truncate(time.Minute).String()
+				}
+			}
+			out = append(out, checksStuckCheck{
+				PR:         pr.Number,
+				URL:        pr.URL,
+				Title:      pr.Title,
+				HeadSHA:    pr.HeadSHA,
+				CheckName:  check.Name,
+				CheckRunID: check.CheckRunID,
+				Status:     check.Status,
+				StartedAt:  check.StartedAt,
+				Age:        age,
+			})
+		}
+	}
+	return out
 }
 
 // redriveableDeliveries is one PR's failed check-creating deliveries; all of
@@ -315,6 +381,9 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 			return err
 		}
 	}
+	if err := writeChecksStuckSection(w, report); err != nil {
+		return err
+	}
 	if len(report.Actions) == 0 {
 		_, err := fmt.Fprintln(w, "No missing SchemaBot Check Runs found.")
 		return err
@@ -359,6 +428,34 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 		return fmt.Errorf("%d Check Run backfills failed; see the outcomes above", failed)
 	}
 	return nil
+}
+
+// writeChecksStuckSection renders the stuck Check Runs the scan found: runs
+// that exist on an open PR's head but have sat uncompleted past --stuck-after.
+// Backfill never acts on these — an existing run may belong to an in-flight
+// apply, and overwriting it could convert real uncertainty into a passing
+// check — so the section tells the operator to investigate instead.
+func writeChecksStuckSection(w io.Writer, report *checksBackfillReport) error {
+	if len(report.Stuck) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintf(w, "\nStuck Check Runs — uncompleted for over %s (backfill does not act on existing Check Runs; investigate the apply or plan that owns each):\n", report.StuckAfter); err != nil {
+		return err
+	}
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	if _, err := fmt.Fprintln(tw, "PR\tHEAD SHA\tCHECK\tSTATUS\tAGE\tTITLE"); err != nil {
+		return err
+	}
+	for _, stuck := range report.Stuck {
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", stuck.URL, shortSHA(stuck.HeadSHA), stuck.CheckName, stuck.Status, stuck.Age, sanitizeCell(stuck.Title)); err != nil {
+			return err
+		}
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintln(w)
+	return err
 }
 
 // describeBackfillPlan renders a dry-run action, naming the remedy the

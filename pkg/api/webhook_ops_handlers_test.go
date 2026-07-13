@@ -518,6 +518,64 @@ func TestScanWebhookMissingChecksReportsOpenPRsMissingConfiguredChecks(t *testin
 	assert.Empty(t, result.Missing[0].UntrustedConflictNames)
 }
 
+// An expected Check Run that exists but never completed is reported as stuck,
+// with its raw status and start time, so the operator can tell a wedged check
+// apart from a missing one — completed runs and missing runs stay out of the
+// stuck list, and an uncompleted run is never misreported as missing.
+func TestScanWebhookMissingChecksReportsUncompletedRuns(t *testing.T) {
+	t.Parallel()
+
+	startedAt := time.Date(2026, 7, 12, 9, 0, 0, 0, time.UTC)
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 7, Title: "wedged check", HeadSHA: "sha7", HeadRef: "feature-7"},
+			{Number: 8, Title: "healthy check", HeadSHA: "sha8", HeadRef: "feature-8"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha7/SchemaBot (production)": {ID: 70, Name: "SchemaBot (production)", Status: "in_progress", StartedAt: startedAt},
+			"sha8/SchemaBot (production)": {ID: 80, Name: "SchemaBot (production)", Status: "completed", Conclusion: "success"},
+		},
+	}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0)
+
+	require.NoError(t, err)
+	assert.Empty(t, result.Missing, "an existing run is not missing, even when uncompleted")
+	require.Len(t, result.Stuck, 1)
+	stuck := result.Stuck[0]
+	assert.Equal(t, 7, stuck.Number)
+	assert.Equal(t, "https://github.com/octo/repo/pull/7", stuck.URL)
+	require.Len(t, stuck.Checks, 1)
+	assert.Equal(t, "SchemaBot (production)", stuck.Checks[0].Name)
+	assert.Equal(t, int64(70), stuck.Checks[0].CheckRunID)
+	assert.Equal(t, "in_progress", stuck.Checks[0].Status)
+	assert.Equal(t, "2026-07-12T09:00:00Z", stuck.Checks[0].StartedAt)
+}
+
+// A stuck run without a reported start time serializes an empty started_at
+// rather than a misleading year-one timestamp.
+func TestScanWebhookMissingChecksReportsUncompletedRunWithoutStartTime(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 9, Title: "queued forever", HeadSHA: "sha9", HeadRef: "feature-9"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha9/SchemaBot (production)": {ID: 90, Name: "SchemaBot (production)", Status: "queued"},
+		},
+	}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0)
+
+	require.NoError(t, err)
+	assert.Empty(t, result.Missing)
+	require.Len(t, result.Stuck, 1)
+	require.Len(t, result.Stuck[0].Checks, 1)
+	assert.Equal(t, "queued", result.Stuck[0].Checks[0].Status)
+	assert.Empty(t, result.Stuck[0].Checks[0].StartedAt)
+}
+
 // A missing check whose name is already taken by an untrusted app's Check Run
 // is reported distinctly, so the operator knows backfill alone leaves a
 // conflicting check to resolve.

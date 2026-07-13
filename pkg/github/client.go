@@ -931,6 +931,10 @@ type CheckRunResult struct {
 	Name       string
 	Status     string // "queued", "in_progress", "completed"
 	Conclusion string // "success", "failure", "neutral", "action_required"
+	// StartedAt is when the Check Run was started; zero when GitHub did not
+	// report a start time. Lets callers judge how long a run that never
+	// completed has been sitting.
+	StartedAt time.Time
 }
 
 // FindCheckRunByName searches for a check run on a specific commit by name.
@@ -989,6 +993,7 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 						Name:       run.GetName(),
 						Status:     run.GetStatus(),
 						Conclusion: run.GetConclusion(),
+						StartedAt:  run.GetStartedAt().Time,
 					}
 				}
 			}

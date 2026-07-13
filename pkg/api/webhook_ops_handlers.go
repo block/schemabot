@@ -78,6 +78,8 @@ type WebhookRedriveSelection = apitypes.WebhookRedriveSelection
 type ChecksScanRequest = apitypes.ChecksScanRequest
 type ChecksScanResponse = apitypes.ChecksScanResponse
 type MissingCheckPR = apitypes.MissingCheckPR
+type StuckCheckPR = apitypes.StuckCheckPR
+type IncompleteCheckRun = apitypes.IncompleteCheckRun
 
 // CheckRunBackfiller replays the auto-plan flow for a PR to recreate missing
 // Check Runs, exactly as the check-creating webhook delivery would have. The
@@ -672,12 +674,21 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 	for _, pr := range prs {
 		var missing []string
 		var untrustedConflicts []string
+		var incomplete []IncompleteCheckRun
 		for _, checkName := range checkNames {
 			run, untrustedApps, err := client.FindCheckRunByName(ctx, repo, pr.HeadSHA, checkName)
 			if err != nil {
 				return nil, fmt.Errorf("scan %s#%d for check %q at %s: %w", repo, pr.Number, checkName, pr.HeadSHA, err)
 			}
 			if run != nil {
+				if !checkRunCompleted(run) {
+					incomplete = append(incomplete, IncompleteCheckRun{
+						Name:       run.Name,
+						CheckRunID: run.ID,
+						Status:     run.Status,
+						StartedAt:  formatCheckRunStartedAt(run.StartedAt),
+					})
+				}
 				continue
 			}
 			missing = append(missing, checkName)
@@ -687,6 +698,16 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 			if len(untrustedApps) > 0 {
 				untrustedConflicts = append(untrustedConflicts, checkName)
 			}
+		}
+		if len(incomplete) > 0 {
+			result.Stuck = append(result.Stuck, StuckCheckPR{
+				Number:  pr.Number,
+				URL:     fmt.Sprintf("https://github.com/%s/pull/%d", repo, pr.Number),
+				Title:   pr.Title,
+				HeadSHA: pr.HeadSHA,
+				HeadRef: pr.HeadRef,
+				Checks:  incomplete,
+			})
 		}
 		if len(missing) == 0 {
 			continue
@@ -702,4 +723,22 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		})
 	}
 	return result, nil
+}
+
+// checkRunCompleted reports whether the Check Run has reached a conclusion.
+// Anything else (queued, in_progress, pending) is still holding its slot
+// without gating, which the scan surfaces so an operator can judge whether
+// the run is legitimately in flight or wedged.
+func checkRunCompleted(run *ghclient.CheckRunResult) bool {
+	return run.Status == "completed"
+}
+
+// formatCheckRunStartedAt renders the start time for the API response; GitHub
+// can omit it, and a zero time would otherwise serialize as a misleading
+// year-one timestamp.
+func formatCheckRunStartedAt(startedAt time.Time) string {
+	if startedAt.IsZero() {
+		return ""
+	}
+	return startedAt.UTC().Format(time.RFC3339)
 }
