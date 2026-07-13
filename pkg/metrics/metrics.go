@@ -118,6 +118,20 @@ func RecordPlan(ctx context.Context, repo, database, deployment, environment, st
 	)
 }
 
+// RecordPlanCommentMinimize counts the outcome of retiring one superseded plan
+// comment. Outcomes: "minimized" (hidden on GitHub and marked in storage),
+// "apply_owned" (kept expanded because an apply owns the plan's head),
+// "guard_error" (apply-ownership lookup failed, comment kept expanded fail
+// closed — investigate storage), "minimize_error" (GitHub minimize call
+// failed; retried on the next supersede — investigate GitHub API health).
+func RecordPlanCommentMinimize(ctx context.Context, repo, outcome string) {
+	addCounter(ctx, "schemabot.plan_comment_minimize.total",
+		"Total number of superseded plan-comment minimize attempts by outcome", "{comment}",
+		attribute.String("repository", repo),
+		attribute.String("outcome", outcome),
+	)
+}
+
 // RecordPlanDuration records the duration of a plan operation.
 func RecordPlanDuration(ctx context.Context, duration time.Duration, repo, database, deployment, environment, status string) {
 	recordHistogram(ctx, "schemabot.plan.duration_seconds", duration.Seconds(),
