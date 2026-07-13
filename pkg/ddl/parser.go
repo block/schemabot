@@ -72,10 +72,10 @@ func (tidbStatementParser) Split(content string) ([]string, error) {
 func (tidbStatementParser) Classify(stmt string) (statement.StatementType, string, error) {
 	results, err := statement.Classify(stmt)
 	if err != nil {
-		return statement.StatementUnknown, "", fmt.Errorf("classify statement %q: %w", stmt, err)
+		return statement.StatementUnknown, "", fmt.Errorf("classify statement %q: %w", statementPreview(stmt), err)
 	}
 	if len(results) == 0 {
-		return statement.StatementUnknown, "", fmt.Errorf("no classification result for statement %q", stmt)
+		return statement.StatementUnknown, "", fmt.Errorf("no classification result for statement %q", statementPreview(stmt))
 	}
 	if len(results) > 1 {
 		return statement.StatementUnknown, "", fmt.Errorf(
