@@ -6,9 +6,8 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// IsReservedPullNamespace must be the MySQL-dialect classification so existing
-// MySQL and Vitess pull discovery is unchanged after routing through the
-// dialect registry.
+// IsReservedPullNamespace is the MySQL-dialect classification, so MySQL and
+// Vitess pull discovery share a single definition of reserved namespaces.
 func TestIsReservedPullNamespaceUsesMySQLDialect(t *testing.T) {
 	for _, ns := range []string{
 		"mysql", "information_schema", "innodb", "performance_schema", "sys",
@@ -70,5 +69,46 @@ func TestIsReservedPullNamespaceForDialect(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, IsReservedPullNamespaceForDialect(tc.dialect, tc.namespace))
 		})
+	}
+}
+
+func TestDialectForDatabaseType(t *testing.T) {
+	tests := []struct {
+		databaseType string
+		want         Dialect
+	}{
+		{databaseType: "mysql", want: DialectMySQL},
+		{databaseType: "vitess", want: DialectMySQL},
+		{databaseType: "strata", want: DialectMySQL},
+		{databaseType: "postgres", want: DialectPostgres},
+		{databaseType: "Postgres", want: DialectPostgres},
+		{databaseType: "MYSQL", want: DialectMySQL},
+		{databaseType: "unknown", want: DialectMySQL},
+		{databaseType: "", want: DialectMySQL},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.databaseType, func(t *testing.T) {
+			assert.Equal(t, tc.want, DialectForDatabaseType(tc.databaseType))
+		})
+	}
+}
+
+// A Dialect constructed by casting a raw database_type (e.g. "vitess" or
+// "strata") is not a registered dialect, so classification must resolve it to
+// the MySQL dialect rather than fail open and expose MySQL system schemas as
+// pullable user namespaces.
+func TestIsReservedPullNamespaceForDialectFailsClosed(t *testing.T) {
+	for _, raw := range []string{"vitess", "strata", "somethingelse"} {
+		for _, ns := range []string{"mysql", "information_schema", "innodb", "sys"} {
+			assert.True(t,
+				IsReservedPullNamespaceForDialect(Dialect(raw), ns),
+				"unregistered dialect %q must reserve MySQL system schema %q", raw, ns,
+			)
+		}
+		assert.False(t,
+			IsReservedPullNamespaceForDialect(Dialect(raw), "orders_production"),
+			"unregistered dialect %q must not reserve application namespaces", raw,
+		)
 	}
 }
