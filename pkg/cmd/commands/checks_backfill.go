@@ -40,7 +40,7 @@ type ChecksBackfillCmd struct {
 	Repo           string `arg:"" optional:"" help:"Repository to backfill, in owner/name form; omit with --all-repos"`
 	AllRepos       bool   `help:"Scan every repository declared in the server's repos config"`
 	Last           string `help:"Only scan PRs updated within this window, for example 1h or 1d; by default every open PR is scanned"`
-	Environment    string `help:"Only backfill this environment's SchemaBot Check Run name"`
+	Environment    string `short:"e" help:"Only backfill this environment's SchemaBot Check Run name"`
 	CheckName      string `help:"Override the SchemaBot Check Run name to look for"`
 	Limit          int    `help:"Maximum open PRs to consider across all scanned repositories; 0 considers all" default:"0"`
 	StuckAfter     string `help:"Report an existing but uncompleted Check Run as stuck once it has been sitting this long, for example 1h or 2d" default:"1h"`
