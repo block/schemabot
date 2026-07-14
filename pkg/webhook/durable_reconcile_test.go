@@ -161,7 +161,7 @@ func TestWebhookReconcilerRunsOnDispatchLifecycle(t *testing.T) {
 	h.StartDurableWebhookDispatch(t.Context())
 	select {
 	case <-listed:
-	case <-time.After(5 * time.Second):
+	case <-time.After(durableWebhookTestDeadline):
 		t.Fatal("expected the reconciler to list open PRs on the dispatch lifecycle")
 	}
 	h.StopDurableWebhookDispatch()

@@ -51,6 +51,20 @@ func (h *Handler) startWebhookReconciler(ctx context.Context, stop <-chan struct
 			"interval", h.webhookReconcileInterval,
 			"lookback", h.webhookReconcileLookback,
 			"grace", h.webhookReconcileGrace)
+		// The stuck-processing sweep is a single cheap DB UPDATE, not a GitHub
+		// list scan, so it runs once at startup rather than waiting a full
+		// interval. A fleet that crash-loops faster than the reconcile interval
+		// would otherwise never reclaim the rows those very crashes wedged. The
+		// missing-delivery scan still waits for the first tick (see the
+		// startup-delay rationale below) to avoid fanning GitHub list calls out
+		// across every starting replica on a rolling deploy.
+		if ctx.Err() == nil {
+			if store := h.webhookEventStore(); store != nil {
+				h.terminateStuckWebhookEvents(ctx, store)
+			} else {
+				h.logger.Warn("webhook reconciler startup stuck-processing sweep skipped because webhook event storage is unavailable")
+			}
+		}
 		for {
 			select {
 			case <-stop:
@@ -99,6 +113,8 @@ func (h *Handler) reconcileWebhookInbox(ctx context.Context) {
 	var scanned, missing int
 	for _, repo := range repos {
 		if ctx.Err() != nil {
+			h.logger.Debug("webhook reconcile missing-delivery scan stopped early because the context was cancelled",
+				"repos_scanned", scanned, "error", ctx.Err())
 			return
 		}
 		repoScanned, repoMissing := h.reconcileRepoWebhookInbox(ctx, store, repo)
@@ -111,12 +127,15 @@ func (h *Handler) reconcileWebhookInbox(ctx context.Context) {
 }
 
 // webhookReconcileStuckReason is the terminal last_error recorded on rows the
-// reconciler sweeps out of a wedged processing state.
-const webhookReconcileStuckReason = "terminated by reconciler: driver crashed on final attempt with lease expired"
+// reconciler sweeps out of a wedged processing state. The row reached the
+// attempt cap and its lease expired without a terminal write — usually a driver
+// hard-killed mid-attempt, but it can also be a dispatch that completed its work
+// yet died before recording completion. The reason stays agnostic between those.
+const webhookReconcileStuckReason = "terminated by reconciler: processing lease expired at attempt cap without a terminal write"
 
 // terminateStuckWebhookEvents marks failed every inbox row parked in processing
-// with an expired lease at the attempt cap — a driver hard-killed on its final
-// attempt. FindNext stops reclaiming a processing row once attempts reach the
+// with an expired lease at the attempt cap — the driver reached the cap and its
+// lease expired without a terminal write. FindNext stops reclaiming a processing row once attempts reach the
 // cap, so without this sweep such a row stays unclaimable forever and its
 // delivery GUID deduplicates every redelivery. Terminalizing it emits the row
 // as a failure and makes it eligible for the redeliver-reopen path.
@@ -165,7 +184,18 @@ pages:
 				// older than the lookback window.
 				break pages
 			}
-			if pr.HeadSHA == "" || pr.UpdatedAt.After(grace) {
+			if pr.HeadSHA == "" {
+				// A PR listing without a head SHA can't be matched to an inbox
+				// delivery; skip rather than emit a spurious missing-row report.
+				h.logger.Debug("webhook reconciler skipped open PR with no head SHA",
+					"repo", repo, "pr", pr.Number)
+				continue
+			}
+			if pr.UpdatedAt.After(grace) {
+				// Updated within the grace window; its webhook delivery may still
+				// be in flight to the inbox, so a missing row here is expected.
+				h.logger.Debug("webhook reconciler skipped recently updated open PR within grace window",
+					"repo", repo, "pr", pr.Number, "updated_at", pr.UpdatedAt)
 				continue
 			}
 			scanned++

@@ -120,6 +120,11 @@ func (s *recordingWebhookEventStore) TerminateStuckProcessing(_ context.Context,
 			event.LeaseToken = ""
 			event.LeaseExpiresAt = nil
 			event.RetryAfter = nil
+			// Mirror the real SQL's completed_at = COALESCE(completed_at, NOW()).
+			if event.CompletedAt == nil {
+				completedAt := now
+				event.CompletedAt = &completedAt
+			}
 			terminated++
 		}
 	}
