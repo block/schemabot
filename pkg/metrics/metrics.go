@@ -123,7 +123,9 @@ func RecordPlan(ctx context.Context, repo, database, deployment, environment, st
 // "apply_owned" (kept expanded because an apply owns the plan's head),
 // "guard_error" (apply-ownership lookup failed, comment kept expanded fail
 // closed — investigate storage), "minimize_error" (GitHub minimize call
-// failed; retried on the next supersede — investigate GitHub API health).
+// failed; retried on the next supersede — investigate GitHub API health),
+// "mark_error" (hidden on GitHub but the storage mark failed; the next
+// supersede re-minimizes it idempotently — investigate storage).
 func RecordPlanCommentMinimize(ctx context.Context, repo, outcome string) {
 	addCounter(ctx, "schemabot.plan_comment_minimize.total",
 		"Total number of superseded plan-comment minimize attempts by outcome", "{comment}",

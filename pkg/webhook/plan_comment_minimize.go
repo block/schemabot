@@ -138,6 +138,8 @@ func (h *Handler) minimizeSupersededPlanComments(ctx context.Context, client *gh
 			// which is idempotent.
 			h.logger.Error("minimized plan comment on GitHub but failed to record it; the next supersede re-minimizes it",
 				append(priorAttrs, "error", err)...)
+			metrics.RecordPlanCommentMinimize(ctx, prior.Repository, "mark_error")
+			continue
 		}
 		metrics.RecordPlanCommentMinimize(ctx, prior.Repository, "minimized")
 		h.logger.Info("minimized superseded plan comment", priorAttrs...)
