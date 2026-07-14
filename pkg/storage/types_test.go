@@ -172,18 +172,19 @@ func TestDecodeVolumeControlRequestMetadataRejectsInvalidPayloads(t *testing.T) 
 // mapping to the Postgres engine and unknown types defaulting to Spirit.
 func TestEngineForType(t *testing.T) {
 	tests := []struct {
+		name   string
 		dbType string
 		want   string
 	}{
-		{dbType: DatabaseTypeMySQL, want: EngineSpirit},
-		{dbType: DatabaseTypeVitess, want: EnginePlanetScale},
-		{dbType: DatabaseTypeStrata, want: EngineStrata},
-		{dbType: DatabaseTypePostgres, want: EnginePostgres},
-		{dbType: "", want: EngineSpirit},
-		{dbType: "unknown", want: EngineSpirit},
+		{name: "mysql", dbType: DatabaseTypeMySQL, want: EngineSpirit},
+		{name: "vitess", dbType: DatabaseTypeVitess, want: EnginePlanetScale},
+		{name: "strata", dbType: DatabaseTypeStrata, want: EngineStrata},
+		{name: "postgres", dbType: DatabaseTypePostgres, want: EnginePostgres},
+		{name: "empty defaults to spirit", dbType: "", want: EngineSpirit},
+		{name: "unknown defaults to spirit", dbType: "unknown", want: EngineSpirit},
 	}
 	for _, tc := range tests {
-		t.Run(tc.dbType, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, EngineForType(tc.dbType))
 		})
 	}
