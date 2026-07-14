@@ -462,6 +462,34 @@ func TestDurableWebhookShutdownReleasesClaim(t *testing.T) {
 	require.Empty(t, store.completed)
 }
 
+func TestDurableWebhookShutdownReleasesClaimWhenCancelErrorIsStringified(t *testing.T) {
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	h := newDurableDriverHandler(t, store, nil, nil)
+
+	driverCtx, cancelDriver := context.WithCancel(t.Context())
+	defer cancelDriver()
+	h.durableWebhookProcessOverride = func(ctx context.Context, _ *storage.WebhookEvent) (bool, error) {
+		cancelDriver()
+		<-ctx.Done()
+		// A client that stringifies the cancellation drops the context.Canceled
+		// sentinel from the error chain. The refund must still fire off the
+		// driver-context cancellation rather than an errors.Is unwrap, or the
+		// interrupted claim burns an attempt via MarkFailed.
+		return true, errors.New(ctx.Err().Error())
+	}
+
+	h.driveNextDurableWebhook(driverCtx, 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case released := <-store.released:
+		require.Equal(t, "token-1", released.leaseToken)
+	default:
+		t.Fatal("expected shutdown-cancelled claim to be released even when the cancel error is stringified")
+	}
+	require.Empty(t, store.failed, "shutdown cancellation must not consume the attempt budget")
+	require.Empty(t, store.completed)
+}
+
 func TestDurableWebhookHeartbeatTransientErrorKeepsRunAlive(t *testing.T) {
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
 		Provider:   storage.WebhookProviderGitHub,

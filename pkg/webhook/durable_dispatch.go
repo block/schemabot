@@ -210,12 +210,17 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if processErr != nil {
-		if heartbeatErr == nil && ctx.Err() != nil && errors.Is(processErr, context.Canceled) {
-			// Shutdown (not lease loss) cancelled the run mid-flight. The claim
-			// consumed an attempt when FindNext incremented the counter, but no
-			// real processing happened — refund it, or deploy-churn restarts
-			// that each claim-and-cancel the same delivery would terminally
-			// fail it without a single genuine attempt.
+		if heartbeatErr == nil && ctx.Err() != nil {
+			// The driver context is cancelled, so the pool is shutting down and
+			// this run was interrupted mid-flight — not lease loss, since the
+			// heartbeat still held. Key the refund off the context cancellation
+			// rather than unwrapping processErr: a client that stringifies the
+			// cancellation drops the context.Canceled sentinel, which would
+			// misroute the interrupted claim into a burned attempt via
+			// MarkFailed. The claim consumed an attempt when FindNext
+			// incremented the counter, but no genuine attempt completed — refund
+			// it, or deploy-churn restarts that each claim-and-cancel the same
+			// delivery would terminally fail it without a single real attempt.
 			if err := store.Release(finishCtx, event.ID, event.LeaseToken); err != nil {
 				h.logger.Warn("durable webhook driver could not release delivery claim on shutdown; lease expiry will hand it to another driver",
 					"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
