@@ -1782,6 +1782,45 @@ func isValidTenantName(tenant string) bool {
 	return true
 }
 
+// KnownEnvironments returns every environment name visible in this instance's
+// configuration: its own allowed environments, the server-owned promotion
+// order (which lists peer-owned environments in environment-isolated
+// deployments), and each database's routing environments. The result is
+// sorted and deduplicated. A command environment outside this set belongs to
+// no SchemaBot instance and can be rejected instead of deferred to a peer.
+func (c *ServerConfig) KnownEnvironments() []string {
+	if c == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	add := func(envs ...string) {
+		for _, env := range envs {
+			if env != "" {
+				seen[env] = struct{}{}
+			}
+		}
+	}
+	add(c.AllowedEnvironments...)
+	add(c.PromotionEnvironmentOrder()...)
+	for _, db := range c.Databases {
+		for env := range db.Environments {
+			add(env)
+		}
+	}
+	envs := make([]string, 0, len(seen))
+	for env := range seen {
+		envs = append(envs, env)
+	}
+	slices.Sort(envs)
+	return envs
+}
+
+// IsEnvironmentKnown reports whether the environment appears anywhere in this
+// instance's configuration (see KnownEnvironments).
+func (c *ServerConfig) IsEnvironmentKnown(env string) bool {
+	return slices.Contains(c.KnownEnvironments(), env)
+}
+
 // PromotionEnvironmentOrder returns the server-owned environment promotion
 // order used by PR apply gating.
 func (c *ServerConfig) PromotionEnvironmentOrder() []string {

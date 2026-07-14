@@ -230,11 +230,29 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
-	// When allowed_environments is configured, silently ignore commands targeting
-	// environments handled by another instance. The other SchemaBot instance will
-	// process the command from its own webhook delivery.
+	// When allowed_environments is configured, commands targeting environments
+	// handled by another instance are silently ignored — that instance will
+	// process the command from its own webhook delivery. An environment that
+	// appears nowhere in the configuration belongs to no instance, so deferring
+	// would leave the command unanswered everywhere; reject it under the
+	// respond_to_unscoped policy so exactly one instance corrects the caller.
 	if result.Found && result.Environment != "" && h.service != nil && !h.service.Config().IsEnvironmentAllowed(result.Environment) {
-		h.logger.Info("ignoring command for non-allowed environment",
+		if !h.service.Config().IsEnvironmentKnown(result.Environment) {
+			if result.Tenant == "" && !h.service.Config().ShouldRespondToUnscoped() {
+				h.logger.Debug("skipping unknown environment response (respond_to_unscoped is false)",
+					"repo", repo, "pr", pr, "environment", result.Environment, "action", result.Action)
+				h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
+				return
+			}
+			h.logger.Info("rejecting command for unknown environment",
+				"repo", repo, "pr", pr, "environment", result.Environment, "action", result.Action)
+			h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
+			h.postComment(repo, pr, installationID,
+				templates.RenderUnknownEnv(result.Action, result.Environment, h.service.Config().KnownEnvironments()))
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unknown environment"})
+			return
+		}
+		h.logger.Info("ignoring command for environment owned by another instance",
 			"repo", repo, "pr", pr, "environment", result.Environment, "action", result.Action)
 		h.writeJSON(w, http.StatusOK, map[string]string{
 			"message": "environment handled by another instance",

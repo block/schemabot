@@ -3464,3 +3464,33 @@ func TestSchemaDirHintsForRepoNoMatches(t *testing.T) {
 	assert.Empty(t, hints)
 	assert.True(t, exhaustive, "no repo-eligible database means no policy-valid config location exists")
 }
+
+func TestKnownEnvironments(t *testing.T) {
+	t.Run("defaults to the promotion order", func(t *testing.T) {
+		cfg := &ServerConfig{}
+		assert.Equal(t, []string{"production", "staging"}, cfg.KnownEnvironments())
+		assert.True(t, cfg.IsEnvironmentKnown("staging"))
+		assert.True(t, cfg.IsEnvironmentKnown("production"))
+		assert.False(t, cfg.IsEnvironmentKnown("prodction"))
+	})
+
+	t.Run("unions allowed environments, environment order, and database routing environments", func(t *testing.T) {
+		cfg := &ServerConfig{
+			AllowedEnvironments: []string{"qa"},
+			EnvironmentOrder:    []string{"staging", "production"},
+			Databases: map[string]DatabaseConfig{
+				"payments": {Environments: map[string]EnvironmentConfig{"load": {}}},
+			},
+		}
+		assert.Equal(t, []string{"load", "production", "qa", "staging"}, cfg.KnownEnvironments())
+		assert.True(t, cfg.IsEnvironmentKnown("load"))
+		assert.True(t, cfg.IsEnvironmentKnown("qa"))
+		assert.False(t, cfg.IsEnvironmentKnown("dev"))
+	})
+
+	t.Run("nil config knows no environments", func(t *testing.T) {
+		var cfg *ServerConfig
+		assert.Nil(t, cfg.KnownEnvironments())
+		assert.False(t, cfg.IsEnvironmentKnown("staging"))
+	})
+}

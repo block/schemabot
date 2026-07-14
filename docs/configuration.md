@@ -590,6 +590,20 @@ gate sees an aggregate-named check from an untrusted app, it blocks as usual
 and emits a warning log and metric so operators can distinguish a check-name
 spoof from a chain member missing from the list.
 
+**Command routing across instances.** Every instance receives every PR comment
+through its own App's webhook. A command whose `-e` value is in the instance's
+`allowed_environments` is handled; one owned by a peer instance is silently
+left for that peer to answer. A command environment that appears nowhere in
+the configuration — not in `allowed_environments`, `environment_order`, or any
+database's routing environments — belongs to no instance, so it is rejected
+with an unknown-environment comment listing the configured environments. A
+malformed `-e` value (typically a flag glued on by a missing space, like
+`-e production--allow-unsafe`) is rejected with a usage comment. Both
+rejections follow the `respond_to_unscoped` policy so exactly one instance
+responds, and are acknowledged with an eyes reaction. Because
+`environment_order` doubles as the fleet-wide environment roster for this
+routing decision, keep it complete on every instance.
+
 ### Environment-local gRPC targets
 
 For remote Tern deployments, keep the target registry environment-local too. The staging instance only needs staging target identifiers:

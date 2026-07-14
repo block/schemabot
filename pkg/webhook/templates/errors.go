@@ -193,6 +193,24 @@ schemabot %s -e staging
 `+"```", action, action)
 }
 
+// RenderUnknownEnv generates an error message when the -e value is a
+// well-formed environment name that no SchemaBot instance handles. The value
+// is safe to render: the parser only accepts environment names made of
+// lowercase alphanumerics, underscores, and single dashes.
+func RenderUnknownEnv(action, env string, available []string) string {
+	quoted := make([]string, len(available))
+	for i, name := range available {
+		quoted[i] = "`" + name + "`"
+	}
+	return fmt.Sprintf(`## ❌ Unknown Environment
+
+`+"`%s`"+` isn't a configured environment.
+
+**Available environments**: %s
+
+**Usage**: `+"`schemabot %s -e <environment>`", env, strings.Join(quoted, ", "), action)
+}
+
 // RenderMissingEnv generates an error message when -e flag is missing.
 func RenderMissingEnv(action string) string {
 	return fmt.Sprintf(`## ❌ Missing Argument
