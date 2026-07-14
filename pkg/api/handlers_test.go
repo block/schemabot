@@ -39,6 +39,7 @@ func (m *mockStorage) Tasks() storage.TaskStore                     { return nil
 func (m *mockStorage) ApplyLogs() storage.ApplyLogStore             { return nil }
 func (m *mockStorage) ControlRequests() storage.ControlRequestStore { return nil }
 func (m *mockStorage) ApplyComments() storage.ApplyCommentStore     { return nil }
+func (m *mockStorage) PlanComments() storage.PlanCommentStore       { return nil }
 func (m *mockStorage) ApplyOperations() storage.ApplyOperationStore { return nil }
 func (m *mockStorage) Checks() storage.CheckStore                   { return nil }
 func (m *mockStorage) Settings() storage.SettingsStore              { return nil }
@@ -2344,6 +2345,13 @@ func TestDatabaseListSanitizesConfigAndReportsTopology(t *testing.T) {
 	assert.Empty(t, resp.Databases)
 
 	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=postgres", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Empty(t, resp.Databases)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=cockroach", nil)
 	w = httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())

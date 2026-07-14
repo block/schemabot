@@ -147,7 +147,12 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 
 	// Post plan comment
-	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+	h.postTrackedPlanComment(repo, pr, installationID, planCommentSlot{
+		Database:     schemaResult.Database,
+		DatabaseType: schemaResult.Type,
+		Environments: []string{environment},
+		HeadSHA:      schemaResult.HeadSHA,
+	}, templates.RenderPlanComment(commentData))
 
 	// When drift blocked the check but its record could not be persisted, the
 	// aggregate must not be recomputed from stale (possibly passing) stored rows.
@@ -468,7 +473,12 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	}
 
 	// Post a single combined comment
-	h.postComment(repo, pr, installationID, templates.RenderMultiEnvPlanComment(multiEnvData))
+	h.postTrackedPlanComment(repo, pr, installationID, planCommentSlot{
+		Database:     multiEnvData.Database,
+		DatabaseType: multiEnvData.DatabaseType,
+		Environments: multiEnvData.Environments,
+		HeadSHA:      multiEnvData.HeadSHA,
+	}, templates.RenderMultiEnvPlanComment(multiEnvData))
 }
 
 func (h *Handler) postFailingAggregateForMultiEnvSetupError(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database string, err error) {

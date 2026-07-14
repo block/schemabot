@@ -472,13 +472,24 @@ func TestGRPCMultiDeploy_FailureHaltsRollout(t *testing.T) {
 	)
 
 	// The earlier deployment failed; the rollout must have halted — the later
-	// deployment is not completed and the apply itself is failed.
+	// deployment is not completed and the apply itself is failed. The aggregate
+	// is projected by a parent-row CAS that runs after the per-deployment op
+	// rows are persisted, so it can briefly lag the terminal op states above;
+	// poll for it rather than asserting once.
 	final := multiDeployOperationStates(t, apply.ApplyID)
 	assert.Truef(t, failedApplyState(final[first].State), "%s should be failed, was %q", first, final[first].State)
 	assert.Falsef(t, state.IsState(final[second].State, state.Apply.Completed),
 		"%s must not complete after %s failed, was %q", second, first, final[second].State)
-	prog := grpcProgressByApplyID(t, apply.ApplyID)
-	assert.Truef(t, failedApplyState(prog.State), "aggregate apply state should be failed, was %q", prog.State)
+	var prog grpcProgressResponse
+	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
+		func() bool {
+			prog = grpcProgressByApplyID(t, apply.ApplyID)
+			return failedApplyState(prog.State)
+		},
+		func() string {
+			return fmt.Sprintf("aggregate apply state should be failed, was %q", prog.State)
+		},
+	)
 
 	multiDeployEnsureNoActiveChange(t, database, env, first, second)
 }
@@ -650,9 +661,20 @@ func TestGRPCMultiDeploy_OnFailureContinue(t *testing.T) {
 		"%s should complete under on_failure: continue, was %q", second, final[second].State)
 
 	// The apply settles to failed even though a sibling completed — continue
-	// governs rollout continuation, not the verdict.
-	prog := grpcProgressByApplyID(t, apply.ApplyID)
-	assert.Truef(t, failedApplyState(prog.State), "aggregate apply state should be failed, was %q", prog.State)
+	// governs rollout continuation, not the verdict. The aggregate is projected
+	// by a parent-row CAS that runs after the per-deployment op rows are
+	// persisted, so it can briefly lag the terminal op states above; poll for it
+	// rather than asserting once.
+	var prog grpcProgressResponse
+	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
+		func() bool {
+			prog = grpcProgressByApplyID(t, apply.ApplyID)
+			return failedApplyState(prog.State)
+		},
+		func() string {
+			return fmt.Sprintf("aggregate apply state should be failed, was %q", prog.State)
+		},
+	)
 
 	multiDeployEnsureNoActiveChange(t, database, env, first, second)
 }

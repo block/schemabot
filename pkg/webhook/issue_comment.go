@@ -428,7 +428,7 @@ func (h *Handler) postComment(repo string, pr int, installationID int64, body st
 		return
 	}
 
-	if _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(body)); err != nil {
+	if _, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(body)); err != nil {
 		h.logger.Error("failed to post comment",
 			"repo", repo, "pr", pr, "installation_id", installationID, "error", err)
 	}
@@ -449,7 +449,7 @@ func (h *Handler) postAndTrackComment(
 		return
 	}
 
-	commentID, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(body))
+	commentID, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(body))
 	if err != nil {
 		h.logger.Error("failed to post tracked comment",
 			"repo", repo, "pr", pr, "commentState", commentState, "error", err)

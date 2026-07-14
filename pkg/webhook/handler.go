@@ -69,6 +69,9 @@ const (
 	hookTargetTypeApp    = "integration"
 	hookTargetTypeRepo   = "repository"
 	maxWebhookBodyBytes  = 10 << 20
+
+	defaultDurableWebhookPollInterval  = 1 * time.Second
+	defaultDurableWebhookLeaseDuration = 1 * time.Minute
 )
 
 // Handler processes GitHub webhook events.
@@ -121,6 +124,21 @@ type Handler struct {
 	// (single- and multi-App) unchanged.
 	repoWebhookSecret []byte
 
+	durableWebhookDispatch      bool
+	durableWebhookDriverCount   int
+	durableWebhookPollInterval  time.Duration
+	durableWebhookLeaseDuration time.Duration
+	durableWebhookMu            sync.Mutex
+	durableWebhookStop          chan struct{}
+	durableWebhookCancel        context.CancelFunc
+	durableWebhookWake          chan struct{}
+	durableWebhookWg            sync.WaitGroup
+	// durableWebhookProcessOverride is a test seam that replaces
+	// processDurableWebhookEvent so driver finish-path behavior (for example
+	// refusing to complete a delivery after lease loss) can be exercised
+	// deterministically. Production code never sets it.
+	durableWebhookProcessOverride func(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error)
+
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
 	priorEnvCheckRetryInterval time.Duration
@@ -138,6 +156,15 @@ func WithRepoWebhookSecret(secret []byte) HandlerOption {
 		if len(secret) > 0 {
 			h.repoWebhookSecret = secret
 		}
+	}
+}
+
+// WithDurableWebhookDispatch enables the durable webhook inbox path for events
+// that have been moved out of the request path. Unsupported events keep using
+// their existing synchronous or fire-and-forget handlers.
+func WithDurableWebhookDispatch() HandlerOption {
+	return func(h *Handler) {
+		h.durableWebhookDispatch = true
 	}
 }
 
@@ -172,13 +199,15 @@ func NewHandlerWithClientSet(service *api.Service, ghClients github.ClientSet, w
 // for legacy single-secret behavior (used internally by NewHandler).
 func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, webhookSecretsByApp map[string][]byte, webhookAppByID map[int64]string, logger *slog.Logger, opts ...HandlerOption) *Handler {
 	h := &Handler{
-		service:                    service,
-		ghClients:                  ghClients,
-		webhookSecretsByApp:        maps.Clone(webhookSecretsByApp),
-		webhookAppByID:             maps.Clone(webhookAppByID),
-		logger:                     logger,
-		priorEnvCheckMaxAttempts:   defaultPriorEnvCheckMaxAttempts,
-		priorEnvCheckRetryInterval: defaultPriorEnvCheckRetryInterval,
+		service:                     service,
+		ghClients:                   ghClients,
+		webhookSecretsByApp:         maps.Clone(webhookSecretsByApp),
+		webhookAppByID:              maps.Clone(webhookAppByID),
+		logger:                      logger,
+		durableWebhookPollInterval:  defaultDurableWebhookPollInterval,
+		durableWebhookLeaseDuration: defaultDurableWebhookLeaseDuration,
+		priorEnvCheckMaxAttempts:    defaultPriorEnvCheckMaxAttempts,
+		priorEnvCheckRetryInterval:  defaultPriorEnvCheckRetryInterval,
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -526,22 +555,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx = withResolvedInstallationID(ctx, installationID)
 	}
 
+	// Capture the handler's HTTP status so "processed" is only recorded when the
+	// delivery actually succeeded. A handler that fails closed with a 5xx has
+	// already emitted a specific failure status; recording "processed" too would
+	// double-count the same delivery under contradictory labels.
+	sw := &statusCapturingResponseWriter{ResponseWriter: w}
+	recordProcessed := func() {
+		if sw.statusCode() >= http.StatusInternalServerError {
+			return
+		}
+		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
+	}
 	switch eventType {
 	case "issue_comment":
-		h.handleIssueComment(ctx, metricApp, w, body)
-		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
+		h.handleIssueComment(ctx, metricApp, sw, body)
+		recordProcessed()
 	case "check_run":
-		h.handleCheckRun(ctx, w, body)
-		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
+		h.handleCheckRun(ctx, sw, body)
+		recordProcessed()
 	case "pull_request":
-		h.handlePullRequest(ctx, metricApp, w, body, r.Header.Get(headerDeliveryID))
-		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
+		h.handlePullRequest(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
+		recordProcessed()
 	case "merge_group":
-		h.handleMergeGroup(ctx, metricApp, w, body)
-		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
+		h.handleMergeGroup(ctx, metricApp, sw, body)
+		recordProcessed()
 	case "push":
-		h.handlePush(ctx, metricApp, w, body)
-		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
+		h.handlePush(ctx, metricApp, sw, body)
+		recordProcessed()
 	default:
 		h.logger.Info("webhook ignored",
 			"reason", "unsupported_event_type",
@@ -769,6 +809,30 @@ func (h *Handler) goSafe(repo string, pr int, installationID int64, fn func()) {
 		defer h.recoverPanic(repo, pr, installationID)
 		fn()
 	}()
+}
+
+// statusCapturingResponseWriter records the HTTP status a handler wrote so the
+// dispatcher can tell a successful delivery from one that failed closed with a
+// 5xx. Without it the dispatcher records "processed" unconditionally, which
+// double-counts a failed delivery alongside the specific failure status the
+// handler already emitted (e.g. durable_enqueue_failed).
+type statusCapturingResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusCapturingResponseWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+// statusCode returns the status the handler wrote, defaulting to 200 for
+// handlers that write a body without an explicit WriteHeader.
+func (w *statusCapturingResponseWriter) statusCode() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
 }
 
 func (h *Handler) writeJSON(w http.ResponseWriter, status int, v any) {

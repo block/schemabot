@@ -35,6 +35,9 @@ type Storage interface {
 	// ApplyComments returns the apply comment store.
 	ApplyComments() ApplyCommentStore
 
+	// PlanComments returns the plan comment store.
+	PlanComments() PlanCommentStore
+
 	// ApplyOperations returns the apply-operations store.
 	ApplyOperations() ApplyOperationStore
 
@@ -234,6 +237,14 @@ type WebhookEventStore interface {
 	// MarkFailed marks a claimed event failed. A non-nil retryAfter keeps it
 	// retryable after that time; nil makes the failure terminal.
 	MarkFailed(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error
+
+	// Release returns a claimed event to pending and refunds the attempt its
+	// claim consumed. Drivers use it when shutdown cancels in-flight
+	// processing: an interrupted claim must not consume retry budget, or
+	// repeated deploy restarts could terminally fail a delivery that never got
+	// a real processing attempt. Returns ErrWebhookEventLeaseLost when the
+	// lease token is stale.
+	Release(ctx context.Context, id int64, leaseToken string) error
 }
 
 // PlanStore manages schema change plans.
@@ -420,6 +431,13 @@ type ApplyStore interface {
 	// GetByPR returns all applies for a PR.
 	GetByPR(ctx context.Context, repo string, pr int) ([]*Apply, error)
 
+	// ExistsForDatabaseHead reports whether any apply for the PR and database
+	// was created from a plan for headSHA. An apply whose plan row no longer
+	// exists also counts: without the plan there is no proof of which head it
+	// came from, so callers deciding whether a record is safe to retire must
+	// treat it as owning.
+	ExistsForDatabaseHead(ctx context.Context, repo string, pr int, database, databaseType, headSHA string) (bool, error)
+
 	// Delete removes an apply by ID.
 	Delete(ctx context.Context, id int64) error
 
@@ -545,6 +563,25 @@ type ApplyCommentStore interface {
 	// has landed on GitHub. A missing row or an already-clear marker is not an
 	// error.
 	ClearPendingFreeze(ctx context.Context, applyID int64, commentState string) error
+}
+
+// PlanCommentStore tracks plan comments posted on PRs so a newer plan comment
+// for the same database can minimize the ones it supersedes. Rows exist only
+// for comments actually posted; minimized_at is set only after the GitHub
+// minimize call succeeded, so an unminimized row is always retried by the next
+// supersede.
+type PlanCommentStore interface {
+	// Insert stores a newly posted plan comment and sets comment.ID.
+	Insert(ctx context.Context, comment *PlanComment) error
+
+	// ListUnminimizedForSlot returns the not-yet-minimized comments for a
+	// (repository, pull_request, database) slot, ordered by id ascending. The
+	// caller decides which of them a newly posted comment supersedes.
+	ListUnminimizedForSlot(ctx context.Context, repo string, pr int, database, databaseType string) ([]*PlanComment, error)
+
+	// MarkMinimized stamps minimized_at after the GitHub minimize call
+	// succeeded. An already-minimized row is not an error.
+	MarkMinimized(ctx context.Context, id int64) error
 }
 
 // ApplyOperationStore manages per-(apply, deployment, operation_key) child rows

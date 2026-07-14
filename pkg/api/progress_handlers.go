@@ -661,10 +661,10 @@ func (s *Service) handleDatabaseList(w http.ResponseWriter, r *http.Request) {
 func parseDatabaseListTypeFilter(r *http.Request) (string, error) {
 	databaseType := r.URL.Query().Get("type")
 	switch databaseType {
-	case "", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata:
+	case "", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
 		return databaseType, nil
 	default:
-		return "", fmt.Errorf("type must be %q, %q, or %q", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata)
+		return "", fmt.Errorf("type must be %q, %q, %q, or %q", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres)
 	}
 }
 

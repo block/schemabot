@@ -72,14 +72,15 @@ func TestCreateIssueCommentRetriesSecondaryRateLimitedWrite(t *testing.T) {
 			writeGitHubSecondaryRateLimitError(t, w, http.StatusTooManyRequests)
 			return
 		}
-		require.NoError(t, json.NewEncoder(w).Encode(gh.IssueComment{ID: new(int64(5678))}))
+		require.NoError(t, json.NewEncoder(w).Encode(gh.IssueComment{ID: new(int64(5678)), NodeID: new("IC_node5678")}))
 	})
 
 	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	commentID, err := ic.CreateIssueComment(t.Context(), "octocat/hello-world", 1, "hello")
+	commentID, nodeID, err := ic.CreateIssueComment(t.Context(), "octocat/hello-world", 1, "hello")
 
 	require.NoError(t, err)
 	assert.Equal(t, int64(5678), commentID)
+	assert.Equal(t, "IC_node5678", nodeID)
 	assert.Equal(t, int64(2), attempts.Load())
 }
 

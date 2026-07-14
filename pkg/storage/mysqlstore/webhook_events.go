@@ -77,19 +77,22 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 
 // reopenTerminalWebhookEvent handles the duplicate-GUID branch of Create.
 // GitHub's "Redeliver" reuses the original delivery GUID, so plain dedup would
-// make redelivery a permanent no-op for a terminally failed row — the one case
-// where an operator most needs it to work. Re-open only terminal failures:
+// make redelivery a permanent no-op for a terminal row — the one case where an
+// operator most needs it to work. Re-open both terminal states (failed and
+// completed): a completed row can still have lost its follow-on work if the
+// process died after the delivery was marked completed but before the detached
+// plan goroutines durably recorded their plans, and re-running auto-plan on the
+// same head SHA is idempotent, so a redeliver is a safe recovery lever.
 // pending/retryable/processing rows are genuinely in flight (dedup, return
-// false), and completed rows must not re-run. last_error is kept for forensics
-// until the next attempt overwrites it.
+// false). last_error is kept for forensics until the next attempt overwrites it.
 func (s *webhookEventStore) reopenTerminalWebhookEvent(ctx context.Context, provider, deliveryID, payload string, receivedAt time.Time) (bool, error) {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE webhook_events
 		SET state = ?, attempts = 0, payload = ?, received_at = ?,
 			lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
 			retry_after = NULL, completed_at = NULL, started_at = NULL, updated_at = NOW()
-		WHERE provider = ? AND delivery_id = ? AND state = ?
-	`, storage.WebhookEventPending, payload, receivedAt, provider, deliveryID, storage.WebhookEventFailed)
+		WHERE provider = ? AND delivery_id = ? AND state IN (?, ?)
+	`, storage.WebhookEventPending, payload, receivedAt, provider, deliveryID, storage.WebhookEventFailed, storage.WebhookEventCompleted)
 	if err != nil {
 		return false, fmt.Errorf("reopen terminally failed webhook delivery (provider=%s, delivery_id=%s): %w", provider, deliveryID, err)
 	}
@@ -242,6 +245,28 @@ func (s *webhookEventStore) MarkFailed(ctx context.Context, id int64, leaseToken
 	`, state, nullString(errMsg), retryAfter, retryAfter == nil, id, leaseToken)
 	if err != nil {
 		return fmt.Errorf("mark webhook event %d failed: %w", id, err)
+	}
+	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
+}
+
+// Release re-queues a claimed event as pending and refunds the attempt the
+// claim consumed. When this undoes the first claim (attempts == 1), started_at
+// is cleared so a later claim re-derives it via COALESCE(started_at, NOW()) —
+// otherwise an interrupted first claim would permanently pin started_at to the
+// cancelled attempt's time and misreport when processing actually began. The
+// started_at reset is ordered before the attempts decrement so the CASE reads
+// the pre-decrement value.
+func (s *webhookEventStore) Release(ctx context.Context, id int64, leaseToken string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?,
+			started_at = CASE WHEN attempts <= 1 THEN NULL ELSE started_at END,
+			attempts = GREATEST(attempts - 1, 0), lease_owner = NULL,
+			lease_token = NULL, lease_expires_at = NULL, retry_after = NULL, updated_at = NOW()
+		WHERE id = ? AND lease_token = ?
+	`, storage.WebhookEventPending, id, leaseToken)
+	if err != nil {
+		return fmt.Errorf("release webhook event %d: %w", id, err)
 	}
 	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
 }

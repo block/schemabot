@@ -49,6 +49,8 @@ func (h *Handler) BackfillPRCheckRuns(ctx context.Context, repo string, pr int, 
 	}
 	h.logger.Info("backfilling Check Runs via the auto-plan flow",
 		"repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA)
-	message := h.runAutoPlanForPR(ctx, client, repo, pr, prInfo.HeadSHA, installationID, "checks.backfill", "checks.backfill", "", "")
+	// Discovery failures are already logged and posted as a failing check
+	// inside runAutoPlanForPR; the backfill reconciler re-runs periodically.
+	message, _ := h.runAutoPlanForPR(ctx, client, repo, pr, prInfo.HeadSHA, installationID, "checks.backfill", "checks.backfill", "", "")
 	return message, nil
 }

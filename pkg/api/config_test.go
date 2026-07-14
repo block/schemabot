@@ -622,6 +622,30 @@ func TestServerConfig_Validate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "postgres database type is valid",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         storage.DatabaseTypePostgres,
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "postgres://localhost/mydb"}},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "unknown database type is rejected",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "cockroach",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
 			name:    "missing databases",
 			cfg:     ServerConfig{},
 			wantErr: true,

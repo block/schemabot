@@ -27,6 +27,7 @@
   - [Tenant-scoped command routing](#tenant-scoped-command-routing)
   - [How it works](#how-it-works)
   - [Auto-plan behavior](#auto-plan-behavior)
+  - [Plan comment minimization](#plan-comment-minimization)
 - [Multi-App Routing](#multi-app-routing)
   - [How dispatch works](#how-dispatch-works)
 - [Secret Resolution](#secret-resolution)
@@ -714,6 +715,27 @@ safe. This usually means the database environment config and deployment scoping
 disagree. Align the server environment config with the deployment's
 `allowed_environments`, then run `schemabot plan -e <environment>` or push a new
 commit to refresh checks.
+
+### Plan comment minimization
+
+On a frequently updated PR, plan comments pile up — every push that touches a
+schema file posts a new one. To keep the PR readable, SchemaBot minimizes
+(collapses as **Outdated**) the plan comments a newer one supersedes. This
+applies to auto-plan and `schemabot plan` comments alike; minimized comments
+stay expandable on GitHub, so the full plan history remains auditable.
+
+A newer plan comment for the same database supersedes a prior one when the
+prior was rendered at an older commit, or when it re-renders the same commit
+for the same set of environments. A same-commit comment covering different
+environments is kept expanded — it may be the only visible plan for those
+environments.
+
+One safety hold: a plan comment whose commit produced an apply is never
+minimized, even after new pushes. That comment is the record of what actually
+ran against the database, and it stays visible until an operator reconciles
+the apply. All minimization fails toward visibility — if GitHub or storage
+misbehaves, comments are left expanded (extra noise), never hidden without a
+durable record.
 
 ## Multi-App Routing
 

@@ -1991,6 +1991,29 @@ func (s *applyStore) GetByPR(ctx context.Context, repo string, pr int) ([]*stora
 	return scanApplies(rows)
 }
 
+// ExistsForDatabaseHead reports whether any apply for the PR and database was
+// created from a plan for headSHA. The LEFT JOIN keeps applies whose plan row
+// was deleted: without the plan there is no proof of which head the apply came
+// from, so it must count as matching any head rather than silently dropping
+// out of the result.
+func (s *applyStore) ExistsForDatabaseHead(ctx context.Context, repo string, pr int, database, databaseType, headSHA string) (bool, error) {
+	var exists bool
+	err := s.db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM applies a
+			LEFT JOIN plans p ON p.id = a.plan_id
+			WHERE a.repository = ? AND a.pull_request = ?
+				AND a.database_name = ? AND a.database_type = ?
+				AND (p.id IS NULL OR p.head_sha = ?)
+		)
+	`, repo, pr, database, databaseType, headSHA).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check applies for %s#%d database %s (%s) head %s: %w", repo, pr, database, databaseType, headSHA, err)
+	}
+	return exists, nil
+}
+
 // Delete removes an apply by ID, along with its per-deployment
 // apply_operations rows, in a single transaction. Deleting the children
 // transactionally prevents orphan operation rows that the operator claim loop

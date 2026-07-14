@@ -15,9 +15,10 @@ import (
 type DatabaseType string
 
 const (
-	DatabaseTypeVitess DatabaseType = "vitess"
-	DatabaseTypeMySQL  DatabaseType = "mysql"
-	DatabaseTypeStrata DatabaseType = "strata"
+	DatabaseTypeVitess   DatabaseType = "vitess"
+	DatabaseTypeMySQL    DatabaseType = "mysql"
+	DatabaseTypeStrata   DatabaseType = "strata"
+	DatabaseTypePostgres DatabaseType = "postgres"
 )
 
 // SchemabotConfig represents the schemabot.yaml configuration file.
@@ -99,12 +100,12 @@ func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath,
 		return nil, fmt.Errorf("invalid schemabot.yaml at %s: database is required", configPath)
 	}
 	if config.Type == "" {
-		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type is required (must be 'vitess', 'mysql', or 'strata')", configPath)
+		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type is required (must be 'vitess', 'mysql', 'strata', or 'postgres')", configPath)
 	}
 	switch config.Type {
-	case DatabaseTypeVitess, DatabaseTypeMySQL, DatabaseTypeStrata:
+	case DatabaseTypeVitess, DatabaseTypeMySQL, DatabaseTypeStrata, DatabaseTypePostgres:
 	default:
-		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type must be 'vitess', 'mysql', or 'strata', got '%s'", configPath, config.Type)
+		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type must be 'vitess', 'mysql', 'strata', or 'postgres', got '%s'", configPath, config.Type)
 	}
 
 	return &config, nil

@@ -4,13 +4,16 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"path"
 	"sort"
 	"strings"
@@ -543,16 +546,18 @@ func splitRepo(repo string) (owner, repoName string) {
 	return repo, ""
 }
 
-// CreateIssueComment posts a comment on a PR/issue.
-func (ic *InstallationClient) CreateIssueComment(ctx context.Context, repo string, pr int, body string) (int64, error) {
+// CreateIssueComment posts a comment on a PR/issue. It returns the REST
+// comment ID (used for edits) and the GraphQL node ID (used to minimize the
+// comment when a newer one supersedes it).
+func (ic *InstallationClient) CreateIssueComment(ctx context.Context, repo string, pr int, body string) (int64, string, error) {
 	owner, repoName := splitRepo(repo)
 	comment, _, err := ic.client.Issues.CreateComment(ctx, owner, repoName, pr, &gh.IssueComment{
 		Body: new(body),
 	})
 	if err != nil {
-		return 0, fmt.Errorf("create issue comment: %w", err)
+		return 0, "", fmt.Errorf("create issue comment: %w", err)
 	}
-	return comment.GetID(), nil
+	return comment.GetID(), comment.GetNodeID(), nil
 }
 
 // GetIssueComment returns the current body of an existing PR/issue comment.
@@ -575,6 +580,75 @@ func (ic *InstallationClient) EditIssueComment(ctx context.Context, repo string,
 		return fmt.Errorf("edit issue comment: %w", err)
 	}
 	return nil
+}
+
+// MinimizeComment collapses a PR comment in the GitHub timeline as outdated.
+// The comment stays expandable — minimizing hides it from the default view
+// without editing or deleting the record. GitHub exposes this only through
+// the GraphQL API, so this posts a minimizeComment mutation using the node ID
+// returned when the comment was created.
+func (ic *InstallationClient) MinimizeComment(ctx context.Context, repo, nodeID string) error {
+	payload, err := json.Marshal(map[string]any{
+		"query":     `mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { minimizedComment { isMinimized } } }`,
+		"variables": map[string]string{"id": nodeID},
+	})
+	if err != nil {
+		return fmt.Errorf("minimize comment %s: marshal GraphQL request: %w", nodeID, err)
+	}
+
+	ctx = withGitHubRateLimitContext(ctx, metrics.GitHubOperationGraphQLMinimizeComment, repo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ic.graphQLURL(), bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("minimize comment %s: build GraphQL request: %w", nodeID, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := ic.client.Client().Do(req)
+	if err != nil {
+		return fmt.Errorf("minimize comment %s: %w", nodeID, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("minimize comment %s: GraphQL endpoint returned %s", nodeID, resp.Status)
+	}
+
+	// GraphQL reports failures as a 200 with an errors array; a response that
+	// carries neither an error nor isMinimized=true did not minimize anything.
+	var result struct {
+		Data struct {
+			MinimizeComment struct {
+				MinimizedComment struct {
+					IsMinimized bool `json:"isMinimized"`
+				} `json:"minimizedComment"`
+			} `json:"minimizeComment"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("minimize comment %s: decode GraphQL response: %w", nodeID, err)
+	}
+	if len(result.Errors) > 0 {
+		return fmt.Errorf("minimize comment %s: GraphQL error: %s", nodeID, result.Errors[0].Message)
+	}
+	if !result.Data.MinimizeComment.MinimizedComment.IsMinimized {
+		return fmt.Errorf("minimize comment %s: GitHub did not report the comment as minimized", nodeID)
+	}
+	return nil
+}
+
+// graphQLURL derives the GraphQL endpoint from the configured REST base URL.
+// github.com serves GraphQL at /graphql on the API host, while GitHub
+// Enterprise Server serves REST under /api/v3/ and GraphQL at /api/graphql on
+// the same host.
+func (ic *InstallationClient) graphQLURL() string {
+	base := ic.client.BaseURL
+	u := url.URL{Scheme: base.Scheme, Host: base.Host, Path: "/graphql"}
+	if strings.HasSuffix(base.Path, "/api/v3/") {
+		u.Path = strings.TrimSuffix(base.Path, "v3/") + "graphql"
+	}
+	return u.String()
 }
 
 // AddReactionToComment adds a reaction emoji to a comment.

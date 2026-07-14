@@ -264,9 +264,10 @@ type Setting struct {
 
 // DatabaseType constants.
 const (
-	DatabaseTypeVitess = "vitess"
-	DatabaseTypeMySQL  = "mysql"
-	DatabaseTypeStrata = "strata"
+	DatabaseTypeVitess   = "vitess"
+	DatabaseTypeMySQL    = "mysql"
+	DatabaseTypeStrata   = "strata"
+	DatabaseTypePostgres = "postgres"
 )
 
 // Engine constants.
@@ -274,6 +275,7 @@ const (
 	EngineSpirit      = "spirit"
 	EnginePlanetScale = "planetscale"
 	EngineStrata      = "strata"
+	EnginePostgres    = "postgres"
 )
 
 // ApplyOperationKind constants classify operation rows by scheduling role.
@@ -289,6 +291,8 @@ func EngineForType(dbType string) string {
 		return EnginePlanetScale
 	case DatabaseTypeStrata:
 		return EngineStrata
+	case DatabaseTypePostgres:
+		return EnginePostgres
 	default:
 		return EngineSpirit
 	}
@@ -1139,6 +1143,55 @@ type ApplyComment struct {
 	CreatedAt time.Time
 
 	// UpdatedAt is when the comment was last edited.
+	UpdatedAt time.Time
+}
+
+// PlanComment tracks a plan comment posted on a PR so a newer plan comment for
+// the same database can minimize it on GitHub. Rows are written only when a
+// comment is actually posted — a plan whose comment was suppressed leaves no
+// row. The GitHub comment itself is never edited or deleted through this
+// record; minimizing collapses it in the PR timeline while keeping it
+// expandable as the record of what was shown.
+type PlanComment struct {
+	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
+	ID int64
+
+	// Repository is the "owner/name" repository the comment was posted on.
+	Repository string
+
+	// PullRequest is the PR number the comment was posted on.
+	PullRequest int
+
+	// DatabaseName and DatabaseType identify the database the plan comment
+	// describes. Together with Repository and PullRequest they form the slot a
+	// newer plan comment supersedes.
+	DatabaseName string
+	DatabaseType string
+
+	// EnvironmentScope names the environments the comment covers, sorted and
+	// comma-joined (e.g. "production,staging" for a multi-environment comment,
+	// "staging" for a single-environment one).
+	EnvironmentScope string
+
+	// HeadSHA is the PR head commit the plan was computed against.
+	HeadSHA string
+
+	// GitHubCommentID is the REST comment ID, kept for triage and reconciliation.
+	GitHubCommentID int64
+
+	// GitHubNodeID is the GraphQL node ID required by the minimizeComment
+	// mutation.
+	GitHubNodeID string
+
+	// MinimizedAt is set only after the GitHub minimize call succeeded. Nil
+	// means the comment is still expanded on the PR — including after a failed
+	// minimize, so the next supersede retries it.
+	MinimizedAt *time.Time
+
+	// CreatedAt is when the comment was posted.
+	CreatedAt time.Time
+
+	// UpdatedAt is when this record last changed.
 	UpdatedAt time.Time
 }
 

@@ -99,7 +99,7 @@ func (h *Handler) handleParticipantCheckCompleted(ctx context.Context, w http.Re
 		return
 	}
 
-	ctx, cancel, client, err := h.autoPlanBootstrap(repo, installationID)
+	ctx, cancel, client, err := h.autoPlanBootstrap(context.Background(), repo, installationID)
 	if err != nil {
 		h.logger.Error("failed to bootstrap participant check completion re-fold",
 			"repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA,
@@ -169,7 +169,7 @@ func (h *Handler) handleCheckRunRerequest(ctx context.Context, w http.ResponseWr
 		return
 	}
 
-	ctx, cancel, client, err := h.autoPlanBootstrap(repo, installationID)
+	ctx, cancel, client, err := h.autoPlanBootstrap(context.Background(), repo, installationID)
 	if err != nil {
 		h.logger.Error("failed to bootstrap check_run rerequest",
 			"repo", repo,
@@ -197,7 +197,9 @@ func (h *Handler) handleCheckRunRerequest(ctx context.Context, w http.ResponseWr
 		"check_run_id", payload.CheckRun.ID,
 		"check_name", payload.CheckRun.Name)
 
-	message := h.runAutoPlanForPR(ctx, client, repo, pr, payload.CheckRun.HeadSHA, installationID, "check_run.rerequested", "check_run.rerequested", "", "")
+	// Discovery failures are already logged and posted as a failing check
+	// inside runAutoPlanForPR; the rerequest path has no retry mechanism.
+	message, _ := h.runAutoPlanForPR(ctx, client, repo, pr, payload.CheckRun.HeadSHA, installationID, "check_run.rerequested", "check_run.rerequested", "", "")
 
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": message})
 }
