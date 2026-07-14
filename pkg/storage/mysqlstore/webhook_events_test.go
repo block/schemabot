@@ -260,11 +260,48 @@ func TestWebhookEventStore_ReleaseRefundsAttemptAndRequeues(t *testing.T) {
 	assert.Equal(t, storage.WebhookEventPending, released.State)
 	assert.Equal(t, 0, released.Attempts, "release must refund the attempt consumed by the claim")
 	assert.Empty(t, released.LeaseToken)
+	assert.Nil(t, released.StartedAt, "releasing the first claim must clear started_at so it re-derives on reclaim")
 
 	reclaimed, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
 	require.NoError(t, err)
 	require.NotNil(t, reclaimed)
 	assert.Equal(t, 1, reclaimed.Attempts)
+	require.NotNil(t, reclaimed.StartedAt, "reclaim must set started_at to the actual processing start")
+}
+
+// A release that undoes a later claim (attempts > 1) must keep started_at,
+// which records when the earliest attempt began processing.
+func TestWebhookEventStore_ReleaseKeepsStartedAtAfterFirstAttempt(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	// First claim + retryable failure so the row is claimable again.
+	first, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	require.NotNil(t, first.StartedAt)
+	firstStartedAt := *first.StartedAt
+	retryAfter := time.Now().Add(-time.Minute)
+	require.NoError(t, store.WebhookEvents().MarkFailed(ctx, first.ID, first.LeaseToken, "boom", &retryAfter))
+
+	// Second claim (attempts == 2), then release it.
+	second, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, second)
+	require.Equal(t, 2, second.Attempts)
+	require.NoError(t, store.WebhookEvents().Release(ctx, second.ID, second.LeaseToken))
+
+	released, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
+	require.NoError(t, err)
+	require.NotNil(t, released)
+	assert.Equal(t, 1, released.Attempts, "release must refund only the second attempt")
+	require.NotNil(t, released.StartedAt, "releasing a later claim must preserve the original started_at")
+	assert.WithinDuration(t, firstStartedAt, *released.StartedAt, time.Second)
 }
 
 func TestWebhookEventStore_TerminalWritesReturnNotFoundAfterDelete(t *testing.T) {

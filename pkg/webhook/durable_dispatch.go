@@ -37,7 +37,11 @@ func (h *Handler) StartDurableWebhookDispatch(ctx context.Context) {
 	}
 	store := h.webhookEventStore()
 	if store == nil {
-		h.logger.Warn("durable webhook dispatch disabled because webhook event storage is unavailable")
+		// Only the driver pool is skipped here — durable dispatch stays enabled,
+		// so the ingest path still routes deliveries through the durable branch
+		// and rejects them with 500 until storage recovers. This is not a
+		// fallback to in-process handling.
+		h.logger.Warn("durable webhook driver pool not started: webhook event storage is unavailable; incoming deliveries will be rejected with 500 until storage recovers")
 		return
 	}
 

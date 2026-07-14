@@ -246,10 +246,19 @@ func (s *webhookEventStore) MarkFailed(ctx context.Context, id int64, leaseToken
 	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
 }
 
+// Release re-queues a claimed event as pending and refunds the attempt the
+// claim consumed. When this undoes the first claim (attempts == 1), started_at
+// is cleared so a later claim re-derives it via COALESCE(started_at, NOW()) —
+// otherwise an interrupted first claim would permanently pin started_at to the
+// cancelled attempt's time and misreport when processing actually began. The
+// started_at reset is ordered before the attempts decrement so the CASE reads
+// the pre-decrement value.
 func (s *webhookEventStore) Release(ctx context.Context, id int64, leaseToken string) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE webhook_events
-		SET state = ?, attempts = GREATEST(attempts - 1, 0), lease_owner = NULL,
+		SET state = ?,
+			started_at = CASE WHEN attempts <= 1 THEN NULL ELSE started_at END,
+			attempts = GREATEST(attempts - 1, 0), lease_owner = NULL,
 			lease_token = NULL, lease_expires_at = NULL, retry_after = NULL, updated_at = NOW()
 		WHERE id = ? AND lease_token = ?
 	`, storage.WebhookEventPending, id, leaseToken)
