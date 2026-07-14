@@ -2009,7 +2009,7 @@ func (s *applyStore) ExistsForDatabaseHead(ctx context.Context, repo string, pr 
 		)
 	`, repo, pr, database, databaseType, headSHA).Scan(&exists)
 	if err != nil {
-		return false, fmt.Errorf("check applies for %s#%d database %s head %s: %w", repo, pr, database, headSHA, err)
+		return false, fmt.Errorf("check applies for %s#%d database %s (%s) head %s: %w", repo, pr, database, databaseType, headSHA, err)
 	}
 	return exists, nil
 }

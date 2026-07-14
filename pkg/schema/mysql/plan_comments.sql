@@ -12,6 +12,6 @@ CREATE TABLE `plan_comments` (
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  KEY `idx_slot` (`repository`,`pull_request`,`database_name`,`database_type`),
+  KEY `idx_slot` (`repository`,`pull_request`,`database_name`,`database_type`,`minimized_at`),
   KEY `idx_github_comment` (`github_comment_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
