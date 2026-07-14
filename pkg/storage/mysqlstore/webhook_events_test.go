@@ -195,7 +195,7 @@ func TestWebhookEventStore_LeaseTokenGuardsWrites(t *testing.T) {
 	require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, claimed.ID, claimed.LeaseToken))
 }
 
-func TestWebhookEventStore_CreateReopensTerminallyFailedDelivery(t *testing.T) {
+func TestWebhookEventStore_CreateReopensTerminalDelivery(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := New(testDB)
@@ -230,11 +230,22 @@ func TestWebhookEventStore_CreateReopensTerminallyFailedDelivery(t *testing.T) {
 	require.NotNil(t, reclaimed)
 	require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, reclaimed.ID, reclaimed.LeaseToken))
 
-	// Completed rows must stay deduplicated: redelivery of finished work is a
-	// no-op.
+	// A completed row is also re-opened on redelivery: completion is recorded
+	// before the detached plan goroutines have durably persisted their work, so
+	// a crash in that window can lose the auto-plan while leaving the row
+	// completed. Re-running auto-plan on the same head SHA is idempotent, so an
+	// operator Redeliver is a safe recovery lever rather than a permanent no-op.
 	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":3}`)})
 	require.NoError(t, err)
-	require.False(t, inserted)
+	require.True(t, inserted)
+
+	reopenedAgain, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
+	require.NoError(t, err)
+	require.NotNil(t, reopenedAgain)
+	assert.Equal(t, storage.WebhookEventPending, reopenedAgain.State)
+	assert.Equal(t, 0, reopenedAgain.Attempts)
+	assert.Nil(t, reopenedAgain.CompletedAt)
+	assert.JSONEq(t, `{"attempt":3}`, string(reopenedAgain.Payload))
 }
 
 func TestWebhookEventStore_ReleaseRefundsAttemptAndRequeues(t *testing.T) {

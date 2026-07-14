@@ -62,14 +62,17 @@ func (h *Handler) StartDurableWebhookDispatch(ctx context.Context) {
 	h.durableWebhookStop = stop
 	h.durableWebhookCancel = cancel
 	h.durableWebhookWake = wake
-	h.durableWebhookMu.Unlock()
-
+	// Register every driver goroutine on the WaitGroup while the mutex is still
+	// held. Adding to the WaitGroup concurrently with a StopDurableWebhookDispatch
+	// Wait is the documented reuse misuse; holding the lock across the spawn keeps
+	// Start and Stop from racing.
 	for i := range driverCount {
 		driverID := i
 		h.durableWebhookWg.Go(func() {
 			h.durableWebhookDriver(driverCtx, driverID, stop, wake)
 		})
 	}
+	h.durableWebhookMu.Unlock()
 
 	h.logger.Info("durable webhook dispatch started", "drivers", driverCount, "interval", h.durableWebhookPollInterval)
 }
@@ -80,6 +83,7 @@ func (h *Handler) StopDurableWebhookDispatch() {
 	h.durableWebhookMu.Lock()
 	if h.durableWebhookStop == nil {
 		h.durableWebhookMu.Unlock()
+		h.logger.Debug("durable webhook dispatch stop requested but pool is not running")
 		return
 	}
 	stop := h.durableWebhookStop
@@ -102,6 +106,10 @@ func (h *Handler) wakeDurableWebhookDispatch() {
 	wake := h.durableWebhookWake
 	h.durableWebhookMu.Unlock()
 	if wake == nil {
+		// The pool isn't running (never started, or stopped): drivers reclaim on
+		// the poll ticker, so a missed wake only delays pickup, it doesn't drop
+		// the durable row.
+		h.logger.Debug("durable webhook wake skipped because the driver pool is not running")
 		return
 	}
 	select {
@@ -111,11 +119,14 @@ func (h *Handler) wakeDurableWebhookDispatch() {
 }
 
 func (h *Handler) durableWebhookDriver(ctx context.Context, driverID int, stop <-chan struct{}, wake <-chan struct{}) {
+	// The lease owner is stable for the driver's lifetime; compute it once rather
+	// than re-deriving hostname/pid on every claim.
+	owner := durableWebhookLeaseOwner(driverID)
 	ticker := time.NewTicker(h.durableWebhookPollInterval)
 	defer ticker.Stop()
 
-	h.logger.Debug("durable webhook driver started", "driver", driverID)
-	h.driveNextDurableWebhook(ctx, driverID)
+	h.logger.Debug("durable webhook driver started", "driver", driverID, "lease_owner", owner)
+	h.drainDurableWebhooks(ctx, driverID, owner)
 
 	for {
 		select {
@@ -127,28 +138,44 @@ func (h *Handler) durableWebhookDriver(ctx context.Context, driverID int, stop <
 			return
 		case <-wake:
 			h.logger.Debug("durable webhook driver woke for queued delivery", "driver", driverID)
-			h.driveNextDurableWebhook(ctx, driverID)
+			h.drainDurableWebhooks(ctx, driverID, owner)
 		case <-ticker.C:
-			h.driveNextDurableWebhook(ctx, driverID)
+			h.drainDurableWebhooks(ctx, driverID, owner)
 		}
 	}
 }
 
-func (h *Handler) driveNextDurableWebhook(ctx context.Context, driverID int) {
+// drainDurableWebhooks claims and drives deliveries until none remain claimable,
+// so a backlog is worked down within a single wake/tick instead of one delivery
+// per signal. It stops on the first empty claim or claim error — a storage error
+// must not spin a tight loop — and on context cancellation.
+func (h *Handler) drainDurableWebhooks(ctx context.Context, driverID int, owner string) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if !h.driveNextDurableWebhook(ctx, driverID, owner) {
+			return
+		}
+	}
+}
+
+// driveNextDurableWebhook claims and drives at most one delivery. It reports
+// whether a delivery was claimed, so the drain loop knows whether to continue.
+func (h *Handler) driveNextDurableWebhook(ctx context.Context, driverID int, owner string) (claimed bool) {
 	store := h.webhookEventStore()
 	if store == nil {
 		h.logger.Warn("durable webhook driver cannot claim because webhook event storage is unavailable", "driver", driverID)
-		return
+		return false
 	}
-	owner := durableWebhookLeaseOwner(driverID)
 	event, err := store.FindNext(ctx, owner, h.durableWebhookLeaseDuration)
 	if err != nil {
 		h.logger.Error("durable webhook driver failed to claim delivery", "driver", driverID, "lease_owner", owner, "error", err)
-		return
+		return false
 	}
 	if event == nil {
 		h.logger.Debug("durable webhook driver found no delivery to claim", "driver", driverID)
-		return
+		return false
 	}
 
 	h.logger.Info("durable webhook driver claimed delivery",
@@ -163,6 +190,50 @@ func (h *Handler) driveNextDurableWebhook(ctx context.Context, driverID int) {
 		"head_sha", event.HeadSHA,
 		"attempts", event.Attempts)
 
+	// A delivery reclaimed beyond the processing attempt budget was abandoned on
+	// its final attempt before recording a terminal state (e.g. a hard kill the
+	// panic recovery cannot catch) and its lease later expired. Terminalize it
+	// without processing — replaying a deterministic poison payload would just
+	// re-abandon it — so it lands in a terminal failed state that GitHub
+	// Redeliver and reconciliation can recover, instead of wedging unclaimable
+	// forever at the cap.
+	if event.Attempts > maxDurableWebhookAttempts {
+		h.terminalizeOverBudgetDelivery(ctx, driverID, store, event)
+		return true
+	}
+
+	h.driveClaimedDurableWebhook(ctx, driverID, store, event)
+	return true
+}
+
+// terminalizeOverBudgetDelivery records a terminal failure for a delivery that
+// was reclaimed after exhausting its processing attempt budget, without running
+// the (possibly poison) work again.
+func (h *Handler) terminalizeOverBudgetDelivery(ctx context.Context, driverID int, store storage.WebhookEventStore, event *storage.WebhookEvent) {
+	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	termErr := fmt.Sprintf("durable webhook delivery %s reclaimed after exhausting its processing attempt budget (%d attempts)", event.DeliveryID, event.Attempts)
+	if err := store.MarkFailed(finishCtx, event.ID, event.LeaseToken, termErr, nil); err != nil {
+		if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
+			h.logger.Warn("durable webhook driver lost the lease before terminalizing an over-budget delivery; another driver owns it or the row is gone",
+				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+				"repo", event.Repository, "pr", event.PullRequest)
+			return
+		}
+		h.logger.Error("durable webhook driver failed to terminalize an over-budget delivery",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"repo", event.Repository, "pr", event.PullRequest, "error", err)
+		return
+	}
+	metrics.RecordWebhookEvent(finishCtx, h.metricAppForRepo(event.Repository), event.Event, event.Action, event.Repository, "durable_dispatch_failed")
+	h.logger.Error("durable webhook delivery terminalized without processing after exhausting its attempt budget",
+		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest, "attempts", event.Attempts)
+}
+
+// driveClaimedDurableWebhook runs the process → heartbeat → finish lifecycle for
+// a freshly claimed delivery.
+func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, store storage.WebhookEventStore, event *storage.WebhookEvent) {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	stopHeartbeat := h.startDurableWebhookHeartbeat(runCtx, driverID, event, cancelRun)
 	process := h.processDurableWebhookEvent
@@ -289,6 +360,11 @@ func (h *Handler) metricAppForRepo(repo string) string {
 	}
 	app, err := cfg.ResolveGitHubAppForRepo(repo)
 	if err != nil {
+		// A multi-App deployment that cannot map the repo to an App still needs a
+		// metric label; fall back to the default rather than dropping the metric,
+		// but log so a misconfigured mapping does not silently mislabel telemetry.
+		h.logger.Warn("could not resolve owning GitHub App for durable webhook metrics; using default app label",
+			"repo", repo, "error", err)
 		return metricAppName("")
 	}
 	return app.Name
@@ -321,6 +397,8 @@ func (h *Handler) startDurableWebhookHeartbeat(ctx context.Context, driverID int
 					if hbCtx.Err() != nil {
 						// The heartbeat was stopped intentionally mid-call; the
 						// interrupted call is not a lease failure.
+						h.logger.Debug("durable webhook heartbeat interrupted by intentional stop; not a lease failure",
+							"driver", driverID, "delivery_id", event.DeliveryID)
 						return
 					}
 					if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
@@ -393,8 +471,24 @@ func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.
 		return false, nil
 	}
 
-	installationID, err := strconv.ParseInt(event.TenantID, 10, 64)
-	if err != nil || installationID == 0 {
+	installationID, parseErr := strconv.ParseInt(event.TenantID, 10, 64)
+	if parseErr != nil {
+		// A non-numeric TenantID is a corrupted/enqueue-side bug, distinct from a
+		// legitimately empty tenant; surface it rather than silently folding it
+		// into the payload fallback below.
+		h.logger.Warn("durable pull_request delivery has an unparseable tenant ID; falling back to the payload installation",
+			"delivery_id", event.DeliveryID, "tenant_id", event.TenantID,
+			"repo", event.Repository, "pr", event.PullRequest, "error", parseErr)
+	}
+	if parseErr != nil || installationID == 0 {
+		// Fallback for rows without a stored tenant. Today the only producer
+		// (enqueueDurablePullRequest) always stores a resolved non-zero
+		// installation ID, so this only matters for replay or future producers.
+		// The payload carries an installation ID only for org/user App installs;
+		// repo-level deliveries have none, so a future producer that synthesizes
+		// such rows (WH-6b) must persist a resolved installation ID in TenantID
+		// rather than relying on this fallback, or repo-level deliveries will
+		// terminally fail here.
 		installationID = h.effectiveInstallationID(ctx, payload.Installation.ID)
 	}
 	if installationID == 0 {

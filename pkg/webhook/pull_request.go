@@ -116,7 +116,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		// fails loudly (metric below + a red delivery in GitHub's webhook UI)
 		// rather than silently, but GitHub never auto-retries, so the delivery
 		// stays lost until an operator hits "Redeliver" (which re-opens a
-		// terminally failed row) or a new push arrives.
+		// terminal row — failed or completed) or a new push arrives.
 		inserted, err := h.enqueueDurablePullRequest(ctx, payload, body, deliveryID, installationID)
 		if err != nil {
 			h.logger.Error("failed to enqueue durable pull_request auto-plan",
@@ -161,9 +161,10 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			return
 		}
 		defer cancel()
-		// The discovery error is already logged and posted as a failing check
-		// inside runAutoPlanForPR; the fire-and-forget request path has no
-		// durable row to retry, so the error is intentionally dropped here.
+		// The discovery error is logged and best-effort posted as a failing check
+		// inside runAutoPlanForPR (the post itself re-verifies the head SHA and
+		// can no-op during a GitHub outage); the fire-and-forget request path has
+		// no durable row to retry, so the error is intentionally dropped here.
 		message, _ := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before, deliveryID)
 		h.logger.Info("auto-plan dispatched",
 			"action", payload.Action,
@@ -221,8 +222,9 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 // work. The returned message describes the dispatch outcome. The returned error
 // is non-nil only for discovery failures (typically transient GitHub API
 // errors), so durable callers can retry the delivery; request-path callers may
-// ignore it because the failure is already logged and posted as a failing
-// check here.
+// ignore it because the failure is logged and best-effort posted as a failing
+// check here (the post re-verifies the head SHA and can no-op during a GitHub
+// outage).
 func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string, deliveryID string) (string, error) {
 	// Fetch the changed files once so the same list drives both config discovery
 	// and the server-managed-directory safety check below.

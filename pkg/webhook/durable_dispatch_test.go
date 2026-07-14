@@ -18,6 +18,10 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
+// durableWebhookTestDeadline bounds waits for async driver work in these
+// unit tests so a hang fails fast instead of stalling the suite.
+const durableWebhookTestDeadline = 5 * time.Second
+
 type durableWebhookTestStorage struct {
 	emptyStorage
 	webhookEvents storage.WebhookEventStore
@@ -256,7 +260,7 @@ func TestDurableWebhookDriverCompletesUnsupportedEvent(t *testing.T) {
 	})
 	h := newDurableDriverHandler(t, store, nil, nil)
 
-	h.driveNextDurableWebhook(t.Context(), 0)
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 	select {
 	case outcome := <-store.completed:
@@ -277,7 +281,7 @@ func TestDurableWebhookDriverFailsMalformedPullRequestTerminally(t *testing.T) {
 	})
 	h := newDurableDriverHandler(t, store, nil, nil)
 
-	h.driveNextDurableWebhook(t.Context(), 0)
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 	select {
 	case failure := <-store.failed:
@@ -295,7 +299,7 @@ func TestDurableWebhookDriverRetriesBootstrapFailure(t *testing.T) {
 	h := newDurableDriverHandler(t, store, nil, factory)
 
 	before := time.Now()
-	h.driveNextDurableWebhook(t.Context(), 0)
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 	select {
 	case failure := <-store.failed:
@@ -314,7 +318,7 @@ func TestDurableWebhookDriverCompletesUnregisteredRepo(t *testing.T) {
 	factory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
 	h := newDurableDriverHandler(t, store, config, factory)
 
-	h.driveNextDurableWebhook(t.Context(), 0)
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 	select {
 	case <-store.completed:
@@ -345,7 +349,7 @@ func TestDurableWebhookHeartbeatLossCancelsRun(t *testing.T) {
 
 	select {
 	case <-runCtx.Done():
-	case <-time.After(5 * time.Second):
+	case <-time.After(durableWebhookTestDeadline):
 		t.Fatal("expected heartbeat lease loss to cancel the run context")
 	}
 	require.ErrorIs(t, stop(), storage.ErrWebhookEventLeaseLost)
@@ -363,7 +367,7 @@ func TestDurableWebhookHeartbeatLossSkipsCompletion(t *testing.T) {
 		return false, nil
 	}
 
-	h.driveNextDurableWebhook(t.Context(), 0)
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 	require.Empty(t, store.completed, "lease-lost delivery must not be marked completed")
 	require.Empty(t, store.failed, "delivery must be left processing so lease expiry hands it to another driver")
@@ -376,7 +380,7 @@ func TestDurableWebhookDriverStopsRetryingAtAttemptCap(t *testing.T) {
 	factory := &fakeClientFactory{forInstallationErr: errors.New("installation token unavailable")}
 	h := newDurableDriverHandler(t, store, nil, factory)
 
-	h.driveNextDurableWebhook(t.Context(), 0)
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 	select {
 	case failure := <-store.failed:
@@ -388,6 +392,61 @@ func TestDurableWebhookDriverStopsRetryingAtAttemptCap(t *testing.T) {
 	require.Empty(t, store.completed)
 }
 
+// A delivery that is reclaimed after its lease expired on the final attempt —
+// e.g. a hard kill the panic recovery can't catch left it in processing at the
+// attempt cap — is terminalized without being processed again, so it lands in a
+// terminal state that redelivery and reconciliation can recover instead of
+// wedging unclaimable forever.
+func TestDurableWebhookDriverTerminalizesOverBudgetDelivery(t *testing.T) {
+	event := durablePullRequestEvent(t)
+	event.Attempts = maxDurableWebhookAttempts // FindNext claim increments past the cap
+	store := newScriptedWebhookEventStore(event)
+	factory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
+	h := newDurableDriverHandler(t, store, nil, factory)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		t.Fatal("over-budget delivery must not be processed again")
+		return false, nil
+	}
+
+	require.True(t, h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0"))
+
+	select {
+	case failure := <-store.failed:
+		require.Nil(t, failure.retryAfter, "an over-budget delivery must fail terminally")
+		require.Contains(t, failure.errMsg, "exhausting its processing attempt budget")
+	default:
+		t.Fatal("expected over-budget delivery to be marked failed")
+	}
+	require.Empty(t, store.completed)
+	select {
+	case <-factory.forInstallationStarted:
+		t.Fatal("over-budget delivery must not create a GitHub client")
+	default:
+	}
+}
+
+// A single wake drains the whole backlog rather than one delivery per signal, so
+// a burst of queued deliveries is worked down without waiting for the next tick.
+func TestDurableWebhookDrainProcessesBacklogInOnePass(t *testing.T) {
+	store := newScriptedWebhookEventStore(
+		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d1", Event: "push", Payload: []byte(`{}`)},
+		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d2", Event: "push", Payload: []byte(`{}`)},
+		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d3", Event: "push", Payload: []byte(`{}`)},
+	)
+	h := newDurableDriverHandler(t, store, nil, nil)
+
+	h.drainDurableWebhooks(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	for i := range 3 {
+		select {
+		case <-store.completed:
+		default:
+			t.Fatalf("expected delivery %d of 3 to be drained in a single pass", i+1)
+		}
+	}
+	require.Empty(t, store.failed)
+}
+
 func TestDurableWebhookDriverRecoversPanic(t *testing.T) {
 	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
 	h := newDurableDriverHandler(t, store, nil, nil)
@@ -397,7 +456,7 @@ func TestDurableWebhookDriverRecoversPanic(t *testing.T) {
 
 	// Must not crash the process: a panicking delivery stays claimable after
 	// lease expiry, so an unrecovered panic would crash-loop every replica.
-	h.driveNextDurableWebhook(t.Context(), 0)
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 	select {
 	case failure := <-store.failed:
@@ -424,7 +483,7 @@ func TestDurableWebhookShutdownReleasesClaim(t *testing.T) {
 		return true, fmt.Errorf("auto-plan interrupted: %w", ctx.Err())
 	}
 
-	h.driveNextDurableWebhook(driverCtx, 0)
+	h.driveNextDurableWebhook(driverCtx, 0, "test-host/1/webhook-driver-0")
 
 	select {
 	case released := <-store.released:
@@ -457,7 +516,7 @@ func TestDurableWebhookHeartbeatTransientErrorKeepsRunAlive(t *testing.T) {
 		}
 	}
 
-	h.driveNextDurableWebhook(t.Context(), 0)
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 	select {
 	case <-store.completed:
@@ -482,7 +541,7 @@ func TestDurableWebhookDispatchLifecycleDrainsQueuedEvent(t *testing.T) {
 	select {
 	case outcome := <-store.completed:
 		require.Equal(t, "token-1", outcome.leaseToken)
-	case <-time.After(5 * time.Second):
+	case <-time.After(durableWebhookTestDeadline):
 		t.Fatal("expected driver pool to drain the queued event")
 	}
 
