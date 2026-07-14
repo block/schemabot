@@ -104,6 +104,28 @@ func (s *recordingWebhookEventStore) InboxStats(context.Context) (*storage.Webho
 	return nil, errors.New("InboxStats not implemented by recordingWebhookEventStore")
 }
 
+func (s *recordingWebhookEventStore) TerminateStuckProcessing(_ context.Context, reason string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	var terminated int64
+	for _, event := range s.events {
+		leaseExpired := event.LeaseExpiresAt != nil && !event.LeaseExpiresAt.After(now)
+		if event.State == storage.WebhookEventProcessing && leaseExpired &&
+			event.Attempts >= storage.MaxWebhookEventAttempts {
+			event.State = storage.WebhookEventFailed
+			event.LastError = reason
+			event.LeaseOwner = ""
+			event.LeaseToken = ""
+			event.LeaseExpiresAt = nil
+			event.RetryAfter = nil
+			terminated++
+		}
+	}
+	return terminated, nil
+}
+
 func TestDurablePullRequestWebhookQueuesAndAcks(t *testing.T) {
 	events := newRecordingWebhookEventStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

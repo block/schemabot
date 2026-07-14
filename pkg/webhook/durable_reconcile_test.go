@@ -116,6 +116,35 @@ func TestWebhookReconcilerSkipsAllowAllRegistry(t *testing.T) {
 	require.False(t, listed, "allow-all registry is not enumerable; no GitHub calls expected")
 }
 
+func TestWebhookReconcilerTerminatesStuckProcessingEvent(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	leaseExpired := time.Now().Add(-time.Minute)
+	_, err := store.Create(t.Context(), &storage.WebhookEvent{
+		Provider:       storage.WebhookProviderGitHub,
+		DeliveryID:     "delivery-stuck",
+		Event:          "pull_request",
+		Repository:     "octocat/hello-world",
+		PullRequest:    7,
+		HeadSHA:        "head-sha",
+		State:          storage.WebhookEventProcessing,
+		Attempts:       storage.MaxWebhookEventAttempts,
+		LeaseExpiresAt: &leaseExpired,
+		Payload:        []byte(`{}`),
+	})
+	require.NoError(t, err)
+	// An allow-all registry: the sweep must still run even though the
+	// missing-delivery scan cannot enumerate repos.
+	h, _ := newReconcileTestHandler(t, store, nil)
+
+	h.reconcileWebhookInbox(t.Context())
+
+	got, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-stuck")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Equal(t, storage.WebhookEventFailed, got.State)
+	require.NotEmpty(t, got.LastError)
+}
+
 func TestWebhookReconcilerRunsOnDispatchLifecycle(t *testing.T) {
 	store := newScriptedWebhookEventStore()
 	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})

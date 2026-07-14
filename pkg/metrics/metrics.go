@@ -40,6 +40,24 @@ func addCounter(ctx context.Context, name, description, unit string, attrs ...at
 	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
 }
 
+// addCounterN increments a named Int64Counter by n with the given attributes,
+// logging and skipping if the instrument cannot be created. n <= 0 is a no-op.
+func addCounterN(ctx context.Context, n int64, name, description, unit string, attrs ...attribute.KeyValue) {
+	if n <= 0 {
+		return
+	}
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter(name,
+		otelmetric.WithDescription(description),
+		otelmetric.WithUnit(unit),
+	)
+	if err != nil {
+		slog.Warn("failed to create counter", "metric", name, "error", err)
+		return
+	}
+	counter.Add(ctx, n, otelmetric.WithAttributes(attrs...))
+}
+
 // addUpDownCounter adjusts a named Int64UpDownCounter by delta with the given
 // attributes, logging and skipping if the instrument cannot be created.
 func addUpDownCounter(ctx context.Context, name string, delta int64, description, unit string, attrs ...attribute.KeyValue) {
@@ -1221,6 +1239,17 @@ func RecordWebhookReconcileMissingEvent(ctx context.Context, repo string) {
 		"Total number of open PR heads found without a webhook inbox delivery", "{event}",
 		EnvironmentAttribute(""),
 		attribute.String("repository", repo))
+}
+
+// RecordWebhookReconcileStuckTerminated counts webhook inbox rows the
+// reconciler terminated because they were parked in processing with an expired
+// lease at the attempt cap — a driver hard-killed on its final attempt. A
+// nonzero rate means deliveries are being lost to crashes mid-processing; each
+// terminated row emits as a failure and becomes eligible for redelivery.
+func RecordWebhookReconcileStuckTerminated(ctx context.Context, count int64) {
+	addCounterN(ctx, count, "schemabot.webhook.reconcile_stuck_terminated_total",
+		"Total number of stuck processing webhook inbox rows terminated by the reconciler", "{event}",
+		EnvironmentAttribute(""))
 }
 
 var knownStatusCheckOperations = map[string]bool{

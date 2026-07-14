@@ -326,6 +326,34 @@ func (s *webhookEventStore) Release(ctx context.Context, id int64, leaseToken st
 	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
 }
 
+// TerminateStuckProcessing marks failed every processing row whose lease has
+// expired and whose attempts have reached the cap. FindNext stops reclaiming a
+// processing row once attempts == MaxWebhookEventAttempts, so a driver
+// hard-killed on its final attempt leaves the row parked in processing forever;
+// this sweep terminalizes it (clearing the lease and preserving completed_at)
+// so it emits as a failure and its delivery GUID becomes eligible for the
+// redeliver-reopen path. Unlike MarkFailed it is lease-token-agnostic: the
+// owning driver is gone, so there is no token to present. Returns the number of
+// rows terminated.
+func (s *webhookEventStore) TerminateStuckProcessing(ctx context.Context, reason string) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, last_error = ?, completed_at = COALESCE(completed_at, NOW()),
+			lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+			retry_after = NULL, updated_at = NOW()
+		WHERE state = ? AND lease_expires_at <= NOW(6) AND attempts >= ?
+	`, storage.WebhookEventFailed, nullString(reason),
+		storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts)
+	if err != nil {
+		return 0, fmt.Errorf("terminate stuck processing webhook events: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read terminate stuck processing rows affected: %w", err)
+	}
+	return rows, nil
+}
+
 func scanWebhookEvent(row *sql.Row) (*storage.WebhookEvent, error) {
 	event, err := scanWebhookEventInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

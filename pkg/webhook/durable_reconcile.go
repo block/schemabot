@@ -1,11 +1,16 @@
-// durable_reconcile.go implements the report-only webhook reconciliation loop:
-// the correctness backstop for deliveries lost upstream of the durable inbox
-// (edge auth failures, GitHub-side send failures). It periodically lists
-// recently updated open PRs in registered repositories and reports any PR head
-// that has no corresponding webhook_events row. This phase only logs and emits
-// metrics; a later phase will synthesize pull_request-equivalent inbox rows
-// (delivery_id "recon:<repo>#<pr>@<sha>", naturally deduped) once report-only
-// output has been tuned.
+// durable_reconcile.go implements the webhook reconciliation loop: the
+// correctness backstop for deliveries the durable inbox cannot recover on its
+// own. Each pass does two things:
+//
+//   - Actively terminates inbox rows wedged in processing (driver hard-killed on
+//     its final attempt, lease expired, attempts at the cap) so they emit as
+//     failures and become redeliverable — FindNext never reclaims them.
+//   - Reports (report-only) any recently updated open PR head in a registered
+//     repository that has no corresponding webhook_events row, surfacing
+//     deliveries lost upstream of the inbox (edge auth failures, GitHub-side
+//     send failures). A later phase will synthesize pull_request-equivalent
+//     inbox rows (delivery_id "recon:<repo>#<pr>@<sha>", naturally deduped) once
+//     report-only output has been tuned.
 package webhook
 
 import (
@@ -42,7 +47,7 @@ func (h *Handler) startWebhookReconciler(ctx context.Context, stop <-chan struct
 	h.durableWebhookWg.Go(func() {
 		ticker := time.NewTicker(h.webhookReconcileInterval)
 		defer ticker.Stop()
-		h.logger.Info("webhook reconciler started (report-only)",
+		h.logger.Info("webhook reconciler started",
 			"interval", h.webhookReconcileInterval,
 			"lookback", h.webhookReconcileLookback,
 			"grace", h.webhookReconcileGrace)
@@ -69,13 +74,21 @@ func (h *Handler) reconcileWebhookInbox(ctx context.Context) {
 		h.logger.Warn("webhook reconciler skipped because webhook event storage is unavailable")
 		return
 	}
+	// The stuck-processing sweep scans the whole inbox by state, not by repo, so
+	// it runs before the registry check — it must reclaim crashed deliveries
+	// even when the registry is allow-all and the missing-delivery scan below
+	// cannot enumerate repos.
+	h.terminateStuckWebhookEvents(ctx, store)
+
 	cfg := h.service.Config()
 	if cfg == nil || len(cfg.Repos) == 0 {
 		// An empty repo registry means "allow all", which is not an enumerable
-		// set; reconciliation needs an explicit registry to know what to scan.
-		h.logger.Debug("webhook reconciler skipped because the repo registry is empty (allow-all)")
+		// set; the missing-delivery scan needs an explicit registry to know what
+		// to scan.
+		h.logger.Debug("webhook reconciler missing-delivery scan skipped because the repo registry is empty (allow-all)")
 		return
 	}
+
 	repos := make([]string, 0, len(cfg.Repos))
 	for repo := range cfg.Repos {
 		repos = append(repos, repo)
@@ -92,9 +105,32 @@ func (h *Handler) reconcileWebhookInbox(ctx context.Context) {
 		scanned += repoScanned
 		missing += repoMissing
 	}
-	h.logger.Info("webhook reconcile pass finished (report-only)",
+	h.logger.Info("webhook reconcile missing-delivery scan finished (report-only)",
 		"repos", len(repos), "prs_scanned", scanned, "missing_inbox_rows", missing,
 		"duration", time.Since(start))
+}
+
+// webhookReconcileStuckReason is the terminal last_error recorded on rows the
+// reconciler sweeps out of a wedged processing state.
+const webhookReconcileStuckReason = "terminated by reconciler: driver crashed on final attempt with lease expired"
+
+// terminateStuckWebhookEvents marks failed every inbox row parked in processing
+// with an expired lease at the attempt cap — a driver hard-killed on its final
+// attempt. FindNext stops reclaiming a processing row once attempts reach the
+// cap, so without this sweep such a row stays unclaimable forever and its
+// delivery GUID deduplicates every redelivery. Terminalizing it emits the row
+// as a failure and makes it eligible for the redeliver-reopen path.
+func (h *Handler) terminateStuckWebhookEvents(ctx context.Context, store storage.WebhookEventStore) {
+	terminated, err := store.TerminateStuckProcessing(ctx, webhookReconcileStuckReason)
+	if err != nil {
+		h.logger.Warn("webhook reconciler failed to terminate stuck processing events", "error", err)
+		return
+	}
+	if terminated == 0 {
+		return
+	}
+	h.logger.Warn("webhook reconciler terminated stuck processing events", "terminated", terminated)
+	metrics.RecordWebhookReconcileStuckTerminated(ctx, terminated)
 }
 
 // reconcileRepoWebhookInbox scans one repository's recently updated open PRs
