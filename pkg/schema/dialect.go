@@ -54,6 +54,10 @@ var systemSchemasByDialect = map[Dialect]map[string]struct{}{
 // system schema for the dialect (including the Postgres pg_ prefix).
 func IsReservedPullNamespaceForDialect(dialect Dialect, namespace string) bool {
 	name := strings.ToLower(namespace)
+	// Normalize the dialect so a differently-cased value (e.g. "Postgres")
+	// cannot silently miss the registry and fail open, treating a reserved
+	// system schema as a user namespace.
+	dialect = Dialect(strings.ToLower(string(dialect)))
 
 	if _, ok := schemabotReservedNamespaces[name]; ok {
 		return true

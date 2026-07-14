@@ -51,6 +51,12 @@ func TestIsReservedPullNamespaceForDialect(t *testing.T) {
 		{name: "pg_catalog on mysql", dialect: DialectMySQL, namespace: "pg_catalog", want: false},
 		{name: "pg_temp prefix on mysql", dialect: DialectMySQL, namespace: "pg_temp_3", want: false},
 
+		// A differently-cased dialect value must not fail open: it still
+		// classifies system schemas for that dialect.
+		{name: "mixed-case postgres dialect matches pg_catalog", dialect: Dialect("Postgres"), namespace: "pg_catalog", want: true},
+		{name: "mixed-case postgres dialect matches pg_ prefix", dialect: Dialect("POSTGRES"), namespace: "pg_temp_3", want: true},
+		{name: "mixed-case mysql dialect matches innodb", dialect: Dialect("MySQL"), namespace: "innodb", want: true},
+
 		// information_schema exists in both dialects.
 		{name: "information_schema on mysql", dialect: DialectMySQL, namespace: "information_schema", want: true},
 		{name: "information_schema on postgres", dialect: DialectPostgres, namespace: "information_schema", want: true},
