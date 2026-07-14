@@ -87,6 +87,10 @@ func (s *recordingWebhookEventStore) Release(context.Context, int64, string) err
 	return errors.New("Release not implemented by recordingWebhookEventStore")
 }
 
+func (s *recordingWebhookEventStore) InboxStats(context.Context) (*storage.WebhookInboxStats, error) {
+	return nil, errors.New("InboxStats not implemented by recordingWebhookEventStore")
+}
+
 func TestDurablePullRequestWebhookQueuesAndAcks(t *testing.T) {
 	events := newRecordingWebhookEventStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

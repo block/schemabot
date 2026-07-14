@@ -152,6 +152,12 @@ type Service struct {
 	remoteHealthWg       sync.WaitGroup
 	remoteHealthInterval time.Duration
 
+	// Webhook inbox metrics monitor loop management.
+	webhookInboxMu       sync.Mutex
+	webhookInboxCancel   context.CancelFunc
+	webhookInboxWg       sync.WaitGroup
+	webhookInboxInterval time.Duration
+
 	// Pending drops cleaner loop management.
 	pendingDropsMu     sync.Mutex
 	pendingDropsCancel context.CancelFunc
@@ -254,6 +260,7 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		clock:                clock.Real{},
 		operatorPollInterval: OperatorPollInterval,
 		remoteHealthInterval: RemoteDeploymentHealthCheckInterval,
+		webhookInboxInterval: WebhookInboxMetricsInterval,
 		pendingObservers:     make(map[pendingObserverKey]tern.ProgressObserver),
 	}
 }
@@ -744,6 +751,7 @@ func (s *Service) Close() error {
 	// Stop background drivers first.
 	s.StopOperator()
 	s.StopRemoteDeploymentHealthMonitor()
+	s.StopWebhookInboxMonitor()
 
 	s.ternMu.Lock()
 	var errs []error

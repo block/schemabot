@@ -29,7 +29,8 @@ import (
 
 // mockStorage implements storage.Storage for testing.
 type mockStorage struct {
-	pingErr error
+	pingErr       error
+	webhookEvents storage.WebhookEventStore
 }
 
 func (m *mockStorage) Locks() storage.LockStore                     { return nil }
@@ -43,7 +44,7 @@ func (m *mockStorage) PlanComments() storage.PlanCommentStore       { return nil
 func (m *mockStorage) ApplyOperations() storage.ApplyOperationStore { return nil }
 func (m *mockStorage) Checks() storage.CheckStore                   { return nil }
 func (m *mockStorage) Settings() storage.SettingsStore              { return nil }
-func (m *mockStorage) WebhookEvents() storage.WebhookEventStore     { return nil }
+func (m *mockStorage) WebhookEvents() storage.WebhookEventStore     { return m.webhookEvents }
 func (m *mockStorage) Ping(ctx context.Context) error               { return m.pingErr }
 func (m *mockStorage) Close() error                                 { return nil }
 

@@ -10,6 +10,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/block/spirit/pkg/utils"
+
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -308,6 +310,62 @@ func scanWebhookEventInto(row scanner) (*storage.WebhookEvent, error) {
 		event.CompletedAt = &completedAt.Time
 	}
 	return &event, nil
+}
+
+// InboxStats returns a read-only snapshot of the inbox for observability. It
+// runs three cheap aggregates rather than one query: heterogeneous aggregates
+// (grouped counts, a MIN age over a filtered subset, and a filtered count) do
+// not combine into a single index-friendly statement, and each is served by an
+// existing index.
+func (s *webhookEventStore) InboxStats(ctx context.Context) (*storage.WebhookInboxStats, error) {
+	stats := &storage.WebhookInboxStats{CountsByState: make(map[string]int64, len(storage.WebhookEventStatesAll))}
+	for _, state := range storage.WebhookEventStatesAll {
+		stats.CountsByState[state] = 0
+	}
+
+	rows, err := s.db.QueryContext(ctx, `SELECT state, COUNT(*) FROM webhook_events GROUP BY state`)
+	if err != nil {
+		return nil, fmt.Errorf("count webhook inbox rows by state: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+	for rows.Next() {
+		var state string
+		var count int64
+		if err := rows.Scan(&state, &count); err != nil {
+			return nil, fmt.Errorf("scan webhook inbox state count: %w", err)
+		}
+		stats.CountsByState[state] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate webhook inbox state counts: %w", err)
+	}
+
+	// Oldest ready-to-claim row: pending, or retryable whose retry window has
+	// elapsed. Processing rows are already claimed, so they are excluded. NULL
+	// (nothing waiting) scans into a zero age.
+	var oldestAgeSeconds sql.NullFloat64
+	err = s.db.QueryRowContext(ctx, `
+		SELECT TIMESTAMPDIFF(MICROSECOND, MIN(received_at), NOW(6)) / 1e6
+		FROM webhook_events
+		WHERE state = ?
+			OR (state = ? AND (retry_after IS NULL OR retry_after <= NOW()))
+	`, storage.WebhookEventPending, storage.WebhookEventFailedRetryable).Scan(&oldestAgeSeconds)
+	if err != nil {
+		return nil, fmt.Errorf("measure oldest claimable webhook inbox row: %w", err)
+	}
+	if oldestAgeSeconds.Valid && oldestAgeSeconds.Float64 > 0 {
+		stats.OldestClaimableAge = time.Duration(oldestAgeSeconds.Float64 * float64(time.Second))
+	}
+
+	err = s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM webhook_events
+		WHERE state = ? AND lease_expires_at <= NOW(6) AND attempts >= ?
+	`, storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts).Scan(&stats.StuckProcessing)
+	if err != nil {
+		return nil, fmt.Errorf("count stuck processing webhook inbox rows: %w", err)
+	}
+
+	return stats, nil
 }
 
 func (s *webhookEventStore) checkWebhookEventLeaseResult(ctx context.Context, result sql.Result, id int64, leaseToken string) error {

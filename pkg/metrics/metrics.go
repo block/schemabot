@@ -1131,6 +1131,55 @@ func RecordUnregisteredRepositoryWebhook(ctx context.Context, appName, eventType
 		attrs...)
 }
 
+// knownWebhookInboxStates allowlists the canonical durable webhook inbox states
+// so the depth gauge's cardinality stays bounded. Mirrors the states in
+// storage; an unrecognized value is folded to "unknown".
+var knownWebhookInboxStates = map[string]bool{
+	"pending":          true,
+	"processing":       true,
+	"failed_retryable": true,
+	"completed":        true,
+	"failed":           true,
+}
+
+// RecordWebhookInboxDepth records the number of durable webhook inbox rows in a
+// given state. A rising pending/processing depth means dispatch is falling
+// behind ingestion; a rising failed_retryable depth means deliveries are
+// retrying; a rising completed/failed depth means terminal rows are accumulating
+// and retention has not reclaimed them.
+func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
+	if !knownWebhookInboxStates[state] {
+		state = "unknown"
+	}
+	recordGauge(ctx, "schemabot.webhook.inbox_depth", count,
+		"Number of durable webhook inbox rows by state", "{row}",
+		EnvironmentAttribute(""),
+		attribute.String("state", state),
+	)
+}
+
+// RecordWebhookInboxOldestClaimableAge records how long the oldest
+// ready-to-claim-but-unclaimed inbox row has been waiting, in seconds. It is the
+// inbox's backlog latency: a value climbing past the dispatch cadence means work
+// is acked but not being picked up.
+func RecordWebhookInboxOldestClaimableAge(ctx context.Context, age time.Duration) {
+	recordGauge(ctx, "schemabot.webhook.inbox_oldest_claimable_age_seconds", int64(age.Seconds()),
+		"Age in seconds of the oldest ready-to-claim durable webhook inbox row", "s",
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordWebhookInboxStuckProcessing records the number of inbox rows wedged in
+// processing with an expired lease at the attempt cap — deliveries no driver can
+// reclaim. A nonzero value means auto-plans are being lost to crashes
+// mid-processing until the reconciler terminalizes them.
+func RecordWebhookInboxStuckProcessing(ctx context.Context, count int64) {
+	recordGauge(ctx, "schemabot.webhook.inbox_stuck_processing", count,
+		"Number of durable webhook inbox rows stuck in processing past the attempt cap", "{row}",
+		EnvironmentAttribute(""),
+	)
+}
+
 var knownStatusCheckOperations = map[string]bool{
 	"plan_check_recorded":                  true,
 	"apply_started":                        true,

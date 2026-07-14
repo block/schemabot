@@ -495,3 +495,66 @@ func TestWebhookEventStore_SubSecondLeaseIsNotImmediatelyReclaimable(t *testing.
 	require.NoError(t, err)
 	assert.Nil(t, none)
 }
+
+// InboxStats gives operators a steady-state view of the durable inbox: how many
+// rows sit in each state, how long the oldest ready-to-claim delivery has waited
+// (backlog latency), and how many are wedged in processing past the attempt cap.
+func TestWebhookEventStore_InboxStats(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	// Empty inbox: every state present at zero, no backlog, nothing stuck.
+	empty, err := store.WebhookEvents().InboxStats(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, empty)
+	assert.Equal(t, int64(0), empty.CountsByState[storage.WebhookEventPending])
+	assert.Equal(t, int64(0), empty.CountsByState[storage.WebhookEventProcessing])
+	assert.Zero(t, empty.OldestClaimableAge)
+	assert.Equal(t, int64(0), empty.StuckProcessing)
+
+	// Two pending rows; the older one drives the backlog age.
+	insertPending := func(deliveryID string, receivedAgo time.Duration) {
+		t.Helper()
+		inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: deliveryID, Event: "pull_request", Payload: []byte(`{}`)})
+		require.NoError(t, err)
+		require.True(t, inserted)
+		_, err = testDB.ExecContext(ctx, `UPDATE webhook_events SET received_at = NOW(6) - INTERVAL ? SECOND WHERE provider = ? AND delivery_id = ?`,
+			int(receivedAgo.Seconds()), storage.WebhookProviderGitHub, deliveryID)
+		require.NoError(t, err)
+	}
+	insertPending("pending-old", 120*time.Second)
+	insertPending("pending-new", 5*time.Second)
+
+	// A completed row: counts toward completed, never toward backlog. Set its
+	// state directly so the FIFO claim order can't reassign it to another row.
+	completedDelivery, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "completed-1", Event: "pull_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.True(t, completedDelivery)
+	_, err = testDB.ExecContext(ctx, `UPDATE webhook_events SET state = ?, completed_at = NOW() WHERE provider = ? AND delivery_id = ?`,
+		storage.WebhookEventCompleted, storage.WebhookProviderGitHub, "completed-1")
+	require.NoError(t, err)
+
+	// A stuck processing row: at the attempt cap with an expired lease.
+	stuck, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "stuck-1", Event: "pull_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.True(t, stuck)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, attempts = ?, lease_owner = 'driver', lease_token = 'tok',
+			lease_expires_at = NOW(6) - INTERVAL 1 SECOND
+		WHERE provider = ? AND delivery_id = ?
+	`, storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts, storage.WebhookProviderGitHub, "stuck-1")
+	require.NoError(t, err)
+
+	stats, err := store.WebhookEvents().InboxStats(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, stats)
+	assert.Equal(t, int64(2), stats.CountsByState[storage.WebhookEventPending])
+	assert.Equal(t, int64(1), stats.CountsByState[storage.WebhookEventProcessing])
+	assert.Equal(t, int64(1), stats.CountsByState[storage.WebhookEventCompleted])
+	assert.Equal(t, int64(1), stats.StuckProcessing)
+	// The oldest pending row is ~120s old; allow slack for execution time.
+	assert.GreaterOrEqual(t, stats.OldestClaimableAge, 110*time.Second)
+	assert.Less(t, stats.OldestClaimableAge, 5*time.Minute)
+}

@@ -245,6 +245,13 @@ type WebhookEventStore interface {
 	// a real processing attempt. Returns ErrWebhookEventLeaseLost when the
 	// lease token is stale.
 	Release(ctx context.Context, id int64, leaseToken string) error
+
+	// InboxStats returns a point-in-time snapshot of the inbox for steady-state
+	// observability: row counts per state, the age of the oldest row that is
+	// ready to claim but not yet claimed (backlog latency), and the count of
+	// rows wedged in processing past the attempt cap with an expired lease. It
+	// is read-only and safe to call on a periodic cadence.
+	InboxStats(ctx context.Context) (*WebhookInboxStats, error)
 }
 
 // PlanStore manages schema change plans.
