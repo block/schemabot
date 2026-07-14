@@ -461,6 +461,47 @@ func TestParseCommand(t *testing.T) {
 			},
 		},
 		{
+			name: "flag glued onto the environment value is invalid, not reinterpreted",
+			body: "schemabot apply -e production--allow-unsafe",
+			expected: CommandResult{
+				Action:           "apply",
+				EnvironmentError: true,
+				AllowUnsafe:      true,
+				Found:            true,
+				IsMention:        true,
+			},
+		},
+		{
+			name: "environment value with a trailing dash is invalid",
+			body: "schemabot apply -e staging-",
+			expected: CommandResult{
+				Action:           "apply",
+				EnvironmentError: true,
+				Found:            true,
+				IsMention:        true,
+			},
+		},
+		{
+			name: "plan with an invalid environment value is not a multi-env plan",
+			body: "schemabot plan -e production--allow-unsafe",
+			expected: CommandResult{
+				Action:           "plan",
+				EnvironmentError: true,
+				Found:            true,
+				IsMention:        true,
+			},
+		},
+		{
+			name: "environment value with single dashes is valid",
+			body: "schemabot apply -e prod-us-east",
+			expected: CommandResult{
+				Action:      "apply",
+				Environment: "prod-us-east",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
 			name: "plan with database flag",
 			body: "schemabot plan -e staging -d my-database",
 			expected: CommandResult{

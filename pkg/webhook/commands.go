@@ -112,39 +112,41 @@ func commandNamePattern() string {
 
 // CommandParser parses SchemaBot commands from PR comments.
 type CommandParser struct {
-	commandRegex      *regexp.Regexp
-	mentionRegex      *regexp.Regexp
-	helpRegex         *regexp.Regexp
-	applyIDRegex      *regexp.Regexp
-	environmentRegex  *regexp.Regexp
-	databaseRegex     *regexp.Regexp
-	tenantRegex       *regexp.Regexp
-	tenantFlagRegex   *regexp.Regexp
-	skipRevertRegex   *regexp.Regexp
-	deferCutoverRegex *regexp.Regexp
-	allowUnsafeRegex  *regexp.Regexp
-	forceRegex        *regexp.Regexp
-	autoConfirmRegex  *regexp.Regexp
-	volumeFlagRegex   *regexp.Regexp
+	commandRegex         *regexp.Regexp
+	mentionRegex         *regexp.Regexp
+	helpRegex            *regexp.Regexp
+	applyIDRegex         *regexp.Regexp
+	environmentRegex     *regexp.Regexp
+	environmentNameRegex *regexp.Regexp
+	databaseRegex        *regexp.Regexp
+	tenantRegex          *regexp.Regexp
+	tenantFlagRegex      *regexp.Regexp
+	skipRevertRegex      *regexp.Regexp
+	deferCutoverRegex    *regexp.Regexp
+	allowUnsafeRegex     *regexp.Regexp
+	forceRegex           *regexp.Regexp
+	autoConfirmRegex     *regexp.Regexp
+	volumeFlagRegex      *regexp.Regexp
 }
 
 // NewCommandParser creates a new command parser.
 func NewCommandParser() *CommandParser {
 	return &CommandParser{
-		commandRegex:      regexp.MustCompile(`(?im)^ {0,3}schemabot[ \t]+(` + commandNamePattern() + `)\b`),
-		mentionRegex:      regexp.MustCompile(`(?im)^ {0,3}schemabot(?:[ \t]+|$)`),
-		helpRegex:         regexp.MustCompile(`(?im)^ {0,3}schemabot[ \t]+help\b`),
-		applyIDRegex:      regexp.MustCompile(`(?i)\b(apply[_-][a-f0-9]+)\b`),
-		environmentRegex:  regexp.MustCompile(`(?i)-e\s+([a-z0-9][a-z0-9_-]*)`),
-		databaseRegex:     regexp.MustCompile(`(?i)-d\s+([a-zA-Z0-9_-]+)`),
-		tenantRegex:       regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`),
-		tenantFlagRegex:   regexp.MustCompile(`(?i)(?:^|\s)(?:--tenant|-t)(?:[ \t]+([^\s]+))?`),
-		skipRevertRegex:   regexp.MustCompile(`(?i)--skip-revert\b`),
-		deferCutoverRegex: regexp.MustCompile(`(?i)--defer-cutover\b`),
-		allowUnsafeRegex:  regexp.MustCompile(`(?i)--allow-unsafe\b`),
-		forceRegex:        regexp.MustCompile(`(?i)--force\b`),
-		autoConfirmRegex:  regexp.MustCompile(`(?i)(?:--yes\b|-y\b)`),
-		volumeFlagRegex:   regexp.MustCompile(`(?i)(?:^|\s)(?:--volume|-v)(?:[ \t]+([^\s]+))?(?:\s|$)`),
+		commandRegex:         regexp.MustCompile(`(?im)^ {0,3}schemabot[ \t]+(` + commandNamePattern() + `)\b`),
+		mentionRegex:         regexp.MustCompile(`(?im)^ {0,3}schemabot(?:[ \t]+|$)`),
+		helpRegex:            regexp.MustCompile(`(?im)^ {0,3}schemabot[ \t]+help\b`),
+		applyIDRegex:         regexp.MustCompile(`(?i)\b(apply[_-][a-f0-9]+)\b`),
+		environmentRegex:     regexp.MustCompile(`(?i)-e\s+([^-\s][^\s]*)`),
+		environmentNameRegex: regexp.MustCompile(`^[a-z0-9][a-z0-9_]*(?:-[a-z0-9_]+)*$`),
+		databaseRegex:        regexp.MustCompile(`(?i)-d\s+([a-zA-Z0-9_-]+)`),
+		tenantRegex:          regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`),
+		tenantFlagRegex:      regexp.MustCompile(`(?i)(?:^|\s)(?:--tenant|-t)(?:[ \t]+([^\s]+))?`),
+		skipRevertRegex:      regexp.MustCompile(`(?i)--skip-revert\b`),
+		deferCutoverRegex:    regexp.MustCompile(`(?i)--defer-cutover\b`),
+		allowUnsafeRegex:     regexp.MustCompile(`(?i)--allow-unsafe\b`),
+		forceRegex:           regexp.MustCompile(`(?i)--force\b`),
+		autoConfirmRegex:     regexp.MustCompile(`(?i)(?:--yes\b|-y\b)`),
+		volumeFlagRegex:      regexp.MustCompile(`(?i)(?:^|\s)(?:--volume|-v)(?:[ \t]+([^\s]+))?(?:\s|$)`),
 	}
 }
 
@@ -176,6 +178,12 @@ type CommandResult struct {
 	IsHelp           bool
 	IsMention        bool
 	MissingEnv       bool
+	// EnvironmentError is true when `-e` is present but its value is not a
+	// valid environment name (for example a flag glued onto the value:
+	// `-e production--allow-unsafe`). The dispatcher posts a usage comment;
+	// such a command must never fall back to missing-env handling, which
+	// would run `plan` against every configured environment.
+	EnvironmentError bool
 }
 
 // ParseCommand parses a SchemaBot command from a comment body.
@@ -316,11 +324,24 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 		result.VolumeLevel, result.VolumeLevelError = p.extractVolumeLevel(body)
 	}
 
+	// The -e capture takes the whole token (any non-flag word) and validity is
+	// checked separately: a malformed value like `production--allow-unsafe`
+	// must be rejected as a whole, never reinterpreted as an environment plus
+	// a glued-on flag.
 	if m := p.environmentRegex.FindStringSubmatch(body); len(m) >= 2 {
-		result.Environment = strings.ToLower(m[1])
+		env := strings.ToLower(m[1])
+		if p.environmentNameRegex.MatchString(env) {
+			result.Environment = env
+		} else {
+			result.EnvironmentError = true
+		}
 	}
 
 	switch {
+	case result.EnvironmentError:
+		// The command is recognized; the dispatcher rejects it with a usage
+		// comment instead of treating the environment as missing.
+		result.Found = true
 	case !spec.RequiresEnv:
 		result.Found = true
 	case result.Environment != "":

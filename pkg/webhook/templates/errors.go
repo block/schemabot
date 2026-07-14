@@ -177,6 +177,22 @@ func RenderInvalidCommand() string {
 	return "## ❌ Invalid Command\n\nThat command wasn't recognized. Available commands:\n\n" + commandReference()
 }
 
+// RenderInvalidEnv generates an error message when the -e flag value is not a
+// valid environment name — most commonly a flag glued onto the value by a
+// missing space (`-e production--allow-unsafe`).
+func RenderInvalidEnv(action string) string {
+	return fmt.Sprintf(`## ❌ Invalid Environment
+
+The value after `+"`-e`"+` isn't a valid environment name. Check for a missing space between the environment and any flags that follow it.
+
+**Usage**: `+"`schemabot %s -e <environment> [flags]`"+`
+
+**Example**:
+`+"```"+`
+schemabot %s -e staging
+`+"```", action, action)
+}
+
 // RenderMissingEnv generates an error message when -e flag is missing.
 func RenderMissingEnv(action string) string {
 	return fmt.Sprintf(`## ❌ Missing Argument

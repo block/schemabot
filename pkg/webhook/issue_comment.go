@@ -174,6 +174,24 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
+	// Reject an invalid -e value. It can never match any instance's
+	// allowed_environments, so no instance would act on it; answer under the
+	// respond_to_unscoped policy so exactly one instance corrects the caller.
+	if result.EnvironmentError {
+		if result.Tenant == "" && h.service != nil && !h.service.Config().ShouldRespondToUnscoped() {
+			h.logger.Debug("skipping invalid environment response (respond_to_unscoped is false)",
+				"repo", repo, "pr", pr, "action", result.Action)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
+			return
+		}
+		h.logger.Info("rejecting command with invalid environment value",
+			"repo", repo, "pr", pr, "action", result.Action)
+		h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
+		h.postComment(repo, pr, installationID, templates.RenderInvalidEnv(result.Action))
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "invalid environment value"})
+		return
+	}
+
 	// Handle missing -e flag
 	if result.MissingEnv {
 		if result.Action == action.Plan {

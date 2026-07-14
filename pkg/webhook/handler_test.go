@@ -420,6 +420,41 @@ func TestWebhookMissingEnvForApply(t *testing.T) {
 	}
 }
 
+// A malformed -e value — typically a flag glued onto the environment by a
+// missing space — can never match any instance's allowed environments, so the
+// command is rejected with a usage comment and an eyes acknowledgment rather
+// than left unanswered.
+func TestWebhookInvalidEnvValue(t *testing.T) {
+	h, comments, reactions := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e production--allow-unsafe",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "invalid environment value")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Invalid Environment")
+		assert.Contains(t, body, "missing space")
+		assert.Contains(t, body, "schemabot apply -e <environment>")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the invalid environment comment")
+	}
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the acknowledgment reaction")
+	}
+}
+
 func TestWebhookYesFlagRejectedOnNonApply(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 
