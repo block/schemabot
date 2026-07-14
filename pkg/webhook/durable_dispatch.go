@@ -22,8 +22,8 @@ const (
 	// before a retryable failure is recorded as terminal. Attempts increment on
 	// claim, so an unclassified permanent error (e.g. a misconfigured GitHub
 	// App) cannot retry forever. It aliases the store's claim ceiling so the
-	// driver terminalizes a delivery on the same attempt at which FindNext
-	// would stop handing it out.
+	// driver records a retryable failure as terminal on the same attempt at
+	// which FindNext would stop handing the delivery out.
 	maxDurableWebhookAttempts = storage.MaxWebhookEventAttempts
 )
 
@@ -190,45 +190,8 @@ func (h *Handler) driveNextDurableWebhook(ctx context.Context, driverID int, own
 		"head_sha", event.HeadSHA,
 		"attempts", event.Attempts)
 
-	// A delivery reclaimed beyond the processing attempt budget was abandoned on
-	// its final attempt before recording a terminal state (e.g. a hard kill the
-	// panic recovery cannot catch) and its lease later expired. Terminalize it
-	// without processing — replaying a deterministic poison payload would just
-	// re-abandon it — so it lands in a terminal failed state that GitHub
-	// Redeliver and reconciliation can recover, instead of wedging unclaimable
-	// forever at the cap.
-	if event.Attempts > maxDurableWebhookAttempts {
-		h.terminalizeOverBudgetDelivery(ctx, driverID, store, event)
-		return true
-	}
-
 	h.driveClaimedDurableWebhook(ctx, driverID, store, event)
 	return true
-}
-
-// terminalizeOverBudgetDelivery records a terminal failure for a delivery that
-// was reclaimed after exhausting its processing attempt budget, without running
-// the (possibly poison) work again.
-func (h *Handler) terminalizeOverBudgetDelivery(ctx context.Context, driverID int, store storage.WebhookEventStore, event *storage.WebhookEvent) {
-	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	termErr := fmt.Sprintf("durable webhook delivery %s reclaimed after exhausting its processing attempt budget (%d attempts)", event.DeliveryID, event.Attempts)
-	if err := store.MarkFailed(finishCtx, event.ID, event.LeaseToken, termErr, nil); err != nil {
-		if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
-			h.logger.Warn("durable webhook driver lost the lease before terminalizing an over-budget delivery; another driver owns it or the row is gone",
-				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
-				"repo", event.Repository, "pr", event.PullRequest)
-			return
-		}
-		h.logger.Error("durable webhook driver failed to terminalize an over-budget delivery",
-			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
-			"repo", event.Repository, "pr", event.PullRequest, "error", err)
-		return
-	}
-	metrics.RecordWebhookEvent(finishCtx, h.metricAppForRepo(event.Repository), event.Event, event.Action, event.Repository, "durable_dispatch_failed")
-	h.logger.Error("durable webhook delivery terminalized without processing after exhausting its attempt budget",
-		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
-		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest, "attempts", event.Attempts)
 }
 
 // driveClaimedDurableWebhook runs the process → heartbeat → finish lifecycle for

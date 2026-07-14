@@ -392,39 +392,6 @@ func TestDurableWebhookDriverStopsRetryingAtAttemptCap(t *testing.T) {
 	require.Empty(t, store.completed)
 }
 
-// A delivery that is reclaimed after its lease expired on the final attempt —
-// e.g. a hard kill the panic recovery can't catch left it in processing at the
-// attempt cap — is terminalized without being processed again, so it lands in a
-// terminal state that redelivery and reconciliation can recover instead of
-// wedging unclaimable forever.
-func TestDurableWebhookDriverTerminalizesOverBudgetDelivery(t *testing.T) {
-	event := durablePullRequestEvent(t)
-	event.Attempts = maxDurableWebhookAttempts // FindNext claim increments past the cap
-	store := newScriptedWebhookEventStore(event)
-	factory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
-	h := newDurableDriverHandler(t, store, nil, factory)
-	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
-		t.Fatal("over-budget delivery must not be processed again")
-		return false, nil
-	}
-
-	require.True(t, h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0"))
-
-	select {
-	case failure := <-store.failed:
-		require.Nil(t, failure.retryAfter, "an over-budget delivery must fail terminally")
-		require.Contains(t, failure.errMsg, "exhausting its processing attempt budget")
-	default:
-		t.Fatal("expected over-budget delivery to be marked failed")
-	}
-	require.Empty(t, store.completed)
-	select {
-	case <-factory.forInstallationStarted:
-		t.Fatal("over-budget delivery must not create a GitHub client")
-	default:
-	}
-}
-
 // A single wake drains the whole backlog rather than one delivery per signal, so
 // a burst of queued deliveries is worked down without waiting for the next tick.
 func TestDurableWebhookDrainProcessesBacklogInOnePass(t *testing.T) {
