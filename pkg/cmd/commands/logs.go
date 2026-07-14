@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // LogsCmd views apply logs for a database or specific apply.
@@ -130,18 +131,21 @@ func printLogs(logs []*client.LogEntry) {
 	}
 }
 
-// formatLogLevel returns a colored log level indicator.
+// formatLogLevel returns a colored log level indicator, wrapping the shared
+// tag text so the terminal output and the PR-comment log fold stay identical
+// apart from color.
 func formatLogLevel(level string) string {
+	tag := webhooktemplates.LogLevelTag(level)
 	switch strings.ToLower(level) {
 	case "error":
-		return fmt.Sprintf("%s[ERR]%s", "\033[31m", templates.ANSIReset) // Red
+		return "\033[31m" + tag + templates.ANSIReset // Red
 	case "warn":
-		return fmt.Sprintf("%s[WRN]%s", templates.ANSIYellow, templates.ANSIReset)
+		return templates.ANSIYellow + tag + templates.ANSIReset
 	case "info":
-		return fmt.Sprintf("%s[INF]%s", templates.ANSIGreen, templates.ANSIReset)
+		return templates.ANSIGreen + tag + templates.ANSIReset
 	case "debug":
-		return fmt.Sprintf("%s[DBG]%s", templates.ANSIDim, templates.ANSIReset)
+		return templates.ANSIDim + tag + templates.ANSIReset
 	default:
-		return fmt.Sprintf("[%s]", strings.ToUpper(level))
+		return tag
 	}
 }

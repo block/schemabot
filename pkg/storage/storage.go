@@ -44,6 +44,9 @@ type Storage interface {
 	// Settings returns the settings store.
 	Settings() SettingsStore
 
+	// WebhookEvents returns the durable webhook event inbox store.
+	WebhookEvents() WebhookEventStore
+
 	// Ping verifies the database connection is alive.
 	Ping(ctx context.Context) error
 
@@ -190,6 +193,47 @@ type SettingsStore interface {
 
 	// Delete removes a setting by key.
 	Delete(ctx context.Context, key string) error
+}
+
+// WebhookEventStore manages durable webhook inbox rows. It is the storage
+// primitive behind fast webhook acknowledgement: handlers can persist a delivery
+// before returning 2xx, and drivers can claim/retry the stored event after the
+// HTTP request has finished.
+type WebhookEventStore interface {
+	// Create records a webhook delivery in the pending state. Returns
+	// inserted=false when provider + delivery GUID already exists, so callers
+	// can deduplicate redeliveries. One exception: when the existing row is
+	// terminally failed, Create re-opens it (pending, attempts reset, fresh
+	// payload) and returns inserted=true, so GitHub's "Redeliver" button —
+	// which reuses the original delivery GUID — is a real remediation for a
+	// terminally failed delivery instead of a permanent no-op.
+	Create(ctx context.Context, event *WebhookEvent) (inserted bool, err error)
+
+	// GetByDeliveryID returns a webhook event by provider + delivery GUID, or nil if not found.
+	GetByDeliveryID(ctx context.Context, provider, deliveryID string) (*WebhookEvent, error)
+
+	// FindNext atomically claims one pending, retryable, or lease-expired event.
+	// The claim rotates lease_owner/lease_token, increments attempts, and sets a
+	// lease expiry in the same transaction. Retryable and lease-expired rows are
+	// only reclaimed while attempts < MaxWebhookEventAttempts, so a poison event
+	// cannot be reclaimed forever. Returns nil when no event is claimable.
+	//
+	// Ordering is currently global FIFO (created_at, id). A contemplated
+	// evolution is per-(repository, pull_request) claiming with coalescing of
+	// superseded deliveries; callers should not depend on cross-key ordering.
+	FindNext(ctx context.Context, owner string, leaseDuration time.Duration) (*WebhookEvent, error)
+
+	// Heartbeat extends the current lease. Returns ErrWebhookEventNotFound when
+	// the event no longer exists, and ErrWebhookEventLeaseLost when the token is
+	// stale, so drivers can abandon work whose result has nowhere to land.
+	Heartbeat(ctx context.Context, id int64, leaseToken string, leaseDuration time.Duration) error
+
+	// MarkCompleted marks a claimed event terminal-successful.
+	MarkCompleted(ctx context.Context, id int64, leaseToken string) error
+
+	// MarkFailed marks a claimed event failed. A non-nil retryAfter keeps it
+	// retryable after that time; nil makes the failure terminal.
+	MarkFailed(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error
 }
 
 // PlanStore manages schema change plans.
@@ -495,6 +539,12 @@ type ApplyCommentStore interface {
 	// Upsert for the same state clears superseded_at. A missing or already-
 	// superseded row is not an error.
 	Supersede(ctx context.Context, applyID int64, commentState string) error
+
+	// ClearPendingFreeze removes the pending-freeze marker for a single
+	// (apply_id, comment_state) once the superseded comment's frozen rendering
+	// has landed on GitHub. A missing row or an already-clear marker is not an
+	// error.
+	ClearPendingFreeze(ctx context.Context, applyID int64, commentState string) error
 }
 
 // ApplyOperationStore manages per-(apply, deployment, operation_key) child rows
@@ -622,6 +672,12 @@ type ApplyLogStore interface {
 
 	// GetByApply returns all logs for an apply, ordered by created_at.
 	GetByApply(ctx context.Context, applyID int64) ([]*ApplyLog, error)
+
+	// GetRecentByApply returns the newest limit logs for an apply, ordered by
+	// created_at ascending so the result reads chronologically. The query is
+	// bounded — long-running applies can accumulate far more log rows than a
+	// caller rendering a tail needs.
+	GetRecentByApply(ctx context.Context, applyID int64, limit int) ([]*ApplyLog, error)
 
 	// List returns logs matching the filter criteria, ordered by created_at.
 	List(ctx context.Context, filter ApplyLogFilter) ([]*ApplyLog, error)

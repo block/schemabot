@@ -754,6 +754,8 @@ GitHub sends `X-GitHub-Hook-Installation-Target-ID` (the App's numeric ID) and `
 
 The legacy single-`github:` shape does not require the header and continues to verify against the single configured secret.
 
+Operator commands inherit this scoping: a Check Run scan or backfill resolves each repository to its owning App and derives the expected check names from that App's `check-name` and the instance's `allowed_environments`. See [Backfilling missing Check Runs](check-runs.md#backfilling-missing-check-runs).
+
 ## Secret Resolution
 
 DSN values support secret resolution prefixes:

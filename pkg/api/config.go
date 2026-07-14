@@ -1164,9 +1164,24 @@ func (f *ForwardAuthSettings) validate() error {
 	return nil
 }
 
+// Comment renderers reserve a fixed amount of headroom under GitHub's comment
+// size cap for the support-channel footer, so its two free-text fields must be
+// bounded — an unbounded footer could push an otherwise budget-fitting comment
+// over the cap and GitHub would reject it outright.
+const (
+	maxSupportChannelNameChars = 100
+	maxSupportChannelURLChars  = 500
+)
+
 func validateSupportChannel(c SupportChannelConfig) error {
 	if c.Name == "" && c.URL == "" {
 		return nil
+	}
+	if len(c.Name) > maxSupportChannelNameChars {
+		return fmt.Errorf("support_channel.name must be at most %d characters (got %d)", maxSupportChannelNameChars, len(c.Name))
+	}
+	if len(c.URL) > maxSupportChannelURLChars {
+		return fmt.Errorf("support_channel.url must be at most %d characters (got %d)", maxSupportChannelURLChars, len(c.URL))
 	}
 	if strings.TrimSpace(c.Name) != c.Name {
 		return fmt.Errorf("support_channel.name contains leading or trailing whitespace")

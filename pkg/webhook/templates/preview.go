@@ -1425,6 +1425,27 @@ func PreviewCommentApplySingleProgressVolume() string {
 	return RenderApplyStatusComment(data)
 }
 
+// PreviewCommentVolumeSupersededProgress renders an old progress comment after
+// a volume change froze it: the final pre-change progress collapses into a
+// details block under a pointer to the fresh comment now tracking the apply.
+func PreviewCommentVolumeSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.Running
+	table.RowsCopied = 2300000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 32
+	table.ETASeconds = 780
+	data := sampleSingleApplyData(state.Apply.Running, table)
+	data.Volume = 3
+	return RenderVolumeSupersededProgressComment(VolumeSupersededProgressData{
+		Volume:       8,
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
 // PreviewCommentApplySingleCompleted renders a single-table apply completed.
 func PreviewCommentApplySingleCompleted() string {
 	table := sampleSingleTable()
@@ -1507,7 +1528,8 @@ func PreviewCommentSummaryCompletedVitessVSchemaOnly() string {
 	return RenderApplySummaryComment(data)
 }
 
-// PreviewCommentSummaryFailed renders a sample failed summary comment.
+// PreviewCommentSummaryFailed renders a sample failed summary comment,
+// including the collapsed recent-logs section every failed summary carries.
 func PreviewCommentSummaryFailed() string {
 	tables := sampleApplyTables()
 	tables[0].Status = state.Task.Completed
@@ -1519,7 +1541,8 @@ func PreviewCommentSummaryFailed() string {
 	tables[2].Status = state.Task.Cancelled
 	data := sampleSummaryData(state.Apply.Failed, tables)
 	data.ErrorMessage = "table users failed: schema change failed: unsafe warning: Field 'name' doesn't have a default value"
-	return RenderApplySummaryComment(data)
+	return RenderApplySummaryComment(data) +
+		RenderRecentFailureLogs(sampleFailureLogEntries("users", "unsafe warning: Field 'name' doesn't have a default value"), GitHubIssueCommentMaxChars, false)
 }
 
 // PreviewCommentSummaryStopped renders a sample stopped summary comment.
@@ -1574,7 +1597,8 @@ func PreviewCommentSummaryFailedLarge() string {
 	}
 	data := sampleSummaryDataWithDuration(state.Apply.Failed, tables, 3*time.Hour+30*time.Minute)
 	data.ErrorMessage = "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"
-	return RenderApplySummaryComment(data)
+	return RenderApplySummaryComment(data) +
+		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"), GitHubIssueCommentMaxChars, false)
 }
 
 // PreviewCommentSummaryMultiNamespaceFailed renders a failed summary with tables from multiple namespaces.
@@ -1588,7 +1612,8 @@ func PreviewCommentSummaryMultiNamespaceFailed() string {
 	}
 	data := sampleSummaryData(state.Apply.Failed, tables)
 	data.ErrorMessage = "table customers.addresses failed: Error 1205: Lock wait timeout exceeded"
-	return RenderApplySummaryComment(data)
+	return RenderApplySummaryComment(data) +
+		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1205: Lock wait timeout exceeded"), GitHubIssueCommentMaxChars, false)
 }
 
 // PreviewCommentSummaryMultiNamespaceCompleted renders a completed summary with tables from multiple namespaces.

@@ -319,7 +319,7 @@ func TestOIDCAuthorizerBypassesNonAPIPaths(t *testing.T) {
 	p := newTestOIDCProvider(t)
 	authz := newAuthorizer(t, p, auth.OIDCConfig{Audience: "schemabot"})
 
-	for _, path := range []string{"/health", "/metrics", "/webhook", "/tern-health/cake/staging"} {
+	for _, path := range []string{"/livez", "/health", "/metrics", "/webhook", "/tern-health/cake/staging"} {
 		t.Run(path, func(t *testing.T) {
 			var ran bool
 			handler := authz.Middleware(okHandler(&ran, nil))

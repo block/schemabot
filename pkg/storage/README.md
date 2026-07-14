@@ -16,6 +16,7 @@ type Storage interface {
     ControlRequests() ControlRequestStore
     Checks()          CheckStore
     Settings()        SettingsStore
+    WebhookEvents()   WebhookEventStore
     Ping(ctx)         error
     Close()           error
 }
@@ -31,6 +32,7 @@ type Storage interface {
 | `ControlRequestStore` | Durable user control intent that can be recovered by drivers |
 | `CheckStore` | GitHub status check state |
 | `SettingsStore` | Admin-level key-value settings |
+| `WebhookEventStore` | Durable webhook inbox rows, dedup + lease-based claim/retry |
 
 ## Lock Coordination
 
@@ -55,6 +57,17 @@ The apply store supports crash recovery through heartbeat-based leasing:
 - **Heartbeat**: Drivers call `Heartbeat(applyID)` every 10 seconds to signal they're alive
 - **FindNextApply**: Claims one apply with a stale heartbeat (>1 minute since last update) by selecting it and refreshing its heartbeat in one transaction
 - If a driver crashes, its apply becomes claimable after the heartbeat times out
+
+## Webhook Inbox Retention
+
+`webhook_events` stores the full JSON payload of every accepted delivery, so it
+grows without bound if never pruned. Terminal rows (`completed`, `failed`) are
+kept for dedup and forensics but only need to outlive GitHub's redelivery
+window (GitHub retains deliveries for 30 days). The intended retention policy
+is a periodic sweep that deletes terminal rows older than ~30 days, keyed on
+`idx_received_at`; it will land with the reconciliation/observability work
+rather than in the initial inbox. Until then the table is append-mostly and
+growth is bounded by webhook volume, not by retries.
 
 ## Key Types
 

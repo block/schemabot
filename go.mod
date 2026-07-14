@@ -1,6 +1,6 @@
 module github.com/block/schemabot
 
-go 1.26.3
+go 1.26.5
 
 require (
 	github.com/alecthomas/kong v1.15.0
@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.14
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.41.1
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3
-	github.com/block/spirit v0.15.2-0.20260702163828-5b931ace8482
+	github.com/block/spirit v0.15.2-0.20260709185452-ade989b3eacd
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10

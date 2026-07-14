@@ -11,7 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 )
 
-func TestParseWebhookRedriveLast(t *testing.T) {
+func TestParseOperatorDuration(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -30,7 +30,7 @@ func TestParseWebhookRedriveLast(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := parseWebhookRedriveLast(tt.value)
+			got, err := parseOperatorDuration(tt.value)
 
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
@@ -38,14 +38,14 @@ func TestParseWebhookRedriveLast(t *testing.T) {
 	}
 }
 
-func TestParseWebhookRedriveLastRejectsInvalidValues(t *testing.T) {
+func TestParseOperatorDurationRejectsInvalidValues(t *testing.T) {
 	t.Parallel()
 
 	for _, value := range []string{"", "0h", "-1h", "two days", "2 months"} {
 		t.Run(value, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := parseWebhookRedriveLast(value)
+			_, err := parseOperatorDuration(value)
 
 			require.Error(t, err)
 		})
@@ -141,7 +141,7 @@ func TestRunChunkedWebhookRedriveFollowsCursorsAndMerges(t *testing.T) {
 
 	merged, err := runChunkedWebhookRedrive(t.Context(), call, "http://server", apitypes.WebhookRedriveRequest{
 		WindowStart: "2026-07-07T19:40:00Z", WindowEnd: "2026-07-07T19:50:00Z", MaxPages: 10,
-	}, 10, true, nil)
+	}, 10, nil)
 
 	require.NoError(t, err)
 	require.Len(t, requests, 2)
@@ -165,7 +165,7 @@ func TestRunChunkedWebhookRedriveFailsOnIncompleteCoverage(t *testing.T) {
 	}
 	_, err := runChunkedWebhookRedrive(t.Context(), budgetExhausted, "http://server", apitypes.WebhookRedriveRequest{
 		WindowStart: "2026-07-07T19:40:00Z", WindowEnd: "2026-07-07T19:50:00Z", MaxPages: 5,
-	}, 5, true, nil)
+	}, 5, nil)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "increase --max-pages")
 
@@ -176,7 +176,7 @@ func TestRunChunkedWebhookRedriveFailsOnIncompleteCoverage(t *testing.T) {
 	}
 	_, err = runChunkedWebhookRedrive(t.Context(), historyEnded, "http://server", apitypes.WebhookRedriveRequest{
 		WindowStart: "2026-07-07T19:40:00Z", WindowEnd: "2026-07-07T19:50:00Z", MaxPages: 5,
-	}, 5, true, nil)
+	}, 5, nil)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "retained delivery history ends")
 }
@@ -221,7 +221,7 @@ func TestRunChunkedWebhookRedriveReturnsPartialOnCancel(t *testing.T) {
 		WindowStart: "2026-07-07T19:40:00Z",
 		WindowEnd:   "2026-07-07T19:50:00Z",
 		App:         "production",
-	}, 10, true, nil)
+	}, 10, nil)
 
 	require.ErrorIs(t, err, context.Canceled)
 	require.Len(t, merged.Results, 1)

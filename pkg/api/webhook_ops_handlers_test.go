@@ -461,20 +461,24 @@ type fakeWebhookMissingCheckScanClient struct {
 	untrusted map[string][]string
 }
 
-func (f fakeWebhookMissingCheckScanClient) ListOpenPullRequestsPage(_ context.Context, _ string, page, perPage int) ([]ghclient.OpenPullRequest, int, error) {
+func (f fakeWebhookMissingCheckScanClient) ListOpenPullRequestsPage(_ context.Context, _ string, page, perPage int) ([]ghclient.OpenPullRequest, int, int, error) {
 	if page <= 0 {
 		page = 1
 	}
 	start := (page - 1) * perPage
 	if start >= len(f.prs) {
-		return nil, 0, nil
+		return nil, 0, 0, nil
 	}
 	end := min(start+perPage, len(f.prs))
 	nextPage := 0
+	lastPage := 0
 	if end < len(f.prs) {
 		nextPage = page + 1
+		// GitHub's Link header names the last page only while more pages
+		// remain; the final page carries no last rel.
+		lastPage = (len(f.prs) + perPage - 1) / perPage
 	}
-	return f.prs[start:end], nextPage, nil
+	return f.prs[start:end], nextPage, lastPage, nil
 }
 
 func (f fakeWebhookMissingCheckScanClient) FindCheckRunByName(_ context.Context, _ string, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error) {
@@ -507,7 +511,7 @@ func TestScanWebhookMissingChecksReportsOpenPRsMissingConfiguredChecks(t *testin
 		},
 	}
 
-	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0)
+	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{})
 
 	require.NoError(t, err)
 	assert.Equal(t, 2, result.Scanned)
@@ -516,6 +520,137 @@ func TestScanWebhookMissingChecksReportsOpenPRsMissingConfiguredChecks(t *testin
 	assert.Equal(t, "https://github.com/octo/repo/pull/2", result.Missing[0].URL)
 	assert.Equal(t, []string{"SchemaBot (production)"}, result.Missing[0].MissingNames)
 	assert.Empty(t, result.Missing[0].UntrustedConflictNames)
+	assert.Equal(t, 2, result.EstimatedOpenPRs, "a single-page listing pins the exact open-PR count")
+}
+
+// A scan page carries the repository's open-PR count so the caller can render
+// a progress denominator: GitHub's last-page pointer gives an upper bound
+// while pages remain, and the final page pins the exact count.
+func TestEstimateOpenPRCount(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, 50*webhookScanPRPageSize, estimateOpenPRCount(2, 50, webhookScanPRPageSize), "mid-listing: upper bound from GitHub's last-page pointer")
+	assert.Equal(t, 3*webhookScanPRPageSize+12, estimateOpenPRCount(4, 0, 12), "final page: the pages before it plus the PRs on it")
+	assert.Equal(t, 12, estimateOpenPRCount(0, 0, 12), "an unpaginated listing is the whole repository")
+}
+
+// An expected Check Run that exists but never completed is reported as stuck,
+// with its raw status and start time, so the operator can tell a wedged check
+// apart from a missing one — completed runs and missing runs stay out of the
+// stuck list, and an uncompleted run is never misreported as missing.
+func TestScanWebhookMissingChecksReportsUncompletedRuns(t *testing.T) {
+	t.Parallel()
+
+	startedAt := time.Date(2026, 7, 12, 9, 0, 0, 0, time.UTC)
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 7, Title: "wedged check", HeadSHA: "sha7", HeadRef: "feature-7"},
+			{Number: 8, Title: "healthy check", HeadSHA: "sha8", HeadRef: "feature-8"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha7/SchemaBot (production)": {ID: 70, Name: "SchemaBot (production)", Status: "in_progress", StartedAt: startedAt},
+			"sha8/SchemaBot (production)": {ID: 80, Name: "SchemaBot (production)", Status: "completed", Conclusion: "success"},
+		},
+	}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{})
+
+	require.NoError(t, err)
+	assert.Empty(t, result.Missing, "an existing run is not missing, even when uncompleted")
+	require.Len(t, result.Stuck, 1)
+	stuck := result.Stuck[0]
+	assert.Equal(t, 7, stuck.Number)
+	assert.Equal(t, "https://github.com/octo/repo/pull/7", stuck.URL)
+	require.Len(t, stuck.Checks, 1)
+	assert.Equal(t, "SchemaBot (production)", stuck.Checks[0].Name)
+	assert.Equal(t, int64(70), stuck.Checks[0].CheckRunID)
+	assert.Equal(t, "in_progress", stuck.Checks[0].Status)
+	assert.Equal(t, "2026-07-12T09:00:00Z", stuck.Checks[0].StartedAt)
+}
+
+// A stuck run without a reported start time serializes an empty started_at
+// rather than a misleading year-one timestamp.
+func TestScanWebhookMissingChecksReportsUncompletedRunWithoutStartTime(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 9, Title: "queued forever", HeadSHA: "sha9", HeadRef: "feature-9"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha9/SchemaBot (production)": {ID: 90, Name: "SchemaBot (production)", Status: "queued"},
+		},
+	}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{})
+
+	require.NoError(t, err)
+	assert.Empty(t, result.Missing)
+	require.Len(t, result.Stuck, 1)
+	require.Len(t, result.Stuck[0].Checks, 1)
+	assert.Equal(t, "queued", result.Stuck[0].Checks[0].Status)
+	assert.Empty(t, result.Stuck[0].Checks[0].StartedAt)
+}
+
+// A windowed sweep stops at the window boundary: the open-PR listing is
+// ordered newest-updated first, so once a PR older than updated_since
+// appears the rest of the repo cannot be in the window — the scan reports
+// only the in-window PRs and clears next_page so the caller stops paging.
+// This bounds an incident sweep by the incident window, not the repo's total
+// open-PR count.
+func TestScanWebhookMissingChecksStopsAtUpdatedSince(t *testing.T) {
+	t.Parallel()
+
+	updatedSince := time.Date(2026, 7, 12, 8, 0, 0, 0, time.UTC)
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 1, Title: "in window, missing check", HeadSHA: "sha1", HeadRef: "f1", UpdatedAt: updatedSince.Add(2 * time.Hour)},
+			{Number: 2, Title: "in window, has check", HeadSHA: "sha2", HeadRef: "f2", UpdatedAt: updatedSince.Add(time.Hour)},
+			{Number: 3, Title: "before window, also missing check", HeadSHA: "sha3", HeadRef: "f3", UpdatedAt: updatedSince.Add(-time.Hour)},
+			{Number: 4, Title: "before window", HeadSHA: "sha4", HeadRef: "f4", UpdatedAt: updatedSince.Add(-2 * time.Hour)},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha2/SchemaBot (production)": {ID: 20, Name: "SchemaBot (production)", Status: "completed", Conclusion: "success"},
+		},
+	}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, updatedSince)
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, result.Scanned, "only the in-window PRs count as scanned")
+	assert.Zero(t, result.NextPage, "crossing the window boundary ends the sweep")
+	require.Len(t, result.Missing, 1)
+	assert.Equal(t, 1, result.Missing[0].Number)
+}
+
+// An unparseable updated_since is a request error, not a full unwindowed scan.
+func TestExecuteChecksScanRejectsInvalidUpdatedSince(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{AllowedEnvironments: []string{"production"}}
+
+	_, err := executeChecksScan(t.Context(), cfg, ChecksScanRequest{Repo: "octo/repo", UpdatedSince: "yesterday"}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "updated_since")
+}
+
+// The repos inventory returns the declared repos config sorted, and a legacy
+// single-App config (which declares no repos) is a request error telling the
+// operator to name a repository — a fleet sweep cannot guess what to scan.
+func TestExecuteChecksRepos(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{
+		Apps:  map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+		Repos: map[string]RepoConfig{"octo/zebra": {GitHubApp: "main"}, "octo/alpha": {GitHubApp: "main"}},
+	}
+	response, err := executeChecksRepos(cfg)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"octo/alpha", "octo/zebra"}, response.Repos)
+
+	_, err = executeChecksRepos(&ServerConfig{GitHub: GitHubConfig{AppID: "1", PrivateKey: "key"}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "declares no repos config")
 }
 
 // A missing check whose name is already taken by an untrusted app's Check Run
@@ -533,7 +668,7 @@ func TestScanWebhookMissingChecksSurfacesUntrustedConflicts(t *testing.T) {
 		},
 	}
 
-	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0)
+	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{})
 
 	require.NoError(t, err)
 	require.Len(t, result.Missing, 1)

@@ -63,14 +63,35 @@ spec:
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          # Startup gates liveness until the server finishes boot (schema
+          # ensure + listeners), allowing a slow start — e.g. waiting out a
+          # storage credential rotation — without liveness killing the pod.
+          # The budget must comfortably exceed the server's storage boot
+          # bounds (the boot retry budget plus a final attempt running to the
+          # schema-ensure timeout: cross-pod advisory lock wait plus the
+          # online DDL timeout), so a boot that is legitimately waiting on
+          # storage or applying storage DDL is never killed mid-apply.
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 180
+          # Liveness is process-only (/livez): it restarts the pod for faults a
+          # restart can fix (wedged process), never for dependency outages. A
+          # storage outage keeps pods alive so in-flight schema changes continue
+          # and the pool reconnects in place.
           livenessProbe:
             httpGet:
-              path: /health
+              path: /livez
               port: http
-            initialDelaySeconds: 10
             periodSeconds: 30
             timeoutSeconds: 3
             failureThreshold: 3
+          # Readiness is dependency-aware (/health pings storage): an instance
+          # that cannot reach storage is pulled from the Service until it
+          # recovers, without being restarted.
           readinessProbe:
             httpGet:
               path: /health

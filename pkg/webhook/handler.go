@@ -418,8 +418,9 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 			ops = nil
 		}
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
-		summaryBody := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, h.deploymentTenant())
-		h.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID, state.Comment.Summary, summaryBody)
+		summaryBase := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, h.deploymentTenant())
+		summaryBody := summaryBase + failureLogsSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
+		h.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply, state.Comment.Summary, summaryBody)
 	}
 }
 

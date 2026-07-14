@@ -21,10 +21,12 @@ func TestApplyCommentStore_Upsert(t *testing.T) {
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_comment_upsert", 1)
 
+	postedVolume := 3
 	comment := &storage.ApplyComment{
 		ApplyID:         apply.ID,
 		CommentState:    state.Comment.Progress,
 		GitHubCommentID: 111222333,
+		PostedVolume:    &postedVolume,
 	}
 
 	// Insert
@@ -37,19 +39,37 @@ func TestApplyCommentStore_Upsert(t *testing.T) {
 	assert.Equal(t, apply.ID, retrieved.ApplyID)
 	assert.Equal(t, state.Comment.Progress, retrieved.CommentState)
 	assert.Equal(t, int64(111222333), retrieved.GitHubCommentID)
+	require.NotNil(t, retrieved.PostedVolume)
+	assert.Equal(t, 3, *retrieved.PostedVolume)
 	assert.NotZero(t, retrieved.ID)
 	assert.NotZero(t, retrieved.CreatedAt)
 	assert.NotZero(t, retrieved.UpdatedAt)
 
-	// Upsert with new comment ID (simulates Start/resume)
+	// Upsert with new comment ID and level (simulates a volume-change rotation)
 	comment.GitHubCommentID = 444555666
+	newVolume := 5
+	comment.PostedVolume = &newVolume
 	require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
 
-	// Verify upsert updated the comment ID
+	// Verify upsert updated the comment ID and recorded level
 	retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
 	require.NoError(t, err)
 	require.NotNil(t, retrieved)
 	assert.Equal(t, int64(444555666), retrieved.GitHubCommentID)
+	require.NotNil(t, retrieved.PostedVolume)
+	assert.Equal(t, 5, *retrieved.PostedVolume)
+
+	// A summary comment carries no level; the column stays NULL and reads back nil.
+	summary := &storage.ApplyComment{
+		ApplyID:         apply.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 777888999,
+	}
+	require.NoError(t, store.ApplyComments().Upsert(ctx, summary))
+	retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Nil(t, retrieved.PostedVolume)
 }
 
 func TestApplyCommentStore_Get(t *testing.T) {
@@ -217,6 +237,58 @@ func TestApplyCommentStore_Supersede(t *testing.T) {
 	require.NoError(t, store.ApplyComments().Supersede(ctx, 99999, state.Comment.Progress))
 }
 
+func TestApplyCommentStore_PendingFreeze(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_comment_pending_freeze", 1)
+
+	// A volume-change rotation records the freeze owed to the superseded
+	// comment in the same write that tracks its successor.
+	postedVolume := 5
+	supersededID := int64(100)
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:                apply.ID,
+		CommentState:           state.Comment.Progress,
+		GitHubCommentID:        200,
+		PostedVolume:           &postedVolume,
+		PendingFreezeCommentID: &supersededID,
+	}))
+
+	retrieved, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, int64(200), retrieved.GitHubCommentID)
+	require.NotNil(t, retrieved.PendingFreezeCommentID)
+	assert.Equal(t, supersededID, *retrieved.PendingFreezeCommentID)
+
+	// Once the frozen rendering lands on GitHub, the marker is cleared; the
+	// rest of the row is untouched.
+	require.NoError(t, store.ApplyComments().ClearPendingFreeze(ctx, apply.ID, state.Comment.Progress))
+	retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Nil(t, retrieved.PendingFreezeCommentID)
+	assert.Equal(t, int64(200), retrieved.GitHubCommentID)
+	require.NotNil(t, retrieved.PostedVolume)
+	assert.Equal(t, 5, *retrieved.PostedVolume)
+
+	// Clearing an already-clear marker or a missing row is a no-op, not an error.
+	require.NoError(t, store.ApplyComments().ClearPendingFreeze(ctx, apply.ID, state.Comment.Progress))
+	require.NoError(t, store.ApplyComments().ClearPendingFreeze(ctx, 99999, state.Comment.Progress))
+
+	// A post that supersedes nothing leaves the marker NULL.
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 300,
+	}))
+	summary, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Nil(t, summary.PendingFreezeCommentID)
+}
+
 func TestApplyCommentStore_UniqueConstraint(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -295,6 +367,24 @@ func TestApplyCommentStore_LeaseGuardsWrites(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, retrieved)
 	assert.Equal(t, 1, retrieved.EditCount)
+
+	// ClearPendingFreeze is a lease-guarded write like the others: a stale
+	// lease fails closed, the current lease clears the marker.
+	pendingFreezeID := int64(50)
+	comment.PendingFreezeCommentID = &pendingFreezeID
+	require.NoError(t, store.ApplyComments().Upsert(currentCtx, comment))
+	require.ErrorIs(t, store.ApplyComments().ClearPendingFreeze(staleCtx, apply.ID, state.Comment.Progress), storage.ErrApplyLeaseLost)
+
+	retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.NotNil(t, retrieved.PendingFreezeCommentID, "a stale lease must not clear the marker")
+
+	require.NoError(t, store.ApplyComments().ClearPendingFreeze(currentCtx, apply.ID, state.Comment.Progress))
+	retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Nil(t, retrieved.PendingFreezeCommentID)
 }
 
 // DB error tests

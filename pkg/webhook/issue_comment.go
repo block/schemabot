@@ -435,9 +435,13 @@ func (h *Handler) postComment(repo string, pr int, installationID int64, body st
 }
 
 // postAndTrackComment creates a PR comment and stores its ID in apply_comments.
+// Progress comments record the apply's volume level at post time — derived
+// here, matching the observer's variant, so no caller can post a progress
+// comment that silently disables volume-rotation detection — and other comment
+// states carry no level.
 func (h *Handler) postAndTrackComment(
 	ctx context.Context, repo string, pr int, installationID int64,
-	applyID int64, commentState string, body string,
+	apply *storage.Apply, commentState string, body string,
 ) {
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
@@ -453,13 +457,17 @@ func (h *Handler) postAndTrackComment(
 	}
 
 	comment := &storage.ApplyComment{
-		ApplyID:         applyID,
+		ApplyID:         apply.ID,
 		CommentState:    commentState,
 		GitHubCommentID: commentID,
 	}
+	if commentState == state.Comment.Progress {
+		level := apply.GetOptions().Volume
+		comment.PostedVolume = &level
+	}
 	if err := h.service.Storage().ApplyComments().Upsert(ctx, comment); err != nil {
 		h.logger.Error("failed to store comment ID",
-			"applyID", applyID, "commentState", commentState, "commentID", commentID, "error", err)
+			"applyID", apply.ID, "commentState", commentState, "commentID", commentID, "error", err)
 	}
 }
 
@@ -473,8 +481,9 @@ func (h *Handler) postAndTrackComment(
 // apply after the post closes that window from this side — whichever of the
 // observer's terminal edit and this finalize runs last converges the comment
 // on the terminal rendering.
-func (h *Handler) postInitialProgressComment(ctx context.Context, repo string, pr int, installationID int64, applyID int64, body string) {
-	h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, body)
+func (h *Handler) postInitialProgressComment(ctx context.Context, repo string, pr int, installationID int64, apply *storage.Apply, body string) {
+	applyID := apply.ID
+	h.postAndTrackComment(ctx, repo, pr, installationID, apply, state.Comment.Progress, body)
 
 	apply, err := h.service.Storage().Applies().Get(ctx, applyID)
 	if err != nil {

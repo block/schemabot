@@ -137,7 +137,7 @@ func TestFormatProgressCommentCutoverReadinessCountsOnlyParkedTables(t *testing.
 		{TableName: "orders", State: state.Task.Running},
 	}
 
-	body := formatProgressComment(apply, tasks, nil)
+	body := formatProgressComment(apply, tasks, nil, "")
 
 	assert.Contains(t, body, "**1/2** table(s) ready for cutover — waiting on 1")
 	assert.Contains(t, body, "✅ Ready for cutover")

@@ -18,6 +18,15 @@ import (
 // the storage claim/expiry paths.
 const MaxRecoveryAttempts = 10
 
+// MaxWebhookEventAttempts is the claim budget for webhook inbox rows: how many
+// times FindNext will hand out a given delivery (each claim increments
+// attempts) before the row stops being claimable. It bounds the blast radius
+// of a poison event whose processing hard-kills drivers before MarkFailed can
+// run — without it, such a row's expired lease would be reclaimed forever,
+// ahead of every newer delivery. Rows that exhaust the budget without reaching
+// a terminal state are left for reconciliation/monitoring to surface.
+const MaxWebhookEventAttempts = 5
+
 // Cutover policies control how a multi-deployment rollout sequences the copy
 // and cutover phases of its deployments. The value is resolved from the
 // environment config at apply-create time and persisted on each apply_operations
@@ -1103,6 +1112,21 @@ type ApplyComment struct {
 	// GitHubCommentID is the GitHub comment ID for editing.
 	GitHubCommentID int64
 
+	// PostedVolume records the apply's volume level at the moment a progress
+	// comment was posted. The observer compares it against the apply's current
+	// level to detect an applied volume change and rotate in a fresh progress
+	// comment. Nil for comment states where the level is not meaningful and
+	// for rows that predate volume tracking — nil never triggers a rotation.
+	PostedVolume *int
+
+	// PendingFreezeCommentID records the GitHub comment ID of a progress
+	// comment this row's comment superseded whose frozen rendering has not yet
+	// landed on GitHub. It is written in the same upsert that tracks the
+	// successor, so a failed freeze edit (or a pod dying before it) leaves a
+	// durable marker any later observer can reconcile; it is cleared once the
+	// freeze lands. Nil means no freeze is owed.
+	PendingFreezeCommentID *int64
+
 	// EditCount tracks how many times this comment was edited.
 	EditCount int
 
@@ -1204,4 +1228,44 @@ type EngineResumeState struct {
 	ApplyOperationID int64
 	MigrationContext string
 	Metadata         string
+}
+
+// Durable webhook event providers.
+const (
+	WebhookProviderGitHub = "github"
+)
+
+// Durable webhook event states.
+const (
+	WebhookEventPending         = "pending"
+	WebhookEventProcessing      = "processing"
+	WebhookEventCompleted       = "completed"
+	WebhookEventFailedRetryable = "failed_retryable"
+	WebhookEventFailed          = "failed"
+)
+
+// WebhookEvent is a durable inbox row for one SCM/webhook delivery.
+type WebhookEvent struct {
+	ID             int64
+	Provider       string
+	DeliveryID     string
+	Event          string
+	Action         string
+	Repository     string
+	PullRequest    int
+	HeadSHA        string
+	TenantID       string
+	Payload        []byte
+	State          string
+	Attempts       int
+	LeaseOwner     string
+	LeaseToken     string
+	LeaseExpiresAt *time.Time
+	RetryAfter     *time.Time
+	LastError      string
+	ReceivedAt     time.Time
+	StartedAt      *time.Time
+	CompletedAt    *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
