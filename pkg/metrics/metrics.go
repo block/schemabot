@@ -1211,6 +1211,18 @@ func RecordWebhookInboxStatsCollectionFailure(ctx context.Context) {
 	)
 }
 
+// RecordWebhookReconcileMissingEvent counts open PR heads the webhook
+// reconciler found with no corresponding inbox delivery. A nonzero rate means
+// deliveries are being lost upstream of the inbox (edge auth, GitHub send
+// failures) — the divergence signal that report-only reconciliation exists to
+// surface.
+func RecordWebhookReconcileMissingEvent(ctx context.Context, repo string) {
+	addCounter(ctx, "schemabot.webhook.reconcile_missing_events_total",
+		"Total number of open PR heads found without a webhook inbox delivery", "{event}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo))
+}
+
 var knownStatusCheckOperations = map[string]bool{
 	"plan_check_recorded":                  true,
 	"apply_started":                        true,

@@ -215,6 +215,12 @@ type WebhookEventStore interface {
 	// GetByDeliveryID returns a webhook event by provider + delivery GUID, or nil if not found.
 	GetByDeliveryID(ctx context.Context, provider, deliveryID string) (*WebhookEvent, error)
 
+	// HasEventForHead reports whether any delivery is recorded for the given
+	// provider + repository + pull request + head SHA, in any state. The
+	// reconciliation loop uses it to detect open PR heads whose webhook
+	// delivery never reached the inbox.
+	HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error)
+
 	// FindNext atomically claims one pending, retryable, or lease-expired event.
 	// The claim rotates lease_owner/lease_token, increments attempts, and sets a
 	// lease expiry in the same transaction. Retryable and lease-expired rows are

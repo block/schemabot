@@ -67,6 +67,19 @@ func (s *recordingWebhookEventStore) GetByDeliveryID(_ context.Context, provider
 	return &copy, nil
 }
 
+func (s *recordingWebhookEventStore) HasEventForHead(_ context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, event := range s.events {
+		if event.Provider == provider && event.Repository == repository &&
+			event.PullRequest == pullRequest && event.HeadSHA == headSHA {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *recordingWebhookEventStore) FindNext(context.Context, string, time.Duration) (*storage.WebhookEvent, error) {
 	return nil, errors.New("FindNext not implemented by recordingWebhookEventStore")
 }

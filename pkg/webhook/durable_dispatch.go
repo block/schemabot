@@ -62,15 +62,18 @@ func (h *Handler) StartDurableWebhookDispatch(ctx context.Context) {
 	h.durableWebhookStop = stop
 	h.durableWebhookCancel = cancel
 	h.durableWebhookWake = wake
-	// Register every driver goroutine on the WaitGroup while the mutex is still
-	// held. Adding to the WaitGroup concurrently with a StopDurableWebhookDispatch
-	// Wait is the documented reuse misuse; holding the lock across the spawn keeps
-	// Start and Stop from racing.
+	// Register every driver (and the reconciler) on the WaitGroup while the mutex
+	// is still held. Adding to the WaitGroup concurrently with a
+	// StopDurableWebhookDispatch Wait is the documented reuse misuse; holding the
+	// lock across the spawn keeps Start and Stop from racing.
 	for i := range driverCount {
 		driverID := i
 		h.durableWebhookWg.Go(func() {
 			h.durableWebhookDriver(driverCtx, driverID, stop, wake)
 		})
+	}
+	if h.webhookReconciler {
+		h.startWebhookReconciler(driverCtx, stop)
 	}
 	h.durableWebhookMu.Unlock()
 

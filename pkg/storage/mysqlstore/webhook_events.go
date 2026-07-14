@@ -151,6 +151,29 @@ func webhookClaimableArgs() []any {
 	}
 }
 
+func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error) {
+	if provider == "" {
+		provider = storage.WebhookProviderGitHub
+	}
+	if repository == "" || pullRequest == 0 || headSHA == "" {
+		return false, fmt.Errorf("repository, pull request, and head SHA are required")
+	}
+	var one int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT 1
+		FROM webhook_events
+		WHERE provider = ? AND repository = ? AND pull_request = ? AND head_sha = ?
+		LIMIT 1
+	`, provider, repository, pullRequest, headSHA).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDuration time.Duration) (*storage.WebhookEvent, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("webhook driver owner is required")

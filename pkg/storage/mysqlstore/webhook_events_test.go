@@ -70,6 +70,50 @@ func TestWebhookEventStore_CreateDeduplicatesByProviderAndDeliveryID(t *testing.
 	require.True(t, inserted)
 }
 
+func TestWebhookEventStore_HasEventForHead(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	_, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+		DeliveryID:  "delivery-head-1",
+		Event:       "pull_request",
+		Action:      "synchronize",
+		Repository:  "block/example",
+		PullRequest: 7,
+		HeadSHA:     "head-sha-1",
+		Payload:     []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	found, err := store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "block/example", 7, "head-sha-1")
+	require.NoError(t, err)
+	assert.True(t, found)
+
+	// Provider defaults to GitHub.
+	found, err = store.WebhookEvents().HasEventForHead(ctx, "", "block/example", 7, "head-sha-1")
+	require.NoError(t, err)
+	assert.True(t, found)
+
+	for _, tc := range []struct {
+		name    string
+		repo    string
+		pr      int
+		headSHA string
+	}{
+		{"different head SHA", "block/example", 7, "head-sha-2"},
+		{"different PR", "block/example", 8, "head-sha-1"},
+		{"different repo", "block/other", 7, "head-sha-1"},
+	} {
+		found, err = store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, tc.repo, tc.pr, tc.headSHA)
+		require.NoError(t, err, tc.name)
+		assert.False(t, found, tc.name)
+	}
+
+	_, err = store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "", 7, "head-sha-1")
+	require.Error(t, err, "missing repository must be rejected")
+}
+
 func TestWebhookEventStore_FindNextClaimsOldestPendingEvent(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
