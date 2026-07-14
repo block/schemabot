@@ -638,12 +638,16 @@ func (ic *InstallationClient) MinimizeComment(ctx context.Context, repo, nodeID 
 	return nil
 }
 
-// graphQLURL derives the GraphQL endpoint from the configured REST base URL:
-// /graphql on the same scheme and host (https://api.github.com/graphql for
-// the standard base; test servers follow the same shape).
+// graphQLURL derives the GraphQL endpoint from the configured REST base URL.
+// github.com serves GraphQL at /graphql on the API host, while GitHub
+// Enterprise Server serves REST under /api/v3/ and GraphQL at /api/graphql on
+// the same host.
 func (ic *InstallationClient) graphQLURL() string {
 	base := ic.client.BaseURL
 	u := url.URL{Scheme: base.Scheme, Host: base.Host, Path: "/graphql"}
+	if strings.HasSuffix(base.Path, "/api/v3/") {
+		u.Path = strings.TrimSuffix(base.Path, "v3/") + "graphql"
+	}
 	return u.String()
 }
 
