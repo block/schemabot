@@ -37,6 +37,19 @@ func (s planCommentSlot) environmentScope() string {
 // failure mode here leaves extra comments expanded on the PR, never a hidden
 // or lost record.
 func (h *Handler) postTrackedPlanComment(repo string, pr int, installationID int64, slot planCommentSlot, body string) {
+	if slot.Database == "" || slot.HeadSHA == "" {
+		// A plan whose every environment failed renders an error-only comment
+		// with no resolved database or head, so there is no slot identity to
+		// track. Post it untracked: an untracked comment only stays expanded,
+		// while tracking it under an empty identity would let error-only
+		// comments for different databases supersede each other.
+		h.logger.Info("posting plan comment untracked because no database or head resolved to key the slot",
+			"repo", repo, "pr", pr, "database", slot.Database, "database_type", slot.DatabaseType,
+			"head_sha", slot.HeadSHA)
+		h.postComment(repo, pr, installationID, body)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 

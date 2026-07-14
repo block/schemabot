@@ -223,6 +223,24 @@ func TestPlanCommentSupersedeMinimizesPriorComments(t *testing.T) {
 	assert.Equal(t, 5, fake.createCount(), "every post reached GitHub exactly once")
 }
 
+// TestPlanCommentWithoutSlotIdentityPostsUntracked covers the error-only
+// comment a plan posts when every environment failed before a database or
+// head resolved: with no slot identity to key tracking, the comment still
+// posts (visibility first) but is not tracked, so no empty-identity row can
+// make error-only comments for different databases supersede each other.
+func TestPlanCommentWithoutSlotIdentityPostsUntracked(t *testing.T) {
+	const repo = "org/plan-min-untracked"
+	h, st, fake := setupPlanCommentHandler(t, repo)
+
+	h.postTrackedPlanComment(repo, 42, 12345, planCommentSlot{}, "plan failed in every environment")
+
+	assert.Equal(t, 1, fake.createCount(), "the error-only comment still posts")
+	assert.Empty(t, fake.minimizedNodes())
+	comments, err := st.PlanComments().ListUnminimizedForSlot(t.Context(), repo, 42, "", "")
+	require.NoError(t, err)
+	assert.Empty(t, comments, "no row is tracked under an empty slot identity")
+}
+
 // TestPlanCommentApplyOwnedHeadStaysExpanded covers the safety hold: once an
 // apply exists for the head a plan comment was rendered at, that comment is
 // the operational record of what ran and a newer plan comment must not hide
