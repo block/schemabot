@@ -19,8 +19,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/block/spirit/pkg/utils"
-
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
@@ -132,7 +130,10 @@ func setupPlanCommentHandler(t *testing.T, repo string) (*Handler, storage.Stora
 
 	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
+	// Redundant close for early-exit leak safety: svc.Close below owns the
+	// handle (the store is built over it), so this close is expected to see an
+	// already-closed DB and must discard the error.
+	t.Cleanup(func() { _ = schemabotDB.Close() })
 	st := mysqlstore.New(schemabotDB)
 
 	for _, stmt := range []string{
