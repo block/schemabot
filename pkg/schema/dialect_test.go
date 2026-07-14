@@ -83,8 +83,11 @@ func TestDialectForDatabaseType(t *testing.T) {
 		{databaseType: "postgres", want: DialectPostgres},
 		{databaseType: "Postgres", want: DialectPostgres},
 		{databaseType: "MYSQL", want: DialectMySQL},
-		{databaseType: "unknown", want: DialectMySQL},
-		{databaseType: "", want: DialectMySQL},
+		// Unrecognized types are returned as unregistered dialects (not forced to
+		// MySQL) so classification treats them conservatively.
+		{databaseType: "postgresql", want: Dialect("postgresql")},
+		{databaseType: "unknown", want: Dialect("unknown")},
+		{databaseType: "", want: Dialect("")},
 	}
 
 	for _, tc := range tests {
@@ -94,16 +97,22 @@ func TestDialectForDatabaseType(t *testing.T) {
 	}
 }
 
-// A Dialect constructed by casting a raw database_type (e.g. "vitess" or
-// "strata") is not a registered dialect, so classification must resolve it to
-// the MySQL dialect rather than fail open and expose MySQL system schemas as
-// pullable user namespaces.
+// An unregistered dialect — a raw database_type cast (e.g. "vitess", "strata")
+// or a mislabeled target (e.g. "postgresql") — is classified conservatively:
+// classification reserves the union of every known dialect's system schemas
+// rather than failing open and exposing a real system schema as a pullable user
+// namespace. Application namespaces stay pullable.
 func TestIsReservedPullNamespaceForDialectFailsClosed(t *testing.T) {
-	for _, raw := range []string{"vitess", "strata", "somethingelse"} {
-		for _, ns := range []string{"mysql", "information_schema", "innodb", "sys"} {
+	for _, raw := range []string{"vitess", "strata", "postgresql", "somethingelse"} {
+		for _, ns := range []string{
+			// MySQL system schemas.
+			"mysql", "information_schema", "innodb", "sys",
+			// Postgres system schemas and the pg_ prefix.
+			"pg_catalog", "pg_toast", "rdsadmin", "pg_temp_3",
+		} {
 			assert.True(t,
 				IsReservedPullNamespaceForDialect(Dialect(raw), ns),
-				"unregistered dialect %q must reserve MySQL system schema %q", raw, ns,
+				"unregistered dialect %q must reserve system schema %q from any family", raw, ns,
 			)
 		}
 		assert.False(t,
@@ -111,4 +120,17 @@ func TestIsReservedPullNamespaceForDialectFailsClosed(t *testing.T) {
 			"unregistered dialect %q must not reserve application namespaces", raw,
 		)
 	}
+}
+
+// A database_type routed through DialectForDatabaseType must be classified
+// safely even when it is misspelled: an unknown type resolves to an unregistered
+// dialect, and classification then reserves system schemas from every family.
+func TestDialectForDatabaseTypeClassifiesUnknownConservatively(t *testing.T) {
+	dialect := DialectForDatabaseType("postgresql")
+	assert.True(t, IsReservedPullNamespaceForDialect(dialect, "pg_catalog"),
+		"a mislabeled postgres type must still reserve pg_catalog")
+	assert.True(t, IsReservedPullNamespaceForDialect(dialect, "mysql"),
+		"an unregistered dialect reserves every family's system schemas")
+	assert.False(t, IsReservedPullNamespaceForDialect(dialect, "orders_production"),
+		"application namespaces stay pullable")
 }

@@ -15,18 +15,22 @@ const (
 	DialectPostgres Dialect = "postgres"
 )
 
-// DialectForDatabaseType maps a database_type to its database family. Callers
-// must use this instead of converting a database_type string directly to a
-// Dialect: "vitess" and "strata" are MySQL-protocol engines that share the
-// MySQL dialect, so a direct conversion would produce an unregistered dialect.
-// An unrecognized type resolves to DialectMySQL, the conservative default that
-// still reserves MySQL system schemas rather than exposing them.
+// DialectForDatabaseType maps a database_type to its database family for
+// system-schema classification. Callers must use this instead of converting a
+// database_type string directly to a Dialect: "vitess" and "strata" are
+// MySQL-protocol engines that share the MySQL dialect. An unrecognized type is
+// returned as its lowercased value — an unregistered dialect — rather than being
+// forced to a family, so IsReservedPullNamespaceForDialect classifies it
+// conservatively (reserving every known dialect's system schemas) instead of a
+// mislabeled target silently exposing another family's system schemas.
 func DialectForDatabaseType(databaseType string) Dialect {
 	switch strings.ToLower(databaseType) {
+	case "mysql", "vitess", "strata":
+		return DialectMySQL
 	case "postgres":
 		return DialectPostgres
 	default:
-		return DialectMySQL
+		return Dialect(strings.ToLower(databaseType))
 	}
 }
 
@@ -57,9 +61,9 @@ var systemSchemasByDialect = map[Dialect]map[string]struct{}{
 	// The Postgres set is provisional: it covers the always-present system
 	// schemas and RDS/Aurora's rdsadmin, but the managed-extension schemas
 	// (aws_commons, aws_s3, aws_lambda, aws_ml, ...) are deliberately not
-	// enumerated yet. It must be finalized when Postgres pull discovery lands
-	// (see the DB-agnostic tracker's Postgres engine slice) so extension-owned
-	// schemas are not surfaced as pullable user namespaces.
+	// enumerated yet. It must be finalized when Postgres pull discovery is
+	// implemented so extension-owned schemas are not surfaced as pullable user
+	// namespaces.
 	DialectPostgres: {
 		"information_schema": {},
 		"pg_catalog":         {},
@@ -83,22 +87,36 @@ var reservedPrefixesByDialect = map[Dialect][]string{
 // system schema for the dialect (including the Postgres pg_ prefix).
 func IsReservedPullNamespaceForDialect(dialect Dialect, namespace string) bool {
 	name := strings.ToLower(namespace)
-	// Normalize the dialect and resolve an unregistered value to DialectMySQL so
-	// a differently-cased or mis-constructed dialect (e.g. a raw "vitess") cannot
-	// silently miss the registry and fail open, treating a reserved system schema
-	// as a user namespace. MySQL is the conservative default: the MySQL-protocol
-	// engines are the only other database_types today, and they share its dialect.
-	dialect = Dialect(strings.ToLower(string(dialect)))
-	if _, known := systemSchemasByDialect[dialect]; !known {
-		dialect = DialectMySQL
-	}
 
+	// SchemaBot-internal namespaces are reserved regardless of dialect.
 	if _, ok := schemabotReservedNamespaces[name]; ok {
 		return true
 	}
 	if strings.HasPrefix(name, "_") {
 		return true
 	}
+
+	dialect = Dialect(strings.ToLower(string(dialect)))
+	if _, known := systemSchemasByDialect[dialect]; known {
+		return isSystemSchemaForDialect(dialect, name)
+	}
+
+	// A mis-constructed or unknown dialect (e.g. a raw "vitess" or a mislabeled
+	// "postgresql") is classified conservatively: reserve any namespace that is a
+	// system schema in ANY known dialect. Over-reserving only excludes a
+	// namespace from pull discovery — the safe direction — whereas failing open
+	// would expose a real system schema as a user namespace.
+	for known := range systemSchemasByDialect {
+		if isSystemSchemaForDialect(known, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSystemSchemaForDialect reports whether name is a database-managed schema for
+// a single, registered dialect (by exact name or reserved prefix).
+func isSystemSchemaForDialect(dialect Dialect, name string) bool {
 	if _, ok := systemSchemasByDialect[dialect][name]; ok {
 		return true
 	}
