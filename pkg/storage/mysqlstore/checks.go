@@ -24,7 +24,8 @@ const (
 
 // checkStore implements storage.CheckStore using MySQL.
 type checkStore struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect Dialect
 }
 
 // Upsert creates or updates stored check state.
@@ -41,6 +42,20 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 
 	op := fmt.Sprintf("upsert check result for %s#%d %s/%s/%s",
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	upsert := s.dialect.UpsertClause(
+		[]string{"repository", "pull_request", "environment", "database_type", "database_name"},
+		[]UpsertAssignment{
+			{Column: "head_sha"},
+			{Column: "check_run_id"},
+			{Column: "apply_id"},
+			{Column: "has_changes"},
+			{Column: "status"},
+			{Column: "conclusion"},
+			{Column: "blocking_reason"},
+			{Column: "error_message"},
+			{Column: "change_summary", Expr: "COALESCE(NULLIF(" + s.dialect.ExcludedValue("change_summary") + ", ''), change_summary)"},
+		},
+	)
 	return withLockRetry(ctx, op, func() error {
 		_, err := s.db.ExecContext(ctx, `
 			INSERT INTO checks (
@@ -48,17 +63,7 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 				environment, database_type, database_name,
 				check_run_id, apply_id, has_changes, status, conclusion, blocking_reason, error_message, change_summary
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON DUPLICATE KEY UPDATE
-				head_sha = VALUES(head_sha),
-				check_run_id = VALUES(check_run_id),
-				apply_id = VALUES(apply_id),
-				has_changes = VALUES(has_changes),
-				status = VALUES(status),
-				conclusion = VALUES(conclusion),
-				blocking_reason = VALUES(blocking_reason),
-				error_message = VALUES(error_message),
-				change_summary = COALESCE(NULLIF(VALUES(change_summary), ''), change_summary)
-		`, check.Repository, check.PullRequest, check.HeadSHA,
+			`+upsert, check.Repository, check.PullRequest, check.HeadSHA,
 			check.Environment, check.DatabaseType, check.DatabaseName,
 			checkRunID, applyID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, nullString(check.ChangeSummary))
 		return err

@@ -17,7 +17,8 @@ const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, pos
 
 // applyCommentStore implements storage.ApplyCommentStore using MySQL.
 type applyCommentStore struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect Dialect
 }
 
 // Upsert creates or updates a comment record.
@@ -29,16 +30,20 @@ func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyCo
 	if err != nil {
 		return err
 	}
+	upsert := s.dialect.UpsertClause(
+		[]string{"apply_id", "comment_state"},
+		[]UpsertAssignment{
+			{Column: "github_comment_id"},
+			{Column: "posted_volume"},
+			{Column: "pending_freeze_github_comment_id"},
+			{Column: "superseded_at", Expr: "NULL"},
+		},
+	)
 	if !hasLease {
 		_, err := s.db.ExecContext(ctx, `
 			INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_volume, pending_freeze_github_comment_id)
 			VALUES (?, ?, ?, ?, ?)
-			ON DUPLICATE KEY UPDATE
-				github_comment_id = VALUES(github_comment_id),
-				posted_volume = VALUES(posted_volume),
-				pending_freeze_github_comment_id = VALUES(pending_freeze_github_comment_id),
-				superseded_at = NULL
-		`, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedVolume, comment.PendingFreezeCommentID)
+			`+upsert, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedVolume, comment.PendingFreezeCommentID)
 		return err
 	}
 
@@ -46,12 +51,7 @@ func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyCo
 		INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_volume, pending_freeze_github_comment_id)
 		SELECT ?, ?, ?, ?, ? FROM applies a
 		WHERE a.id = ? AND a.lease_token = ?
-		ON DUPLICATE KEY UPDATE
-			github_comment_id = VALUES(github_comment_id),
-			posted_volume = VALUES(posted_volume),
-			pending_freeze_github_comment_id = VALUES(pending_freeze_github_comment_id),
-			superseded_at = NULL
-	`, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedVolume, comment.PendingFreezeCommentID, comment.ApplyID, lease.Token)
+		`+upsert, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedVolume, comment.PendingFreezeCommentID, comment.ApplyID, lease.Token)
 	if err != nil {
 		return err
 	}

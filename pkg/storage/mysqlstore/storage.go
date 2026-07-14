@@ -35,11 +35,11 @@ func New(db *sql.DB) *Storage {
 		tasks:           &taskStore{db: db},
 		applyLogs:       &applyLogStore{db: db},
 		controlRequests: &controlRequestStore{db: db},
-		applyComments:   &applyCommentStore{db: db},
+		applyComments:   &applyCommentStore{db: db, dialect: MySQLDialect{}},
 		planComments:    &planCommentStore{db: db},
 		applyOperations: &applyOperationStore{db: db},
-		checks:          &checkStore{db: db},
-		settings:        &settingsStore{db: db},
+		checks:          &checkStore{db: db, dialect: MySQLDialect{}},
+		settings:        &settingsStore{db: db, dialect: MySQLDialect{}},
 		webhookEvents:   &webhookEventStore{db: db},
 	}
 }
