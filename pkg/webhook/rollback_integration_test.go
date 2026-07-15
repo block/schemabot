@@ -356,6 +356,20 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 				"watchApplyProgress may have lost repo/PR/installationID context")
 		}
 	}
+
+	// Step 6: The rollback apply is attributed to the user who confirmed it,
+	// in the same caller format as any other PR command, so history and
+	// progress views show who acted rather than the lock owner.
+	applies, err := svc.Storage().Applies().GetByDatabase(ctx, dbName, "mysql", "staging")
+	require.NoError(t, err)
+	var rollbackApply *storage.Apply
+	for _, a := range applies {
+		if a.ID != applyID {
+			rollbackApply = a
+		}
+	}
+	require.NotNil(t, rollbackApply, "rollback apply row should exist")
+	assert.Equal(t, "github:testuser@octocat/hello-world#1", rollbackApply.Caller)
 }
 
 // checkWriteRecorder wraps the service's storage so a test can observe every

@@ -390,12 +390,14 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 	})
 	h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, observer)
 
-	// Execute apply with the rollback plan
+	// Execute apply with the rollback plan. The caller attributes the apply to
+	// the user who confirmed the rollback, not the lock owner (repo#pr), so
+	// history and progress views show who acted.
 	applyReq := api.ApplyRequest{
 		PlanID:         rollbackPlan.PlanIdentifier,
 		Environment:    environment,
 		Options:        options,
-		Caller:         lockOwner,
+		Caller:         formatGitHubCaller(requestedBy, repo, pr),
 		InstallationID: installationID,
 	}
 
