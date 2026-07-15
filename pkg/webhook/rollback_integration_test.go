@@ -339,20 +339,25 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	// Step 5: Verify that the summary comment arrives on the PR.
-	// This is the critical assertion — if repo/PR/installationID are wrong,
-	// the comment goes to the wrong URL and never reaches the channel.
+	// Step 5: Verify that the summary comment arrives on the PR with rollback
+	// vocabulary — a completed rollback announces "Rollback Complete", never a
+	// green-check applied schema change. This is also the critical delivery
+	// assertion — if repo/PR/installationID are wrong, the comment goes to the
+	// wrong URL and never reaches the channel.
 	gotSummary := false
 	deadline := time.After(webhookIntegrationPollDeadline)
 	for !gotSummary {
 		select {
 		case body := <-result.comments:
-			if strings.Contains(body, "Schema Change") && (strings.Contains(body, "Applied") || strings.Contains(body, "Complete") || strings.Contains(body, "Failed")) {
+			if strings.Contains(body, "Rollback Complete") {
 				gotSummary = true
+				assert.Contains(t, body, "⏪", "the rollback summary carries the rewind emoji, not the green check")
+				assert.Contains(t, body, "Rolled back successfully")
 				assert.Contains(t, body, "DROP INDEX", "rollback should drop the index")
+				assert.NotContains(t, body, "Schema Change Applied")
 			}
 		case <-deadline:
-			t.Fatal("timed out waiting for rollback summary comment — " +
+			t.Fatal("timed out waiting for the rollback summary comment — " +
 				"watchApplyProgress may have lost repo/PR/installationID context")
 		}
 	}

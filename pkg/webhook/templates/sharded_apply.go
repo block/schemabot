@@ -42,6 +42,12 @@ type ShardedApplyData struct {
 	// pasteable command hint so copied commands address this deployment in
 	// tenant mode. Empty on single-tenant deployments, leaving hints unchanged.
 	Tenant string
+
+	// Rollback reports whether this apply reverts a previously applied schema
+	// change (the apply's durable rollback option). It switches the headline
+	// vocabulary from "apply" to "rollback", matching the single-deployment
+	// comment.
+	Rollback bool
 }
 
 // ShardStatus is one shard's aggregate status. Emoji/Label come from the same
@@ -89,7 +95,7 @@ func RenderShardedApplyComment(data ShardedApplyData) string {
 	var sb strings.Builder
 	renderedAt := currentTimestamp()
 
-	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.State, Environment: data.Environment})
+	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeShardedMetadata(&sb, data, renderedAt)
 
 	writeShardCounts(&sb, data.Shards)

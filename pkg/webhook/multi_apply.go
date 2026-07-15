@@ -101,6 +101,7 @@ func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, re
 		Environment: apply.Environment,
 		Details:     details,
 		Tenant:      tenant,
+		Rollback:    apply.IsRollback(),
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)
@@ -164,6 +165,7 @@ func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tas
 		DeployRequestURL: display.DeployRequestURL,
 		RevertExpiresAt:  display.RevertExpiresAt,
 		Tenant:           tenant,
+		Rollback:         apply.IsRollback(),
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)

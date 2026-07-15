@@ -95,6 +95,12 @@ type ApplyStatusCommentData struct {
 	// pasteable command hint so copied commands address this deployment in
 	// tenant mode. Empty on single-tenant deployments, leaving hints unchanged.
 	Tenant string
+
+	// Rollback reports whether this apply reverts a previously applied schema
+	// change (the apply's durable rollback option). It switches the headline and
+	// status vocabulary from "apply" to "rollback" so a completed rollback is
+	// announced as "Rollback Complete", never as a freshly applied schema change.
+	Rollback bool
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -153,21 +159,30 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 }
 
 // writeApplyStatusHeader writes the headline for an in-place apply status
-// comment. The title is intentionally state-independent — always "Schema Change
-// Status — <env>" — so the headline stays stable as the apply moves through its
-// states (running → revert window → applied); the current state is conveyed by
-// the Status line and the per-table progress, not the headline. The single-,
-// multi-deployment, and sharded status comments all use this so their headline
-// vocabulary is identical. Terminal summary/notification comments use
-// writeApplyHeader, which keeps a state-specific title.
+// comment. The title is intentionally state-independent — "Schema Change
+// Status — <env>" (or "Rollback Status — <env>" for a rollback apply, which is
+// fixed for the apply's lifetime) — so the headline stays stable as the apply
+// moves through its states (running → revert window → applied); the current
+// state is conveyed by the Status line and the per-table progress, not the
+// headline. The single-, multi-deployment, and sharded status comments all use
+// this so their headline vocabulary is identical. Terminal summary/notification
+// comments use writeApplyHeader, which keeps a state-specific title.
 func writeApplyStatusHeader(sb *strings.Builder, data ApplyStatusCommentData) {
-	writeEnvironmentTitle(sb, "Schema Change Status", data.Environment)
+	title := "Schema Change Status"
+	if data.Rollback {
+		title = "Rollback Status"
+	}
+	writeEnvironmentTitle(sb, title, data.Environment)
 }
 
 // writeApplyHeader writes the state-specific title for a terminal summary or
 // notification comment (the separate comment posted when an apply reaches a
 // terminal state), distinct from the stable in-place status headline.
 func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
+	if data.Rollback {
+		writeRollbackHeader(sb, data)
+		return
+	}
 	switch data.State {
 	case state.Apply.Completed:
 		writeEnvironmentTitle(sb, "✅ Schema Change Applied", data.Environment)
@@ -181,6 +196,25 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 		writeEnvironmentTitle(sb, "🚫 Schema Change Cancelled", data.Environment)
 	default:
 		writeEnvironmentTitle(sb, fmt.Sprintf("Schema Change: %s", humanizeState(data.State)), data.Environment)
+	}
+}
+
+// writeRollbackHeader writes the terminal title for a rollback apply. A
+// completed rollback is announced with rollback vocabulary and a rewind emoji —
+// never the green-check "Schema Change Applied" — so a PR reader cannot mistake
+// the revert for the schema change landing.
+func writeRollbackHeader(sb *strings.Builder, data ApplyStatusCommentData) {
+	switch data.State {
+	case state.Apply.Completed:
+		writeEnvironmentTitle(sb, "⏪ Rollback Complete", data.Environment)
+	case state.Apply.Failed:
+		writeEnvironmentTitle(sb, "❌ Rollback Failed", data.Environment)
+	case state.Apply.Stopped:
+		writeEnvironmentTitle(sb, "⏹️ Rollback Stopped", data.Environment)
+	case state.Apply.Cancelled:
+		writeEnvironmentTitle(sb, "🚫 Rollback Cancelled", data.Environment)
+	default:
+		writeEnvironmentTitle(sb, fmt.Sprintf("Rollback: %s", humanizeState(data.State)), data.Environment)
 	}
 }
 
@@ -212,6 +246,9 @@ func startedAtDisplay(startedAt, fallback string) string {
 
 func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
 	detail := applyStatusDetail(data.State)
+	if data.Rollback && state.IsState(data.State, state.Apply.Completed) {
+		detail = "Rolled Back"
+	}
 	if detail == "" {
 		return
 	}
@@ -1008,9 +1045,16 @@ func writeSummaryCompleted(sb *strings.Builder, data ApplyStatusCommentData, tot
 	writeSummaryCompletedMetadata(sb, data)
 	// A VSchema update counts as a schema change alongside table changes, so the
 	// singular/plural wording reflects the total operation count.
+	singular := totalTables+len(data.VSchemaChanges) == 1
 	msg := "Applied successfully — your schema changes are live!"
-	if totalTables+len(data.VSchemaChanges) == 1 {
+	if singular {
 		msg = "Applied successfully — your schema change is live!"
+	}
+	if data.Rollback {
+		msg = "Rolled back successfully — the schema changes have been reverted."
+		if singular {
+			msg = "Rolled back successfully — the schema change has been reverted."
+		}
 	}
 	writeSuccessBlock(sb, msg)
 	writeCompletedSummaryDetails(sb, data)

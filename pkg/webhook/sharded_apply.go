@@ -129,6 +129,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		Shards:      shardStatuses(shardOrder, opsByShard, released, tasksByOp),
 		Cells:       cells,
 		Tenant:      tenant,
+		Rollback:    apply.IsRollback(),
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)

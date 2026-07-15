@@ -386,3 +386,28 @@ func TestRenderMultiDeploymentApplyComment_EscapesSummaryHTML(t *testing.T) {
 	assert.Contains(t, out, "us&amp;ca")
 	assert.NotContains(t, out, "<summary>🔄 eu<b>")
 }
+
+// A rollback apply that fans out across deployments carries rollback vocabulary
+// on the aggregate headline of both the in-place status comment and the
+// terminal summary, matching the single-deployment comments.
+func TestRenderMultiDeploymentApplyComment_Rollback(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu", so.Running),
+		rollingOp("us", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model: model, ApplyID: "apply-123", Environment: "production", Rollback: true,
+	})
+	assert.Contains(t, out, "## Rollback Status")
+	assert.NotContains(t, out, "Schema Change Status")
+
+	completedModel := presentation.Derive([]presentation.Operation{
+		rollingOp("eu", so.Completed),
+		rollingOp("us", so.Completed),
+	})
+	summary := RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model: completedModel, ApplyID: "apply-123", Environment: "production", Rollback: true,
+	})
+	assert.Contains(t, summary, "## ⏪ Rollback Complete")
+	assert.NotContains(t, summary, "Schema Change Applied")
+}
