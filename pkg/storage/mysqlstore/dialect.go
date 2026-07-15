@@ -7,9 +7,13 @@ import (
 )
 
 // Dialect abstracts the SQL-syntax differences between database families (MySQL
-// and, in the future, Postgres) that the state store depends on, so the same
-// store logic can target either engine. This package provides the MySQL
-// implementation; a Postgres store provides its own.
+// and, in the future, Postgres) that the state store depends on. This is an
+// incremental seam: the store lives in mysqlstore and still emits MySQL-style
+// "?" placeholders, and only the family-varying syntax (upsert clause,
+// current-time and relative-time expressions) routes through here. When a
+// Postgres store is introduced this interface likely moves to a shared package,
+// and its parameterized SQL will need a "?"-to-"$n" rebind at the store
+// boundary.
 type Dialect interface {
 	// UpsertClause returns the trailing conflict-resolution clause that turns an
 	// INSERT into an upsert. conflictColumns names the unique key that defines a
