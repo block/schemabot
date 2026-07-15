@@ -391,6 +391,70 @@ func TestTargetRouterApplyRoutesByPlanTargetWhenRequestOmitsTarget(t *testing.T)
 	assert.Equal(t, "production", client.applyReq.Environment)
 }
 
+// A dispatched apply for a non-primary deployment references a plan created on
+// the primary deployment's Tern, so no local plan row exists. When the request
+// carries the plan's authoritative DDL changes and schema files, routing must
+// proceed on the request's own route fields so the deployment-local client can
+// materialize the plan, rather than rejecting the dispatch.
+func TestTargetRouterApplyRoutesMissingPlanWithMaterializationPayload(t *testing.T) {
+	resolver := newStaticResolver(t)
+	created := make(map[string]*targetRouterRecordingClient)
+	planStore := targetRouterPlanStore{byIdentifier: map[string]*storage.Plan{}}
+	router := newTargetRouterForTest(t, resolver, nil, planStore, created)
+
+	resp, err := router.Apply(t.Context(), &ternv1.ApplyRequest{
+		PlanId:      "plan-7",
+		Database:    "orders",
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: "production",
+		Target:      "dsid-orders-prod",
+		DdlChanges: []*ternv1.TableChange{{
+			Namespace: "orders",
+			TableName: "customers",
+			Ddl:       "ALTER TABLE `customers` ADD COLUMN `region_code` CHAR(2) NULL",
+		}},
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"orders": {Files: map[string]string{"customers.sql": "CREATE TABLE `customers` (`id` BIGINT UNSIGNED)"}},
+		},
+	})
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	client := created["orders"]
+	require.NotNil(t, client)
+	require.NotNil(t, client.applyReq)
+	assert.Equal(t, "plan-7", client.applyReq.PlanId)
+	assert.Equal(t, "orders", client.applyReq.Database)
+	assert.Equal(t, "dsid-orders-prod", client.applyReq.Target)
+	assert.Equal(t, "dsid-orders-prod", client.applyReq.Options["target"])
+	assert.Equal(t, storage.DatabaseTypeMySQL, client.applyReq.Type)
+	assert.Equal(t, "production", client.applyReq.Environment)
+	assert.Len(t, client.applyReq.DdlChanges, 1, "the routed request must keep the DDL changes for materialization")
+	assert.Len(t, client.applyReq.SchemaFiles, 1, "the routed request must keep the schema files for materialization")
+}
+
+// A request for a plan that exists nowhere and carries nothing to materialize
+// it from — a stale apply, or a local-mode apply for a plan that was never
+// stored here — must fail closed rather than route on unverifiable fields.
+func TestTargetRouterApplyFailsClosedOnMissingPlanWithoutPayload(t *testing.T) {
+	resolver := newStaticResolver(t)
+	created := make(map[string]*targetRouterRecordingClient)
+	planStore := targetRouterPlanStore{byIdentifier: map[string]*storage.Plan{}}
+	router := newTargetRouterForTest(t, resolver, nil, planStore, created)
+
+	_, err := router.Apply(t.Context(), &ternv1.ApplyRequest{
+		PlanId:      "plan-7",
+		Database:    "orders",
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: "production",
+		Target:      "dsid-orders-prod",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `plan "plan-7" not found for apply target routing`)
+	assert.Empty(t, created, "no client should be created when the plan is missing and there is nothing to materialize")
+}
+
 // The plan is authoritative: a request that supplies a Target contradicting the
 // stored plan target must fail closed rather than silently override the
 // plan-time route.
