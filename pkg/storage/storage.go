@@ -263,11 +263,12 @@ type WebhookEventStore interface {
 	// whose lease has expired and whose attempts have reached
 	// MaxWebhookEventAttempts. Such a row is a driver that was hard-killed on
 	// its final attempt before recording a terminal state — FindNext never
-	// reclaims it (it stops reclaiming at the cap), so without this sweep it
-	// stays parked in processing forever and its delivery GUID deduplicates
-	// every redelivery. Terminalizing it emits the row as a failure and makes
-	// it eligible for the redeliver-reopen path. Returns the number of rows
-	// terminated.
+	// reclaims it (it stops reclaiming at the cap). GitHub Redeliver can already
+	// reopen an expired-lease processing row on demand (see
+	// reopenTerminalWebhookEvent), so this sweep is the automatic complement: it
+	// terminalizes rows nobody redelivered, emitting each as a durable failure
+	// (for metrics/alerting) and draining the stuck-processing gauge without
+	// operator action. Returns the number of rows terminated.
 	TerminateStuckProcessing(ctx context.Context, reason string) (int64, error)
 }
 

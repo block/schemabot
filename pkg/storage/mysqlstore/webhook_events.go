@@ -329,12 +329,14 @@ func (s *webhookEventStore) Release(ctx context.Context, id int64, leaseToken st
 // TerminateStuckProcessing marks failed every processing row whose lease has
 // expired and whose attempts have reached the cap. FindNext stops reclaiming a
 // processing row once attempts == MaxWebhookEventAttempts, so a driver
-// hard-killed on its final attempt leaves the row parked in processing forever;
-// this sweep terminalizes it (clearing the lease and preserving completed_at)
-// so it emits as a failure and its delivery GUID becomes eligible for the
-// redeliver-reopen path. Unlike MarkFailed it is lease-token-agnostic: the
-// owning driver is gone, so there is no token to present. Returns the number of
-// rows terminated.
+// hard-killed on its final attempt leaves the row stuck in processing until it
+// is either terminalized here or reopened by a GitHub Redeliver (see
+// reopenTerminalWebhookEvent). This sweep is the automatic complement to
+// redelivery: it clears the lease (preserving completed_at) and emits the row
+// as a durable failure so it surfaces in metrics/alerting and drains the
+// stuck-processing gauge without operator action. Unlike MarkFailed it is
+// lease-token-agnostic: the owning driver is gone, so there is no token to
+// present. Returns the number of rows terminated.
 func (s *webhookEventStore) TerminateStuckProcessing(ctx context.Context, reason string) (int64, error) {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE webhook_events

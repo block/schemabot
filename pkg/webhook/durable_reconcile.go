@@ -3,8 +3,11 @@
 // own. Each pass does two things:
 //
 //   - Actively terminates inbox rows wedged in processing (driver hard-killed on
-//     its final attempt, lease expired, attempts at the cap) so they emit as
-//     failures and become redeliverable — FindNext never reclaims them.
+//     its final attempt, lease expired, attempts at the cap) that FindNext never
+//     reclaims, emitting each as a durable failure so it surfaces in
+//     metrics/alerting and drains the stuck-processing gauge. GitHub Redeliver
+//     can also reopen such a row on demand; this sweep is the automatic
+//     complement that recovers rows nobody redelivered.
 //   - Reports (report-only) any recently updated open PR head in a registered
 //     repository that has no corresponding webhook_events row, surfacing
 //     deliveries lost upstream of the inbox (edge auth failures, GitHub-side
@@ -174,6 +177,7 @@ func (h *Handler) reconcileRepoWebhookInbox(ctx context.Context, store storage.W
 	cutoff := now.Add(-h.webhookReconcileLookback)
 	grace := now.Add(-h.webhookReconcileGrace)
 	page := 1
+	coverageComplete := false
 pages:
 	for range h.webhookReconcileMaxPages {
 		prs, nextPage, _, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookReconcilePageSize)
@@ -185,6 +189,7 @@ pages:
 			if pr.UpdatedAt.Before(cutoff) {
 				// The listing is newest-updated first; everything after this is
 				// older than the lookback window.
+				coverageComplete = true
 				break pages
 			}
 			if pr.HeadSHA == "" {
@@ -217,9 +222,17 @@ pages:
 			metrics.RecordWebhookReconcileMissingEvent(ctx, repo)
 		}
 		if nextPage == 0 {
+			coverageComplete = true
 			break
 		}
 		page = nextPage
+	}
+	if !coverageComplete {
+		// The page budget ran out before the walk reached the lookback cutoff,
+		// so open PR heads older than the last page scanned went unchecked this
+		// pass. Surface the truncated coverage rather than silently capping it.
+		h.logger.Warn("webhook reconciler exhausted its page budget before reaching the lookback cutoff; open PR coverage is truncated this pass",
+			"repo", repo, "max_pages", h.webhookReconcileMaxPages, "page_size", webhookReconcilePageSize)
 	}
 	return scanned, missing
 }
