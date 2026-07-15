@@ -832,8 +832,8 @@ func (h *Handler) goSafe(repo string, pr int, installationID int64, fn func()) {
 	h.inProcessWebhookMu.Lock()
 	if h.inProcessWebhookDraining {
 		h.inProcessWebhookMu.Unlock()
-		h.logger.Warn("webhook work started during shutdown drain; running untracked and it may be dropped on exit",
-			"repo", repo, "pr", pr)
+		h.logger.Warn("webhook work started after shutdown drain began; running untracked and will be dropped if shutdown completes before it finishes",
+			"repo", repo, "pr", pr, "installation_id", installationID)
 		go run()
 		return
 	}
