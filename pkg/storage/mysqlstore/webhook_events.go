@@ -117,6 +117,29 @@ func (s *webhookEventStore) GetByDeliveryID(ctx context.Context, provider, deliv
 	return scanWebhookEvent(row)
 }
 
+// webhookClaimablePredicate matches exactly the rows a driver would claim: a
+// pending row, a retryable row whose retry window has elapsed and is under the
+// attempt cap, or a processing row whose lease has expired and is under the
+// attempt cap. FindNext and the InboxStats backlog-age query derive from this
+// single source so the "ready to claim" definition cannot drift between what a
+// driver picks up and what the backlog gauge measures. Bind its placeholders
+// with webhookClaimableArgs.
+const webhookClaimablePredicate = `(
+			state = ?
+			OR (state = ? AND (retry_after IS NULL OR retry_after <= NOW()) AND attempts < ?)
+			OR (state = ? AND lease_expires_at <= NOW(6) AND attempts < ?)
+		)`
+
+// webhookClaimableArgs returns the placeholder bindings for
+// webhookClaimablePredicate, in order.
+func webhookClaimableArgs() []any {
+	return []any{
+		storage.WebhookEventPending,
+		storage.WebhookEventFailedRetryable, storage.MaxWebhookEventAttempts,
+		storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts,
+	}
+}
+
 func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDuration time.Duration) (*storage.WebhookEvent, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("webhook driver owner is required")
@@ -133,15 +156,11 @@ func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDur
 	row := tx.QueryRowContext(ctx, `
 		SELECT `+webhookEventColumns+`
 		FROM webhook_events
-		WHERE state = ?
-			OR (state = ? AND (retry_after IS NULL OR retry_after <= NOW()) AND attempts < ?)
-			OR (state = ? AND lease_expires_at <= NOW(6) AND attempts < ?)
+		WHERE `+webhookClaimablePredicate+`
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, storage.WebhookEventPending,
-		storage.WebhookEventFailedRetryable, storage.MaxWebhookEventAttempts,
-		storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts)
+	`, webhookClaimableArgs()...)
 
 	event, err := scanWebhookEventInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -340,16 +359,18 @@ func (s *webhookEventStore) InboxStats(ctx context.Context) (*storage.WebhookInb
 		return nil, fmt.Errorf("iterate webhook inbox state counts: %w", err)
 	}
 
-	// Oldest ready-to-claim row: pending, or retryable whose retry window has
-	// elapsed. Processing rows are already claimed, so they are excluded. NULL
-	// (nothing waiting) scans into a zero age.
+	// Oldest ready-to-claim row, using the exact predicate a driver claims by
+	// (webhookClaimablePredicate) so the backlog gauge and dispatch agree on
+	// what is claimable: a cap-exhausted retryable row is not counted (a driver
+	// won't take it, so it isn't backlog), and an expired-lease processing row a
+	// driver would reclaim is counted (real backlog when its driver crashed).
+	// NULL (nothing waiting) scans into a zero age.
 	var oldestAgeSeconds sql.NullFloat64
 	err = s.db.QueryRowContext(ctx, `
 		SELECT TIMESTAMPDIFF(MICROSECOND, MIN(received_at), NOW(6)) / 1e6
 		FROM webhook_events
-		WHERE state = ?
-			OR (state = ? AND (retry_after IS NULL OR retry_after <= NOW()))
-	`, storage.WebhookEventPending, storage.WebhookEventFailedRetryable).Scan(&oldestAgeSeconds)
+		WHERE `+webhookClaimablePredicate+`
+	`, webhookClaimableArgs()...).Scan(&oldestAgeSeconds)
 	if err != nil {
 		return nil, fmt.Errorf("measure oldest claimable webhook inbox row: %w", err)
 	}

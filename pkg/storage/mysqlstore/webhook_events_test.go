@@ -496,6 +496,58 @@ func TestWebhookEventStore_SubSecondLeaseIsNotImmediatelyReclaimable(t *testing.
 	assert.Nil(t, none)
 }
 
+// The backlog-age gauge must count exactly the rows a driver would claim: a
+// retryable row past the attempt cap is not backlog (FindNext skips it forever),
+// while an expired-lease processing row under the cap is (a driver reclaims it).
+func TestWebhookEventStore_InboxStatsBacklogMatchesClaimable(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	// A cap-exhausted retryable row whose retry window has long elapsed. FindNext
+	// never reclaims it, so it must not inflate the backlog age.
+	capExhausted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "cap-exhausted", Event: "pull_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.True(t, capExhausted)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, attempts = ?, retry_after = NOW() - INTERVAL 1 HOUR,
+			received_at = NOW(6) - INTERVAL 600 SECOND
+		WHERE provider = ? AND delivery_id = ?
+	`, storage.WebhookEventFailedRetryable, storage.MaxWebhookEventAttempts, storage.WebhookProviderGitHub, "cap-exhausted")
+	require.NoError(t, err)
+
+	onlyExhausted, err := store.WebhookEvents().InboxStats(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, onlyExhausted.OldestClaimableAge, "a cap-exhausted retryable row must not count as backlog")
+
+	// An expired-lease processing row under the cap is genuinely reclaimable
+	// backlog: its driver crashed and another will pick it up.
+	reclaimable, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "reclaimable", Event: "pull_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.True(t, reclaimable)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, attempts = ?, lease_owner = 'driver', lease_token = 'tok',
+			lease_expires_at = NOW(6) - INTERVAL 1 SECOND,
+			received_at = NOW(6) - INTERVAL 200 SECOND
+		WHERE provider = ? AND delivery_id = ?
+	`, storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts-1, storage.WebhookProviderGitHub, "reclaimable")
+	require.NoError(t, err)
+
+	stats, err := store.WebhookEvents().InboxStats(ctx)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, stats.OldestClaimableAge, 190*time.Second, "an expired-lease processing row under the cap is claimable backlog")
+	assert.Less(t, stats.OldestClaimableAge, 300*time.Second, "the 600s cap-exhausted retryable row must not drive the age")
+
+	// FindNext agrees with the gauge: it reclaims the processing row and never
+	// the cap-exhausted retryable one.
+	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, "reclaimable", claimed.DeliveryID)
+}
+
 // InboxStats gives operators a steady-state view of the durable inbox: how many
 // rows sit in each state, how long the oldest ready-to-claim delivery has waited
 // (backlog latency), and how many are wedged in processing past the attempt cap.

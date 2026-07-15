@@ -137,9 +137,12 @@ func TestCollectWebhookInboxMetricsRecordsGauges(t *testing.T) {
 	assert.Equal(t, int64(2), stuck)
 }
 
-// A store failure must not emit gauges (stale values are worse than a gap) and
-// must not panic the monitor loop.
-func TestCollectWebhookInboxMetricsSkipsOnStoreError(t *testing.T) {
+// A store failure must not emit the depth/backlog gauges: they are last-value
+// instruments, so leaving them untouched re-exports the last-good values and
+// reads as a healthy inbox. Instead it increments the collection-failure
+// counter — the liveness signal that the gauges are stale — and must not panic
+// the monitor loop.
+func TestCollectWebhookInboxMetricsSkipsGaugesAndCountsFailureOnStoreError(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	prevMP := otel.GetMeterProvider()
@@ -155,9 +158,14 @@ func TestCollectWebhookInboxMetricsSkipsOnStoreError(t *testing.T) {
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))
+	names := map[string]bool{}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
-			assert.NotContains(t, m.Name, "schemabot.webhook.inbox_")
+			names[m.Name] = true
 		}
 	}
+	assert.NotContains(t, names, "schemabot.webhook.inbox_depth", "gauges must not be re-emitted on error")
+	assert.NotContains(t, names, "schemabot.webhook.inbox_oldest_claimable_age_seconds")
+	assert.NotContains(t, names, "schemabot.webhook.inbox_stuck_processing")
+	assert.Contains(t, names, "schemabot.webhook.inbox_stats_collection_failures", "a failed snapshot must increment the failure counter")
 }

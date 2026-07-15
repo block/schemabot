@@ -11,6 +11,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	otelmetric "go.opentelemetry.io/otel/metric"
+
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // Meter name used for all SchemaBot metrics.
@@ -1132,15 +1134,16 @@ func RecordUnregisteredRepositoryWebhook(ctx context.Context, appName, eventType
 }
 
 // knownWebhookInboxStates allowlists the canonical durable webhook inbox states
-// so the depth gauge's cardinality stays bounded. Mirrors the states in
-// storage; an unrecognized value is folded to "unknown".
-var knownWebhookInboxStates = map[string]bool{
-	"pending":          true,
-	"processing":       true,
-	"failed_retryable": true,
-	"completed":        true,
-	"failed":           true,
-}
+// so the depth gauge's cardinality stays bounded. It is derived from the
+// storage state list so the two cannot drift; an unrecognized value is folded to
+// "unknown".
+var knownWebhookInboxStates = func() map[string]bool {
+	states := make(map[string]bool, len(storage.WebhookEventStatesAll))
+	for _, state := range storage.WebhookEventStatesAll {
+		states[state] = true
+	}
+	return states
+}()
 
 // RecordWebhookInboxDepth records the number of durable webhook inbox rows in a
 // given state. A rising pending/processing depth means dispatch is falling
@@ -1176,6 +1179,18 @@ func RecordWebhookInboxOldestClaimableAge(ctx context.Context, age time.Duration
 func RecordWebhookInboxStuckProcessing(ctx context.Context, count int64) {
 	recordGauge(ctx, "schemabot.webhook.inbox_stuck_processing", count,
 		"Number of durable webhook inbox rows stuck in processing past the attempt cap", "{row}",
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordWebhookInboxStatsCollectionFailure counts failed inbox snapshots. The
+// inbox depth/backlog gauges are last-value instruments, so a failed snapshot
+// leaves them frozen at their last-good values — indistinguishable from a
+// healthy inbox. This counter is the liveness signal for the gauges: a nonzero
+// rate means the depth/backlog/stuck values are stale and must not be trusted.
+func RecordWebhookInboxStatsCollectionFailure(ctx context.Context) {
+	addCounter(ctx, "schemabot.webhook.inbox_stats_collection_failures",
+		"Total number of failed durable webhook inbox metric snapshots", "{failure}",
 		EnvironmentAttribute(""),
 	)
 }

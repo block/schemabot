@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
@@ -65,21 +64,6 @@ func (s *Service) StopWebhookInboxMonitor() {
 	s.webhookInboxWg.Wait()
 }
 
-// SetWebhookInboxMetricsInterval sets the inbox snapshot interval. Call before
-// StartWebhookInboxMonitor.
-func (s *Service) SetWebhookInboxMetricsInterval(interval time.Duration) error {
-	if interval <= 0 {
-		return fmt.Errorf("webhook inbox metrics interval must be positive")
-	}
-	s.webhookInboxMu.Lock()
-	defer s.webhookInboxMu.Unlock()
-	if s.webhookInboxCancel != nil {
-		return fmt.Errorf("webhook inbox monitor already running")
-	}
-	s.webhookInboxInterval = interval
-	return nil
-}
-
 func (s *Service) webhookInboxMonitor(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -105,18 +89,41 @@ func (s *Service) CollectWebhookInboxMetrics(ctx context.Context) {
 		s.logger.Debug("webhook inbox metrics collection skipped because context is done", "error", err)
 		return
 	}
+	if s.storage == nil || s.storage.WebhookEvents() == nil {
+		s.logger.Debug("webhook inbox metrics collection skipped because webhook storage is unavailable")
+		return
+	}
 
 	collectCtx, cancel := context.WithTimeout(ctx, WebhookInboxMetricsTimeout)
 	defer cancel()
 
 	stats, err := s.storage.WebhookEvents().InboxStats(collectCtx)
 	if err != nil {
+		// The depth/backlog gauges are last-value instruments: leaving them
+		// untouched here re-exports the last-good values with fresh timestamps,
+		// which reads as a healthy inbox. The failure counter is the liveness
+		// signal that tells operators the gauges are stale.
+		metrics.RecordWebhookInboxStatsCollectionFailure(ctx)
 		s.logger.Warn("webhook inbox metrics collection failed", "error", err)
 		return
 	}
 
+	recorded := make(map[string]bool, len(stats.CountsByState))
 	for _, state := range storage.WebhookEventStatesAll {
 		metrics.RecordWebhookInboxDepth(ctx, state, stats.CountsByState[state])
+		recorded[state] = true
+	}
+	// The state column is a free-form varchar, not an enum, so a value outside
+	// the canonical set could appear. Sum any such rows into a single unknown
+	// series rather than dropping them, so an unexpected state still surfaces.
+	var unknownCount int64
+	for state, count := range stats.CountsByState {
+		if !recorded[state] {
+			unknownCount += count
+		}
+	}
+	if unknownCount > 0 {
+		metrics.RecordWebhookInboxDepth(ctx, "unknown", unknownCount)
 	}
 	metrics.RecordWebhookInboxOldestClaimableAge(ctx, stats.OldestClaimableAge)
 	metrics.RecordWebhookInboxStuckProcessing(ctx, stats.StuckProcessing)
