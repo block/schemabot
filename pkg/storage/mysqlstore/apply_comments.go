@@ -253,7 +253,7 @@ func (s *applyCommentStore) ReclaimStaleSummaryClaim(ctx context.Context, applyI
 		SET updated_at = NOW()
 		WHERE apply_id = ? AND comment_state = ?
 		  AND github_comment_id = 0
-		  AND updated_at < NOW() - INTERVAL ? SECOND
+		  AND updated_at < `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalSecond)+`
 	`, applyID, state.Comment.Summary, int64(storage.SummaryClaimStaleAfter.Seconds()))
 	if err != nil {
 		return false, fmt.Errorf("reclaim stale summary claim for apply %d: %w", applyID, err)
