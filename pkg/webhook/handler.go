@@ -139,6 +139,20 @@ type Handler struct {
 	// deterministically. Production code never sets it.
 	durableWebhookProcessOverride func(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error)
 
+	// inProcessWebhookWg tracks the detached goSafe goroutines that non-durable
+	// event paths (issue_comment, participant_nudge, check_run, push, and the
+	// legacy pull_request branches) launch after acking 200. The request handler
+	// returns immediately, so the HTTP server's own graceful shutdown does not
+	// wait for this work; DrainInProcessWebhookWork does, so a deploy drains
+	// already-acked work instead of dropping it. inProcessWebhookMu guards the
+	// WaitGroup Add against inProcessWebhookDraining: some goSafe work is spawned
+	// by delayed timers (time.AfterFunc), which can fire when the counter is
+	// zero, so Add and the drain's flag flip must be mutually exclusive to avoid
+	// "Add called concurrently with Wait" misuse.
+	inProcessWebhookMu       sync.Mutex
+	inProcessWebhookDraining bool
+	inProcessWebhookWg       sync.WaitGroup
+
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
 	priorEnvCheckRetryInterval time.Duration
@@ -803,12 +817,58 @@ func (h *Handler) recoverPanic(repo string, pr int, installationID int64) {
 }
 
 // goSafe launches fn in a goroutine with panic recovery that posts an error
-// comment on the PR so the user gets feedback instead of silence.
+// comment on the PR so the user gets feedback instead of silence. The goroutine
+// is registered on inProcessWebhookWg so DrainInProcessWebhookWork can wait for
+// already-acked work to finish on shutdown. Once the drain has begun, new work
+// is launched untracked rather than added to the WaitGroup: the drain has
+// committed to a bounded wait, and adding after it may have observed a zero
+// counter would be WaitGroup misuse.
 func (h *Handler) goSafe(repo string, pr int, installationID int64, fn func()) {
-	go func() {
+	run := func() {
 		defer h.recoverPanic(repo, pr, installationID)
 		fn()
+	}
+
+	h.inProcessWebhookMu.Lock()
+	if h.inProcessWebhookDraining {
+		h.inProcessWebhookMu.Unlock()
+		h.logger.Warn("webhook work started during shutdown drain; running untracked and it may be dropped on exit",
+			"repo", repo, "pr", pr)
+		go run()
+		return
+	}
+	h.inProcessWebhookWg.Add(1)
+	h.inProcessWebhookMu.Unlock()
+
+	go func() {
+		defer h.inProcessWebhookWg.Done()
+		run()
 	}()
+}
+
+// DrainInProcessWebhookWork waits for the detached goSafe goroutines to finish,
+// bounded by ctx. It first flips the draining flag so no new work is added to
+// the WaitGroup while it waits (delayed timers can spawn goSafe work at any
+// time), then waits for the work registered up to that point. On timeout it
+// returns without waiting further; the already-acked work still running may be
+// dropped when the process exits.
+func (h *Handler) DrainInProcessWebhookWork(ctx context.Context) {
+	h.inProcessWebhookMu.Lock()
+	h.inProcessWebhookDraining = true
+	h.inProcessWebhookMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		h.inProcessWebhookWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		h.logger.Info("in-process webhook goroutines drained")
+	case <-ctx.Done():
+		h.logger.Warn("timed out draining in-process webhook goroutines; already-acked webhook work still running will be dropped on exit",
+			"error", ctx.Err())
+	}
 }
 
 // statusCapturingResponseWriter records the HTTP status a handler wrote so the
