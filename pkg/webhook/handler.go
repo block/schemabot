@@ -174,10 +174,14 @@ func WithDurableWebhookDispatch() HandlerOption {
 	}
 }
 
-// WithWebhookReconciler enables the report-only webhook reconciliation loop:
-// a periodic scan of recently updated open PRs in registered repositories that
-// reports PR heads with no corresponding inbox delivery. It only takes effect
-// alongside WithDurableWebhookDispatch, whose lifecycle it shares.
+// WithWebhookReconciler enables the webhook reconciliation loop. It does two
+// things per pass: (1) an active stuck-processing sweep that terminalizes inbox
+// rows wedged past the attempt cap so they emit failures and become
+// redeliverable, and (2) a report-only scan of recently updated open PRs in
+// registered repositories that reports PR heads with no corresponding inbox
+// delivery (no rows are synthesized). Only the missing-delivery scan is
+// report-only. It takes effect alongside WithDurableWebhookDispatch, whose
+// lifecycle it shares.
 func WithWebhookReconciler() HandlerOption {
 	return func(h *Handler) {
 		h.webhookReconciler = true

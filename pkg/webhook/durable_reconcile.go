@@ -80,8 +80,11 @@ func (h *Handler) startWebhookReconciler(ctx context.Context, stop <-chan struct
 	})
 }
 
-// reconcileWebhookInbox runs one report-only pass over all registered
-// repositories.
+// reconcileWebhookInbox runs one reconciliation pass in two stages: an active
+// stuck-processing sweep that terminalizes inbox rows wedged past the attempt
+// cap, followed by a report-only missing-delivery scan over registered
+// repositories. Only the missing-delivery scan is report-only; the sweep
+// mutates rows.
 func (h *Handler) reconcileWebhookInbox(ctx context.Context) {
 	store := h.webhookEventStore()
 	if store == nil {
