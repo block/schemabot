@@ -177,38 +177,25 @@ func RenderInvalidCommand() string {
 	return "## ❌ Invalid Command\n\nThat command wasn't recognized. Available commands:\n\n" + commandReference()
 }
 
-// RenderInvalidEnv generates an error message when the -e flag value is not a
-// valid environment name — most commonly a flag glued onto the value by a
-// missing space (`-e production--allow-unsafe`).
-func RenderInvalidEnv(action string) string {
-	return fmt.Sprintf(`## ❌ Invalid Environment
-
-The value after `+"`-e`"+` isn't a valid environment name. Check for a missing space between the environment and any flags that follow it.
-
-**Usage**: `+"`schemabot %s -e <environment> [flags]`"+`
-
-**Example**:
-`+"```"+`
-schemabot %s -e staging
-`+"```", action, action)
-}
-
-// RenderUnknownEnv generates an error message when the -e value is a
-// well-formed environment name that no SchemaBot instance handles. The
-// rejected value and the configured environment names are both normalized for
-// markdown display so an unexpected character cannot break the comment.
-func RenderUnknownEnv(action, env string, available []string) string {
+// RenderInvalidEnv generates an error message when the -e value does not name
+// a configured environment — whether malformed (e.g. a flag glued onto the
+// value by a missing space) or simply not an environment any instance
+// handles. The configured environment names are normalized for markdown
+// display so an unexpected character cannot break the comment.
+func RenderInvalidEnv(action string, available []string) string {
 	quoted := make([]string, len(available))
 	for i, name := range available {
 		quoted[i] = markdownInlineCode(name)
 	}
-	return fmt.Sprintf(`## ❌ Unknown Environment
+	availableLine := ""
+	if len(quoted) > 0 {
+		availableLine = "\n**Available environments**: " + strings.Join(quoted, ", ") + "\n"
+	}
+	return fmt.Sprintf(`## ❌ Invalid Environment
 
-%s isn't a configured environment.
-
-**Available environments**: %s
-
-**Usage**: `+"`schemabot %s -e <environment>`", markdownInlineCode(env), strings.Join(quoted, ", "), action)
+`+"`-e`"+` must name one of the configured environments.
+%s
+**Usage**: `+"`schemabot %s -e <environment> [flags]`", availableLine, action)
 }
 
 // markdownInlineCode renders a value as a markdown inline code span,

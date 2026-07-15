@@ -187,7 +187,8 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		h.logger.Info("rejecting command with invalid environment value",
 			"repo", repo, "pr", pr, "action", result.Action)
 		h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
-		h.postComment(repo, pr, installationID, templates.RenderInvalidEnv(result.Action))
+		h.postComment(repo, pr, installationID,
+			templates.RenderInvalidEnv(result.Action, h.knownEnvironments()))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "invalid environment value"})
 		return
 	}
@@ -248,7 +249,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 				"repo", repo, "pr", pr, "environment", result.Environment, "action", result.Action)
 			h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
 			h.postComment(repo, pr, installationID,
-				templates.RenderUnknownEnv(result.Action, result.Environment, h.service.Config().KnownEnvironments()))
+				templates.RenderInvalidEnv(result.Action, h.knownEnvironments()))
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unknown environment"})
 			return
 		}
@@ -640,6 +641,15 @@ func (h *Handler) acknowledgeCommandEarlyIfOwned(ctx context.Context, client *gh
 	}
 	h.acknowledgeCommand(repo, pr, installationID, commentID)
 	return true
+}
+
+// knownEnvironments returns the configured environment roster for error
+// comments, or nil when the handler has no service configuration.
+func (h *Handler) knownEnvironments() []string {
+	if h.service == nil {
+		return nil
+	}
+	return h.service.Config().KnownEnvironments()
 }
 
 // acknowledgeCommand adds the eyes reaction to the command comment,

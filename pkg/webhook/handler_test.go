@@ -441,7 +441,7 @@ func TestWebhookInvalidEnvValue(t *testing.T) {
 	select {
 	case body := <-comments:
 		assert.Contains(t, body, "Invalid Environment")
-		assert.Contains(t, body, "missing space")
+		assert.Contains(t, body, "**Available environments**: `production`, `staging`")
 		assert.Contains(t, body, "schemabot apply -e <environment>")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for the invalid environment comment")
@@ -456,7 +456,7 @@ func TestWebhookInvalidEnvValue(t *testing.T) {
 }
 
 // In an environment-isolated deployment, an environment no instance handles
-// is rejected with an eyes acknowledgment and an unknown-environment comment
+// is rejected with an eyes acknowledgment and an invalid-environment comment
 // listing the configured environments, instead of every instance silently
 // deferring to a peer that does not exist.
 func TestWebhookUnknownEnvironmentRejected(t *testing.T) {
@@ -476,12 +476,11 @@ func TestWebhookUnknownEnvironmentRejected(t *testing.T) {
 
 	select {
 	case body := <-comments:
-		assert.Contains(t, body, "Unknown Environment")
-		assert.Contains(t, body, "`prodction`")
+		assert.Contains(t, body, "Invalid Environment")
 		assert.Contains(t, body, "`staging`")
 		assert.Contains(t, body, "`production`")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the unknown environment comment")
+		t.Fatal("timed out waiting for the invalid environment comment")
 	}
 
 	select {
