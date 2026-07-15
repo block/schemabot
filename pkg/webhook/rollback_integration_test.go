@@ -364,7 +364,8 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 	require.NoError(t, err)
 	var rollbackApply *storage.Apply
 	for _, a := range applies {
-		if a.ID != applyID {
+		if a.IsRollback() {
+			require.Nil(t, rollbackApply, "expected exactly one rollback apply row")
 			rollbackApply = a
 		}
 	}
