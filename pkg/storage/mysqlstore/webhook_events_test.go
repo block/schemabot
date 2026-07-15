@@ -248,6 +248,78 @@ func TestWebhookEventStore_CreateReopensTerminalDelivery(t *testing.T) {
 	assert.JSONEq(t, `{"attempt":3}`, string(reopenedAgain.Payload))
 }
 
+func TestWebhookEventStore_CreateReopensStuckProcessingDelivery(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":1}`)})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	// A driver hard-killed on its final attempt leaves the row in processing
+	// with an expired lease at the attempts ceiling. FindNext never reclaims it,
+	// so absent the reconciler's periodic sweep an operator Redeliver is the
+	// only immediate recovery lever — which is the path this exercises.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, attempts = ?, lease_owner = 'driver-a', lease_token = 'token-a',
+			lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 HOUR), started_at = NOW(6)
+		WHERE delivery_id = 'delivery-1'
+	`, storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts)
+	require.NoError(t, err)
+
+	stuck, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
+	require.NoError(t, err)
+	require.Nil(t, stuck, "cap-exhausted processing row must not be reclaimable by FindNext")
+
+	// Redeliver reuses the delivery GUID; it must re-open the wedged row.
+	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":2}`)})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
+	require.NoError(t, err)
+	require.NotNil(t, reopened)
+	assert.Equal(t, storage.WebhookEventPending, reopened.State)
+	assert.Equal(t, 0, reopened.Attempts)
+	assert.Empty(t, reopened.LeaseToken)
+	assert.Nil(t, reopened.StartedAt)
+	assert.JSONEq(t, `{"attempt":2}`, string(reopened.Payload))
+
+	reclaimed, err := store.WebhookEvents().FindNext(ctx, "driver-c", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, reclaimed, "reopened row must be claimable again")
+	assert.Equal(t, 1, reclaimed.Attempts)
+}
+
+func TestWebhookEventStore_CreateDedupesProcessingWithLiveLease(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":1}`)})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	// A live driver owns the row (unexpired lease), so it is genuinely in
+	// flight — a duplicate delivery must dedup rather than yank it away.
+	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":2}`)})
+	require.NoError(t, err)
+	require.False(t, inserted, "a processing row with a live lease must dedup, not reopen")
+
+	current, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
+	require.NoError(t, err)
+	require.NotNil(t, current)
+	assert.Equal(t, storage.WebhookEventProcessing, current.State)
+	assert.Equal(t, claimed.LeaseToken, current.LeaseToken, "the live driver's lease must be untouched")
+	assert.JSONEq(t, `{"attempt":1}`, string(current.Payload), "payload must not be overwritten while in flight")
+}
+
 func TestWebhookEventStore_ReleaseRefundsAttemptAndRequeues(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

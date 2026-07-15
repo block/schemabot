@@ -80,23 +80,34 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 // reopenTerminalWebhookEvent handles the duplicate-GUID branch of Create.
 // GitHub's "Redeliver" reuses the original delivery GUID, so plain dedup would
 // make redelivery a permanent no-op for a terminal row — the one case where an
-// operator most needs it to work. Re-open both terminal states (failed and
-// completed): a completed row can still have lost its follow-on work if the
-// process died after the delivery was marked completed but before the detached
-// plan goroutines durably recorded their plans, and re-running auto-plan on the
-// same head SHA is idempotent, so a redeliver is a safe recovery lever.
-// pending/retryable/processing rows are genuinely in flight (dedup, return
-// false). last_error is kept for forensics until the next attempt overwrites it.
+// operator most needs it to work. Re-open:
+//   - failed and completed rows: a completed row can still have lost its
+//     follow-on work if the process died after the delivery was marked completed
+//     but before the detached plan goroutines durably recorded their plans, and
+//     re-running auto-plan on the same head SHA is idempotent.
+//   - processing rows whose lease has expired: a driver hard-killed on its final
+//     attempt leaves the row parked in processing with attempts at the cap,
+//     which FindNext never reclaims — so it would otherwise be recoverable only
+//     by the reconciler's periodic sweep. Matching it here makes Redeliver an
+//     immediate recovery lever. An expired lease means no live owner, so the
+//     reopen can't race a real driver, and the lease-token guard on
+//     MarkCompleted/MarkFailed still rejects a returning zombie driver.
+//
+// pending/retryable rows and processing rows with a live (unexpired) lease are
+// genuinely in flight, so they dedup (return false). last_error is kept for
+// forensics until the next attempt overwrites it.
 func (s *webhookEventStore) reopenTerminalWebhookEvent(ctx context.Context, provider, deliveryID, payload string, receivedAt time.Time) (bool, error) {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE webhook_events
 		SET state = ?, attempts = 0, payload = ?, received_at = ?,
 			lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
 			retry_after = NULL, completed_at = NULL, started_at = NULL, updated_at = NOW()
-		WHERE provider = ? AND delivery_id = ? AND state IN (?, ?)
-	`, storage.WebhookEventPending, payload, receivedAt, provider, deliveryID, storage.WebhookEventFailed, storage.WebhookEventCompleted)
+		WHERE provider = ? AND delivery_id = ?
+			AND (state IN (?, ?) OR (state = ? AND lease_expires_at <= NOW(6)))
+	`, storage.WebhookEventPending, payload, receivedAt, provider, deliveryID,
+		storage.WebhookEventFailed, storage.WebhookEventCompleted, storage.WebhookEventProcessing)
 	if err != nil {
-		return false, fmt.Errorf("reopen terminally failed webhook delivery (provider=%s, delivery_id=%s): %w", provider, deliveryID, err)
+		return false, fmt.Errorf("reopen webhook delivery for redelivery (provider=%s, delivery_id=%s): %w", provider, deliveryID, err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
