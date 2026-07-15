@@ -1816,9 +1816,26 @@ func (c *ServerConfig) KnownEnvironments() []string {
 }
 
 // IsEnvironmentKnown reports whether the environment appears anywhere in this
-// instance's configuration (see KnownEnvironments).
+// instance's configuration — the same set KnownEnvironments returns — checked
+// by direct membership so the webhook command path does not materialize and
+// sort the full list on every lookup.
 func (c *ServerConfig) IsEnvironmentKnown(env string) bool {
-	return slices.Contains(c.KnownEnvironments(), env)
+	if c == nil || env == "" {
+		return false
+	}
+	order := c.EnvironmentOrder
+	if len(order) == 0 {
+		order = defaultEnvironmentOrder
+	}
+	if slices.Contains(c.AllowedEnvironments, env) || slices.Contains(order, env) {
+		return true
+	}
+	for _, db := range c.Databases {
+		if _, ok := db.Environments[env]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // PromotionEnvironmentOrder returns the server-owned environment promotion

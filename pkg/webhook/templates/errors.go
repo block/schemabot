@@ -194,21 +194,29 @@ schemabot %s -e staging
 }
 
 // RenderUnknownEnv generates an error message when the -e value is a
-// well-formed environment name that no SchemaBot instance handles. The value
-// is safe to render: the parser only accepts environment names made of
-// lowercase alphanumerics, underscores, and single dashes.
+// well-formed environment name that no SchemaBot instance handles. The
+// rejected value and the configured environment names are both normalized for
+// markdown display so an unexpected character cannot break the comment.
 func RenderUnknownEnv(action, env string, available []string) string {
 	quoted := make([]string, len(available))
 	for i, name := range available {
-		quoted[i] = "`" + name + "`"
+		quoted[i] = markdownInlineCode(name)
 	}
 	return fmt.Sprintf(`## ❌ Unknown Environment
 
-`+"`%s`"+` isn't a configured environment.
+%s isn't a configured environment.
 
 **Available environments**: %s
 
-**Usage**: `+"`schemabot %s -e <environment>`", env, strings.Join(quoted, ", "), action)
+**Usage**: `+"`schemabot %s -e <environment>`", markdownInlineCode(env), strings.Join(quoted, ", "), action)
+}
+
+// markdownInlineCode renders a value as a markdown inline code span,
+// normalizing characters that would break the span: backticks are stripped
+// and whitespace (including newlines) collapses to single spaces.
+func markdownInlineCode(s string) string {
+	s = strings.ReplaceAll(s, "`", "")
+	return "`" + strings.Join(strings.Fields(s), " ") + "`"
 }
 
 // RenderMissingEnv generates an error message when -e flag is missing.
