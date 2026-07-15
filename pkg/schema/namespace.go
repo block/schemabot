@@ -84,12 +84,9 @@ func GroupFilesByNamespace(files map[string]string, defaultNamespace string, env
 }
 
 // IsReservedPullNamespace reports whether a live namespace should be excluded
-// from schema pull discovery and rejected for explicit pull requests.
+// from schema pull discovery and rejected for explicit pull requests, using the
+// MySQL dialect. Callers that know the target dialect should use
+// IsReservedPullNamespaceForDialect.
 func IsReservedPullNamespace(namespace string) bool {
-	switch strings.ToLower(namespace) {
-	case "_pending_drops", "dbadmin", "information_schema", "innodb", "mysql", "performance_schema", "polt", "rdsmon", "schemabot", "sys", "tmp", "topo":
-		return true
-	default:
-		return strings.HasPrefix(namespace, "_")
-	}
+	return IsReservedPullNamespaceForDialect(DialectMySQL, namespace)
 }
