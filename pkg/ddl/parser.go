@@ -56,7 +56,7 @@ func (tidbStatementParser) Split(content string) ([]string, error) {
 		AllowMixedStatementTypes: true,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse SQL statements: %w", err)
+		return nil, fmt.Errorf("failed to parse SQL statements %q: %w", statementPreview(content), err)
 	}
 	var stmts []string
 	for _, s := range parsed {
