@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -181,6 +182,7 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 		StuckAfter:      cmd.StuckAfter,
 	}
 	checkNamesSeen := map[string]bool{}
+	skippedByServer := map[string]bool{}
 	held := 0
 scanning:
 	for i, repo := range repos {
@@ -205,6 +207,7 @@ scanning:
 			// off rather than reporting every open PR as missing; record the
 			// skip for the report and move to the next repo.
 			if chunk.ChecksDisabled {
+				skippedByServer[repo] = true
 				report.SkippedDisabled = append(report.SkippedDisabled, repo)
 				continue scanning
 			}
@@ -260,6 +263,13 @@ scanning:
 		}
 	}
 	sort.Strings(report.CheckNames)
+
+	// The report's scanned-repo list and its skip list stay disjoint: a repo
+	// the server reported as disabled was never scanned, so it belongs only
+	// in the skip list.
+	if len(skippedByServer) > 0 {
+		report.Repos = slices.DeleteFunc(report.Repos, func(r string) bool { return skippedByServer[r] })
+	}
 
 	if !cmd.DryRun {
 		// Act phase: synthesize the missing checks in server-bounded batches
@@ -462,7 +472,11 @@ func (cmd *ChecksBackfillCmd) write(report *checksBackfillReport) error {
 
 func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error {
 	if len(report.Repos) == 0 && len(report.SkippedDisabled) > 0 {
-		_, err := fmt.Fprintf(w, "All %d declared repositories have Check Runs disabled (enable_checks: false); nothing to scan: %s.\n", len(report.SkippedDisabled), strings.Join(report.SkippedDisabled, ", "))
+		if len(report.SkippedDisabled) == 1 {
+			_, err := fmt.Fprintf(w, "Repository %s has Check Runs disabled (enable_checks: false); nothing to scan.\n", report.SkippedDisabled[0])
+			return err
+		}
+		_, err := fmt.Fprintf(w, "All %d repositories have Check Runs disabled (enable_checks: false); nothing to scan: %s.\n", len(report.SkippedDisabled), strings.Join(report.SkippedDisabled, ", "))
 		return err
 	}
 	repoScope := strings.Join(report.Repos, ", ")

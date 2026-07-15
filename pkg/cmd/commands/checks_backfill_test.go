@@ -1,6 +1,9 @@
 package commands
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -171,8 +174,53 @@ func TestWriteChecksBackfillReportAllReposDisabled(t *testing.T) {
 	require.NoError(t, writeChecksBackfillReport(&out, report))
 
 	rendered := out.String()
-	assert.Contains(t, rendered, "All 2 declared repositories have Check Runs disabled (enable_checks: false); nothing to scan: octo/off, octo/quiet.")
+	assert.Contains(t, rendered, "All 2 repositories have Check Runs disabled (enable_checks: false); nothing to scan: octo/off, octo/quiet.")
 	assert.NotContains(t, rendered, "Scanned")
+}
+
+// A single repository with Check Run publishing turned off — the shape a
+// named-repo invocation produces — reads as a sentence about that repository,
+// not a fleet summary.
+func TestWriteChecksBackfillReportSingleRepoDisabled(t *testing.T) {
+	report := &checksBackfillReport{
+		SkippedDisabled: []string{"octo/off"},
+		DryRun:          true,
+		StuckAfter:      "1h",
+	}
+
+	var out strings.Builder
+	require.NoError(t, writeChecksBackfillReport(&out, report))
+
+	rendered := out.String()
+	assert.Contains(t, rendered, "Repository octo/off has Check Runs disabled (enable_checks: false); nothing to scan.")
+	assert.NotContains(t, rendered, "Scanned")
+}
+
+// Naming a repository whose Check Run publishing is turned off scans nothing:
+// the server reports the repo as disabled and the CLI reports the skip with
+// the reason. The repo appears only in the skip list — not in the scanned-repo
+// scope — so the report never implies a scan that did not happen.
+func TestChecksBackfillRunSkipsNamedDisabledRepo(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/checks/scan", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(apitypes.ChecksScanResponse{Repo: "octo/off", ChecksDisabled: true}))
+	}))
+	t.Cleanup(server.Close)
+
+	cmd := &ChecksBackfillCmd{Repo: "octo/off", DryRun: true, StuckAfter: "1h", JSON: true}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+	})
+	require.NoError(t, runErr)
+
+	var report checksBackfillReport
+	require.NoError(t, json.Unmarshal([]byte(output), &report))
+	assert.Empty(t, report.Repos, "a repo the server reported as disabled was not scanned and must not appear in the scanned-repo list")
+	assert.Equal(t, []string{"octo/off"}, report.SkippedDisabled)
+	assert.Zero(t, report.Scanned)
+	assert.Empty(t, report.Actions)
 }
 
 // The pacing decision: pause only when the budget snapshot is below the floor
