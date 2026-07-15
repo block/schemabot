@@ -607,7 +607,11 @@ the checks that instance owns:
 - **Repositories.** `--repo` scans one repository; `--all-repos` scans every
   repository declared in the instance's `repos:` config. A legacy single-App
   config declares no repos, so there `--all-repos` is rejected and repositories
-  must be named explicitly.
+  must be named explicitly. Repositories with `enable_checks: false` are
+  skipped, not scanned — the server refuses to create their checks, so every
+  open PR would trivially read as missing one. The skip is reported, never an
+  error: an `--all-repos` sweep keeps going, and naming a disabled repository
+  explicitly returns skip outcomes that say why nothing was created.
 - **Apps.** Each repository resolves to the GitHub App that owns it (see
   [Multi-App Routing](configuration.md#multi-app-routing)); the scan and the
   recreated Check Runs both use that App's installation. An instance hosting

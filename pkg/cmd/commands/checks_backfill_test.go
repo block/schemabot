@@ -135,6 +135,46 @@ func TestWriteChecksBackfillReportFleetHeadlineAndHeldPRs(t *testing.T) {
 	assert.Contains(t, rendered, "held: an uncompleted Check Run sits on this head")
 }
 
+// Repositories whose Check Run publishing is turned off are skipped, not
+// scanned, and the report names them so the operator knows the sweep left
+// them out deliberately.
+func TestWriteChecksBackfillReportNamesSkippedDisabledRepos(t *testing.T) {
+	report := &checksBackfillReport{
+		Repos:           []string{"octo/a", "octo/b"},
+		SkippedDisabled: []string{"octo/off", "octo/quiet"},
+		CheckNames:      []string{"SchemaBot (production)"},
+		Scanned:         20,
+		DryRun:          true,
+		StuckAfter:      "1h",
+	}
+
+	var out strings.Builder
+	require.NoError(t, writeChecksBackfillReport(&out, report))
+
+	rendered := out.String()
+	assert.Contains(t, rendered, "Scanned 20 open PRs in octo/a, octo/b")
+	assert.Contains(t, rendered, "Skipped repositories with Check Runs disabled (enable_checks: false): octo/off, octo/quiet.")
+	assert.Contains(t, rendered, "No missing SchemaBot Check Runs found.")
+}
+
+// When every declared repository has Check Run publishing turned off, a fleet
+// sweep has nothing to scan; the report says so plainly instead of rendering
+// an empty scan headline.
+func TestWriteChecksBackfillReportAllReposDisabled(t *testing.T) {
+	report := &checksBackfillReport{
+		SkippedDisabled: []string{"octo/off", "octo/quiet"},
+		DryRun:          true,
+		StuckAfter:      "1h",
+	}
+
+	var out strings.Builder
+	require.NoError(t, writeChecksBackfillReport(&out, report))
+
+	rendered := out.String()
+	assert.Contains(t, rendered, "All 2 declared repositories have Check Runs disabled (enable_checks: false); nothing to scan: octo/off, octo/quiet.")
+	assert.NotContains(t, rendered, "Scanned")
+}
+
 // The pacing decision: pause only when the budget snapshot is below the floor
 // and a future reset exists to wait for. Missing snapshots, disabled pacing,
 // healthy budgets, and already-past resets all proceed without waiting.

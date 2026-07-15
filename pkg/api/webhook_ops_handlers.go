@@ -98,6 +98,11 @@ type ChecksSynthesizeResult = apitypes.ChecksSynthesizeResult
 // heavy plan work runs asynchronously, so a chunk only pays discovery.
 const checksSynthesizeMaxPRsPerRequest = 10
 
+// checksDisabledSkipOutcome is the per-PR outcome when a synthesize request
+// names a repository whose Check Run publishing is turned off. A skip, not an
+// error: a fleet sweep that includes a disabled repo should keep going.
+const checksDisabledSkipOutcome = "skipped: Check Runs are disabled for this repository (enable_checks: false)"
+
 func (s *Service) handleChecksSynthesize(w http.ResponseWriter, r *http.Request) {
 	var req ChecksSynthesizeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -132,11 +137,23 @@ func executeChecksSynthesize(ctx context.Context, cfg *ServerConfig, backfiller 
 			return nil, webhookOpsRequestErrorf("pr numbers must be positive; got %d", pr)
 		}
 	}
-	if backfiller == nil {
-		return nil, fmt.Errorf("check run backfill is unavailable: no GitHub webhook runtime is configured")
-	}
 	if logger == nil {
 		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	}
+	// Backfill exists to create Check Runs; on a repo with publishing turned
+	// off it could only replay auto-plans whose checks the publisher refuses,
+	// leaving plan comments as the sole side effect. Skip per PR rather than
+	// erroring so a fleet sweep that includes a disabled repo keeps going.
+	if !cfg.AreChecksEnabled(req.Repo) {
+		logger.Info("Check Run backfill skipping repository with checks disabled", "repo", req.Repo, "prs", len(req.PRs))
+		response := &ChecksSynthesizeResponse{Repo: req.Repo}
+		for _, pr := range req.PRs {
+			response.Results = append(response.Results, ChecksSynthesizeResult{PR: pr, Outcome: checksDisabledSkipOutcome})
+		}
+		return response, nil
+	}
+	if backfiller == nil {
+		return nil, fmt.Errorf("check run backfill is unavailable: no GitHub webhook runtime is configured")
 	}
 	installationClient, installationID, err := resolveRepoInstallationClient(ctx, cfg, req.Repo, logger)
 	if err != nil {
@@ -297,6 +314,14 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanReq
 	if logger == nil {
 		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	}
+	// With Check Run publishing turned off, every open PR would trivially be
+	// missing a check the server refuses to create — the scan result would be
+	// all noise. Report the repo as disabled instead of scanning, as a normal
+	// response rather than an error so a fleet sweep keeps going.
+	if !cfg.AreChecksEnabled(req.Repo) {
+		logger.Info("checks scan skipping repository with checks disabled", "repo", req.Repo)
+		return &ChecksScanResponse{Repo: req.Repo, ChecksDisabled: true}, nil
+	}
 	installationClient, _, err := resolveRepoInstallationClient(ctx, cfg, req.Repo, logger)
 	if err != nil {
 		return nil, err
@@ -319,9 +344,12 @@ func (s *Service) handleChecksRepos(w http.ResponseWriter, r *http.Request) {
 }
 
 // executeChecksRepos lists the repositories declared in the server's repos
-// config — the inventory a fleet-wide checks scan iterates. A legacy
-// single-App config declares no repos, so a fleet sweep cannot know what to
-// scan; the operator must name repositories explicitly there.
+// config — the inventory a fleet-wide checks scan iterates. Repositories with
+// Check Run publishing turned off are listed separately as disabled: a scan
+// of one would report every open PR as missing a check the server refuses to
+// create, so callers skip them and tell the operator. A legacy single-App
+// config declares no repos, so a fleet sweep cannot know what to scan; the
+// operator must name repositories explicitly there.
 func executeChecksRepos(cfg *ServerConfig) (*ChecksReposResponse, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
@@ -329,12 +357,17 @@ func executeChecksRepos(cfg *ServerConfig) (*ChecksReposResponse, error) {
 	if len(cfg.Repos) == 0 {
 		return nil, webhookOpsRequestErrorf("this server declares no repos config; name a repository explicitly instead of scanning all repos")
 	}
-	repos := make([]string, 0, len(cfg.Repos))
+	response := &ChecksReposResponse{Repos: make([]string, 0, len(cfg.Repos))}
 	for repo := range cfg.Repos {
-		repos = append(repos, repo)
+		if cfg.AreChecksEnabled(repo) {
+			response.Repos = append(response.Repos, repo)
+		} else {
+			response.Disabled = append(response.Disabled, repo)
+		}
 	}
-	sort.Strings(repos)
-	return &ChecksReposResponse{Repos: repos}, nil
+	sort.Strings(response.Repos)
+	sort.Strings(response.Disabled)
+	return response, nil
 }
 
 // resolveRepoInstallationClient builds an installation-scoped GitHub client
