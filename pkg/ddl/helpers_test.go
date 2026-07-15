@@ -91,7 +91,7 @@ func TestSplitStatements_Content(t *testing.T) {
 func TestSplitStatements_ParseErrorIncludesPreview(t *testing.T) {
 	_, err := SplitStatements("this is not valid SQL @@@")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "this is not valid SQL")
+	assert.Contains(t, err.Error(), `failed to parse SQL statements "this is not valid SQL @@@"`)
 }
 
 // TestClassifyStatement verifies the single-statement contract: each DDL type

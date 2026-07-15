@@ -32,11 +32,14 @@ func ClassifyStatement(stmt string) (statement.StatementType, string, error) {
 func statementPreview(stmt string) string {
 	const maxPreview = 80
 	s := strings.TrimSpace(stmt)
-	runes := []rune(s)
-	if len(runes) <= maxPreview {
-		return s
+	count := 0
+	for i := range s {
+		if count == maxPreview {
+			return s[:i] + "..."
+		}
+		count++
 	}
-	return string(runes[:maxPreview]) + "..."
+	return s
 }
 
 // ClassifyStatementOp is like ClassifyStatement but returns the operation as a
