@@ -3570,6 +3570,64 @@ ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 ```
 
 </details>
+
+</details>
+
+<details>
+<summary><a name="rollback-status-running"></a><strong>Rollback Status: Running</strong></summary>
+
+
+## Rollback Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
+
+**Schema `testapp`**
+
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 45%
+
+```sql
+ALTER TABLE `users` DROP INDEX `idx_email`;
+```
+Rows: 45,000 / 100,000
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="summary-rollback-complete"></a><strong>Summary: Rollback Complete</strong></summary>
+
+
+## ⏪ Rollback Complete — Staging
+
+**Database**: `testapp`
+
+
+> Rolled back successfully — the schema change has been reverted.
+
+<details><summary>Apply details (1 table)</summary>
+
+_Apply ID: `apply-a1b2c3d4e5f6`_
+
+
+**`users`**
+```sql
+ALTER TABLE `users` DROP INDEX `idx_email`;
+```
+
+</details>
 </details>
 
 ### CLI Output

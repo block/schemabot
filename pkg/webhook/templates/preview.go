@@ -1499,6 +1499,40 @@ func PreviewCommentSummaryCompleted() string {
 	return RenderApplySummaryComment(sampleSummaryData(state.Apply.Completed, tables))
 }
 
+// sampleRollbackTables returns reverse-DDL table rows for rollback previews.
+func sampleRollbackTables(status string) []TableProgressData {
+	return []TableProgressData{
+		{
+			Namespace: "testapp",
+			TableName: "users",
+			DDL:       "ALTER TABLE `users` DROP INDEX `idx_email`",
+			Status:    status,
+		},
+	}
+}
+
+// PreviewCommentRollbackStatus renders the in-place status comment for a
+// running rollback apply — the headline carries rollback vocabulary for the
+// apply's whole lifetime.
+func PreviewCommentRollbackStatus() string {
+	tables := sampleRollbackTables(state.Task.Running)
+	tables[0].RowsCopied = 45000
+	tables[0].RowsTotal = 100000
+	tables[0].PercentComplete = 45
+	data := sampleApplyData(state.Apply.Running, tables)
+	data.Rollback = true
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentRollbackSummaryCompleted renders the terminal summary for a
+// completed rollback apply — announced as a rollback, never as an applied
+// schema change.
+func PreviewCommentRollbackSummaryCompleted() string {
+	data := sampleSummaryData(state.Apply.Completed, sampleRollbackTables(state.Task.Completed))
+	data.Rollback = true
+	return RenderApplySummaryComment(data)
+}
+
 // PreviewCommentSummaryCompletedVitessDDLWithVSchema renders a completed Vitess
 // summary where the schema change included both table work and VSchema updates.
 func PreviewCommentSummaryCompletedVitessDDLWithVSchema() string {
