@@ -183,6 +183,7 @@ func (r *TargetRouter) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*te
 			r.logger.Info("apply target routing: no local plan; routing dispatch by request fields so the deployment-local client can materialize the plan",
 				"plan_id", req.PlanId,
 				"database", namespace,
+				"database_type", databaseType,
 				"environment", environment,
 				"target", target,
 			)
