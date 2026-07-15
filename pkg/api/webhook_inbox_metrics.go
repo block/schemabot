@@ -122,9 +122,11 @@ func (s *Service) CollectWebhookInboxMetrics(ctx context.Context) {
 			unknownCount += count
 		}
 	}
-	if unknownCount > 0 {
-		metrics.RecordWebhookInboxDepth(ctx, "unknown", unknownCount)
-	}
+	// Always record unknown, including 0, like the canonical states above:
+	// inbox_depth is a last-value gauge, so skipping the record when the count
+	// drops back to 0 would leave the gauge re-exporting its last nonzero value
+	// forever, showing a phantom unknown-state population that never resolves.
+	metrics.RecordWebhookInboxDepth(ctx, "unknown", unknownCount)
 	metrics.RecordWebhookInboxOldestClaimableAge(ctx, stats.OldestClaimableAge)
 	metrics.RecordWebhookInboxStuckProcessing(ctx, stats.StuckProcessing)
 

@@ -130,11 +130,73 @@ func TestCollectWebhookInboxMetricsRecordsGauges(t *testing.T) {
 		"failed_retryable": 2,
 		"completed":        10,
 		"failed":           4,
+		"unknown":          0,
 	}, depthByState)
 	assert.True(t, oldestFound)
 	assert.Equal(t, int64(90), oldestAge)
 	assert.True(t, stuckFound)
 	assert.Equal(t, int64(2), stuck)
+}
+
+// A non-canonical state row folds into the unknown depth series, and once it is
+// cleaned up the series must return to 0. inbox_depth is a last-value gauge, so
+// the collector records unknown on every pass (including 0); otherwise the
+// gauge would freeze at its last nonzero value and show a phantom unknown
+// population that never resolves.
+func TestCollectWebhookInboxMetricsUnknownReturnsToZeroAfterCleanup(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	store := &fakeWebhookEventStore{stats: &storage.WebhookInboxStats{
+		CountsByState: map[string]int64{
+			storage.WebhookEventPending: 1,
+			"bogus":                     5,
+		},
+	}}
+	svc := newInboxMetricsTestService(t, store)
+
+	svc.CollectWebhookInboxMetrics(t.Context())
+	require.Equal(t, int64(5), inboxDepthForState(t, reader, "unknown"),
+		"a non-canonical state row should fold into the unknown series")
+
+	// The bogus row is cleaned up; the next pass must drive unknown back to 0.
+	store.stats = &storage.WebhookInboxStats{
+		CountsByState: map[string]int64{storage.WebhookEventPending: 1},
+	}
+	svc.CollectWebhookInboxMetrics(t.Context())
+	require.Equal(t, int64(0), inboxDepthForState(t, reader, "unknown"),
+		"unknown must return to 0 once the non-canonical row is gone")
+}
+
+// inboxDepthForState collects the current metrics and returns the inbox_depth
+// gauge value for the given state, or -1 if no data point for that state exists.
+func inboxDepthForState(t *testing.T, reader sdkmetric.Reader, state string) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "schemabot.webhook.inbox_depth" {
+				continue
+			}
+			gauge, ok := m.Data.(metricdata.Gauge[int64])
+			require.True(t, ok)
+			for _, dp := range gauge.DataPoints {
+				v, ok := dp.Attributes.Value(attribute.Key("state"))
+				require.True(t, ok)
+				if v.AsString() == state {
+					return dp.Value
+				}
+			}
+		}
+	}
+	return -1
 }
 
 // A store failure must not emit the depth/backlog gauges: they are last-value
