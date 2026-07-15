@@ -259,7 +259,8 @@ func TestWebhookEventStore_CreateReopensStuckProcessingDelivery(t *testing.T) {
 
 	// A driver hard-killed on its final attempt leaves the row in processing
 	// with an expired lease at the attempts ceiling. FindNext never reclaims it,
-	// so an operator Redeliver is the only recovery lever.
+	// so absent the reconciler's periodic sweep an operator Redeliver is the
+	// only immediate recovery lever — which is the path this exercises.
 	_, err = testDB.ExecContext(ctx, `
 		UPDATE webhook_events
 		SET state = ?, attempts = ?, lease_owner = 'driver-a', lease_token = 'token-a',

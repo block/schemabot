@@ -105,7 +105,7 @@ func (s *webhookEventStore) reopenTerminalWebhookEvent(ctx context.Context, prov
 	`, storage.WebhookEventPending, payload, receivedAt, provider, deliveryID,
 		storage.WebhookEventFailed, storage.WebhookEventCompleted, storage.WebhookEventProcessing)
 	if err != nil {
-		return false, fmt.Errorf("reopen terminally failed webhook delivery (provider=%s, delivery_id=%s): %w", provider, deliveryID, err)
+		return false, fmt.Errorf("reopen webhook delivery for redelivery (provider=%s, delivery_id=%s): %w", provider, deliveryID, err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
