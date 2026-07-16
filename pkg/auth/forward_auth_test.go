@@ -330,17 +330,25 @@ func TestForwardAuth_GroupsFromRepeatedAndDelimitedHeaders(t *testing.T) {
 }
 
 func TestForwardAuth_SkipsInfraPaths(t *testing.T) {
-	// Health/metrics/webhook paths bypass the authorizer entirely.
+	// Health/webhook paths bypass the authorizer entirely.
 	handler, _ := newForwardAuth(t, auth.ForwardAuthConfig{
 		TrustedProxyCIDRs: []string{trustedCIDR},
 		WriteGroups:       []string{"owners"},
 	})
 
-	for _, path := range []string{"/livez", "/health", "/metrics", "/webhook"} {
+	for _, path := range []string{"/livez", "/health", "/webhook"} {
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, nil)
 		req.RemoteAddr = untrustedAddr // untrusted, but these paths skip auth
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		assert.Equalf(t, http.StatusOK, rec.Code, "path %s should bypass auth", path)
 	}
+
+	// /metrics is served on a dedicated listener outside the API handler, so it
+	// no longer bypasses the authorizer on the API port.
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	req.RemoteAddr = untrustedAddr
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusUnauthorized, rec.Code, "/metrics should not bypass auth")
 }
