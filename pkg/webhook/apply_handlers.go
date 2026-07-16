@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -277,17 +278,17 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	// any uncertainty downgrades rather than auto-applying against an
 	// unverified base.
 	if h.service.Config().RequiresUpToDateWithBase(repo) {
-		changed, changedFiles, driftErr := client.SchemaDirChangedOnBase(ctx, repo, prInfo.BaseSHA, prInfo.HeadSHA, schemaResult.SchemaPath)
+		changed, changedFiles, driftErr := client.SchemaDirChangedOnBase(ctx, repo, prInfo.BaseRef, prInfo.HeadSHA, schemaResult.SchemaPath)
 		switch {
 		case driftErr != nil:
 			h.logger.Warn("automatic apply downgraded: could not verify branch is current with base",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "schema_path", schemaResult.SchemaPath, "error", driftErr)
-			h.postAutoApplyDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, commentData, baseDriftUnknownDowngradeReason(prInfo.BaseRef))
+			h.postAutoApplyDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, commentData, "base_drift_unverified", baseDriftUnknownDowngradeReason(prInfo.BaseRef))
 			return
 		case changed:
 			h.logger.Info("automatic apply downgraded: schema directory changed on base branch",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "schema_path", schemaResult.SchemaPath, "base_ref", prInfo.BaseRef, "changed_file_count", len(changedFiles))
-			h.postAutoApplyDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, commentData, baseDriftDowngradeReason(prInfo.BaseRef, changedFiles))
+			h.postAutoApplyDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, commentData, "base_drift", baseDriftDowngradeReason(prInfo.BaseRef, changedFiles))
 			return
 		}
 	}
@@ -299,7 +300,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	if planErr != nil || storedPlan == nil {
 		h.logger.Info("automatic apply downgraded: could not load plan for DDL comparison",
 			"repo", repo, "pr", pr, "planID", planResp.PlanID, "error", planErr)
-		h.postAutoApplyDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, commentData, "Could not verify plan — confirm manually")
+		h.postAutoApplyDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, commentData, "plan_load_failed", "Could not verify plan — confirm manually")
 		return
 	}
 
@@ -317,15 +318,19 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 }
 
 // postAutoApplyDowngrade is the shared tail for automatic-apply downgrades that
-// happen before the apply is queued (base drift, plan-load failure). It posts
-// the manual-confirmation plan comment and records the apply plan check,
-// leaving the lock held so the operator can review and run apply-confirm.
+// happen before the apply is queued (base drift, plan-load failure). It records
+// the downgrade metric, posts the manual-confirmation plan comment, and records
+// the apply plan check, leaving the lock held so the operator can review and run
+// apply-confirm. metricReason is the low-cardinality label for the downgrade
+// counter (see metrics.RecordAutoApplyDowngrade); reason is the operator-facing
+// comment text.
 func (h *Handler) postAutoApplyDowngrade(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, installationID int64,
 	schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse,
-	environment string, commentData templates.PlanCommentData, reason string,
+	environment string, commentData templates.PlanCommentData, metricReason, reason string,
 ) {
+	metrics.RecordAutoApplyDowngrade(ctx, metricReason, environment)
 	commentData.AutoConfirmDowngradeReason = reason
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 	headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)

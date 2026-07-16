@@ -61,18 +61,22 @@ package webhook
 
 import (
 	"context"
+	"crypto/sha1"
 	"database/sql"
 	"embed"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -308,18 +312,30 @@ type planFlowResult struct {
 	CheckStatusNodes atomic.Pointer[func() []checkStatusNode]
 
 	// MergeBaseSHA drives the base-branch drift gate's compare response. Empty
-	// (the default) makes the merge base equal the compare base, so the gate
-	// sees no base advance and every existing automatic-apply test proceeds
-	// unchanged. A drift test sets it to a distinct SHA; because the shallow
-	// tree server salts directory tree SHAs with the commit SHA, a distinct
-	// merge base makes the schema subtree differ from the base and triggers the
-	// manual-confirm downgrade.
+	// (the default) makes the merge base equal the resolved base tip, so the
+	// gate sees no base advance and every existing automatic-apply test proceeds
+	// unchanged. A drift test sets it to a distinct SHA so the gate walks the
+	// schema subtree at the merge base and the base tip.
 	MergeBaseSHA string
+
+	// BaseTipSHA is the live base tip the compare returns as base_commit.sha —
+	// what the gate resolves the base ref to. Empty defaults to the compare's
+	// base path segment (the ref name), which equals the default merge base, so
+	// the gate short-circuits with no drift. A drift test sets a distinct value
+	// so the merge base and base tip differ.
+	BaseTipSHA string
 
 	// BaseDriftChangedFiles are the files a compare returns, so a drift test can
 	// assert the downgrade comment lists them. They should live under the
 	// resolved schema directory to survive the gate's path filter.
 	BaseDriftChangedFiles []string
+
+	// TreeContentByCommit overrides the schema files served for specific commits
+	// (typically the merge base). Commits absent from the map use the default
+	// schema files. Because tree SHAs are content-addressed, this is what lets a
+	// base-drift test make the schema subtree genuinely differ (drift) or stay
+	// identical (base advanced elsewhere) between the merge base and base tip.
+	TreeContentByCommit map[string]map[string]string
 }
 
 func (p *planFlowResult) nextHeadSHA() string {
@@ -377,48 +393,99 @@ type shallowChild struct {
 	sha  string // blob SHA (only meaningful for blobs)
 }
 
-// serveShallowTree serves a single-level (non-recursive) git tree for a GetTree
-// request, resolved from the flat recursive treeEntries. Directory tree SHAs are
-// encoded as "tree|<commit>|<dirPath>" so that (a) successive shallow fetches
-// can walk into subdirectories, and (b) the same directory reports a different
-// tree SHA at a different commit — which is what lets the base-branch drift gate
-// detect that the schema subtree changed between the merge base and the base.
-// The root fetch uses the commit SHA directly as the requested tree SHA.
-func serveShallowTree(w http.ResponseWriter, requestedSHA string, treeEntries []*gh.TreeEntry) {
-	commit, dir := parseShallowTreeSHA(requestedSHA)
-	var entries []*gh.TreeEntry
-	for _, c := range shallowChildren(treeEntries, dir) {
-		if c.typ == "tree" {
+// contentTreeSHA hashes a directory's immediate children (each child's name,
+// type, and child SHA) into a content-addressed tree SHA. Identical directory
+// contents therefore yield an identical SHA regardless of which commit they
+// appear in — the git property that lets the base-branch drift gate distinguish
+// "the schema subtree actually changed" (different content → different SHA) from
+// "the base advanced elsewhere" (same content → same SHA).
+func contentTreeSHA(children []*gh.TreeEntry) string {
+	var b strings.Builder
+	for _, c := range children {
+		fmt.Fprintf(&b, "%s\x00%s\x00%s\n", c.GetPath(), c.GetType(), c.GetSHA())
+	}
+	sum := sha1.Sum([]byte(b.String()))
+	return "tree:" + hex.EncodeToString(sum[:])
+}
+
+// buildContentTree walks the flat recursive treeEntries and returns the root
+// directory's immediate children (with content-addressed tree SHAs) plus an
+// index from every directory's content SHA to its children. The index lets a
+// per-level shallow fetch resolve a content SHA into its children without
+// knowing which commit produced it, since content SHAs are content-addressed.
+func buildContentTree(treeEntries []*gh.TreeEntry) (root []*gh.TreeEntry, index map[string][]*gh.TreeEntry) {
+	index = map[string][]*gh.TreeEntry{}
+	var walk func(dir string) []*gh.TreeEntry
+	walk = func(dir string) []*gh.TreeEntry {
+		var out []*gh.TreeEntry
+		for _, c := range shallowChildren(treeEntries, dir) {
+			if c.typ != "tree" {
+				out = append(out, &gh.TreeEntry{
+					Path: new(c.name),
+					Mode: new("100644"),
+					Type: new("blob"),
+					SHA:  new(c.sha),
+				})
+				continue
+			}
 			childDir := c.name
 			if dir != "" {
 				childDir = dir + "/" + c.name
 			}
-			entries = append(entries, &gh.TreeEntry{
+			childChildren := walk(childDir)
+			sha := contentTreeSHA(childChildren)
+			index[sha] = childChildren
+			out = append(out, &gh.TreeEntry{
 				Path: new(c.name),
 				Mode: new("040000"),
 				Type: new("tree"),
-				SHA:  new("tree|" + commit + "|" + childDir),
+				SHA:  new(sha),
 			})
-			continue
 		}
-		entries = append(entries, &gh.TreeEntry{
-			Path: new(c.name),
-			Mode: new("100644"),
-			Type: new("blob"),
-			SHA:  new(c.sha),
-		})
+		return out
 	}
-	_ = json.NewEncoder(w).Encode(gh.Tree{SHA: &requestedSHA, Entries: entries, Truncated: new(false)})
+	root = walk("")
+	return root, index
 }
 
-// parseShallowTreeSHA decodes a requested tree SHA into the commit it belongs to
-// and the directory path it represents. A synthetic directory SHA has the form
-// "tree|<commit>|<dir>"; any other value is a root commit SHA (empty dir).
-func parseShallowTreeSHA(requestedSHA string) (commit, dir string) {
-	if parts := strings.SplitN(requestedSHA, "|", 3); len(parts) == 3 && parts[0] == "tree" {
-		return parts[1], parts[2]
+// blobSHAForContent returns a content-addressed blob SHA so identical file
+// content yields an identical blob SHA (and therefore identical enclosing tree
+// SHAs) regardless of which commit it appears in.
+func blobSHAForContent(content string) string {
+	sum := sha1.Sum([]byte(content))
+	return "blob:" + hex.EncodeToString(sum[:])
+}
+
+// buildSchemaTreeEntries builds a flat recursive git tree listing (and its blob
+// content map) for schemaSQL under schema/<ns>/ plus an optional
+// schema/schemabot.yaml config. Names are emitted in sorted order so the listing
+// is deterministic across runs.
+func buildSchemaTreeEntries(schemaSQL map[string]string, schemabotConfig, ns string) ([]*gh.TreeEntry, map[string]string) {
+	var treeEntries []*gh.TreeEntry
+	blobContents := map[string]string{}
+	add := func(pth, content string) {
+		sha := blobSHAForContent(content)
+		blobContents[sha] = content
+		treeEntries = append(treeEntries, &gh.TreeEntry{
+			Path: new(pth),
+			Mode: new("100644"),
+			Type: new("blob"),
+			SHA:  new(sha),
+			Size: new(len(content)),
+		})
 	}
-	return requestedSHA, ""
+	if schemabotConfig != "" {
+		add("schema/schemabot.yaml", schemabotConfig)
+	}
+	names := make([]string, 0, len(schemaSQL))
+	for name := range schemaSQL {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		add("schema/"+ns+"/"+name, schemaSQL[name])
+	}
+	return treeEntries, blobContents
 }
 
 // shallowChildren returns the immediate children of dir (empty dir = root),
@@ -486,10 +553,13 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	})
 
 	// Compare commits — used by the base-branch drift gate to resolve the merge
-	// base of base...head. By default the merge base equals the compare base
-	// (result.MergeBaseSHA empty), so the gate concludes the base has not
-	// advanced and automatic apply proceeds. The changed-files list for a
-	// mergeBase...base compare is served for drift tests that set MergeBaseSHA.
+	// base of baseRef...head and the live base tip (base_commit.sha). By default
+	// the base tip equals the merge base (both default to the base path segment,
+	// i.e. the ref name), so the gate concludes the base has not advanced and
+	// automatic apply proceeds. A drift test sets MergeBaseSHA and BaseTipSHA to
+	// distinct values so the gate walks the schema subtree at each. The
+	// changed-files list for a mergeBase...baseTip compare is served for drift
+	// tests via BaseDriftChangedFiles.
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/{basehead}", func(w http.ResponseWriter, r *http.Request) {
 		basehead := r.PathValue("basehead")
 		parts := strings.SplitN(basehead, "...", 2)
@@ -497,12 +567,17 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		if len(parts) == 2 {
 			base = parts[0]
 		}
-		mergeBase := base
+		baseTip := base
+		if result.BaseTipSHA != "" {
+			baseTip = result.BaseTipSHA
+		}
+		mergeBase := baseTip
 		if result.MergeBaseSHA != "" {
 			mergeBase = result.MergeBaseSHA
 		}
 		cmp := gh.CommitsComparison{
 			MergeBaseCommit: &gh.RepositoryCommit{SHA: &mergeBase},
+			BaseCommit:      &gh.RepositoryCommit{SHA: &baseTip},
 		}
 		for _, f := range result.BaseDriftChangedFiles {
 			cmp.Files = append(cmp.Files, &gh.CommitFile{Filename: new(f), Status: new("modified")})
@@ -526,65 +601,56 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		_ = json.NewEncoder(w).Encode(files)
 	})
 
-	// Build tree entries for all schema files + schemabot.yaml config
-	var treeEntries []*gh.TreeEntry
-	blobIndex := 0
-	blobContents := make(map[string]string) // sha -> content
+	// Build the default flat tree listing + blob contents for the schema files
+	// and schemabot.yaml config. Blob SHAs are content-addressed so identical
+	// content yields identical tree SHAs across commits (see buildContentTree).
+	treeEntries, blobContents := buildSchemaTreeEntries(schemaSQL, schemabotConfig, ns)
 
-	// schemabot.yaml config
-	if schemabotConfig != "" {
-		configSHA := "configsha001"
-		blobContents[configSHA] = schemabotConfig
-		treeEntries = append(treeEntries, &gh.TreeEntry{
-			Path: new("schema/schemabot.yaml"),
-			Mode: new("100644"),
-			Type: new("blob"),
-			SHA:  new(configSHA),
-			Size: new(len(schemabotConfig)),
-		})
+	// treeEntriesForCommit returns the flat tree for a commit, honoring
+	// per-commit schema-content overrides. A base-drift test sets an override on
+	// the merge base so its schema subtree genuinely differs from the base tip;
+	// commits without an override serve the default tree.
+	treeEntriesForCommit := func(commit string) []*gh.TreeEntry {
+		if override, ok := result.TreeContentByCommit[commit]; ok {
+			entries, _ := buildSchemaTreeEntries(override, schemabotConfig, ns)
+			return entries
+		}
+		return treeEntries
 	}
 
-	for name, content := range schemaSQL {
-		sha := fmt.Sprintf("blobsha%03d", blobIndex)
-		blobIndex++
-		blobContents[sha] = content
-		treeEntries = append(treeEntries, &gh.TreeEntry{
-			Path: new("schema/" + ns + "/" + name),
-			Mode: new("100644"),
-			Type: new("blob"),
-			SHA:  new(sha),
-			Size: new(len(content)),
-		})
-	}
+	// Content-addressed directory index, populated as commit root trees are
+	// served. The base-drift gate always fetches a commit's root tree before
+	// walking into subdirectories, so a later per-level fetch of a content SHA
+	// resolves against entries indexed by the earlier root fetch.
+	var treeIndexMu sync.Mutex
+	treeIndex := map[string][]*gh.TreeEntry{}
 
-	// Git tree (recursive). The exact-SHA handler preserves the historical
-	// "abc123" behavior for tests that only exercise one head; the prefix
-	// fallback serves the same tree for any other SHA so tests that simulate
-	// HEAD advancing (e.g. the cross-delivery freshness checks) don't need a
-	// custom fixture per SHA. Go 1.22 ServeMux gives precedence to the more
-	// specific exact path, so existing tests are unaffected.
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.Tree{
-			SHA:       new("abc123"),
-			Entries:   treeEntries,
-			Truncated: new(false),
-		})
-	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, r *http.Request) {
 		sha := r.URL.Path[len("/repos/octocat/hello-world/git/trees/"):]
 		// Recursive fetches (schema discovery) get the flat whole-tree listing.
-		// Non-recursive fetches (the base-branch drift gate's per-level path
-		// resolution) get a faithful single-level tree so the gate can walk into
-		// the schema directory and compare its subtree SHA across commits.
 		if r.URL.Query().Get("recursive") == "1" {
 			_ = json.NewEncoder(w).Encode(gh.Tree{
 				SHA:       &sha,
-				Entries:   treeEntries,
+				Entries:   treeEntriesForCommit(sha),
 				Truncated: new(false),
 			})
 			return
 		}
-		serveShallowTree(w, sha, treeEntries)
+		// Non-recursive (the base-drift gate's per-level path resolution): a
+		// content-addressed subtree SHA resolves via the index; any other value
+		// is a commit whose root tree is built and indexed on demand.
+		treeIndexMu.Lock()
+		children, indexed := treeIndex[sha]
+		treeIndexMu.Unlock()
+		if indexed {
+			_ = json.NewEncoder(w).Encode(gh.Tree{SHA: &sha, Entries: children, Truncated: new(false)})
+			return
+		}
+		root, index := buildContentTree(treeEntriesForCommit(sha))
+		treeIndexMu.Lock()
+		maps.Copy(treeIndex, index)
+		treeIndexMu.Unlock()
+		_ = json.NewEncoder(w).Encode(gh.Tree{SHA: &sha, Entries: root, Truncated: new(false)})
 	})
 
 	// Blob content

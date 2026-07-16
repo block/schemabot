@@ -15,12 +15,19 @@ import (
 )
 
 // baseDriftFixture models the GitHub API responses SchemaDirChangedOnBase needs:
-// merge-base resolution (compare base...head), per-commit root trees (so a path
-// can be resolved to a tree SHA), and the compare file list used for the
+// merge-base resolution (compare baseRef...head), per-commit root trees (so a
+// path can be resolved to a tree SHA), and the compare file list used for the
 // operator-facing changed-file display.
 type baseDriftFixture struct {
-	// mergeBase is returned as merge_base_commit.sha for compare base...head.
+	// mergeBase is returned as merge_base_commit.sha for compare baseRef...head.
 	mergeBase string
+	// baseTip is returned as base_commit.sha for compare baseRef...head — the
+	// live tip of the base ref, which the gate uses as the base SHA. When empty
+	// it falls back to the compare's base path segment (the ref name).
+	baseTip string
+	// omitBaseCommit suppresses base_commit in the compare response so tests can
+	// exercise the "no base commit" fail-closed path.
+	omitBaseCommit bool
 	// rootTrees maps a commit SHA to the entries of its root tree.
 	rootTrees map[string][]driftEntry
 	// compareFiles maps a "base...head" key to the files that compare returns.
@@ -44,14 +51,25 @@ func newBaseDriftClient(t *testing.T, fx baseDriftFixture) *InstallationClient {
 		base, head := parts[0], parts[1]
 
 		cmp := &gh.CommitsComparison{}
-		// The merge-base query is always base...head where head is the PR head.
-		// For any compare we serve the recorded merge base and any recorded files.
+		// The merge-base query is always baseRef...head where head is the PR
+		// head. For any compare we serve the recorded merge base, the live base
+		// tip, and any recorded files.
 		if base == "" || head == "" {
 			http.Error(w, "bad compare", http.StatusBadRequest)
 			return
 		}
 		if fx.mergeBase != "" {
 			cmp.MergeBaseCommit = &gh.RepositoryCommit{SHA: new(fx.mergeBase)}
+		}
+		// base_commit.sha is the resolved live tip of the base ref. Default to
+		// the base path segment so callers that pass a concrete SHA see it
+		// echoed back; tests that model a moving base set baseTip explicitly.
+		if !fx.omitBaseCommit {
+			baseTip := fx.baseTip
+			if baseTip == "" {
+				baseTip = base
+			}
+			cmp.BaseCommit = &gh.RepositoryCommit{SHA: new(baseTip)}
 		}
 		if files, ok := fx.compareFiles[basehead]; ok {
 			cmp.Files = files
@@ -125,6 +143,41 @@ func TestSchemaDirChangedOnBase(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, changed, "only docs changed on base, not the schema dir")
 		assert.Empty(t, files)
+	})
+
+	t.Run("resolves the live base tip so a stale snapshot does not mask drift", func(t *testing.T) {
+		// GitHub's pull.base.sha snapshot for a fast-moving base is typically
+		// the base tip at PR creation, which equals the merge base — so passing
+		// it would short-circuit as "no drift". The gate passes the base ref and
+		// resolves the live tip from base_commit, catching drift the snapshot
+		// would hide. Here the merge base still has the old schema tree while the
+		// live base tip has a new one.
+		ic := newBaseDriftClient(t, baseDriftFixture{
+			mergeBase: "mergebase",
+			baseTip:   "livebasetip",
+			rootTrees: map[string][]driftEntry{
+				"mergebase":   {treeEntry("schemas", "schematree_old")},
+				"livebasetip": {treeEntry("schemas", "schematree_new")},
+			},
+			compareFiles: map[string][]*gh.CommitFile{
+				"mergebase...livebasetip": {
+					{Filename: new("schemas/orders.sql"), Status: new("modified")},
+				},
+			},
+		})
+		changed, files, err := ic.SchemaDirChangedOnBase(t.Context(), "octo/repo", "main", headSHA, "schemas")
+		require.NoError(t, err)
+		assert.True(t, changed, "drift on the live base tip must be detected")
+		assert.Equal(t, []string{"schemas/orders.sql"}, files)
+	})
+
+	t.Run("missing base commit is an error so callers fail closed", func(t *testing.T) {
+		// A compare response with a merge base but no base_commit leaves the live
+		// base tip unknown; the gate must fail closed rather than guess.
+		ic := newBaseDriftClient(t, baseDriftFixture{mergeBase: "mergebase", omitBaseCommit: true})
+		_, _, err := ic.SchemaDirChangedOnBase(t.Context(), "octo/repo", "main", headSHA, "schemas")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no base commit")
 	})
 
 	t.Run("schema dir changed on base lists changed files", func(t *testing.T) {

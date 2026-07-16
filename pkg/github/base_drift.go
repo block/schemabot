@@ -12,11 +12,20 @@ import (
 
 // SchemaDirChangedOnBase reports whether the resolved schema directory
 // schemaPath changed on the PR's base branch since the branch diverged. It
-// compares the git tree SHA of schemaPath at the merge base of baseSHA/headSHA
-// against its tree SHA at the current baseSHA — so a base branch that advanced
-// by thousands of commits without touching schemaPath reports no change, while
-// any change under schemaPath (including the directory being added or removed on
-// base) reports changed.
+// compares the git tree SHA of schemaPath at the merge base of baseRef/headSHA
+// against its tree SHA at the current tip of baseRef — so a base branch that
+// advanced by thousands of commits without touching schemaPath reports no
+// change, while any change under schemaPath (including the directory being added
+// or removed on base) reports changed.
+//
+// baseRef must be the base branch *ref name* (e.g. "main"), not a snapshot SHA.
+// The live base tip is resolved from the compare response's BaseCommit rather
+// than from the caller's snapshot: GitHub's pull.base.sha is not guaranteed to
+// track the live base tip and is typically the base tip at PR creation — which
+// for most PRs equals the merge base, so passing it would make the
+// mergeBase == base short-circuit fire (reporting "no drift") in exactly the
+// fast-moving-base scenario this guard exists for. Resolving the tip from the
+// ref keeps the comparison against the branch's current state.
 //
 // changed is the safety-relevant signal: callers downgrade automatic apply to
 // manual confirmation when it is true. changedFiles is a best-effort list of the
@@ -30,27 +39,34 @@ import (
 // types, and child object SHAs, so equal tree SHAs prove identical directory
 // snapshots. It does not follow schema-namespace symlinks whose targets live
 // outside schemaPath, nor does it detect a base branch repointing the
-// environment-root symlink itself; those are known gaps (see the feature's
-// limitations) where the guard behaves as if no base change occurred.
-func (ic *InstallationClient) SchemaDirChangedOnBase(ctx context.Context, repo, baseSHA, headSHA, schemaPath string) (changed bool, changedFiles []string, err error) {
+// environment-root symlink itself; those are known gaps where the guard behaves
+// as if no base change occurred.
+func (ic *InstallationClient) SchemaDirChangedOnBase(ctx context.Context, repo, baseRef, headSHA, schemaPath string) (changed bool, changedFiles []string, err error) {
 	owner, repoName := splitRepo(repo)
 
 	comparison, err := retryGitHubUnavailableRead(ctx, ic.logger, "compare for merge base",
-		[]any{"repo", repo, "base", baseSHA, "head", headSHA},
+		[]any{"repo", repo, "base", baseRef, "head", headSHA},
 		func(ctx context.Context) (*gh.CommitsComparison, error) {
-			cmp, _, cmpErr := ic.client.Repositories.CompareCommits(ctx, owner, repoName, baseSHA, headSHA, nil)
+			cmp, _, cmpErr := ic.client.Repositories.CompareCommits(ctx, owner, repoName, baseRef, headSHA, nil)
 			if cmpErr != nil {
-				return nil, fmt.Errorf("compare commits %s...%s: %w", baseSHA, headSHA, classifyGitHubAPIError(cmpErr))
+				return nil, fmt.Errorf("compare commits %s...%s: %w", baseRef, headSHA, classifyGitHubAPIError(cmpErr))
 			}
 			return cmp, nil
 		})
 	if err != nil {
-		return false, nil, fmt.Errorf("resolve merge base %s...%s in %s: %w", baseSHA, headSHA, repo, err)
+		return false, nil, fmt.Errorf("resolve merge base %s...%s in %s: %w", baseRef, headSHA, repo, err)
 	}
 	if comparison == nil || comparison.MergeBaseCommit == nil || comparison.MergeBaseCommit.GetSHA() == "" {
-		return false, nil, fmt.Errorf("resolve merge base %s...%s in %s: comparison returned no merge base", baseSHA, headSHA, repo)
+		return false, nil, fmt.Errorf("resolve merge base %s...%s in %s: comparison returned no merge base", baseRef, headSHA, repo)
 	}
 	mergeBase := comparison.MergeBaseCommit.GetSHA()
+
+	// Pin the live base tip from the compare response (the tip of baseRef at the
+	// time of this call), not the caller's snapshot SHA. Fail closed if absent.
+	if comparison.BaseCommit == nil || comparison.BaseCommit.GetSHA() == "" {
+		return false, nil, fmt.Errorf("resolve base tip %s...%s in %s: comparison returned no base commit", baseRef, headSHA, repo)
+	}
+	baseSHA := comparison.BaseCommit.GetSHA()
 
 	// The current base is already an ancestor of head: no base commits landed
 	// since the branch diverged, so the schema directory cannot have changed on

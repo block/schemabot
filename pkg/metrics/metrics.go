@@ -283,6 +283,34 @@ func RecordStalePlanRejected(ctx context.Context, environment string) {
 	)
 }
 
+// knownAutoApplyDowngradeReasons limits metric cardinality on the
+// schemabot.auto_apply.downgraded counter to the reasons an automatic apply is
+// downgraded to manual confirmation before it is queued.
+var knownAutoApplyDowngradeReasons = map[string]bool{
+	"base_drift":            true,
+	"base_drift_unverified": true,
+	"plan_load_failed":      true,
+}
+
+// RecordAutoApplyDowngrade increments the counter for automatic applies
+// downgraded to manual confirmation before the apply was queued. reason is
+// base_drift (the schema dir changed on base), base_drift_unverified (the
+// base-drift check could not be completed and failed closed), or
+// plan_load_failed (the stored plan could not be loaded for DDL comparison).
+// A spike in base_drift_unverified points at a GitHub API degradation
+// downgrading applies fleet-wide; base_drift tracks how often base advances
+// under reviewed plans; plan_load_failed points at storage trouble.
+func RecordAutoApplyDowngrade(ctx context.Context, reason, environment string) {
+	if !knownAutoApplyDowngradeReasons[reason] {
+		reason = "unknown"
+	}
+	addCounter(ctx, "schemabot.auto_apply.downgraded.total",
+		"Automatic applies downgraded to manual confirmation before being queued", "{downgrade}",
+		attribute.String("reason", reason),
+		EnvironmentAttribute(environment),
+	)
+}
+
 // RecordTransientPlanRetry increments the counter for webhook plan retries
 // after transient remote deployment unavailability. A spike with
 // outcome="exhausted" for one environment means the network path to that
