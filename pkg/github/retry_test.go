@@ -83,6 +83,7 @@ func TestGitHubReadRetryDelay(t *testing.T) {
 		{name: "delay doubles per attempt", attempt: 3, err: transient, want: 2 * time.Second},
 		{name: "fifth attempt reaches eight seconds", attempt: 5, err: transient, want: 8 * time.Second},
 		{name: "retry-after hint raises the wait", attempt: 1, err: &gh.AbuseRateLimitError{RetryAfter: &longHint}, want: 5 * time.Second},
+		{name: "retry-after hint survives error classification", attempt: 1, err: classifyGitHubAPIError(&gh.AbuseRateLimitError{RetryAfter: &longHint}), want: 5 * time.Second},
 		{name: "schedule wins over a shorter hint", attempt: 3, err: &gh.AbuseRateLimitError{RetryAfter: &shortHint}, want: 2 * time.Second},
 	}
 
