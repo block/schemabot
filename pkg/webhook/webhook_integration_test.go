@@ -305,6 +305,13 @@ type planFlowResult struct {
 	// before issuing the webhook request. Nil preserves the default
 	// "no checks → passing" behavior.
 	CheckStatusNodes atomic.Pointer[func() []checkStatusNode]
+
+	// MergeBaseSHA drives the base-branch drift gate's compare response. Empty
+	// (the default) makes the merge base equal the compare base, so the gate
+	// sees no base advance and every existing automatic-apply test proceeds
+	// unchanged. A drift test sets it to a distinct SHA (and provides differing
+	// schema-dir trees) to exercise the manual-confirm downgrade.
+	MergeBaseSHA string
 }
 
 func (p *planFlowResult) nextHeadSHA() string {
@@ -378,6 +385,27 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 				SHA: new("def456"),
 			},
 			User: &gh.User{Login: new("testuser")},
+		})
+	})
+
+	// Compare commits — used by the base-branch drift gate to resolve the merge
+	// base of base...head. By default the merge base equals the compare base
+	// (result.MergeBaseSHA empty), so the gate concludes the base has not
+	// advanced and automatic apply proceeds. The changed-files list for a
+	// mergeBase...base compare is served for drift tests that set MergeBaseSHA.
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/{basehead}", func(w http.ResponseWriter, r *http.Request) {
+		basehead := r.PathValue("basehead")
+		parts := strings.SplitN(basehead, "...", 2)
+		base := ""
+		if len(parts) == 2 {
+			base = parts[0]
+		}
+		mergeBase := base
+		if result.MergeBaseSHA != "" {
+			mergeBase = result.MergeBaseSHA
+		}
+		_ = json.NewEncoder(w).Encode(gh.CommitsComparison{
+			MergeBaseCommit: &gh.RepositoryCommit{SHA: &mergeBase},
 		})
 	})
 

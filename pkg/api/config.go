@@ -70,6 +70,13 @@ type ServerConfig struct {
 	// Repos holds per-repository configuration.
 	Repos map[string]RepoConfig `yaml:"repos"`
 
+	// RequireUpToDateWithBase controls whether automatic apply is downgraded to
+	// manual confirmation when the resolved schema directory changed on the PR's
+	// base branch since the branch diverged. It is the global default; a repo may
+	// override it via RepoConfig.RequireUpToDateWithBase. Nil defaults to true
+	// (guard enabled). Resolved via RequiresUpToDateWithBase.
+	RequireUpToDateWithBase *bool `yaml:"require_up_to_date_with_base,omitempty"`
+
 	// PRCommandAuthorization controls which GitHub users may run SchemaBot
 	// apply/apply-confirm PR comment commands. When disabled, existing OSS/local
 	// behavior is preserved.
@@ -715,6 +722,14 @@ type RepoConfig struct {
 	// this repository. Stored check state is still maintained for SchemaBot's
 	// own safety gates. Defaults to true when not configured.
 	EnableChecks *bool `yaml:"enable_checks,omitempty"`
+
+	// RequireUpToDateWithBase overrides ServerConfig.RequireUpToDateWithBase for
+	// this repository. Nil inherits the global setting (which itself defaults to
+	// true). Set it to false as an escape hatch for very high-churn repositories
+	// where the base branch changes the schema directory faster than a PR can
+	// stay current, and where operators accept auto-apply against a base that
+	// may have advanced. Resolved via RequiresUpToDateWithBase.
+	RequireUpToDateWithBase *bool `yaml:"require_up_to_date_with_base,omitempty"`
 
 	// GitHubApp names the App in ServerConfig.Apps that owns webhooks and
 	// outbound GitHub API calls for this repository. Required when Apps is
@@ -1663,6 +1678,24 @@ func (c *ServerConfig) AreChecksEnabled(repo string) bool {
 		return true
 	}
 	return *repoConfig.EnableChecks
+}
+
+// RequiresUpToDateWithBase reports whether automatic apply should be downgraded
+// to manual confirmation when the resolved schema directory changed on the PR's
+// base branch since the branch diverged. Precedence: a non-nil repo override
+// wins, else the non-nil global default, else true (guard enabled). A nil
+// receiver returns the safe default of true.
+func (c *ServerConfig) RequiresUpToDateWithBase(repo string) bool {
+	if c == nil {
+		return true
+	}
+	if repoConfig, ok := c.Repos[repo]; ok && repoConfig.RequireUpToDateWithBase != nil {
+		return *repoConfig.RequireUpToDateWithBase
+	}
+	if c.RequireUpToDateWithBase != nil {
+		return *c.RequireUpToDateWithBase
+	}
+	return true
 }
 
 // ResolvedGitHubApp identifies which configured GitHub App owns a repository.

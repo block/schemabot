@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -267,6 +268,30 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		return
 	}
 
+	// Base-branch drift gate: if the schema directory changed on the base
+	// branch since this PR diverged, the plan may no longer reflect the base
+	// it will apply against. Downgrade automatic apply to manual confirmation
+	// so the operator reviews it. The lock stays held so apply-confirm can
+	// proceed. apply-confirm (the deliberate override) does not run this gate.
+	// Repositories can disable it via RequireUpToDateWithBase. Fail closed:
+	// any uncertainty downgrades rather than auto-applying against an
+	// unverified base.
+	if h.service.Config().RequiresUpToDateWithBase(repo) {
+		changed, changedFiles, driftErr := client.SchemaDirChangedOnBase(ctx, repo, prInfo.BaseSHA, prInfo.HeadSHA, schemaResult.SchemaPath)
+		switch {
+		case driftErr != nil:
+			h.logger.Warn("automatic apply downgraded: could not verify branch is current with base",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "schema_path", schemaResult.SchemaPath, "error", driftErr)
+			h.postAutoApplyDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, commentData, baseDriftUnknownDowngradeReason(prInfo.BaseRef))
+			return
+		case changed:
+			h.logger.Info("automatic apply downgraded: schema directory changed on base branch",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "schema_path", schemaResult.SchemaPath, "base_ref", prInfo.BaseRef, "changed_file_count", len(changedFiles))
+			h.postAutoApplyDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, commentData, baseDriftDowngradeReason(prInfo.BaseRef, changedFiles))
+			return
+		}
+	}
+
 	// Look up the plan we just created for DDL comparison in executeApply.
 	// Fail closed: if we can't load the plan, downgrade to manual confirmation
 	// rather than skipping the DDL drift check entirely.
@@ -274,15 +299,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	if planErr != nil || storedPlan == nil {
 		h.logger.Info("automatic apply downgraded: could not load plan for DDL comparison",
 			"repo", repo, "pr", pr, "planID", planResp.PlanID, "error", planErr)
-		commentData.AutoConfirmDowngradeReason = "Could not verify plan — confirm manually"
-		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
-		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
-		if checkRunErr != nil {
-			h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
-		}
-		if headSHA != "" {
-			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
-		}
+		h.postAutoApplyDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, commentData, "Could not verify plan — confirm manually")
 		return
 	}
 
@@ -297,6 +314,27 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
 	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan)
+}
+
+// postAutoApplyDowngrade is the shared tail for automatic-apply downgrades that
+// happen before the apply is queued (base drift, plan-load failure). It posts
+// the manual-confirmation plan comment and records the apply plan check,
+// leaving the lock held so the operator can review and run apply-confirm.
+func (h *Handler) postAutoApplyDowngrade(
+	ctx context.Context, client *ghclient.InstallationClient,
+	repo string, pr int, installationID int64,
+	schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse,
+	environment string, commentData templates.PlanCommentData, reason string,
+) {
+	commentData.AutoConfirmDowngradeReason = reason
+	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+	headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
+	if checkErr != nil {
+		h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkErr)
+	}
+	if headSHA != "" {
+		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+	}
 }
 
 // handleApplyConfirmCommand handles the "schemabot apply-confirm -e <env>" PR comment command.

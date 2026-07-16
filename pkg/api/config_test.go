@@ -2378,6 +2378,63 @@ func TestServerConfig_AreChecksEnabled(t *testing.T) {
 	})
 }
 
+func TestServerConfig_RequiresUpToDateWithBase(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+
+	t.Run("nil config defaults to enabled", func(t *testing.T) {
+		var cfg *ServerConfig
+		assert.True(t, cfg.RequiresUpToDateWithBase("org/repo"))
+	})
+
+	t.Run("unset global and repo default to enabled", func(t *testing.T) {
+		cfg := ServerConfig{Repos: map[string]RepoConfig{"org/repo": {}}}
+		assert.True(t, cfg.RequiresUpToDateWithBase("org/repo"))
+	})
+
+	t.Run("global false applies to repos without override", func(t *testing.T) {
+		cfg := ServerConfig{
+			RequireUpToDateWithBase: boolPtr(false),
+			Repos:                   map[string]RepoConfig{"org/repo": {}},
+		}
+		assert.False(t, cfg.RequiresUpToDateWithBase("org/repo"))
+	})
+
+	t.Run("global false applies to unlisted repos", func(t *testing.T) {
+		cfg := ServerConfig{RequireUpToDateWithBase: boolPtr(false)}
+		assert.False(t, cfg.RequiresUpToDateWithBase("org/other-repo"))
+	})
+
+	t.Run("repo override wins over global", func(t *testing.T) {
+		cfg := ServerConfig{
+			RequireUpToDateWithBase: boolPtr(true),
+			Repos: map[string]RepoConfig{
+				"org/repo": {RequireUpToDateWithBase: boolPtr(false)},
+			},
+		}
+		assert.False(t, cfg.RequiresUpToDateWithBase("org/repo"))
+	})
+
+	t.Run("repo override enables when global disables", func(t *testing.T) {
+		cfg := ServerConfig{
+			RequireUpToDateWithBase: boolPtr(false),
+			Repos: map[string]RepoConfig{
+				"org/repo": {RequireUpToDateWithBase: boolPtr(true)},
+			},
+		}
+		assert.True(t, cfg.RequiresUpToDateWithBase("org/repo"))
+	})
+
+	t.Run("nil repo override inherits global", func(t *testing.T) {
+		cfg := ServerConfig{
+			RequireUpToDateWithBase: boolPtr(false),
+			Repos: map[string]RepoConfig{
+				"org/repo": {RequireUpToDateWithBase: nil},
+			},
+		}
+		assert.False(t, cfg.RequiresUpToDateWithBase("org/repo"))
+	})
+}
+
 func TestServerConfig_IsEnvironmentAllowed(t *testing.T) {
 	t.Run("nil allowed_environments allows all", func(t *testing.T) {
 		cfg := ServerConfig{AllowedEnvironments: nil}
