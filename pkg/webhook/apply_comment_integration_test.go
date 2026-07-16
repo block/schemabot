@@ -354,9 +354,10 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 
 // When a stopped apply resumes, the observer posts a fresh progress comment and
 // tracks that as the live one, rather than re-editing the comment frozen at
-// "Stopped". The prior progress comment is left in place as the record of where
-// the apply paused, the stopped summary marker is consumed, and later progress
-// edits land on the new comment.
+// "Stopped". The prior progress comment is folded into a collapsed details
+// block pointing at its successor — keeping the pre-stop record on the PR
+// without looking live — the stopped summary marker is consumed, and later
+// progress edits land on the new comment.
 func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	ctx := t.Context()
 
@@ -402,13 +403,27 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	}
 	assert.NotEqual(t, stoppedProgressID, newProgressID, "resume must post a new comment, not reuse the stopped one")
 
-	// The progress row now tracks the new comment; the stopped-summary marker is
-	// consumed by being superseded — the row and its GitHub comment are kept, not
-	// deleted.
+	// The prior comment is frozen into a collapsed details block pointing at
+	// its successor, with the pre-stop body preserved inside the fold.
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, stoppedProgressID, edited.CommentID, "the freeze edit lands on the superseded comment")
+		assert.Contains(t, edited.Body, "Schema change resumed")
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", newProgressID), "the frozen comment links to its successor")
+		assert.Contains(t, edited.Body, "<details>")
+		assert.Contains(t, edited.Body, "Stopped at 21%", "the pre-stop body is preserved inside the fold")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the superseded progress comment to be frozen")
+	}
+
+	// The progress row now tracks the new comment with no freeze left owing;
+	// the stopped-summary marker is consumed by being superseded — the row and
+	// its GitHub comment are kept, not deleted.
 	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
 	require.NoError(t, err)
 	require.NotNil(t, prog)
 	assert.Equal(t, newProgressID, prog.GitHubCommentID)
+	assert.Nil(t, prog.PendingFreezeCommentID)
 	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
 	require.NoError(t, err)
 	require.NotNil(t, summary, "the stopped-summary row is retired, not deleted")
@@ -431,6 +446,94 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("expected an in-place edit of the new progress comment on the next tick")
 	}
+}
+
+// Across repeated stop/start iterations, each resume folds the progress
+// comment it supersedes, so the PR timeline keeps exactly one live progress
+// comment. A resume rotation also reconciles a freeze that a prior drive owed
+// but never landed: the first tick after the second resume freezes both the
+// leftover comment and the one this resume supersedes, each pointing at its
+// successor. The owed fold uses the generic superseded rendering — the marker
+// records which comment is owed, not which rotation superseded it — while the
+// fold this resume performs itself carries the resume headline.
+func TestE2EResumeRotationFreezesAcrossIterations(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-rotate-iterations",
+		pr:         146,
+		database:   "e2e_rotate_iterations_db",
+		applyState: state.Apply.Resuming,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	// Seed the comments left by a first stop/start cycle whose drive died
+	// before its freeze edit landed: the first cycle's progress comment (still
+	// unfolded), the fresh comment that resume rotated to — now frozen at
+	// "Stopped" by a second stop — and the second stop's summary marker.
+	h.postAndTrackComment(ctx, "org/repo-rotate-iterations", 146, 12345, apply, state.Comment.Progress, "Stopped at 21%")
+	firstProgressID := requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-rotate-iterations", 146, 12345, apply, state.Comment.Progress, "Stopped at 63%")
+	secondProgressID := requireCommentCreate(t, capture)
+	require.NoError(t, st.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:                apply.ID,
+		CommentState:           state.Comment.Progress,
+		GitHubCommentID:        secondProgressID,
+		PendingFreezeCommentID: &firstProgressID,
+	}))
+	h.postAndTrackComment(ctx, "org/repo-rotate-iterations", 146, 12345, apply, state.Comment.Summary, "Schema Change Stopped")
+	requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The first tick after the second resume reconciles the owed freeze before
+	// rotating: the first cycle's comment folds pointing at the comment that
+	// superseded it.
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, firstProgressID, edited.CommentID, "the reconciled freeze lands on the first cycle's comment")
+		assert.Contains(t, edited.Body, "Progress comment superseded",
+			"the owed fold uses the generic rendering since the superseding rotation is not recorded")
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", secondProgressID), "the frozen comment links to its successor")
+		assert.Contains(t, edited.Body, "Stopped at 21%", "the superseded body is preserved inside the fold")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the owed freeze from the prior drive to be reconciled")
+	}
+
+	// The same tick rotates for the second resume: a fresh progress comment is
+	// posted and the second cycle's comment folds pointing at it.
+	var thirdProgressID int64
+	select {
+	case created := <-capture.creates:
+		thirdProgressID = created.ID
+		assert.Contains(t, created.Body, "Schema Change Status — Staging")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a new progress comment on the second resume")
+	}
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, secondProgressID, edited.CommentID, "the freeze edit lands on the second cycle's comment")
+		assert.Contains(t, edited.Body, "Schema change resumed")
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", thirdProgressID), "the frozen comment links to its successor")
+		assert.Contains(t, edited.Body, "Stopped at 63%", "the superseded body is preserved inside the fold")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the second cycle's progress comment to be frozen")
+	}
+
+	// The tracked row points at the live comment with no freeze left owing, and
+	// the stopped-summary marker is consumed.
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, thirdProgressID, prog.GitHubCommentID)
+	assert.Nil(t, prog.PendingFreezeCommentID)
+	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.NotNil(t, summary.SupersededAt, "the stopped-summary marker is superseded after rotation")
 }
 
 // requireCommentCreate returns the next captured comment-create id, failing if
@@ -854,7 +957,9 @@ func TestE2EVolumeRotationUntrackedFreshCommentAdoptedWhenStorageHeals(t *testin
 // landed leaves the pending-freeze marker on the tracked row. A later drive's
 // observer — with no in-memory state from the rotation — reconciles it on its
 // first volume check: the superseded comment is frozen pointing at its
-// successor and the marker is cleared, without posting anything new.
+// successor and the marker is cleared, without posting anything new. The fold
+// uses the generic superseded rendering — the marker records which comment is
+// owed, not which rotation superseded it.
 func TestE2EVolumeRotationReconcilesPendingFreezeFromPriorDrive(t *testing.T) {
 	ctx := t.Context()
 
@@ -896,7 +1001,8 @@ func TestE2EVolumeRotationReconcilesPendingFreezeFromPriorDrive(t *testing.T) {
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, supersededID, edited.CommentID, "the reconciled freeze lands on the superseded comment")
-		assert.Contains(t, edited.Body, "Volume changed to **5/11**")
+		assert.Contains(t, edited.Body, "Progress comment superseded",
+			"the owed fold uses the generic rendering since the superseding rotation is not recorded")
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", freshID), "the frozen comment links to its successor")
 		assert.Contains(t, edited.Body, "Copying at volume 3", "the superseded body is preserved inside the fold")
 	case created := <-capture.creates:

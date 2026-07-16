@@ -432,9 +432,28 @@ func newGitHubRateLimitTransport(base http.RoundTripper) http.RoundTripper {
 	)
 }
 
-const githubUnavailableReadRetryMaxAttempts = 3
+// GitHub read retries are deliberately generous: transient edge failures
+// (5xx, empty-body 400s, dropped connections, short rate-limit windows) can
+// last several seconds, and a failed read on a webhook path surfaces to the
+// user as a ❌ comment on the PR. The exponential schedule waits roughly
+// fifteen seconds end to end; the caller's context deadline still bounds the
+// total wait, so a short-deadline caller gives up sooner.
+const (
+	githubUnavailableReadRetryMaxAttempts = 6
+	githubUnavailableReadRetryMaxDelay    = 20 * time.Second
+)
 
-var githubUnavailableReadRetryDelay = 200 * time.Millisecond
+var githubUnavailableReadRetryDelay = 500 * time.Millisecond
+
+// SetUnavailableReadRetryDelayForTest shrinks the read-retry backoff base so
+// tests that simulate GitHub failures do not wait out the production
+// schedule. It returns a restore function; a test-binary init may discard it
+// to keep the override for the whole run.
+func SetUnavailableReadRetryDelayForTest(delay time.Duration) (restore func()) {
+	original := githubUnavailableReadRetryDelay
+	githubUnavailableReadRetryDelay = delay
+	return func() { githubUnavailableReadRetryDelay = original }
+}
 
 func retryGitHubUnavailableRead[T any](ctx context.Context, logger *slog.Logger, operation string, logAttrs []any, read func(context.Context) (T, error)) (T, error) {
 	var zero T
@@ -450,7 +469,7 @@ func retryGitHubUnavailableRead[T any](ctx context.Context, logger *slog.Logger,
 		if !IsUnavailableError(err) || attempt == githubUnavailableReadRetryMaxAttempts || ctx.Err() != nil {
 			return zero, err
 		}
-		delay := githubUnavailableReadRetryDelay * time.Duration(attempt)
+		delay := githubReadRetryDelay(attempt, err)
 		if logger != nil {
 			logger.Warn("retrying unavailable GitHub read",
 				append(logAttrs, "operation", operation, "attempt", attempt, "max_attempts", githubUnavailableReadRetryMaxAttempts, "delay", delay, "error", err)...)
@@ -464,6 +483,29 @@ func retryGitHubUnavailableRead[T any](ctx context.Context, logger *slog.Logger,
 		}
 	}
 	return zero, fmt.Errorf("retry GitHub read %s: exhausted attempts", operation)
+}
+
+// githubReadRetryDelay picks the wait before the next read attempt:
+// exponential backoff from the base delay, raised to any rate-limit
+// retry-after hint carried by the error, and capped so a long rate-limit
+// window cannot stall the caller far past what its context deadline would
+// allow anyway.
+func githubReadRetryDelay(attempt int, err error) time.Duration {
+	delay := githubUnavailableReadRetryDelay << (attempt - 1)
+	if hint, ok := githubRateLimitRetryAfter(err); ok && hint > delay {
+		delay = hint
+	}
+	return min(delay, githubUnavailableReadRetryMaxDelay)
+}
+
+// githubRateLimitRetryAfter extracts the Retry-After wait a GitHub
+// secondary rate limit carries, when present.
+func githubRateLimitRetryAfter(err error) (time.Duration, bool) {
+	var abuseErr *gh.AbuseRateLimitError
+	if errors.As(err, &abuseErr) && abuseErr.RetryAfter != nil {
+		return *abuseErr.RetryAfter, true
+	}
+	return 0, false
 }
 
 // AppSlug returns the GitHub App slug associated with this installation
@@ -522,11 +564,13 @@ func isGitHubUnavailable(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
+	if isGitHubSecondaryRateLimited(err) {
+		return true
+	}
 
 	var ghErr *gh.ErrorResponse
 	if errors.As(err, &ghErr) && ghErr.Response != nil {
-		status := ghErr.Response.StatusCode
-		return status >= http.StatusInternalServerError
+		return isTransientGitHubStatus(ghErr)
 	}
 
 	var netErr net.Error
@@ -535,6 +579,39 @@ func isGitHubUnavailable(err error) bool {
 	}
 	var opErr *net.OpError
 	return errors.As(err, &opErr)
+}
+
+// isGitHubSecondaryRateLimited reports whether the error is a GitHub
+// secondary (abuse) rate limit. Secondary limits clear within seconds, so
+// they count as availability failures; the retry delay honors the server's
+// Retry-After hint via githubRateLimitRetryAfter. A primary rate limit
+// (*gh.RateLimitError) is deliberately not retried here: it means the
+// installation's hourly budget is exhausted, the reset is typically far
+// beyond any read's context deadline, and callers with durable retry
+// (webhook deliveries) recover on their own schedule instead.
+func isGitHubSecondaryRateLimited(err error) bool {
+	var abuseErr *gh.AbuseRateLimitError
+	return errors.As(err, &abuseErr)
+}
+
+// isTransientGitHubStatus classifies an HTTP error status from the GitHub
+// API as an availability failure (worth retrying) or a semantic answer
+// about the request (not). 5xx and 429 are availability failures. A 400
+// whose body carries no error message or details is GitHub's edge
+// intermittently rejecting a valid read — a real client error always says
+// what was wrong with the request. 404 stays semantic: config discovery
+// depends on it meaning "this path does not exist".
+func isTransientGitHubStatus(ghErr *gh.ErrorResponse) bool {
+	switch status := ghErr.Response.StatusCode; {
+	case status >= http.StatusInternalServerError:
+		return true
+	case status == http.StatusTooManyRequests:
+		return true
+	case status == http.StatusBadRequest && ghErr.Message == "" && len(ghErr.Errors) == 0:
+		return true
+	default:
+		return false
+	}
 }
 
 // splitRepo splits "owner/repo" into owner and repo parts.
@@ -563,7 +640,13 @@ func (ic *InstallationClient) CreateIssueComment(ctx context.Context, repo strin
 // GetIssueComment returns the current body of an existing PR/issue comment.
 func (ic *InstallationClient) GetIssueComment(ctx context.Context, repo string, commentID int64) (string, error) {
 	owner, repoName := splitRepo(repo)
-	comment, _, err := ic.client.Issues.GetComment(ctx, owner, repoName, commentID)
+	comment, err := retryGitHubUnavailableRead(ctx, ic.logger, "get issue comment", []any{"repo", repo, "comment_id", commentID}, func(ctx context.Context) (*gh.IssueComment, error) {
+		c, _, callErr := ic.client.Issues.GetComment(ctx, owner, repoName, commentID)
+		if callErr != nil {
+			return nil, classifyGitHubAPIError(callErr)
+		}
+		return c, nil
+	})
 	if err != nil {
 		return "", fmt.Errorf("get issue comment %d: %w", commentID, err)
 	}
@@ -1077,7 +1160,15 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 	var untrustedApps []string
 	seenUntrusted := make(map[string]struct{})
 	for {
-		result, resp, err := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, headSHA, opts)
+		var resp *gh.Response
+		result, err := retryGitHubUnavailableRead(ctx, ic.logger, "list check runs by name", []any{"repo", repo, "head_sha", headSHA, "check_name", checkName}, func(ctx context.Context) (*gh.ListCheckRunsResults, error) {
+			res, listResp, listErr := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, headSHA, opts)
+			if listErr != nil {
+				return nil, classifyGitHubAPIError(listErr)
+			}
+			resp = listResp
+			return res, nil
+		})
 		if err != nil {
 			return nil, nil, fmt.Errorf("list check runs named %q on %s@%s: %w", checkName, repo, headSHA, err)
 		}
@@ -1284,7 +1375,15 @@ func (ic *InstallationClient) fetchCommitStatusRows(ctx context.Context, owner, 
 	opts := &gh.ListOptions{PerPage: 100}
 	var out []CheckStatusRow
 	for {
-		combined, resp, err := ic.client.Repositories.GetCombinedStatus(ctx, owner, repoName, ref, opts)
+		var resp *gh.Response
+		combined, err := retryGitHubUnavailableRead(ctx, ic.logger, "get combined commit status", []any{"repo", repo, "ref", ref}, func(ctx context.Context) (*gh.CombinedStatus, error) {
+			res, statusResp, statusErr := ic.client.Repositories.GetCombinedStatus(ctx, owner, repoName, ref, opts)
+			if statusErr != nil {
+				return nil, classifyGitHubAPIError(statusErr)
+			}
+			resp = statusResp
+			return res, nil
+		})
 		if err != nil {
 			return nil, fmt.Errorf("get combined commit status for %s@%s: %w", repo, ref, err)
 		}
@@ -1312,7 +1411,15 @@ func (ic *InstallationClient) fetchCheckRunRows(ctx context.Context, owner, repo
 	opts := &gh.ListCheckRunsOptions{Filter: &filter, ListOptions: gh.ListOptions{PerPage: 100}}
 	var out []CheckStatusRow
 	for {
-		result, resp, err := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, ref, opts)
+		var resp *gh.Response
+		result, err := retryGitHubUnavailableRead(ctx, ic.logger, "list check runs", []any{"repo", repo, "ref", ref}, func(ctx context.Context) (*gh.ListCheckRunsResults, error) {
+			res, listResp, listErr := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, ref, opts)
+			if listErr != nil {
+				return nil, classifyGitHubAPIError(listErr)
+			}
+			resp = listResp
+			return res, nil
+		})
 		if err != nil {
 			return nil, fmt.Errorf("list check runs for %s@%s: %w", repo, ref, err)
 		}

@@ -46,6 +46,9 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
             {{- if .Values.grpc.enabled }}
             - name: grpc
               containerPort: {{ .Values.grpc.port }}

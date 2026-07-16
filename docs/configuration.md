@@ -12,6 +12,7 @@
 - [Environment Order](#environment-order)
 - [Hybrid Mode](#hybrid-mode)
 - [Drivers](#drivers)
+- [Metrics](#metrics)
 - [Pending Drops](#pending-drops)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
@@ -276,6 +277,16 @@ Increase `drivers` when one SchemaBot server should make operator progress acros
 
 A driver claim means selecting one stale apply and refreshing its heartbeat in the same storage transaction. That heartbeat refresh is the driver's lease while it reloads state and drives the apply to a terminal state.
 
+## Metrics
+
+SchemaBot serves Prometheus metrics at `/metrics` on a dedicated HTTP listener, separate from the API port. A separate port lets scrapers reach metrics without traversing the API port's transport security — for example when a service mesh proxy terminates mutual TLS on the API port — and keeps the endpoint off any externally routed surface.
+
+```yaml
+metrics_port: 9102
+```
+
+The listener binds `:9102` by default; set `metrics_port` to move it. The API port (the `PORT` environment variable) does not serve `/metrics`.
+
 **Sizing:** each driver drives one claimed apply synchronously to a terminal state, and that includes waiting states such as deferred cutovers and revert windows, so a server's effective apply concurrency is `drivers × replicas`. Size that product to the number of applies you expect to be in flight at once, counting parked ones — a deferred cutover holds its driver for the full wait. A control plane that dispatches to remote servers bounds end-to-end concurrency with its own driver pool the same way.
 
 ## Pending Drops
@@ -499,7 +510,7 @@ By default (`auth.type: none` or unset) the SchemaBot API is unauthenticated —
 - **Read tier** — visibility: `status`, `progress`, `logs`, `locks` (list), history, database discovery, and `pull` (read a live schema).
 - **Write tier** — anything that stages or makes a change: `plan`, `apply`, controls (`stop`/`start`/`cutover`/`volume`/`revert`/`skip-revert`/`rollback`), `unlock`, and settings mutation. `plan` is a write because it stages a change against a database.
 
-Any unclassified `/api` route is treated as write (fail-closed). The `/webhook` and health/metrics endpoints are exempt — webhooks authenticate themselves via HMAC. Two authenticators are available.
+Any unclassified `/api` route is treated as write (fail-closed). The `/webhook` and health endpoints are exempt — webhooks authenticate themselves via HMAC. Prometheus metrics are served on a dedicated listener (see [Metrics](#metrics)), not on the API port. Two authenticators are available.
 
 ### OIDC (Bearer tokens)
 

@@ -108,6 +108,14 @@ type ServerConfig struct {
 	// SKIP LOCKED to prevent races. Defaults to DefaultDrivers.
 	Drivers int `yaml:"drivers"`
 
+	// MetricsPort is the TCP port of the dedicated HTTP listener serving
+	// Prometheus metrics at /metrics. Metrics are served on their own listener —
+	// not on the main API port — so scrapers can reach them without traversing
+	// the API port's transport security (for example a service mesh proxy
+	// terminating mutual TLS on the API port). Defaults to DefaultMetricsPort.
+	// Read via MetricsListenPort.
+	MetricsPort int `yaml:"metrics_port,omitempty"`
+
 	// OperatorClaimOperations switches drivers to claim work at the
 	// apply_operations (per-deployment) level via FindNextApplyOperation instead
 	// of the apply level via FindNextApply. While every apply still owns exactly
@@ -897,6 +905,9 @@ func (c *ServerConfig) Validate() error {
 
 	if err := validateUniqueNames("environment_order", c.EnvironmentOrder); err != nil {
 		return err
+	}
+	if c.MetricsPort < 0 || c.MetricsPort > 65535 {
+		return fmt.Errorf("metrics_port must be between 0 and 65535, got %d", c.MetricsPort)
 	}
 	if err := validateUniqueNames("required_checks", c.RequiredChecks); err != nil {
 		return err
@@ -1920,6 +1931,19 @@ func (c *ServerConfig) ShouldClaimOperations() bool {
 		return true
 	}
 	return *c.OperatorClaimOperations
+}
+
+// DefaultMetricsPort is the port of the dedicated Prometheus metrics listener
+// when metrics_port is not configured.
+const DefaultMetricsPort = 9102
+
+// MetricsListenPort returns the TCP port of the dedicated /metrics listener:
+// metrics_port when configured, DefaultMetricsPort otherwise.
+func (c *ServerConfig) MetricsListenPort() int {
+	if c == nil || c.MetricsPort == 0 {
+		return DefaultMetricsPort
+	}
+	return c.MetricsPort
 }
 
 // IsCheckRequired returns whether a PR check name is part of the configured
