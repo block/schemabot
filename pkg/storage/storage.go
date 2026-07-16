@@ -215,6 +215,12 @@ type WebhookEventStore interface {
 	// GetByDeliveryID returns a webhook event by provider + delivery GUID, or nil if not found.
 	GetByDeliveryID(ctx context.Context, provider, deliveryID string) (*WebhookEvent, error)
 
+	// HasEventForHead reports whether any delivery is recorded for the given
+	// provider + repository + pull request + head SHA, in any state. The
+	// reconciliation loop uses it to detect open PR heads whose webhook
+	// delivery never reached the inbox.
+	HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error)
+
 	// FindNext atomically claims one pending, retryable, or lease-expired event.
 	// The claim rotates lease_owner/lease_token, increments attempts, and sets a
 	// lease expiry in the same transaction. Retryable and lease-expired rows are
@@ -252,6 +258,18 @@ type WebhookEventStore interface {
 	// rows wedged in processing past the attempt cap with an expired lease. It
 	// is read-only and safe to call on a periodic cadence.
 	InboxStats(ctx context.Context) (*WebhookInboxStats, error)
+
+	// TerminateStuckProcessing marks as terminally failed every processing row
+	// whose lease has expired and whose attempts have reached
+	// MaxWebhookEventAttempts. Such a row is a driver that was hard-killed on
+	// its final attempt before recording a terminal state — FindNext never
+	// reclaims it (it stops reclaiming at the cap). GitHub Redeliver can already
+	// reopen an expired-lease processing row on demand (see
+	// reopenTerminalWebhookEvent), so this sweep is the automatic complement: it
+	// terminalizes rows nobody redelivered, emitting each as a durable failure
+	// (for metrics/alerting) and draining the stuck-processing gauge without
+	// operator action. Returns the number of rows terminated.
+	TerminateStuckProcessing(ctx context.Context, reason string) (int64, error)
 }
 
 // PlanStore manages schema change plans.

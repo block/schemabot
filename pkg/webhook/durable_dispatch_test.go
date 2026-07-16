@@ -67,6 +67,19 @@ func (s *recordingWebhookEventStore) GetByDeliveryID(_ context.Context, provider
 	return &copy, nil
 }
 
+func (s *recordingWebhookEventStore) HasEventForHead(_ context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, event := range s.events {
+		if event.Provider == provider && event.Repository == repository &&
+			event.PullRequest == pullRequest && event.HeadSHA == headSHA {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *recordingWebhookEventStore) FindNext(context.Context, string, time.Duration) (*storage.WebhookEvent, error) {
 	return nil, errors.New("FindNext not implemented by recordingWebhookEventStore")
 }
@@ -89,6 +102,33 @@ func (s *recordingWebhookEventStore) Release(context.Context, int64, string) err
 
 func (s *recordingWebhookEventStore) InboxStats(context.Context) (*storage.WebhookInboxStats, error) {
 	return nil, errors.New("InboxStats not implemented by recordingWebhookEventStore")
+}
+
+func (s *recordingWebhookEventStore) TerminateStuckProcessing(_ context.Context, reason string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	var terminated int64
+	for _, event := range s.events {
+		leaseExpired := event.LeaseExpiresAt != nil && !event.LeaseExpiresAt.After(now)
+		if event.State == storage.WebhookEventProcessing && leaseExpired &&
+			event.Attempts >= storage.MaxWebhookEventAttempts {
+			event.State = storage.WebhookEventFailed
+			event.LastError = reason
+			event.LeaseOwner = ""
+			event.LeaseToken = ""
+			event.LeaseExpiresAt = nil
+			event.RetryAfter = nil
+			// Mirror the real SQL's completed_at = COALESCE(completed_at, NOW()).
+			if event.CompletedAt == nil {
+				completedAt := now
+				event.CompletedAt = &completedAt
+			}
+			terminated++
+		}
+	}
+	return terminated, nil
 }
 
 func TestDurablePullRequestWebhookQueuesAndAcks(t *testing.T) {

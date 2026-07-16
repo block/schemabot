@@ -151,6 +151,29 @@ func webhookClaimableArgs() []any {
 	}
 }
 
+func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error) {
+	if provider == "" {
+		provider = storage.WebhookProviderGitHub
+	}
+	if repository == "" || pullRequest == 0 || headSHA == "" {
+		return false, fmt.Errorf("repository, pull request, and head SHA are required")
+	}
+	var one int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT 1
+		FROM webhook_events
+		WHERE provider = ? AND repository = ? AND pull_request = ? AND head_sha = ?
+		LIMIT 1
+	`, provider, repository, pullRequest, headSHA).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDuration time.Duration) (*storage.WebhookEvent, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("webhook driver owner is required")
@@ -301,6 +324,36 @@ func (s *webhookEventStore) Release(ctx context.Context, id int64, leaseToken st
 		return fmt.Errorf("release webhook event %d: %w", id, err)
 	}
 	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
+}
+
+// TerminateStuckProcessing marks failed every processing row whose lease has
+// expired and whose attempts have reached the cap. FindNext stops reclaiming a
+// processing row once attempts == MaxWebhookEventAttempts, so a driver
+// hard-killed on its final attempt leaves the row stuck in processing until it
+// is either terminalized here or reopened by a GitHub Redeliver (see
+// reopenTerminalWebhookEvent). This sweep is the automatic complement to
+// redelivery: it clears the lease (preserving completed_at) and emits the row
+// as a durable failure so it surfaces in metrics/alerting and drains the
+// stuck-processing gauge without operator action. Unlike MarkFailed it is
+// lease-token-agnostic: the owning driver is gone, so there is no token to
+// present. Returns the number of rows terminated.
+func (s *webhookEventStore) TerminateStuckProcessing(ctx context.Context, reason string) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, last_error = ?, completed_at = COALESCE(completed_at, NOW()),
+			lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+			retry_after = NULL, updated_at = NOW()
+		WHERE state = ? AND lease_expires_at <= NOW(6) AND attempts >= ?
+	`, storage.WebhookEventFailed, nullString(reason),
+		storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts)
+	if err != nil {
+		return 0, fmt.Errorf("terminate stuck processing webhook events: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read terminate stuck processing rows affected: %w", err)
+	}
+	return rows, nil
 }
 
 func scanWebhookEvent(row *sql.Row) (*storage.WebhookEvent, error) {

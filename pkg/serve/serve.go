@@ -679,7 +679,8 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		ghclient.WithConfigDirHints(serverConfig))
 	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger,
 		webhook.WithRepoWebhookSecret([]byte(repoWebhookSecret)),
-		webhook.WithDurableWebhookDispatch())
+		webhook.WithDurableWebhookDispatch(),
+		webhook.WithWebhookReconciler())
 	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub webhook endpoint registered",
 		"app_id", appID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs,
@@ -757,6 +758,7 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 		appByID,
 		logger,
 		webhook.WithDurableWebhookDispatch(),
+		webhook.WithWebhookReconciler(),
 	)
 	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub multi-App webhook endpoint registered", "apps", len(serverConfig.Apps))

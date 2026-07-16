@@ -57,6 +57,14 @@ func (f *fakeWebhookEventStore) Release(context.Context, int64, string) error {
 	return errors.New("unused")
 }
 
+func (f *fakeWebhookEventStore) HasEventForHead(context.Context, string, string, int, string) (bool, error) {
+	return false, errors.New("unused")
+}
+
+func (f *fakeWebhookEventStore) TerminateStuckProcessing(context.Context, string) (int64, error) {
+	return 0, errors.New("unused")
+}
+
 func newInboxMetricsTestService(t *testing.T, store storage.WebhookEventStore) *Service {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
