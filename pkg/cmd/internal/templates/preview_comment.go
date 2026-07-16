@@ -79,6 +79,7 @@ func previewCommentAllOutput() {
 		{"VOLUME COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted()) }},
 		{"VOLUME COMMAND INVALID LEVEL", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel()) }},
 		{"VOLUME CHANGED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeSupersededProgress()) }},
+		{"RESUMED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentResumeSupersededProgress()) }},
 		{"SUMMARY: COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompleted()) }},
 		{"SUMMARY: FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailed()) }},
 		{"SUMMARY: STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryStopped()) }},
@@ -132,6 +133,7 @@ func previewApplyCommandAllOutput() {
 		{"VOLUME COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted()) }},
 		{"VOLUME COMMAND INVALID LEVEL", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel()) }},
 		{"VOLUME CHANGED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeSupersededProgress()) }},
+		{"RESUMED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentResumeSupersededProgress()) }},
 		{"CHECKS GATE: NOT PASSING", func() {
 			fmt.Print(webhooktemplates.RenderApplyBlockedByNonPassingChecks("staging", []webhooktemplates.BlockingCheck{
 				{Name: "CI / unit-tests", State: "failure"},
@@ -267,6 +269,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"VOLUME COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted()) }},
 		{"VOLUME COMMAND INVALID LEVEL", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel()) }},
 		{"VOLUME CHANGED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeSupersededProgress()) }},
+		{"RESUMED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentResumeSupersededProgress()) }},
 		// Summaries
 		{"SUMMARY: COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompleted()) }},
 		{"SUMMARY: FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailed()) }},

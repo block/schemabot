@@ -210,6 +210,41 @@ func TestRenderVolumeSupersededProgressComment(t *testing.T) {
 		"the superseded body is preserved inside the fold")
 }
 
+// TestRenderResumeSupersededProgressComment verifies the frozen body written
+// over an old progress comment after a resume: it links the successor comment
+// and folds the final pre-stop progress into a details block so the record
+// stays on the PR without looking live.
+func TestRenderResumeSupersededProgressComment(t *testing.T) {
+	rendered := RenderResumeSupersededProgressComment(ResumeSupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: "## Schema Change Progress\n\nStopped at 21%",
+	})
+	assert.Contains(t, rendered, "Schema change resumed")
+	assert.Contains(t, rendered, "https://github.com/acme/testapp/pull/42#issuecomment-2222222222")
+	assert.Contains(t, rendered, "<details>")
+	assert.Contains(t, rendered, "<summary>Progress before the stop</summary>")
+	assert.Contains(t, rendered, "Stopped at 21%",
+		"the superseded body is preserved inside the fold")
+}
+
+// TestIsSupersededProgressComment verifies the frozen-body predicate accepts
+// both frozen flavors — so a freeze retry never folds a frozen body inside a
+// second fold — and rejects a live progress body.
+func TestIsSupersededProgressComment(t *testing.T) {
+	volume := RenderVolumeSupersededProgressComment(VolumeSupersededProgressData{
+		Volume: 8, Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
+	})
+	resume := RenderResumeSupersededProgressComment(ResumeSupersededProgressData{
+		Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
+	})
+	assert.True(t, IsSupersededProgressComment(volume), "a volume-frozen body is recognized as frozen")
+	assert.True(t, IsSupersededProgressComment(resume), "a resume-frozen body is recognized as frozen")
+	assert.False(t, IsSupersededProgressComment("## Schema Change Status — Staging"),
+		"a live progress body is not frozen")
+}
+
 func TestRenderRevertCommandAccepted(t *testing.T) {
 	rendered := RenderRevertCommandAccepted(RevertCommandAcceptedData{
 		ApplyID:     "apply-957642f96d634694",
