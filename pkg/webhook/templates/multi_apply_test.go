@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/block/schemabot/pkg/presentation"
@@ -311,6 +312,77 @@ func TestRenderMultiDeploymentApplySummaryComment_CompletedReusesSummaryRenderer
 	assert.Contains(t, out, "Applied successfully — your schema change is live!")
 	assert.Contains(t, out, "**Database**: `payments_eu`")
 	assert.Contains(t, out, "**Database**: `payments_us`")
+}
+
+// The comment's headline appears once, on the aggregate header: each
+// deployment's <details> body drops the headline the single-deployment renderer
+// would write, since the <summary> line already names the deployment and
+// repeating the title in every expanded section is noise. The rest of the body
+// (database, tables) is untouched.
+func TestRenderMultiDeploymentApplyComment_DetailsOmitDuplicateHeadline(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu", so.Completed),
+		rollingOp("us", so.Running),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: map[string]ApplyStatusCommentData{
+			"eu": {
+				Database:    "payments_eu",
+				Environment: "production",
+				State:       state.Apply.Completed,
+				Tables:      []TableProgressData{{TableName: "orders", Status: state.Task.Completed}},
+			},
+			"us": {
+				Database:    "payments_us",
+				Environment: "production",
+				State:       state.Apply.Running,
+				Tables:      []TableProgressData{{TableName: "orders", Status: state.Task.Running}},
+			},
+		},
+	})
+
+	assert.Equal(t, 1, strings.Count(out, "## Schema Change Status"),
+		"the headline must appear once, on the aggregate header, not inside each deployment's section")
+	assert.True(t, strings.HasPrefix(out, "## Schema Change Status — Production"))
+	// The section bodies keep their per-deployment content.
+	assert.Contains(t, out, "**Database**: `payments_eu`")
+	assert.Contains(t, out, "**Database**: `payments_us`")
+}
+
+// The terminal summary comment deduplicates the same way: the state-specific
+// headline appears once on the aggregate header, not inside each deployment's
+// expanded terminal summary.
+func TestRenderMultiDeploymentApplySummaryComment_DetailsOmitDuplicateHeadline(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu", so.Completed),
+		rollingOp("us", so.Completed),
+	})
+	out := RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: map[string]ApplyStatusCommentData{
+			"eu": {
+				Database:    "payments_eu",
+				Environment: "production",
+				State:       state.Apply.Completed,
+				Tables:      []TableProgressData{{TableName: "orders", Status: state.Task.Completed}},
+			},
+			"us": {
+				Database:    "payments_us",
+				Environment: "production",
+				State:       state.Apply.Completed,
+				Tables:      []TableProgressData{{TableName: "orders", Status: state.Task.Completed}},
+			},
+		},
+	})
+
+	assert.Equal(t, 1, strings.Count(out, "## ✅ Schema Change Applied"),
+		"the terminal headline must appear once, on the aggregate header, not inside each deployment's section")
+	assert.Contains(t, out, "Applied successfully — your schema change is live!")
 }
 
 // A failed multi-deployment summary keeps the aggregate failed header and routes

@@ -226,7 +226,9 @@ func writeDeploymentSummarySections(sb *strings.Builder, data MultiDeploymentApp
 // and problematic deployments default open; completed and queued ones default
 // collapsed (the model's Open flag). The per-deployment body keeps today's
 // single-deployment fidelity — per-table progress, errors, and DDL — scoped to
-// one deployment.
+// one deployment, minus the single-deployment headline: the aggregate header
+// already carries the title and the <summary> line names the deployment, so
+// repeating the headline inside every section is noise.
 func writeDeploymentDetailSections(sb *strings.Builder, data MultiDeploymentApplyData, renderDetail func(ApplyStatusCommentData) string) {
 	for _, d := range data.Model.Deployments {
 		openAttr := ""
@@ -235,12 +237,28 @@ func writeDeploymentDetailSections(sb *strings.Builder, data MultiDeploymentAppl
 		}
 		fmt.Fprintf(sb, "\n<details%s>\n<summary>%s — %s</summary>\n\n", openAttr, deploymentTag(d), html.EscapeString(d.Label))
 		if detail, ok := data.Details[d.Deployment]; ok {
-			sb.WriteString(renderDetail(detail))
+			sb.WriteString(stripLeadingHeading(renderDetail(detail)))
 		} else {
 			sb.WriteString("_No details available yet._\n")
 		}
 		sb.WriteString("\n</details>\n")
 	}
+}
+
+// stripLeadingHeading removes the headline a single-deployment renderer writes
+// as its first line ("## <title>[ — <env>]") plus the blank lines that follow
+// it, so a body embedded in a per-deployment <details> section does not repeat
+// the aggregate comment's header. A body that does not start with a heading is
+// returned unchanged.
+func stripLeadingHeading(body string) string {
+	if !strings.HasPrefix(body, "## ") {
+		return body
+	}
+	_, rest, found := strings.Cut(body, "\n")
+	if !found {
+		return ""
+	}
+	return strings.TrimLeft(rest, "\n")
 }
 
 // deploymentTag renders the "<emoji> <deployment>" prefix, omitting the leading

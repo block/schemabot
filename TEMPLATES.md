@@ -5760,8 +5760,6 @@ schemabot cutover apply-a1b2c3d4e5f6 -e production
 <details open>
 <summary>🟢 eu — ready for cutover — next in order</summary>
 
-## Schema Change Status — Production
-
 **Database**: `payments_eu` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
@@ -5804,8 +5802,6 @@ schemabot cutover apply-a1b2c3d4e5f6 -e production
 
 <details open>
 <summary>🔄 us — running table copy</summary>
-
-## Schema Change Status — Production
 
 **Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -5893,8 +5889,6 @@ schemabot apply -e production
 <details>
 <summary>✅ eu — completed</summary>
 
-## Schema Change Status — Production
-
 **Database**: `payments_eu` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
@@ -5928,8 +5922,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 <details open>
 <summary>❌ us — failed</summary>
-
-## Schema Change Status — Production
 
 **Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -6006,8 +5998,6 @@ _No details available yet._
 <details>
 <summary>✅ eu — completed</summary>
 
-## Schema Change Status — Production
-
 **Database**: `payments_eu` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
@@ -6042,8 +6032,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <details>
 <summary>✅ us — completed</summary>
 
-## Schema Change Status — Production
-
 **Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
@@ -6077,8 +6065,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 <details>
 <summary>✅ au — completed</summary>
-
-## Schema Change Status — Production
 
 **Database**: `payments_au` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -6132,8 +6118,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <details>
 <summary>✅ eu — completed</summary>
 
-## ✅ Schema Change Applied — Production
-
 **Database**: `payments_eu`
 
 
@@ -6168,8 +6152,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <details>
 <summary>✅ us — completed</summary>
 
-## ✅ Schema Change Applied — Production
-
 **Database**: `payments_us`
 
 
@@ -6203,8 +6185,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 <details>
 <summary>✅ au — completed</summary>
-
-## ✅ Schema Change Applied — Production
 
 **Database**: `payments_au`
 
@@ -6268,8 +6248,6 @@ schemabot apply -e production
 <details>
 <summary>✅ eu — completed</summary>
 
-## ✅ Schema Change Applied — Production
-
 **Database**: `payments_eu`
 
 
@@ -6303,8 +6281,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 <details open>
 <summary>❌ us — failed</summary>
-
-## ❌ Schema Change Failed — Production
 
 **Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
