@@ -1464,6 +1464,25 @@ func PreviewCommentResumeSupersededProgress() string {
 	})
 }
 
+// PreviewCommentSupersededProgress renders an old progress comment after a
+// freeze retry folded it without knowing which rotation superseded it: the
+// final progress collapses into a details block under a pointer to the fresh
+// comment now tracking the apply.
+func PreviewCommentSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.Stopped
+	table.RowsCopied = 2300000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 32
+	data := sampleSingleApplyData(state.Apply.Stopped, table)
+	return RenderSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
 // PreviewCommentApplySingleCompleted renders a single-table apply completed.
 func PreviewCommentApplySingleCompleted() string {
 	table := sampleSingleTable()

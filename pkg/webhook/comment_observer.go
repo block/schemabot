@@ -674,7 +674,7 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 			// frozen rendering — the freeze edit failed or the pod died before it
 			// landed. Retry it now; on success the marker is cleared.
 			o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
-				supersededByResume, 0)
+				supersededByPriorRotation, 0)
 		}
 		pendingFreeze = &tracked.GitHubCommentID
 	}
@@ -714,14 +714,26 @@ type supersededProgressReason int
 const (
 	supersededByVolumeChange supersededProgressReason = iota
 	supersededByResume
+	// supersededByPriorRotation is the retry reason: the pending-freeze marker
+	// records which comment is owed a fold but not which rotation superseded
+	// it, so a retry renders the generic fold instead of guessing a headline.
+	supersededByPriorRotation
 )
 
 // frozenSupersededProgressBody renders the folded body written over a
 // superseded progress comment, headlined by the reason it was rotated away
 // from. volume is read only for the volume-change rendering.
 func (o *CommentObserver) frozenSupersededProgressBody(reason supersededProgressReason, volume int, newCommentID int64, previousBody string) string {
-	if reason == supersededByResume {
+	switch reason {
+	case supersededByResume:
 		return templates.RenderResumeSupersededProgressComment(templates.ResumeSupersededProgressData{
+			Repo:         o.repo,
+			PR:           o.pr,
+			NewCommentID: newCommentID,
+			PreviousBody: previousBody,
+		})
+	case supersededByPriorRotation:
+		return templates.RenderSupersededProgressComment(templates.SupersededProgressData{
 			Repo:         o.repo,
 			PR:           o.pr,
 			NewCommentID: newCommentID,
@@ -816,7 +828,7 @@ func (o *CommentObserver) rotateProgressCommentForVolumeChange(apply *storage.Ap
 		// frozen rendering — the freeze edit failed or the pod died before it
 		// landed. Retry it now; on success the marker is cleared.
 		o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
-			supersededByVolumeChange, *tracked.PostedVolume)
+			supersededByPriorRotation, 0)
 	}
 	o.trackedPostedVolume = *tracked.PostedVolume
 	o.trackedPostedVolumeKnown = true
@@ -914,9 +926,10 @@ func (o *CommentObserver) freezeSupersededProgressComment(apply *storage.Apply, 
 			"error", err, "github_comment_id", oldCommentID)
 		return
 	}
+	// A retry after a failed marker clear finds the frozen body already on
+	// GitHub; re-rendering it would fold the frozen body inside another fold,
+	// so only a still-live body is edited.
 	if !templates.IsSupersededProgressComment(oldBody) {
-		// A retry after a failed marker clear sees the frozen body already on
-		// GitHub; re-rendering would fold the frozen body inside another fold.
 		if !o.leaseStillOwnsObserver(apply, "freeze superseded progress comment") {
 			return
 		}

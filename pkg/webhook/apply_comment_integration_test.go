@@ -453,7 +453,9 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 // comment. A resume rotation also reconciles a freeze that a prior drive owed
 // but never landed: the first tick after the second resume freezes both the
 // leftover comment and the one this resume supersedes, each pointing at its
-// successor.
+// successor. The owed fold uses the generic superseded rendering — the marker
+// records which comment is owed, not which rotation superseded it — while the
+// fold this resume performs itself carries the resume headline.
 func TestE2EResumeRotationFreezesAcrossIterations(t *testing.T) {
 	ctx := t.Context()
 
@@ -493,7 +495,8 @@ func TestE2EResumeRotationFreezesAcrossIterations(t *testing.T) {
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, firstProgressID, edited.CommentID, "the reconciled freeze lands on the first cycle's comment")
-		assert.Contains(t, edited.Body, "Schema change resumed")
+		assert.Contains(t, edited.Body, "Progress comment superseded",
+			"the owed fold uses the generic rendering since the superseding rotation is not recorded")
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", secondProgressID), "the frozen comment links to its successor")
 		assert.Contains(t, edited.Body, "Stopped at 21%", "the superseded body is preserved inside the fold")
 	case <-time.After(5 * time.Second):
@@ -954,7 +957,9 @@ func TestE2EVolumeRotationUntrackedFreshCommentAdoptedWhenStorageHeals(t *testin
 // landed leaves the pending-freeze marker on the tracked row. A later drive's
 // observer — with no in-memory state from the rotation — reconciles it on its
 // first volume check: the superseded comment is frozen pointing at its
-// successor and the marker is cleared, without posting anything new.
+// successor and the marker is cleared, without posting anything new. The fold
+// uses the generic superseded rendering — the marker records which comment is
+// owed, not which rotation superseded it.
 func TestE2EVolumeRotationReconcilesPendingFreezeFromPriorDrive(t *testing.T) {
 	ctx := t.Context()
 
@@ -996,7 +1001,8 @@ func TestE2EVolumeRotationReconcilesPendingFreezeFromPriorDrive(t *testing.T) {
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, supersededID, edited.CommentID, "the reconciled freeze lands on the superseded comment")
-		assert.Contains(t, edited.Body, "Volume changed to **5/11**")
+		assert.Contains(t, edited.Body, "Progress comment superseded",
+			"the owed fold uses the generic rendering since the superseding rotation is not recorded")
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", freshID), "the frozen comment links to its successor")
 		assert.Contains(t, edited.Body, "Copying at volume 3", "the superseded body is preserved inside the fold")
 	case created := <-capture.creates:
