@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -217,28 +218,84 @@ func (h *Handler) executeApply(
 	}
 }
 
-// ddlMatchesStoredPlan compares the re-plan DDL against a previously stored plan.
-// Uses order-independent comparison since FlatTables() and FlatDDLChanges() may
-// return statements in different order.
-func ddlMatchesStoredPlan(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) bool {
-	newDDL := planResp.FlatTables()
-	storedDDL := storedPlan.FlatDDLChanges()
+// planChangeIdentity is the drift-comparison key for a single table change. A
+// bare DDL string is not enough: the same DDL text can move between namespaces,
+// tables, or operations (e.g. one keyspace dropping a table and another creating
+// it), which a DDL-only multiset would treat as unchanged and auto-apply. The
+// full identity is what the operator reviewed, so drift must be judged on it.
+type planChangeIdentity struct {
+	namespace string
+	table     string
+	operation string
+	ddl       string
+}
 
-	if len(newDDL) != len(storedDDL) {
+// ddlMatchesStoredPlan reports whether the re-plan describes the same set of
+// table changes the operator reviewed in storedPlan. Comparison is
+// order-independent (the flattening helpers may emit changes in different order)
+// and keyed on the full change identity, not DDL text alone. Any mismatch means
+// drift, and the caller downgrades an automatic apply to manual confirmation —
+// so this errs toward requiring re-review, never toward silently applying a
+// changed plan.
+func ddlMatchesStoredPlan(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) bool {
+	newChanges := responsePlanIdentities(planResp)
+	storedChanges := storedPlanIdentities(storedPlan)
+
+	if len(newChanges) != len(storedChanges) {
 		return false
 	}
 
-	// Build a set of DDL strings from the stored plan
-	storedSet := make(map[string]int, len(storedDDL))
-	for _, s := range storedDDL {
-		storedSet[s.DDL]++
-	}
-
-	for _, n := range newDDL {
-		if storedSet[n.DDL] <= 0 {
+	for identity, count := range newChanges {
+		if storedChanges[identity] != count {
 			return false
 		}
-		storedSet[n.DDL]--
 	}
 	return true
+}
+
+// responsePlanIdentities builds the change-identity multiset from a re-plan
+// response. Namespace comes from the SchemaChangeResponse grouping (the
+// authoritative source; FlatTables() does not carry it onto each change) and is
+// normalized the same way the stored plan is — an empty namespace becomes
+// "default" — so the two multisets are keyed identically.
+func responsePlanIdentities(planResp *apitypes.PlanResponse) map[planChangeIdentity]int {
+	identities := make(map[planChangeIdentity]int)
+	for _, sc := range planResp.Changes {
+		namespace := normalizePlanNamespace(sc.Namespace)
+		for _, tc := range sc.TableChanges {
+			identities[planChangeIdentity{
+				namespace: namespace,
+				table:     tc.TableName,
+				operation: strings.ToLower(tc.ChangeType),
+				ddl:       tc.DDL,
+			}]++
+		}
+	}
+	return identities
+}
+
+// storedPlanIdentities builds the change-identity multiset from a stored plan.
+// FlatDDLChanges backfills each change's namespace from its map key, which the
+// store already normalized (empty → "default"), so it matches the response side.
+func storedPlanIdentities(storedPlan *storage.Plan) map[planChangeIdentity]int {
+	identities := make(map[planChangeIdentity]int)
+	for _, tc := range storedPlan.FlatDDLChanges() {
+		identities[planChangeIdentity{
+			namespace: normalizePlanNamespace(tc.Namespace),
+			table:     tc.Table,
+			operation: strings.ToLower(tc.Operation),
+			ddl:       tc.DDL,
+		}]++
+	}
+	return identities
+}
+
+// normalizePlanNamespace mirrors the store's namespace handling so a plan whose
+// proto namespace is empty (persisted as "default") compares equal to the
+// re-plan response that still carries the empty grouping namespace.
+func normalizePlanNamespace(namespace string) string {
+	if namespace == "" {
+		return "default"
+	}
+	return namespace
 }
