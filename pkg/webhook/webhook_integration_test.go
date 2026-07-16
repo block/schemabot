@@ -71,6 +71,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -309,9 +310,16 @@ type planFlowResult struct {
 	// MergeBaseSHA drives the base-branch drift gate's compare response. Empty
 	// (the default) makes the merge base equal the compare base, so the gate
 	// sees no base advance and every existing automatic-apply test proceeds
-	// unchanged. A drift test sets it to a distinct SHA (and provides differing
-	// schema-dir trees) to exercise the manual-confirm downgrade.
+	// unchanged. A drift test sets it to a distinct SHA; because the shallow
+	// tree server salts directory tree SHAs with the commit SHA, a distinct
+	// merge base makes the schema subtree differ from the base and triggers the
+	// manual-confirm downgrade.
 	MergeBaseSHA string
+
+	// BaseDriftChangedFiles are the files a compare returns, so a drift test can
+	// assert the downgrade comment lists them. They should live under the
+	// resolved schema directory to survive the gate's path filter.
+	BaseDriftChangedFiles []string
 }
 
 func (p *planFlowResult) nextHeadSHA() string {
@@ -362,6 +370,95 @@ func setupFakeGitHubForPlan(t *testing.T, mux *http.ServeMux, schemaSQL map[stri
 	return setupFakeGitHubForPlanWithPRFiles(t, mux, schemaSQL, schemabotConfig, ns, nil)
 }
 
+// shallowChild is one entry in a single directory level of a fake git tree.
+type shallowChild struct {
+	name string
+	typ  string // "tree" or "blob"
+	sha  string // blob SHA (only meaningful for blobs)
+}
+
+// serveShallowTree serves a single-level (non-recursive) git tree for a GetTree
+// request, resolved from the flat recursive treeEntries. Directory tree SHAs are
+// encoded as "tree|<commit>|<dirPath>" so that (a) successive shallow fetches
+// can walk into subdirectories, and (b) the same directory reports a different
+// tree SHA at a different commit — which is what lets the base-branch drift gate
+// detect that the schema subtree changed between the merge base and the base.
+// The root fetch uses the commit SHA directly as the requested tree SHA.
+func serveShallowTree(w http.ResponseWriter, requestedSHA string, treeEntries []*gh.TreeEntry) {
+	commit, dir := parseShallowTreeSHA(requestedSHA)
+	var entries []*gh.TreeEntry
+	for _, c := range shallowChildren(treeEntries, dir) {
+		if c.typ == "tree" {
+			childDir := c.name
+			if dir != "" {
+				childDir = dir + "/" + c.name
+			}
+			entries = append(entries, &gh.TreeEntry{
+				Path: new(c.name),
+				Mode: new("040000"),
+				Type: new("tree"),
+				SHA:  new("tree|" + commit + "|" + childDir),
+			})
+			continue
+		}
+		entries = append(entries, &gh.TreeEntry{
+			Path: new(c.name),
+			Mode: new("100644"),
+			Type: new("blob"),
+			SHA:  new(c.sha),
+		})
+	}
+	_ = json.NewEncoder(w).Encode(gh.Tree{SHA: &requestedSHA, Entries: entries, Truncated: new(false)})
+}
+
+// parseShallowTreeSHA decodes a requested tree SHA into the commit it belongs to
+// and the directory path it represents. A synthetic directory SHA has the form
+// "tree|<commit>|<dir>"; any other value is a root commit SHA (empty dir).
+func parseShallowTreeSHA(requestedSHA string) (commit, dir string) {
+	if parts := strings.SplitN(requestedSHA, "|", 3); len(parts) == 3 && parts[0] == "tree" {
+		return parts[1], parts[2]
+	}
+	return requestedSHA, ""
+}
+
+// shallowChildren returns the immediate children of dir (empty dir = root),
+// derived from the flat recursive treeEntries, sorted by name. A name with
+// descendants is a "tree"; otherwise it carries the entry's blob SHA.
+func shallowChildren(treeEntries []*gh.TreeEntry, dir string) []shallowChild {
+	byName := make(map[string]shallowChild)
+	prefix := ""
+	if dir != "" {
+		prefix = dir + "/"
+	}
+	for _, e := range treeEntries {
+		p := e.GetPath()
+		if prefix != "" {
+			if !strings.HasPrefix(p, prefix) {
+				continue
+			}
+			p = p[len(prefix):]
+		}
+		if p == "" {
+			continue
+		}
+		first, rest, hasRest := strings.Cut(p, "/")
+		if hasRest && rest != "" {
+			byName[first] = shallowChild{name: first, typ: "tree"}
+			continue
+		}
+		// A leaf directly under dir keeps its actual type and blob SHA.
+		if _, exists := byName[first]; !exists {
+			byName[first] = shallowChild{name: first, typ: e.GetType(), sha: e.GetSHA()}
+		}
+	}
+	children := make([]shallowChild, 0, len(byName))
+	for _, c := range byName {
+		children = append(children, c)
+	}
+	slices.SortFunc(children, func(a, b shallowChild) int { return strings.Compare(a.name, b.name) })
+	return children
+}
+
 func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string, prFiles []*gh.CommitFile) *planFlowResult {
 	t.Helper()
 
@@ -404,9 +501,13 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		if result.MergeBaseSHA != "" {
 			mergeBase = result.MergeBaseSHA
 		}
-		_ = json.NewEncoder(w).Encode(gh.CommitsComparison{
+		cmp := gh.CommitsComparison{
 			MergeBaseCommit: &gh.RepositoryCommit{SHA: &mergeBase},
-		})
+		}
+		for _, f := range result.BaseDriftChangedFiles {
+			cmp.Files = append(cmp.Files, &gh.CommitFile{Filename: new(f), Status: new("modified")})
+		}
+		_ = json.NewEncoder(w).Encode(cmp)
 	})
 
 	// PR changed files — report schema files changed (in namespace subdir)
@@ -471,11 +572,19 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, r *http.Request) {
 		sha := r.URL.Path[len("/repos/octocat/hello-world/git/trees/"):]
-		_ = json.NewEncoder(w).Encode(gh.Tree{
-			SHA:       &sha,
-			Entries:   treeEntries,
-			Truncated: new(false),
-		})
+		// Recursive fetches (schema discovery) get the flat whole-tree listing.
+		// Non-recursive fetches (the base-branch drift gate's per-level path
+		// resolution) get a faithful single-level tree so the gate can walk into
+		// the schema directory and compare its subtree SHA across commits.
+		if r.URL.Query().Get("recursive") == "1" {
+			_ = json.NewEncoder(w).Encode(gh.Tree{
+				SHA:       &sha,
+				Entries:   treeEntries,
+				Truncated: new(false),
+			})
+			return
+		}
+		serveShallowTree(w, sha, treeEntries)
 	})
 
 	// Blob content
