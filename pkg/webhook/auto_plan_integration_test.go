@@ -705,6 +705,62 @@ func TestE2EGitHubUnavailableDuringAutoPlanDoesNotPublishCheckRun(t *testing.T) 
 	assert.Nil(t, aggregate)
 }
 
+// TestE2EAutoPlanFailureCommentAttributesAutomaticTrigger verifies the
+// failure comment for an auto-plan that fails after dispatch: config
+// discovery succeeds, but the dispatched plan's own GitHub reads fail. The
+// comment must attribute the plan to the automatic pull request trigger and
+// state the multi-environment scope — an auto-plan has no requesting user
+// and no single target environment, so it must never render a bare @ mention
+// or an empty environment code span.
+func TestE2EAutoPlanFailureCommentAttributesAutomaticTrigger(t *testing.T) {
+	dbName := "webhook_autoplan_failure_attribution"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	// Discovery reads the changed files once; the dispatched plan re-fetches
+	// them with a fresh client and hits the outage.
+	result.FailPRFilesAfterFirstFetch.Store(true)
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "## ❌ Plan Failed")
+		assert.Contains(t, body, "**Environment**: all configured environments",
+			"an auto-plan targets every configured environment, so the header must say so")
+		assert.Contains(t, body, "Triggered automatically by a pull request update",
+			"a system-triggered plan must be attributed to the pull request update")
+		assert.NotContains(t, body, "**Environment**: ``")
+		assert.NotContains(t, body, "Requested by @")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the auto-plan failure comment")
+	}
+}
+
 // TestE2EAutoPlanWithOnlySchemaBotConfigChangeClearsRollbackCheck verifies the
 // self-serve reconciliation path for a PR whose live database already matches
 // the current schema files. A no-op schemabot.yaml edit should make config

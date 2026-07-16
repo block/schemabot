@@ -220,6 +220,17 @@ func PreviewCommentErrorGeneric() string {
 	})
 }
 
+// PreviewCommentErrorGenericAutoPlan renders the plan failure error comment
+// for a system-triggered auto-plan: no requesting user and no single target
+// environment.
+func PreviewCommentErrorGenericAutoPlan() string {
+	return RenderGenericError(SchemaErrorData{
+		Timestamp:   "2026-01-15 14:30:00",
+		CommandName: action.Plan,
+		ErrorDetail: "failed to fetch repository contents: API rate limit exceeded",
+	})
+}
+
 // PreviewCommentMissingEnv renders the "missing -e flag" error comment.
 func PreviewCommentMissingEnv() string {
 	return RenderMissingEnv(action.Plan)

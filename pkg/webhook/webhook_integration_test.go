@@ -305,6 +305,14 @@ type planFlowResult struct {
 	// before issuing the webhook request. Nil preserves the default
 	// "no checks → passing" behavior.
 	CheckStatusNodes atomic.Pointer[func() []checkStatusNode]
+
+	// FailPRFilesAfterFirstFetch makes /pulls/1/files serve only its first
+	// request and answer every later one with a 503. Config discovery fetches
+	// the changed files exactly once, so this simulates GitHub becoming
+	// unavailable between a successful discovery and the dispatched command's
+	// own re-fetch. False (the default) always serves the files.
+	FailPRFilesAfterFirstFetch atomic.Bool
+	prFilesRequests            atomic.Int64
 }
 
 func (p *planFlowResult) nextHeadSHA() string {
@@ -383,6 +391,10 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 
 	// PR changed files — report schema files changed (in namespace subdir)
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, r *http.Request) {
+		if result.FailPRFilesAfterFirstFetch.Load() && result.prFilesRequests.Add(1) > 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		if prFiles != nil {
 			_ = json.NewEncoder(w).Encode(prFiles)
 			return

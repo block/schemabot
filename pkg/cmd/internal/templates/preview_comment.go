@@ -17,6 +17,7 @@ func previewCommentErrorsOutput() {
 		{"DATABASE NOT FOUND", webhooktemplates.PreviewCommentErrorNotFound},
 		{"INVALID CONFIG", webhooktemplates.PreviewCommentErrorInvalid},
 		{"GENERIC ERROR", webhooktemplates.PreviewCommentErrorGeneric},
+		{"AUTO-PLAN: GENERIC ERROR", webhooktemplates.PreviewCommentErrorGenericAutoPlan},
 		{"MISSING -e FLAG", webhooktemplates.PreviewCommentMissingEnv},
 		{"INVALID COMMAND", webhooktemplates.PreviewCommentInvalidCmd},
 	}
@@ -64,6 +65,7 @@ func previewCommentAllOutput() {
 		{"DATABASE NOT FOUND", func() { fmt.Print(webhooktemplates.PreviewCommentErrorNotFound()) }},
 		{"INVALID CONFIG", func() { fmt.Print(webhooktemplates.PreviewCommentErrorInvalid()) }},
 		{"GENERIC ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentErrorGeneric()) }},
+		{"AUTO-PLAN: GENERIC ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentErrorGenericAutoPlan()) }},
 		{"MISSING -E FLAG", func() { fmt.Print(webhooktemplates.PreviewCommentMissingEnv()) }},
 		{"INVALID COMMAND", func() { fmt.Print(webhooktemplates.PreviewCommentInvalidCmd()) }},
 		{"APPLY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyProgress()) }},
@@ -196,6 +198,7 @@ func previewCommentPlanAllOutput() {
 		{"DATABASE NOT FOUND", func() { fmt.Print(webhooktemplates.PreviewCommentErrorNotFound()) }},
 		{"INVALID CONFIG", func() { fmt.Print(webhooktemplates.PreviewCommentErrorInvalid()) }},
 		{"GENERIC ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentErrorGeneric()) }},
+		{"AUTO-PLAN: GENERIC ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentErrorGenericAutoPlan()) }},
 		{"MISSING -E FLAG", func() { fmt.Print(webhooktemplates.PreviewCommentMissingEnv()) }},
 		{"INVALID COMMAND", func() { fmt.Print(webhooktemplates.PreviewCommentInvalidCmd()) }},
 	}

@@ -8,8 +8,13 @@ import (
 
 // SchemaErrorData contains data for rendering schema request error comments.
 type SchemaErrorData struct {
-	RequestedBy        string
-	Timestamp          string
+	// RequestedBy is the GitHub login that issued the command. Empty means the
+	// command was system-triggered (an auto-plan from a pull request update).
+	RequestedBy string
+	Timestamp   string
+	// Environment is the single environment the command targeted. Empty means
+	// the command was not scoped to one environment: multi-environment plans
+	// (including auto-plans) target every configured environment.
 	Environment        string
 	DatabaseName       string
 	SchemaPath         string
@@ -18,11 +23,41 @@ type SchemaErrorData struct {
 	AvailableDatabases string
 }
 
+// EnvironmentDisplay renders the environment header value: the environment as
+// a code span when the command targeted one, otherwise a statement that every
+// configured environment was in scope — never an empty code span.
+func (d SchemaErrorData) EnvironmentDisplay() string {
+	if d.Environment == "" {
+		return "all configured environments"
+	}
+	return "`" + d.Environment + "`"
+}
+
+// ExampleEnvironment is the -e value rendered inside pasteable usage
+// examples: the requested environment when one was given, otherwise a
+// placeholder for the reader to fill in.
+func (d SchemaErrorData) ExampleEnvironment() string {
+	if d.Environment == "" {
+		return "<environment>"
+	}
+	return d.Environment
+}
+
+// Attribution renders the footer attribution line: the requesting user for
+// user-issued commands, or the automatic trigger for system-issued ones —
+// never a bare @ mention.
+func (d SchemaErrorData) Attribution() string {
+	if d.RequestedBy == "" {
+		return "*Triggered automatically by a pull request update at " + d.Timestamp + " UTC*"
+	}
+	return "*Requested by @" + d.RequestedBy + " at " + d.Timestamp + " UTC*"
+}
+
 const databaseNotFoundTemplate = `## ⚠️ Database Not Found
 
-**Database**: ` + "`{{.DatabaseName}}`" + ` | **Environment**: ` + "`{{.Environment}}`" + `
+**Database**: ` + "`{{.DatabaseName}}`" + ` | **Environment**: {{.EnvironmentDisplay}}
 
-*Requested by @{{.RequestedBy}} at {{.Timestamp}} UTC*
+{{.Attribution}}
 
 No ` + "`schemabot.yaml`" + ` configuration with ` + "`database: {{.DatabaseName}}`" + ` was found in this repository.
 
@@ -30,9 +65,9 @@ Check that your ` + "`schemabot.yaml`" + ` file has the correct ` + "`database`"
 
 const invalidConfigTemplate = `## ⚠️ No Valid SchemaBot Configuration Found
 
-**Environment**: ` + "`{{.Environment}}`" + `
+**Environment**: {{.EnvironmentDisplay}}
 
-*Requested by @{{.RequestedBy}} at {{.Timestamp}} UTC*
+{{.Attribution}}
 
 The ` + "`schemabot.yaml`" + ` file must include ` + "`database`" + ` and ` + "`type`" + ` fields:
 
@@ -46,9 +81,9 @@ type: mysql
 
 const noConfigNoDatabaseTemplate = `## ℹ️ No SchemaBot Configuration Found
 
-**Environment**: ` + "`{{.Environment}}`" + `
+**Environment**: {{.EnvironmentDisplay}}
 
-*Requested by @{{.RequestedBy}} at {{.Timestamp}} UTC*
+{{.Attribution}}
 
 No ` + "`schemabot.yaml`" + ` configuration file was found in this repository.
 
@@ -64,14 +99,14 @@ type: mysql
 Use the ` + "`-d`" + ` flag to specify which database to {{.CommandName}}:
 
 ` + "```" + `
-schemabot {{.CommandName}} -e {{.Environment}} -d <database-name>
+schemabot {{.CommandName}} -e {{.ExampleEnvironment}} -d <database-name>
 ` + "```" + ``
 
 const noConfigWithDatabaseTemplate = `## ℹ️ No SchemaBot Configuration Found
 
-**Database**: ` + "`{{.DatabaseName}}`" + ` | **Environment**: ` + "`{{.Environment}}`" + `
+**Database**: ` + "`{{.DatabaseName}}`" + ` | **Environment**: {{.EnvironmentDisplay}}
 
-*Requested by @{{.RequestedBy}} at {{.Timestamp}} UTC*
+{{.Attribution}}
 
 No ` + "`schemabot.yaml`" + ` configuration file exists in this repository.
 
@@ -85,9 +120,9 @@ type: mysql
 
 const configOutsideAllowedDirsTemplate = `## ⚠️ SchemaBot Configuration Not Authorized
 
-**Database**: ` + "`{{.DatabaseName}}`" + ` | **Environment**: ` + "`{{.Environment}}`" + `
+**Database**: ` + "`{{.DatabaseName}}`" + ` | **Environment**: {{.EnvironmentDisplay}}
 
-*Requested by @{{.RequestedBy}} at {{.Timestamp}} UTC*
+{{.Attribution}}
 
 SchemaBot found a ` + "`schemabot.yaml`" + ` configuration, but this SchemaBot instance is not configured to manage its schema directory.
 
@@ -97,9 +132,9 @@ Ask a SchemaBot operator to add this directory to ` + "`databases.{{.DatabaseNam
 
 const multipleConfigsTemplate = `## ⚠️ Multiple Databases Detected
 
-**Environment**: ` + "`{{.Environment}}`" + `
+**Environment**: {{.EnvironmentDisplay}}
 
-*Requested by @{{.RequestedBy}} at {{.Timestamp}} UTC*
+{{.Attribution}}
 
 This repository has multiple ` + "`schemabot.yaml`" + ` configurations.
 
@@ -112,14 +147,14 @@ This repository has multiple ` + "`schemabot.yaml`" + ` configurations.
 Use the ` + "`-d`" + ` flag:
 
 ` + "```" + `
-schemabot {{.CommandName}} -e {{.Environment}} -d <database-name>
+schemabot {{.CommandName}} -e {{.ExampleEnvironment}} -d <database-name>
 ` + "```" + ``
 
 const genericErrorTemplate = `## ❌ {{.CommandName}} Failed
 
-**Environment**: ` + "`{{.Environment}}`" + `
+**Environment**: {{.EnvironmentDisplay}}
 
-*Requested by @{{.RequestedBy}} at {{.Timestamp}} UTC*
+{{.Attribution}}
 
 ### Error
 

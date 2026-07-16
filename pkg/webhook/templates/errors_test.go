@@ -6,6 +6,79 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// TestRenderGenericErrorAutoPlan covers the failure comment for a
+// system-triggered auto-plan: there is no requesting user and no single
+// target environment, so the comment must attribute the plan to the pull
+// request update and state the multi-environment scope — never render an
+// empty code span or a bare @ mention.
+func TestRenderGenericErrorAutoPlan(t *testing.T) {
+	body := RenderGenericError(SchemaErrorData{
+		Timestamp:   "2026-07-16 18:56:00",
+		CommandName: "plan",
+		ErrorDetail: "failed to fetch repository contents",
+	})
+
+	assert.Contains(t, body, "## ❌ Plan Failed")
+	assert.Contains(t, body, "**Environment**: all configured environments")
+	assert.Contains(t, body, "*Triggered automatically by a pull request update at 2026-07-16 18:56:00 UTC*")
+	assert.Contains(t, body, "> failed to fetch repository contents")
+	assert.NotContains(t, body, "``")
+	assert.NotContains(t, body, "@ ")
+}
+
+// TestRenderGenericErrorUserRequested pins the user-issued rendering: a
+// single environment shows as a code span and the footer names the requester.
+func TestRenderGenericErrorUserRequested(t *testing.T) {
+	body := RenderGenericError(SchemaErrorData{
+		RequestedBy: "octocat",
+		Timestamp:   "2026-07-16 18:56:00",
+		Environment: "staging",
+		CommandName: "plan",
+		ErrorDetail: "boom",
+	})
+
+	assert.Contains(t, body, "**Environment**: `staging`")
+	assert.Contains(t, body, "*Requested by @octocat at 2026-07-16 18:56:00 UTC*")
+	assert.NotContains(t, body, "Triggered automatically")
+}
+
+// TestRenderNoConfigUsageExample verifies the pasteable usage example: the
+// requested environment when one was given, otherwise a placeholder — never
+// an empty -e value.
+func TestRenderNoConfigUsageExample(t *testing.T) {
+	t.Run("multi-environment command uses a placeholder", func(t *testing.T) {
+		body := RenderNoConfig(SchemaErrorData{
+			Timestamp:   "2026-07-16 18:56:00",
+			CommandName: "plan",
+		})
+		assert.Contains(t, body, "schemabot plan -e <environment> -d <database-name>")
+		assert.Contains(t, body, "**Environment**: all configured environments")
+	})
+
+	t.Run("single-environment command uses the environment", func(t *testing.T) {
+		body := RenderNoConfig(SchemaErrorData{
+			RequestedBy: "octocat",
+			Timestamp:   "2026-07-16 18:56:00",
+			Environment: "staging",
+			CommandName: "plan",
+		})
+		assert.Contains(t, body, "schemabot plan -e staging -d <database-name>")
+	})
+}
+
+// TestRenderMultipleConfigsUsageExample verifies the multi-database picker
+// keeps a pasteable -e value when the command was not scoped to one
+// environment.
+func TestRenderMultipleConfigsUsageExample(t *testing.T) {
+	body := RenderMultipleConfigs(SchemaErrorData{
+		Timestamp:          "2026-07-16 18:56:00",
+		CommandName:        "plan",
+		AvailableDatabases: "- `testapp`\n- `payments`",
+	})
+	assert.Contains(t, body, "schemabot plan -e <environment> -d <database-name>")
+	assert.Contains(t, body, "*Triggered automatically by a pull request update at 2026-07-16 18:56:00 UTC*")
+}
+
 func TestRenderInvalidEnv(t *testing.T) {
 	t.Run("lists the configured environments", func(t *testing.T) {
 		body := RenderInvalidEnv("apply", []string{"production", "staging"})

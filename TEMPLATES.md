@@ -962,6 +962,21 @@ type: mysql
 </details>
 
 <details>
+<summary><a name="autoplan-generic-error"></a><strong>Auto-plan: Generic Error</strong></summary>
+
+
+## ❌ Plan Failed
+
+**Environment**: all configured environments
+
+*Triggered automatically by a pull request update at 2026-01-15 14:30:00 UTC*
+
+### Error
+
+> failed to fetch repository contents: API rate limit exceeded
+</details>
+
+<details>
 <summary><a name="missing-e-flag"></a><strong>Missing -e Flag</strong></summary>
 
 
