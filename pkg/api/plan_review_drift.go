@@ -7,6 +7,7 @@ import (
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 // RollupReviewTimeDrift computes the review-time drift rollup for a
@@ -62,13 +63,15 @@ func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, pr
 		switch entry.Class {
 		case DeploymentDiverged:
 			s.logger.Warn("review-time drift: deployment diverged from the reviewed plan; the plan check will block the PR until reconciled",
-				"repository", req.Repository,
-				"pr", pr,
-				"head_sha", headSHA,
-				"database", req.Database,
-				"environment", req.Environment,
-				"deployment", entry.Deployment,
-				"target", entry.Target)
+				append([]any{
+					"repository", req.Repository,
+					"pr", pr,
+					"head_sha", headSHA,
+					"database", req.Database,
+					"environment", req.Environment,
+					"deployment", entry.Deployment,
+					"target", entry.Target,
+				}, driftDiffLogAttrs(entry.Diff)...)...)
 		case DeploymentErrored:
 			s.logger.Warn("review-time drift: deployment could not be diffed or compared; the plan check will block the PR closed",
 				"repository", req.Repository,
@@ -83,4 +86,61 @@ func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, pr
 	}
 
 	return rollup, nil
+}
+
+// maxDriftDiffLogItems caps how many diff items a diverged deployment's warn log
+// renders per list, so a badly drifted deployment cannot flood the log line.
+// The omitted remainder is summarized as a "+N more" tail.
+const maxDriftDiffLogItems = 5
+
+// driftDiffLogAttrs renders a diverged deployment's change-set diff as log
+// attributes so an operator can tell from the warn log alone what the
+// deployment would run that the reviewed plan does not say (and vice versa).
+// Each item names the namespace, shard when set, table, and operation — never
+// the DDL body, which can be long and belongs on the producer's own logs.
+// Empty lists are omitted.
+func driftDiffLogAttrs(diff tern.ChangeSetDiff) []any {
+	var attrs []any
+	if items := formatDriftDiffItems(diff.MissingFromCandidate); len(items) > 0 {
+		attrs = append(attrs, "diff_missing", items)
+	}
+	if items := formatDriftDiffItems(diff.UnexpectedInCandidate); len(items) > 0 {
+		attrs = append(attrs, "diff_unexpected", items)
+	}
+	if ns := capDriftList(diff.MissingVSchema); len(ns) > 0 {
+		attrs = append(attrs, "diff_missing_vschema", ns)
+	}
+	if ns := capDriftList(diff.UnexpectedVSchema); len(ns) > 0 {
+		attrs = append(attrs, "diff_unexpected_vschema", ns)
+	}
+	return attrs
+}
+
+// formatDriftDiffItems renders diff items as "namespace[/shard].table operation"
+// strings, capped to maxDriftDiffLogItems with a "+N more" overflow entry.
+func formatDriftDiffItems(items []tern.ChangeSetDiffItem) []string {
+	formatted := make([]string, 0, min(len(items), maxDriftDiffLogItems+1))
+	for _, item := range items[:min(len(items), maxDriftDiffLogItems)] {
+		loc := item.Namespace
+		if item.Shard != "" {
+			loc += "/" + item.Shard
+		}
+		formatted = append(formatted, fmt.Sprintf("%s.%s %s", loc, item.Table, item.Operation))
+	}
+	if overflow := len(items) - maxDriftDiffLogItems; overflow > 0 {
+		formatted = append(formatted, fmt.Sprintf("+%d more", overflow))
+	}
+	return formatted
+}
+
+// capDriftList caps a namespace list to maxDriftDiffLogItems with a "+N more"
+// overflow entry.
+func capDriftList(values []string) []string {
+	if len(values) <= maxDriftDiffLogItems {
+		return values
+	}
+	capped := make([]string, 0, maxDriftDiffLogItems+1)
+	capped = append(capped, values[:maxDriftDiffLogItems]...)
+	capped = append(capped, fmt.Sprintf("+%d more", len(values)-maxDriftDiffLogItems))
+	return capped
 }

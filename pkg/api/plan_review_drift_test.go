@@ -2,12 +2,15 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+
+	"github.com/block/schemabot/pkg/tern"
 )
 
 func reviewedUsersPlan(ddl string) *ternv1.PlanResponse {
@@ -90,4 +93,73 @@ func TestRollupReviewTimeDrift_UnresolvedTargetsError(t *testing.T) {
 	req.Database = "unknown"
 	_, err := svc.RollupReviewTimeDrift(t.Context(), req, reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"), "eu")
 	require.Error(t, err)
+}
+
+// A diverged deployment's warn log carries the comparator's diff so an operator
+// can tell what the deployment would run that the reviewed plan does not say —
+// table and operation per item, never the DDL body, capped with a "+N more"
+// overflow so a badly drifted deployment cannot flood the log line.
+func TestDriftDiffLogAttrs(t *testing.T) {
+	diff := tern.ChangeSetDiff{
+		MissingFromCandidate: []tern.ChangeSetDiffItem{
+			{Namespace: "testapp", Table: "users", Operation: "alter_table", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		},
+		UnexpectedInCandidate: []tern.ChangeSetDiffItem{
+			{Namespace: "testapp", Shard: "-80", Table: "orders", Operation: "create_table", DDL: "CREATE TABLE `orders` (`id` bigint)"},
+		},
+		MissingVSchema:    []string{"testapp"},
+		UnexpectedVSchema: []string{"other"},
+	}
+
+	attrs := driftDiffLogAttrs(diff)
+	require.Equal(t, []any{
+		"diff_missing", []string{"testapp.users alter_table"},
+		"diff_unexpected", []string{"testapp/-80.orders create_table"},
+		"diff_missing_vschema", []string{"testapp"},
+		"diff_unexpected_vschema", []string{"other"},
+	}, attrs)
+	for _, attr := range attrs {
+		if items, ok := attr.([]string); ok {
+			for _, item := range items {
+				assert.NotContains(t, item, "ADD COLUMN", "diff log items must never carry DDL bodies")
+			}
+		}
+	}
+}
+
+// Empty diff lists are omitted from the log attributes so a warn line only
+// names the directions that actually differ.
+func TestDriftDiffLogAttrs_OmitsEmptyLists(t *testing.T) {
+	diff := tern.ChangeSetDiff{
+		UnexpectedInCandidate: []tern.ChangeSetDiffItem{
+			{Namespace: "testapp", Table: "orders", Operation: "drop_table"},
+		},
+	}
+
+	assert.Equal(t, []any{
+		"diff_unexpected", []string{"testapp.orders drop_table"},
+	}, driftDiffLogAttrs(diff))
+}
+
+// A diff with more items than the log cap renders the first items and
+// summarizes the remainder as "+N more" instead of flooding the log line.
+func TestDriftDiffLogAttrs_CapsWithOverflow(t *testing.T) {
+	var items []tern.ChangeSetDiffItem
+	for i := range maxDriftDiffLogItems + 3 {
+		items = append(items, tern.ChangeSetDiffItem{
+			Namespace: "testapp",
+			Table:     fmt.Sprintf("t%02d", i),
+			Operation: "create_table",
+		})
+	}
+
+	attrs := driftDiffLogAttrs(tern.ChangeSetDiff{MissingFromCandidate: items})
+	require.Len(t, attrs, 2)
+	require.Equal(t, "diff_missing", attrs[0])
+	rendered, ok := attrs[1].([]string)
+	require.True(t, ok)
+	require.Len(t, rendered, maxDriftDiffLogItems+1)
+	assert.Equal(t, "testapp.t00 create_table", rendered[0])
+	assert.Equal(t, fmt.Sprintf("testapp.t%02d create_table", maxDriftDiffLogItems-1), rendered[maxDriftDiffLogItems-1])
+	assert.Equal(t, "+3 more", rendered[maxDriftDiffLogItems])
 }
