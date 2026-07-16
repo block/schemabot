@@ -194,6 +194,7 @@ func TestGetApprovedReviewers(t *testing.T) {
 }
 
 func TestIsTeamMember(t *testing.T) {
+	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
 	tests := []struct {
 		name            string
 		statusCode      int
@@ -270,6 +271,7 @@ func TestIsTeamMember(t *testing.T) {
 }
 
 func TestListTeamMembersErrorClassification(t *testing.T) {
+	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
 	tests := []struct {
 		name           string
 		statusCode     int

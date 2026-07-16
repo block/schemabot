@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -102,9 +103,10 @@ func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, l
 }
 
 // Run starts the SchemaBot server with the given configuration and blocks until
-// it receives SIGINT/SIGTERM or the HTTP server fails, then shuts down
+// it receives SIGINT/SIGTERM or either HTTP server fails, then shuts down
 // gracefully. The storage DSN is resolved from cfg (falling back to MYSQL_DSN);
-// PORT and GRPC_PORT are read from the environment.
+// PORT and GRPC_PORT are read from the environment. Prometheus metrics are
+// served on a dedicated listener at cfg.MetricsListenPort, not on the API port.
 func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	port := getEnv("PORT", "8080")
 	grpcPort := os.Getenv("GRPC_PORT")
@@ -162,13 +164,31 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	errCh := make(chan error, 1)
+	// Metrics get their own listener so scrapers never traverse the API port
+	// (see ServerConfig.MetricsPort).
+	metricsPort := strconv.Itoa(cfg.MetricsListenPort())
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("GET /metrics", srv.MetricsHandler())
+	metricsServer := &http.Server{
+		Addr:         ":" + metricsPort,
+		Handler:      metricsMux,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	errCh := make(chan error, 2)
 	go func() {
 		srv.logger.Info("starting http server", "port", port)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
+			errCh <- fmt.Errorf("http server: %w", err)
 		}
-		close(errCh)
+	}()
+	go func() {
+		srv.logger.Info("starting metrics server", "port", metricsPort)
+		if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("metrics server: %w", err)
+		}
 	}()
 
 	// Wait for a shutdown signal, context cancellation (embedded callers), or a
@@ -186,13 +206,13 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 		return err
 	}
 
-	// Graceful shutdown of the HTTP server; Server.Close (deferred) releases the
-	// rest.
+	// Graceful shutdown of both HTTP servers; Server.Close (deferred) releases
+	// the rest.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	srv.logger.Info("shutting down server")
-	return server.Shutdown(shutdownCtx)
+	return errors.Join(server.Shutdown(shutdownCtx), metricsServer.Shutdown(shutdownCtx))
 }
 
 // Server is a built but not-yet-listening SchemaBot server. Build constructs it
@@ -332,7 +352,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	// Authentication middleware. With the default (none) auth this is an
 	// allow-all NoneAuthorizer that lets every request through (attaching an
 	// anonymous user); with "oidc" it validates Bearer JWTs and bypasses
-	// non-API paths (/webhook, /metrics, health) itself.
+	// non-API paths (/webhook, health) itself.
 	authz, err := buildAuthorizer(ctx, cfg.Auth, cfg.PRCommandAuthorization.AdminTeams, logger)
 	if err != nil {
 		return nil, fmt.Errorf("setup auth: %w", err)
@@ -451,13 +471,13 @@ func (s *Server) RegisterGRPC(ctx context.Context, gs *grpc.Server) error {
 	return nil
 }
 
-// Handler returns the SchemaBot HTTP handler: API routes, /metrics, the webhook
-// endpoint, the auth middleware, and OTel instrumentation. An embedder mounts it
-// on its own server; Run serves it directly.
+// Handler returns the SchemaBot HTTP handler: API routes, the webhook endpoint,
+// the auth middleware, and OTel instrumentation. An embedder mounts it on its
+// own server; Run serves it directly. Prometheus metrics are not part of this
+// handler — mount MetricsHandler on a dedicated listener instead.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	s.svc.ConfigureRoutes(mux)
-	mux.Handle("GET /metrics", s.telemetry.MetricsHandler)
 	mux.Handle("POST /webhook", s.webhook.handler)
 
 	authedHandler := s.authz.Middleware(mux)
@@ -470,6 +490,13 @@ func (s *Server) Handler() http.Handler {
 		authedHandler.ServeHTTP(w, r)
 	})
 	return otelhttp.NewHandler(metricHandler, "schemabot")
+}
+
+// MetricsHandler returns the Prometheus /metrics handler. Run serves it on the
+// dedicated metrics listener (ServerConfig.MetricsPort); an embedder that owns
+// its listeners mounts it wherever its scraper expects it.
+func (s *Server) MetricsHandler() http.Handler {
+	return s.telemetry.MetricsHandler
 }
 
 // Start launches the server's background work: the operator driver pool

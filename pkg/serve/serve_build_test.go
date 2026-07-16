@@ -40,10 +40,9 @@ func TestServerRegisterGRPCRegistersTernService(t *testing.T) {
 	assert.True(t, ok, "RegisterGRPC must register the Tern service on the embedder's gRPC server")
 }
 
-// Handler returns the SchemaBot HTTP handler an embedder mounts on its own mux.
-// It exposes /metrics through the auth middleware, so a request reaches the
-// metrics endpoint without Run owning the HTTP server.
-func TestServerHandlerServesMetrics(t *testing.T) {
+// Prometheus metrics live on their own handler (served by Run on the dedicated
+// metrics listener), not on the API handler an embedder mounts on its own mux.
+func TestServerMetricsHandlerSeparateFromAPIHandler(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	cfg := &api.ServerConfig{}
 	svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
@@ -69,7 +68,14 @@ func TestServerHandlerServesMetrics(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
-	assert.Equal(t, http.StatusOK, rec.Code, "the handler serves /metrics through the auth middleware")
+	assert.Equal(t, http.StatusNotFound, rec.Code, "the API handler does not serve /metrics")
+
+	metricsHandler := srv.MetricsHandler()
+	require.NotNil(t, metricsHandler)
+
+	rec = httptest.NewRecorder()
+	metricsHandler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	assert.Equal(t, http.StatusOK, rec.Code, "the metrics handler serves /metrics")
 }
 
 // Enabling auth.type: forward_auth wires the forward-auth authorizer into the

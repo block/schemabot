@@ -319,7 +319,7 @@ func TestOIDCAuthorizerBypassesNonAPIPaths(t *testing.T) {
 	p := newTestOIDCProvider(t)
 	authz := newAuthorizer(t, p, auth.OIDCConfig{Audience: "schemabot"})
 
-	for _, path := range []string{"/livez", "/health", "/metrics", "/webhook", "/tern-health/cake/staging"} {
+	for _, path := range []string{"/livez", "/health", "/webhook", "/tern-health/cake/staging"} {
 		t.Run(path, func(t *testing.T) {
 			var ran bool
 			handler := authz.Middleware(okHandler(&ran, nil))
@@ -332,4 +332,17 @@ func TestOIDCAuthorizerBypassesNonAPIPaths(t *testing.T) {
 			assert.True(t, ran)
 		})
 	}
+
+	// /metrics is served on a dedicated listener outside the API handler, so it
+	// no longer bypasses authentication on the API port.
+	t.Run("/metrics requires auth", func(t *testing.T) {
+		var ran bool
+		handler := authz.Middleware(okHandler(&ran, nil))
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		assert.False(t, ran)
+	})
 }

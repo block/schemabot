@@ -747,6 +747,37 @@ func TestServerConfig_ValidateRejectsLocalRemoteRouteCollision(t *testing.T) {
 // A non-empty but unparseable revert_window_duration is a startup config error
 // so a typo (e.g. "30 minutes") fails closed instead of silently reverting to
 // the engine default window.
+// MetricsListenPort defaults to DefaultMetricsPort and honors an explicit
+// metrics_port override.
+func TestServerConfig_MetricsListenPort(t *testing.T) {
+	cfg := ServerConfig{}
+	assert.Equal(t, DefaultMetricsPort, cfg.MetricsListenPort(), "unset metrics_port defaults")
+
+	cfg.MetricsPort = 9464
+	assert.Equal(t, 9464, cfg.MetricsListenPort(), "explicit metrics_port wins")
+}
+
+// A metrics_port outside the TCP port range fails closed at config load.
+func TestServerConfig_ValidateRejectsInvalidMetricsPort(t *testing.T) {
+	for _, port := range []int{-1, 65536} {
+		cfg := ServerConfig{
+			MetricsPort: port,
+			Databases: map[string]DatabaseConfig{
+				"mydb": {
+					Type: "vitess",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root@tcp(localhost)/mydb"},
+					},
+				},
+			},
+		}
+
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "metrics_port")
+	}
+}
+
 func TestServerConfig_ValidateRejectsInvalidRevertWindowDuration(t *testing.T) {
 	cfg := ServerConfig{
 		Databases: map[string]DatabaseConfig{
