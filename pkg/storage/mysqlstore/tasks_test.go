@@ -338,6 +338,20 @@ func TestTaskStore_GetByApplyIDIncludesShardScopedDriveTasks(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	// A work operation of a different apply with the same key. tasks has no
+	// foreign-key constraint on apply_operation_id, so a row mis-associated
+	// with another apply's operation must still be excluded from drive work.
+	otherLock := createTestLock(t, store, "resolute_other", storage.DatabaseTypeStrata, "staging")
+	otherApply := createTestApply(t, store, otherLock, "apply_other_shard_drive", 1)
+	foreignOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:       otherApply.ID,
+		Deployment:    "region-a",
+		OperationKey:  "commerce/-80/users",
+		OperationKind: storage.ApplyOperationKindWork,
+		Target:        "resolute_other",
+	})
+	require.NoError(t, err)
+
 	now := time.Now()
 	createTask := func(identifier string, opID int64, table, shard string) {
 		_, err := store.Tasks().Create(ctx, &storage.Task{
@@ -364,6 +378,7 @@ func TestTaskStore_GetByApplyIDIncludesShardScopedDriveTasks(t *testing.T) {
 	createTask("task_users_80-_reflected", shardedOpID, "users", "80-")
 	createTask("task_orders_drive", unshardedOpID, "orders", "")
 	createTask("task_orders_-80_reflected", unshardedOpID, "orders", "-80")
+	createTask("task_users_-80_foreign_op", foreignOpID, "users", "-80")
 
 	tasks, err := store.Tasks().GetByApplyID(ctx, apply.ID)
 	require.NoError(t, err)

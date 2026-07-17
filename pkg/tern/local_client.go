@@ -1535,7 +1535,9 @@ func scopedDispatchDDLChanges(changes []*ternv1.TableChange) ([]storage.TableCha
 // one (namespace, shard, table)'s changes per operation, so every change in the
 // dispatch must agree on namespace and table; a mixed set is a malformed
 // dispatch and fails closed rather than stamping a key that matches only some
-// of the dispatch's tasks.
+// of the dispatch's tasks. Components must not contain the key's "/" delimiter:
+// readers split the key back into exactly three parts, so a delimiter inside a
+// component would produce a key they no longer recognize as shard-scoped work.
 func shardScopedDispatchOperationKey(changes []storage.TableChange, shard string) (string, error) {
 	if len(changes) == 0 {
 		return "", fmt.Errorf("shard-scoped dispatch has no ddl changes to key its operation from")
@@ -1545,6 +1547,16 @@ func shardScopedDispatchOperationKey(changes []storage.TableChange, shard string
 		if ch.Namespace != namespace || ch.Table != table {
 			return "", fmt.Errorf("shard-scoped dispatch mixes tables %s.%s and %s.%s; a dispatch must carry one table's changes for one shard",
 				namespace, table, ch.Namespace, ch.Table)
+		}
+	}
+	for _, component := range []struct{ name, value string }{
+		{"namespace", namespace},
+		{"shard", shard},
+		{"table", table},
+	} {
+		if strings.Contains(component.value, "/") {
+			return "", fmt.Errorf("shard-scoped dispatch %s %q contains the shard operation key delimiter; refusing to stamp a key readers would misparse",
+				component.name, component.value)
 		}
 	}
 	return storage.ShardOperationKey(namespace, shard, table), nil

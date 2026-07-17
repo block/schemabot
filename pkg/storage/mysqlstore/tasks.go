@@ -367,8 +367,12 @@ func (s *taskStore) insertShardTaskGuardedByApply(ctx context.Context, task *sto
 
 // GetByApplyID returns the drive tasks for an apply. Unsharded rows (shard = "")
 // always load. A shard-tagged row loads only when it is the drive task of a
-// shard-scoped work operation — its operation's key matches the row's
-// namespace/shard/table — the same discrimination GetByApplyOperationID applies.
+// shard-scoped work operation — its operation belongs to the same apply and its
+// operation's key matches the row's namespace/shard/table — the same
+// discrimination GetByApplyOperationID applies. The join is constrained to the
+// row's own apply so a mis-associated operation reference from another apply
+// can never classify a row as drive work; tasks has no foreign-key constraint
+// enforcing the association.
 // Reflected per-shard progress rows (a read-model written by the operator under
 // an operation whose key does not match) are excluded so they never re-enter the
 // per-table drive/gating/progress pipeline on reload. Read those via
@@ -377,7 +381,9 @@ func (s *taskStore) GetByApplyID(ctx context.Context, applyID int64) ([]*storage
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+prefixedTaskColumns("t")+`
 		FROM tasks t
-		LEFT JOIN apply_operations ao ON ao.id = t.apply_operation_id
+		LEFT JOIN apply_operations ao
+			ON ao.id = t.apply_operation_id
+			AND ao.apply_id = t.apply_id
 		WHERE t.apply_id = ?
 			AND (
 				t.shard = ''

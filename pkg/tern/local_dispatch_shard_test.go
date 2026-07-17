@@ -30,4 +30,19 @@ func TestShardScopedDispatchOperationKey(t *testing.T) {
 
 	_, err = shardScopedDispatchOperationKey(nil, "-80")
 	require.Error(t, err)
+
+	// A component containing the key's "/" delimiter would produce a key that
+	// splits into more than three parts, so readers would no longer classify
+	// the operation as shard-scoped work. Stamping must refuse it.
+	_, err = shardScopedDispatchOperationKey([]storage.TableChange{
+		{Namespace: "commerce", Table: "users/archive", DDL: "ALTER TABLE `users/archive` ADD COLUMN `email` varchar(255)", Operation: "alter"},
+	}, "-80")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "delimiter")
+
+	_, err = shardScopedDispatchOperationKey([]storage.TableChange{
+		{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"},
+	}, "-80/0")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "delimiter")
 }
