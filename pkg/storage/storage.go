@@ -448,9 +448,13 @@ type ApplyStore interface {
 	// active again.
 	ReapplyFailed(ctx context.Context, applyID int64) (*Apply, error)
 
-	// FindMissingSummaryComment returns GitHub-backed applies that should have
-	// a terminal summary comment but only have a progress comment. Used by
-	// startup reconciliation to post missing summary comments after restarts.
+	// FindMissingSummaryComment returns GitHub-backed applies that recently
+	// reached a terminal state (including stopped, judged by updated_at since a
+	// resumable stop keeps completed_at NULL) but whose progress comment was
+	// never followed by a summary comment — either no summary marker exists, or
+	// only a claim sentinel stale for longer than SummaryClaimStaleAfter
+	// remains from a publisher that crashed before posting. Used by startup
+	// reconciliation to post missing summary comments after restarts.
 	FindMissingSummaryComment(ctx context.Context) ([]*Apply, error)
 
 	// GetByPR returns all applies for a PR.
@@ -588,7 +592,40 @@ type ApplyCommentStore interface {
 	// has landed on GitHub. A missing row or an already-clear marker is not an
 	// error.
 	ClearPendingFreeze(ctx context.Context, applyID int64, commentState string) error
+
+	// ClaimSummaryComment atomically claims the right to publish the terminal
+	// summary comment for an apply by inserting the summary marker as a claim
+	// sentinel (github_comment_id = 0). Exactly one caller wins per apply: the
+	// winner posts the summary and records the real comment ID via Upsert; every
+	// loser skips. The claim — not the apply lease — is the exactly-once
+	// authority for the summary, so a writer whose lease was re-claimed (stop
+	// reconciliation, resume) can still be beaten to the post without a
+	// duplicate. Returns true when this caller won the claim.
+	ClaimSummaryComment(ctx context.Context, applyID int64) (bool, error)
+
+	// ReclaimStaleSummaryClaim takes over a summary claim sentinel whose holder
+	// crashed between claiming and posting: a sentinel (github_comment_id = 0)
+	// not updated for at least SummaryClaimStaleAfter. Ownership transfers by
+	// bumping updated_at, so concurrent reclaimers race on the same conditional
+	// update and exactly one wins. Returns true when this caller now owns the
+	// claim; false when the sentinel is missing, fresh, or already a real
+	// comment.
+	ReclaimStaleSummaryClaim(ctx context.Context, applyID int64) (bool, error)
+
+	// ReleaseSummaryClaim releases a summary claim this caller won but could not
+	// convert into a posted comment, so a later publisher (or startup
+	// reconciliation) can retry immediately instead of waiting out the stale-
+	// claim window. Deletes only the sentinel form of the marker — a recorded
+	// real comment is never released.
+	ReleaseSummaryClaim(ctx context.Context, applyID int64) error
 }
+
+// SummaryClaimStaleAfter is how long a summary claim sentinel
+// (apply_comments row with github_comment_id = 0) may go without an update
+// before it is considered abandoned by a crashed publisher and becomes
+// reclaimable. Claims are normally held only for the duration of one GitHub
+// post, so anything older than this window is a crash, not a slow post.
+const SummaryClaimStaleAfter = 2 * time.Minute
 
 // PlanCommentStore tracks plan comments posted on PRs so a newer plan comment
 // for the same database can minimize the ones it supersedes. Rows exist only

@@ -746,18 +746,18 @@ var knownOperatorTerminalSummaryFailureReasons = map[string]bool{
 	"callback_error":               true,
 }
 
-// RecordOperatorTerminalSummaryFailure increments the counter for a
-// multi-operation apply whose aggregate terminal summary failed to publish after
-// the projection CAS already terminalized the parent. A spike means terminal PR
-// summaries / check refreshes are being dropped; the parent state itself is
-// already durable, so the expected operator action is to check the GitHub
-// side-effect path (App client, check state) and rely on summary reconciliation.
+// RecordOperatorTerminalSummaryFailure increments the counter for an apply
+// whose aggregate terminal summary failed to publish after the projection CAS
+// already terminalized the parent. A spike means terminal PR summaries / check
+// refreshes are being dropped; the parent state itself is already durable, so
+// the expected operator action is to check the GitHub side-effect path (App
+// client, check state) and rely on summary reconciliation.
 func RecordOperatorTerminalSummaryFailure(ctx context.Context, reason string) {
 	if !knownOperatorTerminalSummaryFailureReasons[reason] {
 		reason = "unknown"
 	}
 	addOperatorCounter(ctx, "terminal_summary_publish_failures_total",
-		"Total number of multi-operation aggregate terminal summary publishes that failed", "{apply}",
+		"Total number of aggregate terminal summary publishes that failed", "{apply}",
 		EnvironmentAttribute(""),
 		attribute.String("reason", reason),
 	)
@@ -1227,6 +1227,20 @@ func RecordWebhookInboxStatsCollectionFailure(ctx context.Context) {
 		"Total number of failed durable webhook inbox metric snapshots", "{failure}",
 		EnvironmentAttribute(""),
 	)
+}
+
+// RecordSummaryCommentRepaired counts terminal summary comments posted by
+// startup reconciliation because no publisher had posted one — the driver's
+// observer lost its lease or crashed, or a claimed publish died before
+// posting. A nonzero rate means terminal summaries are being missed at apply
+// time; investigate the terminal-publish paths (observer lease churn, stop
+// reconciliation, aggregate CAS publisher) for the apply state on the label.
+func RecordSummaryCommentRepaired(ctx context.Context, repo string, applyState string) {
+	addCounter(ctx, "schemabot.webhook.summary_comments_repaired_total",
+		"Total number of missing terminal summary comments posted by startup reconciliation", "{comment}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo),
+		attribute.String("apply_state", applyState))
 }
 
 // RecordWebhookReconcileMissingEvent counts open PR heads the webhook

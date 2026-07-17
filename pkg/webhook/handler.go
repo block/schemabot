@@ -275,9 +275,12 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 				}))
 		}
 
-		// Register the aggregate terminal-summary callback. A multi-operation
-		// apply suppresses the per-driver observer, so its single terminal summary
-		// is published here by the operator that won the aggregate projection CAS.
+		// Register the aggregate terminal-summary callback, invoked by the
+		// operator that won the aggregate projection CAS. A multi-operation apply
+		// suppresses the per-driver observer, so this is its only summary
+		// publisher; a single-operation apply reaches it from paths with no live
+		// observer (stop reconciliation), where the summary-marker claim keeps
+		// the publish exactly-once against any observer still alive.
 		service.OnApplyTerminalSummary = func(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
 			if apply.Repository == "" || apply.PullRequest == 0 || apply.InstallationID == 0 {
 				logger.Debug("aggregate terminal summary skipped: apply has no GitHub destination",
@@ -291,7 +294,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 				return fmt.Errorf("resolve GitHub App client for aggregate terminal summary of apply %s repo %s pr %d: %w",
 					apply.ApplyIdentifier, apply.Repository, apply.PullRequest, err)
 			}
-			logger.Info("publishing aggregate terminal summary for multi-operation apply",
+			logger.Info("publishing aggregate terminal summary",
 				"apply_id", apply.ApplyIdentifier,
 				"repo", apply.Repository,
 				"pr", apply.PullRequest,
@@ -425,8 +428,12 @@ func (h *Handler) clientForRepo(repo string, installationID int64) (*github.Inst
 }
 
 // ReconcileMissingSummaryComments repairs the apply_comments outbox on startup.
-// It finds applies with a progress comment but no summary comment, then posts
-// the missing summary so the PR shows the final result after a restart.
+// It finds recently terminal applies (including stopped) with a progress
+// comment but no summary comment, then posts the missing summary so the PR
+// shows the final result after a restart. Each repair goes through the atomic
+// summary-marker claim, so a publisher racing this reconciler — or another
+// pod's reconciler — still yields exactly one summary; a claim sentinel left
+// by a publisher that crashed before posting is taken over once stale.
 func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 	if h.service == nil {
 		h.logger.Debug("skipping missing summary reconciliation without service")
@@ -448,9 +455,14 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 	h.logger.Info("found applies missing summary comments", "count", len(applies))
 
 	for _, apply := range applies {
+		if !h.claimSummaryForReconciliation(ctx, apply) {
+			continue
+		}
+
 		tasks, err := h.service.Storage().Tasks().GetByApplyID(ctx, apply.ID)
 		if err != nil {
-			h.logger.Error("failed to load tasks for missing summary reconciliation", append(apply.LogAttrs(), "error", err)...)
+			h.logger.Error("failed to load tasks for missing summary reconciliation; releasing summary claim", append(apply.LogAttrs(), "error", err)...)
+			h.releaseSummaryClaim(ctx, apply)
 			continue
 		}
 
@@ -473,7 +485,81 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
 		summaryBase := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, h.deploymentTenant())
 		summaryBody := summaryBase + failureLogsSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
-		h.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply, state.Comment.Summary, summaryBody)
+		h.postClaimedSummaryComment(ctx, apply, summaryBody)
+	}
+}
+
+// claimSummaryForReconciliation acquires the atomic summary-marker claim for a
+// reconciliation repair. A fresh claim wins when no marker exists; when the
+// marker is a claim sentinel left behind by a crashed publisher, the stale
+// takeover path transfers it instead. Losing both means another writer posted
+// or is actively posting the summary, so the repair is skipped.
+func (h *Handler) claimSummaryForReconciliation(ctx context.Context, apply *storage.Apply) bool {
+	won, err := h.service.Storage().ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	if err != nil {
+		h.logger.Error("failed to claim summary comment for reconciliation; apply skipped until next startup",
+			append(apply.LogAttrs(), "error", err)...)
+		return false
+	}
+	if won {
+		return true
+	}
+	reclaimed, err := h.service.Storage().ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	if err != nil {
+		h.logger.Error("failed to reclaim stale summary claim for reconciliation; apply skipped until next startup",
+			append(apply.LogAttrs(), "error", err)...)
+		return false
+	}
+	if !reclaimed {
+		h.logger.Info("summary comment already claimed or posted by another writer; skipping reconciliation for apply",
+			apply.LogAttrs()...)
+		return false
+	}
+	return true
+}
+
+// postClaimedSummaryComment posts a reconciled summary comment under a claim
+// this reconciler holds and records the posted comment ID. A failed post
+// releases the claim so the next startup can retry immediately; a post that
+// lands but fails to record leaves the sentinel to be reclaimed once stale
+// (bounding the duplicate to one).
+func (h *Handler) postClaimedSummaryComment(ctx context.Context, apply *storage.Apply, body string) {
+	client, err := h.clientForRepo(apply.Repository, apply.InstallationID)
+	if err != nil {
+		h.logger.Error("failed to create GitHub client for reconciled summary comment; releasing summary claim",
+			append(apply.LogAttrs(), "error", err)...)
+		h.releaseSummaryClaim(ctx, apply)
+		return
+	}
+
+	commentID, _, err := client.CreateIssueComment(ctx, apply.Repository, apply.PullRequest, h.renderPRComment(body))
+	if err != nil {
+		h.logger.Error("failed to post reconciled summary comment; releasing summary claim",
+			append(apply.LogAttrs(), "error", err)...)
+		h.releaseSummaryClaim(ctx, apply)
+		return
+	}
+
+	metrics.RecordSummaryCommentRepaired(ctx, apply.Repository, apply.State)
+
+	marker := &storage.ApplyComment{
+		ApplyID:         apply.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: commentID,
+	}
+	if err := h.service.Storage().ApplyComments().Upsert(ctx, marker); err != nil {
+		h.logger.Error("posted reconciled summary comment but failed to record its comment ID",
+			append(apply.LogAttrs(), "error", err, "comment_id", commentID)...)
+	}
+}
+
+// releaseSummaryClaim returns a won-but-unused summary claim so a later
+// publisher or the next startup's reconciliation can retry immediately instead
+// of waiting out the stale-claim window.
+func (h *Handler) releaseSummaryClaim(ctx context.Context, apply *storage.Apply) {
+	if err := h.service.Storage().ApplyComments().ReleaseSummaryClaim(ctx, apply.ID); err != nil {
+		h.logger.Error("failed to release summary claim; reconciliation will reclaim it once stale",
+			append(apply.LogAttrs(), "error", err)...)
 	}
 }
 

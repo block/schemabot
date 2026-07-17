@@ -1711,16 +1711,18 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	}, nil
 }
 
-// publishTerminalSummaryIfWon publishes the apply-level terminal summary exactly
-// once, when this drive won the aggregate non-terminal→terminal projection CAS
-// for a multi-operation apply. Single-operation applies (OperationCount <= 1)
-// publish their summary through the per-driver observer and are skipped here, so
-// this is a no-op on the legacy path. Because the parent apply is already
+// publishTerminalSummaryIfWon publishes the apply-level terminal summary when
+// this drive won the aggregate non-terminal→terminal projection CAS, whatever
+// the apply's operation count. A live single-operation drive usually has its
+// per-driver observer publish first, but when no live observer is left — for
+// example stop reconciliation terminalizing an apply whose driver is gone —
+// this is the only publisher; the atomic summary-marker claim inside the
+// publish path keeps the two exactly-once. Because the parent apply is already
 // durably terminal once result.BecameTerminal is true, publishing is best
 // effort: every failure is logged with triage identifiers and counted, never
 // reverted, and left for summary reconciliation to repair.
 func (s *Service) publishTerminalSummaryIfWon(ctx context.Context, driverID int, apply *storage.Apply, result applyProjectionResult) {
-	if !result.BecameTerminal || result.OperationCount <= 1 {
+	if !result.BecameTerminal {
 		return
 	}
 	if s.OnApplyTerminalSummary == nil {
@@ -1781,7 +1783,7 @@ func (s *Service) publishTerminalSummaryIfWon(ctx context.Context, driverID int,
 		metrics.RecordOperatorTerminalSummaryFailure(ctx, "callback_error")
 		return
 	}
-	s.logger.Info("operator: published aggregate terminal summary for multi-operation apply",
+	s.logger.Info("operator: published aggregate terminal summary",
 		"driver", driverID, "apply_id", terminalApply.ApplyIdentifier,
 		"database", terminalApply.Database, "environment", terminalApply.Environment,
 		"derived_state", result.DerivedState, "operation_count", result.OperationCount)

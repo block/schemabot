@@ -2915,6 +2915,102 @@ func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestin
 	assert.Equal(t, githubApply.ApplyIdentifier, applies[0].ApplyIdentifier)
 }
 
+// seedApplyMissingSummary creates a GitHub-backed apply in the given state with
+// a tracked progress comment and no summary marker — the shape
+// FindMissingSummaryComment exists to repair. Terminal states other than
+// stopped stamp completed_at; a stopped apply keeps it NULL (resumable) and
+// must qualify by recency of updated_at instead.
+func seedApplyMissingSummary(t *testing.T, store *Storage, name, applyState string, planID int64) *storage.Apply {
+	t.Helper()
+	ctx := t.Context()
+	lock := createTestLockWithPR(t, store, name+"_db", storage.DatabaseTypeMySQL, "staging", "org/repo", 123)
+	apply := &storage.Apply{
+		ApplyIdentifier: name,
+		LockID:          lock.ID,
+		PlanID:          planID,
+		Database:        lock.DatabaseName,
+		DatabaseType:    lock.DatabaseType,
+		Repository:      lock.Repository,
+		PullRequest:     lock.PullRequest,
+		Environment:     "staging",
+		Caller:          "org/repo#123",
+		InstallationID:  12345,
+		Engine:          storage.EngineSpirit,
+		State:           applyState,
+	}
+	applyID, err := store.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+	if applyState != state.Apply.Stopped {
+		now := time.Now()
+		apply.CompletedAt = &now
+		require.NoError(t, store.Applies().Update(ctx, apply))
+	}
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         apply.ID,
+		CommentState:    state.Comment.Progress,
+		GitHubCommentID: 1001,
+	}))
+	return apply
+}
+
+// TestApplyStore_FindMissingSummaryComment_IncludesRecentlyStoppedApplies
+// verifies stopped applies participate in summary reconciliation: a stop is
+// terminal for summary purposes even though it is resumable and never stamps
+// completed_at, so recency is judged by updated_at. A stopped apply whose last
+// update is older than the reconciliation lookback is left alone.
+func TestApplyStore_FindMissingSummaryComment_IncludesRecentlyStoppedApplies(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	recent := seedApplyMissingSummary(t, store, "apply_stopped_recent", state.Apply.Stopped, 700)
+	stale := seedApplyMissingSummary(t, store, "apply_stopped_stale", state.Apply.Stopped, 701)
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 2 HOUR WHERE id = ?`, stale.ID)
+	require.NoError(t, err)
+
+	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, recent.ApplyIdentifier, applies[0].ApplyIdentifier)
+	assert.Equal(t, state.Apply.Stopped, applies[0].State)
+}
+
+// TestApplyStore_FindMissingSummaryComment_SummaryClaimSentinels verifies the
+// claim-aware missing test: a fresh claim sentinel means a publisher is posting
+// right now, so the apply is not reported; a sentinel stale past
+// storage.SummaryClaimStaleAfter means that publisher crashed before posting,
+// so the apply is reported for repair; and a marker recording a real posted
+// comment never reports.
+func TestApplyStore_FindMissingSummaryComment_SummaryClaimSentinels(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	freshClaim := seedApplyMissingSummary(t, store, "apply_claim_fresh", state.Apply.Completed, 710)
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, freshClaim.ID)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	staleClaim := seedApplyMissingSummary(t, store, "apply_claim_stale", state.Apply.Completed, 711)
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, staleClaim.ID)
+	require.NoError(t, err)
+	require.True(t, won)
+	backdateSummaryClaim(t, staleClaim.ID)
+
+	posted := seedApplyMissingSummary(t, store, "apply_summary_posted", state.Apply.Completed, 712)
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         posted.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 2002,
+	}))
+
+	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, staleClaim.ApplyIdentifier, applies[0].ApplyIdentifier)
+}
+
 func TestApplyStore_GetByPR(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

@@ -1942,23 +1942,38 @@ func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, enviro
 	return scanApplies(rows)
 }
 
-// FindMissingSummaryComment returns GitHub-backed applies that should have a
-// terminal summary comment but only have a progress comment. Used to post missing
-// summaries after restart.
+// FindMissingSummaryComment returns GitHub-backed applies that reached a
+// terminal state recently but whose progress comment was never followed by a
+// summary comment. Used to post missing summaries after restart.
+//
+// Two forms of "missing" qualify: no summary marker at all (the publisher never
+// ran), and a summary claim sentinel (github_comment_id = 0) stale for longer
+// than storage.SummaryClaimStaleAfter (the publisher claimed, then crashed
+// before posting). A fresh sentinel is an in-flight publish and is left alone.
+//
+// Recency is judged per state family: most terminal states stamp completed_at,
+// but a stopped apply is resumable and keeps completed_at NULL, so it qualifies
+// by updated_at instead.
 func (s *applyStore) FindMissingSummaryComment(ctx context.Context) ([]*storage.Apply, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+applyColumnsForApplyAlias+`
 		FROM applies a
 		JOIN apply_comments acp ON acp.apply_id = a.id AND acp.comment_state = 'progress'
 		LEFT JOIN apply_comments acs ON acs.apply_id = a.id AND acs.comment_state = 'summary'
-		WHERE a.state IN (?, ?, ?, ?)
-		  AND a.repository != ''
+		WHERE a.repository != ''
 		  AND a.pull_request > 0
 		  AND a.installation_id > 0
-		  AND a.completed_at > NOW() - INTERVAL 1 HOUR
-		  AND acs.id IS NULL
-		ORDER BY a.completed_at DESC
-	`, state.Apply.Completed, state.Apply.Failed, state.Apply.Reverted, state.Apply.Cancelled)
+		  AND (
+			(a.state IN (?, ?, ?, ?) AND a.completed_at > NOW() - INTERVAL 1 HOUR)
+			OR (a.state = ? AND a.updated_at > NOW() - INTERVAL 1 HOUR)
+		  )
+		  AND (
+			acs.id IS NULL
+			OR (acs.github_comment_id = 0 AND acs.updated_at < NOW() - INTERVAL ? SECOND)
+		  )
+		ORDER BY a.updated_at DESC
+	`, state.Apply.Completed, state.Apply.Failed, state.Apply.Reverted, state.Apply.Cancelled,
+		state.Apply.Stopped, int64(storage.SummaryClaimStaleAfter.Seconds()))
 	if err != nil {
 		return nil, err
 	}

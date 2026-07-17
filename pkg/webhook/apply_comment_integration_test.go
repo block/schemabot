@@ -1151,6 +1151,236 @@ func TestE2EReconcileMissingSummaryCommentsPostsSummary(t *testing.T) {
 	assert.Equal(t, created.ID, summaryComment.GitHubCommentID)
 }
 
+// seedReconcileScenario clears the shared storage rows for a repo, then seeds a
+// GitHub-backed apply in the given state with one task and a tracked progress
+// comment but no summary marker — a restart that lost the terminal summary.
+// Stopped applies keep completed_at NULL (a stop is resumable), matching how
+// stop reconciliation leaves them.
+func seedReconcileScenario(t *testing.T, st storage.Storage, schemabotDB *sql.DB, repo, database, applyState, taskState string) *storage.Apply {
+	t.Helper()
+	ctx := t.Context()
+
+	for _, stmt := range []string{
+		"DELETE FROM apply_comments",
+		"DELETE FROM tasks WHERE repository = ?",
+		"DELETE FROM applies WHERE repository = ?",
+		"DELETE FROM locks WHERE repository = ?",
+	} {
+		args := []any{repo}
+		if stmt == "DELETE FROM apply_comments" {
+			args = nil
+		}
+		_, err := schemabotDB.ExecContext(ctx, stmt, args...)
+		require.NoError(t, err)
+	}
+
+	lock := &storage.Lock{
+		DatabaseName: database,
+		DatabaseType: storage.DatabaseTypeMySQL,
+		Repository:   repo,
+		PullRequest:  44,
+		Owner:        repo + "#44",
+	}
+	require.NoError(t, st.Locks().Acquire(ctx, lock))
+	lock, err := st.Locks().Get(ctx, database, storage.DatabaseTypeMySQL)
+	require.NoError(t, err)
+
+	now := time.Now()
+	startedAt := now.Add(-time.Minute)
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply_reconcile_%s_%d", applyState, now.UnixNano()),
+		LockID:          lock.ID,
+		PlanID:          1,
+		Database:        database,
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Repository:      repo,
+		PullRequest:     44,
+		Environment:     "staging",
+		Caller:          repo + "#44",
+		InstallationID:  12345,
+		Engine:          storage.EngineSpirit,
+		State:           applyState,
+	}
+	applyID, err := st.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+	apply.StartedAt = &startedAt
+	if applyState != state.Apply.Stopped {
+		apply.CompletedAt = &now
+	}
+	require.NoError(t, st.Applies().Update(ctx, apply))
+
+	task := &storage.Task{
+		TaskIdentifier: fmt.Sprintf("task_reconcile_%s_%d", applyState, now.UnixNano()),
+		ApplyID:        applyID,
+		PlanID:         1,
+		Database:       database,
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		Repository:     repo,
+		PullRequest:    44,
+		Environment:    "staging",
+		State:          taskState,
+		TableName:      "reconcile_users",
+		DDL:            "ALTER TABLE reconcile_users ADD COLUMN email VARCHAR(255)",
+		DDLAction:      "alter",
+		RowsCopied:     5,
+		RowsTotal:      10,
+		CreatedAt:      startedAt,
+		UpdatedAt:      now,
+		StartedAt:      &startedAt,
+	}
+	_, err = st.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+
+	require.NoError(t, st.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         applyID,
+		CommentState:    state.Comment.Progress,
+		GitHubCommentID: 9001,
+	}))
+	return apply
+}
+
+// TestE2EReconcileMissingSummaryCommentsRepairsStoppedApply verifies startup
+// reconciliation repairs a stopped apply that lost its terminal summary — the
+// operator stopped the apply (stop reconciliation, driver crash) and no
+// publisher posted the "⏹️ Stopped" summary before the restart. The PR must
+// still get exactly one stopped summary, and the recorded marker must prevent
+// a repeat on the next startup.
+func TestE2EReconcileMissingSummaryCommentsRepairsStoppedApply(t *testing.T) {
+	ctx := t.Context()
+
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
+	st := mysqlstore.New(schemabotDB)
+
+	apply := seedReconcileScenario(t, st, schemabotDB, "org/reconcile-stopped", "e2e_reconcile_stopped_db", state.Apply.Stopped, state.Task.Stopped)
+
+	installClient, capture := setupFakeGitHubForComments(t)
+	factory := &fakeClientFactory{client: installClient}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	svc := api.New(st, &api.ServerConfig{}, map[string]tern.Client{}, logger)
+	t.Cleanup(func() { utils.CloseAndLog(svc) })
+
+	h := NewHandler(svc, factory, nil, logger)
+	h.ReconcileMissingSummaryComments(ctx)
+
+	var created commentCreate
+	select {
+	case created = <-capture.creates:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "timed out waiting for stopped summary comment")
+	}
+	assert.Contains(t, created.Body, "Schema Change Stopped")
+	assert.Contains(t, created.Body, "reconcile_users")
+	assert.Contains(t, created.Body, apply.ApplyIdentifier)
+
+	summaryComment, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summaryComment)
+	assert.Equal(t, created.ID, summaryComment.GitHubCommentID)
+}
+
+// TestE2EReconcileMissingSummaryCommentsRespectsFreshClaim verifies the
+// reconciler defers to an in-flight publisher: an apply whose summary marker is
+// a fresh claim sentinel is being posted right now by another writer, so the
+// reconciler must not post a duplicate and must leave the claim untouched.
+func TestE2EReconcileMissingSummaryCommentsRespectsFreshClaim(t *testing.T) {
+	ctx := t.Context()
+
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
+	st := mysqlstore.New(schemabotDB)
+
+	apply := seedReconcileScenario(t, st, schemabotDB, "org/reconcile-claimed", "e2e_reconcile_claimed_db", state.Apply.Completed, state.Task.Completed)
+
+	won, err := st.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	installClient, capture := setupFakeGitHubForComments(t)
+	factory := &fakeClientFactory{client: installClient}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	svc := api.New(st, &api.ServerConfig{}, map[string]tern.Client{}, logger)
+	t.Cleanup(func() { utils.CloseAndLog(svc) })
+
+	h := NewHandler(svc, factory, nil, logger)
+	h.ReconcileMissingSummaryComments(ctx)
+
+	select {
+	case created := <-capture.creates:
+		t.Fatalf("reconciler must not post while a fresh claim is held, posted: %q", created.Body)
+	default:
+	}
+
+	marker, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, marker)
+	assert.Equal(t, int64(0), marker.GitHubCommentID, "the in-flight claim sentinel must survive reconciliation")
+}
+
+// TestE2EAggregateTerminalObserverClaimsSummaryExactlyOnce verifies the
+// summary-marker claim makes concurrent terminal publishers exactly-once: when
+// two aggregate CAS-winner observers (for example stop reconciliation's
+// publisher racing a still-live driver observer) both reach the terminal
+// summary step for the same apply, exactly one summary comment lands on the PR
+// and the marker records its comment ID.
+func TestE2EAggregateTerminalObserverClaimsSummaryExactlyOnce(t *testing.T) {
+	ctx := t.Context()
+
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
+	st := mysqlstore.New(schemabotDB)
+
+	apply := seedReconcileScenario(t, st, schemabotDB, "org/claim-once", "e2e_claim_once_db", state.Apply.Stopped, state.Task.Stopped)
+	tasks, err := st.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err)
+
+	installClient, capture := setupFakeGitHubForComments(t)
+	factory := &fakeClientFactory{client: installClient}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	newObserver := func() *CommentObserver {
+		return NewAggregateTerminalCommentObserver(CommentObserverConfig{
+			GHClient:       factory,
+			Storage:        st,
+			Repo:           apply.Repository,
+			PR:             apply.PullRequest,
+			InstallationID: apply.InstallationID,
+			ApplyID:        apply.ID,
+			Logger:         logger,
+		})
+	}
+
+	newObserver().OnTerminal(apply, tasks)
+	newObserver().OnTerminal(apply, tasks)
+
+	var created commentCreate
+	select {
+	case created = <-capture.creates:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "timed out waiting for the claimed summary comment")
+	}
+	assert.Contains(t, created.Body, "Schema Change Stopped")
+	assert.Contains(t, created.Body, apply.ApplyIdentifier)
+
+	select {
+	case duplicate := <-capture.creates:
+		t.Fatalf("the second publisher must lose the claim and skip, posted duplicate: %q", duplicate.Body)
+	default:
+	}
+
+	marker, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, marker)
+	assert.Equal(t, created.ID, marker.GitHubCommentID)
+}
+
 // TestE2EApplyCommentUpsertOnResume tests that Start/resume replaces old comment IDs.
 func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 	ctx := t.Context()

@@ -430,3 +430,137 @@ func TestApplyCommentStore_DeleteByApply_DBError(t *testing.T) {
 	err = store.ApplyComments().DeleteByApply(t.Context(), 1)
 	require.Error(t, err)
 }
+
+// TestApplyCommentStore_ClaimSummaryComment verifies the atomic summary-marker
+// claim is first-writer-wins: the first claim inserts the sentinel
+// (github_comment_id = 0) and wins, every later claim for the same apply loses,
+// and a summary marker that already records a real comment also blocks the
+// claim. Claims for different applies are independent.
+func TestApplyCommentStore_ClaimSummaryComment(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_comment_claim", 1)
+	otherLock := createTestLock(t, store, "testdb_other", "mysql", "staging")
+	other := createTestApply(t, store, otherLock, "apply_comment_claim_other", 2)
+
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.True(t, won, "first claim must win")
+
+	claimed, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, int64(0), claimed.GitHubCommentID, "won claim is the sentinel form of the marker")
+
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, won, "second claim for the same apply must lose")
+
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, other.ID)
+	require.NoError(t, err)
+	assert.True(t, won, "claims for different applies are independent")
+
+	// A recorded real comment blocks the claim the same way a sentinel does.
+	require.NoError(t, store.ApplyComments().ReleaseSummaryClaim(ctx, apply.ID))
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9001,
+	}))
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, won, "a posted summary must block the claim")
+}
+
+// TestApplyCommentStore_ReclaimStaleSummaryClaim verifies crashed-publisher
+// takeover: a claim sentinel older than the stale window transfers to the
+// reclaimer (bumping updated_at so a second reclaimer loses), while a fresh
+// sentinel, a missing marker, and a recorded real comment are all not
+// reclaimable.
+func TestApplyCommentStore_ReclaimStaleSummaryClaim(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_comment_reclaim", 1)
+
+	reclaimed, err := store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "missing marker is not reclaimable")
+
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "fresh sentinel is an in-flight publish, not reclaimable")
+
+	// Backdate the sentinel past the stale window to simulate a publisher that
+	// crashed between claiming and posting.
+	backdateSummaryClaim(t, apply.ID)
+
+	reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.True(t, reclaimed, "stale sentinel transfers to the reclaimer")
+
+	reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "a just-reclaimed sentinel is fresh again; a second reclaimer loses")
+
+	// A recorded real comment is never reclaimable, however old.
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9001,
+	}))
+	backdateSummaryClaim(t, apply.ID)
+	reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "a posted summary must never be reclaimed")
+}
+
+// TestApplyCommentStore_ReleaseSummaryClaim verifies release deletes only the
+// sentinel form of the summary marker: a released claim can be re-won, a
+// missing marker releases without error, and a marker recording a real posted
+// comment survives release untouched.
+func TestApplyCommentStore_ReleaseSummaryClaim(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_comment_release", 1)
+
+	require.NoError(t, store.ApplyComments().ReleaseSummaryClaim(ctx, apply.ID), "releasing a missing claim is not an error")
+
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	require.True(t, won)
+	require.NoError(t, store.ApplyComments().ReleaseSummaryClaim(ctx, apply.ID))
+
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.True(t, won, "a released claim must be re-winnable")
+
+	// Convert the claim to a posted summary; release must not delete it.
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9001,
+	}))
+	require.NoError(t, store.ApplyComments().ReleaseSummaryClaim(ctx, apply.ID))
+	posted, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, posted, "a recorded posted summary must survive release")
+	assert.Equal(t, int64(9001), posted.GitHubCommentID)
+}
+
+// backdateSummaryClaim pushes an apply's summary marker updated_at past the
+// stale-claim window, simulating a publisher that crashed after claiming.
+func backdateSummaryClaim(t *testing.T, applyID int64) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(), `
+		UPDATE apply_comments SET updated_at = NOW() - INTERVAL ? SECOND
+		WHERE apply_id = ? AND comment_state = ?
+	`, int64(storage.SummaryClaimStaleAfter.Seconds())+1, applyID, state.Comment.Summary)
+	require.NoError(t, err)
+}

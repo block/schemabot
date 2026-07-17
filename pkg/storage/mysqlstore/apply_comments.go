@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
 )
@@ -214,6 +215,69 @@ func (s *applyCommentStore) ClearPendingFreeze(ctx context.Context, applyID int6
 		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// ClaimSummaryComment atomically claims the terminal summary publish for an
+// apply by inserting the summary marker as a claim sentinel
+// (github_comment_id = 0). The unique key on (apply_id, comment_state) makes
+// this a race-safe first-writer-wins: the insert that lands the row wins the
+// claim; a duplicate-key loss means another writer already claimed or posted
+// the summary. Deliberately lease-agnostic — the claim itself is the
+// exactly-once authority, so a publisher whose apply lease was re-claimed can
+// still win or lose cleanly.
+func (s *applyCommentStore) ClaimSummaryComment(ctx context.Context, applyID int64) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		INSERT IGNORE INTO apply_comments (apply_id, comment_state, github_comment_id)
+		VALUES (?, ?, 0)
+	`, applyID, state.Comment.Summary)
+	if err != nil {
+		return false, fmt.Errorf("claim summary comment for apply %d: %w", applyID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read summary claim rows affected for apply %d: %w", applyID, err)
+	}
+	return rows == 1, nil
+}
+
+// ReclaimStaleSummaryClaim takes over a summary claim sentinel abandoned by a
+// crashed publisher: still github_comment_id = 0 and not updated for at least
+// storage.SummaryClaimStaleAfter. Bumping updated_at transfers ownership, and
+// because concurrent reclaimers race on the same conditional update, exactly
+// one sees an affected row and wins.
+func (s *applyCommentStore) ReclaimStaleSummaryClaim(ctx context.Context, applyID int64) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_comments
+		SET updated_at = NOW()
+		WHERE apply_id = ? AND comment_state = ?
+		  AND github_comment_id = 0
+		  AND updated_at < NOW() - INTERVAL ? SECOND
+	`, applyID, state.Comment.Summary, int64(storage.SummaryClaimStaleAfter.Seconds()))
+	if err != nil {
+		return false, fmt.Errorf("reclaim stale summary claim for apply %d: %w", applyID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read summary claim reclaim rows affected for apply %d: %w", applyID, err)
+	}
+	return rows == 1, nil
+}
+
+// ReleaseSummaryClaim deletes the summary claim sentinel for an apply so a
+// later publisher can retry without waiting out the stale-claim window. Only
+// the sentinel form (github_comment_id = 0) is deleted — a marker that already
+// records a posted comment is never released. A missing sentinel is not an
+// error: the claim may have been converted to a real comment or reclaimed by
+// another writer in the meantime.
+func (s *applyCommentStore) ReleaseSummaryClaim(ctx context.Context, applyID int64) error {
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM apply_comments
+		WHERE apply_id = ? AND comment_state = ? AND github_comment_id = 0
+	`, applyID, state.Comment.Summary)
+	if err != nil {
+		return fmt.Errorf("release summary claim for apply %d: %w", applyID, err)
 	}
 	return nil
 }

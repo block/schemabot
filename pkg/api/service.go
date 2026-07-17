@@ -106,13 +106,15 @@ func (c TernConfig) Endpoint(deployment, environment string) (string, error) {
 type RecoveryCallback func(apply *storage.Apply)
 
 // ApplyTerminalSummaryCallback is called after the operator wins the aggregate
-// non-terminal→terminal projection compare-and-swap for a multi-operation apply.
-// A multi-operation drive owns only its operation and suppresses the per-driver
-// terminal observer, so the apply-level terminal summary is published exactly
-// once, here, by the CAS winner. The apply and tasks are reloaded from storage
-// (the apply at its terminal state, the tasks across every operation) before
-// invocation. Single-operation applies keep publishing via the per-driver
-// observer and never reach this callback.
+// non-terminal→terminal projection compare-and-swap for an apply, whatever its
+// operation count. A multi-operation drive owns only its operation and
+// suppresses the per-driver terminal observer, so its apply-level terminal
+// summary is published only here, by the CAS winner. A single-operation apply
+// usually publishes through its live per-driver observer, but paths with no
+// live observer — stop reconciliation terminalizing an orphaned apply — also
+// publish here; the summary-marker claim inside the publisher keeps the two
+// exactly-once. The apply and tasks are reloaded from storage (the apply at
+// its terminal state, the tasks across every operation) before invocation.
 type ApplyTerminalSummaryCallback func(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error
 
 type pendingObserverKey struct {
@@ -168,10 +170,11 @@ type Service struct {
 	// an observer for PR comments.
 	OnApplyRecovered RecoveryCallback
 
-	// OnApplyTerminalSummary is called after a multi-operation apply is
-	// terminalized by the aggregate projection CAS. Set by the webhook handler to
-	// publish the apply-level terminal PR summary and refresh GitHub check state
-	// exactly once, since multi-operation drives suppress the per-driver observer.
+	// OnApplyTerminalSummary is called after an apply is terminalized by the
+	// aggregate projection CAS. Set by the webhook handler to publish the
+	// apply-level terminal PR summary and refresh GitHub check state; the
+	// summary-marker claim inside the publish path keeps it exactly-once
+	// against any still-live per-driver observer.
 	OnApplyTerminalSummary ApplyTerminalSummaryCallback
 
 	pendingObserverMu sync.Mutex

@@ -195,10 +195,12 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 }
 
 // NewAggregateTerminalCommentObserver builds a one-shot observer for the
-// operator to publish a multi-operation apply's single terminal summary after it
-// won the aggregate projection compare-and-swap. The CAS win — not a parent
-// apply lease — is the authority, so this observer bypasses the per-driver
-// apply-lease checks. Only OnTerminal is meant to be called on it.
+// operator to publish an apply's single terminal summary after it won the
+// aggregate projection compare-and-swap. The CAS win — not a parent apply
+// lease — is the authority for the comment edits, so this observer bypasses
+// the per-driver apply-lease checks; the separate summary post is additionally
+// serialized by the summary-marker claim against any still-live per-driver
+// observer. Only OnTerminal is meant to be called on it.
 func NewAggregateTerminalCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 	o := NewCommentObserver(cfg)
 	o.aggregateTerminalCASWinner = true
@@ -365,7 +367,7 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		// to it rather than post a duplicate, partial summary.
 		if o.shouldPublishSeparateSummary(apply, ops, opsErr) {
 			summaryBody := o.summaryCommentFromOps(ctx, apply, ops, opsErr, tasks, shardsByTable)
-			o.postAndTrackComment(apply, state.Comment.Summary, summaryBody, nil)
+			o.publishClaimedSummary(apply, summaryBody)
 		}
 	}
 
@@ -1010,6 +1012,70 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 
 func (o *CommentObserver) renderPRComment(body string) string {
 	return appendSupportChannelFooter(body, o.supportChannel)
+}
+
+// publishClaimedSummary posts the separate apply-level terminal summary
+// comment under the atomic summary-marker claim. Multiple writers can reach a
+// terminal apply's summary step — the origin driver's observer, the aggregate
+// CAS-winner observer, and stop reconciliation's publisher — so the claim, not
+// the apply lease, is the exactly-once authority here: whichever writer wins
+// the claim posts the one summary, and every loser skips. The storage writes
+// are deliberately lease-free — a writer whose apply lease was re-claimed (for
+// example by stop reconciliation) must still be able to lose the claim cleanly,
+// and the winner must be able to record its post.
+func (o *CommentObserver) publishClaimedSummary(apply *storage.Apply, body string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	won, err := o.stor.ApplyComments().ClaimSummaryComment(ctx, o.applyID)
+	if err != nil {
+		o.logError(apply, "observer: failed to claim terminal summary; summary not posted, left for reconciliation",
+			"error", err)
+		return
+	}
+	if !won {
+		o.logInfo(apply, "observer: terminal summary already claimed or posted by another writer; skipping")
+		return
+	}
+
+	client, err := o.ghClient.ForInstallation(o.installationID)
+	if err != nil {
+		o.logError(apply, "observer: failed to create GitHub client for claimed terminal summary; releasing claim",
+			"error", err)
+		o.releaseSummaryClaim(ctx, apply)
+		return
+	}
+	commentID, _, err := client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(body))
+	if err != nil {
+		o.logError(apply, "observer: failed to post claimed terminal summary; releasing claim",
+			"error", err)
+		o.releaseSummaryClaim(ctx, apply)
+		return
+	}
+
+	marker := &storage.ApplyComment{
+		ApplyID:         o.applyID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: commentID,
+	}
+	if err := o.stor.ApplyComments().Upsert(ctx, marker); err != nil {
+		// The comment is live on the PR but the marker still looks like a claim
+		// sentinel, so once it goes stale, reconciliation will reclaim it and may
+		// post one duplicate — the bounded-duplicate contract for a lost tracking
+		// write.
+		o.logError(apply, "observer: posted terminal summary but failed to record its comment ID",
+			"error", err, "comment_id", commentID)
+	}
+}
+
+// releaseSummaryClaim returns a won-but-unused summary claim so another
+// publisher or startup reconciliation can retry immediately instead of waiting
+// out the stale-claim window.
+func (o *CommentObserver) releaseSummaryClaim(ctx context.Context, apply *storage.Apply) {
+	if err := o.stor.ApplyComments().ReleaseSummaryClaim(ctx, o.applyID); err != nil {
+		o.logError(apply, "observer: failed to release terminal summary claim; reconciliation will reclaim it once stale",
+			"error", err)
+	}
 }
 
 // markSummaryPosted upserts a summary marker record in apply_comments.
