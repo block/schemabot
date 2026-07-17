@@ -630,6 +630,9 @@ func verifyExpectedLockIntent(ctx context.Context, tx *sql.Tx, apply *storage.Ap
 	if apply.ExpectedLockOwner == "" && apply.ExpectedPendingPlanID == "" {
 		return nil
 	}
+	if apply.ExpectedLockOwner == "" || apply.ExpectedPendingPlanID == "" {
+		return fmt.Errorf("verify lock intent for %s/%s: expected lock owner and pending plan ID must both be set", apply.Database, apply.DatabaseType)
+	}
 
 	var lockID int64
 	err := tx.QueryRowContext(ctx, `

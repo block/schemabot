@@ -596,28 +596,34 @@ func TestSchemaPathsChangedSinceMergeBaseFailsWithoutMergeBase(t *testing.T) {
 
 func TestSchemaPathsChangedSinceMergeBaseDetectsSymlinkRetarget(t *testing.T) {
 	client, mux := setupRateLimitedTestGitHubServer(t)
+	var mergeRootRequests, baseRootRequests atomic.Int32
+	var mergeSchemaRequests, baseSchemaRequests atomic.Int32
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-sha...head-sha", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
 			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("merge-base-sha")},
 		}))
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/merge-base-sha", func(w http.ResponseWriter, _ *http.Request) {
+		mergeRootRequests.Add(1)
 		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
 			{Path: new("schema"), Type: new("tree"), SHA: new("merge-schema-tree")},
 		}}))
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/base-sha", func(w http.ResponseWriter, _ *http.Request) {
+		baseRootRequests.Add(1)
 		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
 			{Path: new("schema"), Type: new("tree"), SHA: new("base-schema-tree")},
 		}}))
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/merge-schema-tree", func(w http.ResponseWriter, _ *http.Request) {
+		mergeSchemaRequests.Add(1)
 		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
 			{Path: new("base"), Type: new("tree"), SHA: new("resolved-schema-tree")},
 			{Path: new("production"), Type: new("blob"), Mode: new(gitSymlinkMode), SHA: new("old-link")},
 		}}))
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/base-schema-tree", func(w http.ResponseWriter, _ *http.Request) {
+		baseSchemaRequests.Add(1)
 		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
 			{Path: new("base"), Type: new("tree"), SHA: new("resolved-schema-tree")},
 			{Path: new("production"), Type: new("blob"), Mode: new(gitSymlinkMode), SHA: new("new-link")},
@@ -629,6 +635,10 @@ func TestSchemaPathsChangedSinceMergeBaseDetectsSymlinkRetarget(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.True(t, changed)
+	assert.Equal(t, int32(1), mergeRootRequests.Load())
+	assert.Equal(t, int32(1), baseRootRequests.Load())
+	assert.Equal(t, int32(1), mergeSchemaRequests.Load())
+	assert.Equal(t, int32(1), baseSchemaRequests.Load())
 }
 
 func TestSchemaPathsChangedSinceMergeBaseUsesRootTreeSHA(t *testing.T) {

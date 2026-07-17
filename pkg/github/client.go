@@ -1034,12 +1034,13 @@ func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Conte
 		return false, fmt.Errorf("compare commits %s...%s for %s returned no merge base", baseSHA, headSHA, repo)
 	}
 
+	levelCache := make(map[string][]TreeEntry)
 	for _, schemaPath := range schemaPaths {
-		mergeBaseObjectSHA, mergeBaseObjectType, mergeBaseFound, err := ic.resolveGitObjectSHA(ctx, repo, mergeBaseSHA, schemaPath, nil)
+		mergeBaseObjectSHA, mergeBaseObjectType, mergeBaseFound, err := ic.resolveGitObjectSHA(ctx, repo, mergeBaseSHA, schemaPath, levelCache)
 		if err != nil {
 			return false, fmt.Errorf("resolve schema path %s at merge base %s: %w", schemaPath, mergeBaseSHA, err)
 		}
-		baseObjectSHA, baseObjectType, baseFound, err := ic.resolveGitObjectSHA(ctx, repo, baseSHA, schemaPath, nil)
+		baseObjectSHA, baseObjectType, baseFound, err := ic.resolveGitObjectSHA(ctx, repo, baseSHA, schemaPath, levelCache)
 		if err != nil {
 			return false, fmt.Errorf("resolve schema path %s at base %s: %w", schemaPath, baseSHA, err)
 		}

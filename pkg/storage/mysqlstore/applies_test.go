@@ -67,6 +67,34 @@ func TestApplyStore_CreateRejectsChangedLockIntent(t *testing.T) {
 	assert.Empty(t, applies)
 }
 
+func TestApplyStore_CreateRejectsPartialExpectedLockIntent(t *testing.T) {
+	clearTables(t)
+	store := New(testDB)
+
+	tests := []struct {
+		name          string
+		expectedOwner string
+		expectedPlan  string
+	}{
+		{name: "owner only", expectedOwner: "org/repo#123"},
+		{name: "pending plan only", expectedPlan: "plan-123"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := store.Applies().Create(t.Context(), &storage.Apply{
+				ApplyIdentifier:       "apply_partial_intent_" + strings.ReplaceAll(tt.name, " ", "_"),
+				ExpectedLockOwner:     tt.expectedOwner,
+				ExpectedPendingPlanID: tt.expectedPlan,
+				Database:              "testdb",
+				DatabaseType:          storage.DatabaseTypeMySQL,
+				Environment:           "staging",
+				State:                 state.Apply.Completed,
+			})
+			require.ErrorContains(t, err, "expected lock owner and pending plan ID must both be set")
+		})
+	}
+}
+
 func TestApplyStore_CreateDuplicate(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
