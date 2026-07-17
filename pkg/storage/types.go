@@ -284,6 +284,16 @@ const (
 	ApplyOperationKindGroupFinalizer = "group_finalizer"
 )
 
+// ShardOperationKey builds the operation key for one shard's work on one table
+// ("<namespace>/<shard>/<table>"). It is the canonical key for shard-scoped
+// work operations: the control plane's sharded fan-out stamps it on each
+// per-shard apply_operation, a shard-scoped dispatch stamps it on the data
+// plane's operation row, and the task loaders match shard-tagged task rows
+// against it to distinguish drive tasks from reflected per-shard progress rows.
+func ShardOperationKey(namespace, shard, table string) string {
+	return namespace + "/" + shard + "/" + table
+}
+
 // EngineForType returns the engine name for a database type.
 func EngineForType(dbType string) string {
 	switch dbType {

@@ -1130,7 +1130,7 @@ func buildShardedApplyOperationGroups(
 					if err := validateShardOperationKeyParts(namespace, shard.Shard, ddlChange.Table); err != nil {
 						return nil, err
 					}
-					operationKey := shardOperationKey(namespace, shard.Shard, ddlChange.Table)
+					operationKey := storage.ShardOperationKey(namespace, shard.Shard, ddlChange.Table)
 					if len(operationKey) > applyOperationKeyMaxLen {
 						return nil, fmt.Errorf("operation key for namespace %q shard %q table %q exceeds %d characters", namespace, shard.Shard, ddlChange.Table, applyOperationKeyMaxLen)
 					}
@@ -1223,10 +1223,6 @@ func changingShardsByNamespace(shards []storage.ShardPlan) map[string][]storage.
 		})
 	}
 	return shardsByNamespace
-}
-
-func shardOperationKey(namespace, shard, table string) string {
-	return namespace + "/" + shard + "/" + table
 }
 
 func finalizerOperationKey(namespace string) string {

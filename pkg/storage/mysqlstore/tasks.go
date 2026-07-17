@@ -365,17 +365,30 @@ func (s *taskStore) insertShardTaskGuardedByApply(ctx context.Context, task *sto
 	return nil
 }
 
-// GetByApplyID returns the per-table tasks for an apply. Per-shard detail rows
-// (shard != "") are excluded: they are a reflected read-model written by the
-// operator and must not re-enter the per-table drive/gating/progress pipeline on
-// reload. Read those via GetShardProgressByApplyOperationID.
+// GetByApplyID returns the drive tasks for an apply. Unsharded rows (shard = "")
+// always load. A shard-tagged row loads only when it is the drive task of a
+// shard-scoped work operation — its operation's key matches the row's
+// namespace/shard/table — the same discrimination GetByApplyOperationID applies.
+// Reflected per-shard progress rows (a read-model written by the operator under
+// an operation whose key does not match) are excluded so they never re-enter the
+// per-table drive/gating/progress pipeline on reload. Read those via
+// GetShardProgressByApplyOperationID.
 func (s *taskStore) GetByApplyID(ctx context.Context, applyID int64) ([]*storage.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT `+taskColumns+`
-		FROM tasks
-		WHERE apply_id = ? AND shard = ''
-		ORDER BY created_at DESC
-	`, applyID)
+		SELECT `+prefixedTaskColumns("t")+`
+		FROM tasks t
+		LEFT JOIN apply_operations ao ON ao.id = t.apply_operation_id
+		WHERE t.apply_id = ?
+			AND (
+				t.shard = ''
+				OR (
+					ao.operation_kind = ?
+					-- Keep this in sync with storage.ShardOperationKey's namespace/shard/table format.
+					AND ao.operation_key = CONCAT(t.namespace, '/', t.shard, '/', t.table_name)
+				)
+			)
+		ORDER BY t.created_at DESC
+	`, applyID, storage.ApplyOperationKindWork)
 	if err != nil {
 		return nil, fmt.Errorf("query tasks for apply %d: %w", applyID, err)
 	}
@@ -399,7 +412,7 @@ func (s *taskStore) GetByApplyOperationID(ctx context.Context, applyOperationID 
 				t.shard = ''
 				OR (
 					ao.operation_kind = ?
-					-- Keep this in sync with shardOperationKey's namespace/shard/table format.
+					-- Keep this in sync with storage.ShardOperationKey's namespace/shard/table format.
 					AND ao.operation_key = CONCAT(t.namespace, '/', t.shard, '/', t.table_name)
 				)
 			)

@@ -304,6 +304,76 @@ func TestTaskStore_GetByApplyOperationIDIncludesMatchingShardedWorkTask(t *testi
 	assert.Equal(t, "-80", tasks[0].Shard)
 }
 
+// GetByApplyID is the whole-apply drive loader — an operator claiming a queued
+// apply loads every task it must drive through it. A shard-tagged row loads
+// only when it is the drive task of a sharded work operation (the operation's
+// shard key names the row's namespace/shard/table); unsharded per-table rows
+// always load; reflected per-shard progress rows — shard rows whose operation's
+// key does not match — stay out of the drive pipeline.
+func TestTaskStore_GetByApplyIDIncludesShardScopedDriveTasks(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "resolute", storage.DatabaseTypeStrata, "staging")
+	apply := createTestApply(t, store, lock, "apply_shard_drive_tasks", 1)
+
+	// A sharded work operation: its shard-tagged row for the keyed shard is the
+	// drive task; a sibling shard's row under the same operation is not.
+	shardedOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:       apply.ID,
+		Deployment:    "region-a",
+		OperationKey:  "commerce/-80/users",
+		OperationKind: storage.ApplyOperationKindWork,
+		Target:        "resolute",
+	})
+	require.NoError(t, err)
+
+	// An unsharded operation: its per-table row drives; a shard-tagged row under
+	// it is reflected per-shard progress, not drive work.
+	unshardedOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    apply.ID,
+		Deployment: "region-b",
+		Target:     "resolute",
+	})
+	require.NoError(t, err)
+
+	now := time.Now()
+	createTask := func(identifier string, opID int64, table, shard string) {
+		_, err := store.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier:   identifier,
+			ApplyID:          apply.ID,
+			ApplyOperationID: &opID,
+			PlanID:           apply.PlanID,
+			Database:         apply.Database,
+			DatabaseType:     apply.DatabaseType,
+			Engine:           storage.EngineStrata,
+			Environment:      apply.Environment,
+			State:            state.Task.Pending,
+			Namespace:        "commerce",
+			TableName:        table,
+			Shard:            shard,
+			DDL:              "ALTER TABLE `" + table + "` ADD COLUMN `email` varchar(255)",
+			DDLAction:        "ALTER",
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		})
+		require.NoError(t, err)
+	}
+	createTask("task_users_-80_drive", shardedOpID, "users", "-80")
+	createTask("task_users_80-_reflected", shardedOpID, "users", "80-")
+	createTask("task_orders_drive", unshardedOpID, "orders", "")
+	createTask("task_orders_-80_reflected", unshardedOpID, "orders", "-80")
+
+	tasks, err := store.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err)
+	identifiers := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		identifiers = append(identifiers, task.TaskIdentifier)
+	}
+	assert.ElementsMatch(t, []string{"task_users_-80_drive", "task_orders_drive"}, identifiers)
+}
+
 // An unsharded engine (MySQL/Spirit) uses the empty-string shard sentinel, which
 // preserves today's one-task-per-table behavior.
 func TestTaskStore_UnshardedTaskHasEmptyShard(t *testing.T) {

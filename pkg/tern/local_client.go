@@ -1530,6 +1530,26 @@ func scopedDispatchDDLChanges(changes []*ternv1.TableChange) ([]storage.TableCha
 	return out, nil
 }
 
+// shardScopedDispatchOperationKey builds the operation key for a shard-scoped
+// dispatch's single operation. The control plane's per-shard fan-out dispatches
+// one (namespace, shard, table)'s changes per operation, so every change in the
+// dispatch must agree on namespace and table; a mixed set is a malformed
+// dispatch and fails closed rather than stamping a key that matches only some
+// of the dispatch's tasks.
+func shardScopedDispatchOperationKey(changes []storage.TableChange, shard string) (string, error) {
+	if len(changes) == 0 {
+		return "", fmt.Errorf("shard-scoped dispatch has no ddl changes to key its operation from")
+	}
+	namespace, table := changes[0].Namespace, changes[0].Table
+	for _, ch := range changes[1:] {
+		if ch.Namespace != namespace || ch.Table != table {
+			return "", fmt.Errorf("shard-scoped dispatch mixes tables %s.%s and %s.%s; a dispatch must carry one table's changes for one shard",
+				namespace, table, ch.Namespace, ch.Table)
+		}
+	}
+	return storage.ShardOperationKey(namespace, shard, table), nil
+}
+
 // planForApplyRequest resolves the plan for an apply. It prefers a plan row in
 // this deployment's own storage (the single-deployment path, and the primary
 // deployment of a multi-deployment apply). When no local plan exists, a
@@ -1936,6 +1956,20 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		}
 	}
 
+	// A shard-scoped dispatch tags its tasks with the target shard, so its
+	// operation row must carry the matching shard operation key: the task
+	// loaders treat a shard-tagged row as a drive task only when its operation's
+	// key matches (the convention the control plane's sharded fan-out stamps).
+	// Without the key, the operator's claim would load no drive tasks for the
+	// apply and the dispatched work would never run.
+	operationKey := ""
+	if dispatchShard != "" {
+		operationKey, err = shardScopedDispatchOperationKey(ddlChanges, dispatchShard)
+		if err != nil {
+			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
+		}
+	}
+
 	// Dual-write one apply_operations row alongside the applies row in the
 	// same transaction so every apply created via the Tern client carries a
 	// claimable, resumable operation. CreateWithTasksAndOperations links each
@@ -1947,11 +1981,12 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// apply path), so the store applies its safe defaults (rolling cutover,
 	// halt on failure).
 	operations := []*storage.ApplyOperation{{
-		Deployment: apply.Deployment,
-		Target:     plan.Target,
-		State:      state.ApplyOperation.Pending,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		Deployment:   apply.Deployment,
+		OperationKey: operationKey,
+		Target:       plan.Target,
+		State:        state.ApplyOperation.Pending,
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}}
 
 	applyID, err := c.storage.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, operations)
