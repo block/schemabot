@@ -1356,7 +1356,10 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		// schema changes that never ran, and the unloaded rows would keep
 		// blocking their database as active work. Count the raw rows — the same
 		// "owns any task work" predicate the operator's claim gate uses — and
-		// fail closed on any mismatch, including count uncertainty.
+		// refuse completion on any mismatch. A failed count also refuses
+		// completion, but surfaces as a storage error rather than
+		// ErrApplyTasksNotLoaded so triage can tell a storage failure apart
+		// from an ownership mismatch.
 		totalTaskRows, err := c.storage.Tasks().CountByApplyID(ctx, apply.ID)
 		if err != nil {
 			return fmt.Errorf("count task rows for apply %s before task-less completion: %w", apply.ApplyIdentifier, err)

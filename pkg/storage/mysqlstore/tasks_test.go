@@ -129,7 +129,7 @@ func TestTaskStore_CountByApplyID(t *testing.T) {
 			State:            state.Task.Pending,
 			TableName:        table,
 			Shard:            shard,
-			DDL:              "ALTER TABLE " + table + " ADD COLUMN email VARCHAR(255)",
+			DDL:              "ALTER TABLE `" + table + "` ADD COLUMN `email` varchar(255)",
 			DDLAction:        "ALTER",
 			CreatedAt:        now,
 			UpdatedAt:        now,
