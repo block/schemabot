@@ -79,6 +79,8 @@ func previewCommentAllOutput() {
 		{"VOLUME COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted()) }},
 		{"VOLUME COMMAND INVALID LEVEL", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel()) }},
 		{"VOLUME CHANGED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeSupersededProgress()) }},
+		{"RESUMED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentResumeSupersededProgress()) }},
+		{"RETRY: SUPERSEDED PROGRESS COMMENT (GENERIC)", func() { fmt.Print(webhooktemplates.PreviewCommentSupersededProgress()) }},
 		{"SUMMARY: COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompleted()) }},
 		{"SUMMARY: FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailed()) }},
 		{"SUMMARY: STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryStopped()) }},
@@ -88,6 +90,8 @@ func previewCommentAllOutput() {
 		{"SUMMARY: FAILED (LARGE)", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailedLarge()) }},
 		{"SUMMARY: MULTI-NAMESPACE FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryMultiNamespaceFailed()) }},
 		{"SUMMARY: MULTI-NAMESPACE COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryMultiNamespaceCompleted()) }},
+		{"ROLLBACK STATUS: RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackStatus()) }},
+		{"SUMMARY: ROLLBACK COMPLETE", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackSummaryCompleted()) }},
 	}
 
 	for i, s := range sections {
@@ -130,6 +134,8 @@ func previewApplyCommandAllOutput() {
 		{"VOLUME COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted()) }},
 		{"VOLUME COMMAND INVALID LEVEL", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel()) }},
 		{"VOLUME CHANGED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeSupersededProgress()) }},
+		{"RESUMED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentResumeSupersededProgress()) }},
+		{"RETRY: SUPERSEDED PROGRESS COMMENT (GENERIC)", func() { fmt.Print(webhooktemplates.PreviewCommentSupersededProgress()) }},
 		{"CHECKS GATE: NOT PASSING", func() {
 			fmt.Print(webhooktemplates.RenderApplyBlockedByNonPassingChecks("staging", []webhooktemplates.BlockingCheck{
 				{Name: "CI / unit-tests", State: "failure"},
@@ -265,6 +271,8 @@ func previewCommentApplyFlowAllOutput() {
 		{"VOLUME COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted()) }},
 		{"VOLUME COMMAND INVALID LEVEL", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel()) }},
 		{"VOLUME CHANGED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeSupersededProgress()) }},
+		{"RESUMED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentResumeSupersededProgress()) }},
+		{"RETRY: SUPERSEDED PROGRESS COMMENT (GENERIC)", func() { fmt.Print(webhooktemplates.PreviewCommentSupersededProgress()) }},
 		// Summaries
 		{"SUMMARY: COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompleted()) }},
 		{"SUMMARY: FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailed()) }},
@@ -276,6 +284,8 @@ func previewCommentApplyFlowAllOutput() {
 		{"SUMMARY: FAILED (LARGE)", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailedLarge()) }},
 		{"SUMMARY: MULTI-NAMESPACE FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryMultiNamespaceFailed()) }},
 		{"SUMMARY: MULTI-NAMESPACE COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryMultiNamespaceCompleted()) }},
+		{"ROLLBACK STATUS: RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackStatus()) }},
+		{"SUMMARY: ROLLBACK COMPLETE", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackSummaryCompleted()) }},
 	}
 	printSections(sections)
 }

@@ -120,6 +120,11 @@ type ChecksScanResponse struct {
 	CheckNames []string `json:"check_names"`
 	Scanned    int      `json:"scanned"`
 	NextPage   int      `json:"next_page,omitempty"`
+	// ChecksDisabled reports that this repository has Check Run publishing
+	// turned off (enable_checks: false), so the scan was skipped: every open
+	// PR would trivially be missing a check the server refuses to create.
+	// When set, no PRs were scanned and the other fields are zero.
+	ChecksDisabled bool `json:"checks_disabled,omitempty"`
 	// EstimatedOpenPRs is the repository's total open-PR count as GitHub
 	// reports it for this page's listing — an upper bound while more pages
 	// remain, exact on the final page. Recomputed every page so the caller
@@ -150,7 +155,14 @@ type GitHubRateLimit struct {
 // ChecksReposResponse lists the repositories declared in the server's repos
 // config — the inventory a fleet-wide scan iterates.
 type ChecksReposResponse struct {
+	// Repos are the declared repositories with Check Run publishing enabled —
+	// the ones a checks scan or backfill can act on.
 	Repos []string `json:"repos"`
+	// Disabled are declared repositories with Check Run publishing turned off
+	// (enable_checks: false). A scan of these would report every open PR as
+	// missing a check that the server refuses to create; callers skip them
+	// and report the skip to the operator.
+	Disabled []string `json:"disabled,omitempty"`
 }
 
 // ChecksSynthesizeRequest asks the server to recreate missing Check Runs for

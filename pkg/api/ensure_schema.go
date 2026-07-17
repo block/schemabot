@@ -8,12 +8,15 @@ import (
 	"sort"
 	"time"
 
+	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/schema"
 )
@@ -29,6 +32,23 @@ import (
 // storage uninitialized.
 const EnsureSchemaTimeout = 5 * time.Minute
 
+// EnsureSchemaOption customizes EnsureSchema behavior.
+type EnsureSchemaOption func(*ensureSchemaOptions)
+
+type ensureSchemaOptions struct {
+	allowDestructive bool
+}
+
+// WithAllowDestructiveSchemaChanges controls whether EnsureSchema may execute
+// destructive DDL (DROP TABLE, or an ALTER TABLE containing DROP COLUMN)
+// against the storage database. It defaults to false: destructive statements
+// are refused and skipped whole — including additive clauses in a mixed
+// ALTER TABLE — while the remaining non-destructive statements still apply.
+// Wire this from StorageConfig.AllowDestructiveSchemaChanges.
+func WithAllowDestructiveSchemaChanges(allow bool) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) { o.allowDestructive = allow }
+}
+
 // EnsureSchema applies all embedded MySQL schema files to the database using Spirit.
 // It is idempotent - no changes are made if the schema is already up-to-date.
 // Uses the same differ/Spirit mechanism as LocalClient for consistency.
@@ -39,7 +59,22 @@ const EnsureSchemaTimeout = 5 * time.Minute
 // MySQL advisory lock to serialize cleanup and Spirit execution, then re-plans
 // under the lock to confirm changes are still needed (another pod may have
 // applied them while we waited for the lock).
-func EnsureSchema(dsn string, logger *slog.Logger) error {
+//
+// Destructive statements in the diff (DROP TABLE, or an ALTER TABLE containing
+// DROP COLUMN) are refused unless WithAllowDestructiveSchemaChanges(true) is
+// set. Refusal skips the statement whole (an ALTER TABLE that mixes additive
+// clauses with a DROP COLUMN is not rewritten — its additive clauses are
+// skipped with it), applies the remaining non-destructive statements,
+// and lets startup proceed — a deliberate exception to fail-closed, because
+// failing here would crash-loop every pod running an older binary during a
+// rolling deploy or rollback where a storage table or column was legitimately
+// removed. The invariant is that an old binary can never destroy newer schema
+// state: the surplus table or column stays in place until an operator opts in.
+func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) error {
+	var o ensureSchemaOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), EnsureSchemaTimeout)
 	defer cancel()
 
@@ -151,7 +186,33 @@ func EnsureSchema(dsn string, logger *slog.Logger) error {
 		return nil
 	}
 
-	tableChanges := planResult.FlatTableChanges()
+	changes := planResult.Changes
+	if !o.allowDestructive {
+		allowed, refused, err := partitionDestructiveChanges(changes)
+		if err != nil {
+			return fmt.Errorf("classify storage schema changes: %w", err)
+		}
+		for _, r := range refused {
+			logger.Warn("refusing destructive storage-schema change; the statement will not run and startup continues — set storage.allow_destructive_schema_changes: true to allow it",
+				"database", "schemabot",
+				"table", r.change.Table,
+				"operation", ddl.StatementTypeToOp(r.change.Operation),
+				"reason", r.reason,
+				"ddl", r.change.DDL,
+			)
+			metrics.RecordStorageSchemaDestructiveRefusal(ctx, r.change.Table, ddl.StatementTypeToOp(r.change.Operation))
+		}
+		if len(allowed) == 0 {
+			logger.Warn("all planned storage schema changes are destructive and refused; storage schema left unchanged",
+				"database", "schemabot",
+				"refused_count", len(refused),
+			)
+			return nil
+		}
+		changes = allowed
+	}
+
+	tableChanges := flatTableChanges(changes)
 	logger.Info("applying storage schema changes", "ddl_count", len(tableChanges))
 	for _, tc := range tableChanges {
 		logger.Info("schema change",
@@ -165,7 +226,7 @@ func EnsureSchema(dsn string, logger *slog.Logger) error {
 	applyStart := time.Now()
 	_, err = eng.Apply(ctx, &engine.ApplyRequest{
 		Database:    "schemabot",
-		Changes:     planResult.Changes,
+		Changes:     changes,
 		Credentials: &engine.Credentials{DSN: dsn},
 	})
 	if err != nil {
@@ -236,6 +297,93 @@ func ensureSchemaTimeoutError(ctx context.Context, ddlCount int, logger *slog.Lo
 	)
 	return fmt.Errorf("storage schema change did not complete within %s (%d change(s)); the database may be throttling the online DDL: %w",
 		EnsureSchemaTimeout, ddlCount, ctx.Err())
+}
+
+// refusedStorageChange is a planned storage-schema statement EnsureSchema
+// refused to execute, with the reason it was classified as destructive.
+type refusedStorageChange struct {
+	change engine.TableChange
+	reason string
+}
+
+// partitionDestructiveChanges splits planned storage-schema changes into the
+// statements safe to execute and the destructive statements to refuse. A
+// statement is refused whole: an ALTER TABLE that mixes additive clauses with
+// a DROP COLUMN is not rewritten, because executing a partial statement would
+// diverge from the plan Spirit produced.
+func partitionDestructiveChanges(changes []engine.SchemaChange) (allowed []engine.SchemaChange, refused []refusedStorageChange, err error) {
+	for _, sc := range changes {
+		kept := sc
+		kept.TableChanges = nil
+		for _, tc := range sc.TableChanges {
+			destructive, reason, err := isDestructiveStorageStatement(tc.DDL)
+			if err != nil {
+				return nil, nil, fmt.Errorf("classify storage schema change for table %q (%s): %w", tc.Table, tc.DDL, err)
+			}
+			if destructive {
+				// The caller logs each refusal with the exact DDL and reason.
+				refused = append(refused, refusedStorageChange{change: tc, reason: reason})
+				continue
+			}
+			kept.TableChanges = append(kept.TableChanges, tc)
+		}
+		if len(kept.TableChanges) > 0 {
+			allowed = append(allowed, kept)
+		}
+	}
+	return allowed, refused, nil
+}
+
+// isDestructiveStorageStatement reports whether a storage-schema DDL statement
+// destroys existing data: DROP TABLE, or an ALTER TABLE containing a DROP
+// COLUMN clause. The Spirit diff emits these when the live storage database
+// holds a table or column the starting binary's embedded schema does not
+// declare — during a rolling deploy or rollback that surplus state usually
+// belongs to a newer binary, not to a removal the operator intended.
+func isDestructiveStorageStatement(stmt string) (bool, string, error) {
+	stmtType, _, err := ddl.ClassifyStatement(stmt)
+	if err != nil {
+		return false, "", fmt.Errorf("classify statement: %w", err)
+	}
+	switch stmtType {
+	case statement.StatementDropTable:
+		return true, "DROP TABLE removes the table and its data", nil
+	case statement.StatementAlterTable:
+		return alterDropsColumn(stmt)
+	default:
+		return false, "", nil
+	}
+}
+
+// alterDropsColumn reports whether an ALTER TABLE statement contains a DROP
+// COLUMN clause, and names the first dropped column when it does.
+func alterDropsColumn(stmt string) (bool, string, error) {
+	parsed, err := statement.New(stmt)
+	if err != nil {
+		return false, "", fmt.Errorf("parse ALTER TABLE statement: %w", err)
+	}
+	if len(parsed) != 1 {
+		return false, "", fmt.Errorf("expected exactly 1 parsed ALTER TABLE statement, got %d", len(parsed))
+	}
+	alterStmt, ok := (*parsed[0].StmtNode).(*ast.AlterTableStmt)
+	if !ok {
+		return false, "", fmt.Errorf("statement is not ALTER TABLE: %s", stmt)
+	}
+	for _, spec := range alterStmt.Specs {
+		if spec.Tp == ast.AlterTableDropColumn {
+			return true, fmt.Sprintf("DROP COLUMN `%s` removes the column and its data", spec.OldColumnName.Name.String()), nil
+		}
+	}
+	return false, "", nil
+}
+
+// flatTableChanges returns all table changes across the given schema changes.
+func flatTableChanges(changes []engine.SchemaChange) []engine.TableChange {
+	var tables []engine.TableChange
+	for _, sc := range changes {
+		tables = append(tables, sc.TableChanges...)
+	}
+	return tables
 }
 
 func staleSpiritTableNames(ctx context.Context, dsn string) ([]string, error) {

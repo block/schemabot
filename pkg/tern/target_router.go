@@ -139,12 +139,19 @@ func (r *TargetRouter) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*te
 	if req == nil {
 		return nil, fmt.Errorf("apply request is required")
 	}
-	// An apply executes a previously created plan, so the plan is authoritative
-	// for routing: it carries the execution target, namespace, type, and
-	// environment chosen at plan time. Derive the route from the plan and reject
-	// a request that contradicts it. Never treat req.Database as the target — the
-	// opaque execution target and the schema namespace are distinct, and that is
-	// the whole point of this router.
+	// An apply executes a previously created plan, so a locally stored plan is
+	// authoritative for routing: it carries the execution target, namespace,
+	// type, and environment chosen at plan time. Derive the route from the plan
+	// and reject a request that contradicts it. Never treat req.Database as the
+	// target — the opaque execution target and the schema namespace are
+	// distinct, and that is the whole point of this router.
+	//
+	// A non-primary deployment of a multi-deployment environment never planned
+	// locally — the plan row lives on the primary deployment's Tern — so no
+	// local plan exists here. The dispatch request carries the plan's
+	// authoritative DDL changes and schema files, so routing proceeds on the
+	// request's own route fields and the deployment-local client materializes
+	// (and re-verifies against the live schema) the plan before applying.
 	target := req.Target
 	if target == "" && req.Options != nil {
 		target = req.Options["target"]
@@ -158,20 +165,30 @@ func (r *TargetRouter) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*te
 		if err != nil {
 			return nil, fmt.Errorf("load plan %q for apply target routing: %w", req.PlanId, err)
 		}
-		if plan == nil {
-			return nil, fmt.Errorf("plan %q not found for apply target routing", req.PlanId)
-		}
-		if target, err = planAuthoritativeField("target", req.PlanId, target, plan.Target); err != nil {
-			return nil, err
-		}
-		if namespace, err = planAuthoritativeField("database", req.PlanId, namespace, plan.Database); err != nil {
-			return nil, err
-		}
-		if databaseType, err = planAuthoritativeField("type", req.PlanId, databaseType, plan.DatabaseType); err != nil {
-			return nil, err
-		}
-		if environment, err = planAuthoritativeField("environment", req.PlanId, environment, plan.Environment); err != nil {
-			return nil, err
+		switch {
+		case plan != nil:
+			if target, err = planAuthoritativeField("target", req.PlanId, target, plan.Target); err != nil {
+				return nil, err
+			}
+			if namespace, err = planAuthoritativeField("database", req.PlanId, namespace, plan.Database); err != nil {
+				return nil, err
+			}
+			if databaseType, err = planAuthoritativeField("type", req.PlanId, databaseType, plan.DatabaseType); err != nil {
+				return nil, err
+			}
+			if environment, err = planAuthoritativeField("environment", req.PlanId, environment, plan.Environment); err != nil {
+				return nil, err
+			}
+		case applyRequestCarriesPlanPayload(req):
+			r.logger.Info("apply target routing: no local plan; routing dispatch by request fields so the deployment-local client can materialize the plan",
+				"plan_id", req.PlanId,
+				"database", namespace,
+				"database_type", databaseType,
+				"environment", environment,
+				"target", target,
+			)
+		default:
+			return nil, fmt.Errorf("plan %q not found for apply target routing and the request carries no DDL changes or schema files to materialize it", req.PlanId)
 		}
 	}
 	if target == "" {
@@ -195,6 +212,14 @@ func (r *TargetRouter) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*te
 	}
 	routedReq.Options["target"] = resolved.Target
 	return client.Apply(ctx, routedReq)
+}
+
+// applyRequestCarriesPlanPayload reports whether a dispatched apply request
+// carries the plan's authoritative content — DDL changes or schema files —
+// which lets a deployment that never planned locally materialize the plan
+// before applying.
+func applyRequestCarriesPlanPayload(req *ternv1.ApplyRequest) bool {
+	return len(req.DdlChanges) > 0 || len(req.SchemaFiles) > 0
 }
 
 // planAuthoritativeField resolves one routing field where the stored plan is

@@ -46,6 +46,12 @@ type MultiDeploymentApplyData struct {
 	// pasteable command hint so copied commands address this deployment in
 	// tenant mode. Empty on single-tenant deployments, leaving hints unchanged.
 	Tenant string
+
+	// Rollback reports whether this apply reverts a previously applied schema
+	// change (the apply's durable rollback option). It switches the aggregate
+	// headline vocabulary from "apply" to "rollback", matching the
+	// single-deployment comment.
+	Rollback bool
 }
 
 // RenderMultiDeploymentApplyComment renders the PR comment for an apply that
@@ -63,7 +69,7 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 
 	// Aggregate header: the stable in-place status title, identical to the
 	// single-deployment comment so the headline vocabulary stays shared.
-	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment})
+	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeAggregateMetadata(&sb, data, renderedAt)
 	writeDeploymentCounts(&sb, data.Model.Counts)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
@@ -94,7 +100,7 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 func RenderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData) string {
 	var sb strings.Builder
 
-	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment})
+	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeAggregateMetadata(&sb, data, currentTimestamp())
 	writeDeploymentCounts(&sb, data.Model.Counts)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)

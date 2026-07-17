@@ -1446,6 +1446,43 @@ func PreviewCommentVolumeSupersededProgress() string {
 	})
 }
 
+// PreviewCommentResumeSupersededProgress renders an old progress comment after
+// a resume froze it: the final pre-stop progress collapses into a details
+// block under a pointer to the fresh comment now tracking the apply.
+func PreviewCommentResumeSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.Stopped
+	table.RowsCopied = 2300000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 32
+	data := sampleSingleApplyData(state.Apply.Stopped, table)
+	return RenderResumeSupersededProgressComment(ResumeSupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
+// PreviewCommentSupersededProgress renders an old progress comment after a
+// freeze retry folded it without knowing which rotation superseded it: the
+// final progress collapses into a details block under a pointer to the fresh
+// comment now tracking the apply.
+func PreviewCommentSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.Stopped
+	table.RowsCopied = 2300000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 32
+	data := sampleSingleApplyData(state.Apply.Stopped, table)
+	return RenderSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
 // PreviewCommentApplySingleCompleted renders a single-table apply completed.
 func PreviewCommentApplySingleCompleted() string {
 	table := sampleSingleTable()
@@ -1497,6 +1534,40 @@ func PreviewCommentSummaryCompleted() string {
 		tables[i].Status = state.Task.Completed
 	}
 	return RenderApplySummaryComment(sampleSummaryData(state.Apply.Completed, tables))
+}
+
+// sampleRollbackTables returns reverse-DDL table rows for rollback previews.
+func sampleRollbackTables(status string) []TableProgressData {
+	return []TableProgressData{
+		{
+			Namespace: "testapp",
+			TableName: "users",
+			DDL:       "ALTER TABLE `users` DROP INDEX `idx_email`",
+			Status:    status,
+		},
+	}
+}
+
+// PreviewCommentRollbackStatus renders the in-place status comment for a
+// running rollback apply — the headline carries rollback vocabulary for the
+// apply's whole lifetime.
+func PreviewCommentRollbackStatus() string {
+	tables := sampleRollbackTables(state.Task.Running)
+	tables[0].RowsCopied = 45000
+	tables[0].RowsTotal = 100000
+	tables[0].PercentComplete = 45
+	data := sampleApplyData(state.Apply.Running, tables)
+	data.Rollback = true
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentRollbackSummaryCompleted renders the terminal summary for a
+// completed rollback apply — announced as a rollback, never as an applied
+// schema change.
+func PreviewCommentRollbackSummaryCompleted() string {
+	data := sampleSummaryData(state.Apply.Completed, sampleRollbackTables(state.Task.Completed))
+	data.Rollback = true
+	return RenderApplySummaryComment(data)
 }
 
 // PreviewCommentSummaryCompletedVitessDDLWithVSchema renders a completed Vitess

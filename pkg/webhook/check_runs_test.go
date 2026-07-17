@@ -442,6 +442,53 @@ func TestRespondToUnscoped(t *testing.T) {
 		assert.Contains(t, rr.Body.String(), "unscoped command skipped")
 	})
 
+	t.Run("invalid environment value skipped when respond_to_unscoped is false", func(t *testing.T) {
+		service := api.New(nil, &api.ServerConfig{
+			RespondToUnscoped: &falseVal,
+			Repos:             map[string]api.RepoConfig{},
+		}, nil, testLogger())
+
+		h := &Handler{
+			service: service,
+			logger:  testLogger(),
+		}
+
+		req := buildWebhookRequest(t, webhookPayloadOpts{
+			comment: "schemabot apply -e production--allow-unsafe",
+			isPR:    true,
+		}, nil)
+
+		rr := httpResponseRecorder()
+		h.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "unscoped command skipped")
+	})
+
+	t.Run("unknown environment skipped when respond_to_unscoped is false", func(t *testing.T) {
+		service := api.New(nil, &api.ServerConfig{
+			RespondToUnscoped:   &falseVal,
+			AllowedEnvironments: []string{"staging"},
+			Repos:               map[string]api.RepoConfig{},
+		}, nil, testLogger())
+
+		h := &Handler{
+			service: service,
+			logger:  testLogger(),
+		}
+
+		req := buildWebhookRequest(t, webhookPayloadOpts{
+			comment: "schemabot apply -e prodction",
+			isPR:    true,
+		}, nil)
+
+		rr := httpResponseRecorder()
+		h.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "unscoped command skipped")
+	})
+
 	t.Run("targeted command skipped by non-matching tenant", func(t *testing.T) {
 		service := api.New(nil, &api.ServerConfig{
 			Tenant:            "alpha",

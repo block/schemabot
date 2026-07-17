@@ -11,6 +11,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	otelmetric "go.opentelemetry.io/otel/metric"
+
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // Meter name used for all SchemaBot metrics.
@@ -36,6 +38,24 @@ func addCounter(ctx context.Context, name, description, unit string, attrs ...at
 		return
 	}
 	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
+}
+
+// addCounterN increments a named Int64Counter by n with the given attributes,
+// logging and skipping if the instrument cannot be created. n <= 0 is a no-op.
+func addCounterN(ctx context.Context, n int64, name, description, unit string, attrs ...attribute.KeyValue) {
+	if n <= 0 {
+		return
+	}
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter(name,
+		otelmetric.WithDescription(description),
+		otelmetric.WithUnit(unit),
+	)
+	if err != nil {
+		slog.Warn("failed to create counter", "metric", name, "error", err)
+		return
+	}
+	counter.Add(ctx, n, otelmetric.WithAttributes(attrs...))
 }
 
 // addUpDownCounter adjusts a named Int64UpDownCounter by delta with the given
@@ -355,6 +375,22 @@ func RecordSourcePolicyBlock(ctx context.Context, operation, database, environme
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
 		attribute.String("reason", reason),
+	)
+}
+
+// RecordStorageSchemaDestructiveRefusal increments the counter for destructive
+// storage-schema DDL statements EnsureSchema refused to execute at startup.
+// A nonzero rate means a starting binary's embedded schema no longer declares
+// a table or column that exists in the storage database — expected briefly
+// from older pods during a rolling deploy or rollback. Operator action: if the
+// removal is intended and every pod runs a binary without the table or column,
+// set storage.allow_destructive_schema_changes to true for one deploy;
+// otherwise investigate which binary is starting against newer storage state.
+func RecordStorageSchemaDestructiveRefusal(ctx context.Context, table, operation string) {
+	addCounter(ctx, "schemabot.storage_schema.destructive_refusals_total",
+		"Total destructive storage-schema DDL statements refused by EnsureSchema", "{statement}",
+		attribute.String("table", table),
+		attribute.String("operation", operation),
 	)
 }
 
@@ -1129,6 +1165,91 @@ func RecordUnregisteredRepositoryWebhook(ctx context.Context, appName, eventType
 	addCounter(ctx, "schemabot.webhook.unregistered_repository_ignored_total",
 		"Total number of GitHub webhook events ignored because the repository is not configured", "{event}",
 		attrs...)
+}
+
+// knownWebhookInboxStates allowlists the canonical durable webhook inbox states
+// so the depth gauge's cardinality stays bounded. It is derived from the
+// storage state list so the two cannot drift; an unrecognized value is folded to
+// "unknown".
+var knownWebhookInboxStates = func() map[string]bool {
+	states := make(map[string]bool, len(storage.WebhookEventStatesAll))
+	for _, state := range storage.WebhookEventStatesAll {
+		states[state] = true
+	}
+	return states
+}()
+
+// RecordWebhookInboxDepth records the number of durable webhook inbox rows in a
+// given state. A rising pending/processing depth means dispatch is falling
+// behind ingestion; a rising failed_retryable depth means deliveries are
+// retrying; a rising completed/failed depth means terminal rows are accumulating
+// and retention has not reclaimed them.
+func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
+	if !knownWebhookInboxStates[state] {
+		state = "unknown"
+	}
+	recordGauge(ctx, "schemabot.webhook.inbox_depth", count,
+		"Number of durable webhook inbox rows by state", "{row}",
+		EnvironmentAttribute(""),
+		attribute.String("state", state),
+	)
+}
+
+// RecordWebhookInboxOldestClaimableAge records how long the oldest
+// ready-to-claim-but-unclaimed inbox row has been waiting, in seconds. It is the
+// inbox's backlog latency: a value climbing past the dispatch cadence means work
+// is acked but not being picked up.
+func RecordWebhookInboxOldestClaimableAge(ctx context.Context, age time.Duration) {
+	recordGauge(ctx, "schemabot.webhook.inbox_oldest_claimable_age_seconds", int64(age.Seconds()),
+		"Age in seconds of the oldest ready-to-claim durable webhook inbox row", "s",
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordWebhookInboxStuckProcessing records the number of inbox rows wedged in
+// processing with an expired lease at the attempt cap — deliveries no driver can
+// reclaim. A nonzero value means auto-plans are being lost to crashes
+// mid-processing until the reconciler terminalizes them.
+func RecordWebhookInboxStuckProcessing(ctx context.Context, count int64) {
+	recordGauge(ctx, "schemabot.webhook.inbox_stuck_processing", count,
+		"Number of durable webhook inbox rows stuck in processing past the attempt cap", "{row}",
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordWebhookInboxStatsCollectionFailure counts failed inbox snapshots. The
+// inbox depth/backlog gauges are last-value instruments, so a failed snapshot
+// leaves them frozen at their last-good values — indistinguishable from a
+// healthy inbox. This counter is the liveness signal for the gauges: a nonzero
+// rate means the depth/backlog/stuck values are stale and must not be trusted.
+func RecordWebhookInboxStatsCollectionFailure(ctx context.Context) {
+	addCounter(ctx, "schemabot.webhook.inbox_stats_collection_failures",
+		"Total number of failed durable webhook inbox metric snapshots", "{failure}",
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordWebhookReconcileMissingEvent counts open PR heads the webhook
+// reconciler found with no corresponding inbox delivery. A nonzero rate means
+// deliveries are being lost upstream of the inbox (edge auth, GitHub send
+// failures) — the divergence signal that report-only reconciliation exists to
+// surface.
+func RecordWebhookReconcileMissingEvent(ctx context.Context, repo string) {
+	addCounter(ctx, "schemabot.webhook.reconcile_missing_events_total",
+		"Total number of open PR heads found without a webhook inbox delivery", "{event}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo))
+}
+
+// RecordWebhookReconcileStuckTerminated counts webhook inbox rows the
+// reconciler terminated because they were parked in processing with an expired
+// lease at the attempt cap — a driver hard-killed on its final attempt. A
+// nonzero rate means deliveries are being lost to crashes mid-processing; each
+// terminated row emits as a failure and becomes eligible for redelivery.
+func RecordWebhookReconcileStuckTerminated(ctx context.Context, count int64) {
+	addCounterN(ctx, count, "schemabot.webhook.reconcile_stuck_terminated_total",
+		"Total number of stuck processing webhook inbox rows terminated by the reconciler", "{event}",
+		EnvironmentAttribute(""))
 }
 
 var knownStatusCheckOperations = map[string]bool{

@@ -3,11 +3,13 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -233,9 +235,10 @@ func startEnsureSchemaContainer(t *testing.T, ctx context.Context) (testcontaine
 }
 
 // A deployment that predates this change still has a live vitess_tasks table.
-// Now that the embedded schema no longer declares it, EnsureSchema must
-// reconcile the obsolete table away cleanly — succeeding, removing it, and
-// staying idempotent on the next run.
+// Now that the embedded schema no longer declares it, an operator who opts in
+// to destructive storage-schema changes can have EnsureSchema reconcile the
+// obsolete table away cleanly — succeeding, removing it, and staying
+// idempotent on the next run.
 func TestEnsureSchema_RemovesObsoleteVitessTasks(t *testing.T) {
 	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -254,9 +257,125 @@ func TestEnsureSchema_RemovesObsoleteVitessTasks(t *testing.T) {
 	require.True(t, testutil.TableExists(t, db, "schemabot", "vitess_tasks"))
 
 	// EnsureSchema reconciles the obsolete table away without error...
-	require.NoError(t, EnsureSchema(dsn, logger), "EnsureSchema with an obsolete vitess_tasks table failed")
+	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+		"EnsureSchema with an obsolete vitess_tasks table failed")
 	assert.False(t, testutil.TableExists(t, db, "schemabot", "vitess_tasks"), "obsolete vitess_tasks should be removed")
 
 	// ...and the next run is a clean no-op.
-	require.NoError(t, EnsureSchema(dsn, logger), "second EnsureSchema not idempotent")
+	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+		"second EnsureSchema not idempotent")
+}
+
+// seedSurplusStorageState simulates storage state written by a newer binary:
+// a column and a table that exist in the live storage database but that the
+// starting binary's embedded schema does not declare. The Spirit diff turns
+// each into destructive DDL (ALTER ... DROP COLUMN and DROP TABLE).
+func seedSurplusStorageState(t *testing.T, db *sql.DB) (surplusColumn, surplusTable string) {
+	t.Helper()
+	surplusColumn = "newer_binary_col"
+	surplusTable = "newer_binary_feature"
+
+	_, err := db.ExecContext(t.Context(),
+		fmt.Sprintf("ALTER TABLE `tasks` ADD COLUMN `%s` varchar(64) DEFAULT NULL", surplusColumn))
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(),
+		fmt.Sprintf("CREATE TABLE `%s` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", surplusTable))
+	require.NoError(t, err)
+	return surplusColumn, surplusTable
+}
+
+// During a rolling deploy or rollback, an older binary's pod starts against a
+// storage database that a newer binary already converged: the database holds a
+// column and a table the older binary's embedded schema does not declare. By
+// default EnsureSchema must refuse the destructive statements the diff emits
+// for that surplus state (so the old binary cannot destroy the newer schema),
+// warn with the exact DDL, and still apply the additive changes the older
+// binary needs — startup proceeds either way.
+func TestEnsureSchema_RefusesDestructiveChangesByDefault(t *testing.T) {
+	ctx := t.Context()
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	container, dsn, db := startEnsureSchemaContainer(t, ctx)
+	defer func() { _ = container.Terminate(t.Context()) }()
+	defer utils.CloseAndLog(db)
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+	surplusColumn, surplusTable := seedSurplusStorageState(t, db)
+
+	// Give EnsureSchema additive work alongside the destructive diff: drop an
+	// embedded table so the diff must re-create it.
+	_, err := db.ExecContext(ctx, "DROP TABLE `locks`")
+	require.NoError(t, err)
+
+	require.NoError(t, EnsureSchema(dsn, logger),
+		"EnsureSchema with a destructive diff must not fail startup")
+
+	// The additive change applied; the surplus state survived.
+	assert.True(t, testutil.TableExists(t, db, "schemabot", "locks"),
+		"additive CREATE TABLE should still be applied when destructive changes are refused")
+	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", surplusColumn),
+		"surplus column from the newer schema must not be dropped by default")
+	assert.True(t, testutil.TableExists(t, db, "schemabot", surplusTable),
+		"surplus table from the newer schema must not be dropped by default")
+
+	// Each refusal is logged with the exact DDL so an operator can see what was
+	// skipped and how to opt in.
+	logs := logBuf.String()
+	assert.Contains(t, logs, "refusing destructive storage-schema change")
+	assert.Contains(t, logs, "allow_destructive_schema_changes")
+	assert.Contains(t, logs, "DROP COLUMN")
+	assert.Contains(t, logs, surplusColumn)
+	assert.Contains(t, logs, "DROP TABLE")
+	assert.Contains(t, logs, surplusTable)
+
+	// A repeat run keeps refusing without error or changes.
+	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema with refused changes failed")
+	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", surplusColumn))
+	assert.True(t, testutil.TableExists(t, db, "schemabot", surplusTable))
+}
+
+// An operator who intentionally removed a storage table and column opts in to
+// destructive storage-schema changes; EnsureSchema then executes the DROP
+// statements and converges the database to the embedded schema.
+func TestEnsureSchema_AllowDestructiveExecutesDrops(t *testing.T) {
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	container, dsn, db := startEnsureSchemaContainer(t, ctx)
+	defer func() { _ = container.Terminate(t.Context()) }()
+	defer utils.CloseAndLog(db)
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+	surplusColumn, surplusTable := seedSurplusStorageState(t, db)
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+		"EnsureSchema with destructive changes allowed failed")
+
+	assert.False(t, testutil.ColumnExists(t, db, "schemabot", "tasks", surplusColumn),
+		"surplus column should be dropped when destructive changes are allowed")
+	assert.False(t, testutil.TableExists(t, db, "schemabot", surplusTable),
+		"surplus table should be dropped when destructive changes are allowed")
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+		"second EnsureSchema not idempotent")
+}
+
+// syncBuffer is an io.Writer safe for concurrent log writes from EnsureSchema
+// and Spirit's background goroutines.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

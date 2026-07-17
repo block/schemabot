@@ -3085,6 +3085,80 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="resumed-superseded-progress-comment"></a><strong>Resumed: Superseded Progress Comment</strong></summary>
+
+
+▶️ Schema change resumed — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the stop</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Stopped
+
+**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 32%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+Rows: 2,300,000 / 7,200,000
+
+
+---
+
+Paused — to resume from where it stopped:
+```
+schemabot start apply-a1b2c3d4e5f6 -e staging
+```
+
+
+</details>
+
+</details>
+
+<details>
+<summary><a name="retry-superseded-progress-comment-generic"></a><strong>Retry: Superseded Progress Comment (Generic)</strong></summary>
+
+
+⏭️ Progress comment superseded — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Earlier progress</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Stopped
+
+**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 32%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+Rows: 2,300,000 / 7,200,000
+
+
+---
+
+Paused — to resume from where it stopped:
+```
+schemabot start apply-a1b2c3d4e5f6 -e staging
+```
+
+
+</details>
+
+</details>
+
+<details>
 <summary><a name="summary-completed"></a><strong>Summary: Completed</strong></summary>
 
 
@@ -3567,6 +3641,64 @@ ALTER TABLE `addresses` ADD INDEX `idx_zip`(`zip_code`);
 **`events`**
 ```sql
 ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+</details>
+
+</details>
+
+<details>
+<summary><a name="rollback-status-running"></a><strong>Rollback Status: Running</strong></summary>
+
+
+## Rollback Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
+
+**Schema `testapp`**
+
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 45%
+
+```sql
+ALTER TABLE `users` DROP INDEX `idx_email`;
+```
+Rows: 45,000 / 100,000
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="summary-rollback-complete"></a><strong>Summary: Rollback Complete</strong></summary>
+
+
+## ⏪ Rollback Complete — Staging
+
+**Database**: `testapp`
+
+
+> Rolled back successfully — the schema change has been reverted.
+
+<details><summary>Apply details (1 table)</summary>
+
+_Apply ID: `apply-a1b2c3d4e5f6`_
+
+
+**`users`**
+```sql
+ALTER TABLE `users` DROP INDEX `idx_email`;
 ```
 
 </details>
@@ -5623,6 +5755,82 @@ schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
+
+</details>
+
+<details>
+<summary><a name="resumed-superseded-progress-comment"></a><strong>Resumed: Superseded Progress Comment</strong></summary>
+
+
+▶️ Schema change resumed — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the stop</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Stopped
+
+**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 32%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+Rows: 2,300,000 / 7,200,000
+
+
+---
+
+Paused — to resume from where it stopped:
+```
+schemabot start apply-a1b2c3d4e5f6 -e staging
+```
+
+
+</details>
+
+
+</details>
+
+<details>
+<summary><a name="retry-superseded-progress-comment-generic"></a><strong>Retry: Superseded Progress Comment (Generic)</strong></summary>
+
+
+⏭️ Progress comment superseded — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Earlier progress</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Stopped
+
+**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 32%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+Rows: 2,300,000 / 7,200,000
+
+
+---
+
+Paused — to resume from where it stopped:
+```
+schemabot start apply-a1b2c3d4e5f6 -e staging
+```
 
 
 </details>

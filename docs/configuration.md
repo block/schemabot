@@ -12,7 +12,9 @@
 - [Environment Order](#environment-order)
 - [Hybrid Mode](#hybrid-mode)
 - [Drivers](#drivers)
+- [Metrics](#metrics)
 - [Pending Drops](#pending-drops)
+- [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
 - [Repository Allowlist](#repository-allowlist)
 - [PR Checks Gate](#pr-checks-gate)
@@ -275,6 +277,16 @@ Increase `drivers` when one SchemaBot server should make operator progress acros
 
 A driver claim means selecting one stale apply and refreshing its heartbeat in the same storage transaction. That heartbeat refresh is the driver's lease while it reloads state and drives the apply to a terminal state.
 
+## Metrics
+
+SchemaBot serves Prometheus metrics at `/metrics` on a dedicated HTTP listener, separate from the API port. A separate port lets scrapers reach metrics without traversing the API port's transport security — for example when a service mesh proxy terminates mutual TLS on the API port — and keeps the endpoint off any externally routed surface.
+
+```yaml
+metrics_port: 9102
+```
+
+The listener binds `:9102` by default; set `metrics_port` to move it. The API port (the `PORT` environment variable) does not serve `/metrics`.
+
 **Sizing:** each driver drives one claimed apply synchronously to a terminal state, and that includes waiting states such as deferred cutovers and revert windows, so a server's effective apply concurrency is `drivers × replicas`. Size that product to the number of applies you expect to be in flight at once, counting parked ones — a deferred cutover holds its driver for the full wait. A control plane that dispatches to remote servers bounds end-to-end concurrency with its own driver pool the same way.
 
 ## Pending Drops
@@ -307,6 +319,36 @@ The cleaner only runs against local-mode MySQL databases (environments with a
 process has no target DSN and cannot clean that target. Cleanup runs only if the
 remote deployment is also a SchemaBot server with the target configured as
 local-mode MySQL and `cleanup_enabled: true`.
+
+## Storage Schema Changes
+
+SchemaBot's internal storage schema is self-bootstrapping: on every startup,
+`EnsureSchema` diffs the embedded schema files against the live storage
+database and applies whatever DDL is needed before the server accepts traffic.
+
+By default, destructive statements in that diff — `DROP TABLE`, or an
+`ALTER TABLE` containing `DROP COLUMN` — are refused and skipped whole (a
+mixed `ALTER TABLE` is not rewritten, so its additive clauses are skipped with
+it), while the remaining non-destructive statements still apply and startup
+proceeds. This protects
+against rolling deploys and rollbacks: a pod running an older binary sees a
+newer binary's tables and columns as surplus, and without the gate would drop
+them (destroying data the newer pods depend on). Each refused statement is
+logged at warn level with the exact DDL, and counted in the
+`schemabot.storage_schema.destructive_refusals_total` metric.
+
+To intentionally remove a storage table or column, first make sure every
+running pod is on a binary whose embedded schema no longer declares it, then
+opt in:
+
+```yaml
+storage:
+  dsn: "env:SCHEMABOT_DSN"
+  allow_destructive_schema_changes: true  # default: false
+```
+
+Leave the flag false during normal operation and revert it after the removal
+converges.
 
 ## Support Channel
 
@@ -468,7 +510,7 @@ By default (`auth.type: none` or unset) the SchemaBot API is unauthenticated —
 - **Read tier** — visibility: `status`, `progress`, `logs`, `locks` (list), history, database discovery, and `pull` (read a live schema).
 - **Write tier** — anything that stages or makes a change: `plan`, `apply`, controls (`stop`/`start`/`cutover`/`volume`/`revert`/`skip-revert`/`rollback`), `unlock`, and settings mutation. `plan` is a write because it stages a change against a database.
 
-Any unclassified `/api` route is treated as write (fail-closed). The `/webhook` and health/metrics endpoints are exempt — webhooks authenticate themselves via HMAC. Two authenticators are available.
+Any unclassified `/api` route is treated as write (fail-closed). The `/webhook` and health endpoints are exempt — webhooks authenticate themselves via HMAC. Prometheus metrics are served on a dedicated listener (see [Metrics](#metrics)), not on the API port. Two authenticators are available.
 
 ### OIDC (Bearer tokens)
 
@@ -589,6 +631,20 @@ gate and cannot be hidden from the passing-checks gate. When the passing-checks
 gate sees an aggregate-named check from an untrusted app, it blocks as usual
 and emits a warning log and metric so operators can distinguish a check-name
 spoof from a chain member missing from the list.
+
+**Command routing across instances.** Every instance receives every PR comment
+through its own App's webhook. A command whose `-e` value is in the instance's
+`allowed_environments` is handled; one owned by a peer instance is silently
+left for that peer to answer. An `-e` value that names no configured
+environment — whether malformed (typically a flag glued on by a missing
+space, like `-e production--allow-unsafe`) or simply absent from
+`allowed_environments`, `environment_order`, and every database's routing
+environments — belongs to no instance, so it is rejected with an
+invalid-environment comment listing the configured environments. The
+rejection follows the `respond_to_unscoped` policy so exactly one instance
+responds, and is acknowledged with an eyes reaction. Because
+`environment_order` doubles as the fleet-wide environment roster for this
+routing decision, keep it complete on every instance.
 
 ### Environment-local gRPC targets
 

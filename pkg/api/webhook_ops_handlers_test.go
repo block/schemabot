@@ -634,23 +634,98 @@ func TestExecuteChecksScanRejectsInvalidUpdatedSince(t *testing.T) {
 	assert.Contains(t, err.Error(), "updated_since")
 }
 
-// The repos inventory returns the declared repos config sorted, and a legacy
-// single-App config (which declares no repos) is a request error telling the
-// operator to name a repository — a fleet sweep cannot guess what to scan.
+// The repos inventory splits the declared repos config into scannable repos
+// and repos with Check Run publishing turned off, both sorted — a fleet sweep
+// scans the former and reports the latter as skipped. A legacy single-App
+// config (which declares no repos) is a request error telling the operator to
+// name a repository — a fleet sweep cannot guess what to scan.
 func TestExecuteChecksRepos(t *testing.T) {
 	t.Parallel()
 
+	checksOff := false
 	cfg := &ServerConfig{
-		Apps:  map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
-		Repos: map[string]RepoConfig{"octo/zebra": {GitHubApp: "main"}, "octo/alpha": {GitHubApp: "main"}},
+		Apps: map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+		Repos: map[string]RepoConfig{
+			"octo/zebra":    {GitHubApp: "main"},
+			"octo/alpha":    {GitHubApp: "main"},
+			"octo/no-check": {GitHubApp: "main", EnableChecks: &checksOff},
+		},
 	}
 	response, err := executeChecksRepos(cfg)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"octo/alpha", "octo/zebra"}, response.Repos)
+	assert.Equal(t, []string{"octo/no-check"}, response.Disabled)
 
 	_, err = executeChecksRepos(&ServerConfig{GitHub: GitHubConfig{AppID: "1", PrivateKey: "key"}})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "declares no repos config")
+}
+
+// A repository whose Check Run publishing is turned off ends up entirely in
+// the disabled list; the response says explicitly that nothing is scannable
+// instead of erroring, so a fleet sweep reports the skips and finishes clean.
+func TestExecuteChecksReposAllDisabled(t *testing.T) {
+	t.Parallel()
+
+	checksOff := false
+	cfg := &ServerConfig{
+		Apps: map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+		Repos: map[string]RepoConfig{
+			"octo/one": {GitHubApp: "main", EnableChecks: &checksOff},
+			"octo/two": {GitHubApp: "main", EnableChecks: &checksOff},
+		},
+	}
+	response, err := executeChecksRepos(cfg)
+	require.NoError(t, err)
+	assert.Empty(t, response.Repos)
+	assert.Equal(t, []string{"octo/one", "octo/two"}, response.Disabled)
+}
+
+// Synthesize against a repository with Check Run publishing turned off skips
+// every requested PR without touching GitHub or the auto-plan flow: the
+// publisher would refuse the checks anyway, and replaying auto-plans would
+// leave plan comments as the only side effect. A skip outcome, not an error,
+// so a fleet sweep that includes a disabled repo keeps going.
+func TestExecuteChecksSynthesizeSkipsRepoWithChecksDisabled(t *testing.T) {
+	t.Parallel()
+
+	checksOff := false
+	cfg := &ServerConfig{
+		Apps:  map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+		Repos: map[string]RepoConfig{"octo/repo": {GitHubApp: "main", EnableChecks: &checksOff}},
+	}
+	backfiller := &fakeCheckRunBackfiller{}
+
+	response, err := executeChecksSynthesize(t.Context(), cfg, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1, 2}}, discardLogger())
+	require.NoError(t, err)
+	assert.Empty(t, backfiller.calls)
+	require.Len(t, response.Results, 2)
+	for i, pr := range []int{1, 2} {
+		assert.Equal(t, pr, response.Results[i].PR)
+		assert.Equal(t, checksDisabledSkipOutcome, response.Results[i].Outcome)
+		assert.Empty(t, response.Results[i].Error)
+	}
+}
+
+// Scanning a repository with Check Run publishing turned off reports the repo
+// as disabled instead of scanning: every open PR would trivially be missing a
+// check the server refuses to create. A normal response, not an error, so a
+// fleet sweep that includes a disabled repo keeps going.
+func TestExecuteChecksScanSkipsRepoWithChecksDisabled(t *testing.T) {
+	t.Parallel()
+
+	checksOff := false
+	cfg := &ServerConfig{
+		Apps:  map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+		Repos: map[string]RepoConfig{"octo/repo": {GitHubApp: "main", EnableChecks: &checksOff}},
+	}
+
+	response, err := executeChecksScan(t.Context(), cfg, ChecksScanRequest{Repo: "octo/repo"}, discardLogger())
+	require.NoError(t, err)
+	assert.True(t, response.ChecksDisabled)
+	assert.Equal(t, "octo/repo", response.Repo)
+	assert.Zero(t, response.Scanned)
+	assert.Empty(t, response.Missing)
 }
 
 // A missing check whose name is already taken by an untrusted app's Check Run

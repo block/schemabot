@@ -604,10 +604,15 @@ instance scans with its own GitHub App credentials, its own `repos:` config,
 its own `allowed_environments`, and its own storage, so one run converges only
 the checks that instance owns:
 
-- **Repositories.** `--repo` scans one repository; `--all-repos` scans every
-  repository declared in the instance's `repos:` config. A legacy single-App
-  config declares no repos, so there `--all-repos` is rejected and repositories
-  must be named explicitly.
+- **Repositories.** Naming a repository (`schemabot checks backfill
+  <owner/name>`) scans just that one; `--all-repos` scans every repository
+  declared in the instance's `repos:` config. A legacy single-App config
+  declares no repos, so there `--all-repos` is rejected and repositories must
+  be named explicitly. Repositories with `enable_checks: false` are skipped,
+  not scanned — the server refuses to create their checks, so every open PR
+  would trivially read as missing one. The skip is reported, never an error:
+  an `--all-repos` sweep keeps going, and naming a disabled repository
+  explicitly reports it as skipped with the reason instead of scanning it.
 - **Apps.** Each repository resolves to the GitHub App that owns it (see
   [Multi-App Routing](configuration.md#multi-app-routing)); the scan and the
   recreated Check Runs both use that App's installation. An instance hosting

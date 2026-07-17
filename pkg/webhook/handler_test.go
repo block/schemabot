@@ -420,6 +420,104 @@ func TestWebhookMissingEnvForApply(t *testing.T) {
 	}
 }
 
+// A malformed -e value — typically a flag glued onto the environment by a
+// missing space — can never match any instance's allowed environments, so the
+// command is rejected with a usage comment and an eyes acknowledgment rather
+// than left unanswered.
+func TestWebhookInvalidEnvValue(t *testing.T) {
+	h, comments, reactions := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e production--allow-unsafe",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "invalid environment value")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Invalid Environment")
+		assert.Contains(t, body, "**Available environments**: `production`, `staging`")
+		assert.Contains(t, body, "schemabot apply -e <environment>")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the invalid environment comment")
+	}
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the acknowledgment reaction")
+	}
+}
+
+// In an environment-isolated deployment, an environment no instance handles
+// is rejected with an eyes acknowledgment and an invalid-environment comment
+// listing the configured environments, instead of every instance silently
+// deferring to a peer that does not exist.
+func TestWebhookUnknownEnvironmentRejected(t *testing.T) {
+	h, comments, reactions := newTestHandler(t)
+	h.service.Config().AllowedEnvironments = []string{"staging"}
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e prodction",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "unknown environment")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Invalid Environment")
+		assert.Contains(t, body, "`staging`")
+		assert.Contains(t, body, "`production`")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the invalid environment comment")
+	}
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the acknowledgment reaction")
+	}
+}
+
+// An environment owned by a peer instance stays silent here: the peer
+// processes the command from its own webhook delivery, and a reaction or
+// comment from this instance would be noise next to the peer's real response.
+func TestWebhookPeerEnvironmentStaysSilent(t *testing.T) {
+	h, comments, reactions := newTestHandler(t)
+	h.service.Config().AllowedEnvironments = []string{"staging"}
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e production",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "environment handled by another instance")
+
+	select {
+	case body := <-comments:
+		t.Fatalf("unexpected comment posted for a peer-owned environment: %s", body)
+	case reaction := <-reactions:
+		t.Fatalf("unexpected reaction for a peer-owned environment: %s", reaction)
+	default:
+	}
+}
+
 func TestWebhookYesFlagRejectedOnNonApply(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 

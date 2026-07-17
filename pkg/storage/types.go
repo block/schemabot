@@ -1293,6 +1293,35 @@ const (
 	WebhookEventFailed          = "failed"
 )
 
+// WebhookEventStatesAll lists every canonical webhook inbox state, ordered from
+// earliest to terminal. Use it to enumerate states for metrics and stats so a
+// series is always present even when a state is momentarily empty.
+var WebhookEventStatesAll = []string{
+	WebhookEventPending,
+	WebhookEventProcessing,
+	WebhookEventFailedRetryable,
+	WebhookEventCompleted,
+	WebhookEventFailed,
+}
+
+// WebhookInboxStats is a point-in-time snapshot of the durable webhook inbox
+// used for steady-state observability.
+type WebhookInboxStats struct {
+	// CountsByState is the number of rows in each state. Every canonical state
+	// is present, defaulting to 0, so a gauge series never disappears when a
+	// state momentarily empties.
+	CountsByState map[string]int64
+
+	// OldestClaimableAge is how long the oldest ready-to-claim-but-unclaimed row
+	// (pending, or retryable with an elapsed retry window) has been waiting. It
+	// is the inbox's backlog latency; zero when nothing is waiting.
+	OldestClaimableAge time.Duration
+
+	// StuckProcessing is the number of rows wedged in processing with an expired
+	// lease at the attempt cap — deliveries a driver can no longer reclaim.
+	StuckProcessing int64
+}
+
 // WebhookEvent is a durable inbox row for one SCM/webhook delivery.
 type WebhookEvent struct {
 	ID             int64

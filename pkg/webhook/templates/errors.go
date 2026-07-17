@@ -177,6 +177,35 @@ func RenderInvalidCommand() string {
 	return "## ❌ Invalid Command\n\nThat command wasn't recognized. Available commands:\n\n" + commandReference()
 }
 
+// RenderInvalidEnv generates an error message when the -e value does not name
+// a configured environment — whether malformed (e.g. a flag glued onto the
+// value by a missing space) or simply not an environment any instance
+// handles. The configured environment names are normalized for markdown
+// display so an unexpected character cannot break the comment.
+func RenderInvalidEnv(action string, available []string) string {
+	quoted := make([]string, len(available))
+	for i, name := range available {
+		quoted[i] = markdownInlineCode(name)
+	}
+	availableLine := ""
+	if len(quoted) > 0 {
+		availableLine = "\n**Available environments**: " + strings.Join(quoted, ", ") + "\n"
+	}
+	return fmt.Sprintf(`## ❌ Invalid Environment
+
+`+"`-e`"+` must name one of the configured environments.
+%s
+**Usage**: `+"`schemabot %s -e <environment> [flags]`", availableLine, action)
+}
+
+// markdownInlineCode renders a value as a markdown inline code span,
+// normalizing characters that would break the span: backticks are stripped
+// and whitespace (including newlines) collapses to single spaces.
+func markdownInlineCode(s string) string {
+	s = strings.ReplaceAll(s, "`", "")
+	return "`" + strings.Join(strings.Fields(s), " ") + "`"
+}
+
 // RenderMissingEnv generates an error message when -e flag is missing.
 func RenderMissingEnv(action string) string {
 	return fmt.Sprintf(`## ❌ Missing Argument

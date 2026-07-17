@@ -154,6 +154,7 @@ services:
       - ./config:/config:ro
     ports:
       - "${SCHEMABOT_PORT:-13380}:8080"
+      - "${SCHEMABOT_METRICS_PORT:-13386}:9102"
     depends_on:
       schemabot-mysql:
         condition: service_healthy

@@ -1936,3 +1936,71 @@ func TestRenderApplyStatusComment_RevertWindowDeadline(t *testing.T) {
 	pastDue.RevertExpiresAt = time.Now().Add(-1 * time.Minute).UTC().Format(time.RFC3339)
 	assert.NotContains(t, RenderApplyStatusComment(pastDue), "Closes in")
 }
+
+// TestRenderApplyStatusComment_Rollback verifies that a rollback apply's
+// in-place status comment uses rollback vocabulary: the stable headline reads
+// "Rollback Status" for the apply's whole lifetime, and the Status line reads
+// "Rolled Back" once it completes, so a PR reader always sees the comment as
+// reverting a change rather than applying one.
+func TestRenderApplyStatusComment_Rollback(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Running,
+		Rollback:    true,
+		Tables: []TableProgressData{
+			{TableName: "users", DDL: "ALTER TABLE `users` DROP INDEX `idx_email`", Status: "running"},
+		},
+	}
+
+	running := RenderApplyStatusComment(data)
+	assert.Contains(t, running, "## Rollback Status")
+	assert.Contains(t, running, "— Staging")
+	assert.NotContains(t, running, "Schema Change Status")
+
+	data.State = state.Apply.Completed
+	completed := RenderApplyStatusComment(data)
+	assert.Contains(t, completed, "## Rollback Status")
+	assert.Contains(t, completed, "**Status**: Rolled Back")
+	assert.NotContains(t, completed, "**Status**: Applied")
+}
+
+// TestRenderApplySummaryComment_Rollback verifies the terminal summary for a
+// rollback apply: a completed rollback is announced as "Rollback Complete" with
+// a rewind emoji and revert wording — never as a green-check applied schema
+// change — and a failed rollback is announced as "Rollback Failed". The
+// vocabulary switch must not drop the collapsible apply details: the apply ID
+// and the reverse DDL statements stay in the comment for triage.
+func TestRenderApplySummaryComment_Rollback(t *testing.T) {
+	data := ApplyStatusCommentData{
+		ApplyID:     "apply-123",
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Completed,
+		Rollback:    true,
+		Tables: []TableProgressData{
+			{TableName: "users", DDL: "ALTER TABLE `users` DROP INDEX `idx_email`", Status: "completed"},
+		},
+	}
+
+	completed := RenderApplySummaryComment(data)
+	assert.Contains(t, completed, "## ⏪ Rollback Complete")
+	assert.Contains(t, completed, "— Staging")
+	assert.Contains(t, completed, "Rolled back successfully — the schema change has been reverted.")
+	assert.NotContains(t, completed, "Schema Change Applied")
+	assert.Contains(t, completed, "<details><summary>Apply details (1 table)</summary>")
+	assert.Contains(t, completed, "_Apply ID: `apply-123`_")
+	assert.Contains(t, completed, "ALTER TABLE `users` DROP INDEX `idx_email`")
+
+	plural := data
+	plural.Tables = append(plural.Tables,
+		TableProgressData{TableName: "orders", DDL: "ALTER TABLE `orders` DROP INDEX `idx_user_id`", Status: "completed"})
+	assert.Contains(t, RenderApplySummaryComment(plural),
+		"Rolled back successfully — the schema changes have been reverted.")
+
+	data.State = state.Apply.Failed
+	data.ErrorMessage = "copy interrupted"
+	failed := RenderApplySummaryComment(data)
+	assert.Contains(t, failed, "## ❌ Rollback Failed")
+	assert.NotContains(t, failed, "Schema Change Failed")
+}

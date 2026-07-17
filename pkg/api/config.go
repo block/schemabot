@@ -108,6 +108,14 @@ type ServerConfig struct {
 	// SKIP LOCKED to prevent races. Defaults to DefaultDrivers.
 	Drivers int `yaml:"drivers"`
 
+	// MetricsPort is the TCP port of the dedicated HTTP listener serving
+	// Prometheus metrics at /metrics. Metrics are served on their own listener —
+	// not on the main API port — so scrapers can reach them without traversing
+	// the API port's transport security (for example a service mesh proxy
+	// terminating mutual TLS on the API port). Defaults to DefaultMetricsPort.
+	// Read via MetricsListenPort.
+	MetricsPort int `yaml:"metrics_port,omitempty"`
+
 	// OperatorClaimOperations switches drivers to claim work at the
 	// apply_operations (per-deployment) level via FindNextApplyOperation instead
 	// of the apply level via FindNextApply. While every apply still owns exactly
@@ -363,6 +371,18 @@ type StorageConfig struct {
 	// DSNFrom builds the MySQL connection string from separate database config
 	// and password references. It is mutually exclusive with DSN.
 	DSNFrom *DSNFromConfig `yaml:"dsn_from,omitempty"`
+
+	// AllowDestructiveSchemaChanges permits EnsureSchema to execute destructive
+	// DDL (DROP TABLE, or an ALTER TABLE containing DROP COLUMN) when converging
+	// the storage schema at startup. Default false: destructive statements are
+	// refused and skipped whole — including additive clauses in a mixed ALTER
+	// TABLE — while the remaining non-destructive statements still apply and
+	// startup proceeds. This keeps an older binary — starting during a rolling
+	// deploy or rollback — from destroying tables or columns a newer binary's
+	// schema added. Set true only when intentionally removing storage tables or
+	// columns, after every running pod is on a binary whose embedded schema no
+	// longer declares them.
+	AllowDestructiveSchemaChanges bool `yaml:"allow_destructive_schema_changes,omitempty"`
 }
 
 // DSNFromConfig configures a MySQL DSN assembled from separate secret values.
@@ -885,6 +905,9 @@ func (c *ServerConfig) Validate() error {
 
 	if err := validateUniqueNames("environment_order", c.EnvironmentOrder); err != nil {
 		return err
+	}
+	if c.MetricsPort < 0 || c.MetricsPort > 65535 {
+		return fmt.Errorf("metrics_port must be between 0 and 65535, got %d", c.MetricsPort)
 	}
 	if err := validateUniqueNames("required_checks", c.RequiredChecks); err != nil {
 		return err
@@ -1782,6 +1805,62 @@ func isValidTenantName(tenant string) bool {
 	return true
 }
 
+// KnownEnvironments returns every environment name visible in this instance's
+// configuration: its own allowed environments, the server-owned promotion
+// order (which lists peer-owned environments in environment-isolated
+// deployments), and each database's routing environments. The result is
+// sorted and deduplicated. A command environment outside this set belongs to
+// no SchemaBot instance and can be rejected instead of deferred to a peer.
+func (c *ServerConfig) KnownEnvironments() []string {
+	if c == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	add := func(envs ...string) {
+		for _, env := range envs {
+			if env != "" {
+				seen[env] = struct{}{}
+			}
+		}
+	}
+	add(c.AllowedEnvironments...)
+	add(c.PromotionEnvironmentOrder()...)
+	for _, db := range c.Databases {
+		for env := range db.Environments {
+			add(env)
+		}
+	}
+	envs := make([]string, 0, len(seen))
+	for env := range seen {
+		envs = append(envs, env)
+	}
+	slices.Sort(envs)
+	return envs
+}
+
+// IsEnvironmentKnown reports whether the environment appears anywhere in this
+// instance's configuration — the same set KnownEnvironments returns — checked
+// by direct membership so the webhook command path does not materialize and
+// sort the full list on every lookup.
+func (c *ServerConfig) IsEnvironmentKnown(env string) bool {
+	if c == nil || env == "" {
+		return false
+	}
+	order := c.EnvironmentOrder
+	if len(order) == 0 {
+		order = defaultEnvironmentOrder
+	}
+	if slices.Contains(c.AllowedEnvironments, env) || slices.Contains(order, env) {
+		return true
+	}
+	for _, db := range c.Databases {
+		if _, ok := db.Environments[env]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // PromotionEnvironmentOrder returns the server-owned environment promotion
 // order used by PR apply gating.
 func (c *ServerConfig) PromotionEnvironmentOrder() []string {
@@ -1852,6 +1931,19 @@ func (c *ServerConfig) ShouldClaimOperations() bool {
 		return true
 	}
 	return *c.OperatorClaimOperations
+}
+
+// DefaultMetricsPort is the port of the dedicated Prometheus metrics listener
+// when metrics_port is not configured.
+const DefaultMetricsPort = 9102
+
+// MetricsListenPort returns the TCP port of the dedicated /metrics listener:
+// metrics_port when configured, DefaultMetricsPort otherwise.
+func (c *ServerConfig) MetricsListenPort() int {
+	if c == nil || c.MetricsPort == 0 {
+		return DefaultMetricsPort
+	}
+	return c.MetricsPort
 }
 
 // IsCheckRequired returns whether a PR check name is part of the configured

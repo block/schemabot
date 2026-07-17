@@ -70,6 +70,50 @@ func TestWebhookEventStore_CreateDeduplicatesByProviderAndDeliveryID(t *testing.
 	require.True(t, inserted)
 }
 
+func TestWebhookEventStore_HasEventForHead(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	_, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+		DeliveryID:  "delivery-head-1",
+		Event:       "pull_request",
+		Action:      "synchronize",
+		Repository:  "block/example",
+		PullRequest: 7,
+		HeadSHA:     "head-sha-1",
+		Payload:     []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	found, err := store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "block/example", 7, "head-sha-1")
+	require.NoError(t, err)
+	assert.True(t, found)
+
+	// Provider defaults to GitHub.
+	found, err = store.WebhookEvents().HasEventForHead(ctx, "", "block/example", 7, "head-sha-1")
+	require.NoError(t, err)
+	assert.True(t, found)
+
+	for _, tc := range []struct {
+		name    string
+		repo    string
+		pr      int
+		headSHA string
+	}{
+		{"different head SHA", "block/example", 7, "head-sha-2"},
+		{"different PR", "block/example", 8, "head-sha-1"},
+		{"different repo", "block/other", 7, "head-sha-1"},
+	} {
+		found, err = store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, tc.repo, tc.pr, tc.headSHA)
+		require.NoError(t, err, tc.name)
+		assert.False(t, found, tc.name)
+	}
+
+	_, err = store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "", 7, "head-sha-1")
+	require.Error(t, err, "missing repository must be rejected")
+}
+
 func TestWebhookEventStore_FindNextClaimsOldestPendingEvent(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -566,4 +610,180 @@ func TestWebhookEventStore_SubSecondLeaseIsNotImmediatelyReclaimable(t *testing.
 	none, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
 	require.NoError(t, err)
 	assert.Nil(t, none)
+}
+
+// The backlog-age gauge must count exactly the rows a driver would claim: a
+// retryable row past the attempt cap is not backlog (FindNext skips it forever),
+// while an expired-lease processing row under the cap is (a driver reclaims it).
+func TestWebhookEventStore_InboxStatsBacklogMatchesClaimable(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	// A cap-exhausted retryable row whose retry window has long elapsed. FindNext
+	// never reclaims it, so it must not inflate the backlog age.
+	capExhausted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "cap-exhausted", Event: "pull_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.True(t, capExhausted)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, attempts = ?, retry_after = NOW() - INTERVAL 1 HOUR,
+			received_at = NOW(6) - INTERVAL 600 SECOND
+		WHERE provider = ? AND delivery_id = ?
+	`, storage.WebhookEventFailedRetryable, storage.MaxWebhookEventAttempts, storage.WebhookProviderGitHub, "cap-exhausted")
+	require.NoError(t, err)
+
+	onlyExhausted, err := store.WebhookEvents().InboxStats(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, onlyExhausted.OldestClaimableAge, "a cap-exhausted retryable row must not count as backlog")
+
+	// An expired-lease processing row under the cap is genuinely reclaimable
+	// backlog: its driver crashed and another will pick it up.
+	reclaimable, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "reclaimable", Event: "pull_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.True(t, reclaimable)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, attempts = ?, lease_owner = 'driver', lease_token = 'tok',
+			lease_expires_at = NOW(6) - INTERVAL 1 SECOND,
+			received_at = NOW(6) - INTERVAL 200 SECOND
+		WHERE provider = ? AND delivery_id = ?
+	`, storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts-1, storage.WebhookProviderGitHub, "reclaimable")
+	require.NoError(t, err)
+
+	stats, err := store.WebhookEvents().InboxStats(ctx)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, stats.OldestClaimableAge, 190*time.Second, "an expired-lease processing row under the cap is claimable backlog")
+	assert.Less(t, stats.OldestClaimableAge, 300*time.Second, "the 600s cap-exhausted retryable row must not drive the age")
+
+	// FindNext agrees with the gauge: it reclaims the processing row and never
+	// the cap-exhausted retryable one.
+	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, "reclaimable", claimed.DeliveryID)
+}
+
+// InboxStats gives operators a steady-state view of the durable inbox: how many
+// rows sit in each state, how long the oldest ready-to-claim delivery has waited
+// (backlog latency), and how many are wedged in processing past the attempt cap.
+func TestWebhookEventStore_InboxStats(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	// Empty inbox: every state present at zero, no backlog, nothing stuck.
+	empty, err := store.WebhookEvents().InboxStats(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, empty)
+	assert.Equal(t, int64(0), empty.CountsByState[storage.WebhookEventPending])
+	assert.Equal(t, int64(0), empty.CountsByState[storage.WebhookEventProcessing])
+	assert.Zero(t, empty.OldestClaimableAge)
+	assert.Equal(t, int64(0), empty.StuckProcessing)
+
+	// Two pending rows; the older one drives the backlog age.
+	insertPending := func(deliveryID string, receivedAgo time.Duration) {
+		t.Helper()
+		inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: deliveryID, Event: "pull_request", Payload: []byte(`{}`)})
+		require.NoError(t, err)
+		require.True(t, inserted)
+		_, err = testDB.ExecContext(ctx, `UPDATE webhook_events SET received_at = NOW(6) - INTERVAL ? SECOND WHERE provider = ? AND delivery_id = ?`,
+			int(receivedAgo.Seconds()), storage.WebhookProviderGitHub, deliveryID)
+		require.NoError(t, err)
+	}
+	insertPending("pending-old", 120*time.Second)
+	insertPending("pending-new", 5*time.Second)
+
+	// A completed row: counts toward completed, never toward backlog. Set its
+	// state directly so the FIFO claim order can't reassign it to another row.
+	completedDelivery, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "completed-1", Event: "pull_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.True(t, completedDelivery)
+	_, err = testDB.ExecContext(ctx, `UPDATE webhook_events SET state = ?, completed_at = NOW() WHERE provider = ? AND delivery_id = ?`,
+		storage.WebhookEventCompleted, storage.WebhookProviderGitHub, "completed-1")
+	require.NoError(t, err)
+
+	// A stuck processing row: at the attempt cap with an expired lease.
+	stuck, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "stuck-1", Event: "pull_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.True(t, stuck)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, attempts = ?, lease_owner = 'driver', lease_token = 'tok',
+			lease_expires_at = NOW(6) - INTERVAL 1 SECOND
+		WHERE provider = ? AND delivery_id = ?
+	`, storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts, storage.WebhookProviderGitHub, "stuck-1")
+	require.NoError(t, err)
+
+	stats, err := store.WebhookEvents().InboxStats(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, stats)
+	assert.Equal(t, int64(2), stats.CountsByState[storage.WebhookEventPending])
+	assert.Equal(t, int64(1), stats.CountsByState[storage.WebhookEventProcessing])
+	assert.Equal(t, int64(1), stats.CountsByState[storage.WebhookEventCompleted])
+	assert.Equal(t, int64(1), stats.StuckProcessing)
+	// The oldest pending row is ~120s old; allow slack for execution time.
+	assert.GreaterOrEqual(t, stats.OldestClaimableAge, 110*time.Second)
+	assert.Less(t, stats.OldestClaimableAge, 5*time.Minute)
+}
+
+// TerminateStuckProcessing sweeps out rows a hard-killed driver left parked in
+// processing at the attempt cap with an expired lease — FindNext never reclaims
+// those, so the reconciler must terminalize them. Rows below the cap, or whose
+// lease is still fresh, must be left alone.
+func TestWebhookEventStore_TerminateStuckProcessing(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	// Seed three processing rows, then drive each into the exact state under
+	// test via SQL so the assertions don't depend on FindNext claim ordering.
+	setProcessing := func(deliveryID string, attempts int, leaseExpiresAt string) {
+		t.Helper()
+		inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: deliveryID, Event: "pull_request", Payload: []byte(`{}`)})
+		require.NoError(t, err)
+		require.True(t, inserted)
+		_, err = testDB.ExecContext(ctx, `
+			UPDATE webhook_events
+			SET state = ?, attempts = ?, lease_owner = 'driver', lease_token = ?,
+				lease_expires_at = `+leaseExpiresAt+`
+			WHERE provider = ? AND delivery_id = ?
+		`, storage.WebhookEventProcessing, attempts, deliveryID, storage.WebhookProviderGitHub, deliveryID)
+		require.NoError(t, err)
+	}
+
+	// stuck: at the attempt cap, lease expired -> terminated by the sweep.
+	setProcessing("stuck", storage.MaxWebhookEventAttempts, "NOW(6) - INTERVAL 1 SECOND")
+	// belowCap: expired lease but under the cap -> FindNext reclaims it, not the sweep.
+	setProcessing("below-cap", storage.MaxWebhookEventAttempts-1, "NOW(6) - INTERVAL 1 SECOND")
+	// fresh: at the cap but lease still valid -> a driver is still working it.
+	setProcessing("fresh", storage.MaxWebhookEventAttempts, "NOW(6) + INTERVAL 1 MINUTE")
+
+	terminated, err := store.WebhookEvents().TerminateStuckProcessing(ctx, "reconciler sweep")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), terminated, "only the cap-exhausted expired-lease row should be terminated")
+
+	got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "stuck")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, storage.WebhookEventFailed, got.State)
+	assert.Equal(t, "reconciler sweep", got.LastError)
+	assert.Empty(t, got.LeaseToken)
+	assert.Nil(t, got.LeaseExpiresAt)
+	assert.NotNil(t, got.CompletedAt)
+
+	belowGot, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "below-cap")
+	require.NoError(t, err)
+	require.NotNil(t, belowGot)
+	assert.Equal(t, storage.WebhookEventProcessing, belowGot.State)
+
+	freshGot, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "fresh")
+	require.NoError(t, err)
+	require.NotNil(t, freshGot)
+	assert.Equal(t, storage.WebhookEventProcessing, freshGot.State)
+
+	// A terminated stuck row is redeliverable: reusing its GUID re-opens it.
+	reopened, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "stuck", Event: "pull_request", Payload: []byte(`{}`)})
+	require.NoError(t, err)
+	require.True(t, reopened)
 }

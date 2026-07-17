@@ -86,6 +86,14 @@ func TestSplitStatements_Content(t *testing.T) {
 	assert.Contains(t, stmts[1], "t2")
 }
 
+// A parse failure identifies the offending input (bounded) so an operator can
+// see which statement failed without the full blob flooding logs.
+func TestSplitStatements_ParseErrorIncludesPreview(t *testing.T) {
+	_, err := SplitStatements("this is not valid SQL @@@")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `failed to parse SQL statements "this is not valid SQL @@@"`)
+}
+
 // TestClassifyStatement verifies the single-statement contract: each DDL type
 // classifies to its typed StatementType and table, while compound input —
 // where a destructive statement could ride behind the first statement's

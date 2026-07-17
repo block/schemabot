@@ -10,6 +10,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/block/spirit/pkg/utils"
+
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -126,6 +128,52 @@ func (s *webhookEventStore) GetByDeliveryID(ctx context.Context, provider, deliv
 	return scanWebhookEvent(row)
 }
 
+// webhookClaimablePredicate matches exactly the rows a driver would claim: a
+// pending row, a retryable row whose retry window has elapsed and is under the
+// attempt cap, or a processing row whose lease has expired and is under the
+// attempt cap. FindNext and the InboxStats backlog-age query derive from this
+// single source so the "ready to claim" definition cannot drift between what a
+// driver picks up and what the backlog gauge measures. Bind its placeholders
+// with webhookClaimableArgs.
+const webhookClaimablePredicate = `(
+			state = ?
+			OR (state = ? AND (retry_after IS NULL OR retry_after <= NOW()) AND attempts < ?)
+			OR (state = ? AND lease_expires_at <= NOW(6) AND attempts < ?)
+		)`
+
+// webhookClaimableArgs returns the placeholder bindings for
+// webhookClaimablePredicate, in order.
+func webhookClaimableArgs() []any {
+	return []any{
+		storage.WebhookEventPending,
+		storage.WebhookEventFailedRetryable, storage.MaxWebhookEventAttempts,
+		storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts,
+	}
+}
+
+func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error) {
+	if provider == "" {
+		provider = storage.WebhookProviderGitHub
+	}
+	if repository == "" || pullRequest == 0 || headSHA == "" {
+		return false, fmt.Errorf("repository, pull request, and head SHA are required")
+	}
+	var one int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT 1
+		FROM webhook_events
+		WHERE provider = ? AND repository = ? AND pull_request = ? AND head_sha = ?
+		LIMIT 1
+	`, provider, repository, pullRequest, headSHA).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDuration time.Duration) (*storage.WebhookEvent, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("webhook driver owner is required")
@@ -142,15 +190,11 @@ func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDur
 	row := tx.QueryRowContext(ctx, `
 		SELECT `+webhookEventColumns+`
 		FROM webhook_events
-		WHERE state = ?
-			OR (state = ? AND (retry_after IS NULL OR retry_after <= NOW()) AND attempts < ?)
-			OR (state = ? AND lease_expires_at <= NOW(6) AND attempts < ?)
+		WHERE `+webhookClaimablePredicate+`
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, storage.WebhookEventPending,
-		storage.WebhookEventFailedRetryable, storage.MaxWebhookEventAttempts,
-		storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts)
+	`, webhookClaimableArgs()...)
 
 	event, err := scanWebhookEventInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -282,6 +326,36 @@ func (s *webhookEventStore) Release(ctx context.Context, id int64, leaseToken st
 	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
 }
 
+// TerminateStuckProcessing marks failed every processing row whose lease has
+// expired and whose attempts have reached the cap. FindNext stops reclaiming a
+// processing row once attempts == MaxWebhookEventAttempts, so a driver
+// hard-killed on its final attempt leaves the row stuck in processing until it
+// is either terminalized here or reopened by a GitHub Redeliver (see
+// reopenTerminalWebhookEvent). This sweep is the automatic complement to
+// redelivery: it clears the lease (preserving completed_at) and emits the row
+// as a durable failure so it surfaces in metrics/alerting and drains the
+// stuck-processing gauge without operator action. Unlike MarkFailed it is
+// lease-token-agnostic: the owning driver is gone, so there is no token to
+// present. Returns the number of rows terminated.
+func (s *webhookEventStore) TerminateStuckProcessing(ctx context.Context, reason string) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, last_error = ?, completed_at = COALESCE(completed_at, NOW()),
+			lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+			retry_after = NULL, updated_at = NOW()
+		WHERE state = ? AND lease_expires_at <= NOW(6) AND attempts >= ?
+	`, storage.WebhookEventFailed, nullString(reason),
+		storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts)
+	if err != nil {
+		return 0, fmt.Errorf("terminate stuck processing webhook events: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read terminate stuck processing rows affected: %w", err)
+	}
+	return rows, nil
+}
+
 func scanWebhookEvent(row *sql.Row) (*storage.WebhookEvent, error) {
 	event, err := scanWebhookEventInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -319,6 +393,64 @@ func scanWebhookEventInto(row scanner) (*storage.WebhookEvent, error) {
 		event.CompletedAt = &completedAt.Time
 	}
 	return &event, nil
+}
+
+// InboxStats returns a read-only snapshot of the inbox for observability. It
+// runs three cheap aggregates rather than one query: heterogeneous aggregates
+// (grouped counts, a MIN age over a filtered subset, and a filtered count) do
+// not combine into a single index-friendly statement, and each is served by an
+// existing index.
+func (s *webhookEventStore) InboxStats(ctx context.Context) (*storage.WebhookInboxStats, error) {
+	stats := &storage.WebhookInboxStats{CountsByState: make(map[string]int64, len(storage.WebhookEventStatesAll))}
+	for _, state := range storage.WebhookEventStatesAll {
+		stats.CountsByState[state] = 0
+	}
+
+	rows, err := s.db.QueryContext(ctx, `SELECT state, COUNT(*) FROM webhook_events GROUP BY state`)
+	if err != nil {
+		return nil, fmt.Errorf("count webhook inbox rows by state: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+	for rows.Next() {
+		var state string
+		var count int64
+		if err := rows.Scan(&state, &count); err != nil {
+			return nil, fmt.Errorf("scan webhook inbox state count: %w", err)
+		}
+		stats.CountsByState[state] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate webhook inbox state counts: %w", err)
+	}
+
+	// Oldest ready-to-claim row, using the exact predicate a driver claims by
+	// (webhookClaimablePredicate) so the backlog gauge and dispatch agree on
+	// what is claimable: a cap-exhausted retryable row is not counted (a driver
+	// won't take it, so it isn't backlog), and an expired-lease processing row a
+	// driver would reclaim is counted (real backlog when its driver crashed).
+	// NULL (nothing waiting) scans into a zero age.
+	var oldestAgeSeconds sql.NullFloat64
+	err = s.db.QueryRowContext(ctx, `
+		SELECT TIMESTAMPDIFF(MICROSECOND, MIN(received_at), NOW(6)) / 1e6
+		FROM webhook_events
+		WHERE `+webhookClaimablePredicate+`
+	`, webhookClaimableArgs()...).Scan(&oldestAgeSeconds)
+	if err != nil {
+		return nil, fmt.Errorf("measure oldest claimable webhook inbox row: %w", err)
+	}
+	if oldestAgeSeconds.Valid && oldestAgeSeconds.Float64 > 0 {
+		stats.OldestClaimableAge = time.Duration(oldestAgeSeconds.Float64 * float64(time.Second))
+	}
+
+	err = s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM webhook_events
+		WHERE state = ? AND lease_expires_at <= NOW(6) AND attempts >= ?
+	`, storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts).Scan(&stats.StuckProcessing)
+	if err != nil {
+		return nil, fmt.Errorf("count stuck processing webhook inbox rows: %w", err)
+	}
+
+	return stats, nil
 }
 
 func (s *webhookEventStore) checkWebhookEventLeaseResult(ctx context.Context, result sql.Result, id int64, leaseToken string) error {

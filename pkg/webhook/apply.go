@@ -36,6 +36,7 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display 
 		RevertExpiresAt:  display.RevertExpiresAt,
 		Volume:           apply.GetOptions().Volume,
 		Tenant:           tenant,
+		Rollback:         apply.IsRollback(),
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)

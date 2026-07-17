@@ -153,6 +153,12 @@ type Handler struct {
 	inProcessWebhookDraining bool
 	inProcessWebhookWg       sync.WaitGroup
 
+	webhookReconciler        bool
+	webhookReconcileInterval time.Duration
+	webhookReconcileLookback time.Duration
+	webhookReconcileGrace    time.Duration
+	webhookReconcileMaxPages int
+
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
 	priorEnvCheckRetryInterval time.Duration
@@ -179,6 +185,20 @@ func WithRepoWebhookSecret(secret []byte) HandlerOption {
 func WithDurableWebhookDispatch() HandlerOption {
 	return func(h *Handler) {
 		h.durableWebhookDispatch = true
+	}
+}
+
+// WithWebhookReconciler enables the webhook reconciliation loop. It does two
+// things per pass: (1) an active stuck-processing sweep that terminalizes inbox
+// rows wedged past the attempt cap so they emit failures and become
+// redeliverable, and (2) a report-only scan of recently updated open PRs in
+// registered repositories that reports PR heads with no corresponding inbox
+// delivery (no rows are synthesized). Only the missing-delivery scan is
+// report-only. It takes effect alongside WithDurableWebhookDispatch, whose
+// lifecycle it shares.
+func WithWebhookReconciler() HandlerOption {
+	return func(h *Handler) {
+		h.webhookReconciler = true
 	}
 }
 
@@ -220,6 +240,10 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 		logger:                      logger,
 		durableWebhookPollInterval:  defaultDurableWebhookPollInterval,
 		durableWebhookLeaseDuration: defaultDurableWebhookLeaseDuration,
+		webhookReconcileInterval:    defaultWebhookReconcileInterval,
+		webhookReconcileLookback:    defaultWebhookReconcileLookback,
+		webhookReconcileGrace:       defaultWebhookReconcileGrace,
+		webhookReconcileMaxPages:    defaultWebhookReconcileMaxPages,
 		priorEnvCheckMaxAttempts:    defaultPriorEnvCheckMaxAttempts,
 		priorEnvCheckRetryInterval:  defaultPriorEnvCheckRetryInterval,
 	}

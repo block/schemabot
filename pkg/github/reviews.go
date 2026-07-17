@@ -37,9 +37,17 @@ func (ic *InstallationClient) ListReviews(ctx context.Context, repo string, pr i
 	var allReviews []*ReviewInfo
 
 	for {
-		reviews, resp, err := ic.client.PullRequests.ListReviews(ctx, owner, repoName, pr, opts)
+		var resp *gh.Response
+		reviews, err := retryGitHubUnavailableRead(ctx, ic.logger, "list PR reviews", []any{"repo", repo, "pr", pr}, func(ctx context.Context) ([]*gh.PullRequestReview, error) {
+			list, listResp, listErr := ic.client.PullRequests.ListReviews(ctx, owner, repoName, pr, opts)
+			if listErr != nil {
+				return nil, classifyGitHubAPIError(listErr)
+			}
+			resp = listResp
+			return list, nil
+		})
 		if err != nil {
-			return nil, fmt.Errorf("list PR reviews: %w", err)
+			return nil, fmt.Errorf("list PR reviews for %s#%d: %w", repo, pr, err)
 		}
 		for _, r := range reviews {
 			allReviews = append(allReviews, &ReviewInfo{
@@ -208,7 +216,15 @@ func (ic *InstallationClient) ListTeamMembers(ctx context.Context, org, slug str
 	var members []string
 
 	for {
-		users, resp, err := ic.client.Teams.ListTeamMembersBySlug(ctx, org, slug, opts)
+		var resp *gh.Response
+		users, err := retryGitHubUnavailableRead(ctx, ic.logger, "list team members", []any{"org", org, "team_slug", slug}, func(ctx context.Context) ([]*gh.User, error) {
+			list, listResp, listErr := ic.client.Teams.ListTeamMembersBySlug(ctx, org, slug, opts)
+			if listErr != nil {
+				return nil, classifyGitHubAPIError(listErr)
+			}
+			resp = listResp
+			return list, nil
+		})
 		if err != nil {
 			return nil, teamMembershipReadError("list team members", org, slug, err)
 		}

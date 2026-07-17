@@ -210,6 +210,68 @@ func TestRenderVolumeSupersededProgressComment(t *testing.T) {
 		"the superseded body is preserved inside the fold")
 }
 
+// TestRenderResumeSupersededProgressComment verifies the frozen body written
+// over an old progress comment after a resume: it links the successor comment
+// and folds the final pre-stop progress into a details block so the record
+// stays on the PR without looking live.
+func TestRenderResumeSupersededProgressComment(t *testing.T) {
+	rendered := RenderResumeSupersededProgressComment(ResumeSupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: "## Schema Change Progress\n\nStopped at 21%",
+	})
+	assert.Contains(t, rendered, "Schema change resumed")
+	assert.Contains(t, rendered, "https://github.com/acme/testapp/pull/42#issuecomment-2222222222")
+	assert.Contains(t, rendered, "<details>")
+	assert.Contains(t, rendered, "<summary>Progress before the stop</summary>")
+	assert.Contains(t, rendered, "Stopped at 21%",
+		"the superseded body is preserved inside the fold")
+}
+
+// TestRenderSupersededProgressComment verifies the frozen body written over a
+// progress comment when the superseding rotation is no longer known: it links
+// the successor comment and folds the final progress into a details block
+// without claiming a specific rotation caused it.
+func TestRenderSupersededProgressComment(t *testing.T) {
+	rendered := RenderSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: "## Schema Change Progress\n\nStopped at 21%",
+	})
+	assert.Contains(t, rendered, "Progress comment superseded")
+	assert.Contains(t, rendered, "https://github.com/acme/testapp/pull/42#issuecomment-2222222222")
+	assert.Contains(t, rendered, "<details>")
+	assert.Contains(t, rendered, "<summary>Earlier progress</summary>")
+	assert.Contains(t, rendered, "Stopped at 21%",
+		"the superseded body is preserved inside the fold")
+	assert.NotContains(t, rendered, "Volume changed",
+		"the generic fold does not claim a volume change caused it")
+	assert.NotContains(t, rendered, "resumed",
+		"the generic fold does not claim a resume caused it")
+}
+
+// TestIsSupersededProgressComment verifies the frozen-body predicate accepts
+// every frozen flavor — so a freeze retry never folds a frozen body inside a
+// second fold — and rejects a live progress body.
+func TestIsSupersededProgressComment(t *testing.T) {
+	volume := RenderVolumeSupersededProgressComment(VolumeSupersededProgressData{
+		Volume: 8, Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
+	})
+	resume := RenderResumeSupersededProgressComment(ResumeSupersededProgressData{
+		Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
+	})
+	generic := RenderSupersededProgressComment(SupersededProgressData{
+		Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
+	})
+	assert.True(t, IsSupersededProgressComment(volume), "a volume-frozen body is recognized as frozen")
+	assert.True(t, IsSupersededProgressComment(resume), "a resume-frozen body is recognized as frozen")
+	assert.True(t, IsSupersededProgressComment(generic), "a generic-frozen body is recognized as frozen")
+	assert.False(t, IsSupersededProgressComment("## Schema Change Status — Staging"),
+		"a live progress body is not frozen")
+}
+
 func TestRenderRevertCommandAccepted(t *testing.T) {
 	rendered := RenderRevertCommandAccepted(RevertCommandAcceptedData{
 		ApplyID:     "apply-957642f96d634694",

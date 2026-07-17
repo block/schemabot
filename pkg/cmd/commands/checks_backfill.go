@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -99,9 +100,13 @@ type checksStuckCheck struct {
 }
 
 type checksBackfillReport struct {
-	Repos      []string `json:"repos"`
-	CheckNames []string `json:"check_names"`
-	Scanned    int      `json:"scanned"`
+	Repos []string `json:"repos"`
+	// SkippedDisabled are repositories the sweep did not scan because their
+	// Check Run publishing is turned off (enable_checks: false) — the server
+	// refuses to create their checks, so every open PR would read as missing.
+	SkippedDisabled []string `json:"skipped_checks_disabled,omitempty"`
+	CheckNames      []string `json:"check_names"`
+	Scanned         int      `json:"scanned"`
 	// Last echoes the --last window bounding the sweep; empty means every
 	// open PR was scanned.
 	Last       string                 `json:"last,omitempty"`
@@ -145,6 +150,7 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 	defer stopProgress()
 
 	repos := []string{cmd.Repo}
+	var skippedDisabled []string
 	if cmd.AllRepos {
 		updateProgress("listing the repositories declared on the server...")
 		declared, err := cmdclient.ChecksRepos(ctx, endpoint)
@@ -154,10 +160,14 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 		if err != nil {
 			return fmt.Errorf("list the server's declared repositories: %w", err)
 		}
-		if len(declared.Repos) == 0 {
+		if len(declared.Repos) == 0 && len(declared.Disabled) == 0 {
 			return fmt.Errorf("the server declared no repositories; name a repository explicitly")
 		}
+		// Disabled repos are skipped, not scanned: the server refuses to
+		// create their checks, so every open PR would read as missing. An
+		// empty enabled list leaves nothing to scan; the report says so.
 		repos = declared.Repos
+		skippedDisabled = declared.Disabled
 	}
 
 	// Scan phase: page through each repository's open PRs and ask the two
@@ -165,12 +175,14 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 	// complete? The listing is newest-updated first, so a --last window stops
 	// each repo's paging as soon as it crosses the window start.
 	report := &checksBackfillReport{
-		Repos:      repos,
-		Last:       cmd.Last,
-		DryRun:     cmd.DryRun,
-		StuckAfter: cmd.StuckAfter,
+		Repos:           repos,
+		SkippedDisabled: skippedDisabled,
+		Last:            cmd.Last,
+		DryRun:          cmd.DryRun,
+		StuckAfter:      cmd.StuckAfter,
 	}
 	checkNamesSeen := map[string]bool{}
+	skippedByServer := map[string]bool{}
 	held := 0
 scanning:
 	for i, repo := range repos {
@@ -190,6 +202,14 @@ scanning:
 			}
 			if err != nil {
 				return fmt.Errorf("scan %s open PRs for missing or stuck Check Runs: %w", repo, err)
+			}
+			// The server skips repos whose Check Run publishing is turned
+			// off rather than reporting every open PR as missing; record the
+			// skip for the report and move to the next repo.
+			if chunk.ChecksDisabled {
+				skippedByServer[repo] = true
+				report.SkippedDisabled = append(report.SkippedDisabled, repo)
+				continue scanning
 			}
 			for _, name := range chunk.CheckNames {
 				if !checkNamesSeen[name] {
@@ -243,6 +263,13 @@ scanning:
 		}
 	}
 	sort.Strings(report.CheckNames)
+
+	// The report's scanned-repo list and its skip list stay disjoint: a repo
+	// the server reported as disabled was never scanned, so it belongs only
+	// in the skip list.
+	if len(skippedByServer) > 0 {
+		report.Repos = slices.DeleteFunc(report.Repos, func(r string) bool { return skippedByServer[r] })
+	}
 
 	if !cmd.DryRun {
 		// Act phase: synthesize the missing checks in server-bounded batches
@@ -444,6 +471,14 @@ func (cmd *ChecksBackfillCmd) write(report *checksBackfillReport) error {
 }
 
 func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error {
+	if len(report.Repos) == 0 && len(report.SkippedDisabled) > 0 {
+		if len(report.SkippedDisabled) == 1 {
+			_, err := fmt.Fprintf(w, "Repository %s has Check Runs disabled (enable_checks: false); nothing to scan.\n", report.SkippedDisabled[0])
+			return err
+		}
+		_, err := fmt.Fprintf(w, "All %d repositories have Check Runs disabled (enable_checks: false); nothing to scan: %s.\n", len(report.SkippedDisabled), strings.Join(report.SkippedDisabled, ", "))
+		return err
+	}
 	repoScope := strings.Join(report.Repos, ", ")
 	if len(report.Repos) > 3 {
 		repoScope = fmt.Sprintf("%d repositories", len(report.Repos))
@@ -452,8 +487,17 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 	if report.Last != "" {
 		window = fmt.Sprintf(" updated in the last %s", report.Last)
 	}
-	if _, err := fmt.Fprintf(w, "Scanned %d open PRs%s in %s for %s.\n", report.Scanned, window, repoScope, strings.Join(report.CheckNames, ", ")); err != nil {
+	checkScope := ""
+	if len(report.CheckNames) > 0 {
+		checkScope = fmt.Sprintf(" for %s", strings.Join(report.CheckNames, ", "))
+	}
+	if _, err := fmt.Fprintf(w, "Scanned %d open PRs%s in %s%s.\n", report.Scanned, window, repoScope, checkScope); err != nil {
 		return err
+	}
+	if len(report.SkippedDisabled) > 0 {
+		if _, err := fmt.Fprintf(w, "Skipped repositories with Check Runs disabled (enable_checks: false): %s.\n", strings.Join(report.SkippedDisabled, ", ")); err != nil {
+			return err
+		}
 	}
 	if err := writeChecksStuckSection(w, report); err != nil {
 		return err

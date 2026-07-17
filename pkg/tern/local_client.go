@@ -1546,7 +1546,7 @@ func (c *LocalClient) planForApplyRequest(ctx context.Context, req *ternv1.Apply
 	if plan != nil {
 		return plan, nil
 	}
-	if len(req.DdlChanges) == 0 && len(req.SchemaFiles) == 0 {
+	if !applyRequestCarriesPlanPayload(req) {
 		return nil, nil
 	}
 	return c.materializeApplyRequestPlan(ctx, req)
