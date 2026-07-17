@@ -239,6 +239,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentApplyInProgress())
 	case PreviewCommentApplyNoLock:
 		fmt.Print(webhooktemplates.PreviewCommentApplyConfirmNoLock())
+	case PreviewCommentBaseSchemaStale:
+		fmt.Print(webhooktemplates.PreviewCommentBaseSchemaFreshnessRejected())
 	case PreviewCommentBlockedByPriorEnv:
 		fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnv())
 	case PreviewCommentBlockedByPriorFailed:

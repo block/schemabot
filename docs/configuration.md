@@ -450,6 +450,28 @@ If the GitHub API is unreachable when checking statuses, the apply is blocked (f
 
 Set `require_passing_checks: false` to disable this gate.
 
+## Base Branch Schema Freshness
+
+SchemaBot can reject `apply` and `apply-confirm` when a PR does not include
+schema changes that landed on its base branch after the PR diverged:
+
+```yaml
+repos:
+  myorg/monorepo:
+    require_up_to_date_with_base: true
+```
+
+This is path-scoped rather than a whole-branch freshness requirement. At apply
+time, SchemaBot compares the Git tree object for the managed schema directory
+at the PR merge base with the same directory at the current base commit. If the
+tree objects match, unrelated commits elsewhere in a busy repository do not
+block the apply. If they differ, SchemaBot rejects the apply and instructs the
+user to merge or rebase the current base branch before reviewing a new plan.
+
+The gate fails closed when GitHub cannot provide the merge base or either tree.
+It defaults to disabled for compatibility; enable it per repository after
+confirming the repository's schema directories are dedicated to schema inputs.
+
 ## Review Gate
 
 SchemaBot can block `apply` and `apply-confirm` until the PR has a satisfying review. This prevents unapproved schema changes from being applied to any environment.

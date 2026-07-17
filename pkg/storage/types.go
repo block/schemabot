@@ -506,6 +506,12 @@ type Apply struct {
 	// LockID points to locks.id.
 	LockID int64
 
+	// ExpectedLockOwner and ExpectedPendingPlanID are optional creation-time
+	// guards. When set, the apply store verifies the captured lock intent in
+	// the same transaction that makes the apply durable. They are not persisted.
+	ExpectedLockOwner     string
+	ExpectedPendingPlanID string
+
 	// PlanID points to plans.id.
 	PlanID int64
 

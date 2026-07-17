@@ -109,7 +109,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyWaiting, templates.PreviewCommentUnlock,
 		templates.PreviewCommentApplyBlocked, templates.PreviewCommentApplyBlockedCLI,
 		templates.PreviewCommentApplyActive,
-		templates.PreviewCommentApplyNoLock, templates.PreviewCommentApplyAllType,
+		templates.PreviewCommentApplyNoLock, templates.PreviewCommentBaseSchemaStale,
+		templates.PreviewCommentApplyAllType,
 		templates.PreviewCommentChecksGateNotPassing, templates.PreviewCommentChecksGateInProgress,
 		templates.PreviewCommentActorNotAuthorized, templates.PreviewCommentActorAuthUnavailable,
 		templates.PreviewCommentDatabaseNotConfigured,
@@ -295,6 +296,7 @@ Apply Command Comments (GitHub PR apply commands):
   comment_apply_blocked_cli     Apply blocked by CLI session
   comment_apply_active          Apply already in progress
   comment_apply_no_lock         No lock found (need apply first)
+  comment_base_schema_stale     Base schema changed after PR divergence
   comment_actor_not_authorized  Actor authorization denied
   comment_actor_auth_unavailable Actor authorization fail-closed error
   comment_database_not_configured Actor authorization database missing from this instance

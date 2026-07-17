@@ -314,6 +314,33 @@ func TestLockStore_Release(t *testing.T) {
 	require.ErrorIs(t, store.Locks().Release(ctx, "testdb", "vitess", "testuser"), storage.ErrLockNotFound)
 }
 
+func TestLockStore_ReleaseIfPendingPlanID(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+		DatabaseName:  "testdb",
+		DatabaseType:  "vitess",
+		Repository:    "org/repo",
+		PullRequest:   123,
+		Owner:         "org/repo#123",
+		PendingPlanID: "rollback:replacement",
+	}))
+
+	released, err := store.Locks().ReleaseIfPendingPlanID(ctx, "testdb", "vitess", "org/repo#123", "apply-original")
+	require.NoError(t, err)
+	assert.False(t, released)
+	lock, err := store.Locks().Get(ctx, "testdb", "vitess")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, "rollback:replacement", lock.PendingPlanID)
+
+	released, err = store.Locks().ReleaseIfPendingPlanID(ctx, "testdb", "vitess", "org/repo#123", "rollback:replacement")
+	require.NoError(t, err)
+	assert.True(t, released)
+}
+
 func TestLockStore_ReleaseIsolation(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

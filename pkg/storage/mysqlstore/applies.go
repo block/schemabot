@@ -479,6 +479,9 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 		}
 	}
 	defer writeTx.close(ctx, "create apply")
+	if err := verifyExpectedLockIntent(ctx, writeTx.tx, apply); err != nil {
+		return 0, err
+	}
 
 	if lockTarget {
 		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, []string{apply.Deployment}, 0); err != nil {
@@ -575,6 +578,9 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 		}
 	}
 	defer writeTx.close(ctx, opName)
+	if err := verifyExpectedLockIntent(ctx, writeTx.tx, apply); err != nil {
+		return 0, err
+	}
 
 	if lockTarget {
 		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, newDeployments, 0); err != nil {
@@ -614,6 +620,32 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 	}
 
 	return id, nil
+}
+
+// verifyExpectedLockIntent locks and validates the webhook apply intent in the
+// same transaction that inserts the apply. This closes the gap where a
+// same-owner rollback can replace pending_plan_id after freshness validation
+// but before the forward apply becomes durable.
+func verifyExpectedLockIntent(ctx context.Context, tx *sql.Tx, apply *storage.Apply) error {
+	if apply.ExpectedLockOwner == "" && apply.ExpectedPendingPlanID == "" {
+		return nil
+	}
+
+	var lockID int64
+	err := tx.QueryRowContext(ctx, `
+		SELECT id
+		FROM locks
+		WHERE database_name = ? AND database_type = ? AND owner = ? AND pending_plan_id = ?
+		FOR UPDATE
+	`, apply.Database, apply.DatabaseType, apply.ExpectedLockOwner, apply.ExpectedPendingPlanID).Scan(&lockID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storage.ErrLockIntentChanged
+	}
+	if err != nil {
+		return fmt.Errorf("verify lock intent for %s/%s: %w", apply.Database, apply.DatabaseType, err)
+	}
+	apply.LockID = lockID
+	return nil
 }
 
 func insertApplyTasksAndOperations(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64, tasks []*storage.Task, operations []*storage.ApplyOperation) error {

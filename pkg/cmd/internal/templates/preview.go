@@ -178,6 +178,7 @@ const (
 	PreviewCommentApplyBlockedCLI       PreviewType = "comment_apply_blocked_cli"            // Apply blocked by CLI session
 	PreviewCommentApplyActive           PreviewType = "comment_apply_active"                 // Apply already in progress
 	PreviewCommentApplyNoLock           PreviewType = "comment_apply_no_lock"                // No lock found
+	PreviewCommentBaseSchemaStale       PreviewType = "comment_base_schema_stale"            // Base schema changed after PR divergence
 	PreviewCommentBlockedByPriorEnv     PreviewType = "comment_blocked_prior_env"            // Blocked by staging (pending)
 	PreviewCommentBlockedByPriorFailed  PreviewType = "comment_blocked_prior_env_failed"     // Blocked by staging (failed)
 	PreviewCommentBlockedByPriorInProg  PreviewType = "comment_blocked_prior_env_inprogress" // Blocked by staging (in progress)

@@ -531,7 +531,7 @@ func TestResolveSchemaRootForEnvironmentRejectsPathTraversal(t *testing.T) {
 	ic := &InstallationClient{}
 	for _, environment := range []string{"../other", "prod/blue", ".", "..", `prod\blue`} {
 		t.Run(environment, func(t *testing.T) {
-			_, err := ic.resolveSchemaRootForEnvironment(t.Context(), "octocat/hello-world", "abc123", "services/orders/schema", environment)
+			_, _, err := ic.resolveSchemaRootForEnvironment(t.Context(), "octocat/hello-world", "abc123", "services/orders/schema", environment)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "must be a single path segment")
 		})

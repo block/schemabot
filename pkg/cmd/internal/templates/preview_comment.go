@@ -119,6 +119,7 @@ func previewApplyCommandAllOutput() {
 		{"APPLY BLOCKED BY CLI", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByCLI()) }},
 		{"APPLY ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyInProgress()) }},
 		{"NO LOCK FOUND", func() { fmt.Print(webhooktemplates.PreviewCommentApplyConfirmNoLock()) }},
+		{"BASE SCHEMA CHANGED SINCE PR DIVERGED", func() { fmt.Print(webhooktemplates.PreviewCommentBaseSchemaFreshnessRejected()) }},
 		{"BLOCKED BY PRIOR ENV (PENDING)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnv()) }},
 		{"BLOCKED BY PRIOR ENV (FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvFailed()) }},
 		{"BLOCKED BY PRIOR ENV (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvInProgress()) }},

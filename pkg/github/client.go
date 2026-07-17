@@ -1012,6 +1012,48 @@ func (ic *InstallationClient) FetchChangedFilesBetween(ctx context.Context, repo
 	return files, nil
 }
 
+// SchemaPathsChangedSinceMergeBase reports whether any schema path has a
+// different Git object on the PR's current base commit than it had when the PR
+// diverged. Paths may name directories or symlinks. Comparing object IDs keeps
+// the guard scoped to schema inputs: commits elsewhere in a busy repository do
+// not make the PR stale.
+func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Context, repo, baseSHA, headSHA string, schemaPaths []string) (bool, error) {
+	owner, repoName := splitRepo(repo)
+	comparison, err := retryGitHubUnavailableRead(ctx, ic.logger, "find pull request merge base", []any{"repo", repo, "base_sha", baseSHA, "head_sha", headSHA}, func(ctx context.Context) (*gh.CommitsComparison, error) {
+		comparison, _, err := ic.client.Repositories.CompareCommits(ctx, owner, repoName, baseSHA, headSHA, nil)
+		if err != nil {
+			return nil, fmt.Errorf("compare commits %s...%s: %w", baseSHA, headSHA, classifyGitHubAPIError(err))
+		}
+		return comparison, nil
+	})
+	if err != nil {
+		return false, err
+	}
+	mergeBaseSHA := comparison.GetMergeBaseCommit().GetSHA()
+	if mergeBaseSHA == "" {
+		return false, fmt.Errorf("compare commits %s...%s for %s returned no merge base", baseSHA, headSHA, repo)
+	}
+
+	for _, schemaPath := range schemaPaths {
+		mergeBaseObjectSHA, mergeBaseObjectType, mergeBaseFound, err := ic.resolveGitObjectSHA(ctx, repo, mergeBaseSHA, schemaPath, nil)
+		if err != nil {
+			return false, fmt.Errorf("resolve schema path %s at merge base %s: %w", schemaPath, mergeBaseSHA, err)
+		}
+		baseObjectSHA, baseObjectType, baseFound, err := ic.resolveGitObjectSHA(ctx, repo, baseSHA, schemaPath, nil)
+		if err != nil {
+			return false, fmt.Errorf("resolve schema path %s at base %s: %w", schemaPath, baseSHA, err)
+		}
+
+		if mergeBaseFound != baseFound {
+			return true, nil
+		}
+		if mergeBaseFound && (mergeBaseObjectSHA != baseObjectSHA || mergeBaseObjectType != baseObjectType) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // CheckRunOptions contains options for creating or updating a GitHub Check Run.
 type CheckRunOptions struct {
 	Name       string
@@ -1526,7 +1568,7 @@ func (ic *InstallationClient) FetchGitTree(ctx context.Context, repo, treeSHA st
 // listings, so it can resolve paths inside repositories whose full tree is
 // truncated. If GitHub ever truncates even a single level, this fails rather
 // than let the caller act on an incomplete listing.
-func (ic *InstallationClient) fetchGitTreeShallow(ctx context.Context, repo, treeSHA string) ([]TreeEntry, error) {
+func (ic *InstallationClient) fetchGitTreeShallow(ctx context.Context, repo, treeSHA string) ([]TreeEntry, string, error) {
 	owner, repoName := splitRepo(repo)
 	ghTree, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch git tree level", []any{"repo", repo, "tree_sha", treeSHA}, func(ctx context.Context) (*gh.Tree, error) {
 		ghTree, _, err := ic.client.Git.GetTree(ctx, owner, repoName, treeSHA, false)
@@ -1536,10 +1578,10 @@ func (ic *InstallationClient) fetchGitTreeShallow(ctx context.Context, repo, tre
 		return ghTree, nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if ghTree.GetTruncated() {
-		return nil, fmt.Errorf("fetch git tree level %s in repo %s: %w", treeSHA, repo, ErrGitTreeTruncated)
+		return nil, "", fmt.Errorf("fetch git tree level %s in repo %s: %w", treeSHA, repo, ErrGitTreeTruncated)
 	}
 
 	entries := make([]TreeEntry, len(ghTree.Entries))
@@ -1552,7 +1594,7 @@ func (ic *InstallationClient) fetchGitTreeShallow(ctx context.Context, repo, tre
 			Size: entry.GetSize(),
 		}
 	}
-	return entries, nil
+	return entries, ghTree.GetSHA(), nil
 }
 
 // FetchGitSubtree fetches the recursive tree of the directory dir at ref.
@@ -1571,29 +1613,9 @@ func (ic *InstallationClient) FetchGitSubtree(ctx context.Context, repo, ref, di
 // directories at the same ref pass one map so shared path-prefix levels (and
 // the root tree) cost a single API call per scan; nil disables memoization.
 func (ic *InstallationClient) fetchGitSubtreeCached(ctx context.Context, repo, ref, dir string, levelCache map[string][]TreeEntry) (entries []TreeEntry, found bool, err error) {
-	treeSHA := ref
-	for segment := range strings.SplitSeq(dir, "/") {
-		levelEntries, cached := levelCache[treeSHA]
-		if !cached {
-			levelEntries, err = ic.fetchGitTreeShallow(ctx, repo, treeSHA)
-			if err != nil {
-				return nil, false, fmt.Errorf("resolve %s under %s in repo %s ref %s: %w", segment, dir, repo, ref, err)
-			}
-			if levelCache != nil {
-				levelCache[treeSHA] = levelEntries
-			}
-		}
-		next := ""
-		for _, entry := range levelEntries {
-			if entry.Path == segment && entry.Type == "tree" {
-				next = entry.SHA
-				break
-			}
-		}
-		if next == "" {
-			return nil, false, nil
-		}
-		treeSHA = next
+	treeSHA, found, err := ic.resolveGitTreeSHA(ctx, repo, ref, dir, levelCache)
+	if err != nil || !found {
+		return nil, found, err
 	}
 
 	entries, truncated, err := ic.FetchGitTree(ctx, repo, treeSHA)
@@ -1604,6 +1626,71 @@ func (ic *InstallationClient) fetchGitSubtreeCached(ctx context.Context, repo, r
 		return nil, false, fmt.Errorf("fetch subtree %s in repo %s ref %s: %w", dir, repo, ref, ErrGitTreeTruncated)
 	}
 	return entries, true, nil
+}
+
+// resolveGitTreeSHA resolves dir to its tree object without listing that
+// directory recursively. The ref itself is the root tree when dir is repo
+// root. found is false when any path segment is absent or is not a tree.
+func (ic *InstallationClient) resolveGitTreeSHA(ctx context.Context, repo, ref, dir string, levelCache map[string][]TreeEntry) (treeSHA string, found bool, err error) {
+	objectSHA, objectType, found, err := ic.resolveGitObjectSHA(ctx, repo, ref, dir, levelCache)
+	if err != nil || !found {
+		return "", found, err
+	}
+	if objectType != "tree" {
+		return "", false, nil
+	}
+	return objectSHA, true, nil
+}
+
+func (ic *InstallationClient) resolveGitObjectSHA(ctx context.Context, repo, ref, objectPath string, levelCache map[string][]TreeEntry) (objectSHA, objectType string, found bool, err error) {
+	cleanPath := path.Clean(objectPath)
+	if cleanPath == "." {
+		_, rootTreeSHA, err := ic.fetchGitTreeShallow(ctx, repo, ref)
+		if err != nil {
+			return "", "", false, fmt.Errorf("resolve repo root in repo %s ref %s: %w", repo, ref, err)
+		}
+		if rootTreeSHA == "" {
+			return "", "", false, fmt.Errorf("resolve repo root in repo %s ref %s: GitHub returned no tree SHA", repo, ref)
+		}
+		return rootTreeSHA, "tree", true, nil
+	}
+	if path.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
+		return "", "", false, fmt.Errorf("schema path %q is not repo-relative", objectPath)
+	}
+
+	treeSHA := ref
+	segments := strings.Split(cleanPath, "/")
+	for i, segment := range segments {
+		levelEntries, cached := levelCache[treeSHA]
+		if !cached {
+			levelEntries, _, err = ic.fetchGitTreeShallow(ctx, repo, treeSHA)
+			if err != nil {
+				return "", "", false, fmt.Errorf("resolve %s under %s in repo %s ref %s: %w", segment, objectPath, repo, ref, err)
+			}
+			if levelCache != nil {
+				levelCache[treeSHA] = levelEntries
+			}
+		}
+		var matched *TreeEntry
+		for _, entry := range levelEntries {
+			if entry.Path == segment {
+				entryCopy := entry
+				matched = &entryCopy
+				break
+			}
+		}
+		if matched == nil {
+			return "", "", false, nil
+		}
+		if i == len(segments)-1 {
+			return matched.SHA, matched.Type, true, nil
+		}
+		if matched.Type != "tree" {
+			return "", "", false, nil
+		}
+		treeSHA = matched.SHA
+	}
+	return "", "", false, nil
 }
 
 // FetchBlobContent fetches file content using the Git Blob API.

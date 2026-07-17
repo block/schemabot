@@ -28,6 +28,45 @@ func TestApplyStore_Create(t *testing.T) {
 	require.NotZero(t, created.ID)
 }
 
+func TestApplyStore_CreateRejectsChangedLockIntent(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+		DatabaseName:  "testdb",
+		DatabaseType:  storage.DatabaseTypeMySQL,
+		Repository:    "org/repo",
+		PullRequest:   123,
+		Owner:         "org/repo#123",
+		PendingPlanID: "rollback:replacement",
+	}))
+	lock, err := store.Locks().Get(ctx, "testdb", storage.DatabaseTypeMySQL)
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+
+	_, err = store.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier:       "apply_changed_lock_intent",
+		LockID:                lock.ID,
+		ExpectedLockOwner:     "org/repo#123",
+		ExpectedPendingPlanID: "apply-original",
+		PlanID:                1,
+		Database:              "testdb",
+		DatabaseType:          storage.DatabaseTypeMySQL,
+		Repository:            "org/repo",
+		PullRequest:           123,
+		Environment:           "staging",
+		Deployment:            "default",
+		Engine:                storage.EngineSpirit,
+		State:                 state.Apply.Pending,
+	})
+	require.ErrorIs(t, err, storage.ErrLockIntentChanged)
+
+	applies, err := store.Applies().GetByPR(ctx, "org/repo", 123)
+	require.NoError(t, err)
+	assert.Empty(t, applies)
+}
+
 func TestApplyStore_CreateDuplicate(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

@@ -293,6 +293,17 @@ func PreviewCommentApplyConfirmNoLock() string {
 	return RenderApplyConfirmNoLock("testapp", "staging")
 }
 
+// PreviewCommentBaseSchemaFreshnessRejected renders a sample path-scoped base
+// freshness rejection for a PR that must merge or rebase before applying.
+func PreviewCommentBaseSchemaFreshnessRejected() string {
+	return RenderBaseSchemaFreshnessRejection(BaseSchemaFreshnessRejectionData{
+		RequestedBy: previewRequestedBy,
+		Database:    "testapp",
+		Environment: "production",
+		SchemaPath:  "schema/testapp",
+	})
+}
+
 // PreviewCommentReviewRequired renders a sample "review required" comment.
 func PreviewCommentReviewRequired() string {
 	return RenderReviewRequired(ReviewGateData{

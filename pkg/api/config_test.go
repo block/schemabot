@@ -114,6 +114,7 @@ tern_deployments:
 repos:
   org/repo:
     enable_checks: false
+    require_up_to_date_with_base: true
 `
 	err := os.WriteFile(configPath, []byte(content), 0644)
 	require.NoError(t, err, "write config file")
@@ -124,6 +125,7 @@ repos:
 	assert.Equal(t, 2, len(cfg.TernDeployments))
 	assert.Contains(t, cfg.Repos, "org/repo")
 	assert.False(t, cfg.AreChecksEnabled("org/repo"))
+	assert.True(t, cfg.RequiresUpToDateWithBase("org/repo"))
 }
 
 func TestLoadServerConfigFromFile_DSNFrom(t *testing.T) {
@@ -2406,6 +2408,26 @@ func TestServerConfig_AreChecksEnabled(t *testing.T) {
 			},
 		}
 		assert.True(t, cfg.AreChecksEnabled("org/repo"))
+	})
+}
+
+func TestServerConfig_RequiresUpToDateWithBase(t *testing.T) {
+	t.Run("defaults to disabled", func(t *testing.T) {
+		cfg := ServerConfig{Repos: map[string]RepoConfig{"org/repo": {}}}
+		assert.False(t, cfg.RequiresUpToDateWithBase("org/repo"))
+	})
+
+	t.Run("enabled for configured repo only", func(t *testing.T) {
+		cfg := ServerConfig{Repos: map[string]RepoConfig{
+			"org/repo": {RequireUpToDateWithBase: true},
+		}}
+		assert.True(t, cfg.RequiresUpToDateWithBase("org/repo"))
+		assert.False(t, cfg.RequiresUpToDateWithBase("org/other-repo"))
+	})
+
+	t.Run("nil config defaults to disabled", func(t *testing.T) {
+		var cfg *ServerConfig
+		assert.False(t, cfg.RequiresUpToDateWithBase("org/repo"))
 	})
 }
 

@@ -724,6 +724,12 @@ type RepoConfig struct {
 	// own safety gates. Defaults to true when not configured.
 	EnableChecks *bool `yaml:"enable_checks,omitempty"`
 
+	// RequireUpToDateWithBase rejects applies when the configured schema
+	// directory changed on the base branch after the PR diverged. Unlike a
+	// whole-branch freshness gate, unrelated base-branch commits do not block
+	// applies. Defaults to false when not configured.
+	RequireUpToDateWithBase bool `yaml:"require_up_to_date_with_base,omitempty"`
+
 	// GitHubApp names the App in ServerConfig.Apps that owns webhooks and
 	// outbound GitHub API calls for this repository. Required when Apps is
 	// configured and must match a key in ServerConfig.Apps. Setting it
@@ -1674,6 +1680,17 @@ func (c *ServerConfig) AreChecksEnabled(repo string) bool {
 		return true
 	}
 	return *repoConfig.EnableChecks
+}
+
+// RequiresUpToDateWithBase reports whether repo applies must use a branch
+// whose managed schema directory includes every schema change on the current
+// base branch.
+func (c *ServerConfig) RequiresUpToDateWithBase(repo string) bool {
+	if c == nil {
+		return false
+	}
+	repoConfig, ok := c.Repos[repo]
+	return ok && repoConfig.RequireUpToDateWithBase
 }
 
 // ResolvedGitHubApp identifies which configured GitHub App owns a repository.

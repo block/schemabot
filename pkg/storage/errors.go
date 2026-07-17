@@ -13,6 +13,10 @@ var (
 	// ErrLockNotOwned is returned when attempting to release a lock not owned by caller.
 	ErrLockNotOwned = errors.New("lock not owned by caller")
 
+	// ErrLockIntentChanged is returned when an apply's captured lock owner or
+	// pending plan no longer matches at durable apply creation time.
+	ErrLockIntentChanged = errors.New("lock intent changed")
+
 	// ErrCheckNotFound is returned when a check does not exist.
 	ErrCheckNotFound = errors.New("check not found")
 

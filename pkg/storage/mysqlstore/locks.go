@@ -162,6 +162,26 @@ func (s *lockStore) Release(ctx context.Context, database, dbType, owner string)
 	return nil
 }
 
+// ReleaseIfPendingPlanID atomically releases only the lock intent the caller
+// observed. Same-owner commands can replace pending_plan_id (for example, an
+// apply lock can become a rollback lock), so owner-only release is insufficient
+// after a network call or other long-running operation.
+func (s *lockStore) ReleaseIfPendingPlanID(ctx context.Context, database, dbType, owner, pendingPlanID string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM locks
+		WHERE database_name = ? AND database_type = ? AND owner = ? AND pending_plan_id = ?
+	`, database, dbType, owner, pendingPlanID)
+	if err != nil {
+		return false, err
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rowsAffected > 0, nil
+}
+
 // ForceRelease releases a lock regardless of owner (admin override).
 func (s *lockStore) ForceRelease(ctx context.Context, database, dbType string) error {
 	result, err := s.db.ExecContext(ctx, `

@@ -24,6 +24,7 @@ import (
 
 	"github.com/block/spirit/pkg/utils"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -1392,6 +1393,258 @@ func TestE2EApplyAutoConfirmRejectsWhenHEADAdvanced(t *testing.T) {
 	for _, a := range applies {
 		assert.NotEqual(t, dbName, a.Database, "no apply for %s should have been started", dbName)
 	}
+}
+
+// A PR whose managed schema directory changed on the base branch after it
+// diverged is rejected before execution and its lock is released. Unrelated
+// base-branch commits are excluded by the directory tree comparison.
+func TestE2EApplyAutoConfirmRejectsStaleBaseSchema(t *testing.T) {
+	dbName := "webhook_auto_confirm_stale_base"
+	svc := setupE2EService(t, dbName)
+	svc.Config().Repos = map[string]api.RepoConfig{
+		"octocat/hello-world": {RequireUpToDateWithBase: true},
+	}
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	registerStaleBaseSchemaComparison(t, mux)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Apply rejected — base schema is newer")
+		assert.Contains(t, body, "`schema`")
+		assert.Contains(t, body, "Merge or rebase")
+		assert.NotContains(t, body, "Applying automatically")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for base-schema rejection")
+	}
+
+	require.Eventually(t, func() bool {
+		lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+		return err == nil && lock == nil
+	}, 5*time.Second, 50*time.Millisecond, "lock must be released after base-schema rejection")
+
+	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, apply := range applies {
+		assert.NotEqual(t, dbName, apply.Database, "base-stale schema must not start an apply")
+	}
+}
+
+// A manual confirmation repeats the base-schema freshness gate and releases
+// only the apply-confirm lock when the branch is stale.
+func TestE2EApplyConfirmRejectsStaleBaseSchema(t *testing.T) {
+	dbName := "webhook_confirm_stale_base"
+	svc := setupE2EService(t, dbName)
+	svc.Config().Repos = map[string]api.RepoConfig{
+		"octocat/hello-world": {RequireUpToDateWithBase: true},
+	}
+	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName:  dbName,
+		DatabaseType:  "mysql",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		Owner:         "octocat/hello-world#1",
+		PendingPlanID: "plan-pending-confirmation",
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}, schemabotConfig, dbName)
+	registerStaleBaseSchemaComparison(t, mux)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Apply rejected — base schema is newer")
+		assert.Contains(t, body, "Merge or rebase")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for apply-confirm base-schema rejection")
+	}
+
+	require.Eventually(t, func() bool {
+		lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+		return err == nil && lock == nil
+	}, 5*time.Second, 50*time.Millisecond, "apply-confirm lock must be released after base-schema rejection")
+
+	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, apply := range applies {
+		assert.NotEqual(t, dbName, apply.Database, "base-stale confirmation must not start an apply")
+	}
+}
+
+// apply-confirm validates lock intent before running freshness checks. A
+// rollback lock owned by the same PR must never be released by the apply path.
+func TestE2EApplyConfirmPreservesRollbackLockWithBaseFreshnessEnabled(t *testing.T) {
+	dbName := "webhook_confirm_rollback_lock"
+	svc := setupE2EService(t, dbName)
+	svc.Config().Repos = map[string]api.RepoConfig{
+		"octocat/hello-world": {RequireUpToDateWithBase: true},
+	}
+	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName:  dbName,
+		DatabaseType:  "mysql",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		Owner:         "octocat/hello-world#1",
+		PendingPlanID: rollbackPendingPlanPrefix + "apply-original",
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}, schemabotConfig, dbName)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "This lock belongs to a rollback plan")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for rollback-lock rejection")
+	}
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, rollbackPendingPlanPrefix+"apply-original", lock.PendingPlanID)
+}
+
+// A same-PR rollback can replace the pending apply intent while apply-confirm
+// is waiting on GitHub. Freshness rejection must conditionally release the
+// apply intent it observed, not delete the newer rollback lock by owner alone.
+func TestE2EApplyConfirmFreshnessRacePreservesReplacementRollbackLock(t *testing.T) {
+	dbName := "webhook_confirm_rollback_race"
+	svc := setupE2EService(t, dbName)
+	svc.Config().Repos = map[string]api.RepoConfig{
+		"octocat/hello-world": {RequireUpToDateWithBase: true},
+	}
+	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName:  dbName,
+		DatabaseType:  "mysql",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		Owner:         "octocat/hello-world#1",
+		PendingPlanID: "plan-pending-confirmation",
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}, schemabotConfig, dbName)
+	registerStaleBaseSchemaComparisonWithHook(t, mux, func() {
+		require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+			DatabaseName:  dbName,
+			DatabaseType:  "mysql",
+			Repository:    "octocat/hello-world",
+			PullRequest:   1,
+			Owner:         "octocat/hello-world#1",
+			PendingPlanID: rollbackPendingPlanPrefix + "replacement",
+		}))
+	})
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Apply rejected — base schema is newer")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for apply-confirm base-schema rejection")
+	}
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, rollbackPendingPlanPrefix+"replacement", lock.PendingPlanID)
+}
+
+func registerStaleBaseSchemaComparison(t *testing.T, mux *http.ServeMux) {
+	t.Helper()
+	registerStaleBaseSchemaComparisonWithHook(t, mux, nil)
+}
+
+func registerStaleBaseSchemaComparisonWithHook(t *testing.T, mux *http.ServeMux, hook func()) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/def456...abc123", func(w http.ResponseWriter, _ *http.Request) {
+		if hook != nil {
+			hook()
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
+			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("merge-base-sha")},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/merge-base-sha", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
+			{Path: new("schema"), Type: new("tree"), SHA: new("schema-tree-old")},
+		}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/def456", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
+			{Path: new("schema"), Type: new("tree"), SHA: new("schema-tree-new")},
+		}}))
+	})
 }
 
 // TestE2EApplyConfirmRejectsWhenHEADAdvanced verifies that `apply-confirm`

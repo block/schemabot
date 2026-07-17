@@ -73,3 +73,80 @@ func (h *Handler) assertSchemaStillCurrent(
 func metricActionKey(action string) string {
 	return strings.ReplaceAll(action, "-", "_")
 }
+
+// assertBaseSchemaStillCurrent enforces the opt-in repository policy that a PR
+// must include every base-branch change under its managed schema directory.
+// It compares Git tree object IDs at the PR merge base and current base, so
+// unrelated commits elsewhere in a monorepo never block an apply. GitHub read
+// uncertainty rejects the apply rather than silently bypassing the guard.
+func (h *Handler) assertBaseSchemaStillCurrent(
+	ctx context.Context,
+	client *ghclient.InstallationClient,
+	repo string,
+	pr int,
+	installationID int64,
+	schema *ghclient.SchemaRequestResult,
+	prInfo *ghclient.PullRequestInfo,
+	environment string,
+	requestedBy string,
+	action string,
+) bool {
+	config, ok := h.serverConfig()
+	if !ok || !config.RequiresUpToDateWithBase(repo) {
+		return false
+	}
+
+	schemaPaths := []string{schema.SchemaPath}
+	if schema.SchemaLinkPath != "" {
+		schemaPaths = append(schemaPaths, schema.SchemaLinkPath)
+	}
+	changed, err := client.SchemaPathsChangedSinceMergeBase(ctx, repo, prInfo.BaseSHA, prInfo.HeadSHA, schemaPaths)
+	if err != nil {
+		h.logger.Error("apply rejected: could not verify base schema freshness",
+			"repo", repo,
+			"pr", pr,
+			"environment", environment,
+			"database", schema.Database,
+			"database_type", schema.Type,
+			"schema_path", schema.SchemaPath,
+			"base_sha", prInfo.BaseSHA,
+			"head_sha", prInfo.HeadSHA,
+			"action", action,
+			"requested_by", requestedBy,
+			"error", err,
+		)
+		metrics.RecordBaseSchemaFreshnessRejected(ctx, metricActionKey(action), environment, "verification_failed")
+		h.postComment(repo, pr, installationID, templates.RenderBaseSchemaFreshnessRejection(templates.BaseSchemaFreshnessRejectionData{
+			RequestedBy:       requestedBy,
+			Database:          schema.Database,
+			Environment:       environment,
+			SchemaPath:        schema.SchemaPath,
+			VerificationError: true,
+		}))
+		return true
+	}
+	if !changed {
+		return false
+	}
+
+	h.logger.Warn("apply rejected: schema path changed on base branch after PR divergence",
+		"repo", repo,
+		"pr", pr,
+		"environment", environment,
+		"database", schema.Database,
+		"database_type", schema.Type,
+		"schema_path", schema.SchemaPath,
+		"base_sha", prInfo.BaseSHA,
+		"head_sha", prInfo.HeadSHA,
+		"action", action,
+		"requested_by", requestedBy,
+	)
+	metrics.RecordBaseSchemaFreshnessRejected(ctx, metricActionKey(action), environment, "stale")
+	h.postComment(repo, pr, installationID, templates.RenderBaseSchemaFreshnessRejection(templates.BaseSchemaFreshnessRejectionData{
+		RequestedBy: requestedBy,
+		Database:    schema.Database,
+		Environment: environment,
+		SchemaPath:  schema.SchemaPath,
+	}))
+	return true
+}

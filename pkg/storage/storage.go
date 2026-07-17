@@ -70,6 +70,11 @@ type LockStore interface {
 	// Returns ErrLockNotOwned if the lock is not owned by the caller.
 	Release(ctx context.Context, database, dbType, owner string) error
 
+	// ReleaseIfPendingPlanID releases a lock only while both its owner and
+	// pending plan still match. A mismatch is a no-op so a superseding apply or
+	// rollback intent owned by the same PR remains intact.
+	ReleaseIfPendingPlanID(ctx context.Context, database, dbType, owner, pendingPlanID string) (bool, error)
+
 	// ForceRelease releases a lock regardless of owner (admin override).
 	// Used by `schemabot unlock` command and --force flag.
 	ForceRelease(ctx context.Context, database, dbType string) error

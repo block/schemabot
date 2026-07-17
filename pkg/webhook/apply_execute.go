@@ -2,7 +2,6 @@ package webhook
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -24,7 +23,7 @@ func (h *Handler) executeApply(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, schemaResult *ghclient.SchemaRequestResult,
 	environment string, installationID int64, requestedBy string,
-	result CommandResult, storedPlan *storage.Plan,
+	result CommandResult, storedPlan *storage.Plan, expectedPendingPlanID string,
 ) {
 	database := schemaResult.Database
 	dbType := schemaResult.Type
@@ -55,8 +54,8 @@ func (h *Handler) executeApply(
 	// acquired it; ErrLockNotFound / ErrLockNotOwned are expected.
 	if len(planResp.FlatTables()) == 0 {
 		lockOwner := fmt.Sprintf("%s#%d", repo, pr)
-		relErr := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner)
-		if relErr != nil && !errors.Is(relErr, storage.ErrLockNotFound) && !errors.Is(relErr, storage.ErrLockNotOwned) {
+		_, relErr := h.service.Storage().Locks().ReleaseIfPendingPlanID(ctx, database, dbType, lockOwner, expectedPendingPlanID)
+		if relErr != nil {
 			h.logger.Error("failed to release lock after no-changes confirm",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "error", relErr)
 		}
@@ -91,6 +90,32 @@ func (h *Handler) executeApply(
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
 		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
+		return
+	}
+
+	// Revalidate the PR immediately before the apply is queued. The earlier
+	// handler checks provide fast rejection, but the apply-time re-plan can be
+	// retried and the base branch or PR HEAD can advance while it runs.
+	actionName := action.ApplyConfirm
+	if storedPlan != nil {
+		actionName = action.Apply
+	}
+	freshPRInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("apply rejected: failed final PR freshness fetch",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "action", actionName, "error", err)
+		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+			"SchemaBot could not verify the current PR state. The apply was rejected; retry the command.")
+		h.releaseApplyLockAfterFreshnessRejection(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID)
+		return
+	}
+	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, freshPRInfo.HeadSHA, environment, requestedBy, actionName); rejected {
+		h.releaseApplyLockAfterFreshnessRejection(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID)
+		return
+	}
+	if rejected := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, freshPRInfo, environment, requestedBy, actionName); rejected {
+		h.releaseApplyLockAfterFreshnessRejection(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID)
 		return
 	}
 
@@ -143,11 +168,13 @@ func (h *Handler) executeApply(
 	h.service.SetPendingObserver(database, "", environment, observer)
 
 	applyReq := api.ApplyRequest{
-		PlanID:         planResp.PlanID,
-		Environment:    environment,
-		Options:        options,
-		Caller:         caller,
-		InstallationID: installationID,
+		PlanID:                planResp.PlanID,
+		Environment:           environment,
+		Options:               options,
+		Caller:                caller,
+		InstallationID:        installationID,
+		ExpectedLockOwner:     fmt.Sprintf("%s#%d", repo, pr),
+		ExpectedPendingPlanID: expectedPendingPlanID,
 	}
 
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
@@ -215,6 +242,20 @@ func (h *Handler) executeApply(
 			"apply_id", applyID, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot could not update the required status check: "+err.Error())
 		return
+	}
+}
+
+func (h *Handler) releaseApplyLockAfterFreshnessRejection(ctx context.Context, repo string, pr int, database, dbType, environment, expectedPendingPlanID string) {
+	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
+	released, relErr := h.service.Storage().Locks().ReleaseIfPendingPlanID(ctx, database, dbType, lockOwner, expectedPendingPlanID)
+	if relErr != nil {
+		h.logger.Error("failed to release lock after final freshness rejection",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "error", relErr)
+	} else if !released {
+		h.logger.Info("preserved lock after final freshness rejection because its pending intent changed",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "expected_pending_plan_id", expectedPendingPlanID)
 	}
 }
 

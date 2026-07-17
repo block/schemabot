@@ -352,6 +352,40 @@ func RenderStalePlanRejection(data StalePlanRejectionData) string {
 	return sb.String()
 }
 
+// BaseSchemaFreshnessRejectionData contains data for an apply rejected because
+// the PR does not include the current base branch's schema directory state.
+type BaseSchemaFreshnessRejectionData struct {
+	RequestedBy       string
+	Database          string
+	Environment       string
+	SchemaPath        string
+	VerificationError bool
+}
+
+// RenderBaseSchemaFreshnessRejection renders the path-scoped base freshness
+// rejection. GitHub errors remain server-side; the PR receives fixed guidance
+// that cannot expose infrastructure details.
+func RenderBaseSchemaFreshnessRejection(data BaseSchemaFreshnessRejectionData) string {
+	var sb strings.Builder
+
+	writeEnvironmentTitle(&sb, "⚠️ Apply rejected — base schema is newer", data.Environment)
+	writeDBLine(&sb, data.Database)
+	sb.WriteString("\n")
+	if data.VerificationError {
+		sb.WriteString("SchemaBot could not verify whether this PR includes the current base branch's schema changes. The apply was rejected to avoid reverting a change that may already be on the base branch.\n\n")
+		sb.WriteString("Retry the command. If verification continues to fail, contact a SchemaBot operator.\n")
+	} else {
+		fmt.Fprintf(&sb, "The schema directory `%s` changed on the base branch after this PR diverged. Applying this branch could revert those newer schema changes.\n\n", data.SchemaPath)
+		sb.WriteString("Merge or rebase the current base branch into this PR, review the updated plan, then run `apply` again.\n")
+	}
+
+	if data.RequestedBy != "" {
+		fmt.Fprintf(&sb, "\n_Requested by @%s_\n", data.RequestedBy)
+	}
+
+	return sb.String()
+}
+
 // RenderApplyConfirmNoLock renders a comment when apply-confirm is run without a lock.
 func RenderApplyConfirmNoLock(database, environment string) string {
 	var sb strings.Builder

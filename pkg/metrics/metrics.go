@@ -301,6 +301,21 @@ func RecordStalePlanRejected(ctx context.Context, environment string) {
 	)
 }
 
+// RecordBaseSchemaFreshnessRejected increments the counter for apply commands
+// rejected by the path-scoped base freshness gate. outcome distinguishes a
+// confirmed stale schema directory from GitHub uncertainty that failed closed.
+func RecordBaseSchemaFreshnessRejected(ctx context.Context, action, environment, outcome string) {
+	if !knownSchemaFreshnessActions[action] {
+		action = "unknown"
+	}
+	addCounter(ctx, "schemabot.command.rejected_base_schema_freshness.total",
+		"Apply rejected because the base branch schema path changed after divergence or could not be verified", "{rejection}",
+		attribute.String("action", action),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
 // RecordTransientPlanRetry increments the counter for webhook plan retries
 // after transient remote deployment unavailability. A spike with
 // outcome="exhausted" for one environment means the network path to that

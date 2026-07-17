@@ -338,6 +338,10 @@ type ApplyRequest struct {
 	Options        map[string]string `json:"options,omitempty"`
 	Caller         string            `json:"caller,omitempty"`          // Identity of the caller (e.g., "cli:user@host")
 	InstallationID int64             `json:"installation_id,omitempty"` // GitHub App installation ID (for PR comment tracking)
+	// ExpectedLockOwner and ExpectedPendingPlanID are internal webhook guards;
+	// direct API callers cannot assert a lock intent through JSON.
+	ExpectedLockOwner     string `json:"-"`
+	ExpectedPendingPlanID string `json:"-"`
 }
 
 // handlePlan handles POST /api/plan requests.
@@ -961,22 +965,24 @@ func (s *Service) createStoredApply(
 	caller := resolveCaller(ctx, req.Caller)
 
 	apply := &storage.Apply{
-		ApplyIdentifier: applyIdentifier,
-		LockID:          lockID,
-		PlanID:          plan.ID,
-		Database:        plan.Database,
-		DatabaseType:    plan.DatabaseType,
-		Repository:      plan.Repository,
-		PullRequest:     plan.PullRequest,
-		Environment:     req.Environment,
-		Deployment:      targets[0].Deployment,
-		Caller:          caller,
-		InstallationID:  req.InstallationID,
-		Engine:          storage.EngineForType(plan.DatabaseType),
-		State:           state.Apply.Pending,
-		Options:         storage.MarshalApplyOptions(applyOpts),
-		CreatedAt:       now,
-		UpdatedAt:       now,
+		ApplyIdentifier:       applyIdentifier,
+		LockID:                lockID,
+		ExpectedLockOwner:     req.ExpectedLockOwner,
+		ExpectedPendingPlanID: req.ExpectedPendingPlanID,
+		PlanID:                plan.ID,
+		Database:              plan.Database,
+		DatabaseType:          plan.DatabaseType,
+		Repository:            plan.Repository,
+		PullRequest:           plan.PullRequest,
+		Environment:           req.Environment,
+		Deployment:            targets[0].Deployment,
+		Caller:                caller,
+		InstallationID:        req.InstallationID,
+		Engine:                storage.EngineForType(plan.DatabaseType),
+		State:                 state.Apply.Pending,
+		Options:               storage.MarshalApplyOptions(applyOpts),
+		CreatedAt:             now,
+		UpdatedAt:             now,
 	}
 
 	taskChanges := applyTaskChanges(plan)
