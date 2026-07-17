@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
@@ -18,6 +19,8 @@ type LogsCmd struct {
 	ApplyID     string `short:"a" help:"Apply ID (e.g., apply_abc123)" name:"apply-id"`
 	Limit       int    `short:"n" help:"Number of log entries to show" default:"50"`
 	Follow      bool   `short:"f" help:"Follow logs in real-time"`
+	Deployment  string `help:"Read logs from the selected data-plane deployment"`
+	JSON        bool   `help:"Output as JSON"`
 }
 
 // Run executes the logs command.
@@ -36,6 +39,12 @@ func (cmd *LogsCmd) Run(g *Globals) error {
 			return fmt.Errorf("--environment is required (or provide an apply_id)")
 		}
 	}
+	if cmd.Deployment != "" && cmd.ApplyID == "" {
+		return fmt.Errorf("--deployment requires an explicit apply_id")
+	}
+	if cmd.Deployment != "" && cmd.Follow {
+		return fmt.Errorf("--deployment is incompatible with --follow")
+	}
 
 	ep, err := resolveEndpoint(g.Endpoint, g.Profile)
 	if err != nil {
@@ -45,20 +54,73 @@ func (cmd *LogsCmd) Run(g *Globals) error {
 	if cmd.Follow {
 		return followLogs(ep, cmd.Database, cmd.Environment, cmd.ApplyID)
 	}
+	if cmd.Deployment != "" {
+		return showDeploymentLogs(ep, cmd.ApplyID, cmd.Deployment, cmd.Limit, cmd.JSON)
+	}
 
-	return showLogs(ep, cmd.Database, cmd.Environment, cmd.ApplyID, cmd.Limit)
+	return showLogs(ep, cmd.Database, cmd.Environment, cmd.ApplyID, cmd.Limit, cmd.JSON)
+}
+
+func showDeploymentLogs(endpoint, applyID, deployment string, limit int, outputJSON bool) error {
+	var result *apitypes.DeploymentLogsResponse
+	err := withLoading("Loading data-plane logs...", !outputJSON, func() error {
+		var loadErr error
+		result, loadErr = client.GetDeploymentLogs(endpoint, applyID, deployment, limit)
+		return loadErr
+	})
+	if err != nil {
+		return err
+	}
+	if outputJSON {
+		return writeJSON(result)
+	}
+	if len(result.Sources) == 0 {
+		fmt.Println("No data-plane logs found.")
+	}
+	for i, source := range result.Sources {
+		if len(result.Sources) > 1 {
+			fmt.Printf("%s%s%s\n", templates.ANSIDim, deploymentLogSourceLabel("", source.Operations, source.ExternalID), templates.ANSIReset)
+		}
+		printLogs(source.Logs)
+		if i+1 < len(result.Sources) {
+			fmt.Println()
+		}
+	}
+	for _, sourceErr := range result.Errors {
+		fmt.Printf("Warning: %s: %s\n", deploymentLogSourceLabel(sourceErr.Target, sourceErr.Operations, sourceErr.ExternalID), sourceErr.Message)
+	}
+	return nil
+}
+
+func deploymentLogSourceLabel(target string, operations []*apitypes.LogOperationProvenance, externalID string) string {
+	if target == "" && len(operations) > 0 {
+		target = operations[0].Target
+	}
+	parts := []string{target}
+	for _, op := range operations {
+		if op.OperationKind != "" {
+			parts = append(parts, op.OperationKind)
+		}
+	}
+	if len(parts) == 1 && parts[0] == "" {
+		return externalID
+	}
+	return strings.Join(parts, " / ") + " (" + externalID + ")"
 }
 
 // showLogs displays logs once and exits.
-func showLogs(endpoint, database, environment, applyID string, limit int) error {
+func showLogs(endpoint, database, environment, applyID string, limit int, outputJSON bool) error {
 	var logs []*client.LogEntry
-	err := withLoading("Loading logs...", true, func() error {
+	err := withLoading("Loading logs...", !outputJSON, func() error {
 		var loadErr error
 		logs, loadErr = client.GetLogs(endpoint, database, environment, applyID, limit)
 		return loadErr
 	})
 	if err != nil {
 		return err
+	}
+	if outputJSON {
+		return writeJSON(&apitypes.LogsResponse{ApplyID: applyID, Logs: logs})
 	}
 
 	if len(logs) == 0 {

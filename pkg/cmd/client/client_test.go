@@ -50,6 +50,28 @@ func TestCallPullSchemaAPI(t *testing.T) {
 	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", result.Namespaces["orders"].Tables["users"])
 }
 
+func TestLogRequestQueryValuesAreEncoded(t *testing.T) {
+	var requests []*http.Request
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Clone(t.Context()))
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"logs":[],"sources":[],"errors":[]}`))
+		require.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := GetLogs(server.URL, "", "", "apply/a & b", 17)
+	require.NoError(t, err)
+	_, err = GetDeploymentLogs(server.URL, "apply/a & b", "data plane/one", 23)
+	require.NoError(t, err)
+	require.Len(t, requests, 2)
+	assert.Equal(t, "apply/a & b", requests[0].URL.Query().Get("apply_id"))
+	assert.Equal(t, "17", requests[0].URL.Query().Get("limit"))
+	assert.Equal(t, "apply/a & b", requests[1].URL.Query().Get("apply_id"))
+	assert.Equal(t, "data plane/one", requests[1].URL.Query().Get("deployment"))
+	assert.Equal(t, "23", requests[1].URL.Query().Get("limit"))
+}
+
 func TestCallPullSchemaAPIError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)

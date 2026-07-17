@@ -2336,6 +2336,44 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	return resp, nil
 }
 
+const maxLogsLimit = 1000
+
+func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("logs request is required")
+	}
+	if req.ApplyId == "" {
+		return nil, fmt.Errorf("apply_id is required")
+	}
+	limit := int(req.Limit)
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > maxLogsLimit {
+		limit = maxLogsLimit
+	}
+	apply, err := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
+	if err != nil {
+		return nil, fmt.Errorf("get apply %s for logs: %w", req.ApplyId, err)
+	}
+	if apply == nil {
+		return nil, fmt.Errorf("get apply %s for logs: %w", req.ApplyId, storage.ErrApplyNotFound)
+	}
+	logs, err := c.storage.ApplyLogs().GetRecentByApply(ctx, apply.ID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("get recent logs for apply %s: %w", req.ApplyId, err)
+	}
+	resp := &ternv1.LogsResponse{ApplyId: req.ApplyId, Logs: make([]*ternv1.ApplyLog, 0, len(logs))}
+	for _, log := range logs {
+		entry := &ternv1.ApplyLog{Id: log.ID, Level: log.Level, EventType: log.EventType, Source: log.Source, Message: log.Message, OldState: log.OldState, NewState: log.NewState, MetadataJson: log.Metadata, CreatedAt: log.CreatedAt.UTC().Format(time.RFC3339Nano)}
+		if log.TaskID != nil {
+			entry.TaskId = log.TaskID
+		}
+		resp.Logs = append(resp.Logs, entry)
+	}
+	return resp, nil
+}
+
 // loadStoredShardsByTable loads the persisted per-shard rows for an apply's
 // operations, grouped by (namespace, table), so the progress response renders
 // the per-shard breakdown from storage. It is Vitess-only (other engines have no

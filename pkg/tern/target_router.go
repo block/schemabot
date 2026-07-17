@@ -271,6 +271,17 @@ func (r *TargetRouter) Progress(ctx context.Context, req *ternv1.ProgressRequest
 	return routeStoredApply(ctx, r, req, "progress", Client.Progress)
 }
 
+func (r *TargetRouter) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("logs request is required")
+	}
+	client, _, err := r.clientForTarget(ctx, req.Target, req.Type, req.Environment, req.Database)
+	if err != nil {
+		return nil, fmt.Errorf("route logs for target %q: %w", req.Target, err)
+	}
+	return client.Logs(ctx, req)
+}
+
 // Cutover triggers cutover for a stored apply by routing through its target.
 func (r *TargetRouter) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
 	return routeStoredApply(ctx, r, req, "cutover", Client.Cutover)

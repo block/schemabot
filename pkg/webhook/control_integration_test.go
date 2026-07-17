@@ -1157,6 +1157,9 @@ func (c *stopCommandTernClient) Apply(context.Context, *ternv1.ApplyRequest) (*t
 func (c *stopCommandTernClient) Progress(context.Context, *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	return nil, nil
 }
+func (c *stopCommandTernClient) Logs(context.Context, *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	return &ternv1.LogsResponse{}, nil
+}
 
 func (c *stopCommandTernClient) Cutover(context.Context, *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
 	return nil, nil

@@ -473,6 +473,14 @@ func (c *GRPCClient) Progress(ctx context.Context, req *ternv1.ProgressRequest) 
 	return c.client.Progress(ctx, req)
 }
 
+func (c *GRPCClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	resp, err := c.client.Logs(ctx, req)
+	if status.Code(err) == codes.Unimplemented {
+		return nil, fmt.Errorf("selected data plane does not support log reads; upgrade that data plane: %w", err)
+	}
+	return resp, err
+}
+
 func (c *GRPCClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
 	return c.client.Cutover(ctx, req)
 }

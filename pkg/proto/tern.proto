@@ -114,6 +114,14 @@ service Tern {
     };
   }
 
+  // Logs returns a bounded recent window of durable apply logs. It is read-only.
+  rpc Logs(LogsRequest) returns (LogsResponse) {
+    option (google.api.http) = {
+      post: "/v1/logs"
+      body: "*"
+    };
+  }
+
   // Cutover triggers the table swap phase for a schema change that was started
   // with defer_cutover=true. Only valid when state is waiting_for_cutover.
   //
@@ -545,6 +553,33 @@ message ProgressRequest {
   string apply_id = 1;
   // Environment: "staging" or "production".
   string environment = 2;
+}
+
+message LogsRequest {
+  string apply_id = 1;
+  string target = 2;
+  string database = 3;
+  string type = 4;
+  string environment = 5;
+  int32 limit = 6;
+}
+
+message ApplyLog {
+  int64 id = 1;
+  optional int64 task_id = 2;
+  string level = 3;
+  string event_type = 4;
+  string source = 5;
+  string message = 6;
+  string old_state = 7;
+  string new_state = 8;
+  bytes metadata_json = 9;
+  string created_at = 10;
+}
+
+message LogsResponse {
+  string apply_id = 1;
+  repeated ApplyLog logs = 2;
 }
 
 // ShardProgress contains progress information for a single Vitess shard.

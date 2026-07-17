@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -587,6 +588,8 @@ type mockTernClient struct {
 	progressResp             *ternv1.ProgressResponse
 	progressErr              error
 	progressReq              *ternv1.ProgressRequest
+	logsReqs                 []*ternv1.LogsRequest
+	logsHook                 func(*ternv1.LogsRequest) (*ternv1.LogsResponse, error)
 	volumeResp               *ternv1.VolumeResponse
 	volumeErr                error
 	volumeReq                *ternv1.VolumeRequest // captured request
@@ -660,6 +663,87 @@ func (m *mockTernClient) Progress(ctx context.Context, req *ternv1.ProgressReque
 	}
 	return nil, m.progressErr
 }
+func (m *mockTernClient) Logs(_ context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	m.logsReqs = append(m.logsReqs, req)
+	if m.logsHook != nil {
+		return m.logsHook(req)
+	}
+	return &ternv1.LogsResponse{}, nil
+}
+
+func TestDeploymentLogEntryRejectsMalformedRecords(t *testing.T) {
+	_, err := deploymentLogEntry("remote-a", &ternv1.ApplyLog{CreatedAt: "not-a-time", MetadataJson: []byte(`{}`)})
+	require.ErrorContains(t, err, "created_at")
+
+	_, err = deploymentLogEntry("remote-a", &ternv1.ApplyLog{CreatedAt: "2026-07-17T01:02:03Z", MetadataJson: []byte(`{`)})
+	require.EqualError(t, err, "remote log metadata is not valid JSON")
+
+	taskID := int64(4)
+	entry, err := deploymentLogEntry("remote-a", &ternv1.ApplyLog{Id: 3, TaskId: &taskID, Level: "info", EventType: "state", Source: "driver", Message: "ready", OldState: "pending", NewState: "running", MetadataJson: []byte(`{"target":"-80"}`), CreatedAt: "2026-07-17T01:02:03.000000004Z"})
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), entry.ID)
+	assert.Equal(t, &taskID, entry.TaskID)
+	assert.JSONEq(t, `{"target":"-80"}`, string(entry.Metadata))
+	assert.Equal(t, time.Date(2026, 7, 17, 1, 2, 3, 4, time.UTC), entry.CreatedAt)
+}
+
+func TestDeploymentLogErrorIsSanitizedAndIncludesProvenance(t *testing.T) {
+	fetch := &deploymentLogFetch{target: "cluster-a", externalID: "remote-a", operations: []*apitypes.LogOperationProvenance{{OperationKey: "commerce/-80/orders", Target: "cluster-a", OperationKind: "work"}}}
+	got := deploymentLogError(fetch, status.Error(codes.Unavailable, "dial secret.example:443"))
+	assert.Equal(t, "RemoteLogReadFailed", got.Code)
+	assert.NotContains(t, got.Message, "secret.example")
+	assert.Equal(t, fetch.operations, got.Operations)
+
+	got = deploymentLogError(fetch, status.Error(codes.Unimplemented, "method Logs not implemented"))
+	assert.Equal(t, "UnsupportedCapability", got.Code)
+	assert.Equal(t, "upgrade_required", got.Reason)
+}
+
+func TestHandleDeploymentLogsFansOutDeduplicatesAndPreservesPartialResults(t *testing.T) {
+	apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-control", Database: "commerce", DatabaseType: storage.DatabaseTypeStrata, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/orders", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-a", ExternalID: "remote-a", ExternalOperationID: "101"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/customers", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-a", ExternalID: "remote-a", ExternalOperationID: "102"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/80-/orders", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-b", ExternalID: "remote-b", ExternalOperationID: "103"},
+	}
+	client := &mockTernClient{isRemote: true}
+	client.logsHook = func(req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+		if req.ApplyId == "remote-b" {
+			return nil, status.Error(codes.Unavailable, "dial private.example:443")
+		}
+		return &ternv1.LogsResponse{ApplyId: req.ApplyId, Logs: []*ternv1.ApplyLog{{Id: 11, Level: "error", EventType: "engine", Source: "driver", Message: "checksum failed", MetadataJson: []byte(`{"chunk":8}`), CreatedAt: "2026-07-17T01:02:03Z"}}}, nil
+	}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&limit=25", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var response apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, client.logsReqs, 2)
+	assert.Equal(t, "remote-a", client.logsReqs[0].ApplyId)
+	assert.Equal(t, "cluster-a", client.logsReqs[0].Target)
+	assert.Equal(t, int32(25), client.logsReqs[0].Limit)
+	assert.Equal(t, "remote-b", client.logsReqs[1].ApplyId)
+	require.Len(t, response.Sources, 1)
+	assert.Equal(t, "remote-a", response.Sources[0].ExternalID)
+	require.Len(t, response.Sources[0].Operations, 2)
+	assert.Equal(t, "commerce/-80/orders", response.Sources[0].Operations[0].OperationKey)
+	assert.NotContains(t, w.Body.String(), "101")
+	assert.NotContains(t, w.Body.String(), "102")
+	require.Len(t, response.Sources[0].Logs, 1)
+	assert.JSONEq(t, `{"chunk":8}`, string(response.Sources[0].Logs[0].Metadata))
+	require.Len(t, response.Errors, 1)
+	assert.Equal(t, "remote-b", response.Errors[0].ExternalID)
+	assert.Equal(t, "RemoteLogReadFailed", response.Errors[0].Code)
+	assert.NotContains(t, w.Body.String(), "private.example")
+}
+
 func (m *mockTernClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
 	m.cutoverReq = req
 	if m.cutoverResp != nil {

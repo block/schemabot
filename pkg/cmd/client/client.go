@@ -596,18 +596,7 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 	return &result, nil
 }
 
-// LogEntry represents a single log entry from the apply logs.
-type LogEntry struct {
-	ID        int64     `json:"id"`
-	ApplyID   string    `json:"apply_id"`
-	TaskID    *int64    `json:"task_id,omitempty"`
-	Level     string    `json:"level"`
-	EventType string    `json:"event_type"`
-	Message   string    `json:"message"`
-	OldState  string    `json:"old_state,omitempty"`
-	NewState  string    `json:"new_state,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-}
+type LogEntry = apitypes.LogEntry
 
 // GetLogs retrieves apply logs for a database.
 // If applyID is provided, it fetches logs for that specific apply.
@@ -617,19 +606,23 @@ func GetLogs(endpoint, database, environment, applyID string, limit int) ([]*Log
 		return nil, fmt.Errorf("database or apply_id is required")
 	}
 
-	var path string
-	if database == "" && applyID != "" {
-		path = fmt.Sprintf("/api/logs?apply_id=%s", applyID)
-	} else {
-		path = fmt.Sprintf("/api/logs/%s?", database)
-		if applyID != "" {
-			path += fmt.Sprintf("apply_id=%s", applyID)
-		} else if environment != "" {
-			path += fmt.Sprintf("environment=%s", environment)
-		}
+	values := url.Values{}
+	if applyID != "" {
+		values.Set("apply_id", applyID)
+	} else if environment != "" {
+		values.Set("environment", environment)
 	}
 	if limit > 0 {
-		path += fmt.Sprintf("&limit=%d", limit)
+		values.Set("limit", strconv.Itoa(limit))
+	}
+	var path string
+	if database == "" && applyID != "" {
+		path = "/api/logs"
+	} else {
+		path = "/api/logs/" + url.PathEscape(database)
+	}
+	if encoded := values.Encode(); encoded != "" {
+		path += "?" + encoded
 	}
 
 	var result struct {
@@ -639,6 +632,20 @@ func GetLogs(endpoint, database, environment, applyID string, limit int) ([]*Log
 		return nil, err
 	}
 	return result.Logs, nil
+}
+
+func GetDeploymentLogs(endpoint, applyID, deployment string, limit int) (*apitypes.DeploymentLogsResponse, error) {
+	values := url.Values{}
+	values.Set("apply_id", applyID)
+	values.Set("deployment", deployment)
+	if limit > 0 {
+		values.Set("limit", strconv.Itoa(limit))
+	}
+	var result apitypes.DeploymentLogsResponse
+	if err := doGetInto(endpoint, "/api/logs?"+values.Encode(), &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 // Setting represents a key-value setting.

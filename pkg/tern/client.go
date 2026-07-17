@@ -55,6 +55,9 @@ type Client interface {
 	// Progress returns detailed progress for an active schema change.
 	Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error)
 
+	// Logs returns a bounded recent window of durable apply logs.
+	Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error)
+
 	// Cutover triggers the cutover phase when defer_cutover was used.
 	Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error)
 

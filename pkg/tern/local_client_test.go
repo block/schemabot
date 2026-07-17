@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"reflect"
@@ -31,6 +32,39 @@ func TestPulledSchemaFileContentValidatesDDL(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "parse pulled schema for database orders table broken_users")
+}
+
+func TestLocalClientLogsValidationAndConversion(t *testing.T) {
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{storage: &mockStorage{applies: &mockApplyStore{}, logs: logs}}
+
+	_, err := client.Logs(t.Context(), nil)
+	require.EqualError(t, err, "logs request is required")
+	_, err = client.Logs(t.Context(), &ternv1.LogsRequest{})
+	require.EqualError(t, err, "apply_id is required")
+	_, err = client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "missing"})
+	require.ErrorIs(t, err, storage.ErrApplyNotFound)
+
+	taskID := int64(42)
+	createdAt := time.Date(2026, 7, 17, 1, 2, 3, 4, time.FixedZone("offset", 3600))
+	logs.logs = []*storage.ApplyLog{{ID: 7, TaskID: &taskID, Level: "info", EventType: "state", Source: "driver", Message: "ready", OldState: "pending", NewState: "running", Metadata: json.RawMessage(`{"shard":"-80"}`), CreatedAt: createdAt}}
+	client.storage = &mockStorage{applies: &mockApplyStore{apply: &storage.Apply{ID: 9}}, logs: logs}
+
+	resp, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a"})
+	require.NoError(t, err)
+	assert.Equal(t, 50, logs.recentLimit)
+	require.Len(t, resp.Logs, 1)
+	assert.Equal(t, int64(7), resp.Logs[0].Id)
+	assert.Equal(t, &taskID, resp.Logs[0].TaskId)
+	assert.Equal(t, []byte(`{"shard":"-80"}`), resp.Logs[0].MetadataJson)
+	assert.Equal(t, createdAt.UTC().Format(time.RFC3339Nano), resp.Logs[0].CreatedAt)
+	assert.Equal(t, "driver", resp.Logs[0].Source)
+	assert.Equal(t, "pending", resp.Logs[0].OldState)
+	assert.Equal(t, "running", resp.Logs[0].NewState)
+
+	_, err = client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Limit: maxLogsLimit + 1})
+	require.NoError(t, err)
+	assert.Equal(t, maxLogsLimit, logs.recentLimit)
 }
 
 type pullSchemaPSClient struct {

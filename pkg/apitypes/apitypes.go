@@ -3,7 +3,58 @@
 // This package has zero dependencies — import it freely from any package.
 package apitypes
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+	"time"
+)
+
+type LogEntry struct {
+	ID        int64           `json:"id"`
+	ApplyID   string          `json:"apply_id"`
+	TaskID    *int64          `json:"task_id,omitempty"`
+	Level     string          `json:"level"`
+	EventType string          `json:"event_type"`
+	Source    string          `json:"source,omitempty"`
+	Message   string          `json:"message"`
+	OldState  string          `json:"old_state,omitempty"`
+	NewState  string          `json:"new_state,omitempty"`
+	Metadata  json.RawMessage `json:"metadata,omitempty"`
+	CreatedAt time.Time       `json:"created_at"`
+}
+
+type LogsResponse struct {
+	ApplyID string      `json:"apply_id,omitempty"`
+	Logs    []*LogEntry `json:"logs"`
+}
+
+type DeploymentLogsResponse struct {
+	ApplyID    string                 `json:"apply_id"`
+	Deployment string                 `json:"deployment"`
+	Sources    []*DeploymentLogSource `json:"sources"`
+	Errors     []*DeploymentLogError  `json:"errors"`
+}
+
+type DeploymentLogSource struct {
+	ExternalID string                    `json:"external_id"`
+	Operations []*LogOperationProvenance `json:"operations"`
+	Logs       []*LogEntry               `json:"logs"`
+}
+
+type LogOperationProvenance struct {
+	OperationKey  string `json:"operation_key,omitempty"`
+	Target        string `json:"target,omitempty"`
+	OperationKind string `json:"operation_kind,omitempty"`
+}
+
+type DeploymentLogError struct {
+	ExternalID string                    `json:"external_id,omitempty"`
+	Target     string                    `json:"target,omitempty"`
+	Operations []*LogOperationProvenance `json:"operations"`
+	Code       string                    `json:"code"`
+	Reason     string                    `json:"reason"`
+	Message    string                    `json:"message"`
+}
 
 // =============================================================================
 // Error Codes

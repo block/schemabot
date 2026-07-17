@@ -229,6 +229,28 @@ func (c *RoutingClient) Progress(ctx context.Context, req *ternv1.ProgressReques
 	}, Client.Progress)
 }
 
+func (c *RoutingClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("logs request is required")
+	}
+	target, err := c.resolveSingleExecutionTarget(ctx, req.Database, req.Environment)
+	if err != nil {
+		return nil, err
+	}
+	client, err := c.clientForDeployment(ctx, target.Deployment, req.Environment)
+	if err != nil {
+		return nil, fmt.Errorf("get client for logs deployment %q environment %q: %w", target.Deployment, req.Environment, err)
+	}
+	routed := proto.Clone(req).(*ternv1.LogsRequest)
+	if routed.Target == "" {
+		routed.Target = target.Target
+	}
+	if routed.Type == "" {
+		routed.Type = target.DatabaseType
+	}
+	return client.Logs(ctx, routed)
+}
+
 // Cutover triggers the cutover phase when defer_cutover was used.
 func (c *RoutingClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
 	return routeApply(ctx, c, req, "cutover", func(r *ternv1.CutoverRequest, applyID, environment string) {

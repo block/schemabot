@@ -64,6 +64,9 @@ func (s *mockTernServer) Progress(ctx context.Context, req *ternv1.ProgressReque
 		Engine: ternv1.Engine_ENGINE_SPIRIT,
 	}, nil
 }
+func (s *mockTernServer) Logs(context.Context, *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	return &ternv1.LogsResponse{}, nil
+}
 
 func (s *mockTernServer) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
 	if req.ApplyId == "" {
@@ -628,6 +631,9 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 	}
 	return &ternv1.ProgressResponse{State: ps, Tables: tables, Volume: volume, ErrorMessage: errorMessage}, nil
 }
+func (s *capturingTernServer) Logs(context.Context, *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	return &ternv1.LogsResponse{}, nil
+}
 
 func (s *capturingTernServer) getStartApplyID() string {
 	s.mu.Lock()
@@ -758,7 +764,8 @@ func (m *mockTaskStore) Update(context.Context, *storage.Task) error { return m.
 
 type mockApplyLogStore struct {
 	storage.ApplyLogStore
-	logs []*storage.ApplyLog
+	logs        []*storage.ApplyLog
+	recentLimit int
 }
 
 func (m *mockApplyLogStore) Append(_ context.Context, log *storage.ApplyLog) error {
@@ -768,6 +775,11 @@ func (m *mockApplyLogStore) Append(_ context.Context, log *storage.ApplyLog) err
 }
 
 func (m *mockApplyLogStore) GetByApply(context.Context, int64) ([]*storage.ApplyLog, error) {
+	return m.logs, nil
+}
+
+func (m *mockApplyLogStore) GetRecentByApply(_ context.Context, _ int64, limit int) ([]*storage.ApplyLog, error) {
+	m.recentLimit = limit
 	return m.logs, nil
 }
 

@@ -24,6 +24,9 @@ type progressErrorClient struct {
 func (c progressErrorClient) Progress(context.Context, *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	return nil, c.err
 }
+func (c progressErrorClient) Logs(context.Context, *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	return nil, storage.ErrApplyNotFound
+}
 
 type applyErrorClient struct {
 	Client

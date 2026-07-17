@@ -112,6 +112,9 @@ func (c *targetRouterRecordingClient) Progress(_ context.Context, req *ternv1.Pr
 	c.progressReq = req
 	return &ternv1.ProgressResponse{ApplyId: req.ApplyId}, nil
 }
+func (c *targetRouterRecordingClient) Logs(_ context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	return &ternv1.LogsResponse{ApplyId: req.ApplyId}, nil
+}
 
 func (c *targetRouterRecordingClient) Cutover(context.Context, *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
 	return &ternv1.CutoverResponse{Accepted: true}, nil
