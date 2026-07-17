@@ -1252,7 +1252,9 @@ func TestE2EReconcileMissingSummaryCommentsRepairsStoppedApply(t *testing.T) {
 
 	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
+	// Redundant early-exit closer: svc owns the storage (and this handle) and
+	// closes it below, so discard the guaranteed already-closed error.
+	t.Cleanup(func() { _ = schemabotDB.Close() })
 	st := mysqlstore.New(schemabotDB)
 
 	apply := seedReconcileScenario(t, st, schemabotDB, "org/reconcile-stopped", "e2e_reconcile_stopped_db", state.Apply.Stopped, state.Task.Stopped)
@@ -1292,7 +1294,9 @@ func TestE2EReconcileMissingSummaryCommentsRespectsFreshClaim(t *testing.T) {
 
 	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
+	// Redundant early-exit closer: svc owns the storage (and this handle) and
+	// closes it below, so discard the guaranteed already-closed error.
+	t.Cleanup(func() { _ = schemabotDB.Close() })
 	st := mysqlstore.New(schemabotDB)
 
 	apply := seedReconcileScenario(t, st, schemabotDB, "org/reconcile-claimed", "e2e_reconcile_claimed_db", state.Apply.Completed, state.Task.Completed)

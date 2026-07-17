@@ -442,7 +442,7 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 
 	applies, err := h.service.Storage().Applies().FindMissingSummaryComment(ctx)
 	if err != nil {
-		h.logger.Error("summary comment reconciliation skipped this startup; PRs with a finished apply may show no final summary until the next restart",
+		h.logger.Error("summary comment reconciliation skipped this startup; terminal applies (including stopped) missing a summary comment stay unrepaired until the next restart",
 			"error", err)
 		return
 	}
