@@ -1350,8 +1350,25 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 			c.notifyTerminalObserver(apply, tasks)
 			return nil
 		}
+		// Completing with zero loaded tasks is only legitimate when the apply
+		// truly owns no task rows. An apply that owns rows this drive did not
+		// load is undriveable, not done: completing it would report success for
+		// schema changes that never ran, and the unloaded rows would keep
+		// blocking their database as active work. Count the raw rows — the same
+		// "owns any task work" predicate the operator's claim gate uses — and
+		// fail closed on any mismatch, including count uncertainty.
+		totalTaskRows, err := c.storage.Tasks().CountByApplyID(ctx, apply.ID)
+		if err != nil {
+			return fmt.Errorf("count task rows for apply %s before task-less completion: %w", apply.ApplyIdentifier, err)
+		}
+		if totalTaskRows > 0 {
+			c.logger.Error("refusing to complete apply as a task-less no-op: it owns task rows this drive did not load; the apply stays claimable and will not finish until its tasks load",
+				append(apply.LogAttrs(), "task_row_count", totalTaskRows)...)
+			return fmt.Errorf("apply %s owns %d task rows: %w", apply.ApplyIdentifier, totalTaskRows, ErrApplyTasksNotLoaded)
+		}
 		c.logger.Info("no tasks found for apply during recovery; completing as a no-op",
 			"apply_id", apply.ApplyIdentifier)
+		previousState := apply.State
 		apply.State = state.Apply.Completed
 		apply.CompletedAt = &now
 		apply.UpdatedAt = now
@@ -1360,6 +1377,8 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 			// recovery retries, and notify the observer only after a durable write.
 			return fmt.Errorf("complete task-less apply %s during recovery: %w", apply.ApplyIdentifier, err)
 		}
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+			"Apply owns no task work; completed without engine work", previousState, state.Apply.Completed)
 		c.notifyTerminalObserver(apply, tasks)
 		return nil
 	}

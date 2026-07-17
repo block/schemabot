@@ -747,6 +747,10 @@ func (m *mockTaskStore) GetByApplyID(context.Context, int64) ([]*storage.Task, e
 	return m.tasks, nil
 }
 
+func (m *mockTaskStore) CountByApplyID(context.Context, int64) (int64, error) {
+	return int64(len(m.tasks)), nil
+}
+
 func (m *mockTaskStore) GetByApplyOperationID(_ context.Context, applyOperationID int64) ([]*storage.Task, error) {
 	m.lastOperationID = applyOperationID
 	if m.getByOperationIDErr != nil {

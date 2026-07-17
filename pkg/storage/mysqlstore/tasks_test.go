@@ -95,6 +95,61 @@ func TestTaskStore_OperationLeaseGuardsUpdate(t *testing.T) {
 	assert.Equal(t, state.Task.Completed, reloaded.State)
 }
 
+// CountByApplyID reports every task row an apply owns — unsharded drive rows
+// and shard-tagged rows alike, with no operation-key filtering — and never
+// another apply's rows. It is the predicate a drive uses to distinguish a
+// genuinely task-less apply (safe to complete as a no-op) from one whose rows
+// a filtered loader did not return (must fail closed).
+func TestTaskStore_CountByApplyID(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	applyWithTasks := createTestApply(t, store, lock, "apply_count_tasks", 1)
+	tasklessLock := createTestLock(t, store, "otherdb", "mysql", "staging")
+	applyTaskless := createTestApply(t, store, tasklessLock, "apply_count_taskless", 2)
+
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: applyWithTasks.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+
+	createTask := func(identifier, table, shard string) {
+		now := time.Now()
+		_, err := store.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier:   identifier,
+			ApplyID:          applyWithTasks.ID,
+			ApplyOperationID: &opID,
+			PlanID:           applyWithTasks.PlanID,
+			Database:         applyWithTasks.Database,
+			DatabaseType:     applyWithTasks.DatabaseType,
+			Engine:           storage.EngineSpirit,
+			Environment:      applyWithTasks.Environment,
+			State:            state.Task.Pending,
+			TableName:        table,
+			Shard:            shard,
+			DDL:              "ALTER TABLE " + table + " ADD COLUMN email VARCHAR(255)",
+			DDLAction:        "ALTER",
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		})
+		require.NoError(t, err)
+	}
+
+	createTask("task_count_users", "users", "")
+	createTask("task_count_users_-80", "users", "-80")
+	createTask("task_count_users_80-", "users", "80-")
+
+	count, err := store.Tasks().CountByApplyID(ctx, applyWithTasks.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), count, "every row counts, shard-tagged or not")
+
+	count, err = store.Tasks().CountByApplyID(ctx, applyTaskless.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), count, "an apply with no rows counts zero, never a sibling apply's rows")
+}
+
 // TestTaskStore_GetByApplyOperationID verifies that tasks can be loaded for a
 // single apply_operation (one deployment) independently of its sibling
 // deployments under the same apply. This is the read primitive an operator

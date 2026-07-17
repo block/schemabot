@@ -1184,6 +1184,26 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 			}
 			return false, err
 		}
+		if errors.Is(err, tern.ErrApplyTasksNotLoaded) {
+			// Fail-closed: the apply owns task rows the whole-apply drive did not
+			// load, so completing it would report success for schema changes that
+			// never ran. The drive mutated nothing; the apply stays claimable and
+			// this driver will re-attempt it on later polls, so the work stays
+			// visibly stuck (and this metric fires) until the rows load or an
+			// operator intervenes.
+			s.logger.Error("operator: apply owns task rows the drive did not load; refusing task-less completion and leaving the apply claimable",
+				"driver", driverID,
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"deployment", deployment,
+				"environment", apply.Environment,
+				"error", err)
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "apply_tasks_not_loaded")
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+			}
+			return false, err
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 			s.logger.Debug("operator: stopped while running claimed apply",
 				"driver", driverID,

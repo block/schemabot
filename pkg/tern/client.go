@@ -25,6 +25,14 @@ var ErrNoTasksForApplyOperation = errors.New("no tasks found for apply operation
 // terminalizes the stale claim rather than retrying it forever.
 var ErrApplyOperationRowMissing = fmt.Errorf("apply_operation row missing: %w", ErrNoTasksForApplyOperation)
 
+// ErrApplyTasksNotLoaded is returned by a whole-apply drive that loaded zero
+// tasks for an apply that owns task rows. Such an apply is undriveable, not
+// done: completing it would report success for schema changes that never ran,
+// and the unreturned rows would keep blocking their database as active work.
+// The drive fails closed and the apply stays claimable, so the work stays
+// visibly stuck until the rows load or an operator intervenes.
+var ErrApplyTasksNotLoaded = errors.New("apply owns task rows the drive loader did not return")
+
 var (
 	// ErrPullSchemaUnsupportedType marks a pull request for a database type that
 	// the data plane does not yet support.

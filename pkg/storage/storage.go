@@ -529,6 +529,13 @@ type TaskStore interface {
 	// Used for aggregating task states to derive Apply state.
 	GetByApplyID(ctx context.Context, applyID int64) ([]*Task, error)
 
+	// CountByApplyID returns the number of task rows an apply owns, with no
+	// shard or operation filtering. It answers "does this apply own any task
+	// work at all?" — the invariant behind the operator's claim gate — so a
+	// drive can distinguish a genuinely task-less apply from one whose rows a
+	// filtered loader did not return.
+	CountByApplyID(ctx context.Context, applyID int64) (int64, error)
+
 	// GetByApplyOperationID returns the drive tasks for a single apply_operation.
 	// Unsharded operations return their per-table tasks. Sharded work operations
 	// return the task whose namespace/shard/table matches the operation key so the

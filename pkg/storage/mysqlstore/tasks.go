@@ -384,6 +384,22 @@ func (s *taskStore) GetByApplyID(ctx context.Context, applyID int64) ([]*storage
 	return scanTasks(rows)
 }
 
+// CountByApplyID returns the number of task rows the apply owns, with no shard
+// or operation filtering — the same "owns any task work" predicate the
+// operator's claim gate uses, so drives can tell a genuinely task-less apply
+// from one whose rows a filtered loader did not return.
+func (s *taskStore) CountByApplyID(ctx context.Context, applyID int64) (int64, error) {
+	var count int64
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM tasks
+		WHERE apply_id = ?
+	`, applyID).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count task rows for apply %d: %w", applyID, err)
+	}
+	return count, nil
+}
+
 // GetByApplyOperationID returns the drive tasks for a single apply_operation.
 // Unsharded operations load their per-table rows (shard = ""). Sharded work
 // operations load the row whose namespace/shard/table matches the operation key,
