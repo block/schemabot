@@ -24,8 +24,14 @@ type progressErrorClient struct {
 func (c progressErrorClient) Progress(context.Context, *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	return nil, c.err
 }
-func (c progressErrorClient) Logs(context.Context, *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
-	return nil, storage.ErrApplyNotFound
+
+type logsErrorClient struct {
+	Client
+	err error
+}
+
+func (c logsErrorClient) Logs(context.Context, *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	return nil, c.err
 }
 
 type applyErrorClient struct {
@@ -75,6 +81,26 @@ func TestServerProgressMapsMissingApplyDataToNotFound(t *testing.T) {
 			})
 			require.Error(t, err)
 			assert.Equal(t, codes.NotFound, status.Code(err))
+		})
+	}
+}
+
+func TestServerLogsMapsErrorsToStatusCode(t *testing.T) {
+	testCases := []struct {
+		name string
+		err  error
+		want codes.Code
+	}{
+		{name: "missing apply", err: fmt.Errorf("get apply missing: %w", storage.ErrApplyNotFound), want: codes.NotFound},
+		{name: "storage failure", err: errors.New("storage unavailable"), want: codes.Internal},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := NewServer(logsErrorClient{err: tc.err})
+			_, err := server.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-123"})
+			require.Error(t, err)
+			assert.Equal(t, tc.want, status.Code(err))
 		})
 	}
 }

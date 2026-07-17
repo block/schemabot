@@ -80,6 +80,7 @@ type targetRouterRecordingClient struct {
 	planDiffReq        *ternv1.PlanRequest
 	applyReq           *ternv1.ApplyRequest
 	progressReq        *ternv1.ProgressRequest
+	logsReq            *ternv1.LogsRequest
 	resumeApply        *storage.Apply
 	targetDSN          string
 	targetMetadata     map[string]string
@@ -113,6 +114,7 @@ func (c *targetRouterRecordingClient) Progress(_ context.Context, req *ternv1.Pr
 	return &ternv1.ProgressResponse{ApplyId: req.ApplyId}, nil
 }
 func (c *targetRouterRecordingClient) Logs(_ context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	c.logsReq = req
 	return &ternv1.LogsResponse{ApplyId: req.ApplyId}, nil
 }
 
@@ -238,6 +240,24 @@ func TestTargetRouterRoutesPlanDiffThroughStaticTarget(t *testing.T) {
 	assert.Equal(t, storage.DatabaseTypeMySQL, client.planDiffReq.Type)
 	assert.Equal(t, "dsid-orders-prod", client.planDiffReq.Target)
 	assert.Equal(t, "root@tcp(localhost:3306)/", client.targetDSN)
+}
+
+func TestTargetRouterRoutesLogsThroughExplicitTarget(t *testing.T) {
+	resolver := newStaticResolver(t)
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	_, err := router.Logs(t.Context(), nil)
+	require.EqualError(t, err, "logs request is required")
+
+	req := &ternv1.LogsRequest{ApplyId: "apply-remote", Database: "orders-logical", Type: storage.DatabaseTypeMySQL, Environment: "production", Target: "dsid-orders-prod", Limit: 25}
+	resp, err := router.Logs(t.Context(), req)
+
+	require.NoError(t, err)
+	assert.Equal(t, "apply-remote", resp.ApplyId)
+	client := created["orders-logical"]
+	require.NotNil(t, client)
+	assert.Same(t, req, client.logsReq)
 }
 
 func TestTargetRouterApplyUsesTargetScopedPendingObserver(t *testing.T) {

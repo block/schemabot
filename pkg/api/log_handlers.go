@@ -183,7 +183,8 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 	}
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
-		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("cannot resolve deployment %q: %v", deployment, err))
+		s.logger.Error("failed to resolve deployment for data-plane logs", append(apply.LogAttrs(), "operation", "read_deployment_logs", "operation_deployment", deployment, "error", err)...)
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("cannot resolve deployment %q; check server logs", deployment))
 		return
 	}
 	if !client.IsRemote() {
