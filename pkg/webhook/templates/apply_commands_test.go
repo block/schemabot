@@ -41,7 +41,9 @@ func TestRenderBaseSchemaFreshnessRejection(t *testing.T) {
 
 		require.Contains(t, out, "Apply rejected — base schema is newer")
 		require.Contains(t, out, "`schema/orders`")
-		require.Contains(t, out, "could revert those newer schema changes")
+		require.Contains(t, out, "newer changes")
+		require.Contains(t, out, "not included in this PR")
+		require.Contains(t, out, "could revert those changes")
 		require.Contains(t, out, "Merge or rebase")
 		require.Contains(t, out, "@alice")
 	})
