@@ -67,32 +67,101 @@ func TestApplyStore_CreateRejectsChangedLockIntent(t *testing.T) {
 	assert.Empty(t, applies)
 }
 
-func TestApplyStore_CreateRejectsPartialExpectedLockIntent(t *testing.T) {
+func TestApplyStore_CreateRejectsPendingPlanIntentWithoutOwner(t *testing.T) {
 	clearTables(t)
+	store := New(testDB)
+
+	_, err := store.Applies().Create(t.Context(), &storage.Apply{
+		ApplyIdentifier:       "apply_plan_intent_without_owner",
+		ExpectedPendingPlanID: "plan-123",
+		Database:              "testdb",
+		DatabaseType:          storage.DatabaseTypeMySQL,
+		Environment:           "staging",
+		State:                 state.Apply.Completed,
+	})
+	require.ErrorContains(t, err, "expected pending plan ID set without an expected lock owner")
+}
+
+func TestApplyStore_CreateWithMatchingLockIntent(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
 	store := New(testDB)
 
 	tests := []struct {
 		name          string
-		expectedOwner string
-		expectedPlan  string
+		pendingPlanID string
 	}{
-		{name: "owner only", expectedOwner: "org/repo#123"},
-		{name: "pending plan only", expectedPlan: "plan-123"},
+		{name: "pinned lock", pendingPlanID: "plan-abc"},
+		{name: "unpinned lock", pendingPlanID: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := store.Applies().Create(t.Context(), &storage.Apply{
-				ApplyIdentifier:       "apply_partial_intent_" + strings.ReplaceAll(tt.name, " ", "_"),
-				ExpectedLockOwner:     tt.expectedOwner,
-				ExpectedPendingPlanID: tt.expectedPlan,
+			clearTables(t)
+			require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+				DatabaseName:  "testdb",
+				DatabaseType:  storage.DatabaseTypeMySQL,
+				Repository:    "org/repo",
+				PullRequest:   123,
+				Owner:         "org/repo#123",
+				PendingPlanID: tt.pendingPlanID,
+			}))
+			lock, err := store.Locks().Get(ctx, "testdb", storage.DatabaseTypeMySQL)
+			require.NoError(t, err)
+			require.NotNil(t, lock)
+
+			id, err := store.Applies().Create(ctx, &storage.Apply{
+				ApplyIdentifier:       "apply_matching_intent_" + strings.ReplaceAll(tt.name, " ", "_"),
+				ExpectedLockOwner:     "org/repo#123",
+				ExpectedPendingPlanID: tt.pendingPlanID,
+				PlanID:                1,
 				Database:              "testdb",
 				DatabaseType:          storage.DatabaseTypeMySQL,
+				Repository:            "org/repo",
+				PullRequest:           123,
 				Environment:           "staging",
-				State:                 state.Apply.Completed,
+				Deployment:            "default",
+				Engine:                storage.EngineSpirit,
+				State:                 state.Apply.Pending,
 			})
-			require.ErrorContains(t, err, "expected lock owner and pending plan ID must both be set")
+			require.NoError(t, err)
+			require.NotZero(t, id)
+
+			created, err := store.Applies().Get(ctx, id)
+			require.NoError(t, err)
+			require.NotNil(t, created)
+			assert.Equal(t, lock.ID, created.LockID)
 		})
 	}
+}
+
+func TestApplyStore_CreateRejectsIntentAgainstUnpinnedLock(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+		DatabaseName: "testdb",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		Repository:   "org/repo",
+		PullRequest:  123,
+		Owner:        "org/repo#123",
+	}))
+
+	_, err := store.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier:       "apply_pinned_intent_unpinned_lock",
+		ExpectedLockOwner:     "org/repo#123",
+		ExpectedPendingPlanID: "plan-abc",
+		PlanID:                1,
+		Database:              "testdb",
+		DatabaseType:          storage.DatabaseTypeMySQL,
+		Repository:            "org/repo",
+		PullRequest:           123,
+		Environment:           "staging",
+		Deployment:            "default",
+		Engine:                storage.EngineSpirit,
+		State:                 state.Apply.Pending,
+	})
+	require.ErrorIs(t, err, storage.ErrLockIntentChanged)
 }
 
 func TestApplyStore_CreateDuplicate(t *testing.T) {

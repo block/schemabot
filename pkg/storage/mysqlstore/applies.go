@@ -627,13 +627,17 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 // same-owner rollback can replace pending_plan_id after freshness validation
 // but before the forward apply becomes durable.
 func verifyExpectedLockIntent(ctx context.Context, tx *sql.Tx, apply *storage.Apply) error {
-	if apply.ExpectedLockOwner == "" && apply.ExpectedPendingPlanID == "" {
+	if apply.ExpectedLockOwner == "" {
+		if apply.ExpectedPendingPlanID != "" {
+			return fmt.Errorf("verify lock intent for %s/%s: expected pending plan ID set without an expected lock owner", apply.Database, apply.DatabaseType)
+		}
 		return nil
 	}
-	if apply.ExpectedLockOwner == "" || apply.ExpectedPendingPlanID == "" {
-		return fmt.Errorf("verify lock intent for %s/%s: expected lock owner and pending plan ID must both be set", apply.Database, apply.DatabaseType)
-	}
 
+	// An empty ExpectedPendingPlanID is a real observed intent, not a missing
+	// one: it matches only a lock whose pending_plan_id is unset (the column is
+	// NOT NULL DEFAULT ''), so an unpinned lock that a rollback re-pins mid-flight
+	// still fails this check.
 	var lockID int64
 	err := tx.QueryRowContext(ctx, `
 		SELECT id

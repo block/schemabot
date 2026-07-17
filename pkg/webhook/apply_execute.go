@@ -50,16 +50,10 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// No changes — release lock and notify. Use owner-scoped Release so we
-	// can't clobber a lock that has changed ownership since this handler
-	// acquired it; ErrLockNotFound / ErrLockNotOwned are expected.
+	// No changes — release the lock (keyed on the pending intent this handler
+	// observed, so a lock re-pinned by a newer plan is preserved) and notify.
 	if len(planResp.FlatTables()) == 0 {
-		lockOwner := fmt.Sprintf("%s#%d", repo, pr)
-		_, relErr := h.service.Storage().Locks().ReleaseIfPendingPlanID(ctx, database, dbType, lockOwner, expectedPendingPlanID)
-		if relErr != nil {
-			h.logger.Error("failed to release lock after no-changes confirm",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "error", relErr)
-		}
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "no changes to apply")
 		// The target already matches the PR schema — apply found nothing to do.
 		// Record the passing (no-change) check result and refresh the aggregate so
 		// the schema check reflects that the target is up to date, the same as the
@@ -108,15 +102,15 @@ func (h *Handler) executeApply(
 			"environment", environment, "action", actionName, "error", err)
 		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
 			"SchemaBot could not verify the current PR state. The apply was rejected; retry the command.")
-		h.releaseApplyLockAfterFreshnessRejection(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID)
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final PR freshness fetch failure")
 		return
 	}
 	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, freshPRInfo.HeadSHA, environment, requestedBy, actionName); rejected {
-		h.releaseApplyLockAfterFreshnessRejection(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID)
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final stale-schema rejection")
 		return
 	}
 	if rejected := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, freshPRInfo, environment, requestedBy, actionName); rejected {
-		h.releaseApplyLockAfterFreshnessRejection(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID)
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final base-schema freshness rejection")
 		return
 	}
 
@@ -250,17 +244,26 @@ func (h *Handler) executeApply(
 	}
 }
 
-func (h *Handler) releaseApplyLockAfterFreshnessRejection(ctx context.Context, repo string, pr int, database, dbType, environment, expectedPendingPlanID string) {
+// releaseApplyLockIfIntentUnchanged releases this PR's apply lock after a
+// pre-execution gate rejected (or obviated) the apply, but only while the lock
+// still carries the exact pending intent the rejecting handler observed. A lock
+// whose pending plan has since changed — e.g. a rollback plan re-pinned it while
+// the gate ran — belongs to that newer intent and is preserved. The reason names
+// the gate that triggered the release so logs distinguish the call sites.
+func (h *Handler) releaseApplyLockIfIntentUnchanged(ctx context.Context, repo string, pr int, database, dbType, environment, expectedPendingPlanID, reason string) {
 	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
 	released, relErr := h.service.Storage().Locks().ReleaseIfPendingPlanID(ctx, database, dbType, lockOwner, expectedPendingPlanID)
 	if relErr != nil {
-		h.logger.Error("failed to release lock after final freshness rejection",
+		h.logger.Error("failed to release apply lock after pre-execution rejection",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
-			"environment", environment, "error", relErr)
-	} else if !released {
-		h.logger.Info("preserved lock after final freshness rejection because its pending intent changed",
+			"environment", environment, "reason", reason, "error", relErr)
+		return
+	}
+	if !released {
+		h.logger.Info("preserved apply lock after pre-execution rejection because its pending intent changed",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
-			"environment", environment, "expected_pending_plan_id", expectedPendingPlanID)
+			"environment", environment, "reason", reason,
+			"expected_pending_plan_id", expectedPendingPlanID)
 	}
 }
 
