@@ -5500,7 +5500,7 @@ schemabot apply -e staging
 
 **Database**: `testapp`
 
-The schema directory `schema/testapp` changed on the base branch after this PR diverged. Applying this branch could revert those newer schema changes.
+The schema directory `schema/testapp` on the base branch has changed since this PR diverged. Applying this branch could revert those newer schema changes.
 
 Merge or rebase the current base branch into this PR, review the updated plan, then run `apply` again.
 

@@ -375,7 +375,7 @@ func RenderBaseSchemaFreshnessRejection(data BaseSchemaFreshnessRejectionData) s
 		sb.WriteString("SchemaBot could not verify whether this PR includes the current base branch's schema changes. The apply was rejected to avoid reverting a change that may already be on the base branch.\n\n")
 		sb.WriteString("Retry the command. If verification continues to fail, contact a SchemaBot operator.\n")
 	} else {
-		fmt.Fprintf(&sb, "The schema directory `%s` changed on the base branch after this PR diverged. Applying this branch could revert those newer schema changes.\n\n", data.SchemaPath)
+		fmt.Fprintf(&sb, "The schema directory `%s` on the base branch has changed since this PR diverged. Applying this branch could revert those newer schema changes.\n\n", data.SchemaPath)
 		sb.WriteString("Merge or rebase the current base branch into this PR, review the updated plan, then run `apply` again.\n")
 	}
 
