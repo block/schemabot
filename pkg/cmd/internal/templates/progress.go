@@ -231,7 +231,7 @@ func FormatNamespacedTables(tables []TableProgress) string {
 // FormatNamespacedTablesWithActivityBar returns tables grouped by keyspace using
 // the provided activity bar when row-copy progress has exceeded its estimate.
 func FormatNamespacedTablesWithActivityBar(tables []TableProgress, activityBar string) string {
-	return FormatNamespacedTablesWithActivity(tables, activityBar, "Active")
+	return FormatNamespacedTablesWithActivity(tables, activityBar, "Finalizing copy")
 }
 
 // FormatNamespacedTablesWithActivity returns tables grouped by keyspace using
@@ -411,7 +411,7 @@ func FormatTableProgress(t TableProgress) string {
 // FormatTableProgressWithActivityBar returns progress for a single table using
 // the provided activity bar when row-copy progress has exceeded its estimate.
 func FormatTableProgressWithActivityBar(t TableProgress, activityBar string) string {
-	return FormatTableProgressWithActivity(t, activityBar, "Active")
+	return FormatTableProgressWithActivity(t, activityBar, "Finalizing copy")
 }
 
 // FormatTableProgressWithActivity returns progress for a single table using the

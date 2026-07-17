@@ -2161,11 +2161,11 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Status**: In Progress
 
-📊 1/3 complete · 1 running (Active) · 1 queued
+📊 1/3 complete · 1 running (finalizing copy) · 1 queued
 
 **Schema `testapp`**
 
-**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Active
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Finalizing copy
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
@@ -7338,7 +7338,7 @@ The following changes will permanently delete data:
 ```
 ⣾ Running...
 
-     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Active ⠋
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Finalizing copy ⠋
        ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
        • Rows copied: 145,250,000 so far
        • ℹ️ More rows than initially estimated, copying is still active and will continue

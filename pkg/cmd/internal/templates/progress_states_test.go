@@ -404,7 +404,7 @@ func TestFormatTableProgress_EstimateExceeded(t *testing.T) {
 		}
 
 		output := FormatTableProgress(tp)
-		assert.Contains(t, output, ui.ProgressBarActivity()+" Active")
+		assert.Contains(t, output, ui.ProgressBarActivity()+" Finalizing copy")
 		assert.Contains(t, output, "Rows copied: 145,000 so far")
 		assert.Contains(t, output, ui.EstimateExceededTooltip)
 		assert.NotContains(t, output, "145%")
@@ -421,7 +421,7 @@ func TestFormatTableProgress_EstimateExceeded(t *testing.T) {
 		}
 
 		output := FormatTableProgress(tp)
-		assert.Contains(t, output, ui.ProgressBarActivity()+" Active")
+		assert.Contains(t, output, ui.ProgressBarActivity()+" Finalizing copy")
 		assert.Contains(t, output, "Rows copied: 145,000 so far")
 		assert.NotContains(t, output, "100%")
 	})

@@ -866,7 +866,7 @@ func (e *logEmitter) emitProgressHeartbeat(tbl *apitypes.TableProgressResponse, 
 	kvs := tableKVs("Copying rows", tbl, ts)
 	if ui.EstimateExceeded(tbl.RowsCopied, tbl.RowsTotal) {
 		kvs = append(kvs,
-			"progress", "Active",
+			"progress", "Finalizing copy",
 			"rows_copied", fmt.Sprintf("%s so far", ui.FormatNumber(tbl.RowsCopied)),
 		)
 	} else {

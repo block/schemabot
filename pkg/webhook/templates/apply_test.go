@@ -679,8 +679,8 @@ func TestRenderApplyStatusComment_EstimateExceeded(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "1 running (Active)")
-	assert.Contains(t, result, ui.ProgressBarActivity()+" Active")
+	assert.Contains(t, result, "1 running (finalizing copy)")
+	assert.Contains(t, result, ui.ProgressBarActivity()+" Finalizing copy")
 	assert.Contains(t, result, "- Rows copied: 145,000 so far\n- ℹ️ _"+ui.EstimateExceededTooltip+"_")
 	assert.NotContains(t, result, "[ℹ️](##")
 	assert.NotContains(t, result, "<br>")
@@ -1264,8 +1264,8 @@ func TestPreviewCommentApplyEstimateExceeded(t *testing.T) {
 	result := PreviewCommentApplyEstimateExceeded()
 
 	assert.Contains(t, result, "Schema Change Status")
-	assert.Contains(t, result, "1 running (Active)")
-	assert.Contains(t, result, "Active")
+	assert.Contains(t, result, "1 running (finalizing copy)")
+	assert.Contains(t, result, "Finalizing copy")
 	assert.Contains(t, result, "Rows copied: 145,000,000 so far")
 	assert.NotContains(t, result, "145%")
 	assert.NotContains(t, result, "100,000,000 / 100,000,000")

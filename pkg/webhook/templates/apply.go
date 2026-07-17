@@ -451,7 +451,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			label = fmt.Sprintf("%d running", running)
 		}
 		if runningEstimateExceeded {
-			label += " (Active)"
+			label += " (finalizing copy)"
 		} else if runningPct > 0 {
 			label += fmt.Sprintf(" (%d%%)", runningPct)
 		}
@@ -852,7 +852,7 @@ func isCopyingShardStatus(status string) bool {
 func renderRunningTable(sb *strings.Builder, table TableProgressData) {
 	if table.RowsTotal > 0 {
 		if ui.EstimateExceeded(table.RowsCopied, table.RowsTotal) {
-			fmt.Fprintf(sb, "**`%s`**: %s Active\n", table.TableName, ui.ProgressBarActivity())
+			fmt.Fprintf(sb, "**`%s`**: %s Finalizing copy\n", table.TableName, ui.ProgressBarActivity())
 			writeDDLLine(sb, table.DDL)
 			fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(table.RowsCopied))
 			fmt.Fprintf(sb, "- ℹ️ _%s_\n", ui.EstimateExceededTooltip)
