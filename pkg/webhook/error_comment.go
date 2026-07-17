@@ -32,12 +32,30 @@ func (h *Handler) postCommandError(
 	commandName, environment, requestedBy, errorDetail string,
 ) {
 	h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
-		RequestedBy: requestedBy,
-		Timestamp:   templates.NowFunc().UTC().Format("2006-01-02 15:04:05"),
-		Environment: environment,
-		CommandName: commandName,
-		ErrorDetail: userFacingErrorDetail(errorDetail),
+		RequestedBy:  requestedBy,
+		Timestamp:    templates.NowFunc().UTC().Format("2006-01-02 15:04:05"),
+		Environment:  environment,
+		Environments: h.deploymentEnvironmentScope(environment),
+		CommandName:  commandName,
+		ErrorDetail:  userFacingErrorDetail(errorDetail),
 	}))
+}
+
+// deploymentEnvironmentScope returns the environments this deployment
+// handles, for rendering in error comments about commands that were not
+// scoped to a single environment. Returns nil when the command already
+// targeted one environment (the comment renders that instead) or when the
+// deployment is unscoped (the comment omits the environment segment — there
+// is no concrete list to show).
+func (h *Handler) deploymentEnvironmentScope(environment string) []string {
+	if environment != "" {
+		return nil
+	}
+	config, ok := h.serverConfig()
+	if !ok {
+		return nil
+	}
+	return config.AllowedEnvironments
 }
 
 func userFacingError(err error) string {

@@ -709,12 +709,14 @@ func TestE2EGitHubUnavailableDuringAutoPlanDoesNotPublishCheckRun(t *testing.T) 
 // failure comment for an auto-plan that fails after dispatch: config
 // discovery succeeds, but the dispatched plan's own GitHub reads fail. The
 // comment must attribute the plan to the automatic pull request trigger and
-// state the multi-environment scope — an auto-plan has no requesting user
-// and no single target environment, so it must never render a bare @ mention
-// or an empty environment code span.
+// name the deployment's environment scope — an auto-plan has no requesting
+// user and no single target environment, so the deployment's own scope is
+// what tells the reader which SchemaBot instance failed. It must never
+// render a bare @ mention or an empty environment code span.
 func TestE2EAutoPlanFailureCommentAttributesAutomaticTrigger(t *testing.T) {
 	dbName := "webhook_autoplan_failure_attribution"
 	svc := setupE2EService(t, dbName)
+	svc.Config().AllowedEnvironments = []string{"staging"}
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -750,8 +752,8 @@ func TestE2EAutoPlanFailureCommentAttributesAutomaticTrigger(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "## ❌ Plan Failed")
-		assert.Contains(t, body, "**Environment**: all configured environments",
-			"an auto-plan targets every configured environment, so the header must say so")
+		assert.Contains(t, body, "**Environment**: `staging`",
+			"an auto-plan is not scoped to one environment, so the header must name the deployment's environment scope")
 		assert.Contains(t, body, "Triggered automatically by a pull request update",
 			"a system-triggered plan must be attributed to the pull request update")
 		assert.NotContains(t, body, "**Environment**: ``")

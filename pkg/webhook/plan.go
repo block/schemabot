@@ -500,6 +500,7 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 		RequestedBy:  requestedBy,
 		Timestamp:    time.Now().UTC().Format("2006-01-02 15:04:05"),
 		Environment:  environment,
+		Environments: h.deploymentEnvironmentScope(environment),
 		DatabaseName: databaseName,
 		CommandName:  commandName,
 	}

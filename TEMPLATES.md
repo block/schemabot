@@ -967,7 +967,7 @@ type: mysql
 
 ## ❌ Plan Failed
 
-**Environment**: all configured environments
+**Environment**: `staging`
 
 *Triggered automatically by a pull request update at 2026-01-15 14:30:00 UTC*
 
