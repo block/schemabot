@@ -97,8 +97,10 @@ func deploymentLogSourceLabel(target string, operations []*apitypes.LogOperation
 		target = operations[0].Target
 	}
 	parts := []string{target}
+	seenKinds := make(map[string]bool)
 	for _, op := range operations {
-		if op.OperationKind != "" {
+		if op.OperationKind != "" && !seenKinds[op.OperationKind] {
+			seenKinds[op.OperationKind] = true
 			parts = append(parts, op.OperationKind)
 		}
 	}

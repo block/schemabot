@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -152,6 +153,7 @@ type deploymentLogFetch struct {
 func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, apply *storage.Apply, deployment string, limit int) {
 	ops, err := s.storage.ApplyOperations().ListByApply(r.Context(), apply.ID)
 	if err != nil {
+		s.logger.Error("failed to list apply operations for data-plane logs", append(apply.LogAttrs(), "operation", "read_deployment_logs", "operation_deployment", deployment, "error", err)...)
 		s.writeError(w, http.StatusInternalServerError, "failed to list apply operations")
 		return
 	}
@@ -163,6 +165,9 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 		}
 		matched = true
 		if op.ExternalID == "" {
+			// An operation without a remote apply id ran on the control plane;
+			// its logs live in control-plane storage, not behind this fan-out.
+			s.logger.Debug("skipping operation without a remote apply id for data-plane logs", append(apply.LogAttrs(), "operation", "read_deployment_logs", "operation_deployment", deployment, "operation_key", op.OperationKey, "target", op.Target)...)
 			continue
 		}
 		key := op.Target + "\x00" + op.ExternalID
@@ -197,9 +202,10 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	requestLimit := int32(min(int64(limit), math.MaxInt32))
 	for _, key := range keys {
 		fetch := fetches[key]
-		resp, fetchErr := client.Logs(r.Context(), &ternv1.LogsRequest{ApplyId: fetch.externalID, Target: fetch.target, Database: apply.Database, Type: apply.DatabaseType, Environment: apply.Environment, Limit: int32(limit)})
+		resp, fetchErr := client.Logs(r.Context(), &ternv1.LogsRequest{ApplyId: fetch.externalID, Target: fetch.target, Database: apply.Database, Type: apply.DatabaseType, Environment: apply.Environment, Limit: requestLimit})
 		if fetchErr != nil {
 			s.recordDeploymentLogFailure(apply, deployment, fetch, fetchErr)
 			result.Errors = append(result.Errors, deploymentLogError(fetch, fetchErr))
@@ -210,7 +216,7 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 			entry, convertErr := deploymentLogEntry(fetch.externalID, log)
 			if convertErr != nil {
 				s.recordDeploymentLogFailure(apply, deployment, fetch, convertErr)
-				result.Errors = append(result.Errors, deploymentLogError(fetch, convertErr))
+				result.Errors = append(result.Errors, deploymentLogRecordError(fetch))
 				source = nil
 				break
 			}
@@ -246,6 +252,13 @@ func deploymentLogError(fetch *deploymentLogFetch, err error) *apitypes.Deployme
 		result.Message = "The selected data plane does not support log reads; upgrade it and retry."
 	}
 	return result
+}
+
+// deploymentLogRecordError reports a source whose log records could not be
+// decoded. Unlike a transport failure, retrying cannot help — the data plane
+// returned records the control plane does not understand.
+func deploymentLogRecordError(fetch *deploymentLogFetch) *apitypes.DeploymentLogError {
+	return &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: "MalformedRemoteLog", Reason: "malformed_remote_log", Message: "The data plane returned log records SchemaBot could not decode; check server logs."}
 }
 
 func (s *Service) recordDeploymentLogFailure(apply *storage.Apply, deployment string, fetch *deploymentLogFetch, err error) {

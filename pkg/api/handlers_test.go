@@ -697,6 +697,17 @@ func TestDeploymentLogErrorIsSanitizedAndIncludesProvenance(t *testing.T) {
 	got = deploymentLogError(fetch, status.Error(codes.Unimplemented, "method Logs not implemented"))
 	assert.Equal(t, "UnsupportedCapability", got.Code)
 	assert.Equal(t, "upgrade_required", got.Reason)
+
+	// The gRPC client wraps Unimplemented with upgrade guidance before it
+	// reaches this mapping; detection must see through the wrapping.
+	got = deploymentLogError(fetch, fmt.Errorf("selected data plane does not support log reads; upgrade that data plane: %w", status.Error(codes.Unimplemented, "method Logs not implemented")))
+	assert.Equal(t, "UnsupportedCapability", got.Code)
+	assert.Equal(t, "upgrade_required", got.Reason)
+
+	got = deploymentLogRecordError(fetch)
+	assert.Equal(t, "MalformedRemoteLog", got.Code)
+	assert.Equal(t, "malformed_remote_log", got.Reason)
+	assert.Equal(t, fetch.operations, got.Operations)
 }
 
 func TestHandleDeploymentLogsFansOutDeduplicatesAndPreservesPartialResults(t *testing.T) {
@@ -705,11 +716,16 @@ func TestHandleDeploymentLogsFansOutDeduplicatesAndPreservesPartialResults(t *te
 		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/orders", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-a", ExternalID: "remote-a", ExternalOperationID: "101"},
 		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/customers", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-a", ExternalID: "remote-a", ExternalOperationID: "102"},
 		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/80-/orders", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-b", ExternalID: "remote-b", ExternalOperationID: "103"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/80-/customers", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-c", ExternalID: "remote-c", ExternalOperationID: "104"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/finalize", OperationKind: storage.ApplyOperationKindGroupFinalizer, Target: "cluster-a"},
 	}
 	client := &mockTernClient{isRemote: true}
 	client.logsHook = func(req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
-		if req.ApplyId == "remote-b" {
+		switch req.ApplyId {
+		case "remote-b":
 			return nil, status.Error(codes.Unavailable, "dial private.example:443")
+		case "remote-c":
+			return &ternv1.LogsResponse{ApplyId: req.ApplyId, Logs: []*ternv1.ApplyLog{{Id: 12, Level: "info", Message: "bad clock", CreatedAt: "not-a-time"}}}, nil
 		}
 		return &ternv1.LogsResponse{ApplyId: req.ApplyId, Logs: []*ternv1.ApplyLog{{Id: 11, Level: "error", EventType: "engine", Source: "driver", Message: "checksum failed", MetadataJson: []byte(`{"chunk":8}`), CreatedAt: "2026-07-17T01:02:03Z"}}}, nil
 	}
@@ -725,11 +741,12 @@ func TestHandleDeploymentLogsFansOutDeduplicatesAndPreservesPartialResults(t *te
 	require.Equal(t, http.StatusOK, w.Code)
 	var response apitypes.DeploymentLogsResponse
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
-	require.Len(t, client.logsReqs, 2)
+	require.Len(t, client.logsReqs, 3)
 	assert.Equal(t, "remote-a", client.logsReqs[0].ApplyId)
 	assert.Equal(t, "cluster-a", client.logsReqs[0].Target)
 	assert.Equal(t, int32(25), client.logsReqs[0].Limit)
 	assert.Equal(t, "remote-b", client.logsReqs[1].ApplyId)
+	assert.Equal(t, "remote-c", client.logsReqs[2].ApplyId)
 	require.Len(t, response.Sources, 1)
 	assert.Equal(t, "remote-a", response.Sources[0].ExternalID)
 	require.Len(t, response.Sources[0].Operations, 2)
@@ -738,10 +755,13 @@ func TestHandleDeploymentLogsFansOutDeduplicatesAndPreservesPartialResults(t *te
 	assert.NotContains(t, w.Body.String(), "102")
 	require.Len(t, response.Sources[0].Logs, 1)
 	assert.JSONEq(t, `{"chunk":8}`, string(response.Sources[0].Logs[0].Metadata))
-	require.Len(t, response.Errors, 1)
+	require.Len(t, response.Errors, 2)
 	assert.Equal(t, "remote-b", response.Errors[0].ExternalID)
 	assert.Equal(t, "RemoteLogReadFailed", response.Errors[0].Code)
+	assert.Equal(t, "remote-c", response.Errors[1].ExternalID)
+	assert.Equal(t, "MalformedRemoteLog", response.Errors[1].Code)
 	assert.NotContains(t, w.Body.String(), "private.example")
+	assert.NotContains(t, w.Body.String(), "not-a-time")
 }
 
 func (m *mockTernClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
