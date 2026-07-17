@@ -22,8 +22,8 @@ func TestRenderGenericErrorAutoPlan(t *testing.T) {
 	assert.Contains(t, body, "**Environment**: all configured environments")
 	assert.Contains(t, body, "*Triggered automatically by a pull request update at 2026-07-16 18:56:00 UTC*")
 	assert.Contains(t, body, "> failed to fetch repository contents")
-	assert.NotContains(t, body, "``")
-	assert.NotContains(t, body, "@ ")
+	assert.NotContains(t, body, "**Environment**: ``")
+	assert.NotContains(t, body, "Requested by")
 }
 
 // TestRenderGenericErrorUserRequested pins the user-issued rendering: a
@@ -67,16 +67,17 @@ func TestRenderNoConfigUsageExample(t *testing.T) {
 }
 
 // TestRenderMultipleConfigsUsageExample verifies the multi-database picker
-// keeps a pasteable -e value when the command was not scoped to one
-// environment.
+// keeps a pasteable -e value and the requester attribution when a user issues
+// a command without scoping it to one environment.
 func TestRenderMultipleConfigsUsageExample(t *testing.T) {
 	body := RenderMultipleConfigs(SchemaErrorData{
+		RequestedBy:        "octocat",
 		Timestamp:          "2026-07-16 18:56:00",
 		CommandName:        "plan",
 		AvailableDatabases: "- `testapp`\n- `payments`",
 	})
 	assert.Contains(t, body, "schemabot plan -e <environment> -d <database-name>")
-	assert.Contains(t, body, "*Triggered automatically by a pull request update at 2026-07-16 18:56:00 UTC*")
+	assert.Contains(t, body, "*Requested by @octocat at 2026-07-16 18:56:00 UTC*")
 }
 
 func TestRenderInvalidEnv(t *testing.T) {
