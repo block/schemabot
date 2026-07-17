@@ -2871,9 +2871,22 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 			append(storedApply.LogAttrs(), "table", storedTask.TableName)...)
 		return
 	}
+	// A shard-scoped drive task (per-shard work operation) is itself the
+	// per-shard row for its shard. Fanning a table-level shard breakdown out
+	// under its operation would overwrite the drive task's own row and attach
+	// rows for shards the operation does not own. Only table-level tasks
+	// (shard == "") mirror a per-shard breakdown.
+	if storedTask.Shard != "" {
+		slog.Warn("skipping remote per-shard progress encode: stored task is scoped to a single shard and owns no breakdown",
+			append(storedApply.LogAttrs(), "table", storedTask.TableName, "task_shard", storedTask.Shard)...)
+		return
+	}
 	for _, sh := range shards {
-		// An empty shard would collide with the unsharded single-shard sentinel.
+		// An empty shard would collide with the unsharded single-shard sentinel,
+		// so the entry cannot be stored as a per-shard row.
 		if sh.Shard == "" {
+			slog.Warn("skipping remote per-shard progress entry with an empty shard name",
+				append(storedApply.LogAttrs(), "table", storedTask.TableName)...)
 			continue
 		}
 		shardState := state.NormalizeShardStatus(sh.Status)

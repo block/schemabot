@@ -3303,6 +3303,40 @@ func TestGRPCClient_SyncShardProgressFromRemote(t *testing.T) {
 
 		assert.Empty(t, tasks.upsertedShards, "no per-shard rows should be written without a lease")
 	})
+
+	t.Run("skips a shard-scoped drive task", func(t *testing.T) {
+		// A per-shard work operation's drive task is itself the per-shard row for
+		// its shard. Mirroring a table-level breakdown under that operation would
+		// overwrite the drive task's row and attach rows for shards the operation
+		// does not own, so a shard-scoped task never fans out.
+		storedTask := newStoredTask()
+		storedTask.Shard = "-80"
+		tasks := &mockTaskStore{tasks: []*storage.Task{storedTask}}
+		client := &GRPCClient{storage: &mockStorage{tasks: tasks, logs: &mockApplyLogStore{}}}
+		ctx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: apply.ID, Token: "lease-tok"})
+
+		require.NoError(t, client.syncStoredTasksFromRemoteTasks(ctx, apply, []*storage.Task{storedTask}, remoteTables(), now))
+
+		assert.Empty(t, tasks.upsertedShards, "a shard-scoped drive task must not mirror a per-shard breakdown")
+	})
+
+	t.Run("skips a shard entry with an empty shard name", func(t *testing.T) {
+		// An empty shard name would collide with the unsharded single-shard
+		// sentinel, so the entry is dropped while the named shards still mirror.
+		storedTask := newStoredTask()
+		tasks := &mockTaskStore{tasks: []*storage.Task{storedTask}}
+		client := &GRPCClient{storage: &mockStorage{tasks: tasks, logs: &mockApplyLogStore{}}}
+		ctx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: apply.ID, Token: "lease-tok"})
+		tables := remoteTables()
+		tables[0].Shards = append(tables[0].Shards, &ternv1.ShardProgress{Status: state.Task.Running, RowsCopied: 10, RowsTotal: 10})
+
+		require.NoError(t, client.syncStoredTasksFromRemoteTasks(ctx, apply, []*storage.Task{storedTask}, tables, now))
+
+		require.Len(t, tasks.upsertedShards, 2)
+		for _, s := range tasks.upsertedShards {
+			assert.NotEmpty(t, s.Shard, "no per-shard row may be stored without a shard name")
+		}
+	})
 }
 
 func TestGRPCClient_SyncRemoteProgressByNamespace(t *testing.T) {
