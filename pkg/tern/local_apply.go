@@ -119,11 +119,27 @@ func (c *LocalClient) tryResolveOrphanedPendingTask(ctx context.Context, t *stor
 	}
 	c.logger.Info("conflict check: cancelling orphaned pending task; its apply is terminal so the task can never start",
 		append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
+	previousState := t.State
 	now := time.Now()
+	t.State = state.Task.Cancelled
 	t.ErrorMessage = "Task orphaned: its apply reached a terminal state before the task started"
 	t.CompletedAt = &now
-	c.transitionTaskState(ctx, t, apply.ID, state.Task.Cancelled,
-		"Cancelled orphaned pending task: its apply was already terminal, so the task could never start")
+	t.UpdatedAt = now
+	// The task only stops blocking once the cancellation is durably written:
+	// reporting it resolved on a failed write would admit the new apply while
+	// storage still records the orphan as active work.
+	if err := c.storage.Tasks().Update(ctx, t); err != nil {
+		t.State = previousState
+		t.ErrorMessage = ""
+		t.CompletedAt = nil
+		c.logger.Error("conflict check: failed to persist orphaned task cancellation; the task keeps blocking the database",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "error", err)...)
+		return false
+	}
+	taskID := t.ID
+	c.logApplyEvent(ctx, apply.ID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+		"Cancelled orphaned pending task: its apply was already terminal, so the task could never start",
+		previousState, state.Task.Cancelled)
 	return true
 }
 

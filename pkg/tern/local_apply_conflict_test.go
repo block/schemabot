@@ -330,6 +330,52 @@ func (s *erroringApplyStore) Get(context.Context, int64) (*storage.Apply, error)
 	return nil, s.err
 }
 
+// An orphan only stops blocking once its cancellation is durably written. If
+// the write fails, the task must keep blocking — reporting it resolved would
+// admit the new apply while storage still records the orphan as active work —
+// and the task must be left pending so a later conflict check retries the
+// cancellation cleanly.
+func TestConflictCheckKeepsOrphanWhenCancellationWriteFails(t *testing.T) {
+	orphan := &storage.Task{
+		ID:             10,
+		ApplyID:        101,
+		TaskIdentifier: "task-orphan-write-fails",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.Pending,
+	}
+	client := newNoActiveChangeClient("testdb", []*storage.Task{orphan})
+	stor := client.storage.(*exactProgressStorage)
+	stor.tasks = &updateFailingTaskStore{
+		exactProgressTaskStore: stor.tasks.(*exactProgressTaskStore),
+		updateErr:              errors.New("storage down"),
+	}
+	stor.applies = &mockApplyStore{apply: &storage.Apply{
+		ID: 101, ApplyIdentifier: "apply-terminal", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeMySQL, State: state.Apply.Completed,
+	}}
+
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+	err := client.checkActiveTaskConflict(t.Context(), plan, "")
+	require.Error(t, err, "the orphan must keep blocking when its cancellation cannot be written")
+	assert.Contains(t, err.Error(), "schema change already in progress")
+	assert.Equal(t, state.Task.Pending, orphan.State, "the task must be restored to pending for a clean retry")
+	assert.Empty(t, orphan.ErrorMessage)
+	assert.Nil(t, orphan.CompletedAt)
+}
+
+// updateFailingTaskStore serves tasks normally but fails every state write,
+// standing in for storage that becomes unavailable mid-conflict-check.
+type updateFailingTaskStore struct {
+	*exactProgressTaskStore
+	updateErr error
+}
+
+func (s *updateFailingTaskStore) Update(context.Context, *storage.Task) error {
+	return s.updateErr
+}
+
 // Once an abandoned in-flight task has been failed, it no longer blocks the
 // database, so a new apply is admitted.
 func TestConflictCheckAdmitsApplyAfterFailingAbandonedTask(t *testing.T) {
