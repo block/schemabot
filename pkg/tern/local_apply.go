@@ -70,6 +70,12 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 			continue
 		}
 
+		// A pending task of a terminal apply can never start; cancel it so it
+		// stops blocking the database as phantom active work.
+		if c.tryResolveOrphanedPendingTask(ctx, t) {
+			continue
+		}
+
 		// Storage says non-terminal — verify with engine before blocking.
 		if c.tryResolveStaleTask(ctx, t, plan.Database) {
 			continue // Task was stale; engine confirmed it's done.
@@ -79,6 +85,46 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 		return t.TaskIdentifier
 	}
 	return ""
+}
+
+// tryResolveOrphanedPendingTask cancels a pending task whose parent apply has
+// already reached a terminal state. Such a task can never start: a terminal
+// apply is not claimable, so no drive will ever pick the task up, and pending
+// means no engine work or checkpoint exists to preserve. Left alone the task
+// would block every later apply targeting its database as phantom active work.
+// Any uncertainty — a non-pending state, a storage failure, or a missing apply
+// row — leaves the task untouched so it keeps blocking (fail closed).
+// Returns true if the task was cancelled and no longer blocks.
+func (c *LocalClient) tryResolveOrphanedPendingTask(ctx context.Context, t *storage.Task) bool {
+	if !state.IsState(t.State, state.Task.Pending) {
+		// Only a pending task is provably unstarted; every other state may own
+		// engine work or a checkpoint and stays with the engine-backed checks.
+		return false
+	}
+	apply, err := c.storage.Applies().Get(ctx, t.ApplyID)
+	if err != nil {
+		c.logger.Warn("conflict check: failed to load the pending task's apply; the task keeps blocking the database",
+			append(t.LogAttrs(), "error", err)...)
+		return false
+	}
+	if apply == nil {
+		c.logger.Warn("conflict check: pending task's apply row is missing; the task keeps blocking the database",
+			t.LogAttrs()...)
+		return false
+	}
+	if !state.IsTerminalApplyState(apply.State) {
+		c.logger.Debug("conflict check: pending task's apply is still active; the task blocks normally",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
+		return false
+	}
+	c.logger.Info("conflict check: cancelling orphaned pending task; its apply is terminal so the task can never start",
+		append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
+	now := time.Now()
+	t.ErrorMessage = "Task orphaned: its apply reached a terminal state before the task started"
+	t.CompletedAt = &now
+	c.transitionTaskState(ctx, t, apply.ID, state.Task.Cancelled,
+		"Cancelled orphaned pending task: its apply was already terminal, so the task could never start")
+	return true
 }
 
 // tryResolveStaleTask checks the engine to see if a non-terminal task is actually done.
