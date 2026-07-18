@@ -150,6 +150,29 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		}
 	}
 
+	// Reject a stale snapshot before planning. A stale branch needs an update
+	// no matter what a plan would say, so freshness rejections outrank every
+	// plan-derived response — in particular the unsafe-change prompt, which
+	// would otherwise coach the user toward `--allow-unsafe` for DDL that only
+	// looks destructive because the branch is missing newer base-branch schema
+	// changes. No lock is held here, so rejections need no release.
+	//
+	// Use FetchPullRequestNoCache: the cached FetchPullRequest used by
+	// discovery would return the discovery-time HeadSHA, masking the race.
+	prInfo, prErr := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if prErr != nil {
+		h.logger.Error("failed to fetch PR for stale-schema check",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", prErr)
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to verify PR HEAD before apply: "+prErr.Error())
+		return
+	}
+	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, prInfo.HeadSHA, environment, requestedBy, action.Apply); rejected {
+		return
+	}
+	if rejected := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, prInfo, environment, requestedBy, action.Apply); rejected {
+		return
+	}
+
 	// Generate plan
 	prNumber := int32(pr)
 	planReq := api.PlanRequest{
@@ -212,36 +235,10 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	commentData.SkipRevert = result.SkipRevert
 	commentData.AllowUnsafe = result.AllowUnsafe
 
-	// Check safety conditions before proceeding.
-	// Reject if the PR HEAD advanced after discovery loaded schema files.
-	// Running against the loaded files would execute DDL derived from an
-	// older commit than the branch is on right now. Release the lock
-	// acquired above so the user can re-run `schemabot apply -e <env>`
-	// cleanly without a manual unlock.
-	//
-	// Use FetchPullRequestNoCache: the cached FetchPullRequest used by
-	// discovery would return the discovery-time HeadSHA, masking the race.
-	prInfo, prErr := client.FetchPullRequestNoCache(ctx, repo, pr)
-	if prErr != nil {
-		h.logger.Error("failed to fetch PR for stale-schema check, releasing lock",
-			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", prErr)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to verify PR HEAD before apply: "+prErr.Error())
-		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "PR freshness fetch failure")
-		return
-	}
-	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, prInfo.HeadSHA, environment, requestedBy, action.Apply); rejected {
-		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "stale-schema rejection")
-		return
-	}
-	if rejected := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, prInfo, environment, requestedBy, action.Apply); rejected {
-		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "base-schema freshness rejection")
-		return
-	}
-
-	// Re-evaluate the checks gate against the fresh HEAD before executing.
-	// The early gate at the top of handleApplyCommand ran against the
-	// discovery-time HeadSHA. On the automatic apply path there is no second
-	// user action between plan and apply, so a required check that
+	// Re-evaluate the checks gate against the freshness-checked HEAD before
+	// executing. The early gate at the top of handleApplyCommand ran against
+	// the discovery-time HeadSHA. On the automatic apply path there is no
+	// second user action between plan and apply, so a required check that
 	// transitioned to failing on the same SHA (e.g. CI re-ran red, or a
 	// new required check was added) would otherwise sneak past. Release
 	// the lock on block so the user can re-run `schemabot apply -e <env>`

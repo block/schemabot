@@ -50,6 +50,35 @@ func (h *Handler) executeApply(
 		return
 	}
 
+	// Revalidate the PR before interpreting the re-plan. The earlier handler
+	// checks provide fast rejection, but the re-plan can be retried and the
+	// base branch or PR HEAD can advance while it runs. A stale snapshot must
+	// be rejected before any plan-derived response — the "no changes" release,
+	// the drift downgrade, and especially the unsafe-change prompt would all
+	// misread DDL that is only an artifact of the stale branch.
+	actionName := action.ApplyConfirm
+	if storedPlan != nil {
+		actionName = action.Apply
+	}
+	freshPRInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("apply rejected: failed final PR freshness fetch",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "action", actionName, "error", err)
+		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+			"SchemaBot could not verify the current PR state. The apply was rejected; retry the command.")
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final PR freshness fetch failure")
+		return
+	}
+	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, freshPRInfo.HeadSHA, environment, requestedBy, actionName); rejected {
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final stale-schema rejection")
+		return
+	}
+	if rejected := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, freshPRInfo, environment, requestedBy, actionName); rejected {
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final base-schema freshness rejection")
+		return
+	}
+
 	// No changes — release the lock (keyed on the pending intent this handler
 	// observed, so a lock re-pinned by a newer plan is preserved) and notify.
 	if len(planResp.FlatTables()) == 0 {
@@ -85,32 +114,6 @@ func (h *Handler) executeApply(
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
 		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
-		return
-	}
-
-	// Revalidate the PR immediately before the apply is queued. The earlier
-	// handler checks provide fast rejection, but the apply-time re-plan can be
-	// retried and the base branch or PR HEAD can advance while it runs.
-	actionName := action.ApplyConfirm
-	if storedPlan != nil {
-		actionName = action.Apply
-	}
-	freshPRInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
-	if err != nil {
-		h.logger.Error("apply rejected: failed final PR freshness fetch",
-			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
-			"environment", environment, "action", actionName, "error", err)
-		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-			"SchemaBot could not verify the current PR state. The apply was rejected; retry the command.")
-		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final PR freshness fetch failure")
-		return
-	}
-	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, freshPRInfo.HeadSHA, environment, requestedBy, actionName); rejected {
-		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final stale-schema rejection")
-		return
-	}
-	if rejected := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, freshPRInfo, environment, requestedBy, actionName); rejected {
-		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final base-schema freshness rejection")
 		return
 	}
 

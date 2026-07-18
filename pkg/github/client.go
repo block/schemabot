@@ -744,12 +744,14 @@ func (ic *InstallationClient) AddReactionToComment(ctx context.Context, repo str
 	return nil
 }
 
-// PullRequestInfo holds relevant PR metadata.
+// PullRequestInfo holds relevant PR metadata. The base branch is carried by
+// ref only: GitHub's pull.base.sha is a snapshot from PR creation, not the
+// branch tip, so callers that need the current base commit must resolve
+// BaseRef themselves.
 type PullRequestInfo struct {
 	HeadRef string
 	HeadSHA string
 	BaseRef string
-	BaseSHA string
 	User    string
 	// State is the PR's lifecycle state as GitHub reports it: "open" or
 	// "closed" (a merged PR reads as closed).
@@ -916,7 +918,6 @@ func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string,
 		HeadRef: ghPR.GetHead().GetRef(),
 		HeadSHA: ghPR.GetHead().GetSHA(),
 		BaseRef: ghPR.GetBase().GetRef(),
-		BaseSHA: ghPR.GetBase().GetSHA(),
 		User:    ghPR.GetUser().GetLogin(),
 		State:   ghPR.GetState(),
 	}, nil
@@ -1013,46 +1014,69 @@ func (ic *InstallationClient) FetchChangedFilesBetween(ctx context.Context, repo
 }
 
 // SchemaPathsChangedSinceMergeBase reports whether any schema path has a
-// different Git object on the PR's current base commit than it had when the PR
-// diverged. Paths may name directories or symlinks. Comparing object IDs keeps
-// the guard scoped to schema inputs: commits elsewhere in a busy repository do
-// not make the PR stale.
-func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Context, repo, baseSHA, headSHA string, schemaPaths []string) (bool, error) {
+// different Git object on the current tip of the PR's base branch than it had
+// at the PR's merge base. Paths may name directories or symlinks. Comparing
+// object IDs keeps the guard scoped to schema inputs: commits elsewhere in a
+// busy repository do not make the PR stale.
+//
+// The base branch is identified by ref, never by the PR object's base SHA:
+// GitHub snapshots pull.base.sha when the PR is created and does not advance
+// it as the base branch moves, so the snapshot typically equals the merge base
+// and can never observe commits that landed after the PR diverged. The ref is
+// resolved to a pinned tip SHA up front — returned for operator logs — so a
+// base branch advancing mid-check cannot make the merge-base lookup and the
+// tree reads observe different commits.
+func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Context, repo, baseRef, headSHA string, schemaPaths []string) (changed bool, baseTipSHA string, err error) {
 	owner, repoName := splitRepo(repo)
-	comparison, err := retryGitHubUnavailableRead(ctx, ic.logger, "find pull request merge base", []any{"repo", repo, "base_sha", baseSHA, "head_sha", headSHA}, func(ctx context.Context) (*gh.CommitsComparison, error) {
-		comparison, _, err := ic.client.Repositories.CompareCommits(ctx, owner, repoName, baseSHA, headSHA, nil)
+	tip, err := retryGitHubUnavailableRead(ctx, ic.logger, "resolve base branch tip", []any{"repo", repo, "base_ref", baseRef}, func(ctx context.Context) (*gh.Reference, error) {
+		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+baseRef)
 		if err != nil {
-			return nil, fmt.Errorf("compare commits %s...%s: %w", baseSHA, headSHA, classifyGitHubAPIError(err))
+			return nil, fmt.Errorf("get ref heads/%s: %w", baseRef, classifyGitHubAPIError(err))
+		}
+		return ref, nil
+	})
+	if err != nil {
+		return false, "", err
+	}
+	baseTipSHA = tip.GetObject().GetSHA()
+	if baseTipSHA == "" {
+		return false, "", fmt.Errorf("ref heads/%s for %s resolved to no commit", baseRef, repo)
+	}
+
+	comparison, err := retryGitHubUnavailableRead(ctx, ic.logger, "find pull request merge base", []any{"repo", repo, "base_ref", baseRef, "base_tip_sha", baseTipSHA, "head_sha", headSHA}, func(ctx context.Context) (*gh.CommitsComparison, error) {
+		comparison, _, err := ic.client.Repositories.CompareCommits(ctx, owner, repoName, baseTipSHA, headSHA, nil)
+		if err != nil {
+			return nil, fmt.Errorf("compare commits %s...%s: %w", baseTipSHA, headSHA, classifyGitHubAPIError(err))
 		}
 		return comparison, nil
 	})
 	if err != nil {
-		return false, err
+		return false, baseTipSHA, err
 	}
 	mergeBaseSHA := comparison.GetMergeBaseCommit().GetSHA()
 	if mergeBaseSHA == "" {
-		return false, fmt.Errorf("compare commits %s...%s for %s returned no merge base", baseSHA, headSHA, repo)
+		return false, baseTipSHA, fmt.Errorf("compare commits %s...%s for %s returned no merge base", baseTipSHA, headSHA, repo)
 	}
 
 	levelCache := make(map[string][]TreeEntry)
 	for _, schemaPath := range schemaPaths {
 		mergeBaseObjectSHA, mergeBaseObjectType, mergeBaseFound, err := ic.resolveGitObjectSHA(ctx, repo, mergeBaseSHA, schemaPath, levelCache)
 		if err != nil {
-			return false, fmt.Errorf("resolve schema path %s at merge base %s: %w", schemaPath, mergeBaseSHA, err)
+			return false, baseTipSHA, fmt.Errorf("resolve schema path %s at merge base %s: %w", schemaPath, mergeBaseSHA, err)
 		}
-		baseObjectSHA, baseObjectType, baseFound, err := ic.resolveGitObjectSHA(ctx, repo, baseSHA, schemaPath, levelCache)
+		baseObjectSHA, baseObjectType, baseFound, err := ic.resolveGitObjectSHA(ctx, repo, baseTipSHA, schemaPath, levelCache)
 		if err != nil {
-			return false, fmt.Errorf("resolve schema path %s at base %s: %w", schemaPath, baseSHA, err)
+			return false, baseTipSHA, fmt.Errorf("resolve schema path %s at base tip %s: %w", schemaPath, baseTipSHA, err)
 		}
 
 		if mergeBaseFound != baseFound {
-			return true, nil
+			return true, baseTipSHA, nil
 		}
 		if mergeBaseFound && (mergeBaseObjectSHA != baseObjectSHA || mergeBaseObjectType != baseObjectType) {
-			return true, nil
+			return true, baseTipSHA, nil
 		}
 	}
-	return false, nil
+	return false, baseTipSHA, nil
 }
 
 // CheckRunOptions contains options for creating or updating a GitHub Check Run.

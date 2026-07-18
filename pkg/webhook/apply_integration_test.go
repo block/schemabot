@@ -1396,8 +1396,11 @@ func TestE2EApplyAutoConfirmRejectsWhenHEADAdvanced(t *testing.T) {
 }
 
 // A PR whose managed schema directory changed on the base branch after it
-// diverged is rejected before execution and its lock is released. Unrelated
-// base-branch commits are excluded by the directory tree comparison.
+// diverged is rejected before any plan is generated or lock acquired.
+// Unrelated base-branch commits are excluded by the directory tree comparison.
+// The fake models real GitHub semantics: the PR object's base SHA is a
+// creation-time snapshot equal to the merge base, so the gate only sees the
+// newer base commits by resolving the base ref to its current tip.
 func TestE2EApplyAutoConfirmRejectsStaleBaseSchema(t *testing.T) {
 	dbName := "webhook_auto_confirm_stale_base"
 	svc := setupE2EService(t, dbName)
@@ -1448,6 +1451,195 @@ func TestE2EApplyAutoConfirmRejectsStaleBaseSchema(t *testing.T) {
 	require.NoError(t, err)
 	for _, apply := range applies {
 		assert.NotEqual(t, dbName, apply.Database, "base-stale schema must not start an apply")
+	}
+}
+
+// A stale branch outranks the unsafe-change prompt. The base branch gained a
+// schema column after this PR diverged, and the live target already has it —
+// so a plan from the stale snapshot would emit a destructive DROP COLUMN that
+// only exists because the branch is missing the newer base schema. The apply
+// must answer with the base-schema freshness rejection, never coach the user
+// toward `--allow-unsafe`, and must not lock or start an apply.
+func TestE2EApplyStaleBaseSchemaOutranksUnsafePrompt(t *testing.T) {
+	dbName := "webhook_stale_base_unsafe"
+	svc := setupE2EService(t, dbName)
+	svc.Config().Repos = map[string]api.RepoConfig{
+		"octocat/hello-world": {RequireUpToDateWithBase: true},
+	}
+
+	// The live target already carries the column the newer base commit added.
+	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+	require.NoError(t, err)
+	_, err = targetDB.ExecContext(t.Context(),
+		"CREATE TABLE `"+dbName+"`.`users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+	_ = targetDB.Close()
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	// The stale PR snapshot omits the email column the base branch added.
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}, schemabotConfig, dbName)
+	registerStaleBaseSchemaComparison(t, mux)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Apply rejected — base schema is newer")
+		assert.Contains(t, body, "Merge or rebase")
+		assert.NotContains(t, body, "allow-unsafe", "stale branch must not be coached toward --allow-unsafe")
+		assert.NotContains(t, body, "Unsafe Change", "unsafe prompt must not outrank the freshness rejection")
+		assert.NotContains(t, body, "DROP COLUMN", "no stale-plan DDL may be rendered")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for base-schema rejection")
+	}
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	assert.Nil(t, lock, "freshness rejection must not leave a lock behind")
+
+	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, apply := range applies {
+		assert.NotEqual(t, dbName, apply.Database, "base-stale schema must not start an apply")
+	}
+}
+
+// The final revalidation inside apply execution also outranks the unsafe
+// prompt. Here the base branch advances only while the confirm's re-plan is
+// running: the handler-level gate sees an unchanged schema tree, then the
+// re-plan produces a destructive diff (the target already has the column the
+// stale snapshot omits) and the base tip's schema tree has moved by the time
+// the final gate reads it. The user must get the freshness rejection — with
+// the lock released — not an `--allow-unsafe` prompt for revert DDL.
+func TestE2EApplyConfirmStaleBaseSchemaAtFinalGateOutranksUnsafePrompt(t *testing.T) {
+	dbName := "webhook_confirm_final_stale_base"
+	svc := setupE2EService(t, dbName)
+	svc.Config().Repos = map[string]api.RepoConfig{
+		"octocat/hello-world": {RequireUpToDateWithBase: true},
+	}
+
+	const pendingPlanID = "plan-pending-confirmation"
+	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName:  dbName,
+		DatabaseType:  "mysql",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		Owner:         "octocat/hello-world#1",
+		PendingPlanID: pendingPlanID,
+	}))
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	// The confirmation plan the user reviewed, rendered at the current HEAD so
+	// the cross-delivery plan check passes and execution reaches the re-plan.
+	planID, err := svc.Storage().Plans().Create(t.Context(), &storage.Plan{
+		PlanIdentifier: pendingPlanID,
+		Database:       dbName,
+		DatabaseType:   "mysql",
+		Deployment:     dbName,
+		Target:         dbName,
+		Repository:     "octocat/hello-world",
+		PullRequest:    1,
+		Environment:    "staging",
+		HeadSHA:        "abc123",
+		CreatedAt:      time.Now(),
+	})
+	require.NoError(t, err)
+	require.NotZero(t, planID)
+
+	// The live target already carries the column the newer base commit added,
+	// so the re-plan from the stale snapshot emits a destructive DROP COLUMN.
+	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+	require.NoError(t, err)
+	_, err = targetDB.ExecContext(t.Context(),
+		"CREATE TABLE `"+dbName+"`.`users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+	_ = targetDB.Close()
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}, schemabotConfig, dbName)
+
+	// The base branch schema tree is unchanged when the handler-level gate
+	// reads it and has moved by the time the final gate re-reads it after the
+	// re-plan. The merge-base tree is fixed; only the tip's tree flips.
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Reference{
+			Ref:    new("refs/heads/main"),
+			Object: &gh.GitObject{Type: new("commit"), SHA: new("base-tip-sha")},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...abc123", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
+			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("def456")},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/def456", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
+			{Path: new("schema"), Type: new("tree"), SHA: new("schema-tree-old")},
+		}}))
+	})
+	var tipTreeReads atomic.Int32
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/base-tip-sha", func(w http.ResponseWriter, _ *http.Request) {
+		schemaTreeSHA := "schema-tree-old"
+		if tipTreeReads.Add(1) > 1 {
+			schemaTreeSHA = "schema-tree-new"
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
+			{Path: new("schema"), Type: new("tree"), SHA: &schemaTreeSHA},
+		}}))
+	})
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Apply rejected — base schema is newer")
+		assert.NotContains(t, body, "allow-unsafe", "stale branch must not be coached toward --allow-unsafe")
+		assert.NotContains(t, body, "Unsafe Change", "unsafe prompt must not outrank the freshness rejection")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for final-gate base-schema rejection")
+	}
+
+	require.Eventually(t, func() bool {
+		lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+		return err == nil && lock == nil
+	}, 5*time.Second, 50*time.Millisecond, "lock must be released after final-gate base-schema rejection")
+
+	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, apply := range applies {
+		assert.NotEqual(t, dbName, apply.Database, "base-stale confirmation must not start an apply")
 	}
 }
 
@@ -1625,22 +1817,35 @@ func registerStaleBaseSchemaComparison(t *testing.T, mux *http.ServeMux) {
 	registerStaleBaseSchemaComparisonWithHook(t, mux, nil)
 }
 
+// registerStaleBaseSchemaComparisonWithHook wires the fake GitHub endpoints
+// the base-schema freshness gate reads when the base branch gained schema
+// commits after the PR diverged. It mirrors real GitHub semantics: the PR
+// object's base SHA ("def456") is a creation-time snapshot equal to the merge
+// base, so only resolving the base ref reveals the advanced tip, whose schema
+// tree differs from the merge base's. The optional hook runs when the
+// merge-base comparison is fetched, mid-way through the gate's reads.
 func registerStaleBaseSchemaComparisonWithHook(t *testing.T, mux *http.ServeMux, hook func()) {
 	t.Helper()
-	mux.HandleFunc("GET /repos/octocat/hello-world/compare/def456...abc123", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Reference{
+			Ref:    new("refs/heads/main"),
+			Object: &gh.GitObject{Type: new("commit"), SHA: new("base-tip-sha")},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...abc123", func(w http.ResponseWriter, _ *http.Request) {
 		if hook != nil {
 			hook()
 		}
 		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
-			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("merge-base-sha")},
+			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("def456")},
 		}))
 	})
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/merge-base-sha", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/def456", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
 			{Path: new("schema"), Type: new("tree"), SHA: new("schema-tree-old")},
 		}}))
 	})
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/def456", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/base-tip-sha", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
 			{Path: new("schema"), Type: new("tree"), SHA: new("schema-tree-new")},
 		}}))

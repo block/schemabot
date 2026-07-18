@@ -76,7 +76,9 @@ func metricActionKey(action string) string {
 
 // assertBaseSchemaStillCurrent enforces the opt-in repository policy that a PR
 // must include every base-branch change under its managed schema directory.
-// It compares Git tree object IDs at the PR merge base and current base, so
+// It compares Git tree object IDs at the PR merge base and the current tip of
+// the base branch (resolved from prInfo.BaseRef — the PR object's base SHA is
+// a creation-time snapshot that never observes later base commits), so
 // unrelated commits elsewhere in a monorepo never block an apply. GitHub read
 // uncertainty rejects the apply rather than silently bypassing the guard.
 func (h *Handler) assertBaseSchemaStillCurrent(
@@ -100,7 +102,7 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 	if schema.SchemaLinkPath != "" {
 		schemaPaths = append(schemaPaths, schema.SchemaLinkPath)
 	}
-	changed, err := client.SchemaPathsChangedSinceMergeBase(ctx, repo, prInfo.BaseSHA, prInfo.HeadSHA, schemaPaths)
+	changed, baseTipSHA, err := client.SchemaPathsChangedSinceMergeBase(ctx, repo, prInfo.BaseRef, prInfo.HeadSHA, schemaPaths)
 	if err != nil {
 		h.logger.Error("apply rejected: could not verify base schema freshness",
 			"repo", repo,
@@ -109,7 +111,7 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 			"database", schema.Database,
 			"database_type", schema.Type,
 			"schema_path", schema.SchemaPath,
-			"base_sha", prInfo.BaseSHA,
+			"base_ref", prInfo.BaseRef,
 			"head_sha", prInfo.HeadSHA,
 			"action", action,
 			"requested_by", requestedBy,
@@ -136,7 +138,8 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 		"database", schema.Database,
 		"database_type", schema.Type,
 		"schema_path", schema.SchemaPath,
-		"base_sha", prInfo.BaseSHA,
+		"base_ref", prInfo.BaseRef,
+		"base_tip_sha", baseTipSHA,
 		"head_sha", prInfo.HeadSHA,
 		"action", action,
 		"requested_by", requestedBy,

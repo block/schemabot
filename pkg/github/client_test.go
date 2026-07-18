@@ -511,34 +511,48 @@ func TestGetPRCheckStatusesClassifiesTrustedSiblingAppAsSchemaBot(t *testing.T) 
 	assert.False(t, byName["ci/build"].IsSchemaBot, "unrelated app check must remain external CI")
 }
 
+// registerBaseTipRef serves the base-branch ref resolution the freshness
+// comparison performs before comparing commits. The tip SHA is deliberately
+// distinct from any PR-object base snapshot: the comparison must observe the
+// branch's current tip, which GitHub only exposes via the ref.
+func registerBaseTipRef(t *testing.T, mux *http.ServeMux, tipSHA string) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Reference{
+			Ref:    new("refs/heads/main"),
+			Object: &gh.GitObject{Type: new("commit"), SHA: &tipSHA},
+		}))
+	})
+}
+
 func TestSchemaPathsChangedSinceMergeBase(t *testing.T) {
 	tests := []struct {
 		name         string
 		mergeTreeSHA string
-		baseTreeSHA  string
+		tipTreeSHA   string
 		mergeHasPath bool
-		baseHasPath  bool
+		tipHasPath   bool
 		wantChanged  bool
 	}{
 		{
 			name:         "same schema tree ignores unrelated base commits",
 			mergeTreeSHA: "schema-tree",
-			baseTreeSHA:  "schema-tree",
+			tipTreeSHA:   "schema-tree",
 			mergeHasPath: true,
-			baseHasPath:  true,
+			tipHasPath:   true,
 		},
 		{
-			name:         "changed schema tree is stale",
+			name:         "schema tree changed on base tip is stale",
 			mergeTreeSHA: "schema-tree-old",
-			baseTreeSHA:  "schema-tree-new",
+			tipTreeSHA:   "schema-tree-new",
 			mergeHasPath: true,
-			baseHasPath:  true,
+			tipHasPath:   true,
 			wantChanged:  true,
 		},
 		{
 			name:        "schema path added on base is stale",
-			baseTreeSHA: "schema-tree-new",
-			baseHasPath: true,
+			tipTreeSHA:  "schema-tree-new",
+			tipHasPath:  true,
 			wantChanged: true,
 		},
 		{
@@ -555,7 +569,8 @@ func TestSchemaPathsChangedSinceMergeBase(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client, mux := setupRateLimitedTestGitHubServer(t)
-			mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-sha...head-sha", func(w http.ResponseWriter, _ *http.Request) {
+			registerBaseTipRef(t, mux, "base-tip-sha")
+			mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...head-sha", func(w http.ResponseWriter, _ *http.Request) {
 				require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
 					MergeBaseCommit: &gh.RepositoryCommit{SHA: new("merge-base-sha")},
 				}))
@@ -570,35 +585,64 @@ func TestSchemaPathsChangedSinceMergeBase(t *testing.T) {
 				})
 			}
 			registerRootTree("GET /repos/octocat/hello-world/git/trees/merge-base-sha", tt.mergeHasPath, tt.mergeTreeSHA)
-			registerRootTree("GET /repos/octocat/hello-world/git/trees/base-sha", tt.baseHasPath, tt.baseTreeSHA)
+			registerRootTree("GET /repos/octocat/hello-world/git/trees/base-tip-sha", tt.tipHasPath, tt.tipTreeSHA)
 
 			ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
-			changed, err := ic.SchemaPathsChangedSinceMergeBase(t.Context(), "octocat/hello-world", "base-sha", "head-sha", []string{"schema"})
+			changed, baseTipSHA, err := ic.SchemaPathsChangedSinceMergeBase(t.Context(), "octocat/hello-world", "main", "head-sha", []string{"schema"})
 
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantChanged, changed)
+			assert.Equal(t, "base-tip-sha", baseTipSHA)
 		})
 	}
 }
 
 func TestSchemaPathsChangedSinceMergeBaseFailsWithoutMergeBase(t *testing.T) {
 	client, mux := setupRateLimitedTestGitHubServer(t)
-	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-sha...head-sha", func(w http.ResponseWriter, _ *http.Request) {
+	registerBaseTipRef(t, mux, "base-tip-sha")
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...head-sha", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{}))
 	})
 
 	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	_, err := ic.SchemaPathsChangedSinceMergeBase(t.Context(), "octocat/hello-world", "base-sha", "head-sha", []string{"schema"})
+	_, _, err := ic.SchemaPathsChangedSinceMergeBase(t.Context(), "octocat/hello-world", "main", "head-sha", []string{"schema"})
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "returned no merge base")
+}
+
+// The base branch is compared by resolving its ref to the current tip; if the
+// ref cannot be resolved the comparison must fail (the caller rejects the
+// apply) rather than report the schema paths as unchanged.
+func TestSchemaPathsChangedSinceMergeBaseFailsWhenBaseRefUnresolvable(t *testing.T) {
+	client, _ := setupRateLimitedTestGitHubServer(t)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, _, err := ic.SchemaPathsChangedSinceMergeBase(t.Context(), "octocat/hello-world", "main", "head-sha", []string{"schema"})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "get ref heads/main")
+}
+
+func TestSchemaPathsChangedSinceMergeBaseFailsWhenBaseRefHasNoCommit(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Reference{Ref: new("refs/heads/main")}))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, _, err := ic.SchemaPathsChangedSinceMergeBase(t.Context(), "octocat/hello-world", "main", "head-sha", []string{"schema"})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "resolved to no commit")
 }
 
 func TestSchemaPathsChangedSinceMergeBaseDetectsSymlinkRetarget(t *testing.T) {
 	client, mux := setupRateLimitedTestGitHubServer(t)
 	var mergeRootRequests, baseRootRequests atomic.Int32
 	var mergeSchemaRequests, baseSchemaRequests atomic.Int32
-	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-sha...head-sha", func(w http.ResponseWriter, _ *http.Request) {
+	registerBaseTipRef(t, mux, "base-tip-sha")
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...head-sha", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
 			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("merge-base-sha")},
 		}))
@@ -609,7 +653,7 @@ func TestSchemaPathsChangedSinceMergeBaseDetectsSymlinkRetarget(t *testing.T) {
 			{Path: new("schema"), Type: new("tree"), SHA: new("merge-schema-tree")},
 		}}))
 	})
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/base-sha", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/base-tip-sha", func(w http.ResponseWriter, _ *http.Request) {
 		baseRootRequests.Add(1)
 		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
 			{Path: new("schema"), Type: new("tree"), SHA: new("base-schema-tree")},
@@ -631,10 +675,11 @@ func TestSchemaPathsChangedSinceMergeBaseDetectsSymlinkRetarget(t *testing.T) {
 	})
 
 	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	changed, err := ic.SchemaPathsChangedSinceMergeBase(t.Context(), "octocat/hello-world", "base-sha", "head-sha", []string{"schema/base", "schema/production"})
+	changed, baseTipSHA, err := ic.SchemaPathsChangedSinceMergeBase(t.Context(), "octocat/hello-world", "main", "head-sha", []string{"schema/base", "schema/production"})
 
 	require.NoError(t, err)
 	assert.True(t, changed)
+	assert.Equal(t, "base-tip-sha", baseTipSHA)
 	assert.Equal(t, int32(1), mergeRootRequests.Load())
 	assert.Equal(t, int32(1), baseRootRequests.Load())
 	assert.Equal(t, int32(1), mergeSchemaRequests.Load())
@@ -643,19 +688,20 @@ func TestSchemaPathsChangedSinceMergeBaseDetectsSymlinkRetarget(t *testing.T) {
 
 func TestSchemaPathsChangedSinceMergeBaseUsesRootTreeSHA(t *testing.T) {
 	client, mux := setupRateLimitedTestGitHubServer(t)
-	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-sha...head-sha", func(w http.ResponseWriter, _ *http.Request) {
+	registerBaseTipRef(t, mux, "base-tip-sha")
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...head-sha", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
 			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("merge-base-sha")},
 		}))
 	})
-	for _, ref := range []string{"merge-base-sha", "base-sha"} {
+	for _, ref := range []string{"merge-base-sha", "base-tip-sha"} {
 		mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/"+ref, func(w http.ResponseWriter, _ *http.Request) {
 			require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{SHA: new("same-root-tree")}))
 		})
 	}
 
 	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	changed, err := ic.SchemaPathsChangedSinceMergeBase(t.Context(), "octocat/hello-world", "base-sha", "head-sha", []string{"."})
+	changed, _, err := ic.SchemaPathsChangedSinceMergeBase(t.Context(), "octocat/hello-world", "main", "head-sha", []string{"."})
 
 	require.NoError(t, err)
 	assert.False(t, changed, "different commit SHAs with the same root tree are unchanged")
