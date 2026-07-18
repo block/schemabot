@@ -784,7 +784,15 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		c.logger.Info("auto-triggering cutover (not in defer mode)", "apply_id", apply.ApplyIdentifier)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
 			"Auto-triggering cutover (defer_cutover not set)", "", "")
-		if _, err := eng.Cutover(ctx, controlReq); err != nil {
+		switch _, err := eng.Cutover(ctx, controlReq); {
+		case err == nil:
+		case engine.IsNotReady(err):
+			// The engine's backend advertised the cutover gate before it was
+			// ready to accept the cutover; the drive reattempts on the next
+			// progress tick, once it catches up.
+			c.logger.Info("auto-cutover not accepted yet; retrying at the next progress tick",
+				append(apply.LogAttrs(), "error", err)...)
+		default:
 			c.logger.Error("auto-cutover failed", append(apply.LogAttrs(), "error", err)...)
 		}
 	}

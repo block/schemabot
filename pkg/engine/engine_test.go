@@ -143,6 +143,30 @@ func TestIsRetryable(t *testing.T) {
 
 }
 
+func TestIsNotReady(t *testing.T) {
+	t.Run("plain error is not a not-ready condition", func(t *testing.T) {
+		assert.False(t, IsNotReady(fmt.Errorf("connection refused")))
+	})
+
+	t.Run("NotReadyError is a not-ready condition", func(t *testing.T) {
+		err := NewNotReadyError("deploy request has not staged its changes yet")
+		assert.True(t, IsNotReady(err))
+	})
+
+	t.Run("wrapped NotReadyError is a not-ready condition", func(t *testing.T) {
+		err := fmt.Errorf("cutover deploy request #7: %w", NewNotReadyError("not staged"))
+		assert.True(t, IsNotReady(err))
+	})
+
+	t.Run("NotReadyError stays retryable", func(t *testing.T) {
+		assert.True(t, IsRetryable(NewNotReadyError("not staged")))
+	})
+
+	t.Run("nil is not a not-ready condition", func(t *testing.T) {
+		assert.False(t, IsNotReady(nil))
+	})
+}
+
 func TestIsTransientTransportError(t *testing.T) {
 	tests := []struct {
 		name string
