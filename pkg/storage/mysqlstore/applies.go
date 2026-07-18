@@ -1136,8 +1136,8 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 //
 // Matches queued pending applies with persisted tasks, pending, stopped, or
 // waiting-for-deploy applies with a pending start control request, stale active
-// applies where heartbeat expired > 1 minute, and recently failed_retryable
-// applies that still have retry budget.
+// applies whose heartbeat expired beyond the lease staleness window, and
+// recently failed_retryable applies that still have retry budget.
 // Apply creation/update enforces one active apply per database/type/environment,
 // so claims only need to lease one row and avoid driver races on that row.
 func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.Apply, error) {
@@ -1183,7 +1183,7 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 					EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id)
 					OR EXISTS (SELECT 1 FROM apply_operations ao WHERE ao.apply_id = a.id)
 				))
-				OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL 1 MINUTE)
+				OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL %s)
 				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= NOW() - INTERVAL ? DAY)
 				OR (
 					a.state = ?
@@ -1210,7 +1210,7 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 						AND (
 							a.lease_acquired_at IS NULL
 							OR a.lease_acquired_at < cr.updated_at
-							OR a.updated_at < NOW() - INTERVAL 1 MINUTE
+							OR a.updated_at < NOW() - INTERVAL %s
 						)
 					)
 				)
@@ -1218,7 +1218,7 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 		ORDER BY a.created_at
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyColumns, activeStatePlaceholders), queryArgs...)
+	`, applyColumns, activeStatePlaceholders, applyLeaseStalenessSQL, applyLeaseStalenessSQL), queryArgs...)
 
 	apply, err := scanApplyInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1289,7 +1289,7 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 					EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id)
 					OR EXISTS (SELECT 1 FROM apply_operations ao WHERE ao.apply_id = a.id)
 				))
-				OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL 1 MINUTE)
+				OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL %s)
 				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= NOW() - INTERVAL ? DAY)
 				OR (
 					a.state = ?
@@ -1316,14 +1316,14 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 						AND (
 							a.lease_acquired_at IS NULL
 							OR a.lease_acquired_at < cr.updated_at
-							OR a.updated_at < NOW() - INTERVAL 1 MINUTE
+							OR a.updated_at < NOW() - INTERVAL %s
 						)
 					)
 				)
 			)
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyColumns, activeStatePlaceholders), queryArgs...)
+	`, applyColumns, activeStatePlaceholders, applyLeaseStalenessSQL, applyLeaseStalenessSQL), queryArgs...)
 
 	apply, err := scanApplyInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

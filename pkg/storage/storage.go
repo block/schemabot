@@ -12,6 +12,18 @@ import (
 // fresh plan so stale execution context is not reactivated unexpectedly.
 const ReapplyFailureFreshnessDays = 1
 
+// ApplyLeaseStaleAfter is how long an apply or apply_operation lease heartbeat
+// (updated_at) may go unrefreshed before peer drivers treat the lease as
+// expired and reclaim the row for crash recovery. The claim queries in
+// mysqlstore derive their SQL staleness window from this constant.
+//
+// The window is also the driver-side presumed-lost bound: a driver whose
+// heartbeats have been failing for this long must assume a peer can already
+// have reclaimed the work, stop driving, and stop writing apply state. Storage
+// writes remain lease-guarded either way; presuming the lease lost bounds how
+// long two drivers can run the same engine work concurrently.
+const ApplyLeaseStaleAfter = time.Minute
+
 // Storage provides access to all stores.
 type Storage interface {
 	// Locks returns the lock store.

@@ -269,37 +269,74 @@ type atomicPollState struct {
 }
 
 // startApplyHeartbeat starts a background goroutine that heartbeats the apply
-// every 10 seconds, preventing the operator from treating it as crashed.
-// Returns a cancel function that stops the heartbeat. Must be deferred by the caller.
+// on the client's heartbeat interval, preventing the operator from treating it
+// as crashed. A definitively lost lease cancels the drive so the displaced
+// driver stops executing. Transient heartbeat errors are retried on the next
+// tick — until they have persisted for the full storage.ApplyLeaseStaleAfter
+// window, at which point the lease is presumed lost (a peer operator can
+// already have reclaimed the stale row) and the drive is cancelled the same
+// way. Returns a cancel function that stops the heartbeat. Must be deferred by
+// the caller.
 func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Apply, cancelApply ...context.CancelFunc) context.CancelFunc {
 	hbCtx, cancel := context.WithCancel(ctx)
+	stopDrive := func() {
+		for _, cancel := range cancelApply {
+			if cancel != nil {
+				cancel()
+			}
+		}
+		cancel()
+	}
 	go func() {
 		ticker := time.NewTicker(c.heartbeatInterval)
 		defer ticker.Stop()
+		lastSuccess := time.Now()
 		for {
 			select {
 			case <-hbCtx.Done():
 				return
 			case <-ticker.C:
-				if err := c.storage.Applies().Heartbeat(hbCtx, apply.ID); err != nil {
-					if errors.Is(err, storage.ErrApplyLeaseLost) {
-						c.logger.Warn("heartbeat failed because apply lease was lost; local driver will stop executing and writing apply state",
-							append(apply.LogAttrs(), "error", err)...)
-						metrics.RecordOperatorResumeFailure(hbCtx, apply.Database, apply.Deployment, apply.Environment, "lease_lost")
-						for _, cancel := range cancelApply {
-							if cancel != nil {
-								cancel()
-							}
-						}
-						cancel()
-						return
-					}
-					c.logger.Warn("heartbeat failed", append(apply.LogAttrs(), "error", err)...)
+				err := c.storage.Applies().Heartbeat(hbCtx, apply.ID)
+				if err == nil {
+					lastSuccess = time.Now()
+					continue
+				}
+				if hbCtx.Err() != nil {
+					// The drive is shutting down; the failed write is
+					// cancellation fallout, not lease trouble.
+					return
+				}
+				if c.applyHeartbeatFailureStopsDrive(hbCtx, apply, err, lastSuccess) {
+					stopDrive()
+					return
 				}
 			}
 		}
 	}()
 	return cancel
+}
+
+// applyHeartbeatFailureStopsDrive classifies a failed apply heartbeat write
+// and reports whether the driver must stop driving: either storage reported
+// the lease definitively lost, or heartbeat failures have persisted since
+// lastSuccess for the full lease staleness window, so a peer operator can
+// already have reclaimed the stale row. A transient failure inside the window
+// keeps the drive running and is retried on the next tick.
+func (c *LocalClient) applyHeartbeatFailureStopsDrive(ctx context.Context, apply *storage.Apply, hbErr error, lastSuccess time.Time) bool {
+	if errors.Is(hbErr, storage.ErrApplyLeaseLost) {
+		c.logger.Warn("heartbeat failed because apply lease was lost; local driver will stop executing and writing apply state",
+			append(apply.LogAttrs(), "error", hbErr)...)
+		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, "lease_lost")
+		return true
+	}
+	if time.Since(lastSuccess) >= storage.ApplyLeaseStaleAfter {
+		c.logger.Warn("heartbeat has failed for the full lease staleness window; a peer operator can reclaim the apply, so this local driver will stop executing and writing apply state",
+			append(apply.LogAttrs(), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
+		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, "lease_presumed_lost")
+		return true
+	}
+	c.logger.Warn("heartbeat failed; will retry", append(apply.LogAttrs(), "error", hbErr)...)
+	return false
 }
 
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).

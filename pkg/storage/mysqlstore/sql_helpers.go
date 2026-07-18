@@ -5,8 +5,18 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
+	"time"
+
+	"github.com/block/schemabot/pkg/storage"
 )
+
+// applyLeaseStalenessSQL is the SQL INTERVAL after which a claimed applies or
+// apply_operations row's lease heartbeat (updated_at) is stale and the row may
+// be re-claimed by another driver. Derived from storage.ApplyLeaseStaleAfter so
+// the reclaim window and the driver-side presumed-lost bound cannot drift apart.
+var applyLeaseStalenessSQL = fmt.Sprintf("%d SECOND", int64(storage.ApplyLeaseStaleAfter/time.Second))
 
 // rollbackTx rolls back tx, logging a warning if the rollback fails for a
 // reason other than the transaction already being finished. operation is

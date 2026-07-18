@@ -2623,6 +2623,32 @@ func (c *GRPCClient) heartbeatScopedDrive(ctx context.Context, apply *storage.Ap
 	return c.storage.Applies().Heartbeat(ctx, apply.ID)
 }
 
+// driveEndingHeartbeatFailure classifies a failed drive-lease heartbeat write.
+// It returns a non-nil error when the drive must end: either storage reported
+// the lease definitively lost, or heartbeat failures have persisted since
+// lastSuccess for the full lease staleness window, so a peer driver can
+// already have reclaimed the stale row. A transient failure inside the window
+// returns nil so the drive keeps polling and the heartbeat is retried on the
+// next tick. The remote Tern keeps executing either way; the next claimant
+// reattaches to it.
+func driveEndingHeartbeatFailure(ctx context.Context, apply *storage.Apply, hbErr error, lastSuccess time.Time) error {
+	if errors.Is(hbErr, storage.ErrApplyLeaseLost) {
+		slog.Warn("gRPC drive heartbeat lost the lease; current owner will stop driving and writing apply state",
+			append(apply.LogAttrs(), "error", hbErr)...)
+		return fmt.Errorf("heartbeat gRPC apply %s: %w", apply.ApplyIdentifier, hbErr)
+	}
+	if time.Since(lastSuccess) >= storage.ApplyLeaseStaleAfter {
+		slog.Warn("gRPC drive heartbeat has failed for the full lease staleness window; a peer driver can reclaim the work, so this owner will stop driving and writing apply state",
+			append(apply.LogAttrs(), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
+		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, "lease_presumed_lost")
+		return fmt.Errorf("heartbeat gRPC apply %s: lease presumed lost after heartbeat failures since %s: %w",
+			apply.ApplyIdentifier, lastSuccess.UTC().Format(time.RFC3339), hbErr)
+	}
+	slog.Warn("gRPC drive heartbeat failed; will retry",
+		append(apply.LogAttrs(), "error", hbErr)...)
+	return nil
+}
+
 func (c *GRPCClient) markRemoteApplyFailed(ctx context.Context, remoteApply *storage.Apply, storedTasks []*storage.Task, message string, retryable bool, scope applyTaskScope) error {
 	return c.markRemoteApplyFailedWithOptions(ctx, remoteApply, storedTasks, message, retryable, false, scope)
 }
@@ -3245,6 +3271,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 	loggedStoppedAfterStart := false
 	var stoppedAfterStartDeadline time.Time
 	var lastDisplayBlob string
+	lastHeartbeatSuccess := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -3253,8 +3280,18 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			// Heartbeat: bump updated_at to maintain the lease. A multi-operation
 			// drive heartbeats its own operation row; every other drive
 			// heartbeats the parent applies row.
-			if err := c.heartbeatScopedDrive(ctx, apply, scope); err != nil {
-				return fmt.Errorf("heartbeat gRPC apply %s: %w", apply.ApplyIdentifier, err)
+			err := c.heartbeatScopedDrive(ctx, apply, scope)
+			if err == nil {
+				lastHeartbeatSuccess = time.Now()
+				continue
+			}
+			if ctx.Err() != nil {
+				// The drive is shutting down; the failed write is cancellation
+				// fallout, not lease trouble.
+				return ctx.Err()
+			}
+			if stopErr := driveEndingHeartbeatFailure(ctx, apply, err, lastHeartbeatSuccess); stopErr != nil {
+				return stopErr
 			}
 		case <-ticker.C:
 			if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); err != nil {

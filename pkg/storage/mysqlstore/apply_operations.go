@@ -575,11 +575,6 @@ func (s *applyOperationStore) GetEngineResumeState(ctx context.Context, operatio
 	}, nil
 }
 
-// applyOperationHeartbeatStaleness is the lease window after which a claimed
-// apply_operations row may be re-claimed by another driver. Mirrors the apply
-// heartbeat staleness in applies.go.
-const applyOperationHeartbeatStaleness = "1 MINUTE"
-
 // releasedFailureExemptionSQL stops a terminal-failed earlier sibling from
 // blocking a later deployment's claim once the rollout policy says to keep
 // going: on_failure='continue', or on_failure='pause' after a release control
@@ -900,7 +895,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND (
 							apply_operations.lease_acquired_at IS NULL
 							OR apply_operations.lease_acquired_at < cr.updated_at
-							OR apply_operations.updated_at < NOW() - INTERVAL 1 MINUTE
+							OR apply_operations.updated_at < NOW() - INTERVAL %s
 						)
 				)
 			)
@@ -927,7 +922,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, activeStatePlaceholders, applyOperationHeartbeatStaleness, activeStatePlaceholders, activeStatePlaceholders, applyOperationHeartbeatStaleness), queryArgs...)
+	`, applyOperationColumns, activeStatePlaceholders, applyLeaseStalenessSQL, activeStatePlaceholders, applyLeaseStalenessSQL, activeStatePlaceholders, applyLeaseStalenessSQL), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1214,7 +1209,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, applyOperationHeartbeatStaleness), queryArgs...)
+	`, applyOperationColumns, applyLeaseStalenessSQL), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

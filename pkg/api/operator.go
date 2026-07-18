@@ -20,17 +20,12 @@ const (
 	// OperatorPollInterval is the default interval for polling applies that need attention.
 	OperatorPollInterval = 10 * time.Second
 
-	// HeartbeatTimeout is how long since last heartbeat before
-	// an apply is considered to have a crashed driver and needs recovery.
-	// FindNextApply uses this (via SQL: updated_at < NOW() - INTERVAL 1 MINUTE).
-	HeartbeatTimeout = 1 * time.Minute
-
 	// ApplyOperationHeartbeatInterval bounds how often the operation-row
 	// heartbeat fires while ResumeApply runs. It is kept safely below
-	// HeartbeatTimeout so that a large (or misconfigured) operator poll
-	// interval cannot let apply_operations.updated_at go stale and allow a peer
-	// driver to re-claim the operation mid-resume. The effective cadence is
-	// min(operatorPollInterval, ApplyOperationHeartbeatInterval).
+	// storage.ApplyLeaseStaleAfter so that a large (or misconfigured) operator
+	// poll interval cannot let apply_operations.updated_at go stale and allow a
+	// peer driver to re-claim the operation mid-resume. The effective cadence
+	// is min(operatorPollInterval, ApplyOperationHeartbeatInterval).
 	ApplyOperationHeartbeatInterval = 10 * time.Second
 
 	// DefaultDrivers is the number of concurrent operator drivers
@@ -1484,8 +1479,11 @@ func (s *Service) logApplyDrivePanicFailure(ctx context.Context, driverID int, a
 // ResumeApply runs, at min(operatorPollInterval, ApplyOperationHeartbeatInterval)
 // so the row cannot go stale and be re-claimed by a peer even when the poll
 // interval is large. The heartbeat writes under the operation lease, so a lost
-// operation lease cancels the run and the displaced driver stops; other
-// heartbeat errors are logged and retried on the next tick.
+// operation lease cancels the run and the displaced driver stops. Other
+// heartbeat errors are logged and retried on the next tick — until they have
+// persisted for the full storage.ApplyLeaseStaleAfter window, at which point
+// the lease is presumed lost (a peer can already have reclaimed the stale row)
+// and the run is cancelled the same way.
 // Returns a stop func that is safe to call more than once.
 func (s *Service) startApplyOperationHeartbeat(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply, cancelRun context.CancelFunc) func() {
 	hbCtx, stop := context.WithCancel(ctx)
@@ -1493,37 +1491,59 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, driverID int
 	s.recoveryWg.Go(func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+		lastSuccess := s.clock.Now()
 		for {
 			select {
 			case <-hbCtx.Done():
 				return
 			case <-ticker.C:
-				if err := s.storage.ApplyOperations().Heartbeat(hbCtx, op.ID); err != nil {
-					if errors.Is(err, storage.ErrApplyLeaseLost) {
-						s.logger.Warn("operator: apply_operation heartbeat lost operation lease; driver will stop",
-							"driver", driverID,
-							"apply_operation_id", op.ID,
-							"apply_id", apply.ApplyIdentifier,
-							"database", apply.Database,
-							"deployment", op.Deployment,
-							"environment", apply.Environment,
-							"error", err)
-						cancelRun()
-						return
-					}
-					s.logger.Warn("operator: apply_operation heartbeat failed; will retry",
-						"driver", driverID,
-						"apply_operation_id", op.ID,
-						"apply_id", apply.ApplyIdentifier,
-						"database", apply.Database,
-						"deployment", op.Deployment,
-						"environment", apply.Environment,
-						"error", err)
+				err := s.storage.ApplyOperations().Heartbeat(hbCtx, op.ID)
+				if err == nil {
+					lastSuccess = s.clock.Now()
+					continue
+				}
+				if hbCtx.Err() != nil {
+					// The run is shutting down; the failed write is
+					// cancellation fallout, not lease trouble.
+					return
+				}
+				if s.operationHeartbeatFailureStopsDrive(hbCtx, driverID, op, apply, err, lastSuccess) {
+					cancelRun()
+					return
 				}
 			}
 		}
 	})
 	return stop
+}
+
+// operationHeartbeatFailureStopsDrive classifies a failed operation heartbeat
+// write and reports whether the driver must stop driving: either storage
+// reported the operation lease definitively lost, or heartbeat failures have
+// persisted since lastSuccess for the full lease staleness window, so a peer
+// driver can already have reclaimed the stale row. A transient failure inside
+// the window keeps the run going and is retried on the next tick.
+func (s *Service) operationHeartbeatFailureStopsDrive(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply, hbErr error, lastSuccess time.Time) bool {
+	logAttrs := append(op.LogAttrs(),
+		"driver", driverID,
+		"apply_id", apply.ApplyIdentifier,
+		"database", apply.Database,
+		"environment", apply.Environment,
+	)
+	if errors.Is(hbErr, storage.ErrApplyLeaseLost) {
+		s.logger.Warn("operator: apply_operation heartbeat lost operation lease; driver will stop",
+			append(logAttrs, "error", hbErr)...)
+		return true
+	}
+	if s.clock.Now().Sub(lastSuccess) >= storage.ApplyLeaseStaleAfter {
+		s.logger.Warn("operator: apply_operation heartbeat has failed for the full lease staleness window; a peer driver can reclaim the operation, so this driver will stop",
+			append(logAttrs, "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
+		metrics.RecordOperatorResumeFailure(ctx, apply.Database, op.Deployment, apply.Environment, "lease_presumed_lost")
+		return true
+	}
+	s.logger.Warn("operator: apply_operation heartbeat failed; will retry",
+		append(logAttrs, "error", hbErr)...)
+	return false
 }
 
 // markOperationFromApplyState transitions the claimed operation row to mirror
