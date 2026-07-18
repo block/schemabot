@@ -77,6 +77,28 @@ type CommentObserver struct {
 	// but whose tracking write failed, so later ticks adopt it (retry the write
 	// with the known comment ID) instead of posting a duplicate.
 	pendingRotation *pendingProgressRotation
+
+	// lastWritten remembers, per GitHub comment ID, the content key
+	// (templates.CommentContentKey) of the body this observer last wrote and
+	// when it was confirmed written, so an edit whose visible content is
+	// unchanged is skipped instead of PATCHing an identical comment — until
+	// unchangedCommentHeartbeat elapses, when a refresh edit goes through so
+	// the "Last updated" footer keeps proving liveness. Guarded by its own
+	// mutex, not o.mu: editTrackedComment runs both under OnProgress (which
+	// holds o.mu) and from OnTerminal (which does not).
+	lastWrittenMu sync.Mutex
+	lastWritten   map[int64]writtenContent
+}
+
+// writtenContent records what an observer last wrote to a GitHub comment and
+// when, so unchanged re-renders can be skipped until the liveness heartbeat
+// elapses. firstWrittenAt is when this observer first wrote the comment; it
+// anchors the young-comment grace window and carries forward across edits, so
+// a rotation to a fresh comment ID starts a new grace window.
+type writtenContent struct {
+	contentKey     string
+	writtenAt      time.Time
+	firstWrittenAt time.Time
 }
 
 // pendingProgressRotation identifies a volume-rotation progress comment that
@@ -99,6 +121,22 @@ const (
 	activeInterval   = 5 * time.Second
 	stagnantInterval = 30 * time.Second
 	stagnantThresh   = 3 // consecutive unchanged ticks before slowing down
+
+	// unchangedCommentHeartbeat bounds how long an unchanged tracked comment
+	// may go without a re-edit. Content-identical edits are normally skipped
+	// to save GitHub write budget, but the "Last updated" footer doubles as a
+	// liveness signal: a periodic refresh keeps a stalled apply's comment from
+	// reading as abandoned. Content changes always edit immediately.
+	unchangedCommentHeartbeat = 10 * time.Minute
+
+	// unchangedCommentGraceWindow is how long a freshly written comment keeps
+	// refreshing on every tick even when its content is unchanged. A young
+	// comment is the one being actively watched — the requester just started
+	// or resumed the apply — and an early stall (setup, throttling) must not
+	// read as SchemaBot going silent, so unchanged-edit skipping only begins
+	// once the comment ages past this window. The cost is bounded: at most a
+	// few minutes of fast identical edits per comment.
+	unchangedCommentGraceWindow = 10 * time.Minute
 )
 
 // CommentObserverConfig holds the parameters for creating a CommentObserver.
@@ -191,6 +229,7 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		logger:         cfg.Logger,
 		OnTerminalHook: cfg.OnTerminalHook,
 		clock:          clk,
+		lastWritten:    map[int64]writtenContent{},
 	}
 }
 
@@ -601,6 +640,21 @@ func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState 
 		// (e.g., first OnProgress tick before the handler posts it).
 		return
 	}
+
+	// Skip the edit when nothing the reader can see has changed. Renders of an
+	// unchanged status differ only in their rendered timestamps ("Last updated"
+	// footer, attribution line), so re-PATCHing spends GitHub write budget
+	// without changing the comment — a stagnant long-running apply would
+	// otherwise re-edit an identical comment forever. Young comments (inside
+	// their grace window) always edit so an early stall never reads as
+	// SchemaBot going silent, and skips lapse after unchangedCommentHeartbeat
+	// so the footer still refreshes periodically as a liveness signal.
+	// Expected and frequent, so no log; the edit count is not incremented
+	// because no edit happens.
+	contentKey := templates.CommentContentKey(body)
+	if o.skipUnchangedEdit(comment.GitHubCommentID, contentKey) {
+		return
+	}
 	if !o.leaseStillOwnsObserver(apply, "create GitHub client before edit") {
 		return
 	}
@@ -618,6 +672,7 @@ func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState 
 		o.logError(apply, "observer: failed to edit comment", "error", err, "comment_state", commentState)
 		return
 	}
+	o.recordLastWritten(comment.GitHubCommentID, contentKey)
 	if !o.leaseStillOwnsObserver(apply, "record edited GitHub comment") {
 		return
 	}
@@ -626,6 +681,46 @@ func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState 
 	if err := o.stor.ApplyComments().IncrementEditCount(o.contextWithApplyLease(ctx, apply), o.applyID, commentState); err != nil {
 		o.logError(apply, "observer: failed to increment edit count", "error", err, "comment_state", commentState)
 	}
+}
+
+// skipUnchangedEdit reports whether an edit may be skipped because its visible
+// content matches what this observer last wrote to the given GitHub comment
+// and that write is recent enough that the "Last updated" footer still proves
+// the observer is alive. A comment still inside its grace window always edits,
+// unchanged or not — young comments are the actively watched ones. A cache
+// miss — including a comment this observer never wrote, such as the
+// handler-posted initial progress comment — means the edit must proceed; only
+// a confirmed match may skip it, so uncertainty always degrades to an extra
+// edit, never a missed one.
+func (o *CommentObserver) skipUnchangedEdit(commentID int64, contentKey string) bool {
+	o.lastWrittenMu.Lock()
+	defer o.lastWrittenMu.Unlock()
+	last, ok := o.lastWritten[commentID]
+	if !ok {
+		return false
+	}
+	now := o.clock.Now()
+	if now.Sub(last.firstWrittenAt) < unchangedCommentGraceWindow {
+		return false
+	}
+	return last.contentKey == contentKey &&
+		now.Sub(last.writtenAt) < unchangedCommentHeartbeat
+}
+
+// recordLastWritten remembers the content key of a body confirmed written to a
+// GitHub comment (posted or edited) and when, keyed by the GitHub comment ID
+// so a rotation to a fresh comment never matches its predecessor's content.
+// The first record for a comment ID anchors its grace window; later records
+// carry the anchor forward.
+func (o *CommentObserver) recordLastWritten(commentID int64, contentKey string) {
+	o.lastWrittenMu.Lock()
+	defer o.lastWrittenMu.Unlock()
+	now := o.clock.Now()
+	firstWrittenAt := now
+	if prev, ok := o.lastWritten[commentID]; ok {
+		firstWrittenAt = prev.firstWrittenAt
+	}
+	o.lastWritten[commentID] = writtenContent{contentKey: contentKey, writtenAt: now, firstWrittenAt: firstWrittenAt}
 }
 
 // rotateProgressCommentForResume posts a fresh progress comment when a resumed
@@ -977,6 +1072,7 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 		o.logError(apply, "observer: failed to post comment", "error", err, "comment_state", commentState)
 		return 0, false, false
 	}
+	o.recordLastWritten(commentID, templates.CommentContentKey(body))
 	if !o.leaseStillOwnsObserver(apply, "record posted GitHub comment") {
 		// The comment is live on the PR; only the tracking write is being
 		// skipped. Report it posted-but-untracked — the contract callers use to

@@ -3,6 +3,7 @@ package templates
 import (
 	"fmt"
 	"html"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -66,6 +67,25 @@ type SupportChannelData struct {
 // currentTimestamp returns the current UTC time formatted for PR comments.
 func currentTimestamp() string {
 	return TimestampFunc()
+}
+
+// renderedTimestampPattern matches the timestamps templates stamp into comment
+// bodies at render time: the "2006-01-02 15:04:05 UTC" display form (TimestampFunc,
+// startedAtDisplay) and the RFC3339 form inside <relative-time> datetime
+// attributes. CommentContentKey collapses both so renders that differ only in
+// when they happened compare equal.
+var renderedTimestampPattern = regexp.MustCompile(`\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?: UTC|Z)`)
+
+// CommentContentKey returns a comparison key for a rendered comment body: the
+// body with every rendered timestamp collapsed to a placeholder. The "Last
+// updated" footer and attribution lines re-stamp the render time on every
+// render, so byte comparison of raw bodies always differs; equal content keys
+// mean an edit would change nothing else the reader can see. Values that must
+// keep updating between otherwise-identical renders — such as the revert-window
+// countdown — are durations, not timestamps, so they stay in the key and their
+// comments keep being edited.
+func CommentContentKey(body string) string {
+	return renderedTimestampPattern.ReplaceAllString(body, "<timestamp>")
 }
 
 // RenderSupportChannelFooter appends a support-channel footer to a rendered PR comment.
