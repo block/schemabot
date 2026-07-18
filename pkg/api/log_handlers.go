@@ -164,16 +164,20 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 			continue
 		}
 		matched = true
-		if op.ExternalID == "" {
+		externalID := op.ExternalID
+		if externalID == "" && len(ops) == 1 {
+			externalID = apply.ExternalID
+		}
+		if externalID == "" {
 			// An operation without a remote apply id ran on the control plane;
 			// its logs live in control-plane storage, not behind this fan-out.
 			s.logger.Debug("skipping operation without a remote apply id for data-plane logs", append(apply.LogAttrs(), "operation", "read_deployment_logs", "operation_deployment", deployment, "operation_key", op.OperationKey, "target", op.Target)...)
 			continue
 		}
-		key := op.Target + "\x00" + op.ExternalID
+		key := op.Target + "\x00" + externalID
 		fetch := fetches[key]
 		if fetch == nil {
-			fetch = &deploymentLogFetch{target: op.Target, externalID: op.ExternalID}
+			fetch = &deploymentLogFetch{target: op.Target, externalID: externalID}
 			fetches[key] = fetch
 		}
 		fetch.operations = append(fetch.operations, &apitypes.LogOperationProvenance{OperationKey: op.OperationKey, Target: op.Target, OperationKind: op.OperationKind})

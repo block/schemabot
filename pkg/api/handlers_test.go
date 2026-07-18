@@ -764,6 +764,33 @@ func TestHandleDeploymentLogsFansOutDeduplicatesAndPreservesPartialResults(t *te
 	assert.NotContains(t, w.Body.String(), "not-a-time")
 }
 
+func TestHandleDeploymentLogsUsesParentExternalIDForSingleOperation(t *testing.T) {
+	apply := &storage.Apply{ID: 8, ApplyIdentifier: "apply-control", ExternalID: "remote-parent", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging", Deployment: "region-a"}
+	operation := &storage.ApplyOperation{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "schema", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-a"}
+	client := &mockTernClient{isRemote: true}
+	client.logsHook = func(req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+		return &ternv1.LogsResponse{ApplyId: req.ApplyId, Logs: []*ternv1.ApplyLog{{Id: 13, Level: "info", Message: "apply complete", CreatedAt: "2026-07-18T18:33:10Z"}}}, nil
+	}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{operation}},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, client.logsReqs, 1)
+	assert.Equal(t, "remote-parent", client.logsReqs[0].ApplyId)
+	var response apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, response.Sources, 1)
+	assert.Equal(t, "remote-parent", response.Sources[0].ExternalID)
+	require.Len(t, response.Sources[0].Logs, 1)
+	assert.Equal(t, "apply complete", response.Sources[0].Logs[0].Message)
+}
+
 func (m *mockTernClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
 	m.cutoverReq = req
 	if m.cutoverResp != nil {
