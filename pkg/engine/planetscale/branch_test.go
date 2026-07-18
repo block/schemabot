@@ -1,15 +1,19 @@
 package planetscale
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"testing"
+
+	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/spirit/pkg/statement"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/lint"
+	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/spirit/pkg/table"
 )
@@ -87,4 +91,35 @@ func TestDiffKeyspace_DetectsSchemaChanges(t *testing.T) {
 		assert.Equal(t, "users", changes[0].Table)
 		assert.Equal(t, statement.StatementCreateTable, changes[0].Operation)
 	})
+}
+
+// deployRequestRecorderClient captures the deploy-request creation payload so
+// tests can assert on the options the engine sends to the PlanetScale API.
+type deployRequestRecorderClient struct {
+	psclient.PSClient
+	created *ps.CreateDeployRequestRequest
+}
+
+func (c *deployRequestRecorderClient) CreateDeployRequest(_ context.Context, req *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.created = req
+	return &ps.DeployRequest{Number: 1}, nil
+}
+
+// SchemaBot is the sole cutover actor: deploy requests are created with
+// PlanetScale's auto-cutover disabled so they park at pending_cutover until
+// the drive (or a deferred-cutover operator) completes the cutover. If
+// PlanetScale cut over on its own, the schema could move without SchemaBot's
+// involvement or caller attribution.
+func TestCreateDeployRequest_DisablesPlanetScaleAutoCutover(t *testing.T) {
+	e := &Engine{logger: slog.New(slog.NewTextHandler(os.Stdout, nil))}
+	client := &deployRequestRecorderClient{}
+
+	_, err := e.createDeployRequest(t.Context(), client, "org", "mydb", "schemabot-mydb-abc", "main", true)
+
+	require.NoError(t, err)
+	require.NotNil(t, client.created)
+	assert.False(t, client.created.AutoCutover)
+	assert.True(t, client.created.AutoDeleteBranch)
+	assert.Equal(t, "schemabot-mydb-abc", client.created.Branch)
+	assert.Equal(t, "main", client.created.IntoBranch)
 }
