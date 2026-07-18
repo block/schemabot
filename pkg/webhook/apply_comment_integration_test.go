@@ -2135,3 +2135,82 @@ func TestE2EProgressRotationRestoresFastCadence(t *testing.T) {
 		t.Fatal("expected the fresh comment to edit at the fastest cadence")
 	}
 }
+
+// During a GitHub rate-limit incident, operators need one valve that slows
+// every apply's progress-comment traffic at once, without a code change: the
+// configured minimum edit interval floors the built-in cadence, so even a
+// fresh, fast-moving apply spaces its edits by the floor. State changes still
+// publish immediately — slowing progress noise must never delay the reader
+// learning that an apply changed state.
+func TestE2EConfiguredFloorSlowsProgressEdits(t *testing.T) {
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-floor",
+		pr:         146,
+		database:   "e2e_floor_db",
+		applyState: state.Apply.Running,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(t.Context(), "org/repo-floor", 146, 12345, apply, state.Comment.Progress, "initial progress")
+	progressID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := NewCommentObserver(CommentObserverConfig{
+		GHClient:        f.factory,
+		Storage:         st,
+		Repo:            apply.Repository,
+		PR:              apply.PullRequest,
+		InstallationID:  apply.InstallationID,
+		ApplyID:         apply.ID,
+		MinEditInterval: 2 * time.Minute,
+		Logger:          f.logger,
+		Clock:           fake,
+	})
+
+	// The first tick edits and anchors the cadence.
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, progressID, edited.CommentID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the first tick to edit the progress comment")
+	}
+
+	// A fresh apply would normally edit again a few seconds later; the floor
+	// holds the edit back even though rows advanced.
+	fake.Advance(30 * time.Second)
+	task.RowsCopied = 600
+	task.ProgressPercent = 60
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		t.Fatalf("the configured floor must hold back progress edits; got %q", edited.Body)
+	default:
+		// expected: the floor spaces edits by at least the configured interval
+	}
+
+	// Once the floor elapses, progress publishes — and the footer advertises
+	// the floored cadence, not the decay schedule's faster rung.
+	fake.Advance(2 * time.Minute)
+	task.RowsCopied = 700
+	task.ProgressPercent = 70
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Contains(t, edited.Body, "70%")
+		assert.Contains(t, edited.Body, "updates every ~2m")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an edit once the configured floor elapsed")
+	}
+
+	// A state change bypasses the floor and publishes immediately.
+	fake.Advance(time.Second)
+	apply.State = state.Apply.WaitingForCutover
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Contains(t, edited.Body, "Waiting for Cutover")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a state change to bypass the configured floor")
+	}
+}

@@ -259,16 +259,17 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 				"pr", apply.PullRequest)
 			service.SetApplyObserver(apply.Database, apply.Deployment, apply.Environment, apply.ID,
 				NewCommentObserver(CommentObserverConfig{
-					GHClient:       factory,
-					Storage:        service.Storage(),
-					Repo:           apply.Repository,
-					PR:             apply.PullRequest,
-					InstallationID: apply.InstallationID,
-					ApplyID:        apply.ID,
-					ApplyLease:     apply.Lease(),
-					SupportChannel: h.supportChannel(),
-					Tenant:         h.deploymentTenant(),
-					Logger:         logger,
+					GHClient:        factory,
+					Storage:         service.Storage(),
+					Repo:            apply.Repository,
+					PR:              apply.PullRequest,
+					InstallationID:  apply.InstallationID,
+					ApplyID:         apply.ID,
+					ApplyLease:      apply.Lease(),
+					SupportChannel:  h.supportChannel(),
+					MinEditInterval: h.progressCommentMinEditInterval(),
+					Tenant:          h.deploymentTenant(),
+					Logger:          logger,
 					OnTerminalHook: func(a *storage.Apply) {
 						h.refreshChecksForTerminalApply(context.Background(), a, "recovered apply")
 					},

@@ -3547,3 +3547,50 @@ func TestKnownEnvironments(t *testing.T) {
 		assert.False(t, cfg.IsEnvironmentKnown("staging"))
 	})
 }
+
+// The progress-comment edit floor is an operator incident valve: it must
+// accept normal durations, reject unparseable or negative values at config
+// load, and default to no floor when unset.
+func TestProgressCommentMinEditInterval(t *testing.T) {
+	t.Run("unset means no floor", func(t *testing.T) {
+		cfg := ServerConfig{}
+		d, err := cfg.ProgressCommentMinEditIntervalDuration()
+		require.NoError(t, err)
+		assert.Equal(t, time.Duration(0), d)
+	})
+
+	t.Run("configured floor parses", func(t *testing.T) {
+		cfg := ServerConfig{ProgressCommentMinEditInterval: "10m"}
+		d, err := cfg.ProgressCommentMinEditIntervalDuration()
+		require.NoError(t, err)
+		assert.Equal(t, 10*time.Minute, d)
+	})
+
+	t.Run("unparseable value rejected", func(t *testing.T) {
+		cfg := ServerConfig{ProgressCommentMinEditInterval: "fast"}
+		_, err := cfg.ProgressCommentMinEditIntervalDuration()
+		assert.ErrorContains(t, err, "progress_comment_min_edit_interval")
+	})
+
+	t.Run("negative value rejected", func(t *testing.T) {
+		cfg := ServerConfig{ProgressCommentMinEditInterval: "-30s"}
+		_, err := cfg.ProgressCommentMinEditIntervalDuration()
+		assert.ErrorContains(t, err, "must not be negative")
+	})
+
+	t.Run("validate rejects invalid interval", func(t *testing.T) {
+		cfg := ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"mydb": {
+					Type: "mysql",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root:pass@tcp(localhost:3306)/mydb"},
+					},
+				},
+			},
+			ProgressCommentMinEditInterval: "not-a-duration",
+		}
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "progress_comment_min_edit_interval")
+	})
+}

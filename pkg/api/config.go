@@ -83,6 +83,15 @@ type ServerConfig struct {
 	// SchemaBot so PR authors know where to ask operators for help.
 	SupportChannel SupportChannelConfig `yaml:"support_channel,omitempty"`
 
+	// ProgressCommentMinEditInterval is the minimum spacing between GitHub
+	// edits of an apply's progress comment, as a Go duration string (e.g.
+	// "60s", "10m"). It is a floor over the built-in age-decayed edit cadence,
+	// giving operators a valve to slow all progress-comment traffic — for
+	// example during a GitHub rate-limit incident — without a code change.
+	// State-change updates always publish immediately and are unaffected; the
+	// CLI remains the high-resolution progress surface. Empty means no floor.
+	ProgressCommentMinEditInterval string `yaml:"progress_comment_min_edit_interval,omitempty"`
+
 	// DefaultReviewers are GitHub teams/users required to review schema changes.
 	DefaultReviewers []string `yaml:"default_reviewers"`
 
@@ -236,6 +245,22 @@ func (c *ServerConfig) PendingDropsRetention() (time.Duration, error) {
 	}
 	if d <= 0 {
 		return 0, fmt.Errorf("pending_drops.retention must be positive, got %q", c.PendingDrops.Retention)
+	}
+	return d, nil
+}
+
+// ProgressCommentMinEditIntervalDuration returns the configured floor for
+// progress-comment edit spacing, or zero when no floor is configured.
+func (c *ServerConfig) ProgressCommentMinEditIntervalDuration() (time.Duration, error) {
+	if c.ProgressCommentMinEditInterval == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.ProgressCommentMinEditInterval)
+	if err != nil {
+		return 0, fmt.Errorf("parse progress_comment_min_edit_interval %q: %w", c.ProgressCommentMinEditInterval, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("progress_comment_min_edit_interval must not be negative, got %q", c.ProgressCommentMinEditInterval)
 	}
 	return d, nil
 }
@@ -937,6 +962,9 @@ func (c *ServerConfig) Validate() error {
 		if _, err := c.PendingDropsRetention(); err != nil {
 			return err
 		}
+	}
+	if _, err := c.ProgressCommentMinEditIntervalDuration(); err != nil {
+		return err
 	}
 
 	// Validate Databases if present. An environment is either local mode

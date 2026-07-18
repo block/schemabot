@@ -686,6 +686,24 @@ func (h *Handler) supportChannel() api.SupportChannelConfig {
 	return cfg.SupportChannel
 }
 
+// progressCommentMinEditInterval returns the operator-configured floor for
+// progress-comment edit spacing, or zero when no floor is configured. The
+// value is validated at config load, so a parse failure here means the
+// running config was replaced without validation; the floor is dropped (the
+// built-in cadence applies) and the bad value logged rather than guessed at.
+func (h *Handler) progressCommentMinEditInterval() time.Duration {
+	cfg := h.config()
+	if cfg == nil {
+		return 0
+	}
+	d, err := cfg.ProgressCommentMinEditIntervalDuration()
+	if err != nil {
+		h.logger.Warn("invalid progress_comment_min_edit_interval; progress comments will edit at the built-in cadence", "error", err)
+		return 0
+	}
+	return d
+}
+
 func appendSupportChannelFooter(body string, support api.SupportChannelConfig) string {
 	if !support.Enabled() || !shouldShowSupportChannel(body) {
 		return body
