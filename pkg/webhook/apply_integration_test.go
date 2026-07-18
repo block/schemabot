@@ -1521,11 +1521,12 @@ func TestE2EApplyStaleBaseSchemaOutranksUnsafePrompt(t *testing.T) {
 
 // The final revalidation inside apply execution also outranks the unsafe
 // prompt. Here the base branch advances only while the confirm's re-plan is
-// running: the handler-level gate sees an unchanged schema tree, then the
-// re-plan produces a destructive diff (the target already has the column the
-// stale snapshot omits) and the base tip's schema tree has moved by the time
-// the final gate reads it. The user must get the freshness rejection — with
-// the lock released — not an `--allow-unsafe` prompt for revert DDL.
+// running: the handler-level gate resolves the base ref to a tip whose schema
+// tree matches the merge base's, then the re-plan produces a destructive diff
+// (the target already has the column the stale snapshot omits) and the base
+// ref has moved to a newer tip by the time the final gate resolves it. The
+// user must get the freshness rejection — with the lock released — not an
+// `--allow-unsafe` prompt for revert DDL.
 func TestE2EApplyConfirmStaleBaseSchemaAtFinalGateOutranksUnsafePrompt(t *testing.T) {
 	dbName := "webhook_confirm_final_stale_base"
 	svc := setupE2EService(t, dbName)
@@ -1583,35 +1584,41 @@ func TestE2EApplyConfirmStaleBaseSchemaAtFinalGateOutranksUnsafePrompt(t *testin
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}, schemabotConfig, dbName)
 
-	// The base branch schema tree is unchanged when the handler-level gate
-	// reads it and has moved by the time the final gate re-reads it after the
-	// re-plan. The merge-base tree is fixed; only the tip's tree flips.
+	// The base branch advances to a new tip commit while the re-plan runs:
+	// the handler-level gate resolves the ref to a tip whose schema tree
+	// still matches the merge base's, and the final gate — resolving the ref
+	// again — observes the newer tip whose schema tree differs. Each commit's
+	// tree is immutable; only the ref moves, so the gate detects the advance
+	// only if it re-resolves the ref rather than reusing an earlier tip.
+	var refReads atomic.Int32
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+		tipSHA := "base-tip-1"
+		if refReads.Add(1) > 1 {
+			tipSHA = "base-tip-2"
+		}
 		require.NoError(t, json.NewEncoder(w).Encode(gh.Reference{
 			Ref:    new("refs/heads/main"),
-			Object: &gh.GitObject{Type: new("commit"), SHA: new("base-tip-sha")},
+			Object: &gh.GitObject{Type: new("commit"), SHA: &tipSHA},
 		}))
 	})
-	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...abc123", func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
-			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("def456")},
-		}))
-	})
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/def456", func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
-			{Path: new("schema"), Type: new("tree"), SHA: new("schema-tree-old")},
-		}}))
-	})
-	var tipTreeReads atomic.Int32
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/base-tip-sha", func(w http.ResponseWriter, _ *http.Request) {
-		schemaTreeSHA := "schema-tree-old"
-		if tipTreeReads.Add(1) > 1 {
-			schemaTreeSHA = "schema-tree-new"
-		}
-		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
-			{Path: new("schema"), Type: new("tree"), SHA: &schemaTreeSHA},
-		}}))
-	})
+	for _, tipSHA := range []string{"base-tip-1", "base-tip-2"} {
+		mux.HandleFunc("GET /repos/octocat/hello-world/compare/"+tipSHA+"...abc123", func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
+				MergeBaseCommit: &gh.RepositoryCommit{SHA: new("def456")},
+			}))
+		})
+	}
+	for path, treeSHA := range map[string]string{
+		"def456":     "schema-tree-old",
+		"base-tip-1": "schema-tree-old",
+		"base-tip-2": "schema-tree-new",
+	} {
+		mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/"+path, func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
+				{Path: new("schema"), Type: new("tree"), SHA: new(treeSHA)},
+			}}))
+		})
+	}
 
 	h := newE2EHandler(t, svc, client)
 	req := buildWebhookRequest(t, webhookPayloadOpts{
