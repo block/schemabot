@@ -107,7 +107,7 @@ func (c *deployRequestRecorderClient) CreateDeployRequest(_ context.Context, req
 
 // SchemaBot is the sole cutover actor: deploy requests are created with
 // PlanetScale's auto-cutover disabled so they park at pending_cutover until
-// the drive (or a deferred-cutover operator) completes the cutover. If
+// the driver (or a deferred-cutover operator) completes the cutover. If
 // PlanetScale cut over on its own, the schema could move without SchemaBot's
 // involvement or caller attribution.
 func TestCreateDeployRequest_DisablesPlanetScaleAutoCutover(t *testing.T) {
