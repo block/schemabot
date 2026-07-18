@@ -3598,6 +3598,7 @@ func TestGRPCClient_SyncRemoteProgressKeepsLastUsefulRows(t *testing.T) {
 		RowsCopied:      950,
 		RowsTotal:       1000,
 		ProgressPercent: 95,
+		ETASeconds:      120,
 	}
 	client := &GRPCClient{
 		storage: &mockStorage{
@@ -3622,6 +3623,61 @@ func TestGRPCClient_SyncRemoteProgressKeepsLastUsefulRows(t *testing.T) {
 	assert.Equal(t, int64(950), task.RowsCopied)
 	assert.Equal(t, int64(1000), task.RowsTotal)
 	assert.Equal(t, 95, task.ProgressPercent)
+	assert.Equal(t, 120, task.ETASeconds)
+}
+
+func TestGRPCClient_SyncRemoteProgressMirrorsRowCopySnapshot(t *testing.T) {
+	// The control plane never polls a remote engine directly: the stored task
+	// rows it mirrors from the remote Progress response are the only source the
+	// PR progress comment and CLI render from. Every field of the remote
+	// row-copy snapshot — rows, percent, ETA, checksum progress — must land in
+	// storage, or the surfaces above render it as absent for the apply's whole
+	// life.
+	apply := &storage.Apply{
+		ID:              21,
+		ApplyIdentifier: "apply-progress-snapshot",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-progress-snapshot",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             34,
+		TaskIdentifier: "task-progress-snapshot",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "orders",
+		State:          state.Task.Running,
+	}
+	client := &GRPCClient{
+		storage: &mockStorage{
+			tasks: &mockTaskStore{tasks: []*storage.Task{task}},
+			logs:  &mockApplyLogStore{},
+		},
+	}
+
+	err := client.syncStoredTasksFromRemoteTasks(t.Context(), apply, []*storage.Task{task}, []*ternv1.TableProgress{
+		{
+			Namespace:           "default",
+			TableName:           "orders",
+			Status:              state.Task.Running,
+			RowsCopied:          450,
+			RowsTotal:           1000,
+			PercentComplete:     45,
+			EtaSeconds:          340,
+			ChecksumRowsChecked: 200,
+			ChecksumRowsTotal:   1000,
+		},
+	}, time.Now())
+	require.NoError(t, err)
+
+	assert.Equal(t, state.Task.Running, task.State)
+	assert.Equal(t, int64(450), task.RowsCopied)
+	assert.Equal(t, int64(1000), task.RowsTotal)
+	assert.Equal(t, 45, task.ProgressPercent)
+	assert.Equal(t, 340, task.ETASeconds)
+	assert.Equal(t, int64(200), task.ChecksumRowsChecked)
+	assert.Equal(t, int64(1000), task.ChecksumRowsTotal)
 }
 
 func TestGRPCClient_PollSetsTerminalTaskMetadataFromRemoteTaskProgress(t *testing.T) {
