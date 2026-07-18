@@ -11,7 +11,9 @@ import (
 
 // failApplyWithTasks marks all tasks and the apply as failed with the given error.
 // If the apply is already in a terminal state (e.g., cancelled by Stop()), the
-// apply state is not overwritten.
+// stored state is not overwritten; the settled state is adopted into the
+// in-memory apply so callers that notify observers afterwards report the
+// concurrent verdict instead of the stale pre-failure state.
 func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) {
 	now := time.Now()
 	for _, task := range tasks {
@@ -31,6 +33,7 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 	if err == nil && fresh != nil && state.IsTerminalApplyState(fresh.State) {
 		c.logger.Debug("apply already in terminal state, not overwriting",
 			"apply_id", apply.ApplyIdentifier, "state", fresh.State)
+		*apply = *fresh
 		return
 	}
 
@@ -65,6 +68,7 @@ func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *st
 	if err == nil && fresh != nil && state.IsTerminalApplyState(fresh.State) {
 		c.logger.Debug("apply already in terminal state, not marking retryable",
 			"apply_id", apply.ApplyIdentifier, "state", fresh.State)
+		*apply = *fresh
 		return
 	}
 

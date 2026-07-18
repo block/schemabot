@@ -375,3 +375,28 @@ func TestResumeApplyMissingPlanFailsApply(t *testing.T) {
 	require.Len(t, observer.terminal, 1)
 	assert.True(t, state.IsState(observer.terminal[0].State, state.Apply.Failed))
 }
+
+// When another actor settles the apply between the recovery claim and the
+// plan-missing terminalization (e.g. a raced Stop()), the stored terminal
+// state wins: it is not overwritten, and the observer is notified with the
+// settled verdict rather than the stale in-flight state this recovery
+// attempt was holding.
+func TestResumeApplyMissingPlanAdoptsConcurrentTerminalState(t *testing.T) {
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{})
+	settled := *apply
+	settled.State = state.Apply.Stopped
+	settled.ErrorMessage = "stopped by operator"
+	applyStore.apply = &settled
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+
+	require.NoError(t, err)
+	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.Stopped),
+		"concurrently-settled state must not be overwritten, got %s", applyStore.apply.State)
+	assert.Equal(t, "stopped by operator", applyStore.apply.ErrorMessage)
+	require.Len(t, observer.terminal, 1)
+	assert.True(t, state.IsState(observer.terminal[0].State, state.Apply.Stopped),
+		"observer must see the settled verdict, got %s", observer.terminal[0].State)
+}
