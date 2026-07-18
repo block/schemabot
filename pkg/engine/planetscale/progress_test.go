@@ -17,7 +17,7 @@ func TestAggregateShardProgress(t *testing.T) {
 			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "running", RowsCopied: 3000, TableRows: 10000, Progress: 30},
 		}
 
-		tables, overall := aggregateShardProgress(rows)
+		tables, overall := aggregateShardProgress(rows, time.Now())
 		require.Len(t, tables, 1)
 		assert.Equal(t, "orders", tables[0].Table)
 		assert.Equal(t, state.Vitess.Running, tables[0].State)
@@ -37,7 +37,7 @@ func TestAggregateShardProgress(t *testing.T) {
 			{MigrationUUID: "uuid-2", Keyspace: "commerce", Shard: "80-", Table: "items", Status: "complete", IsImmediate: true},
 		}
 
-		tables, overall := aggregateShardProgress(rows)
+		tables, overall := aggregateShardProgress(rows, time.Now())
 		require.Len(t, tables, 1)
 		assert.Equal(t, state.Vitess.Complete, tables[0].State)
 		assert.Equal(t, 100, tables[0].Progress)
@@ -51,7 +51,7 @@ func TestAggregateShardProgress(t *testing.T) {
 			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "complete", RowsCopied: 10000, TableRows: 10000},
 		}
 
-		tables, _ := aggregateShardProgress(rows)
+		tables, _ := aggregateShardProgress(rows, time.Now())
 		require.Len(t, tables, 1)
 		// One shard running means table is running
 		assert.Equal(t, state.Vitess.Running, tables[0].State)
@@ -63,7 +63,7 @@ func TestAggregateShardProgress(t *testing.T) {
 			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "failed"},
 		}
 
-		tables, _ := aggregateShardProgress(rows)
+		tables, _ := aggregateShardProgress(rows, time.Now())
 		require.Len(t, tables, 1)
 		assert.Equal(t, state.Vitess.Failed, tables[0].State)
 	})
@@ -74,7 +74,7 @@ func TestAggregateShardProgress(t *testing.T) {
 			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "running", ReadyToComplete: true},
 		}
 
-		tables, _ := aggregateShardProgress(rows)
+		tables, _ := aggregateShardProgress(rows, time.Now())
 		require.Len(t, tables, 1)
 		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].State)
 		// Shards should show derived state
@@ -87,7 +87,7 @@ func TestAggregateShardProgress(t *testing.T) {
 			{MigrationUUID: "uuid-2", Keyspace: "commerce", Shard: "0", Table: "items", Status: "running", RowsCopied: 50, TableRows: 200},
 		}
 
-		tables, overall := aggregateShardProgress(rows)
+		tables, overall := aggregateShardProgress(rows, time.Now())
 		require.Len(t, tables, 2)
 		assert.Equal(t, "orders", tables[0].Table)
 		assert.Equal(t, "items", tables[1].Table)
@@ -102,7 +102,7 @@ func TestAggregateShardProgress(t *testing.T) {
 			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "running", ReadyToComplete: true, Progress: 97, RowsCopied: 9700, TableRows: 10000},
 		}
 
-		tables, _ := aggregateShardProgress(rows)
+		tables, _ := aggregateShardProgress(rows, time.Now())
 		require.Len(t, tables, 1)
 		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].State)
 		assert.Equal(t, 100, tables[0].Progress)
@@ -119,7 +119,7 @@ func TestAggregateShardProgress(t *testing.T) {
 			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-", Table: "users", Status: "complete", RowsCopied: 284953, TableRows: 284953},
 		}
 
-		tables, overall := aggregateShardProgress(rows)
+		tables, overall := aggregateShardProgress(rows, time.Now())
 		require.Len(t, tables, 1)
 		assert.Equal(t, 100, tables[0].Progress)
 		assert.Equal(t, 100, tables[0].Shards[0].Progress)
@@ -133,7 +133,7 @@ func TestAggregateShardProgress(t *testing.T) {
 			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "running", ReadyToComplete: false, Progress: 50, RowsCopied: 5000, TableRows: 10000},
 		}
 
-		tables, _ := aggregateShardProgress(rows)
+		tables, _ := aggregateShardProgress(rows, time.Now())
 		require.Len(t, tables, 1)
 		assert.Equal(t, state.Vitess.Running, tables[0].State)
 		// First shard (ready_to_complete) should be clamped to 100%
@@ -152,11 +152,103 @@ func TestAggregateShardProgress(t *testing.T) {
 			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-", Table: "orders", Status: "running", Progress: 99, RowsCopied: 12000, TableRows: 10000},
 		}
 
-		tables, overall := aggregateShardProgress(rows)
+		tables, overall := aggregateShardProgress(rows, time.Now())
 		require.Len(t, tables, 1)
 		assert.Equal(t, state.Vitess.Running, tables[0].State)
 		assert.Equal(t, 100, tables[0].Progress)
 		assert.Equal(t, 100, overall)
+	})
+}
+
+// The provider reports eta_seconds as -1 (or 0) while it considers the ETA
+// unknown, which for some providers persists across the entire copy phase.
+// A shard that is actively copying must still surface an ETA in the PR status
+// comment and CLI, so the aggregation estimates one from the copy rate so far
+// (elapsed * remaining / copied) whenever the reported value is non-positive.
+func TestAggregateShardProgress_ETAEstimate(t *testing.T) {
+	now := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
+	started := now.Add(-10 * time.Minute)
+
+	t.Run("unknown provider ETA is estimated from copy rate", func(t *testing.T) {
+		// 25% copied in 10 minutes → 30 minutes remaining.
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "running",
+				ETASeconds: -1, RowsCopied: 25_000_000, TableRows: 100_000_000, Progress: 25, StartedAt: &started},
+		}
+
+		tables, _ := aggregateShardProgress(rows, now)
+		require.Len(t, tables, 1)
+		assert.Equal(t, int64(1800), tables[0].ETASeconds)
+		require.Len(t, tables[0].Shards, 1)
+		assert.Equal(t, int64(1800), tables[0].Shards[0].ETASeconds)
+	})
+
+	t.Run("provider-reported ETA wins over the estimate", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "running",
+				ETASeconds: 542, RowsCopied: 25_000_000, TableRows: 100_000_000, Progress: 25, StartedAt: &started},
+		}
+
+		tables, _ := aggregateShardProgress(rows, now)
+		require.Len(t, tables, 1)
+		assert.Equal(t, int64(542), tables[0].ETASeconds)
+		assert.Equal(t, int64(542), tables[0].Shards[0].ETASeconds)
+	})
+
+	t.Run("table ETA is the slowest shard's estimate", func(t *testing.T) {
+		// -80 is 50% done (10 min remaining); 80- is 25% done (30 min remaining).
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "running",
+				ETASeconds: -1, RowsCopied: 50_000_000, TableRows: 100_000_000, Progress: 50, StartedAt: &started},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "running",
+				ETASeconds: -1, RowsCopied: 25_000_000, TableRows: 100_000_000, Progress: 25, StartedAt: &started},
+		}
+
+		tables, _ := aggregateShardProgress(rows, now)
+		require.Len(t, tables, 1)
+		assert.Equal(t, int64(1800), tables[0].ETASeconds)
+		assert.Equal(t, int64(600), tables[0].Shards[0].ETASeconds)
+		assert.Equal(t, int64(1800), tables[0].Shards[1].ETASeconds)
+	})
+
+	t.Run("no estimate before any rows are copied", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "running",
+				ETASeconds: -1, RowsCopied: 0, TableRows: 100_000_000, StartedAt: &started},
+		}
+
+		tables, _ := aggregateShardProgress(rows, now)
+		require.Len(t, tables, 1)
+		assert.Zero(t, tables[0].ETASeconds)
+		assert.Zero(t, tables[0].Shards[0].ETASeconds)
+	})
+
+	t.Run("no estimate without a start time", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "running",
+				ETASeconds: -1, RowsCopied: 25_000_000, TableRows: 100_000_000, Progress: 25},
+		}
+
+		tables, _ := aggregateShardProgress(rows, now)
+		require.Len(t, tables, 1)
+		assert.Zero(t, tables[0].ETASeconds)
+	})
+
+	t.Run("no estimate once a shard is done copying", func(t *testing.T) {
+		// ready_to_complete and complete shards are past the copy phase; a
+		// fabricated ETA there would contradict the rendered 100% state.
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "running",
+				ReadyToComplete: true, ETASeconds: -1, RowsCopied: 99_000_000, TableRows: 100_000_000, Progress: 99, StartedAt: &started},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "complete",
+				ETASeconds: -1, RowsCopied: 100_000_000, TableRows: 100_000_000, Progress: 100, StartedAt: &started},
+		}
+
+		tables, _ := aggregateShardProgress(rows, now)
+		require.Len(t, tables, 1)
+		assert.Zero(t, tables[0].ETASeconds)
+		assert.Zero(t, tables[0].Shards[0].ETASeconds)
+		assert.Zero(t, tables[0].Shards[1].ETASeconds)
 	})
 }
 
