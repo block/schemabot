@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -223,9 +224,9 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		for _, t := range sc.TableChanges {
 			nsData.Statements = append(nsData.Statements, t.DDL)
 		}
-		if diff, ok := sc.Metadata["vschema"]; ok {
+		if sc.HasVSchemaChange() {
 			nsData.VSchemaChanged = true
-			nsData.VSchemaDiff = diff
+			nsData.VSchemaDiff = sc.Metadata[apitypes.VSchemaDiffMetadataKey]
 		}
 		commentData.Changes = append(commentData.Changes, nsData)
 	}

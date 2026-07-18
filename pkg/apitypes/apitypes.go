@@ -551,11 +551,11 @@ func (r *PlanResponse) FlatTables() []*TableChangeResponse {
 // plan is actionable must use this rather than counting table changes alone —
 // a VSchema-only plan has zero table changes but still requires an apply.
 func (r *PlanResponse) HasChanges() bool {
-	if len(r.FlatTables()) > 0 {
-		return true
-	}
 	for _, sc := range r.Changes {
-		if sc != nil && sc.HasVSchemaChange() {
+		if sc == nil {
+			continue
+		}
+		if len(sc.TableChanges) > 0 || sc.HasVSchemaChange() {
 			return true
 		}
 	}
