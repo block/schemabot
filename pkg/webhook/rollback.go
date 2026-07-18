@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
-	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -180,7 +179,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		return
 	}
 
-	if !rollbackPlanResponseHasChanges(planResp) {
+	if planResp == nil || !planResp.HasChanges() {
 		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
 		h.postComment(repo, pr, installationID,
 			templates.RenderRollbackNothingToDo(database, environment, applyID))
@@ -527,21 +526,6 @@ func rollbackPlanIDFromLock(lock *storage.Lock) (string, bool) {
 	}
 	planID := strings.TrimPrefix(lock.PendingPlanID, rollbackPendingPlanPrefix)
 	return planID, planID != ""
-}
-
-func rollbackPlanResponseHasChanges(resp *apitypes.PlanResponse) bool {
-	if resp == nil {
-		return false
-	}
-	for _, sc := range resp.Changes {
-		if len(sc.TableChanges) > 0 {
-			return true
-		}
-		if sc.Metadata["vschema"] != "" || sc.Metadata["vschema_changed"] == "true" {
-			return true
-		}
-	}
-	return false
 }
 
 func (h *Handler) rollbackPlanForLock(ctx context.Context, lock *storage.Lock) (*storage.Plan, error) {

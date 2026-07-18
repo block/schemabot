@@ -195,8 +195,9 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		return
 	}
 
-	// No changes — post a regular plan comment (no lock, no confirm footer)
-	if len(planResp.FlatTables()) == 0 {
+	// No changes (neither table DDL nor a VSchema update) — post a regular plan
+	// comment (no lock, no confirm footer)
+	if !planResp.HasChanges() {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 		return

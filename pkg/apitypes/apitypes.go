@@ -538,9 +538,28 @@ func (r *PlanResponse) LintErrors() []LintViolationResponse {
 func (r *PlanResponse) FlatTables() []*TableChangeResponse {
 	var tables []*TableChangeResponse
 	for _, sc := range r.Changes {
+		if sc == nil {
+			continue
+		}
 		tables = append(tables, sc.TableChanges...)
 	}
 	return tables
+}
+
+// HasChanges reports whether the plan carries any work an apply would execute:
+// table DDL in any namespace, or a VSchema update. Gates that decide whether a
+// plan is actionable must use this rather than counting table changes alone —
+// a VSchema-only plan has zero table changes but still requires an apply.
+func (r *PlanResponse) HasChanges() bool {
+	if len(r.FlatTables()) > 0 {
+		return true
+	}
+	for _, sc := range r.Changes {
+		if sc != nil && sc.HasVSchemaChange() {
+			return true
+		}
+	}
+	return false
 }
 
 // SchemaChangeResponse groups changes for a single namespace.
