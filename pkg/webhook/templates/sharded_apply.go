@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"html"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/state"
 )
@@ -48,6 +49,12 @@ type ShardedApplyData struct {
 	// vocabulary from "apply" to "rollback", matching the single-deployment
 	// comment.
 	Rollback bool
+
+	// UpdateCadence is the current spacing between automatic refreshes of this
+	// comment, shown beside the "Last updated" footer so a reader knows how long
+	// to expect between updates as the cadence slows on a long apply. Zero
+	// renders no cadence note.
+	UpdateCadence time.Duration
 }
 
 // ShardStatus is one shard's aggregate status. Emoji/Label come from the same
@@ -120,7 +127,7 @@ func RenderShardedApplyComment(data ShardedApplyData) string {
 
 	writeShardedFooter(&sb, data)
 	if !state.IsTerminalApplyState(data.State) {
-		writeLastUpdatedFooter(&sb, renderedAt)
+		writeLastUpdatedFooter(&sb, renderedAt, data.UpdateCadence)
 	}
 	return sb.String()
 }

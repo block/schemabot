@@ -78,6 +78,14 @@ type CommentObserver struct {
 	// with the known comment ID) instead of posting a duplicate.
 	pendingRotation *pendingProgressRotation
 
+	// progressCommentSince is when the live progress comment became this
+	// drive's edit target — the base age for the decayed edit cadence. Zero
+	// until the first progress tick (set to that tick's time, so a recovered
+	// drive starts back at the fastest cadence); reset when a rotation posts a
+	// fresh progress comment, since a fresh comment means someone just acted
+	// on the apply and is watching the PR again.
+	progressCommentSince time.Time
+
 	// lastWritten remembers, per GitHub comment ID, the content key
 	// (templates.CommentContentKey) of the body this observer last wrote and
 	// when it was confirmed written, so an edit whose visible content is
@@ -138,6 +146,34 @@ const (
 	// few minutes of fast identical edits per comment.
 	unchangedCommentGraceWindow = 10 * time.Minute
 )
+
+// progressEditDecayStep is one rung of the age-decayed edit cadence: while the
+// live progress comment is younger than age, edits are spaced at least
+// interval apart.
+type progressEditDecayStep struct {
+	age      time.Duration
+	interval time.Duration
+}
+
+// progressEditDecaySchedule spaces progress-comment edits further apart as the
+// live progress comment ages. A fresh apply updates every few seconds while
+// the requester is watching the PR; a copy that has been running for hours is
+// being checked occasionally, and each edit spends shared GitHub write budget
+// (one comment editing every 5s for a week is thousands of writes per day
+// against per-installation rate limits). The CLI remains the high-resolution
+// progress surface. State transitions bypass the cadence entirely, so
+// slowdowns never delay a state change reaching the PR.
+var progressEditDecaySchedule = []progressEditDecayStep{
+	{age: 10 * time.Minute, interval: activeInterval},
+	{age: time.Hour, interval: 30 * time.Second},
+	{age: 2 * time.Hour, interval: time.Minute},
+	{age: 4 * time.Hour, interval: 2 * time.Minute},
+	{age: 6 * time.Hour, interval: 5 * time.Minute},
+}
+
+// progressEditDecayMaxInterval is the edit spacing once the live progress
+// comment is older than the last schedule step.
+const progressEditDecayMaxInterval = 10 * time.Minute
 
 // CommentObserverConfig holds the parameters for creating a CommentObserver.
 type CommentObserverConfig struct {
@@ -278,7 +314,9 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	// hasCutoverComment unset so the next tick retries, instead of muting the
 	// observer for the rest of the drive over one transient GitHub error.
 	if currentState == state.Apply.CuttingOver && o.shouldDeferCutover(apply) && !o.hasCutoverComment {
-		body := o.formatStatusComment(apply, tasks)
+		// The cutover comment stays frozen until an operator triggers cutover, so
+		// it advertises no update cadence.
+		body := o.formatStatusComment(apply, tasks, 0)
 		if _, posted, _ := o.postAndTrackComment(apply, state.Comment.Cutover, body, nil); posted {
 			o.hasCutoverComment = true
 		}
@@ -300,6 +338,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	if !state.IsTerminalApplyState(apply.State) && o.rotateProgressCommentForResume(apply, tasks) {
 		o.lastState = currentState
 		o.lastProgressPost = now
+		o.progressCommentSince = now
 		o.stagnantTicks = 0
 		return
 	}
@@ -311,34 +350,34 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	if !state.IsTerminalApplyState(apply.State) && o.rotateProgressCommentForVolumeChange(apply, tasks) {
 		o.lastState = currentState
 		o.lastProgressPost = now
+		o.progressCommentSince = now
 		o.stagnantTicks = 0
 		return
 	}
 
 	// Adaptive rate limiting — ported from watchApplyProgress.
-	// Edit every 5s when progress is moving, slow to 30s when stagnant.
+	// Edits are spaced by the age-decayed cadence while progress is moving,
+	// and slowed further (never sped up) when it stagnates.
 	var totalRows int64
 	for _, t := range tasks {
 		totalRows += t.RowsCopied
 	}
 
-	interval := activeInterval
-	if o.stagnantTicks >= stagnantThresh {
-		interval = stagnantInterval
-	}
+	decayed := o.progressEditInterval(now)
 
 	if totalRows == o.lastRowsCopied && currentState == o.lastState {
 		o.stagnantTicks++
-		if o.stagnantTicks >= stagnantThresh && now.Sub(o.lastProgressPost) < stagnantInterval {
-			return // stagnant — skip edit
+		interval := decayed
+		if o.stagnantTicks >= stagnantThresh && interval < stagnantInterval {
+			interval = stagnantInterval
 		}
 		if now.Sub(o.lastProgressPost) < interval {
-			return // not time yet
+			return // stagnant — not time yet
 		}
 	} else {
 		o.stagnantTicks = 0
 		o.lastRowsCopied = totalRows
-		if now.Sub(o.lastProgressPost) < activeInterval && currentState == o.lastState {
+		if now.Sub(o.lastProgressPost) < decayed && currentState == o.lastState {
 			return // active but not time yet (unless state changed)
 		}
 	}
@@ -346,9 +385,36 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	o.lastState = currentState
 	o.lastProgressPost = now
 
-	// Edit the progress comment
-	body := o.formatStatusComment(apply, tasks)
+	// Edit the progress comment, advertising the cadence that spaced this edit
+	// so the rendered footer matches the refresh rate the reader will observe.
+	body := o.formatStatusComment(apply, tasks, decayed)
 	o.editTrackedComment(apply, state.Comment.Progress, body)
+}
+
+// progressEditInterval returns the minimum spacing between progress-comment
+// edits per progressEditDecaySchedule, keyed to the age of the live progress
+// comment rather than the apply: a rotation posts a fresh comment because
+// someone just acted on the apply, so the new comment starts back at the
+// fastest cadence. Called with o.mu held; the first call anchors the age to
+// its own tick time.
+func (o *CommentObserver) progressEditInterval(now time.Time) time.Duration {
+	if o.progressCommentSince.IsZero() {
+		o.progressCommentSince = now
+	}
+	age := now.Sub(o.progressCommentSince)
+	for _, step := range progressEditDecaySchedule {
+		if age < step.age {
+			return step.interval
+		}
+	}
+	return progressEditDecayMaxInterval
+}
+
+// freshProgressCadence is the update cadence advertised on a newly posted
+// progress comment. A rotation resets the comment-age anchor, so the fresh
+// comment starts back at the fastest rung of the decay schedule.
+func (o *CommentObserver) freshProgressCadence() time.Duration {
+	return activeInterval
 }
 
 // OnTerminal is called when the apply reaches a terminal state.
@@ -393,7 +459,7 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		// This is the per-operation status freeze, not the apply-level summary, so
 		// it always runs; the aggregate publisher re-edits it with the full task
 		// set for multi-operation applies.
-		finalBody := o.statusCommentFromOps(apply, ops, opsErr, tasks, shardsByTable)
+		finalBody := o.statusCommentFromOps(apply, ops, opsErr, tasks, shardsByTable, 0)
 		o.editTrackedComment(apply, activeCommentState, finalBody)
 
 		// Post a separate summary comment. A new comment is more reliable than
@@ -456,11 +522,11 @@ func (o *CommentObserver) shouldPublishSeparateSummary(apply *storage.Apply, ops
 // single-deployment layout byte-for-byte. A load failure falls back to the
 // single-deployment layout so a transient storage error never blocks a comment
 // update.
-func (o *CommentObserver) formatStatusComment(apply *storage.Apply, tasks []*storage.Task) string {
+func (o *CommentObserver) formatStatusComment(apply *storage.Apply, tasks []*storage.Task, updateCadence time.Duration) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	ops, err := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
-	return o.statusCommentFromOps(apply, ops, err, tasks, o.shardsByTable(ctx, apply, ops))
+	return o.statusCommentFromOps(apply, ops, err, tasks, o.shardsByTable(ctx, apply, ops), updateCadence)
 }
 
 // shardsByTable loads an apply's per-shard detail rows and groups them by table
@@ -497,13 +563,13 @@ func (o *CommentObserver) shardsByTable(ctx context.Context, apply *storage.Appl
 // rows, applying the same single-deployment fallback as formatStatusComment when
 // the load failed. Callers that already hold the operation set (e.g. OnTerminal)
 // use this to avoid re-reading apply_operations.
-func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
+func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task, updateCadence time.Duration) string {
 	if opsErr != nil {
 		o.logger.Error("observer: failed to load apply operations for comment dispatch; rendering single-deployment layout",
 			"apply_id", o.applyID, "error", opsErr)
-		return formatProgressComment(apply, tasks, shardsByTable, o.tenant)
+		return formatProgressComment(apply, tasks, shardsByTable, o.tenant, updateCadence)
 	}
-	return formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant)
+	return formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant, updateCadence)
 }
 
 // resolveDisplay projects the apply's per-operation engine display state (VSchema
@@ -776,7 +842,7 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 		pendingFreeze = &tracked.GitHubCommentID
 	}
 
-	body := o.formatStatusComment(apply, tasks)
+	body := o.formatStatusComment(apply, tasks, o.freshProgressCadence())
 	newCommentID, posted, trackedNew := o.postAndTrackComment(apply, state.Comment.Progress, body, pendingFreeze)
 	if !posted {
 		// postAndTrackComment logged the failure. The summary marker is left in
@@ -935,7 +1001,7 @@ func (o *CommentObserver) rotateProgressCommentForVolumeChange(apply *storage.Ap
 		return false
 	}
 
-	body := o.formatStatusComment(apply, tasks)
+	body := o.formatStatusComment(apply, tasks, o.freshProgressCadence())
 	newCommentID, posted, trackedNew := o.postAndTrackComment(apply, state.Comment.Progress, body, &tracked.GitHubCommentID)
 	if !posted {
 		// postAndTrackComment logged the failure; the level mismatch persists,

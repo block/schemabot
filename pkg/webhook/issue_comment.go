@@ -573,7 +573,7 @@ func (h *Handler) postInitialProgressComment(ctx context.Context, repo string, p
 			append(apply.LogAttrs(), "error", err)...)
 		return
 	}
-	finalBody := formatProgressComment(apply, nil, nil, h.deploymentTenant())
+	finalBody := formatProgressComment(apply, nil, nil, h.deploymentTenant(), 0)
 	if err := client.EditIssueComment(ctx, repo, comment.GitHubCommentID, h.renderPRComment(finalBody)); err != nil {
 		h.logger.Error("failed to finalize progress comment for already-terminal apply",
 			append(apply.LogAttrs(), "github_comment_id", comment.GitHubCommentID, "error", err)...)

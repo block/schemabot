@@ -1723,7 +1723,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		pending := *apply
 		pending.State = state.Apply.Pending
 		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply,
-			formatProgressComment(&pending, nil, nil, ""))
+			formatProgressComment(&pending, nil, nil, "", 0))
 
 		var created commentCreate
 		select {
@@ -1761,7 +1761,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		require.NoError(t, st.ApplyComments().IncrementEditCount(ctx, apply.ID, state.Comment.Progress))
 
 		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply,
-			formatProgressComment(apply, nil, nil, ""))
+			formatProgressComment(apply, nil, nil, "", 0))
 
 		select {
 		case <-capture.creates:
@@ -1782,7 +1782,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		h, capture := newHandler(t)
 
 		h.postInitialProgressComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply,
-			formatProgressComment(apply, nil, nil, ""))
+			formatProgressComment(apply, nil, nil, "", 0))
 
 		select {
 		case <-capture.creates:
@@ -1908,13 +1908,13 @@ func TestE2EStagnantApplyHeartbeatRefreshesComment(t *testing.T) {
 
 	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
 		repo:       "org/repo-heartbeat",
-		pr:         144,
+		pr:         147,
 		database:   "e2e_heartbeat_db",
 		applyState: state.Apply.Running,
 	})
 	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
 
-	h.postAndTrackComment(ctx, "org/repo-heartbeat", 144, 12345, apply, state.Comment.Progress, "initial progress")
+	h.postAndTrackComment(ctx, "org/repo-heartbeat", 147, 12345, apply, state.Comment.Progress, "initial progress")
 	progressID := requireCommentCreate(t, capture)
 
 	fake := clock.NewFake(task.CreatedAt)
@@ -1956,4 +1956,182 @@ func TestE2EStagnantApplyHeartbeatRefreshesComment(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, prog)
 	assert.Equal(t, 2, prog.EditCount)
+}
+
+// A progress comment that has been live for hours no longer needs
+// second-resolution updates: nobody watches a PR comment continuously for a
+// day, every edit spends the installation's shared GitHub write budget, and
+// the CLI is the high-resolution progress surface. The edit cadence therefore
+// decays with the age of the live progress comment — an old apply's rows can
+// advance on every tick and still reach GitHub only a few times per hour —
+// while a state change always publishes immediately, regardless of age.
+func TestE2EProgressEditCadenceDecaysWithCommentAge(t *testing.T) {
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-decay",
+		pr:         144,
+		database:   "e2e_decay_db",
+		applyState: state.Apply.Running,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(t.Context(), "org/repo-decay", 144, 12345, apply, state.Comment.Progress, "initial progress")
+	progressID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The first tick anchors the comment's age and edits. The rendered footer
+	// advertises the fastest rung so a reader knows the expected refresh rate.
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, progressID, edited.CommentID)
+		assert.Contains(t, edited.Body, "updates every ~5s")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the first tick to edit the progress comment")
+	}
+
+	// Over an hour in, the cadence has decayed: row-copy progress alone no
+	// longer reaches GitHub every few seconds, and the footer advertises the
+	// slower rung so the wider gap reads as designed rather than as a stall.
+	fake.Advance(61 * time.Minute)
+	task.RowsCopied = 600
+	task.ProgressPercent = 60
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Contains(t, edited.Body, "60%")
+		assert.Contains(t, edited.Body, "updates every ~1m")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an edit after a long-overdue interval")
+	}
+
+	fake.Advance(31 * time.Second)
+	task.RowsCopied = 650
+	task.ProgressPercent = 65
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		t.Fatalf("an hour-old comment must not edit again after 31s; got %q", edited.Body)
+	default:
+		// expected: the decayed cadence spaces edits minutes apart
+	}
+
+	// Once the decayed interval elapses, progress reaches GitHub again.
+	fake.Advance(time.Minute)
+	task.RowsCopied = 700
+	task.ProgressPercent = 70
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Contains(t, edited.Body, "70%")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an edit once the decayed interval elapsed")
+	}
+
+	// Hours deeper in, the cadence has decayed further: the same spacing that
+	// published above is no longer enough.
+	fake.Advance(4 * time.Hour)
+	task.RowsCopied = 750
+	task.ProgressPercent = 75
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Contains(t, edited.Body, "75%")
+		assert.Contains(t, edited.Body, "updates every ~5m")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an edit after hours without one")
+	}
+
+	fake.Advance(2 * time.Minute)
+	task.RowsCopied = 800
+	task.ProgressPercent = 80
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		t.Fatalf("a comment hours old must space edits further apart than minutes; got %q", edited.Body)
+	default:
+		// expected: deeper rungs of the schedule space edits further apart
+	}
+
+	fake.Advance(5 * time.Minute)
+	task.RowsCopied = 850
+	task.ProgressPercent = 85
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Contains(t, edited.Body, "85%")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an edit once the deeper decayed interval elapsed")
+	}
+
+	// A state change bypasses the cadence entirely: it publishes one second
+	// after the previous edit even on an hours-old comment.
+	fake.Advance(time.Second)
+	apply.State = state.Apply.WaitingForCutover
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, progressID, edited.CommentID)
+		assert.Contains(t, edited.Body, "Waiting for Cutover")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a state change to edit immediately")
+	}
+}
+
+// A rotation posts a fresh progress comment because someone just acted on the
+// apply (a resume after a stop, a volume change) and is watching the PR again,
+// so the fresh comment starts back at the fastest cadence even when the apply
+// itself has been running for hours.
+func TestE2EProgressRotationRestoresFastCadence(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-decay-rotate",
+		pr:         145,
+		database:   "e2e_decay_rotate_db",
+		applyState: state.Apply.Resuming,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	// Seed the pre-resume comments left by the stop: the progress comment
+	// frozen at "Stopped" and the stopped summary marker.
+	h.postAndTrackComment(ctx, "org/repo-decay-rotate", 145, 12345, apply, state.Comment.Progress, "Stopped at 21%")
+	requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-decay-rotate", 145, 12345, apply, state.Comment.Summary, "Schema Change Stopped")
+	requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The apply has been running long enough for the cadence to decay fully.
+	obs.progressCommentSince = task.CreatedAt
+	fake.Advance(7 * time.Hour)
+
+	// The resume tick rotates: a fresh progress comment is posted and the old
+	// one is frozen.
+	obs.OnProgress(apply, []*storage.Task{task})
+	newProgressID := requireCommentCreate(t, capture)
+	select {
+	case <-capture.edits: // the freeze edit on the superseded comment
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the superseded progress comment to be frozen")
+	}
+
+	// Six seconds later, real progress on the fresh comment publishes at the
+	// fastest cadence; the pre-rotation age no longer applies.
+	apply.State = state.Apply.Running
+	fake.Advance(6 * time.Second)
+	task.RowsCopied = 700
+	task.ProgressPercent = 70
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, newProgressID, edited.CommentID)
+		assert.Contains(t, edited.Body, "70%")
+		assert.Contains(t, edited.Body, "updates every ~5s",
+			"the fresh comment advertises the fastest rung again")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the fresh comment to edit at the fastest cadence")
+	}
 }

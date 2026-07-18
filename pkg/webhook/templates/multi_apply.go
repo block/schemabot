@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"html"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
@@ -52,6 +53,12 @@ type MultiDeploymentApplyData struct {
 	// headline vocabulary from "apply" to "rollback", matching the
 	// single-deployment comment.
 	Rollback bool
+
+	// UpdateCadence is the current spacing between automatic refreshes of this
+	// comment, shown beside the "Last updated" footer so a reader knows how long
+	// to expect between updates as the cadence slows on a long apply. Zero
+	// renders no cadence note.
+	UpdateCadence time.Duration
 }
 
 // RenderMultiDeploymentApplyComment renders the PR comment for an apply that
@@ -82,7 +89,7 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 	// Expandable per-deployment detail, in resolved order.
 	writeDeploymentSections(&sb, data, renderedAt)
 	if !state.IsTerminalApplyState(data.Model.State) {
-		writeLastUpdatedFooter(&sb, renderedAt)
+		writeLastUpdatedFooter(&sb, renderedAt, data.UpdateCadence)
 	}
 
 	return sb.String()

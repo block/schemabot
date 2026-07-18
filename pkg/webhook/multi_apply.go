@@ -37,17 +37,26 @@ func releasedForApply(ctx context.Context, stor storage.Storage, apply *storage.
 // ops must be in resolved deployment order (as returned by
 // ApplyOperations().ListByApply); tasks are the apply's tasks across all
 // deployments, regrouped per operation for the multi-deployment layout.
-func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, tenant string) string {
+// updateCadence is the current spacing between automatic refreshes of the
+// comment, rendered beside the "Last updated" footer; zero renders no cadence
+// note (terminal finalizations).
+func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, tenant string, updateCadence time.Duration) string {
 	// A sharded apply fans out across the shards of one keyspace within a single
 	// deployment, so it gets the shard-unit layout rather than the deployment-unit
 	// one — its operations differ by shard, not deployment.
 	if isShardedApply(ops) {
-		return templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, released, tasks, tenant))
+		data := buildShardedApplyData(apply, ops, released, tasks, tenant)
+		data.UpdateCadence = updateCadence
+		return templates.RenderShardedApplyComment(data)
 	}
 	if len(ops) <= 1 {
-		return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks, singleOpDisplay(ops, displayByOp), shardsByTable, tenant))
+		data := buildApplyCommentData(apply, tasks, singleOpDisplay(ops, displayByOp), shardsByTable, tenant)
+		data.UpdateCadence = updateCadence
+		return templates.RenderApplyStatusComment(data)
 	}
-	return templates.RenderMultiDeploymentApplyComment(buildMultiApplyData(apply, ops, released, tasks, displayByOp, shardsByTable, tenant))
+	data := buildMultiApplyData(apply, ops, released, tasks, displayByOp, shardsByTable, tenant)
+	data.UpdateCadence = updateCadence
+	return templates.RenderMultiDeploymentApplyComment(data)
 }
 
 // formatApplySummaryComment renders the terminal summary PR comment for an apply,
