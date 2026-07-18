@@ -500,13 +500,18 @@ func (e *Engine) waitForBranchReady(ctx context.Context, client psclient.PSClien
 	}
 }
 
-func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClient, org, database, branchName, intoBranch string, autoCutover, autoDeleteBranch bool) (*ps.DeployRequest, error) {
+func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClient, org, database, branchName, intoBranch string, autoDeleteBranch bool) (*ps.DeployRequest, error) {
+	// AutoCutover stays off so SchemaBot is the sole cutover actor: the deploy
+	// request parks at pending_cutover and the drive completes it via Cutover
+	// (or an operator does, when cutover is deferred). Letting PlanetScale cut
+	// over on its own would race the drive's cutover call and move the schema
+	// without SchemaBot's involvement or caller attribution.
 	return client.CreateDeployRequest(ctx, &ps.CreateDeployRequestRequest{
 		Organization:     org,
 		Database:         database,
 		Branch:           branchName,
 		IntoBranch:       intoBranch,
-		AutoCutover:      autoCutover,
+		AutoCutover:      false,
 		AutoDeleteBranch: autoDeleteBranch,
 	})
 }

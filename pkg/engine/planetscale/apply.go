@@ -276,7 +276,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// request transitions from "pending" to "ready" (or "no_changes"/"error").
 	drStart := time.Now()
 	autoDeleteBranch := existingBranch == "" // don't delete reused branches
-	dr, err := e.createDeployRequest(ctx, client, org, req.Database, branchName, main, !deferCutover, autoDeleteBranch)
+	dr, err := e.createDeployRequest(ctx, client, org, req.Database, branchName, main, autoDeleteBranch)
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request: %w", err)
 	}
@@ -789,10 +789,9 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 
 	// Create deploy request
 	main := mainBranch(req.Credentials)
-	deferCutover := req.Options["defer_cutover"] == "true"
 	deferDeploy := req.Options["defer_deploy"] == "true"
 
-	dr, err := e.createDeployRequest(ctx, client, org, req.Database, meta.BranchName, main, !deferCutover, true)
+	dr, err := e.createDeployRequest(ctx, client, org, req.Database, meta.BranchName, main, true)
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request on resume: %w", err)
 	}
