@@ -128,6 +128,7 @@ func TestPSDisplayMetadataStorageBlobRoundTrip(t *testing.T) {
 		"branch_name":                      "schemabot-db-7",
 		"deploy_request_url":               "https://app.planetscale.com/org/db/deploy-requests/106",
 		"is_instant":                       "true",
+		"revert_expires_at":                "2026-06-29T18:30:00Z",
 		apitypes.VSchemaChangesMetadataKey: encodedVSchema,
 	}
 
@@ -140,12 +141,39 @@ func TestPSDisplayMetadataStorageBlobRoundTrip(t *testing.T) {
 	assert.Equal(t, "https://app.planetscale.com/org/db/deploy-requests/106", got["deploy_request_url"])
 	assert.Equal(t, "schemabot-db-7", got["branch_name"])
 	assert.Equal(t, "true", got["is_instant"])
+	assert.Equal(t, "2026-06-29T18:30:00Z", got["revert_expires_at"])
 
 	changes, err := apitypes.ParseVSchemaChanges(got)
 	require.NoError(t, err)
 	require.Len(t, changes, 1)
 	assert.Equal(t, "commerce_sharded", changes[0].Namespace)
 	assert.Equal(t, "applied", changes[0].Status)
+}
+
+// The revert-window deadline alone is worth storing: during the revert window a
+// remote apply's progress response may carry only revert_expires_at as display
+// state, and the PR comment needs it to render the countdown.
+func TestPSDisplayMetadataStorageBlobRevertExpiresOnly(t *testing.T) {
+	blob, err := PSDisplayMetadataStorageBlob(map[string]string{
+		"revert_expires_at": "2026-06-29T18:30:00Z",
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, blob)
+
+	got, err := PSDisplayMetadata(blob)
+	require.NoError(t, err)
+	assert.Equal(t, "2026-06-29T18:30:00Z", got["revert_expires_at"])
+}
+
+// A malformed revert-window deadline is surfaced as an error rather than being
+// silently dropped or stored corrupt, so the mirror logs it and retries on the
+// next poll with the rest of the display state intact.
+func TestPSDisplayMetadataStorageBlobBadRevertExpires(t *testing.T) {
+	_, err := PSDisplayMetadataStorageBlob(map[string]string{
+		"deploy_request_url": "https://app.planetscale.com/org/db/deploy-requests/106",
+		"revert_expires_at":  "not-a-timestamp",
+	})
+	require.ErrorContains(t, err, "revert_expires_at")
 }
 
 // A display map with nothing worth storing yields an empty blob, so the caller

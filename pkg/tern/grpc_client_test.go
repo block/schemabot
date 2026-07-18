@@ -951,6 +951,7 @@ func TestGRPCClientMirrorsRemoteDisplayMetadata(t *testing.T) {
 	display := map[string]string{
 		"deploy_request_url": "https://app.planetscale.com/org/db/deploy-requests/106",
 		"branch_name":        "schemabot-db",
+		"revert_expires_at":  "2026-06-29T18:30:00Z",
 	}
 
 	t.Run("multi-operation preserves the remote-apply-id context", func(t *testing.T) {
@@ -967,6 +968,7 @@ func TestGRPCClientMirrorsRemoteDisplayMetadata(t *testing.T) {
 		got, err := PSDisplayMetadata(ops.ops[7].EngineResumeMetadata)
 		require.NoError(t, err)
 		assert.Equal(t, "https://app.planetscale.com/org/db/deploy-requests/106", got["deploy_request_url"])
+		assert.Equal(t, "2026-06-29T18:30:00Z", got["revert_expires_at"], "the revert-window deadline must survive the mirror so the PR comment can show the countdown")
 		assert.Equal(t, "remote-apply-xyz", ops.ops[7].EngineResumeContext, "the remote apply id must survive the display-metadata write")
 
 		// A second poll with the same metadata skips the redundant write.

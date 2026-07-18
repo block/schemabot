@@ -651,7 +651,7 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 
 	case state.Task.Completed:
 		bar := ui.ProgressBarComplete()
-		fmt.Fprintf(sb, "**`%s`**: %s \u2713 Complete\n", table.TableName, bar)
+		fmt.Fprintf(sb, "**`%s`**: %s \u2705 Complete\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Checksumming:
@@ -716,7 +716,7 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 
 	case state.Task.RevertWindow:
 		bar := ui.ProgressBarWaitingCutover()
-		fmt.Fprintf(sb, "**`%s`**: %s \u2713 Complete (pending revert)\n", table.TableName, bar)
+		fmt.Fprintf(sb, "**`%s`**: %s \u2705 Complete (pending revert)\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Reverting:

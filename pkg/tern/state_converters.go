@@ -403,13 +403,14 @@ func PSDisplayMetadata(resumeStateMetadata string) (map[string]string, error) {
 
 // PSDisplayMetadataStorageBlob converts a progress response's display
 // metadata — the map a data-plane progress poll returns (deploy_request_url, the
-// encoded VSchema status, instant/deferred flags) — back into the stored
-// psMetadataForStorage JSON that the PR comment's display projection
-// (resolveDisplayByOperation → PSDisplayMetadata) reads. For a remote (gRPC)
-// apply the engine runs in the data plane, so its resume metadata never lands on
-// the control-plane operation; mirroring these display fields is how the comment
-// surfaces the deploy-request link and VSchema status. Returns "" when there is
-// nothing worth storing, so callers leave the operation's metadata untouched.
+// encoded VSchema status, instant/deferred flags, the revert-window deadline) —
+// back into the stored psMetadataForStorage JSON that the PR comment's display
+// projection (resolveDisplayByOperation → PSDisplayMetadata) reads. For a remote
+// (gRPC) apply the engine runs in the data plane, so its resume metadata never
+// lands on the control-plane operation; mirroring these display fields is how
+// the comment surfaces the deploy-request link, VSchema status, and revert-window
+// countdown. Returns "" when there is nothing worth storing, so callers leave
+// the operation's metadata untouched.
 func PSDisplayMetadataStorageBlob(md map[string]string) (string, error) {
 	if len(md) == 0 {
 		return "", nil
@@ -419,6 +420,13 @@ func PSDisplayMetadataStorageBlob(md map[string]string) (string, error) {
 		DeployRequestURL: md["deploy_request_url"],
 		IsInstant:        md["is_instant"] == "true",
 		DeferredDeploy:   md["deferred_deploy"] == "true",
+	}
+	if raw := md["revert_expires_at"]; raw != "" {
+		expires, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return "", fmt.Errorf("parse revert_expires_at %q from display metadata: %w", raw, err)
+		}
+		m.RevertExpiresAt = &expires
 	}
 	changes, err := apitypes.ParseVSchemaChanges(md)
 	if err != nil {
@@ -430,7 +438,7 @@ func PSDisplayMetadataStorageBlob(md map[string]string) (string, error) {
 		}
 		m.VSchemaDiffs = append(m.VSchemaDiffs, vschemaKeyspaceDiff{Namespace: ch.Namespace, Diff: ch.Diff})
 	}
-	if m.DeployRequestURL == "" && m.BranchName == "" && !m.IsInstant && !m.DeferredDeploy && len(m.VSchemaDiffs) == 0 {
+	if m.DeployRequestURL == "" && m.BranchName == "" && !m.IsInstant && !m.DeferredDeploy && len(m.VSchemaDiffs) == 0 && m.RevertExpiresAt == nil {
 		return "", nil
 	}
 	encoded, err := json.Marshal(m)
