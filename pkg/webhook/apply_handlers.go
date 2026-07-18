@@ -163,7 +163,8 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	if prErr != nil {
 		h.logger.Error("failed to fetch PR for stale-schema check",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", prErr)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to verify PR HEAD before apply: "+prErr.Error())
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+			"SchemaBot could not verify the current PR state. The apply was rejected; retry the command.")
 		return
 	}
 	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, prInfo.HeadSHA, environment, requestedBy, action.Apply); rejected {

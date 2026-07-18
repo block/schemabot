@@ -1470,10 +1470,10 @@ func TestE2EApplyStaleBaseSchemaOutranksUnsafePrompt(t *testing.T) {
 	// The live target already carries the column the newer base commit added.
 	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
 	require.NoError(t, err)
+	defer utils.CloseAndLog(targetDB)
 	_, err = targetDB.ExecContext(t.Context(),
 		"CREATE TABLE `"+dbName+"`.`users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err)
-	_ = targetDB.Close()
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -1543,7 +1543,7 @@ func TestE2EApplyConfirmStaleBaseSchemaAtFinalGateOutranksUnsafePrompt(t *testin
 		PendingPlanID: pendingPlanID,
 	}))
 	t.Cleanup(func() {
-		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+		_ = svc.Storage().Locks().ForceRelease(t.Context(), dbName, "mysql")
 	})
 
 	// The confirmation plan the user reviewed, rendered at the current HEAD so
@@ -1567,10 +1567,10 @@ func TestE2EApplyConfirmStaleBaseSchemaAtFinalGateOutranksUnsafePrompt(t *testin
 	// so the re-plan from the stale snapshot emits a destructive DROP COLUMN.
 	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
 	require.NoError(t, err)
+	defer utils.CloseAndLog(targetDB)
 	_, err = targetDB.ExecContext(t.Context(),
 		"CREATE TABLE `"+dbName+"`.`users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err)
-	_ = targetDB.Close()
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
