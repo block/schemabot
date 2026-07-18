@@ -234,12 +234,13 @@ func TestAggregateShardProgress_ETAEstimate(t *testing.T) {
 		assert.Zero(t, tables[0].ETASeconds)
 	})
 
-	t.Run("no estimate once a shard is done copying", func(t *testing.T) {
-		// ready_to_complete and complete shards are past the copy phase; a
-		// fabricated ETA there would contradict the rendered 100% state.
+	t.Run("no ETA once a shard is done copying", func(t *testing.T) {
+		// ready_to_complete and complete shards are past the copy phase; any
+		// ETA there — estimated or a stale provider value — would contradict
+		// the rendered 100% state.
 		rows := []vitessMigrationRow{
 			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "running",
-				ReadyToComplete: true, ETASeconds: -1, RowsCopied: 99_000_000, TableRows: 100_000_000, Progress: 99, StartedAt: &started},
+				ReadyToComplete: true, ETASeconds: 37, RowsCopied: 99_000_000, TableRows: 100_000_000, Progress: 99, StartedAt: &started},
 			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "complete",
 				ETASeconds: -1, RowsCopied: 100_000_000, TableRows: 100_000_000, Progress: 100, StartedAt: &started},
 		}
@@ -249,6 +250,23 @@ func TestAggregateShardProgress_ETAEstimate(t *testing.T) {
 		assert.Zero(t, tables[0].ETASeconds)
 		assert.Zero(t, tables[0].Shards[0].ETASeconds)
 		assert.Zero(t, tables[0].Shards[1].ETASeconds)
+	})
+
+	t.Run("stale ETA on a finished shard does not inflate the table ETA", func(t *testing.T) {
+		// The copying shard's estimate defines the table ETA even when a
+		// finished sibling still carries a larger provider-reported value.
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "running",
+				ReadyToComplete: true, ETASeconds: 5000, RowsCopied: 100_000_000, TableRows: 100_000_000, Progress: 100, StartedAt: &started},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "running",
+				ETASeconds: -1, RowsCopied: 50_000_000, TableRows: 100_000_000, Progress: 50, StartedAt: &started},
+		}
+
+		tables, _ := aggregateShardProgress(rows, now)
+		require.Len(t, tables, 1)
+		assert.Equal(t, int64(600), tables[0].ETASeconds)
+		assert.Zero(t, tables[0].Shards[0].ETASeconds)
+		assert.Equal(t, int64(600), tables[0].Shards[1].ETASeconds)
 	})
 }
 

@@ -791,12 +791,18 @@ func aggregateShardProgress(rows []vitessMigrationRow, now time.Time) ([]engine.
 				shardState = state.Vitess.ReadyToComplete
 			}
 
-			// Prefer the provider-reported ETA, normalizing its -1 "unknown"
-			// sentinel to 0; while it is unknown for a shard that is still
-			// copying, estimate one from the copy rate so far.
-			shardETA := max(sh.etaSeconds, 0)
-			if shardETA == 0 && shardState == state.Vitess.Running {
-				shardETA = estimateETASeconds(sh.startedAt, now, sh.rowsCopied, sh.tableRows)
+			// A copy ETA is only meaningful while a shard is still copying:
+			// after ready_to_complete/complete the copy is done (any reported
+			// value is stale), and queued/failed shards have no copy to
+			// project. For a copying shard, prefer the provider-reported ETA,
+			// normalizing its -1 "unknown" sentinel to 0; while it is unknown,
+			// estimate one from the copy rate so far.
+			var shardETA int64
+			if shardState == state.Vitess.Running {
+				shardETA = max(sh.etaSeconds, 0)
+				if shardETA == 0 {
+					shardETA = estimateETASeconds(sh.startedAt, now, sh.rowsCopied, sh.tableRows)
+				}
 			}
 			if shardETA > maxETA {
 				maxETA = shardETA
