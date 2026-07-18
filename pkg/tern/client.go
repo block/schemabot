@@ -18,6 +18,15 @@ import (
 // callers can match it with errors.Is regardless of the transport.
 var ErrNoTasksForApplyOperation = errors.New("no tasks found for apply operation")
 
+// ErrApplyLeasePresumedLost is returned by a drive whose lease heartbeat
+// writes have been failing for the full storage.ApplyLeaseStaleAfter window.
+// The lease was never definitively reported lost — storage was unreachable —
+// but the row's heartbeat is now stale enough for a peer driver to reclaim
+// it, so the current owner must stop driving. Callers match it with errors.Is
+// to record the displacement once and release the claim without treating it
+// as an engine failure.
+var ErrApplyLeasePresumedLost = errors.New("apply lease presumed lost after heartbeat failures spanning the staleness window")
+
 // ErrApplyOperationRowMissing is returned by ResumeApplyOperation when tasks
 // scope to the operation but the apply_operation row itself is absent. It is a
 // distinct, more accurate cause than the no-tasks case, but wraps

@@ -1209,6 +1209,21 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 			s.failClaimedApplyAfterDrivePanic(ctx, driverID, apply, applyOperationID, deployment, drivePanic)
 			return false, err
 		}
+		if errors.Is(err, tern.ErrApplyLeasePresumedLost) {
+			s.logger.Warn("operator: apply lease presumed lost after heartbeat failures spanning the staleness window; driver will stop writing this apply and a peer will reclaim it",
+				"driver", driverID,
+				"lease_owner", lease.Owner,
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"deployment", deployment,
+				"environment", apply.Environment,
+				"error", err)
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "lease_presumed_lost")
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+			}
+			return false, err
+		}
 		if errors.Is(err, storage.ErrApplyLeaseLost) {
 			s.logger.Warn("operator: apply lease was lost; driver will stop writing this apply",
 				"driver", driverID,

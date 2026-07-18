@@ -2627,11 +2627,12 @@ func (c *GRPCClient) heartbeatScopedDrive(ctx context.Context, apply *storage.Ap
 // It returns a non-nil error when the drive must end: either storage reported
 // the lease definitively lost, or heartbeat failures have persisted since
 // lastSuccess for the full lease staleness window, so a peer driver can
-// already have reclaimed the stale row. A transient failure inside the window
-// returns nil so the drive keeps polling and the heartbeat is retried on the
-// next tick. The remote Tern keeps executing either way; the next claimant
-// reattaches to it.
-func driveEndingHeartbeatFailure(ctx context.Context, apply *storage.Apply, hbErr error, lastSuccess time.Time) error {
+// already have reclaimed the stale row — that case wraps
+// ErrApplyLeasePresumedLost so the operator records the displacement exactly
+// once. A transient failure inside the window returns nil so the drive keeps
+// polling and the heartbeat is retried on the next tick. The remote Tern keeps
+// executing either way; the next claimant reattaches to it.
+func driveEndingHeartbeatFailure(apply *storage.Apply, hbErr error, lastSuccess time.Time) error {
 	if errors.Is(hbErr, storage.ErrApplyLeaseLost) {
 		slog.Warn("gRPC drive heartbeat lost the lease; current owner will stop driving and writing apply state",
 			append(apply.LogAttrs(), "error", hbErr)...)
@@ -2640,9 +2641,8 @@ func driveEndingHeartbeatFailure(ctx context.Context, apply *storage.Apply, hbEr
 	if time.Since(lastSuccess) >= storage.ApplyLeaseStaleAfter {
 		slog.Warn("gRPC drive heartbeat has failed for the full lease staleness window; a peer driver can reclaim the work, so this owner will stop driving and writing apply state",
 			append(apply.LogAttrs(), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
-		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, "lease_presumed_lost")
-		return fmt.Errorf("heartbeat gRPC apply %s: lease presumed lost after heartbeat failures since %s: %w",
-			apply.ApplyIdentifier, lastSuccess.UTC().Format(time.RFC3339), hbErr)
+		return fmt.Errorf("heartbeat gRPC apply %s: %w (heartbeats failing since %s): %w",
+			apply.ApplyIdentifier, ErrApplyLeasePresumedLost, lastSuccess.UTC().Format(time.RFC3339), hbErr)
 	}
 	slog.Warn("gRPC drive heartbeat failed; will retry",
 		append(apply.LogAttrs(), "error", hbErr)...)
@@ -3290,7 +3290,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				// fallout, not lease trouble.
 				return ctx.Err()
 			}
-			if stopErr := driveEndingHeartbeatFailure(ctx, apply, err, lastHeartbeatSuccess); stopErr != nil {
+			if stopErr := driveEndingHeartbeatFailure(apply, err, lastHeartbeatSuccess); stopErr != nil {
 				return stopErr
 			}
 		case <-ticker.C:

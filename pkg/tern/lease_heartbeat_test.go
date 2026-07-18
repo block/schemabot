@@ -92,23 +92,24 @@ func TestDriveEndingHeartbeatFailure(t *testing.T) {
 
 	t.Run("lost lease ends the drive immediately", func(t *testing.T) {
 		hbErr := fmt.Errorf("heartbeat apply %d: %w", apply.ID, storage.ErrApplyLeaseLost)
-		stopErr := driveEndingHeartbeatFailure(t.Context(), apply, hbErr, time.Now())
+		stopErr := driveEndingHeartbeatFailure(apply, hbErr, time.Now())
 		require.Error(t, stopErr)
 		assert.ErrorIs(t, stopErr, storage.ErrApplyLeaseLost)
 	})
 
 	t.Run("transient failure inside the window keeps driving", func(t *testing.T) {
 		hbErr := errors.New("connection refused")
-		assert.NoError(t, driveEndingHeartbeatFailure(t.Context(), apply, hbErr, time.Now()))
+		assert.NoError(t, driveEndingHeartbeatFailure(apply, hbErr, time.Now()))
 	})
 
 	t.Run("failures spanning the staleness window end the drive", func(t *testing.T) {
 		hbErr := errors.New("connection refused")
 		lastSuccess := time.Now().Add(-storage.ApplyLeaseStaleAfter)
-		stopErr := driveEndingHeartbeatFailure(t.Context(), apply, hbErr, lastSuccess)
+		stopErr := driveEndingHeartbeatFailure(apply, hbErr, lastSuccess)
 		require.Error(t, stopErr)
 		assert.ErrorIs(t, stopErr, hbErr)
-		assert.Contains(t, stopErr.Error(), "lease presumed lost")
+		assert.ErrorIs(t, stopErr, ErrApplyLeasePresumedLost,
+			"the presumed-lost sentinel must survive wrapping so the operator can classify the displacement")
 	})
 }
 
