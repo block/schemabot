@@ -715,8 +715,10 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.RevertWindow:
+		// Deliberately no checkmark: the change is applied but not final while
+		// the revert window is open, and a checkmark reads as "done, walk away".
 		bar := ui.ProgressBarWaitingCutover()
-		fmt.Fprintf(sb, "**`%s`**: %s \u2705 Complete (pending revert)\n", table.TableName, bar)
+		fmt.Fprintf(sb, "**`%s`**: %s Complete (revert window open)\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Reverting:
