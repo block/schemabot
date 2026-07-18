@@ -54,8 +54,8 @@ func TestDrainInProcessWebhookWorkWaitsForGoroutines(t *testing.T) {
 }
 
 // Nested goSafe work (for example issue_comment fanning out per participant)
-// spawned before the drain begins must also be waited for: the child registers
-// on the WaitGroup while draining is still false, so the drain sees it too.
+// spawned before the drain begins must also be waited for: the child is counted
+// while draining is still false, so the drain sees it too.
 func TestDrainInProcessWebhookWorkWaitsForNestedGoroutines(t *testing.T) {
 	h := &Handler{logger: testLogger()}
 
@@ -121,15 +121,16 @@ func TestDrainInProcessWebhookWorkTimesOut(t *testing.T) {
 		require.FailNow(t, "DrainInProcessWebhookWork did not return after its context deadline")
 	}
 
-	// Release the straggler and wait so the test leaves no goroutine behind.
+	// Release the straggler and drain again so the test leaves no goroutine
+	// behind: the second drain returns once the count drops to zero.
 	close(release)
-	h.inProcessWebhookWg.Wait()
+	h.DrainInProcessWebhookWork(t.Context())
 }
 
 // A delayed timer (participant re-fold) can call goSafe after the drain has
-// already begun. That work must run untracked — never Add to the WaitGroup once
-// the drain flipped the flag — so it cannot trigger "Add called concurrently
-// with Wait" misuse, and the drain must not block on it.
+// already reached empty. With no tracked work in flight (count zero) that work
+// runs untracked so late timers cannot keep the drain alive forever, and the
+// drain must not block on it.
 func TestDrainInProcessWebhookWorkGoSafeAfterDrainRunsUntracked(t *testing.T) {
 	h := &Handler{logger: testLogger()}
 
@@ -146,4 +147,56 @@ func TestDrainInProcessWebhookWorkGoSafeAfterDrainRunsUntracked(t *testing.T) {
 	case <-time.After(durableWebhookTestDeadline):
 		require.FailNow(t, "expected goSafe work started after drain to still run (untracked)")
 	}
+}
+
+// Tracked work that spawns a child goSafe *after* the drain has begun — but
+// while the parent is still in flight (count nonzero) — must have that child
+// drained too. The drain is a promise over the whole acked work chain, so a
+// child spawned mid-drain (for example handleMultiEnvPlan acknowledging its
+// command, which fans out an eyes-reaction goSafe) cannot be dropped while the
+// drain reports success.
+func TestDrainInProcessWebhookWorkWaitsForChildSpawnedDuringDrain(t *testing.T) {
+	h := &Handler{logger: testLogger()}
+
+	parentStarted := make(chan struct{})
+	spawnChild := make(chan struct{})
+	releaseChild := make(chan struct{})
+	var childRan atomic.Bool
+
+	// The parent stays in flight until spawnChild fires, then registers a child
+	// and returns. The child outlives the parent and only finishes on release.
+	h.goSafe("octocat/hello-world", 1, 1, func() {
+		close(parentStarted)
+		<-spawnChild
+		h.goSafe("octocat/hello-world", 1, 1, func() {
+			<-releaseChild
+			childRan.Store(true)
+		})
+	})
+	<-parentStarted
+
+	// Begin draining while only the parent is counted.
+	drained := make(chan struct{})
+	go func() {
+		h.DrainInProcessWebhookWork(t.Context())
+		close(drained)
+	}()
+
+	// Spawn the child mid-drain (parent still counted, so count is nonzero and
+	// the child registers rather than running untracked).
+	close(spawnChild)
+
+	select {
+	case <-drained:
+		require.FailNow(t, "DrainInProcessWebhookWork returned before the mid-drain child finished")
+	case <-time.After(drainNotDoneProbe):
+	}
+
+	close(releaseChild)
+	select {
+	case <-drained:
+	case <-time.After(durableWebhookTestDeadline):
+		require.FailNow(t, "DrainInProcessWebhookWork did not return after the mid-drain child finished")
+	}
+	assert.True(t, childRan.Load(), "expected the mid-drain child goroutine to complete before drain returned")
 }
