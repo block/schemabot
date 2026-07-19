@@ -18,12 +18,19 @@ import (
 // on closed PRs: they are the recovery paths for an apply that ran while the
 // PR was open. A PR fetch failure blocks the command (fail closed) because
 // the PR state cannot be verified.
+//
+// This is a safety re-check, so it bypasses the request-scoped PR-info cache:
+// discovery earlier in the same delivery may have cached the PR as open, and a
+// close landing between discovery and this gate must still block the apply.
 func (h *Handler) enforceOpenPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, commandName, environment, requestedBy string) (blocked bool) {
-	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	prInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to fetch PR state for the closed-PR apply gate; blocking the command",
 			"repo", repo, "pr", pr, "environment", environment, "command", commandName, "error", err)
-		h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, "Failed to fetch PR info: "+err.Error())
+		// The raw error can carry internal detail (hosts, headers, newlines)
+		// that must not render in PR markdown; operators triage from the log
+		// line above.
+		h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, "Could not verify the pull request state, so the command was blocked. Retry, and see server logs if it persists.")
 		return true
 	}
 	if !prInfo.IsClosed() {
