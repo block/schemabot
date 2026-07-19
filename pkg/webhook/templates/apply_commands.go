@@ -615,7 +615,7 @@ func RenderApplyBlockedByCheckStatusError(environment string, err error, details
 			}
 			sb.WriteString("\nGrant or accept those permissions, then retry:\n")
 		case details != nil && details.ChecksReadable && details.CommitStatusesReadable:
-			sb.WriteString("Diagnostic REST probes could read both **Checks** and **Commit statuses**, so the check-status read failed even though the underlying permissions appear readable. Retry the command; if it keeps failing, inspect the SchemaBot logs for the exact GitHub API error:\n")
+			fmt.Fprintf(&sb, "Diagnostic REST probes could read both **Checks** and **Commit statuses**, so the check-status read failed even though the underlying permissions appear readable. Internal SchemaBot error — retry (error reference `%s`):\n", errorRef)
 		default:
 			sb.WriteString("Verify the app installation has access to this repository and has permission to read both **Checks** and **Commit statuses**, then retry:\n")
 		}
@@ -624,8 +624,7 @@ func RenderApplyBlockedByCheckStatusError(environment string, err error, details
 	}
 
 	if err != nil {
-		sb.WriteString("Unable to verify PR check statuses — internal SchemaBot error.\n\n")
-		fmt.Fprintf(&sb, "Retry; if it keeps failing, report error reference `%s`:\n", errorRef)
+		fmt.Fprintf(&sb, "Unable to verify PR check statuses. Internal SchemaBot error — retry (error reference `%s`):\n", errorRef)
 	} else {
 		// Defensive: callers should always pass a non-nil error here, but
 		// referencing an error that was never surfaced would be confusing if
@@ -708,7 +707,7 @@ func RenderApplyBlockedByPriorEnvCheckError(priorEnv, reason, errorRef string) s
 	// an unchanged retry can succeed — so this is a failed verification the
 	// apply fail-closed on, not a request SchemaBot refuses to perform.
 	sb.WriteString("## " + glyph.Failed + " Apply Blocked\n\n")
-	fmt.Fprintf(&sb, "Could not verify %s status: failed to %s. Internal SchemaBot error — retry the apply command. If it keeps failing, report error reference `%s`.\n", priorEnv, reason, errorRef)
+	fmt.Fprintf(&sb, "Could not verify %s status: failed to %s. Internal SchemaBot error — retry (error reference `%s`).\n", priorEnv, reason, errorRef)
 
 	return offerSupportChannel(sb.String())
 }

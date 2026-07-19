@@ -75,18 +75,22 @@ func newErrorReference() string {
 // internalErrorDetail builds the PR-facing detail for a failure inside a
 // SchemaBot-internal operation (storage reads/writes, GitHub API calls, lock
 // bookkeeping). Raw error text from those operations can carry hostnames, DSN
-// fragments, or driver internals, so it never renders on the PR: the comment
-// tells the user what to do next, and the error reference ties the report to
-// the server-side log line where the caller recorded the raw error.
+// fragments, or driver internals, so it never renders on the PR; the error
+// reference ties the comment to the server-side log line where the caller
+// recorded the raw error.
+//
+// The sentence is a fixed, machine-matchable pattern — agents driving schema
+// changes parse retryability ("— retry" present or absent) and the backticked
+// reference from it, so any rewording must keep both facts regex-stable.
 func internalErrorDetail(summary, errorRef string) string {
-	return summary + " Internal SchemaBot error — retry. If it keeps failing, report error reference `" + errorRef + "`."
+	return summary + " Internal SchemaBot error — retry (error reference `" + errorRef + "`)."
 }
 
 // internalErrorDetailNoRetry is internalErrorDetail for failures where
 // retrying the command would be wrong — the command was already accepted and
 // only a follow-up step (such as a status-check update) failed.
 func internalErrorDetailNoRetry(summary, errorRef string) string {
-	return summary + " Internal SchemaBot error — report error reference `" + errorRef + "`."
+	return summary + " Internal SchemaBot error (error reference `" + errorRef + "`)."
 }
 
 // userFacingError maps an execution error to the text rendered on the PR.

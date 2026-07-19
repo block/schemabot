@@ -314,7 +314,7 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "a transient apply lookup failure must stay retryable for a durable driver")
 		body := requireComment(t, comments, "apply lookup failure comment")
 		assert.Contains(t, body, "Failed to look up the apply.")
-		assert.Regexp(t, "report error reference `[0-9a-f]{8}`", body)
+		assert.Regexp(t, "error reference `[0-9a-f]{8}`", body)
 	})
 
 	// The source-apply guardrails read the plan from storage; a failed read is
@@ -335,7 +335,7 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "an internal source validation failure must stay retryable, not become the command's answer")
 		body := requireComment(t, comments, "source validation failure comment")
 		assert.Contains(t, body, "Rollback source validation failed.")
-		assert.Regexp(t, "report error reference `[0-9a-f]{8}`", body)
+		assert.Regexp(t, "error reference `[0-9a-f]{8}`", body)
 		assert.NotContains(t, body, "load source plan",
 			"raw error text must never render in PR markdown")
 	})
@@ -359,7 +359,7 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.Equal(t, 1, lockStore.releaseCalls)
 		body := requireComment(t, comments, "rollback plan read failure comment")
 		assert.Contains(t, body, "Rollback plan failed.")
-		assert.Regexp(t, "report error reference `[0-9a-f]{8}`", body)
+		assert.Regexp(t, "error reference `[0-9a-f]{8}`", body)
 		assert.NotContains(t, body, "get rollback source plan",
 			"raw error text must never render in PR markdown")
 	})
@@ -386,7 +386,7 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released so a re-drive can start over")
 		body := requireComment(t, comments, "revalidation failure comment")
 		assert.Contains(t, body, "Rollback source validation failed.")
-		assert.Regexp(t, "report error reference `[0-9a-f]{8}`", body)
+		assert.Regexp(t, "error reference `[0-9a-f]{8}`", body)
 		assert.NotContains(t, body, "load source plan",
 			"raw error text must never render in PR markdown")
 	})
@@ -453,7 +453,7 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.Zero(t, lockStore.acquireCalls, "no lock may be acquired while lock state is unknown")
 		body := requireComment(t, comments, "lock read failure comment")
 		assert.Contains(t, body, "Failed to check the rollback lock status.")
-		assert.Regexp(t, "report error reference `[0-9a-f]{8}`", body)
+		assert.Regexp(t, "error reference `[0-9a-f]{8}`", body)
 	})
 
 	t.Run("lock acquire failure is retryable", func(t *testing.T) {
@@ -469,7 +469,7 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "a failed lock acquisition must stay retryable so a re-drive can acquire it")
 		body := requireComment(t, comments, "lock acquire failure comment")
 		assert.Contains(t, body, "Failed to acquire the rollback lock.")
-		assert.Regexp(t, "report error reference `[0-9a-f]{8}`", body)
+		assert.Regexp(t, "error reference `[0-9a-f]{8}`", body)
 	})
 
 	// A gate that could not evaluate its inputs fails closed for this delivery
@@ -514,7 +514,7 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released so a re-drive can start over")
 		body := requireComment(t, comments, "plan unavailability comment")
 		assert.Contains(t, body, "Rollback plan failed.")
-		assert.Regexp(t, "report error reference `[0-9a-f]{8}`", body)
+		assert.Regexp(t, "error reference `[0-9a-f]{8}`", body)
 		assert.NotContains(t, body, "connection refused",
 			"raw transport error text must never render in PR markdown")
 	})
@@ -653,7 +653,7 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 		assert.False(t, retry, "missing required stored data cannot be repaired by re-driving")
 		body := requireComment(t, comments, "missing source plan comment")
 		assert.Contains(t, body, "Rollback source validation failed.")
-		assert.Regexp(t, "report error reference `[0-9a-f]{8}`", body)
+		assert.Regexp(t, "error reference `[0-9a-f]{8}`", body)
 		assert.NotContains(t, body, "source plan 10 not found",
 			"raw error text must never render in PR markdown")
 		assert.NotContains(t, body, "Rollback Not Allowed")
