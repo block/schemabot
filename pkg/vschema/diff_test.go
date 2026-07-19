@@ -47,6 +47,18 @@ func TestChanged(t *testing.T) {
 			expected: false,
 		},
 		{
+			name:     "whitespace-only vs empty object",
+			current:  "  \n  ",
+			desired:  "{}",
+			expected: false,
+		},
+		{
+			name:     "surrounding whitespace ignored",
+			current:  "\n  {\"sharded\": true}  \n",
+			desired:  `{"sharded": true}`,
+			expected: false,
+		},
+		{
 			name:     "empty vs empty tables",
 			current:  "{}",
 			desired:  `{"tables": {}}`,

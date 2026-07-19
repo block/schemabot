@@ -9,6 +9,7 @@ package vschema
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 
 	"github.com/pmezard/go-difflib/difflib"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -41,9 +42,13 @@ func Diff(current, desired string) string {
 		ToFile:   "new",
 		Context:  3,
 	}
+	// The two documents differ at this point, so an empty result would be
+	// indistinguishable from "no change". Surface rendering failure with a
+	// fixed placeholder instead (never the raw error, which could carry
+	// internal detail into PR-facing output).
 	text, err := difflib.GetUnifiedDiffString(diff)
 	if err != nil {
-		return ""
+		return "(VSchema diff unavailable)"
 	}
 	return text
 }
@@ -53,6 +58,7 @@ func Diff(current, desired string) string {
 // "sharded": false) that are semantically equivalent to being absent.
 // This matches the approach used for VSchema comparison in the tern layer.
 func Normalize(s string) string {
+	s = strings.TrimSpace(s)
 	if s == "" {
 		return "{}"
 	}
