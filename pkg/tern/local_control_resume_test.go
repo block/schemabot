@@ -267,6 +267,59 @@ func TestReplanAndFilterTasks_MatchKeepsTaskActive(t *testing.T) {
 	assert.Zero(t, rp.CompletedCount)
 }
 
+// An apply reclaimed while its engine holds or unwinds a revert (task states
+// revert_window, reverting) reports a live schema that matches the reviewed
+// target until the revert cutover lands, so a schema match is not evidence the
+// task settled — completing it would terminalize the apply as a success while
+// the engine reverts the schema change underneath it. The resume re-plan must
+// keep such tasks active, with their reviewed DDL untouched, so the resume
+// reattaches to the engine and the terminal state comes from engine progress.
+func TestReplanAndFilterTasks_RevertPhaseTaskStaysActive(t *testing.T) {
+	reviewed := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	revertPhaseTask := func(taskState string) []*storage.Task {
+		return []*storage.Task{{
+			TaskIdentifier: "task_1",
+			Namespace:      "testapp",
+			TableName:      "users",
+			DDLAction:      "alter",
+			DDL:            reviewed,
+			State:          taskState,
+		}}
+	}
+	replans := []struct {
+		name   string
+		replan *engine.PlanResult
+	}{
+		// Revert not yet landed: live still matches the reviewed target, so the
+		// re-plan finds no remaining diff for the table.
+		{name: "live schema still matches the reviewed target", replan: &engine.PlanResult{}},
+		// Revert already landed: live is back on the original schema, so the
+		// re-plan reproduces the forward change.
+		{name: "revert already landed", replan: alterUsersEmailPlan()},
+	}
+
+	for _, taskState := range []string{state.Task.RevertWindow, state.Task.Reverting} {
+		for _, tc := range replans {
+			t.Run(taskState+"/"+tc.name, func(t *testing.T) {
+				store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+				c := newPlanMaterializeClientWithPlan(store, tc.replan)
+
+				apply := &storage.Apply{Database: "testapp"}
+				tasks := revertPhaseTask(taskState)
+
+				rp, err := c.replanAndFilterTasks(t.Context(), apply, tasks, &storage.Plan{})
+				require.NoError(t, err)
+				require.Len(t, rp.ActiveTasks, 1, "a revert-phase task must stay active for the engine reattach")
+				active := rp.ActiveTasks[0]
+				assert.Equal(t, taskState, active.State, "the engine-monitored state is preserved for the reattach")
+				assert.Equal(t, reviewed, active.DDL, "the reviewed DDL is kept, not overwritten from the re-plan")
+				assert.Nil(t, active.CompletedAt)
+				assert.Zero(t, rp.CompletedCount)
+			})
+		}
+	}
+}
+
 // scriptedPlanStore scripts plan reads for recovery tests: a nil plan with a
 // nil error models a confirmed-missing plan row, while a non-nil error models
 // a storage read failure.

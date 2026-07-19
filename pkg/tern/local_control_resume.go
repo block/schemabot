@@ -449,6 +449,21 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 		if task.State == state.Task.Completed {
 			continue
 		}
+		if taskInRevertPhase(task) {
+			// Post-cutover, the live schema matches the reviewed target by
+			// definition: the change is applied and the engine is holding the
+			// revert window open or unwinding it. A schema match therefore says
+			// nothing about this task settling — completing it here would
+			// terminalize the apply as a success while the engine reverts the
+			// schema change underneath it. The task stays active (reviewed DDL
+			// untouched) so the resume reattaches to the engine and the task's
+			// terminal state comes from engine progress, never from this
+			// schema comparison.
+			c.logger.Info("keeping revert-phase task active through resume re-plan; engine progress decides its terminal state",
+				append(task.LogAttrs(), "database", apply.Database)...)
+			activeTasks = append(activeTasks, task)
+			continue
+		}
 		ddl, stillNeeded := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
 		if !stillNeeded {
 			// The re-plan diffs the reviewed target (plan.SchemaFiles) against
@@ -474,6 +489,16 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 	}
 
 	return &replanResult{ActiveTasks: activeTasks, CompletedCount: completedCount}, nil
+}
+
+// taskInRevertPhase reports whether the task sits in an engine-monitored
+// revert-phase state: the revert window is open or a revert is in flight.
+// While a task is in one of these states, comparing live schema against the
+// reviewed target proves nothing about the task's outcome — a match is the
+// expected live state until a revert lands, and a mismatch just means the
+// revert already landed.
+func taskInRevertPhase(task *storage.Task) bool {
+	return state.IsState(task.State, state.Task.RevertWindow, state.Task.Reverting)
 }
 
 // verifyReplannedTaskDDL fails closed when the DDL a resume re-plan would now
