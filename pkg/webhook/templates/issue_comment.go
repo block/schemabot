@@ -322,9 +322,9 @@ const volumeSupersededPrefix = "⏩ Volume changed to"
 // (which must start with that flavor's superseded prefix) and fold label.
 func renderSupersededFold(headline, foldLabel, repo string, pr int, newCommentID int64, previousBody string) string {
 	return fmt.Sprintf(
-		headline+" [a new progress comment](https://github.com/%s/pull/%d#issuecomment-%d).\n\n"+
+		"%s [a new progress comment](https://github.com/%s/pull/%d#issuecomment-%d).\n\n"+
 			"<details>\n<summary>%s</summary>\n\n%s\n\n</details>\n",
-		repo, pr, newCommentID, foldLabel, previousBody)
+		headline, repo, pr, newCommentID, foldLabel, previousBody)
 }
 
 // RenderVolumeSupersededProgressComment renders the frozen body written over a
