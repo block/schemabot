@@ -788,6 +788,374 @@ func TestE2EVolumeChangeRotatesProgressComment(t *testing.T) {
 	}
 }
 
+// When an operator's revert takes effect on an apply in its revert window, the
+// observer posts a fresh progress comment tracking the revert — a new comment
+// at the bottom of the PR timeline is where the operator looks for the effect
+// of the command they just issued. The prior progress comment is frozen at its
+// pre-revert rendering inside a collapsed details block pointing at its
+// successor, later progress edits land on the new comment, and neither a later
+// tick nor a fresh observer on a later drive claim rotates again: the fresh
+// comment durably records that it was posted while the apply was reverting.
+func TestE2ERevertRotatesProgressComment(t *testing.T) {
+	ctx := t.Context()
+
+	// The apply completed its copy and is holding its revert window open when
+	// the operator issues the revert.
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-revert",
+		pr:         144,
+		database:   "e2e_revert_db",
+		applyState: state.Apply.RevertWindow,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	// Seed the tracked progress comment as it stood during the revert window;
+	// posted before the revert, it records that the apply was not yet reverting.
+	h.postAndTrackComment(ctx, "org/repo-revert", 144, 12345, apply, state.Comment.Progress, "Revert window open — closes in 25m")
+	preRevertID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The revert command was accepted and the driver is unwinding the change.
+	// The first progress tick while reverting rotates the progress comment.
+	apply.State = state.Apply.Reverting
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	var newProgressID int64
+	select {
+	case created := <-capture.creates:
+		newProgressID = created.ID
+		assert.Contains(t, created.Body, "Schema Change Status — Staging")
+		assert.Contains(t, created.Body, "**Status**: Reverting")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a new progress comment to be posted when the revert takes effect")
+	}
+	assert.NotEqual(t, preRevertID, newProgressID, "the revert must post a new comment, not reuse the pre-revert one")
+
+	// The prior comment is frozen into a collapsed details block pointing at
+	// its successor, with the pre-revert body preserved inside the fold.
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, preRevertID, edited.CommentID, "the freeze edit lands on the superseded comment")
+		assert.Contains(t, edited.Body, "Schema change reverting")
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", newProgressID), "the frozen comment links to its successor")
+		assert.Contains(t, edited.Body, "<details>")
+		assert.Contains(t, edited.Body, "Revert window open", "the pre-revert body is preserved inside the fold")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the superseded progress comment to be frozen")
+	}
+
+	// The progress row tracks the new comment with no freeze left owing, and
+	// records that the comment was posted while the apply was reverting.
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, newProgressID, prog.GitHubCommentID)
+	assert.Nil(t, prog.PendingFreezeCommentID)
+	require.NotNil(t, prog.PostedPhase)
+	assert.Equal(t, "reverting", *prog.PostedPhase, "the fresh comment records the reverting phase")
+
+	// A later tick while still reverting edits the new comment in place — the
+	// revert rotates exactly once.
+	task.RowsCopied = 300
+	task.ProgressPercent = 30
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, newProgressID, edited.CommentID, "later edits land on the new comment")
+	case created := <-capture.creates:
+		t.Fatalf("a revert must rotate exactly once; got another new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an in-place edit of the new progress comment on the next tick")
+	}
+
+	// A fresh observer — a later drive claim after a restart — sees the durable
+	// record that the tracked comment already postdates the revert and edits it
+	// in place instead of rotating again.
+	obs2 := f.newObserver(st, fake)
+	task.RowsCopied = 100
+	task.ProgressPercent = 10
+	fake.Advance(activeInterval + time.Second)
+	obs2.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, newProgressID, edited.CommentID, "a fresh observer edits the tracked comment in place")
+	case created := <-capture.creates:
+		t.Fatalf("a fresh observer must not rotate for a revert already tracked; got new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the fresh observer to edit the tracked progress comment")
+	}
+}
+
+// When an operator's skip-revert takes effect on an apply in its revert
+// window, the observer posts a fresh progress comment tracking the finalizing
+// schema change — the operator looks at the bottom of the PR timeline for the
+// effect of the command they just issued. The prior progress comment is frozen
+// at its revert-window rendering inside a collapsed details block pointing at
+// its successor, and neither a later tick nor a fresh observer on a later
+// drive claim rotates again: the fresh comment durably records the
+// skipping-revert phase.
+func TestE2ESkipRevertRotatesProgressComment(t *testing.T) {
+	ctx := t.Context()
+
+	// The apply completed its copy and is holding its revert window open when
+	// the operator issues the skip-revert.
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-skip-revert",
+		pr:         145,
+		database:   "e2e_skip_revert_db",
+		applyState: state.Apply.RevertWindow,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	// Seed the tracked progress comment as it stood during the revert window;
+	// posted before the skip-revert, it records the revert-window phase.
+	h.postAndTrackComment(ctx, "org/repo-skip-revert", 145, 12345, apply, state.Comment.Progress, "Revert window open — closes in 25m")
+	preSkipID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The skip-revert command was accepted and the driver is finalizing the
+	// change. The first progress tick while skipping rotates the comment.
+	apply.State = state.Apply.SkippingRevert
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	var newProgressID int64
+	select {
+	case created := <-capture.creates:
+		newProgressID = created.ID
+		assert.Contains(t, created.Body, "Schema Change Status — Staging")
+		assert.Contains(t, created.Body, "**Status**: Skipping revert")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a new progress comment to be posted when the skip-revert takes effect")
+	}
+	assert.NotEqual(t, preSkipID, newProgressID, "the skip-revert must post a new comment, not reuse the revert-window one")
+
+	// The prior comment is frozen into a collapsed details block pointing at
+	// its successor, with the revert-window body preserved inside the fold.
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, preSkipID, edited.CommentID, "the freeze edit lands on the superseded comment")
+		assert.Contains(t, edited.Body, "Revert skipped")
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", newProgressID), "the frozen comment links to its successor")
+		assert.Contains(t, edited.Body, "<details>")
+		assert.Contains(t, edited.Body, "Revert window open", "the revert-window body is preserved inside the fold")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the superseded progress comment to be frozen")
+	}
+
+	// The progress row tracks the new comment with no freeze left owing, and
+	// records the skipping-revert phase.
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, newProgressID, prog.GitHubCommentID)
+	assert.Nil(t, prog.PendingFreezeCommentID)
+	require.NotNil(t, prog.PostedPhase)
+	assert.Equal(t, "skipping_revert", *prog.PostedPhase, "the fresh comment records the skipping-revert phase")
+
+	// A fresh observer — a later drive claim after a restart — sees the durable
+	// record that the tracked comment already postdates the skip-revert and
+	// edits it in place instead of rotating again.
+	obs2 := f.newObserver(st, fake)
+	task.RowsCopied = 700
+	task.ProgressPercent = 70
+	fake.Advance(activeInterval + time.Second)
+	obs2.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, newProgressID, edited.CommentID, "a fresh observer edits the tracked comment in place")
+	case created := <-capture.creates:
+		t.Fatalf("a fresh observer must not rotate for a skip-revert already tracked; got new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the fresh observer to edit the tracked progress comment")
+	}
+}
+
+// A control-phase rotation whose fresh comment posts to the PR but fails to
+// be recorded as the tracked comment must not freeze the prior comment: the
+// tracked row still points at it, so later progress edits land there. While
+// the outage lasts, later ticks retry only the tracking write (adoption) —
+// never another post — so duplicates stay bounded at one. Once storage heals,
+// the next tick adopts the already-live fresh comment: the tracked row records
+// it with the control phase, the prior comment is frozen pointing at its
+// successor, and progress edits move to the adopted comment — including for a
+// fresh observer on a later drive claim.
+func TestE2ERevertRotationUntrackedFreshCommentAdoptedWhenStorageHeals(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-revert-untracked",
+		pr:         148,
+		database:   "e2e_revert_untracked_db",
+		applyState: state.Apply.RevertWindow,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-revert-untracked", 148, 12345, apply, state.Comment.Progress, "Revert window open — closes in 25m")
+	preRevertID := requireCommentCreate(t, capture)
+
+	failingStorage := &failingCommentUpsertStorage{Storage: st}
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(failingStorage, fake)
+
+	// The revert takes effect: the fresh comment posts, but recording it as
+	// the tracked comment fails — the prior comment must not be frozen.
+	apply.State = state.Apply.Reverting
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	var freshProgressID int64
+	select {
+	case created := <-capture.creates:
+		freshProgressID = created.ID
+		assert.Contains(t, created.Body, "**Status**: Reverting")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the revert to post a fresh progress comment")
+	}
+	select {
+	case edited := <-capture.edits:
+		t.Fatalf("no comment may be edited when the fresh comment was not tracked; got an edit of %d: %s", edited.CommentID, edited.Body)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// While the outage lasts, a later tick retries only the tracking write —
+	// no duplicate post — and its progress edit lands on the prior comment,
+	// still the tracked one.
+	task.RowsCopied = 300
+	task.ProgressPercent = 30
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, preRevertID, edited.CommentID, "progress edits continue on the prior tracked comment")
+	case created := <-capture.creates:
+		t.Fatalf("an untracked rotation must not repost for the same phase; got another new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an in-place edit of the prior tracked comment")
+	}
+
+	// Once storage heals, the next tick adopts the already-live fresh comment
+	// instead of posting another: the prior comment is frozen pointing at its
+	// successor and the tick's progress edit lands on the adopted comment.
+	failingStorage.heal()
+	task.RowsCopied = 200
+	task.ProgressPercent = 20
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, preRevertID, edited.CommentID, "the freeze edit lands on the superseded comment")
+		assert.Contains(t, edited.Body, "Schema change reverting")
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", freshProgressID), "the frozen comment links to its adopted successor")
+	case created := <-capture.creates:
+		t.Fatalf("adoption must not post another comment; got %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the superseded progress comment to be frozen after adoption")
+	}
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, freshProgressID, edited.CommentID, "progress edits move to the adopted comment")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a progress edit on the adopted comment")
+	}
+
+	// The tracked row records the adopted comment with the reverting phase and
+	// no freeze left owing, so no observer — this one or a fresh one on a later
+	// drive claim — rotates again.
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, freshProgressID, prog.GitHubCommentID)
+	require.NotNil(t, prog.PostedPhase)
+	assert.Equal(t, "reverting", *prog.PostedPhase, "adoption records the control phase durably")
+	assert.Nil(t, prog.PendingFreezeCommentID)
+
+	obs2 := f.newObserver(st, fake)
+	task.RowsCopied = 100
+	task.ProgressPercent = 10
+	fake.Advance(activeInterval + time.Second)
+	obs2.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, freshProgressID, edited.CommentID, "a fresh observer edits the adopted comment in place")
+	case created := <-capture.creates:
+		t.Fatalf("a fresh observer must not rotate for a revert already tracked; got new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the fresh observer to edit the adopted comment")
+	}
+}
+
+// A cancel resolves the apply directly to a terminal state, so its effect
+// surfaces through the terminal flow rather than a progress-comment rotation:
+// the tracked progress comment is frozen at its final rendering in place, and
+// a brand-new summary comment lands at the bottom of the PR timeline — which
+// is where the operator looks for the effect of the command they just issued.
+// Exactly one new comment is posted; rotating as well would duplicate it.
+func TestE2ECancelSurfacesThroughTerminalSummaryComment(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-cancel",
+		pr:         147,
+		database:   "e2e_cancel_db",
+		applyState: state.Apply.Running,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	// The apply is mid-copy with a tracked progress comment when the operator
+	// issues the cancel.
+	h.postAndTrackComment(ctx, "org/repo-cancel", 147, 12345, apply, state.Comment.Progress, "Copying rows — 50%")
+	progressID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	apply.State = state.Apply.Cancelled
+	task.State = state.Task.Cancelled
+	obs.OnTerminal(apply, []*storage.Task{task})
+
+	// The tracked progress comment is frozen at its final rendering in place —
+	// no rotation.
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, progressID, edited.CommentID, "the terminal freeze lands on the tracked progress comment")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the progress comment to be edited to its final rendering")
+	}
+
+	// The cancel's operator-visible effect is a fresh summary comment at the
+	// bottom of the PR.
+	var summaryID int64
+	select {
+	case created := <-capture.creates:
+		summaryID = created.ID
+		assert.Contains(t, created.Body, "🚫 Schema Change Cancelled")
+		assert.Contains(t, created.Body, apply.ApplyIdentifier)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a new summary comment to be posted for the cancel")
+	}
+	assert.NotEqual(t, progressID, summaryID, "the summary is a new comment, not an edit of the progress comment")
+
+	// Exactly one new comment: the summary. A rotation on top of it would
+	// post a duplicate.
+	select {
+	case duplicate := <-capture.creates:
+		t.Fatalf("a cancel must surface through exactly one new comment; got another: %q", duplicate.Body)
+	default:
+	}
+
+	// The summary marker records the posted comment so reconciliation and
+	// later observers know the terminal publish happened.
+	marker, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, marker)
+	assert.Equal(t, summaryID, marker.GitHubCommentID)
+}
+
 // failingCommentUpsertStore wraps an ApplyCommentStore so every Upsert fails
 // until the outage is healed, modeling a storage outage between posting a
 // comment and recording its ID. Reads and every other write pass through.

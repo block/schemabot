@@ -501,6 +501,8 @@ func (h *Handler) postAndTrackComment(
 	if commentState == state.Comment.Progress {
 		level := apply.GetOptions().Volume
 		comment.PostedVolume = &level
+		phase := controlPhase(apply.State)
+		comment.PostedPhase = &phase
 	}
 	if err := h.service.Storage().ApplyComments().Upsert(ctx, comment); err != nil {
 		h.logger.Error("failed to store comment ID",

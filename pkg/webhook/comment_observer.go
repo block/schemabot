@@ -63,6 +63,12 @@ type CommentObserver struct {
 	resumeRotated     bool
 	volumeRotatedTo   int
 
+	// rotatedPhases records the control phases this observer already rotated
+	// for (or confirmed the tracked comment postdates), keyed by phase name,
+	// so later ticks skip the storage re-read. Guarded by mu like the other
+	// per-drive rotation flags.
+	rotatedPhases map[string]bool
+
 	// trackedPostedVolume caches the tracked progress comment's recorded level
 	// (valid only when trackedPostedVolumeKnown) so the per-tick volume-change
 	// check answers from memory instead of a storage read under the mutex. The
@@ -79,17 +85,23 @@ type CommentObserver struct {
 	pendingRotation *pendingProgressRotation
 }
 
-// pendingProgressRotation identifies a volume-rotation progress comment that
-// was posted but not tracked: the comment exists on the PR while the stored
-// row still points at its predecessor. Adoption retries only the tracking
-// write — never another post — so duplicates stay bounded, and a level change
-// while the comment was untracked (an operator reverting the volume) is
-// re-detected against the adopted level on the same tick.
+// pendingProgressRotation identifies a rotation progress comment that was
+// posted but not tracked: the comment exists on the PR while the stored row
+// still points at its predecessor. Adoption retries only the tracking write —
+// never another post — so duplicates stay bounded, and a level change while
+// the comment was untracked (an operator reverting the volume) is re-detected
+// against the adopted level on the same tick.
 type pendingProgressRotation struct {
 	// commentID is the posted comment's GitHub ID.
 	commentID int64
 	// volume is the level the comment was posted at.
 	volume int
+	// phase is the control phase the comment was posted in (empty when none),
+	// recorded on the tracked row at adoption so the durable rotation signal
+	// survives the retried write.
+	phase string
+	// reason selects the frozen rendering the superseded comment is owed.
+	reason supersededProgressReason
 	// supersededCommentID is the prior tracked comment, still owed its freeze.
 	supersededCommentID int64
 }
@@ -253,27 +265,48 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 		return
 	}
 
-	// A summary comment present while the apply is active again means the apply
-	// was stopped and has resumed — stopped is the only terminal state that
-	// returns to active. Post a fresh progress comment to track the resumed row
-	// copy and leave the prior comment frozen at "Stopped" as the record of where
-	// the apply paused.
-	if !state.IsTerminalApplyState(apply.State) && o.rotateProgressCommentForResume(apply, tasks) {
-		o.lastState = currentState
-		o.lastProgressPost = now
-		o.stagnantTicks = 0
-		return
-	}
+	// A prior tick's rotation comment may be live on the PR but untracked.
+	// Adopt it before considering any rotation, so the tracking write is
+	// retried with the known comment ID instead of a rotation reading the
+	// stale tracked row and posting a duplicate. While adoption keeps failing,
+	// rotations stay blocked but the tick's normal progress edit below still
+	// lands on the prior comment — the tracked one.
+	if o.pendingRotation == nil || o.adoptPendingRotationComment(apply) {
+		// A summary comment present while the apply is active again means the apply
+		// was stopped and has resumed — stopped is the only terminal state that
+		// returns to active. Post a fresh progress comment to track the resumed row
+		// copy and leave the prior comment frozen at "Stopped" as the record of where
+		// the apply paused.
+		if !state.IsTerminalApplyState(apply.State) && o.rotateProgressCommentForResume(apply, tasks) {
+			o.lastState = currentState
+			o.lastProgressPost = now
+			o.stagnantTicks = 0
+			return
+		}
 
-	// An applied volume change likewise gets a fresh progress comment: a new
-	// comment at the bottom of the PR timeline is where operators look for the
-	// effect of a command they just issued, rather than re-reading an older
-	// comment for an edited level.
-	if !state.IsTerminalApplyState(apply.State) && o.rotateProgressCommentForVolumeChange(apply, tasks) {
-		o.lastState = currentState
-		o.lastProgressPost = now
-		o.stagnantTicks = 0
-		return
+		// An applied volume change likewise gets a fresh progress comment: a new
+		// comment at the bottom of the PR timeline is where operators look for the
+		// effect of a command they just issued, rather than re-reading an older
+		// comment for an edited level. A level change while the comment was
+		// untracked (an operator reverting the volume) is re-detected against the
+		// just-adopted level on the same tick.
+		if !state.IsTerminalApplyState(apply.State) && o.rotateProgressCommentForVolumeChange(apply, tasks) {
+			o.lastState = currentState
+			o.lastProgressPost = now
+			o.stagnantTicks = 0
+			return
+		}
+
+		// A control operation taking effect (revert, skip-revert) likewise gets a
+		// fresh progress comment: the user just issued the command, so its effect
+		// belongs at the bottom of the PR timeline, with the old comment frozen at
+		// its pre-operation state as the record.
+		if o.rotateProgressCommentForControlPhase(apply, tasks) {
+			o.lastState = currentState
+			o.lastProgressPost = now
+			o.stagnantTicks = 0
+			return
+		}
 	}
 
 	// Adaptive rate limiting — ported from watchApplyProgress.
@@ -709,6 +742,166 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 	return true
 }
 
+// Control-operation phases recorded on tracked progress comments
+// (ApplyComment.PostedPhase) and used to decide comment rotation. The phase is
+// derived from engine-agnostic apply state so every engine gets the same PR
+// UX.
+const (
+	phaseNone              = ""
+	phaseWaitingForCutover = "waiting_for_cutover"
+	phaseCuttingOver       = "cutting_over"
+	phaseRevertWindow      = "revert_window"
+	phaseReverting         = "reverting"
+	phaseSkippingRevert    = "skipping_revert"
+)
+
+// controlPhase maps an apply state to the control-operation phase recorded on
+// progress comments posted in that state. States outside the cutover/revert
+// lifecycle carry no phase.
+func controlPhase(applyState string) string {
+	switch state.NormalizeState(applyState) {
+	case state.Apply.WaitingForCutover:
+		return phaseWaitingForCutover
+	case state.Apply.CuttingOver:
+		return phaseCuttingOver
+	case state.Apply.RevertWindow:
+		return phaseRevertWindow
+	case state.Apply.Reverting:
+		return phaseReverting
+	case state.Apply.SkippingRevert:
+		return phaseSkippingRevert
+	}
+	return phaseNone
+}
+
+// phaseRotatesProgressComment reports whether an apply entering the phase is
+// the effect of an operator control command that warrants rotating the
+// progress comment. Reverting and skipping-revert are always operator-issued.
+// The cutover-driven phases are not listed here: entering the revert window
+// after an auto-cutover involves no operator command (the comment transitions
+// in place), and while a deferred-cutover prompt is live the observer does
+// not edit progress comments.
+func phaseRotatesProgressComment(phase string) bool {
+	return phase == phaseReverting || phase == phaseSkippingRevert
+}
+
+// trackedPhase returns the phase recorded on a tracked comment row, treating
+// nil (a row predating phase tracking) as no phase — the comment predates
+// whatever phase the apply is in now.
+func trackedPhase(tracked *storage.ApplyComment) string {
+	if tracked.PostedPhase == nil {
+		return phaseNone
+	}
+	return *tracked.PostedPhase
+}
+
+// rotateProgressCommentForControlPhase posts a fresh progress comment when a
+// control operation's phase (revert, skip-revert) has taken effect, so the
+// operation is tracked in a new comment at the bottom of the PR timeline
+// instead of re-editing the comment last rendered for the prior phase. The
+// signal is durable and cross-pod safe: every tracked progress comment records
+// the phase the apply was in when it was posted, so an apply in a control
+// phase whose tracked comment records a different phase still predates it. The
+// fresh comment records the phase, so later ticks — and fresh observers on
+// later drive claims — see the rotation already happened. Returns true when it
+// rotated.
+func (o *CommentObserver) rotateProgressCommentForControlPhase(apply *storage.Apply, tasks []*storage.Task) bool {
+	phase := controlPhase(apply.State)
+	if !phaseRotatesProgressComment(phase) {
+		// Not in a phase that rotates — the common path on every progress tick.
+		return false
+	}
+	if o.rotatedPhases[phase] {
+		// This observer already rotated for the phase (or confirmed the tracked
+		// comment postdates it) — answered from memory instead of re-reading
+		// storage on every later tick. A fresh observer on a later drive claim
+		// starts with this unset and re-checks the durable record.
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tracked, err := o.stor.ApplyComments().Get(ctx, o.applyID, state.Comment.Progress)
+	if err != nil {
+		o.logError(apply, "observer: failed to load tracked progress comment before control-phase rotation",
+			"error", err, "phase", phase)
+		return false
+	}
+	if tracked == nil {
+		// No tracked progress comment to rotate away from — the handler may
+		// still be posting the initial one. The next posted comment records the
+		// phase itself.
+		o.logInfo(apply, "observer: no tracked progress comment yet; skipping control-phase rotation check", "phase", phase)
+		return false
+	}
+	if trackedPhase(tracked) == phase {
+		// The tracked comment was posted while the apply was already in this
+		// phase — it already tracks the operation, across restarts and drive
+		// re-claims.
+		o.markPhaseRotated(phase)
+		return false
+	}
+	if tracked.PendingFreezeCommentID != nil {
+		// A superseded comment from an earlier rotation is still owed its
+		// frozen rendering — the freeze edit failed or the pod died before it
+		// landed. Retry it now; on success the marker is cleared.
+		o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
+			supersededByPriorRotation, 0)
+	}
+
+	body := o.formatStatusComment(apply, tasks)
+	newCommentID, posted, trackedNew := o.postAndTrackComment(apply, state.Comment.Progress, body, &tracked.GitHubCommentID)
+	if !posted {
+		// postAndTrackComment logged the failure. The tracked comment still
+		// predates the phase, so the next tick retries the rotation.
+		return false
+	}
+	if !trackedNew {
+		// The fresh comment is on the PR, but the tracked row still points at
+		// the prior comment, which therefore must not be folded. Remember the
+		// fresh comment so later ticks retry only the tracking write —
+		// adoption — instead of posting a duplicate; the phase is marked
+		// rotated once the row tracks it.
+		o.pendingRotation = &pendingProgressRotation{
+			commentID:           newCommentID,
+			volume:              apply.GetOptions().Volume,
+			phase:               phase,
+			reason:              supersededReasonForPhase(phase),
+			supersededCommentID: tracked.GitHubCommentID,
+		}
+		o.logError(apply, "observer: fresh progress comment posted for control phase but not tracked; progress edits continue on the prior comment until the next tick adopts it",
+			"phase", phase, "github_comment_id", newCommentID)
+		return true
+	}
+	o.markPhaseRotated(phase)
+
+	o.freezeSupersededProgressComment(apply, tracked.GitHubCommentID, newCommentID, supersededReasonForPhase(phase), 0)
+
+	o.logger.Info("observer: posted fresh progress comment for control phase",
+		"apply_id", o.applyID, "repo", o.repo, "pr", o.pr, "state", apply.State, "phase", phase)
+	return true
+}
+
+// markPhaseRotated records in-memory that this observer rotated (or confirmed
+// the tracked comment already covers) the given control phase, so later ticks
+// skip the storage re-read.
+func (o *CommentObserver) markPhaseRotated(phase string) {
+	if o.rotatedPhases == nil {
+		o.rotatedPhases = make(map[string]bool)
+	}
+	o.rotatedPhases[phase] = true
+}
+
+// supersededReasonForPhase selects the frozen rendering for the comment a
+// control-phase rotation supersedes.
+func supersededReasonForPhase(phase string) supersededProgressReason {
+	if phase == phaseSkippingRevert {
+		return supersededBySkipRevert
+	}
+	return supersededByRevert
+}
+
 // supersededProgressReason names why a tracked progress comment was rotated
 // away from, selecting the frozen rendering written over it.
 type supersededProgressReason int
@@ -716,6 +909,8 @@ type supersededProgressReason int
 const (
 	supersededByVolumeChange supersededProgressReason = iota
 	supersededByResume
+	supersededByRevert
+	supersededBySkipRevert
 	// supersededByPriorRotation is the retry reason: the pending-freeze marker
 	// records which comment is owed a fold but not which rotation superseded
 	// it, so a retry renders the generic fold instead of guessing a headline.
@@ -729,6 +924,20 @@ func (o *CommentObserver) frozenSupersededProgressBody(reason supersededProgress
 	switch reason {
 	case supersededByResume:
 		return templates.RenderResumeSupersededProgressComment(templates.ResumeSupersededProgressData{
+			Repo:         o.repo,
+			PR:           o.pr,
+			NewCommentID: newCommentID,
+			PreviousBody: previousBody,
+		})
+	case supersededByRevert:
+		return templates.RenderRevertSupersededProgressComment(templates.RevertSupersededProgressData{
+			Repo:         o.repo,
+			PR:           o.pr,
+			NewCommentID: newCommentID,
+			PreviousBody: previousBody,
+		})
+	case supersededBySkipRevert:
+		return templates.RenderSkipRevertSupersededProgressComment(templates.SkipRevertSupersededProgressData{
 			Repo:         o.repo,
 			PR:           o.pr,
 			NewCommentID: newCommentID,
@@ -764,17 +973,6 @@ func (o *CommentObserver) rotateProgressCommentForVolumeChange(apply *storage.Ap
 		// The apply has no explicit volume level to compare — nothing changed.
 		return false
 	}
-	if o.pendingRotation != nil {
-		// A prior tick's fresh comment is live on the PR but untracked. Adopt
-		// it before considering another rotation so the tracking write is
-		// retried with the known comment ID instead of posting a duplicate.
-		if !o.adoptPendingRotationComment(apply) {
-			return false
-		}
-		// Fall through: the adopted level may already mismatch again (an
-		// operator changed the volume while the comment was untracked), which
-		// the checks below re-detect against the adopted level.
-	}
 	if o.volumeRotatedTo == currentVolume {
 		// This observer already rotated for this level — answered from memory
 		// without a storage read.
@@ -808,11 +1006,15 @@ func (o *CommentObserver) rotateProgressCommentForVolumeChange(apply *storage.Ap
 		// compare. Backfill the current level so the next applied volume change
 		// rotates (and so this check answers from the cache instead of
 		// re-reading storage every tick for the apply's remaining lifetime).
+		// Upsert overwrites every tracked field, so the row's other recorded
+		// state is carried through unchanged.
 		backfill := &storage.ApplyComment{
-			ApplyID:         o.applyID,
-			CommentState:    state.Comment.Progress,
-			GitHubCommentID: tracked.GitHubCommentID,
-			PostedVolume:    &currentVolume,
+			ApplyID:                o.applyID,
+			CommentState:           state.Comment.Progress,
+			GitHubCommentID:        tracked.GitHubCommentID,
+			PostedVolume:           &currentVolume,
+			PostedPhase:            tracked.PostedPhase,
+			PendingFreezeCommentID: tracked.PendingFreezeCommentID,
 		}
 		if err := o.stor.ApplyComments().Upsert(o.contextWithApplyLease(ctx, apply), backfill); err != nil {
 			o.logError(apply, "observer: failed to backfill tracked progress comment volume; volume rotation stays disabled for this apply until the backfill lands",
@@ -855,6 +1057,8 @@ func (o *CommentObserver) rotateProgressCommentForVolumeChange(apply *storage.Ap
 		o.pendingRotation = &pendingProgressRotation{
 			commentID:           newCommentID,
 			volume:              currentVolume,
+			phase:               controlPhase(apply.State),
+			reason:              supersededByVolumeChange,
 			supersededCommentID: tracked.GitHubCommentID,
 		}
 		o.logError(apply, "observer: fresh progress comment posted for volume change but not tracked; progress edits continue on the prior comment until the next tick adopts it",
@@ -883,20 +1087,24 @@ func (o *CommentObserver) adoptPendingRotationComment(apply *storage.Apply) bool
 		CommentState:           state.Comment.Progress,
 		GitHubCommentID:        p.commentID,
 		PostedVolume:           &p.volume,
+		PostedPhase:            &p.phase,
 		PendingFreezeCommentID: &p.supersededCommentID,
 	}
 	if err := o.stor.ApplyComments().Upsert(o.contextWithApplyLease(ctx, apply), comment); err != nil {
 		o.logError(apply, "observer: failed to adopt posted-but-untracked progress comment; progress edits continue on the prior comment until a retry lands",
-			"github_comment_id", p.commentID, "volume", p.volume, "error", err)
+			"github_comment_id", p.commentID, "volume", p.volume, "phase", p.phase, "error", err)
 		return false
 	}
 	o.pendingRotation = nil
 	o.trackedPostedVolume = p.volume
 	o.trackedPostedVolumeKnown = true
 	o.volumeRotatedTo = p.volume
+	if p.phase != phaseNone {
+		o.markPhaseRotated(p.phase)
+	}
 	o.logInfo(apply, "observer: adopted posted-but-untracked progress comment; progress edits now land on it",
-		"github_comment_id", p.commentID, "volume", p.volume)
-	o.freezeSupersededProgressComment(apply, p.supersededCommentID, p.commentID, supersededByVolumeChange, p.volume)
+		"github_comment_id", p.commentID, "volume", p.volume, "phase", p.phase)
+	o.freezeSupersededProgressComment(apply, p.supersededCommentID, p.commentID, p.reason, p.volume)
 	return true
 }
 
@@ -949,8 +1157,9 @@ func (o *CommentObserver) freezeSupersededProgressComment(apply *storage.Apply, 
 }
 
 // postAndTrackComment creates a comment and stores its ID, recording the
-// apply's volume level on progress comments so a later applied volume change
-// is detectable. pendingFreezeCommentID, when non-nil, records in the same
+// apply's volume level and control phase on progress comments so a later
+// applied volume change or control operation is detectable. pendingFreezeCommentID, when
+// non-nil, records in the same
 // tracking write that the named predecessor comment is still owed its frozen
 // rendering; pass nil for posts that supersede nothing. Returns the GitHub
 // comment ID, whether the post landed on the PR, and whether the tracking row
@@ -993,6 +1202,8 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 	if commentState == state.Comment.Progress {
 		level := apply.GetOptions().Volume
 		comment.PostedVolume = &level
+		phase := controlPhase(apply.State)
+		comment.PostedPhase = &phase
 	}
 	if err := o.stor.ApplyComments().Upsert(o.contextWithApplyLease(ctx, apply), comment); err != nil {
 		o.logError(apply, "observer: failed to store comment ID", "error", err, "comment_state", commentState)
