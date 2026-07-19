@@ -300,6 +300,11 @@ func PreviewCommentApplyInProgress() string {
 	})
 }
 
+// PreviewCommentApplyBlockedClosedPR renders a sample closed-PR apply rejection.
+func PreviewCommentApplyBlockedClosedPR() string {
+	return RenderApplyBlockedClosedPR("staging", previewRequestedBy)
+}
+
 // PreviewCommentApplyConfirmNoLock renders a sample "no lock found" comment.
 func PreviewCommentApplyConfirmNoLock() string {
 	return RenderApplyConfirmNoLock("testapp", "staging")

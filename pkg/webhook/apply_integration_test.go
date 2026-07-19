@@ -92,6 +92,113 @@ func TestE2EApplyWithChanges(t *testing.T) {
 	}
 }
 
+// TestE2EApplyRejectedOnClosedPR verifies the closed-PR apply gate: an apply
+// command on a closed PR must be rejected with an explicit comment before any
+// plan, lock, or execution work happens. A closed PR's schema changes have no
+// path to the base branch, and its close-time lock cleanup has already run, so
+// an apply from it would push unmergeable schema and orphan the database lock.
+func TestE2EApplyRejectedOnClosedPR(t *testing.T) {
+	dbName := "webhook_apply_closed_pr"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	closedState := "closed"
+	result.PRState.Store(&closedState)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "PR Is Closed")
+		assert.Contains(t, body, "open PRs")
+		assert.NotContains(t, body, "Applying automatically")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for closed-PR rejection comment")
+	}
+
+	// The rejected apply must not have acquired the database lock.
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	assert.Nil(t, lock)
+}
+
+// TestE2EApplyConfirmRejectedOnClosedPR verifies the closed-PR gate also
+// covers the manual confirmation path: apply-confirm on a closed PR is
+// rejected before any lock or freshness handling, so a confirmation comment
+// cannot execute a pending apply after the PR closes.
+func TestE2EApplyConfirmRejectedOnClosedPR(t *testing.T) {
+	dbName := "webhook_applyconfirm_closed_pr"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	closedState := "closed"
+	result.PRState.Store(&closedState)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "PR Is Closed")
+		assert.Contains(t, body, "open PRs")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for closed-PR rejection comment")
+	}
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	assert.Nil(t, lock)
+}
+
 func TestE2EApplyNoChanges(t *testing.T) {
 	dbName := "webhook_apply_nochanges"
 	svc := setupE2EService(t, dbName)

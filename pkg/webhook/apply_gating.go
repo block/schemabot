@@ -10,6 +10,31 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
+// enforceOpenPR rejects apply-family commands on closed PRs. A closed PR's
+// schema changes can never merge, so applying them would push schema to the
+// target database from code with no path to the base branch — and the PR's
+// close-time lock cleanup has already run, so a lock acquired by the apply
+// would be orphaned until a manual unlock. Rollback and unlock stay available
+// on closed PRs: they are the recovery paths for an apply that ran while the
+// PR was open. A PR fetch failure blocks the command (fail closed) because
+// the PR state cannot be verified.
+func (h *Handler) enforceOpenPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, commandName, environment, requestedBy string) (blocked bool) {
+	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("failed to fetch PR state for the closed-PR apply gate; blocking the command",
+			"repo", repo, "pr", pr, "environment", environment, "command", commandName, "error", err)
+		h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, "Failed to fetch PR info: "+err.Error())
+		return true
+	}
+	if !prInfo.IsClosed() {
+		return false
+	}
+	h.logger.Info("apply command rejected: PR is closed",
+		"repo", repo, "pr", pr, "environment", environment, "command", commandName, "requested_by", requestedBy)
+	h.postComment(repo, pr, installationID, templates.RenderApplyBlockedClosedPR(environment, requestedBy))
+	return true
+}
+
 // isAggregateCheckName reports whether a check name matches this deployment's
 // configured aggregate Check Run name: the base name itself or the
 // environment-scoped form "base (<env>)". Aggregate identity is decided by

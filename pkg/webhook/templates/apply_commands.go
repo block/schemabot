@@ -250,6 +250,19 @@ func RenderApplyInProgress(data ApplyLockConflictData) string {
 	return sb.String()
 }
 
+// RenderApplyBlockedClosedPR renders a rejection when an apply command targets
+// a closed PR.
+func RenderApplyBlockedClosedPR(environment, requestedBy string) string {
+	var sb strings.Builder
+
+	writeEnvironmentTitle(&sb, "⛔ Apply Blocked: PR Is Closed", environment)
+	writeRequesterOrTimestamp(&sb, requestedBy)
+	sb.WriteString("\nThis PR is closed, so its schema changes can never merge. SchemaBot only applies schema changes from open PRs.\n\n")
+	sb.WriteString("Reopen this PR, or open a new PR with the schema change, and apply from there.\n")
+
+	return sb.String()
+}
+
 // RenderNoLocksFound renders a comment when unlock finds no locks for this PR.
 func RenderNoLocksFound() string {
 	var sb strings.Builder
