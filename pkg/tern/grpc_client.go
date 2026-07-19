@@ -1080,14 +1080,18 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 // remote that is still active keeps the durable request pending for the next
 // drive to retry.
 func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, scope applyTaskScope) (bool, error) {
+	// Route the remote apply id through the scope: an operation-scoped drive
+	// tracks its remote apply on the operation, not on the parent apply's
+	// ExternalID.
+	remoteID := scope.remoteApplyID(apply)
 	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:     scope.remoteApplyID(apply),
+		ApplyId:     remoteID,
 		Environment: apply.Environment,
 	})
 	if err != nil {
 		slog.Warn("remote gRPC cancel error could not be reconciled from progress",
 			"apply_id", apply.ApplyIdentifier,
-			"external_id", apply.ExternalID,
+			"remote_apply_id", remoteID,
 			"database", apply.Database,
 			"environment", apply.Environment,
 			"requested_by", controlRequestCaller(controlReq),
@@ -1097,7 +1101,7 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE || !isTerminalProtoState(progress.State) {
 		slog.Warn("remote gRPC cancel error found nonterminal progress; durable cancel request remains pending for operator retry",
 			"apply_id", apply.ApplyIdentifier,
-			"external_id", apply.ExternalID,
+			"remote_apply_id", remoteID,
 			"database", apply.Database,
 			"environment", apply.Environment,
 			"requested_by", controlRequestCaller(controlReq),
@@ -1107,7 +1111,7 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 	}
 	remoteState := ProtoStateToStorage(progress.State)
 	if remoteState == "" {
-		return false, fmt.Errorf("sync remote gRPC cancel for apply %s remote %s after cancel error: unmapped remote state %s", apply.ApplyIdentifier, apply.ExternalID, remoteApplyStateDescription(progress.State))
+		return false, fmt.Errorf("sync remote gRPC cancel for apply %s remote %s after cancel error: unmapped remote state %s", apply.ApplyIdentifier, remoteID, remoteApplyStateDescription(progress.State))
 	}
 	now := time.Now()
 	priorState, priorStartedAt, priorUpdatedAt := apply.State, apply.StartedAt, apply.UpdatedAt
