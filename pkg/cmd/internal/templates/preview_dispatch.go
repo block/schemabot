@@ -285,6 +285,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvFailed())
 	case PreviewCommentBlockedByPriorInProg:
 		fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvInProgress())
+	case PreviewCommentBlockedByPriorError:
+		fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvCheckError())
 	case PreviewCommentReviewRequired:
 		fmt.Print(webhooktemplates.PreviewCommentReviewRequired())
 	case PreviewCommentReviewGateError:
@@ -299,6 +301,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 			{Name: "CI / unit-tests", State: "in_progress"},
 			{Name: "CI / integration-tests", State: "queued"},
 		}, nil))
+	case PreviewCommentChecksGateError:
+		fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByCheckStatusError())
 	case PreviewCommentActorNotAuthorized:
 		fmt.Print(webhooktemplates.PreviewCommentPRCommandNotAuthorized())
 	case PreviewCommentActorAuthUnavailable:
