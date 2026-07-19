@@ -90,10 +90,20 @@ func newSchemaConfigOutsideAllowedDirsError(config *ghclient.SchemabotConfig, sc
 }
 
 func (h *Handler) createManagedSchemaRequestFromPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, environment, databaseName, source string) (*ghclient.SchemaRequestResult, error) {
-	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName, h.validateRequestedDatabaseEnvironment)
+	var schemaResult *ghclient.SchemaRequestResult
+	var err error
+	if databaseName == "" {
+		schemaResult, err = h.createUnscopedSchemaRequestFromPR(ctx, client, repo, pr, environment, source)
+	} else {
+		schemaResult, err = client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName, h.validateRequestedDatabaseEnvironment)
+	}
 	if err != nil {
 		return nil, err
 	}
+	// Re-check the resolved schema root: environment resolution can retarget it
+	// (for example through an environment symlink), so ownership must hold for
+	// the path the schema files were actually fetched from, not just the
+	// discovered config directory.
 	if !h.shouldProcessSchemaConfig(ctx, repo, pr, schemaResult.HeadSHA, schemaResult.Database, schemaResult.Type, schemaResult.SchemaPath, source) {
 		return nil, &schemaConfigOutsideAllowedDirsError{
 			Database:     schemaResult.Database,
@@ -102,6 +112,57 @@ func (h *Handler) createManagedSchemaRequestFromPR(ctx context.Context, client *
 		}
 	}
 	return schemaResult, nil
+}
+
+// createUnscopedSchemaRequestFromPR resolves which database an unscoped
+// command (no -d) targets and fetches that database's schema files.
+func (h *Handler) createUnscopedSchemaRequestFromPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, environment, source string) (*ghclient.SchemaRequestResult, error) {
+	config, configDir, err := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, source)
+	if err != nil {
+		return nil, err
+	}
+	return client.CreateSchemaRequestForConfig(ctx, repo, pr, environment, config, configDir, h.validateRequestedDatabaseEnvironment)
+}
+
+// resolveUnscopedManagedConfig resolves which database an unscoped command
+// (no -d) targets. Discovery mirrors auto-plan — changed config files plus the
+// nearest config above each changed schema file — and the discovered configs
+// are filtered to the ones this deployment manages before deciding
+// multiplicity, so on fan-out repos each deployment decides from its own slice:
+//
+//   - no configs discovered at all: fall back to repo-wide single-config
+//     discovery (a changeless PR can still carry commands for its database)
+//   - none of the discovered configs managed here: an unowned-schema error,
+//     which unscoped fan-out handling downgrades to a silent skip
+//   - exactly one managed config: the command targets it, even when the PR
+//     also touches configs other deployments own
+//   - several managed configs: ErrMultipleConfigs — one apply drives one
+//     database, so the user must scope the command with -d
+func (h *Handler) resolveUnscopedManagedConfig(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, source string) (*ghclient.SchemabotConfig, string, error) {
+	configs, err := client.FindAllConfigsForPR(ctx, repo, pr)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(configs) == 0 {
+		config, configDir, _, err := client.FindConfigInRepo(ctx, repo, pr)
+		if err != nil {
+			return nil, "", err
+		}
+		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, source) {
+			return nil, "", newSchemaConfigOutsideAllowedDirsError(config, configDir)
+		}
+		return config, configDir, nil
+	}
+	// filterManagedDiscoveredConfigs filters in place, so give it a copy —
+	// callers may still need the full discovery result.
+	managed := h.filterManagedDiscoveredConfigs(ctx, repo, pr, "", source, slices.Clone(configs))
+	if len(managed) == 0 {
+		h.logger.Info("unscoped command discovered only schema configs this deployment does not manage",
+			"repo", repo, "pr", pr, "source", source,
+			"discovered_configs", len(configs))
+		return nil, "", newSchemaConfigOutsideAllowedDirsError(configs[0].Config, configs[0].SchemaDir)
+	}
+	return ghclient.SingleDiscoveredConfig(managed)
 }
 
 func (h *Handler) validateRequestedDatabaseEnvironment(database, environment string) error {

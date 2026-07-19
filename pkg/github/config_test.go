@@ -332,6 +332,47 @@ func TestFindConfigForPRDiscoversChangedConfigFile(t *testing.T) {
 	assert.Equal(t, "apps/widgets/schema", schemaDir)
 }
 
+func TestFindConfigForPRRejectsMultipleDiscoveredConfigs(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{
+		{
+			Filename: new("apps/widgets/schema/schemabot.yaml"),
+			Status:   new("added"),
+		},
+		{
+			Filename: new("apps/gadgets/schema/schemabot.yaml"),
+			Status:   new("added"),
+		},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/gadgets/schema/schemabot.yaml", "database: gadgets\ntype: mysql\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, _, err := ic.FindConfigForPR(t.Context(), "octocat/hello-world", 1)
+
+	require.ErrorIs(t, err, ErrMultipleConfigs)
+	assert.Contains(t, err.Error(), "`widgets` (apps/widgets/schema)")
+	assert.Contains(t, err.Error(), "`gadgets` (apps/gadgets/schema)")
+}
+
+func TestFindConfigForPRDiscoversNearestConfigForChangedSchemaFile(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("apps/widgets/schema/main/widgets.sql"),
+		Status:   new("modified"),
+	}})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	config, schemaDir, err := ic.FindConfigForPR(t.Context(), "octocat/hello-world", 1)
+
+	require.NoError(t, err)
+	assert.Equal(t, "widgets", config.Database)
+	assert.Equal(t, "apps/widgets/schema", schemaDir)
+}
+
 func TestFindConfigByDatabaseNameUsesChangedConfigFileBeforeRepoScan(t *testing.T) {
 	client, mux := setupConfigTestGitHubServer(t)
 	registerPullRequest(t, mux, "abc123")
