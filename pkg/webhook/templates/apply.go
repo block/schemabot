@@ -101,6 +101,12 @@ type ApplyStatusCommentData struct {
 	// status vocabulary from "apply" to "rollback" so a completed rollback is
 	// announced as "Rollback Complete", never as a freshly applied schema change.
 	Rollback bool
+
+	// UpdateCadence is the current spacing between automatic refreshes of this
+	// comment, shown beside the "Last updated" footer so a reader knows how long
+	// to expect between updates as the cadence slows on a long apply. Zero
+	// renders no cadence note (terminal renders and one-shot comments).
+	UpdateCadence time.Duration
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -152,7 +158,7 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	// Footer with next actions
 	writeApplyFooter(&sb, data)
 	if includeLastUpdated && !state.IsTerminalApplyState(data.State) {
-		writeLastUpdatedFooter(&sb, renderedAt)
+		writeLastUpdatedFooter(&sb, renderedAt, data.UpdateCadence)
 	}
 
 	return sb.String()

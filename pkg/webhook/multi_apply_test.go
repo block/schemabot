@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"testing"
+	"time"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -22,7 +23,7 @@ func runningApply() *storage.Apply {
 // An apply with no operation rows (legacy, predating apply_operations) renders
 // the single-deployment comment unchanged — no aggregate header.
 func TestFormatApplyStatusComment_NoOperationsRendersSingle(t *testing.T) {
-	out := formatApplyStatusComment(runningApply(), nil, false, nil, nil, nil, "")
+	out := formatApplyStatusComment(runningApply(), nil, false, nil, nil, nil, "", 0)
 	assert.Contains(t, out, "## Schema Change Status")
 	assert.NotContains(t, out, "**Deployments**:")
 }
@@ -33,7 +34,7 @@ func TestFormatApplyStatusComment_OneOperationRendersSingle(t *testing.T) {
 	ops := []*storage.ApplyOperation{
 		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Running},
 	}
-	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, "")
+	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, "", 0)
 	assert.NotContains(t, out, "**Deployments**:")
 	assert.NotContains(t, out, "- 🔄 eu")
 }
@@ -45,7 +46,7 @@ func TestFormatApplyStatusComment_MultipleOperationsRendersMulti(t *testing.T) {
 		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyBarrier},
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier},
 	}
-	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, "")
+	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, "", 0)
 	assert.Contains(t, out, "## Schema Change Status")
 	assert.Contains(t, out, "**Deployments**: 1 completed, 1 running")
 	assert.Contains(t, out, "- ✅ eu — completed")
@@ -62,10 +63,10 @@ func TestFormatApplyStatusComment_ReleasedPauseRendersDegradedNotPaused(t *testi
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Pending, OnFailure: storage.OnFailurePause},
 	}
 
-	paused := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, "")
+	paused := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, "", 0)
 	assert.Contains(t, paused, "paused — eu failed; release or stop")
 
-	released := formatApplyStatusComment(runningApply(), ops, true, nil, nil, nil, "")
+	released := formatApplyStatusComment(runningApply(), ops, true, nil, nil, nil, "", 0)
 	assert.NotContains(t, released, "paused — eu failed; release or stop")
 }
 
@@ -222,4 +223,20 @@ func TestGroupTasksByOperation_SkipsUnlinkedTasks(t *testing.T) {
 	})
 	require.Len(t, grouped[1], 2)
 	assert.Len(t, grouped, 1)
+}
+
+// Both the single- and multi-deployment status layouts advertise the current
+// automatic-refresh cadence beside the "Last updated" footer, so a reader on a
+// long apply knows how far apart updates are expected in either layout.
+func TestFormatApplyStatusComment_RendersUpdateCadence(t *testing.T) {
+	single := formatApplyStatusComment(runningApply(), nil, false, nil, nil, nil, "", 2*time.Minute)
+	assert.Contains(t, single, "updates every ~2m")
+
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier},
+		{ID: 2, Deployment: "us", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier},
+	}
+	multi := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, "", 2*time.Minute)
+	assert.Contains(t, multi, "**Deployments**:")
+	assert.Contains(t, multi, "updates every ~2m")
 }

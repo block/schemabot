@@ -150,15 +150,23 @@ func writeAttributionLineAt(sb *strings.Builder, verb, user, timestamp, suffix s
 	}
 }
 
-func writeLastUpdatedFooter(sb *strings.Builder, timestamp string) {
+func writeLastUpdatedFooter(sb *strings.Builder, timestamp string, updateCadence time.Duration) {
 	if !strings.HasSuffix(sb.String(), "\n") {
 		sb.WriteString("\n")
 	}
+	// State the current refresh cadence so a reader watching a long apply knows
+	// how long to expect between updates as the cadence slows with comment age,
+	// instead of reading a widening gap as a stall.
+	cadenceNote := ""
+	if updateCadence > 0 {
+		cadenceNote = fmt.Sprintf(" · updates every ~%s", formatDuration(updateCadence))
+	}
 	escapedTimestamp := html.EscapeString(timestamp)
-	fmt.Fprintf(sb, "\n_Last updated: <relative-time datetime=\"%s\">%s</relative-time> (%s)_\n",
+	fmt.Fprintf(sb, "\n_Last updated: <relative-time datetime=\"%s\">%s</relative-time> (%s)%s_\n",
 		escapeRelativeTimeDatetime(timestamp),
 		escapedTimestamp,
-		escapedTimestamp)
+		escapedTimestamp,
+		cadenceNote)
 }
 
 func escapeRelativeTimeDatetime(timestamp string) string {

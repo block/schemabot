@@ -81,3 +81,44 @@ func TestCommentContentKeyKeepsRevertCountdownLive(t *testing.T) {
 	assert.Contains(t, second, "Closes in 10m")
 	assert.NotEqual(t, CommentContentKey(first), CommentContentKey(second))
 }
+
+// A progress comment states its own refresh cadence beside the "Last updated"
+// footer, so a reader watching a long apply knows how far apart updates are
+// expected instead of reading a slowed cadence as a stall. Zero cadence
+// (terminal finalizations and one-shot renders) omits the note entirely.
+func TestLastUpdatedFooterShowsUpdateCadence(t *testing.T) {
+	withTemplateTimestamp(t, "2026-06-16 19:42:00 UTC")
+	data := ApplyStatusCommentData{
+		Database:      "testapp",
+		Environment:   "staging",
+		RequestedBy:   "octocat",
+		State:         state.Apply.Running,
+		UpdateCadence: 2 * time.Minute,
+	}
+
+	out := RenderApplyStatusComment(data)
+	assert.Contains(t, out, "(2026-06-16 19:42:00 UTC) · updates every ~2m_")
+
+	data.UpdateCadence = 0
+	out = RenderApplyStatusComment(data)
+	assert.Contains(t, out, "(2026-06-16 19:42:00 UTC)_")
+	assert.NotContains(t, out, "updates every")
+}
+
+// The cadence note is part of the visible content, so a cadence change alone
+// changes the content key: when the decay schedule moves to a slower rung, the
+// comment is edited once and its advertised cadence stays truthful.
+func TestCommentContentKeyChangesWithUpdateCadence(t *testing.T) {
+	withTemplateTimestamp(t, "2026-06-16 19:42:00 UTC")
+	render := func(cadence time.Duration) string {
+		return RenderApplyStatusComment(ApplyStatusCommentData{
+			Database:      "testapp",
+			Environment:   "staging",
+			RequestedBy:   "octocat",
+			State:         state.Apply.Running,
+			UpdateCadence: cadence,
+		})
+	}
+
+	assert.NotEqual(t, CommentContentKey(render(30*time.Second)), CommentContentKey(render(time.Minute)))
+}

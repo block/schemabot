@@ -22,7 +22,7 @@ func TestFormatApplyStatusComment_ShardedAttributionFromCaller(t *testing.T) {
 	oid := int64(1)
 	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: "-40", DDL: "ALTER TABLE `mutes` ADD INDEX a"}}
 
-	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil, "")
+	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil, "", 0)
 
 	assert.Contains(t, out, "by @morgo at", "attribution shows the clean username")
 	assert.NotContains(t, out, "github:", "the raw structured caller is not rendered")
@@ -100,7 +100,7 @@ func TestFormatApplyStatusComment_ShardedFailedSurfacesError(t *testing.T) {
 	}
 	tasks := []*storage.Task{task(1, 1, "-40"), task(2, 2, "40-80"), task(3, 3, "80-c0"), task(4, 4, "c0-")}
 
-	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, "")
+	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, "", 0)
 
 	assert.Contains(t, out, "## Schema Change Status", "uses the stable in-place status headline")
 	assert.Contains(t, out, "**Shards**:", "counts shards, not deployments")
@@ -127,7 +127,7 @@ func TestFormatApplyStatusComment_ShardedFailureFallsBackToTaskError(t *testing.
 	oid := int64(1)
 	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: "-40", DDL: "ALTER ...", ErrorMessage: gotZero}}
 
-	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil, "")
+	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil, "", 0)
 
 	assert.Contains(t, out, gotZero, "the task error is surfaced when the operation row has none")
 }
@@ -178,4 +178,20 @@ func TestBuildShardedApplyData_JoinsMultiTaskDDL(t *testing.T) {
 	require.Len(t, data.Cells, 1)
 	assert.Equal(t, "ALTER TABLE `mutes` ADD INDEX a\nALTER TABLE `mutes` ADD INDEX b", data.Cells[0].DDL,
 		"all non-empty task DDLs are joined in order")
+}
+
+// The sharded status layout advertises the current automatic-refresh cadence
+// beside the "Last updated" footer, matching the deployment-unit layouts.
+func TestFormatApplyStatusComment_ShardedRendersUpdateCadence(t *testing.T) {
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running,
+	}
+	op := &storage.ApplyOperation{ID: 1, ApplyID: 1, Deployment: "cake", OperationKey: "cdb_resolute_sharded/-40/mutes", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	oid := int64(1)
+	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: "-40", DDL: "ALTER TABLE `mutes` ADD INDEX a"}}
+
+	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil, "", 5*time.Minute)
+
+	assert.Contains(t, out, "**Shards**:", "the shard-unit layout is selected")
+	assert.Contains(t, out, "updates every ~5m")
 }

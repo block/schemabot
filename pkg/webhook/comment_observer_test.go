@@ -88,7 +88,7 @@ func TestCommentObserverRendersVSchemaFromEngineResumeState(t *testing.T) {
 
 	t.Run("progress comment shows the applying keyspace and diff", func(t *testing.T) {
 		body := observer(`{"vschema_status":"applying","vschema_diffs":[{"namespace":"commerce_sharded","diff":"+ \"xxhash\": {\"type\": \"xxhash\"}"}]}`).
-			formatStatusComment(psApply(state.Apply.Running), nil)
+			formatStatusComment(psApply(state.Apply.Running), nil, 0)
 		assert.Contains(t, body, "### VSchema")
 		assert.Contains(t, body, "**`commerce_sharded`**: Applying...")
 		assert.Contains(t, body, `+ "xxhash": {"type": "xxhash"}`)
@@ -104,19 +104,19 @@ func TestCommentObserverRendersVSchemaFromEngineResumeState(t *testing.T) {
 
 	t.Run("multi-keyspace renders each keyspace independently", func(t *testing.T) {
 		body := observer(`{"vschema_status":"applying","vschema_diffs":[{"namespace":"commerce","diff":"+ \"lookup\": {}"},{"namespace":"commerce_sharded","diff":"+ \"xxhash\": {}"}]}`).
-			formatStatusComment(psApply(state.Apply.Running), nil)
+			formatStatusComment(psApply(state.Apply.Running), nil, 0)
 		assert.Contains(t, body, "**`commerce`**: Applying...")
 		assert.Contains(t, body, "**`commerce_sharded`**: Applying...")
 	})
 
 	t.Run("no engine resume state renders no VSchema section", func(t *testing.T) {
-		body := observer("").formatStatusComment(psApply(state.Apply.Running), nil)
+		body := observer("").formatStatusComment(psApply(state.Apply.Running), nil, 0)
 		assert.NotContains(t, body, "### VSchema")
 	})
 
 	t.Run("non-PlanetScale apply skips VSchema projection", func(t *testing.T) {
 		body := observer(`{"vschema_status":"applying","vschema_diffs":[{"namespace":"x","diff":"+ y"}]}`).
-			formatStatusComment(runningApply(), nil)
+			formatStatusComment(runningApply(), nil, 0)
 		assert.NotContains(t, body, "### VSchema")
 	})
 }
@@ -129,7 +129,7 @@ func TestFormatStatusCommentRoutesMultiDeployment(t *testing.T) {
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Running},
 	}})
 
-	body := o.formatStatusComment(runningApply(), nil)
+	body := o.formatStatusComment(runningApply(), nil, 0)
 
 	assert.Contains(t, body, "**Deployments**: 1 completed, 1 running")
 	assert.Contains(t, body, "- ✅ eu — completed")
@@ -143,7 +143,7 @@ func TestFormatStatusCommentRoutesSingleDeployment(t *testing.T) {
 		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Running},
 	}})
 
-	body := o.formatStatusComment(runningApply(), nil)
+	body := o.formatStatusComment(runningApply(), nil, 0)
 
 	assert.Contains(t, body, "## Schema Change Status")
 	assert.NotContains(t, body, "**Deployments**:")
@@ -154,7 +154,7 @@ func TestFormatStatusCommentRoutesSingleDeployment(t *testing.T) {
 func TestFormatStatusCommentFallsBackOnLoadError(t *testing.T) {
 	o := newDispatchTestObserver(&stubApplyOperationStore{err: errors.New("db unavailable")})
 
-	body := o.formatStatusComment(runningApply(), nil)
+	body := o.formatStatusComment(runningApply(), nil, 0)
 
 	assert.Contains(t, body, "## Schema Change Status")
 	assert.NotContains(t, body, "**Deployments**:")
