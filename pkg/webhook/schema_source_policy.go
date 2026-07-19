@@ -160,7 +160,14 @@ func (h *Handler) shouldProcessSchemaConfig(ctx context.Context, repo string, pr
 			Repository: repo,
 			Status:     "skipped",
 		})
-		h.logger.Info("schema config is outside repo allowed_dirs and will be ignored",
+		// On an aggregate-role repo a config outside this deployment's
+		// allowed_dirs is routine fan-out — another deployment owns it. On any
+		// other repo nothing will ever act on the config, so warn.
+		logDropped := h.logger.Warn
+		if config.AggregateRoleForRepo(repo) != "" {
+			logDropped = h.logger.Info
+		}
+		logDropped("schema config is outside repo allowed_dirs and will be ignored",
 			"repo", repo, "pr", pr, "head_sha", headSHA,
 			"database", database, "database_type", databaseType,
 			"schema_path", schemaPath, "source", source)

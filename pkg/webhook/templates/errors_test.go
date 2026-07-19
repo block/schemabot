@@ -153,6 +153,18 @@ func TestRenderMultipleConfigsUsageExample(t *testing.T) {
 	assert.Contains(t, body, "*Requested by @octocat at 2026-07-16 18:56:00 UTC*")
 }
 
+func TestRenderUnmanagedSchemaConfigsNotice(t *testing.T) {
+	body := RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
+		{Database: "inventory", SchemaPath: "services/inventory/schema"},
+		{Database: "billing", SchemaPath: "services/billing/schema"},
+	})
+	assert.Contains(t, body, "## ⚠️ Schema Changes Not Managed by SchemaBot")
+	assert.Contains(t, body, "- `services/inventory/schema` — declares database `inventory`")
+	assert.Contains(t, body, "- `services/billing/schema` — declares database `billing`")
+	assert.Contains(t, body, "will **not** be planned or applied")
+	assert.Contains(t, body, "`allowed_dirs`")
+}
+
 func TestRenderInvalidEnv(t *testing.T) {
 	t.Run("lists the configured environments", func(t *testing.T) {
 		body := RenderInvalidEnv("apply", []string{"production", "staging"})

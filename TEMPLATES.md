@@ -947,6 +947,21 @@ type: mysql
 </details>
 
 <details>
+<summary><a name="unmanaged-schema-configs-notice"></a><strong>Unmanaged Schema Configs Notice</strong></summary>
+
+
+## ⚠️ Schema Changes Not Managed by SchemaBot
+
+This PR changes schema under the following path(s), which this SchemaBot instance is not configured to manage:
+
+- `services/inventory/schema` — declares database `inventory`
+
+These schema changes will **not** be planned or applied, and the SchemaBot checks on this PR do not cover them.
+
+If SchemaBot should manage them, ask a SchemaBot operator to add the directory to the database's `allowed_dirs` in the server config; otherwise remove these schema changes from this PR.
+</details>
+
+<details>
 <summary><a name="generic-error"></a><strong>Generic Error</strong></summary>
 
 
