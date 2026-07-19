@@ -6,6 +6,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/action"
 )
 
 // RenderRollbackMissingArguments renders the message posted when `schemabot rollback`
@@ -88,11 +89,17 @@ type CutoverCommandAcceptedData struct {
 }
 
 // RenderControlMissingApplyID renders the message posted when an apply-scoped
-// control command is invoked without the required apply ID.
-func RenderControlMissingApplyID(action string) string {
+// control command is invoked without the required apply ID. The usage line
+// carries every flag the command requires, so a volume command also shows its
+// mandatory `-v` level.
+func RenderControlMissingApplyID(command string) string {
+	usage := fmt.Sprintf("schemabot %s <apply-id> -e <environment>", command)
+	if command == action.Volume {
+		usage += fmt.Sprintf(" -v <%d-%d>", storage.MinVolume, storage.MaxVolume)
+	}
 	return fmt.Sprintf("## Missing Apply ID\n\n"+
-		"Usage: `schemabot %s <apply-id> -e <environment>`\n\n"+
-		"Use `schemabot status -e <environment>` to find the apply ID.", action)
+		"Usage: `%s`\n\n"+
+		"Use `schemabot status -e <environment>` to find the apply ID.", usage)
 }
 
 // RenderVolumeInvalidLevel renders the message posted when a volume command
@@ -291,6 +298,12 @@ func PreviewCommentVolumeCommandAccepted() string {
 // volume command carries a missing or invalid level.
 func PreviewCommentVolumeInvalidLevel() string {
 	return RenderVolumeInvalidLevel()
+}
+
+// PreviewCommentVolumeMissingApplyID renders the usage comment posted when a
+// volume command is missing the required apply ID.
+func PreviewCommentVolumeMissingApplyID() string {
+	return RenderControlMissingApplyID(action.Volume)
 }
 
 // VolumeSupersededProgressData contains data for freezing a progress comment
