@@ -88,6 +88,18 @@ type txBeginner interface {
 // holds while waiting for the data plane to leave stopped after a start. A
 // stale heartbeat there means the driver died mid-resume, and recovery must be
 // able to reclaim and finish driving it to a terminal state.
+//
+// The revert-phase states (reverting, skipping_revert) are included because an
+// apply can dwell in them while the engine works: a driver killed by routine
+// pod churn mid-revert must not strand the apply non-terminal forever. Recovery
+// re-attaches to the engine (the deploy request keeps reverting or finalizing
+// server-side) and drives the apply to its terminal state; the durable
+// revert/skip-revert signals mean a re-claim never re-issues the command.
+//
+// Every non-terminal state an apply can dwell in must appear here (or have its
+// own claim arm, like pending and stopped-with-start): the stale-heartbeat
+// re-claim is the only recovery path after a driver dies, and a dwellable state
+// missing from this list is orphaned by any pod restart.
 func claimableApplyStates() []string {
 	return []string{
 		state.Apply.Running,
@@ -99,6 +111,8 @@ func claimableApplyStates() []string {
 		"recovering_cutover",
 		state.Apply.CuttingOver,
 		state.Apply.RevertWindow,
+		state.Apply.Reverting,
+		state.Apply.SkippingRevert,
 		state.Apply.PreparingBranch,
 		state.Apply.ApplyingBranchChanges,
 		state.Apply.ValidatingBranch,
