@@ -145,15 +145,16 @@ func (h *Handler) executeApply(
 	// Set observer before queuing the apply so ExecuteApply can register it on
 	// the durable apply row before operator dispatch starts.
 	observer := NewCommentObserver(CommentObserverConfig{
-		GHClient:       factory,
-		Storage:        h.service.Storage(),
-		Repo:           repo,
-		PR:             pr,
-		InstallationID: installationID,
-		DeferCutover:   options["defer_cutover"] == "true",
-		SupportChannel: h.supportChannel(),
-		Tenant:         h.deploymentTenant(),
-		Logger:         h.logger,
+		GHClient:        factory,
+		Storage:         h.service.Storage(),
+		Repo:            repo,
+		PR:              pr,
+		InstallationID:  installationID,
+		DeferCutover:    options["defer_cutover"] == "true",
+		SupportChannel:  h.supportChannel(),
+		MinEditInterval: h.progressCommentMinEditInterval(),
+		Tenant:          h.deploymentTenant(),
+		Logger:          h.logger,
 		OnTerminalHook: func(apply *storage.Apply) {
 			// refreshChecksForTerminalApply routes a completed rollback straight
 			// to action_required. The observer registered here can be consumed by

@@ -372,15 +372,16 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 	}
 
 	observer := NewCommentObserver(CommentObserverConfig{
-		GHClient:       factory,
-		Storage:        h.service.Storage(),
-		Repo:           repo,
-		PR:             pr,
-		InstallationID: installationID,
-		DeferCutover:   options["defer_cutover"] == "true",
-		SupportChannel: h.supportChannel(),
-		Tenant:         h.deploymentTenant(),
-		Logger:         h.logger,
+		GHClient:        factory,
+		Storage:         h.service.Storage(),
+		Repo:            repo,
+		PR:              pr,
+		InstallationID:  installationID,
+		DeferCutover:    options["defer_cutover"] == "true",
+		SupportChannel:  h.supportChannel(),
+		MinEditInterval: h.progressCommentMinEditInterval(),
+		Tenant:          h.deploymentTenant(),
+		Logger:          h.logger,
 		OnTerminalHook: func(a *storage.Apply) {
 			// refreshChecksForTerminalApply routes a completed rollback straight
 			// to action_required so the stored check state never passes through
@@ -456,7 +457,8 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 	// Post initial progress comment for the observer to edit. VSchema status is
 	// omitted on this first comment — the observer refreshes it from engine
 	// display metadata on the next progress tick.
-	progressBody := formatProgressComment(apply, nil, nil, h.deploymentTenant(), activeInterval)
+	progressBody := formatProgressComment(apply, nil, nil, h.deploymentTenant(),
+		max(activeInterval, h.progressCommentMinEditInterval()))
 	h.postInitialProgressComment(ctx, repo, pr, installationID, apply, progressBody)
 }
 

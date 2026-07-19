@@ -16,8 +16,10 @@
 - [Pending Drops](#pending-drops)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
+- [Progress Comment Edit Cadence](#progress-comment-edit-cadence)
 - [Repository Allowlist](#repository-allowlist)
 - [PR Checks Gate](#pr-checks-gate)
+- [Base Branch Schema Freshness](#base-branch-schema-freshness)
 - [Review Gate](#review-gate)
 - [Authentication](#authentication)
   - [OIDC (Bearer tokens)](#oidc-bearer-tokens)
@@ -365,6 +367,33 @@ support_channel:
 Both `name` and `url` are required when `support_channel` is configured. The
 URL must be an absolute `http` or `https` link with no credentials, whitespace,
 or Markdown link delimiters. When omitted, SchemaBot comments are unchanged.
+
+## Progress Comment Edit Cadence
+
+While an apply runs, SchemaBot edits the PR progress comment on a built-in
+cadence that decays with the age of the comment: young comments update every
+few seconds, and long-running applies settle to an edit every few minutes.
+Each edit consumes GitHub API budget, so a server hosting many concurrent
+long-running applies can set a floor over that cadence:
+
+```yaml
+progress_comment_min_edit_interval: 2m  # default: unset (no floor)
+```
+
+The value is a Go duration string (`30s`, `2m`, `10m`). When set, no progress
+comment is edited more often than this interval, regardless of the built-in
+cadence. State changes (for example `Running` → `Waiting for Cutover`) always
+publish immediately — the floor spaces out progress-percentage noise, not
+state transitions.
+
+The progress comment states its effective cadence beside its "Last updated"
+footer (`updates every ~2m`), so PR readers see the configured floor rather
+than wondering why updates slowed down.
+
+Leave it unset for normal operation. Set it during a GitHub rate-limit
+incident, or permanently on servers that host many concurrent long-running
+applies. Users who need high-resolution progress can watch the apply from the
+SchemaBot CLI, which polls the server directly and is unaffected.
 
 ## Repository Allowlist
 

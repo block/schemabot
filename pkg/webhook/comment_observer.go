@@ -31,7 +31,11 @@ type CommentObserver struct {
 	deferCutover   bool
 	supportChannel api.SupportChannelConfig
 	tenant         string
-	logger         interface {
+
+	// minEditInterval is the operator-configured floor over the age-decayed
+	// progress-comment edit cadence. Zero means no floor.
+	minEditInterval time.Duration
+	logger          interface {
 		Info(msg string, args ...any)
 		Error(msg string, args ...any)
 	}
@@ -192,6 +196,12 @@ type CommentObserverConfig struct {
 	// deployments.
 	Tenant string
 
+	// MinEditInterval is the operator-configured floor over the age-decayed
+	// progress-comment edit cadence (server config
+	// progress_comment_min_edit_interval). Zero means no floor. State-change
+	// updates bypass the cadence and are unaffected.
+	MinEditInterval time.Duration
+
 	Logger interface {
 		Info(msg string, args ...any)
 		Error(msg string, args ...any)
@@ -252,20 +262,21 @@ func (o *CommentObserver) logInfo(apply *storage.Apply, msg string, args ...any)
 func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 	clk := clock.Default(cfg.Clock)
 	return &CommentObserver{
-		ghClient:       cfg.GHClient,
-		stor:           cfg.Storage,
-		repo:           cfg.Repo,
-		pr:             cfg.PR,
-		installationID: cfg.InstallationID,
-		applyID:        cfg.ApplyID,
-		applyLease:     cfg.ApplyLease,
-		deferCutover:   cfg.DeferCutover,
-		supportChannel: cfg.SupportChannel,
-		tenant:         cfg.Tenant,
-		logger:         cfg.Logger,
-		OnTerminalHook: cfg.OnTerminalHook,
-		clock:          clk,
-		lastWritten:    map[int64]writtenContent{},
+		ghClient:        cfg.GHClient,
+		stor:            cfg.Storage,
+		repo:            cfg.Repo,
+		pr:              cfg.PR,
+		installationID:  cfg.InstallationID,
+		applyID:         cfg.ApplyID,
+		applyLease:      cfg.ApplyLease,
+		deferCutover:    cfg.DeferCutover,
+		supportChannel:  cfg.SupportChannel,
+		minEditInterval: cfg.MinEditInterval,
+		tenant:          cfg.Tenant,
+		logger:          cfg.Logger,
+		OnTerminalHook:  cfg.OnTerminalHook,
+		clock:           clk,
+		lastWritten:     map[int64]writtenContent{},
 	}
 }
 
@@ -395,25 +406,36 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 // edits per progressEditDecaySchedule, keyed to the age of the live progress
 // comment rather than the apply: a rotation posts a fresh comment because
 // someone just acted on the apply, so the new comment starts back at the
-// fastest cadence. Called with o.mu held; the first call anchors the age to
-// its own tick time.
+// fastest cadence. The operator-configured minEditInterval floors the
+// schedule, so during an incident a deployment can slow every apply's
+// progress edits at once. Called with o.mu held; the first call anchors the
+// age to its own tick time.
 func (o *CommentObserver) progressEditInterval(now time.Time) time.Duration {
 	if o.progressCommentSince.IsZero() {
 		o.progressCommentSince = now
 	}
 	age := now.Sub(o.progressCommentSince)
+	interval := progressEditDecayMaxInterval
 	for _, step := range progressEditDecaySchedule {
 		if age < step.age {
-			return step.interval
+			interval = step.interval
+			break
 		}
 	}
-	return progressEditDecayMaxInterval
+	if o.minEditInterval > interval {
+		interval = o.minEditInterval
+	}
+	return interval
 }
 
 // freshProgressCadence is the update cadence advertised on a newly posted
 // progress comment. A rotation resets the comment-age anchor, so the fresh
-// comment starts back at the fastest rung of the decay schedule.
+// comment starts back at the fastest rung of the decay schedule — floored by
+// the operator-configured minimum, which governs fresh comments too.
 func (o *CommentObserver) freshProgressCadence() time.Duration {
+	if o.minEditInterval > activeInterval {
+		return o.minEditInterval
+	}
 	return activeInterval
 }
 
