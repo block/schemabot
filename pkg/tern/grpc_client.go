@@ -953,6 +953,11 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	}
 	resp, err := c.client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: remoteID, Environment: apply.Environment})
 	if err != nil {
+		if completed, completeErr := c.completeRemoteCancelFromTerminalProgress(ctx, apply, controlReq, scope); completeErr == nil && completed {
+			return true, nil
+		} else if completeErr != nil {
+			return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: %w; terminal progress reconciliation also failed: %w", apply.ApplyIdentifier, remoteID, err, completeErr)
+		}
 		return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 	}
 	if resp == nil || !resp.Accepted {
@@ -1062,6 +1067,74 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
 		fmt.Sprintf("Remote stop request completed from terminal progress after stop error%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+	return true, nil
+}
+
+// completeRemoteCancelFromTerminalProgress reconciles a failed remote cancel
+// against the remote's actual progress. A remote apply that is already
+// terminal (for example a cancel consumed on a previous drive before the
+// driver could persist it) rejects a re-sent Cancel; that rejection means the
+// requested outcome already happened, so the drive must reconcile the stored
+// apply to the remote's terminal state and complete the durable cancel request
+// instead of failing the resume and leaving the apply claimable forever. A
+// remote that is still active keeps the durable request pending for the next
+// drive to retry.
+func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, scope applyTaskScope) (bool, error) {
+	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     scope.remoteApplyID(apply),
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		slog.Warn("remote gRPC cancel error could not be reconciled from progress",
+			"apply_id", apply.ApplyIdentifier,
+			"external_id", apply.ExternalID,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", controlRequestCaller(controlReq),
+			"error", err)
+		return false, nil
+	}
+	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE || !isTerminalProtoState(progress.State) {
+		slog.Warn("remote gRPC cancel error found nonterminal progress; durable cancel request remains pending for operator retry",
+			"apply_id", apply.ApplyIdentifier,
+			"external_id", apply.ExternalID,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", controlRequestCaller(controlReq),
+			"remote_state", progress.State.String(),
+			"remote_state_number", int32(progress.State))
+		return false, nil
+	}
+	remoteState := ProtoStateToStorage(progress.State)
+	if remoteState == "" {
+		return false, fmt.Errorf("sync remote gRPC cancel for apply %s remote %s after cancel error: unmapped remote state %s", apply.ApplyIdentifier, apply.ExternalID, remoteApplyStateDescription(progress.State))
+	}
+	now := time.Now()
+	priorState, priorStartedAt, priorUpdatedAt := apply.State, apply.StartedAt, apply.UpdatedAt
+	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
+		apply.StartedAt = &now
+	}
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
+	apply.UpdatedAt = now
+	if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
+		return false, err
+	}
+	// An operation-only drive owns only its operation: the apply-level cancel
+	// request is shared across siblings and completed by the operator projection
+	// once the parent derives terminal. Leave it pending here and restore the
+	// in-memory parent apply fields the driver does not own, so this operation's
+	// terminal remote state does not leak onto the shared apply and let a later
+	// cancel pass treat the parent as terminal.
+	if scope.suppressesDirectParentApplyWrites() {
+		apply.State, apply.StartedAt, apply.UpdatedAt = priorState, priorStartedAt, priorUpdatedAt
+		logOperationDriveLeavesParentCancel(apply, scope)
+		return true, nil
+	}
+	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
+		return false, err
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested,
+		fmt.Sprintf("Remote cancel request completed from terminal progress after cancel error%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 	return true, nil
 }
 

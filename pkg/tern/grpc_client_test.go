@@ -526,6 +526,7 @@ type capturingTernServer struct {
 	progressError     string
 	progressErr       error
 	startErr          error
+	cancelErr         error
 	cutoverErr        error
 	cutoverAccepted   bool
 	cutoverMessage    string
@@ -573,7 +574,11 @@ func (s *capturingTernServer) Stop(_ context.Context, req *ternv1.StopRequest) (
 func (s *capturingTernServer) Cancel(_ context.Context, req *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
 	s.mu.Lock()
 	s.cancelApplyID = req.ApplyId
+	err := s.cancelErr
 	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	return &ternv1.CancelResponse{Accepted: true}, nil
 }
 
@@ -2021,6 +2026,191 @@ func TestGRPCClient_ProcessPendingCancelOperationLeavesApplyCancelPending(t *tes
 	require.NoError(t, err)
 	assert.True(t, handled)
 	assert.Equal(t, "remote-op-west", server.getCancelApplyID())
+	assert.Equal(t, state.Task.Cancelled, task.State)
+	assert.Equal(t, state.Apply.Running, apply.State)
+	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.NotNil(t, cancelReq)
+}
+
+func TestGRPCClient_ProcessPendingCancelReconcilesAlreadyTerminalRemote(t *testing.T) {
+	// A remote apply whose cancel was already consumed (for example on a prior
+	// drive that lost its lease before persisting) rejects a re-sent Cancel.
+	// The drive must treat that rejection as "the requested outcome already
+	// happened": reconcile the stored apply to the remote terminal state and
+	// complete the durable cancel request, so the apply reaches a terminal
+	// state instead of failing every future resume.
+	server := &capturingTernServer{
+		cancelErr:        status.Error(codes.Internal, "apply remote-grpc-cancel is already terminal (state: cancelled)"),
+		progressState:    ternv1.State_STATE_CANCELLED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "users",
+			Status:    state.Task.Cancelled,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-cancel",
+		ExternalID:      "remote-grpc-cancel",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             11,
+		TaskIdentifier: "task-users",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	storedApply := *apply
+	applyStore := &mockApplyStore{apply: &storedApply}
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, state.Apply.Cancelled, applyStore.apply.State)
+	assert.Equal(t, state.Task.Cancelled, task.State)
+	assert.True(t, hasLogEvent(logs.logs, storage.LogEventCancelRequested))
+	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, cancelReq)
+}
+
+func TestGRPCClient_ProcessPendingCancelKeepsRequestWhenRemoteStillActive(t *testing.T) {
+	// A cancel rejection with the remote still actively running is a real
+	// failure: the durable cancel request must stay pending for the next drive
+	// to retry, and the stored apply must not be marked terminal.
+	server := &capturingTernServer{
+		cancelErr:        status.Error(codes.Unavailable, "data plane restarting"),
+		progressState:    ternv1.State_STATE_RUNNING,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "users",
+			Status:    state.Task.Running,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-cancel",
+		ExternalID:      "remote-grpc-cancel",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	storedApply := *apply
+	applyStore := &mockApplyStore{apply: &storedApply}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.Error(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, state.Apply.Running, applyStore.apply.State)
+	cancelReq, getErr := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, getErr)
+	assert.NotNil(t, cancelReq)
+}
+
+func TestGRPCClient_ProcessPendingCancelAlreadyTerminalRemoteLeavesApplyCancelPendingForOperation(t *testing.T) {
+	// The already-terminal reconcile must respect operation-drive ownership: a
+	// multi-deployment apply has one durable cancel request shared by every
+	// deployment, so an operation drive reconciling its own already-cancelled
+	// remote must cancel only its operation's tasks and leave both the parent
+	// apply state and the shared cancel request for the siblings.
+	server := &capturingTernServer{
+		cancelErr:        status.Error(codes.Internal, "apply remote-op-west is already terminal (state: cancelled)"),
+		progressState:    ternv1.State_STATE_CANCELLED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "users",
+			Status:    state.Task.Cancelled,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-multi-op-cancel",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	operationID := int64(42)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		Namespace:        "default",
+		TableName:        "users",
+		State:            state.Task.Running,
+	}
+	operation := &storage.ApplyOperation{ID: operationID, ApplyID: apply.ID, Deployment: "west", State: state.ApplyOperation.Running, EngineResumeContext: "remote-op-west"}
+	operationStore := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: operation,
+		43:          {ID: 43, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.Running, EngineResumeContext: "remote-op-east"},
+	}}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	storedApply := *apply
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+		operations:      operationStore,
+	}
+	scope := applyTaskScope{applyOperationID: operationID, operation: operation, multiOperation: true}
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, scope)
+	require.NoError(t, err)
+	assert.True(t, handled)
 	assert.Equal(t, state.Task.Cancelled, task.State)
 	assert.Equal(t, state.Apply.Running, apply.State)
 	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
