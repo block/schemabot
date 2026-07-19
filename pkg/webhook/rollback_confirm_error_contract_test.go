@@ -192,7 +192,7 @@ func TestRollbackConfirmCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "a transient lock list read failure must stay retryable for a durable driver")
 		body := requireComment(t, comments, "lock list failure comment")
 		assert.Contains(t, body, "Failed to resolve the pending rollback plan.")
-		assert.Regexp(t, "share error reference `[0-9a-f]{8}` with your SchemaBot operators", body)
+		assert.Regexp(t, "report error reference `[0-9a-f]{8}`", body)
 		assert.NotContains(t, body, "list locks",
 			"raw error text must never render in PR markdown")
 	})
@@ -212,7 +212,7 @@ func TestRollbackConfirmCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "a transient pinned-plan read failure must stay retryable, not become the command's answer")
 		body := requireComment(t, comments, "pinned plan read failure comment")
 		assert.Contains(t, body, "Failed to resolve the pending rollback plan.")
-		assert.Regexp(t, "share error reference `[0-9a-f]{8}` with your SchemaBot operators", body)
+		assert.Regexp(t, "report error reference `[0-9a-f]{8}`", body)
 		assert.NotContains(t, body, "load rollback plan",
 			"raw error text must never render in PR markdown")
 	})

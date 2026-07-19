@@ -79,14 +79,14 @@ func newErrorReference() string {
 // tells the user what to do next, and the error reference ties the report to
 // the server-side log line where the caller recorded the raw error.
 func internalErrorDetail(summary, errorRef string) string {
-	return summary + " This is an internal SchemaBot error, not a problem with your schema change. Retry the command; if it keeps failing, share error reference `" + errorRef + "` with your SchemaBot operators."
+	return summary + " Internal SchemaBot error — retry. If it keeps failing, report error reference `" + errorRef + "`."
 }
 
 // internalErrorDetailNoRetry is internalErrorDetail for failures where
 // retrying the command would be wrong — the command was already accepted and
 // only a follow-up step (such as a status-check update) failed.
 func internalErrorDetailNoRetry(summary, errorRef string) string {
-	return summary + " This is an internal SchemaBot error. Share error reference `" + errorRef + "` with your SchemaBot operators."
+	return summary + " Internal SchemaBot error — report error reference `" + errorRef + "`."
 }
 
 // userFacingError maps an execution error to the text rendered on the PR.

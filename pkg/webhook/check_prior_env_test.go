@@ -148,7 +148,7 @@ func TestCheckPriorEnvViaLocalReturnsStorageError(t *testing.T) {
 	case body := <-comments:
 		assert.Contains(t, body, "Apply Blocked")
 		assert.Contains(t, body, "Could not verify staging status")
-		assert.Regexp(t, "share error reference `[0-9a-f]{8}` with your SchemaBot operators", body)
+		assert.Regexp(t, "report error reference `[0-9a-f]{8}`", body)
 		assert.NotContains(t, body, "storage read failed",
 			"raw error text must never render in PR markdown")
 	case <-time.After(2 * time.Second):

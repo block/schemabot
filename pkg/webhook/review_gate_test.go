@@ -26,7 +26,7 @@ func TestReviewGateErrorDetailTeamMembership(t *testing.T) {
 	detail := reviewGateErrorDetail(err, "ab12cd34")
 
 	assert.Contains(t, detail, "Review gate check failed")
-	assert.Contains(t, detail, "share error reference `ab12cd34` with your SchemaBot operators")
+	assert.Contains(t, detail, "report error reference `ab12cd34`")
 	assert.Contains(t, detail, "GitHub App can read organization members")
 	assert.NotContains(t, detail, "expand team @octocat/schema-admins",
 		"raw error text must never render in PR markdown")
@@ -36,7 +36,7 @@ func TestReviewGateErrorDetailGeneric(t *testing.T) {
 	detail := reviewGateErrorDetail(assert.AnError, "ab12cd34")
 
 	assert.Contains(t, detail, "Review gate check failed")
-	assert.Contains(t, detail, "share error reference `ab12cd34` with your SchemaBot operators")
+	assert.Contains(t, detail, "report error reference `ab12cd34`")
 	assert.NotContains(t, detail, "GitHub App can read organization members")
 	assert.NotContains(t, detail, assert.AnError.Error(),
 		"raw error text must never render in PR markdown")
@@ -602,7 +602,7 @@ func TestEnforceReviewGate(t *testing.T) {
 		select {
 		case body := <-comments:
 			assert.Contains(t, body, "Review gate check failed.")
-			assert.Regexp(t, "share error reference `[0-9a-f]{8}` with your SchemaBot operators", body)
+			assert.Regexp(t, "report error reference `[0-9a-f]{8}`", body)
 			assert.NotContains(t, body, "Resource not accessible", "raw GitHub error text must never render in PR markdown")
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for evaluation-failure comment")

@@ -2090,11 +2090,10 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "— Staging")
-		assert.Contains(t, result, "Unable to verify PR check statuses")
-		assert.Contains(t, result, "This is an internal SchemaBot error, not a problem with your schema change")
+		assert.Contains(t, result, "Unable to verify PR check statuses — internal SchemaBot error")
 		assert.NotContains(t, result, "get combined commit status",
 			"raw GitHub API error text must not render on the PR")
-		assert.Contains(t, result, "Retry; if it keeps failing, share error reference `ab12cd34` with your SchemaBot operators:\n```\nschemabot apply -e staging\n```",
+		assert.Contains(t, result, "Retry; if it keeps failing, report error reference `ab12cd34`:\n```\nschemabot apply -e staging\n```",
 			"retry command must be inside a fenced code block immediately after the retry copy")
 	})
 
@@ -2156,8 +2155,8 @@ func TestRenderApplyBlockedByPriorEnvCheckError(t *testing.T) {
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "Could not verify staging status: failed to fetch PR details.")
-		assert.Contains(t, result, "This is an internal SchemaBot error, not a problem with your schema change.")
-		assert.Contains(t, result, "Retry the apply command; if it keeps failing, share error reference `ab12cd34` with your SchemaBot operators.")
+		assert.Contains(t, result, "Internal SchemaBot error — retry the apply command.")
+		assert.Contains(t, result, "If it keeps failing, report error reference `ab12cd34`.")
 	})
 
 	t.Run("each reason variant produces matching body", func(t *testing.T) {
@@ -2168,7 +2167,7 @@ func TestRenderApplyBlockedByPriorEnvCheckError(t *testing.T) {
 	})
 
 	t.Run("full body is stable", func(t *testing.T) {
-		expected := "## ❌ Apply Blocked\n\nCould not verify staging status: failed to create GitHub client. This is an internal SchemaBot error, not a problem with your schema change.\n\nRetry the apply command; if it keeps failing, share error reference `ab12cd34` with your SchemaBot operators.\n" + supportChannelOfferMarker + "\n"
+		expected := "## ❌ Apply Blocked\n\nCould not verify staging status: failed to create GitHub client. Internal SchemaBot error — retry the apply command. If it keeps failing, report error reference `ab12cd34`.\n" + supportChannelOfferMarker + "\n"
 
 		assert.Equal(t, expected, RenderApplyBlockedByPriorEnvCheckError("staging", "create GitHub client", "ab12cd34"))
 	})

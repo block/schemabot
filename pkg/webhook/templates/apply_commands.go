@@ -624,8 +624,8 @@ func RenderApplyBlockedByCheckStatusError(environment string, err error, details
 	}
 
 	if err != nil {
-		sb.WriteString("Unable to verify PR check statuses. This is an internal SchemaBot error, not a problem with your schema change.\n\n")
-		fmt.Fprintf(&sb, "Retry; if it keeps failing, share error reference `%s` with your SchemaBot operators:\n", errorRef)
+		sb.WriteString("Unable to verify PR check statuses — internal SchemaBot error.\n\n")
+		fmt.Fprintf(&sb, "Retry; if it keeps failing, report error reference `%s`:\n", errorRef)
 	} else {
 		// Defensive: callers should always pass a non-nil error here, but
 		// referencing an error that was never surfaced would be confusing if
@@ -708,8 +708,7 @@ func RenderApplyBlockedByPriorEnvCheckError(priorEnv, reason, errorRef string) s
 	// an unchanged retry can succeed — so this is a failed verification the
 	// apply fail-closed on, not a request SchemaBot refuses to perform.
 	sb.WriteString("## " + glyph.Failed + " Apply Blocked\n\n")
-	fmt.Fprintf(&sb, "Could not verify %s status: failed to %s. This is an internal SchemaBot error, not a problem with your schema change.\n\n", priorEnv, reason)
-	fmt.Fprintf(&sb, "Retry the apply command; if it keeps failing, share error reference `%s` with your SchemaBot operators.", errorRef)
+	fmt.Fprintf(&sb, "Could not verify %s status: failed to %s. Internal SchemaBot error — retry the apply command. If it keeps failing, report error reference `%s`.\n", priorEnv, reason, errorRef)
 
 	return offerSupportChannel(sb.String())
 }

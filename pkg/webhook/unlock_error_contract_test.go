@@ -145,7 +145,7 @@ func TestUnlockCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "a failed GitHub read during inference must stay retryable for a durable driver")
 		body := requireComment(t, comments, "inference failure comment")
 		assert.Contains(t, body, "Failed to infer the database for force unlock.")
-		assert.Regexp(t, "share error reference `[0-9a-f]{8}` with your SchemaBot operators", body)
+		assert.Regexp(t, "report error reference `[0-9a-f]{8}`", body)
 	})
 
 	t.Run("lock lookup failure is retryable", func(t *testing.T) {
