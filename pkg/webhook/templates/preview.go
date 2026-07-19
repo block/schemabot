@@ -861,13 +861,13 @@ func PreviewCommentApplyBlockedByCheckStatusError() string {
 		&CheckStatusAccessDetails{
 			GitHubApp:          "schemabot-app",
 			MissingPermissions: []string{"Checks: Read", "Commit statuses: Read"},
-		})
+		}, "ab12cd34")
 }
 
 // PreviewCommentApplyBlockedByPriorEnvCheckError renders a sample fail-closed
 // block for a prior-environment check that could not be read.
 func PreviewCommentApplyBlockedByPriorEnvCheckError() string {
-	return RenderApplyBlockedByPriorEnvCheckError("staging", "query check runs")
+	return RenderApplyBlockedByPriorEnvCheckError("staging", "query check runs", "ab12cd34")
 }
 
 // PreviewCommentApplyBlockedByMissingPriorEnvCheck renders a sample block for

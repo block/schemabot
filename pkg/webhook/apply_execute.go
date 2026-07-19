@@ -76,11 +76,12 @@ func (h *Handler) executeApply(
 	}
 	freshPRInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
+		errorRef := newErrorReference()
 		h.logger.Error("apply rejected: failed final PR freshness fetch",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
-			"environment", environment, "action", actionName, "error", err)
+			"environment", environment, "action", actionName, "error_ref", errorRef, "error", err)
 		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-			"SchemaBot could not verify the current PR state. The apply was rejected; retry the command.")
+			internalErrorDetail("SchemaBot could not verify the current PR state, so the apply was rejected.", errorRef))
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final PR freshness fetch failure")
 		return
 	}
@@ -346,9 +347,10 @@ func (h *Handler) executeApply(
 
 	// Update stored check state to in_progress (transitions action_required to in_progress).
 	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply); err != nil {
+		errorRef := newErrorReference()
 		h.logger.Error("failed to mark check in_progress for apply",
-			append(apply.LogAttrs(), "error", err)...)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, internalErrorDetail("Apply was accepted, but SchemaBot could not update the required status check."))
+			append(apply.LogAttrs(), "error_ref", errorRef, "error", err)...)
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, internalErrorDetailNoRetry("Apply was accepted, but SchemaBot could not update the required status check.", errorRef))
 		return
 	}
 }

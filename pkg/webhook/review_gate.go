@@ -40,11 +40,12 @@ type ReviewGateResult struct {
 func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, environment, requestedBy, commandName string, suppressRetryComments bool) (blocked bool, err error) {
 	gateResult, err := h.checkReviewGate(ctx, client, repo, pr, schemaResult.Database, schemaResult.SchemaPath)
 	if err != nil {
+		errorRef := newErrorReference()
 		h.logger.Error("review gate check failed", "repo", repo, "pr", pr,
 			"database", schemaResult.Database, "environment", environment,
-			"command", commandName, "error", err)
+			"command", commandName, "error_ref", errorRef, "error", err)
 		if !suppressRetryComments {
-			h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, reviewGateErrorDetail(err))
+			h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, reviewGateErrorDetail(err, errorRef))
 		}
 		return false, fmt.Errorf("review gate check %s#%d: %w", repo, pr, err)
 	}
@@ -66,8 +67,8 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 // the PR. The underlying errors wrap GitHub API calls (reviews, teams,
 // CODEOWNERS fetches) whose raw text stays in the server logs; the one cause
 // with a user-side remedy gets its guidance appended.
-func reviewGateErrorDetail(err error) string {
-	detail := internalErrorDetail("Review gate check failed.")
+func reviewGateErrorDetail(err error, errorRef string) string {
+	detail := internalErrorDetail("Review gate check failed.", errorRef)
 	if errors.Is(err, ghclient.ErrTeamMembershipUnreadable) {
 		detail += " If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership."
 	}

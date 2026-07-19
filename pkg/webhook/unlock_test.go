@@ -157,7 +157,7 @@ func TestUnlockRefusedWhenActiveApplyLookupFails(t *testing.T) {
 	select {
 	case body := <-comments:
 		assert.Contains(t, body, "Failed to verify active applies for database `orders`")
-		assert.Contains(t, body, "See SchemaBot server logs for details")
+		assert.Regexp(t, "share error reference `[0-9a-f]{8}` with your SchemaBot operators", body)
 		assert.Contains(t, body, "No locks were released")
 		assert.NotContains(t, body, "storage read failed")
 	case <-time.After(2 * time.Second):

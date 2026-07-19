@@ -17,13 +17,14 @@ import (
 // Tern, or other unexpected errors) log at Error so operators investigate
 // them, while operator-actionable rejections such as state conflicts log at
 // Warn.
-func (h *Handler) logControlCommandError(command, repo string, pr int, applyID, environment, requestedBy string, err error) {
+func (h *Handler) logControlCommandError(command, repo string, pr int, applyID, environment, requestedBy string, errorRef string, err error) {
 	attrs := []any{
 		"repo", repo,
 		"pr", pr,
 		"apply_id", applyID,
 		"environment", environment,
 		"requested_by", requestedBy,
+		"error_ref", errorRef,
 		"error", err,
 	}
 	if api.IsInternalControlError(err) {
@@ -37,14 +38,14 @@ func (h *Handler) logControlCommandError(command, repo string, pr int, applyID, 
 // rendered on the PR. Typed rejections carry guardrail wording authored for
 // the user and render as-is; internal failures (storage, Tern transport, or
 // any untyped error) never render raw — logControlCommandError has already
-// recorded the raw error, so the comment points at the server logs. Known
-// transport failures keep their fixed retry guidance.
-func controlCommandErrorDetail(command string, err error) string {
+// recorded the raw error under the same error reference the comment shows.
+// Known transport failures keep their fixed retry guidance.
+func controlCommandErrorDetail(command string, err error, errorRef string) string {
 	if message, ok := mappedUserFacingError(err); ok {
 		return message
 	}
 	if api.IsInternalControlError(err) {
-		return internalErrorDetail("Failed to execute the " + command + " command.")
+		return internalErrorDetail("Failed to execute the "+command+" command.", errorRef)
 	}
 	return err.Error()
 }
@@ -100,6 +101,7 @@ func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int
 	}
 	apply, err := applyStore.GetByApplyIdentifier(ctx, result.ApplyID)
 	if err != nil {
+		errorRef := newErrorReference()
 		h.logger.Error("failed to load apply for PR control command",
 			"command", command,
 			"repo", repo,
@@ -107,8 +109,9 @@ func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int
 			"apply_id", result.ApplyID,
 			"environment", result.Environment,
 			"requested_by", requestedBy,
+			"error_ref", errorRef,
 			"error", err)
-		h.postCommandError(repo, pr, installationID, command, result.Environment, requestedBy, internalErrorDetail("Failed to look up the apply."))
+		h.postCommandError(repo, pr, installationID, command, result.Environment, requestedBy, internalErrorDetail("Failed to look up the apply.", errorRef))
 		return nil, false
 	}
 	if apply == nil {
@@ -210,8 +213,9 @@ func runControlCommand[R any](
 		Caller:      caller,
 	})
 	if err != nil {
-		h.logControlCommandError(actionName, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
-		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, controlCommandErrorDetail(actionName, err))
+		errorRef := newErrorReference()
+		h.logControlCommandError(actionName, repo, pr, result.ApplyID, result.Environment, requestedBy, errorRef, err)
+		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, controlCommandErrorDetail(actionName, err, errorRef))
 		return nil
 	}
 	if resp == nil {

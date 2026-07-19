@@ -37,7 +37,7 @@ func (e *prClosedForCheckRefreshError) Error() string {
 // config-discovery outcomes are authored for the user; everything else (GitHub
 // reads, storage, check updates) is an internal failure whose raw text stays in
 // the server logs.
-func noManagedSchemaChangesErrorDetail(err error) string {
+func noManagedSchemaChangesErrorDetail(err error, errorRef string) string {
 	var closedErr *prClosedForCheckRefreshError
 	if errors.As(err, &closedErr) {
 		return closedErr.Error()
@@ -45,7 +45,7 @@ func noManagedSchemaChangesErrorDetail(err error) string {
 	if isUserMeaningfulSchemaRequestError(err) {
 		return err.Error()
 	}
-	return internalErrorDetail("Failed to check whether this PR needs schema change reconciliation.")
+	return internalErrorDetail("Failed to check whether this PR needs schema change reconciliation.", errorRef)
 }
 
 func (h *Handler) handleNoManagedSchemaChangesForCommand(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, commandName, environment, databaseName, requestedBy string) (bool, error) {
