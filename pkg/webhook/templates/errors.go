@@ -158,7 +158,7 @@ const unmanagedSchemaConfigsNoticeTemplate = `## ⚠️ Schema Changes Not Manag
 
 This PR changes schema under the following path(s), which this SchemaBot instance is not configured to manage:
 
-{{range .Configs}}- ` + "`{{.SchemaPath}}`" + ` — declares database ` + "`{{.Database}}`" + `
+{{range .Configs}}- {{.SchemaPath}} — declares database {{.Database}}
 {{end}}
 These schema changes will **not** be planned or applied, and the SchemaBot checks on this PR do not cover them.
 
@@ -239,13 +239,21 @@ type UnmanagedSchemaConfigNoticeData struct {
 
 // RenderUnmanagedSchemaConfigsNotice renders the notice posted when a PR
 // changes schema under configs this deployment is not authorized to manage
-// and no other deployment is expected to handle them. The notice names only
-// paths and database names already visible in the PR's own files.
+// and no other deployment is expected to handle them. The database names and
+// paths come from the PR's own schemabot.yaml files — untrusted input — so
+// each is normalized into a safe inline code span before rendering.
 func RenderUnmanagedSchemaConfigsNotice(configs []UnmanagedSchemaConfigNoticeData) string {
+	normalized := make([]UnmanagedSchemaConfigNoticeData, len(configs))
+	for i, cfg := range configs {
+		normalized[i] = UnmanagedSchemaConfigNoticeData{
+			Database:   markdownInlineCode(cfg.Database),
+			SchemaPath: markdownInlineCode(cfg.SchemaPath),
+		}
+	}
 	var sb strings.Builder
 	data := struct {
 		Configs []UnmanagedSchemaConfigNoticeData
-	}{Configs: configs}
+	}{Configs: normalized}
 	if err := tmplUnmanagedNotice.Execute(&sb, data); err != nil {
 		return fmt.Sprintf("Error rendering template: %v", err)
 	}

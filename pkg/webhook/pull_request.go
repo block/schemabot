@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"sync"
 	"time"
 
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -256,7 +257,14 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 
 	discovered := slices.Clone(configs)
 	configs = h.filterManagedDiscoveredConfigs(ctx, repo, pr, headSHA, source, configs)
-	h.notifyUnmanagedDiscoveredConfigs(ctx, client, repo, pr, installationID, source, action, beforeSHA, headSHA, discovered, configs)
+	// On synchronize the comment cadence compares changed files between SHAs —
+	// a GitHub compare call. The unmanaged-config notice and the plan comments
+	// follow the same cadence, so the decision is memoized and computed at most
+	// once per delivery, only when a caller needs it.
+	shouldPostComment := sync.OnceValue(func() bool {
+		return h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA)
+	})
+	h.notifyUnmanagedDiscoveredConfigs(repo, pr, installationID, source, headSHA, shouldPostComment, discovered, configs)
 
 	// Config discovery and the managed-directory guard just re-verified this
 	// commit, and the clear re-checks allowed-environment coverage for every
@@ -336,7 +344,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		})
 		return "no schema files in PR", nil
 	}
-	postPlanComment := h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA)
+	postPlanComment := shouldPostComment()
 
 	// Launch auto-plan for each discovered config
 	tenant := ""
@@ -362,7 +370,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 // or participant) a dropped config is routine cross-deployment fan-out — the
 // owning deployment plans it and posts its own comment and check — so the
 // notice stays a log line there.
-func (h *Handler) notifyUnmanagedDiscoveredConfigs(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, source, action, beforeSHA, headSHA string, discovered, managed []ghclient.DiscoveredConfig) {
+func (h *Handler) notifyUnmanagedDiscoveredConfigs(repo string, pr int, installationID int64, source, headSHA string, shouldPostComment func() bool, discovered, managed []ghclient.DiscoveredConfig) {
 	dropped := droppedDiscoveredConfigs(discovered, managed)
 	if len(dropped) == 0 {
 		return
@@ -376,7 +384,10 @@ func (h *Handler) notifyUnmanagedDiscoveredConfigs(ctx context.Context, client *
 	// Match the plan-comment cadence: a synchronize push that changed no
 	// schema inputs re-verifies checks without re-posting comments, and the
 	// notice follows suit so an active PR is not re-noticed on every push.
-	if !h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA) {
+	if !shouldPostComment() {
+		h.logger.Info("unmanaged schema config notice suppressed by comment cadence; PR was already noticed on an earlier commit",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source,
+			"unmanaged_configs", len(dropped))
 		return
 	}
 	notice := make([]templates.UnmanagedSchemaConfigNoticeData, 0, len(dropped))

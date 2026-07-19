@@ -154,15 +154,26 @@ func TestRenderMultipleConfigsUsageExample(t *testing.T) {
 }
 
 func TestRenderUnmanagedSchemaConfigsNotice(t *testing.T) {
-	body := RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
-		{Database: "inventory", SchemaPath: "services/inventory/schema"},
-		{Database: "billing", SchemaPath: "services/billing/schema"},
+	t.Run("lists each dropped config with its database", func(t *testing.T) {
+		body := RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
+			{Database: "inventory", SchemaPath: "services/inventory/schema"},
+			{Database: "billing", SchemaPath: "services/billing/schema"},
+		})
+		assert.Contains(t, body, "## ⚠️ Schema Changes Not Managed by SchemaBot")
+		assert.Contains(t, body, "- `services/inventory/schema` — declares database `inventory`")
+		assert.Contains(t, body, "- `services/billing/schema` — declares database `billing`")
+		assert.Contains(t, body, "will **not** be planned or applied")
+		assert.Contains(t, body, "`allowed_dirs`")
 	})
-	assert.Contains(t, body, "## ⚠️ Schema Changes Not Managed by SchemaBot")
-	assert.Contains(t, body, "- `services/inventory/schema` — declares database `inventory`")
-	assert.Contains(t, body, "- `services/billing/schema` — declares database `billing`")
-	assert.Contains(t, body, "will **not** be planned or applied")
-	assert.Contains(t, body, "`allowed_dirs`")
+
+	t.Run("normalizes values that would break markdown code spans", func(t *testing.T) {
+		body := RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
+			{Database: "inven`tory", SchemaPath: "services/inventory\nschema"},
+		})
+		assert.Contains(t, body, "- `services/inventory schema` — declares database `inventory`")
+		assert.NotContains(t, body, "``")
+		assert.NotContains(t, body, "inventory\nschema")
+	})
 }
 
 func TestRenderInvalidEnv(t *testing.T) {
