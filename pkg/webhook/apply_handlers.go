@@ -592,10 +592,10 @@ func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, 
 
 	config, _, err := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, action.Unlock)
 	if err != nil {
-		// A config this deployment does not manage means there is nothing for
-		// this deployment to unlock — same outcome as no config at all.
-		var notOwned *schemaConfigOutsideAllowedDirsError
-		if errors.As(err, &notOwned) {
+		// Schema another deployment owns — whether outside allowed_dirs or for
+		// a database not in this deployment's registry — means there is nothing
+		// for this deployment to unlock: same outcome as no config at all.
+		if isSchemaUnownedByDeploymentError(err) {
 			return "", ghclient.ErrNoConfig
 		}
 		if errors.Is(err, ghclient.ErrMultipleConfigs) {

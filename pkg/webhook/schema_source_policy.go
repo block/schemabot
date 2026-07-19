@@ -162,7 +162,39 @@ func (h *Handler) resolveUnscopedManagedConfig(ctx context.Context, client *ghcl
 			"discovered_configs", len(configs))
 		return nil, "", newSchemaConfigOutsideAllowedDirsError(configs[0].Config, configs[0].SchemaDir)
 	}
-	return ghclient.SingleDiscoveredConfig(managed)
+	// The directory allowlist is only half the ownership contract: on repos
+	// partitioned by database registry rather than allowed_dirs, a config for
+	// another deployment's database passes the directory filter here. Narrow to
+	// the configs whose database this deployment has registered before deciding
+	// multiplicity, so a PR spanning several deployments' databases is not
+	// falsely ambiguous for the one that owns a single database in it.
+	registered := h.registeredDiscoveredConfigs(managed)
+	if len(registered) == 0 {
+		if len(managed) == 1 {
+			return managed[0].Config, managed[0].SchemaDir, nil
+		}
+		h.logger.Info("unscoped command discovered only schema configs for databases not registered on this deployment",
+			"repo", repo, "pr", pr, "source", source,
+			"discovered_configs", len(configs), "managed_configs", len(managed))
+		return nil, "", &api.DatabaseNotConfiguredError{Database: managed[0].Config.Database}
+	}
+	return ghclient.SingleDiscoveredConfig(registered)
+}
+
+// registeredDiscoveredConfigs narrows discovered configs to the ones whose
+// database has an entry in this deployment's databases registry.
+func (h *Handler) registeredDiscoveredConfigs(configs []ghclient.DiscoveredConfig) []ghclient.DiscoveredConfig {
+	config, ok := h.serverConfig()
+	if !ok {
+		return configs
+	}
+	var registered []ghclient.DiscoveredConfig
+	for _, cfg := range configs {
+		if config.Database(cfg.Config.Database) != nil {
+			registered = append(registered, cfg)
+		}
+	}
+	return registered
 }
 
 func (h *Handler) validateRequestedDatabaseEnvironment(database, environment string) error {
