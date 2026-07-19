@@ -1007,8 +1007,9 @@ func (h *Handler) recoverPanic(repo string, pr int, installationID int64, delive
 			attrs = append(attrs, "delivery_id", deliveryID)
 		}
 		h.logger.Error("goroutine panic", append(attrs, "error", r, "stack", string(stack))...)
+		metrics.RecordRecoveredPanic(context.Background(), "webhook_command")
 		h.postComment(repo, pr, installationID,
-			"**Internal error while processing this request. This is a bug — please report it.** Details are in the server logs.")
+			"**Internal error while processing this command.** This is a bug — please report it. See SchemaBot server logs for details.")
 	}
 }
 

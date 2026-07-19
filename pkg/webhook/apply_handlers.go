@@ -83,7 +83,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Apply, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether apply command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 		if !result.SuppressRetryComments {
-			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, noManagedSchemaChangesErrorDetail(err))
 		}
 		return true, fmt.Errorf("apply command managed-schema check %s#%d: %w", repo, pr, err)
 	} else if handled {
@@ -177,7 +177,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	if err != nil {
 		h.logger.Error("failed to check lock", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
 		if !result.SuppressRetryComments {
-			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to check lock status: "+err.Error())
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, internalErrorDetail("Failed to check the apply lock status."))
 		}
 		return true, fmt.Errorf("apply command check lock %s#%d: %w", repo, pr, err)
 	}
@@ -283,11 +283,11 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "error", err)
 		if isTransientRemotePlanError(err) {
 			if !result.SuppressRetryComments {
-				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, userFacingError(err))
 			}
 			return true, fmt.Errorf("apply command plan %s#%d: %w", repo, pr, err)
 		}
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, userFacingError(err))
 		// Failures other than remote-deployment unavailability are treated
 		// as deterministic: the posted error is the command's answer. Some
 		// of them are not truly deterministic (planning runs against a live
@@ -371,7 +371,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		}
 		h.logger.Error("failed to acquire lock", "error", err)
 		if !result.SuppressRetryComments {
-			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to acquire lock: "+err.Error())
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, internalErrorDetail("Failed to acquire the apply lock."))
 		}
 		return true, fmt.Errorf("apply command acquire lock %s#%d: %w", repo, pr, err)
 	}
@@ -604,7 +604,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether apply-confirm command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 		if !result.SuppressRetryComments {
-			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, err.Error())
+			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, noManagedSchemaChangesErrorDetail(err))
 		}
 		return true, fmt.Errorf("apply-confirm command managed-schema check %s#%d: %w", repo, pr, err)
 	} else if handled {
@@ -682,7 +682,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	if err != nil {
 		h.logger.Error("failed to check lock", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
 		if !result.SuppressRetryComments {
-			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Failed to check lock status: "+err.Error())
+			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, internalErrorDetail("Failed to check the apply lock status."))
 		}
 		return true, fmt.Errorf("apply-confirm command check lock %s#%d: %w", repo, pr, err)
 	}
@@ -775,7 +775,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"pending_plan_id", existingLock.PendingPlanID, "error", planLoadErr)
 		if !result.SuppressRetryComments {
-			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Failed to load confirmation plan: "+planLoadErr.Error())
+			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, internalErrorDetail("Failed to load the confirmation plan."))
 		}
 		return true, fmt.Errorf("apply-confirm command load confirmation plan %s#%d: %w", repo, pr, planLoadErr)
 	}
@@ -902,7 +902,7 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 		if err != nil {
 			h.logger.Error("failed to infer database for force unlock", "repo", repo, "pr", pr, "error", err)
 			if isUnlockRejection(err) {
-				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to infer database for force unlock: "+err.Error())
+				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, inferUnlockDatabaseErrorDetail(err))
 				return false, nil
 			}
 			// A GitHub App resolution failure is deterministic per deployment
@@ -915,7 +915,7 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 				return false, fmt.Errorf("unlock command infer database %s#%d: %w", repo, pr, err)
 			}
 			if !result.SuppressRetryComments {
-				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to infer database for force unlock: "+err.Error())
+				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, inferUnlockDatabaseErrorDetail(err))
 			}
 			return true, fmt.Errorf("unlock command infer database %s#%d: %w", repo, pr, err)
 		}
@@ -930,7 +930,7 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 			return false, nil
 		}
 		if !result.SuppressRetryComments {
-			h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to look up locks: "+err.Error())
+			h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, internalErrorDetail("Failed to look up locks."))
 		}
 		return true, fmt.Errorf("unlock command lock lookup %s#%d: %w", repo, pr, err)
 	}
@@ -1017,7 +1017,7 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
 			if !result.SuppressRetryComments {
 				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy,
-					"Failed to verify active applies for database `"+lock.DatabaseName+"`: "+err.Error()+". No locks were released.")
+					internalErrorDetail("Failed to verify active applies for database `"+lock.DatabaseName+"`. No locks were released."))
 			}
 			return true, fmt.Errorf("unlock command verify active applies %s#%d database %s: %w", repo, pr, lock.DatabaseName, err)
 		}
@@ -1121,6 +1121,23 @@ func (h *Handler) locksForUnlock(ctx context.Context, repo string, pr int, resul
 		}
 	}
 	return filtered, nil
+}
+
+// inferUnlockDatabaseErrorDetail maps an inferUnlockDatabase failure to the
+// text rendered on the PR. Config-discovery outcomes get actionable guidance
+// and other deterministic rejections render their answer verbatim; anything
+// else is an internal failure whose raw text stays in the server logs.
+func inferUnlockDatabaseErrorDetail(err error) string {
+	if errors.Is(err, ghclient.ErrMultipleConfigs) {
+		return "Multiple SchemaBot configs match this PR. Retry with `schemabot unlock -d <database> --force`."
+	}
+	if errors.Is(err, ghclient.ErrNoConfig) {
+		return "No SchemaBot config was found for this PR, so there is no database to force-unlock."
+	}
+	if isUnlockRejection(err) {
+		return "Force unlock could not infer a database: " + err.Error()
+	}
+	return internalErrorDetail("Failed to infer the database for force unlock.")
 }
 
 func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, installationID int64) (string, error) {

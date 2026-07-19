@@ -33,6 +33,22 @@ func (h *Handler) logControlCommandError(command, repo string, pr int, applyID, 
 	}
 }
 
+// controlCommandErrorDetail maps a failed PR control command to the text
+// rendered on the PR. Typed rejections carry guardrail wording authored for
+// the user and render as-is; internal failures (storage, Tern transport, or
+// any untyped error) never render raw — logControlCommandError has already
+// recorded the raw error, so the comment points at the server logs. Known
+// transport failures keep their fixed retry guidance.
+func controlCommandErrorDetail(command string, err error) string {
+	if message, ok := mappedUserFacingError(err); ok {
+		return message
+	}
+	if api.IsInternalControlError(err) {
+		return internalErrorDetail("Failed to execute the " + command + " command.")
+	}
+	return err.Error()
+}
+
 func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int, installationID int64, requestedBy string, result CommandResult, command string) (*storage.Apply, bool) {
 	if result.ApplyID == "" {
 		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
@@ -92,7 +108,7 @@ func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int
 			"environment", result.Environment,
 			"requested_by", requestedBy,
 			"error", err)
-		h.postCommandError(repo, pr, installationID, command, result.Environment, requestedBy, "Failed to look up apply: "+err.Error())
+		h.postCommandError(repo, pr, installationID, command, result.Environment, requestedBy, internalErrorDetail("Failed to look up the apply."))
 		return nil, false
 	}
 	if apply == nil {
@@ -195,7 +211,7 @@ func runControlCommand[R any](
 	})
 	if err != nil {
 		h.logControlCommandError(actionName, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
-		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, err.Error())
+		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, controlCommandErrorDetail(actionName, err))
 		return nil
 	}
 	if resp == nil {

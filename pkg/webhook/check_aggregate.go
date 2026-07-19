@@ -96,22 +96,55 @@ func (h *Handler) aggregateCheckTargetsForRepo(repo string) []aggregateCheckTarg
 	return targets
 }
 
+// environmentConfigError reports a database/environment configuration problem
+// in wording composed only of SchemaBot-owned text and config identifiers, so
+// its message is safe to render on the PR. It preserves the underlying error
+// in the chain so callers can still branch on typed causes such as
+// *api.DatabaseNotConfiguredError (fan-out silent skips).
+type environmentConfigError struct {
+	message string
+	cause   error
+}
+
+func (e *environmentConfigError) Error() string {
+	return e.message
+}
+
+func (e *environmentConfigError) Unwrap() error {
+	return e.cause
+}
+
+func environmentConfigErrorf(format string, args ...any) *environmentConfigError {
+	return &environmentConfigError{message: fmt.Sprintf(format, args...)}
+}
+
+// asEnvironmentConfigError marks a configuration error whose message is
+// SchemaBot-authored (server config lookups) as safe for PR display while
+// keeping the original error in the chain.
+func asEnvironmentConfigError(err error) *environmentConfigError {
+	return &environmentConfigError{message: err.Error(), cause: err}
+}
+
 func (h *Handler) configuredDatabaseEnvironments(database string) ([]string, error) {
 	config, ok := h.serverConfig()
 	if !ok {
-		return nil, fmt.Errorf("server config is unavailable")
+		return nil, environmentConfigErrorf("server config is unavailable")
 	}
-	return config.DatabaseEnvironments(database)
+	environments, err := config.DatabaseEnvironments(database)
+	if err != nil {
+		return nil, asEnvironmentConfigError(err)
+	}
+	return environments, nil
 }
 
 func (h *Handler) allowedDatabaseEnvironments(database string) ([]string, error) {
 	config, ok := h.serverConfig()
 	if !ok {
-		return nil, fmt.Errorf("server config is unavailable")
+		return nil, environmentConfigErrorf("server config is unavailable")
 	}
 	environments, err := config.DatabaseEnvironments(database)
 	if err != nil {
-		return nil, fmt.Errorf("resolve configured environments for database %q: %w", database, err)
+		return nil, asEnvironmentConfigError(err)
 	}
 	if len(config.AllowedEnvironments) == 0 {
 		return environments, nil
@@ -131,7 +164,7 @@ func (h *Handler) attachServerEnvironments(schemaResult *ghclient.SchemaRequestR
 	}
 	environments, err := h.configuredDatabaseEnvironments(schemaResult.Database)
 	if err != nil {
-		return fmt.Errorf("resolve configured environments for database %q: %w", schemaResult.Database, err)
+		return err
 	}
 	if environment != "" && !slices.Contains(environments, environment) {
 		return &environmentNotConfiguredError{Database: schemaResult.Database, Environment: environment}

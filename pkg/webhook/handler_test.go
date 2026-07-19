@@ -1197,7 +1197,8 @@ func TestGoSafeRecoversPanicAndPostsErrorComment(t *testing.T) {
 	})
 
 	body := requireComment(t, comments, "panic recovery comment")
-	assert.Contains(t, body, "Internal error while processing this request")
+	assert.Contains(t, body, "Internal error while processing this command")
+	assert.Contains(t, body, "See SchemaBot server logs for details")
 	assert.NotContains(t, body, "boom", "the raw panic value must never reach the public PR comment")
 
 	logged := logBuf.String()

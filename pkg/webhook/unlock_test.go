@@ -157,8 +157,9 @@ func TestUnlockRefusedWhenActiveApplyLookupFails(t *testing.T) {
 	select {
 	case body := <-comments:
 		assert.Contains(t, body, "Failed to verify active applies for database `orders`")
-		assert.Contains(t, body, "storage read failed")
+		assert.Contains(t, body, "See SchemaBot server logs for details")
 		assert.Contains(t, body, "No locks were released")
+		assert.NotContains(t, body, "storage read failed")
 	case <-time.After(2 * time.Second):
 		require.FailNow(t, "timed out waiting for unlock error comment")
 	}

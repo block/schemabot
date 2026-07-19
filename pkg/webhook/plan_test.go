@@ -833,7 +833,8 @@ func TestUserFacingErrorExplainsNoHealthyUpstream(t *testing.T) {
 	assert.Contains(t, got, "SchemaBot could not reach the remote deployment `pie`")
 	assert.Contains(t, got, "target `orders-staging`")
 	assert.Contains(t, got, "service or network path is unavailable")
-	assert.Contains(t, got, "Raw error: remote deployment \"pie\" target \"orders-staging\" unavailable: rpc error: code = Unavailable desc = no healthy upstream")
+	assert.Contains(t, got, "See SchemaBot server logs for the underlying error")
+	assert.NotContains(t, got, "rpc error")
 }
 
 func TestUserFacingErrorPreservesNonGRPCErrors(t *testing.T) {
@@ -859,13 +860,12 @@ func TestUserFacingErrorExplainsConfigOutsideAllowedDirs(t *testing.T) {
 }
 
 func TestUserFacingErrorDetailDoesNotWrapFormattedRemoteErrors(t *testing.T) {
-	formatted := "SchemaBot could not reach the remote deployment `pie` for target `orders-staging`. No healthy upstream is available. Raw error: rpc error: code = Unavailable desc = no healthy upstream"
+	formatted := "SchemaBot could not reach the remote deployment `pie` for target `orders-staging`. No healthy upstream is available. The service or network path is unavailable; retry after the upstream is healthy. See SchemaBot server logs for the underlying error."
 
 	got := userFacingErrorDetail(formatted)
 
 	assert.Equal(t, formatted, got)
 	assert.Equal(t, 1, strings.Count(got, "SchemaBot could not reach"))
-	assert.Equal(t, 1, strings.Count(got, "Raw error:"))
 }
 
 func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {

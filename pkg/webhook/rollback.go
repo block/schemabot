@@ -115,7 +115,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 	apply, err := applyStore.GetByApplyIdentifier(ctx, applyID)
 	if err != nil {
 		h.logger.Error("failed to look up rollback apply", "repo", repo, "pr", pr, "apply_id", applyID, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Rollback, result.Environment, requestedBy, "Failed to look up apply: "+err.Error())
+		h.postCommandError(repo, pr, installationID, action.Rollback, result.Environment, requestedBy, internalErrorDetail("Failed to look up the apply."))
 		return true, fmt.Errorf("rollback command apply lookup %s#%d apply %s: %w", repo, pr, applyID, err)
 	}
 	if apply == nil {
@@ -194,7 +194,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 	existingLock, err := lockStore.Get(ctx, database, dbType)
 	if err != nil {
 		h.logger.Error("failed to check lock", "error", err)
-		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, "Failed to check lock status: "+err.Error())
+		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, internalErrorDetail("Failed to check the rollback lock status."))
 		return true, fmt.Errorf("rollback command lock lookup %s#%d database %s: %w", repo, pr, database, err)
 	}
 
@@ -219,7 +219,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		}
 		if err := lockStore.Acquire(ctx, lock); err != nil {
 			h.logger.Error("failed to acquire lock", "error", err)
-			h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, "Failed to acquire lock: "+err.Error())
+			h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, internalErrorDetail("Failed to acquire the rollback lock."))
 			return true, fmt.Errorf("rollback command acquire lock %s#%d database %s: %w", repo, pr, database, err)
 		}
 	}
@@ -239,7 +239,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 			h.logger.Error("rollback source revalidation failed after lock acquisition",
 				"repo", repo, "pr", pr, "apply_id", applyID,
 				"environment", result.Environment, "database", database, "error", err)
-			h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, err.Error())
+			h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, internalErrorDetail("Rollback source validation failed."))
 			return true, errors.Join(
 				fmt.Errorf("rollback command revalidate source apply %s#%d apply %s: %w", repo, pr, applyID, err),
 				releaseErr)
@@ -269,7 +269,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		// deterministic engine rejections come back typed terminal.
 		retryable := !api.IsTerminalControlError(err)
 		h.logger.Error("rollback plan failed", "repo", repo, "pr", pr, "apply_id", applyID, "retryable", retryable, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, err.Error())
+		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, rollbackPlanErrorDetail(err, retryable))
 		if retryable {
 			return true, errors.Join(
 				fmt.Errorf("rollback command plan %s#%d apply %s: %w", repo, pr, applyID, err),
@@ -300,7 +300,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		h.logger.Error("failed to pin rollback plan on lock", "repo", repo, "pr", pr,
 			"database", database, "database_type", dbType, "environment", environment,
 			"plan_id", planResp.PlanID, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, "Failed to pin rollback plan on lock: "+err.Error())
+		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, internalErrorDetail("Failed to pin the rollback plan on the lock."))
 		return true, errors.Join(
 			fmt.Errorf("rollback command pin plan on lock %s#%d database %s plan %s: %w", repo, pr, database, planResp.PlanID, err),
 			releaseErr)
@@ -359,7 +359,7 @@ func (h *Handler) handleRollbackSourceError(repo string, pr int, installationID 
 		h.logger.Error("rollback source validation failed",
 			"repo", repo, "pr", pr, "apply_id", applyID,
 			"environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, err.Error())
+		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, internalErrorDetail("Rollback source validation failed."))
 		return true, fmt.Errorf("rollback command validate source apply %s#%d apply %s: %w", repo, pr, applyID, err)
 	}
 	if api.IsInternalControlError(err) {
@@ -392,7 +392,18 @@ func (h *Handler) postRollbackTerminalInvariant(logMsg, repo string, pr int, ins
 		attrs = append(attrs, "database", database)
 	}
 	h.logger.Error(logMsg, append(attrs, "error", err)...)
-	h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, err.Error())
+	h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, internalErrorDetail("Rollback source validation failed."))
+}
+
+// rollbackPlanErrorDetail renders a rollback plan failure for the PR. A
+// terminal failure is the engine's own deterministic rejection and carries the
+// user-actionable detail the operator needs; a retryable failure is internal
+// infrastructure whose raw text stays in the server logs.
+func rollbackPlanErrorDetail(err error, retryable bool) string {
+	if retryable {
+		return internalErrorDetail("Rollback plan failed.")
+	}
+	return userFacingError(err)
 }
 
 func (h *Handler) postRollbackRejected(repo string, pr int, installationID int64, apply *storage.Apply, applyID, environment, database, reason string) {
@@ -534,10 +545,11 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 	if err != nil {
 		h.logger.Error("failed to resolve rollback-confirm plan", "repo", repo, "pr", pr,
 			"environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, err.Error())
 		if isRollbackConfirmRejection(err) {
+			h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, err.Error())
 			return false, nil
 		}
+		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, internalErrorDetail("Failed to resolve the pending rollback plan."))
 		return true, fmt.Errorf("rollback-confirm command resolve pinned plan %s#%d environment %s: %w", repo, pr, environment, err)
 	}
 	if existingLock == nil || rollbackPlan == nil {
@@ -667,7 +679,7 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 	if err != nil {
 		h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, nil)
 		h.logger.Error("rollback apply failed", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, "Failed to execute rollback: "+err.Error())
+		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, internalErrorDetail("Failed to execute rollback."))
 		return false, nil
 	}
 
@@ -709,7 +721,7 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply); err != nil {
 		h.logger.Error("failed to mark check in_progress for rollback",
 			append(apply.LogAttrs(), "error", err)...)
-		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, "Rollback was accepted, but SchemaBot could not update the required status check: "+err.Error())
+		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, internalErrorDetail("Rollback was accepted, but SchemaBot could not update the required status check."))
 		return false, nil
 	}
 

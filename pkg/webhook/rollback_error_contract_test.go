@@ -313,7 +313,7 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		require.Error(t, err)
 		assert.True(t, retry, "a transient apply lookup failure must stay retryable for a durable driver")
 		body := requireComment(t, comments, "apply lookup failure comment")
-		assert.Contains(t, body, "Failed to look up apply")
+		assert.Contains(t, body, "Failed to look up the apply. See SchemaBot server logs for details.")
 	})
 
 	// The source-apply guardrails read the plan from storage; a failed read is
@@ -333,7 +333,9 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		require.Error(t, err)
 		assert.True(t, retry, "an internal source validation failure must stay retryable, not become the command's answer")
 		body := requireComment(t, comments, "source validation failure comment")
-		assert.Contains(t, body, "load source plan")
+		assert.Contains(t, body, "Rollback source validation failed. See SchemaBot server logs for details.")
+		assert.NotContains(t, body, "load source plan",
+			"raw error text must never render in PR markdown")
 	})
 
 	t.Run("rollback plan source read failure is retryable", func(t *testing.T) {
@@ -354,7 +356,9 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "a failed plan storage read must stay retryable")
 		assert.Equal(t, 1, lockStore.releaseCalls)
 		body := requireComment(t, comments, "rollback plan read failure comment")
-		assert.Contains(t, body, "get rollback source plan")
+		assert.Contains(t, body, "Rollback plan failed. See SchemaBot server logs for details.")
+		assert.NotContains(t, body, "get rollback source plan",
+			"raw error text must never render in PR markdown")
 	})
 
 	// The source apply is revalidated after lock acquisition; an internal
@@ -378,7 +382,9 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "an internal revalidation failure must stay retryable, not become the command's answer")
 		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released so a re-drive can start over")
 		body := requireComment(t, comments, "revalidation failure comment")
-		assert.Contains(t, body, "load source plan")
+		assert.Contains(t, body, "Rollback source validation failed. See SchemaBot server logs for details.")
+		assert.NotContains(t, body, "load source plan",
+			"raw error text must never render in PR markdown")
 	})
 
 	// The lock release after a post-lock failure must run even when the
@@ -442,7 +448,7 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "an unknown lock state must be retried, not treated as the command's answer")
 		assert.Zero(t, lockStore.acquireCalls, "no lock may be acquired while lock state is unknown")
 		body := requireComment(t, comments, "lock read failure comment")
-		assert.Contains(t, body, "Failed to check lock status")
+		assert.Contains(t, body, "Failed to check the rollback lock status. See SchemaBot server logs for details.")
 	})
 
 	t.Run("lock acquire failure is retryable", func(t *testing.T) {
@@ -457,7 +463,7 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		require.Error(t, err)
 		assert.True(t, retry, "a failed lock acquisition must stay retryable so a re-drive can acquire it")
 		body := requireComment(t, comments, "lock acquire failure comment")
-		assert.Contains(t, body, "Failed to acquire lock")
+		assert.Contains(t, body, "Failed to acquire the rollback lock. See SchemaBot server logs for details.")
 	})
 
 	// A gate that could not evaluate its inputs fails closed for this delivery
@@ -501,7 +507,9 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "remote unavailability during plan generation must stay retryable")
 		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released so a re-drive can start over")
 		body := requireComment(t, comments, "plan unavailability comment")
-		assert.Contains(t, body, "connection refused")
+		assert.Contains(t, body, "Rollback plan failed. See SchemaBot server logs for details.")
+		assert.NotContains(t, body, "connection refused",
+			"raw transport error text must never render in PR markdown")
 	})
 }
 
@@ -637,7 +645,9 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, retry, "missing required stored data cannot be repaired by re-driving")
 		body := requireComment(t, comments, "missing source plan comment")
-		assert.Contains(t, body, "source plan 10 not found")
+		assert.Contains(t, body, "Rollback source validation failed. See SchemaBot server logs for details.")
+		assert.NotContains(t, body, "source plan 10 not found",
+			"raw error text must never render in PR markdown")
 		assert.NotContains(t, body, "Rollback Not Allowed")
 	})
 

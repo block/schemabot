@@ -38,7 +38,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Plan, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether plan command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, err.Error())
+		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, noManagedSchemaChangesErrorDetail(err))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema reconciliation check failed"})
 		return
 	} else if handled {
@@ -78,7 +78,8 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	freshPRInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to fetch PR for stale-schema check", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, "Failed to verify PR HEAD: "+err.Error())
+		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy,
+			"SchemaBot could not verify the current PR state. The plan was rejected; retry the command.")
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "PR fetch failed"})
 		return
 	}
@@ -244,7 +245,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	if !isAutoPlan {
 		if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Plan, "", databaseName, requestedBy); err != nil {
 			h.logger.Error("failed to check whether plan command needs schema change reconciliation", "repo", repo, "pr", pr, "database", databaseName, "error", err)
-			h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, err.Error())
+			h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, noManagedSchemaChangesErrorDetail(err))
 			return
 		} else if handled {
 			return
@@ -324,8 +325,13 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	if len(environments) == 0 {
 		prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 		if err != nil {
-			h.logger.Error("failed to fetch PR for no allowed configured environments failure",
+			// The failing aggregate needs the PR HEAD, so without it the user
+			// still gets the environment problem as a comment rather than
+			// silence — with a warning that the required check was not updated.
+			h.logger.Error("failed to fetch PR for no allowed configured environments failure; posting comment without updating the required status check",
 				"repo", repo, "pr", pr, "error", err)
+			h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy,
+				noAllowedConfiguredEnvironmentsBlock.message+" SchemaBot could not update the required status check for this PR; retry the command after fixing the configuration.")
 			return
 		}
 
@@ -364,12 +370,12 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, env, databaseName, action.Plan)
 		if err != nil {
 			h.logger.Error("schema request failed", "repo", repo, "pr", pr, "env", env, "error", err)
-			multiEnvData.Errors[env] = userFacingError(err)
+			multiEnvData.Errors[env] = userFacingSchemaRequestError(err)
 			continue
 		}
 		if err := h.attachServerEnvironments(schemaResult, env); err != nil {
 			h.logger.Error("schema environment validation failed", "repo", repo, "pr", pr, "env", env, "error", err)
-			multiEnvData.Errors[env] = userFacingError(err)
+			multiEnvData.Errors[env] = userFacingSchemaRequestError(err)
 			continue
 		}
 
@@ -392,7 +398,8 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 				if prErr != nil {
 					h.logger.Error("failed to fetch PR for stale-schema check",
 						"repo", repo, "pr", pr, "error", prErr)
-					h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, "Failed to verify PR HEAD: "+prErr.Error())
+					h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy,
+						"SchemaBot could not verify the current PR state. The plan was rejected; retry the command.")
 					return
 				}
 				if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, freshPRInfo.HeadSHA, env, requestedBy, action.Plan); rejected {
@@ -540,7 +547,7 @@ func (h *Handler) postFailingAggregateForMultiEnvSetupError(ctx context.Context,
 		h.logger.Error("failed to fetch PR for multi-env setup failure aggregate", "repo", repo, "pr", pr, "database", database, "error", fetchErr)
 		return
 	}
-	userError := userFacingError(err)
+	userError := userFacingSchemaRequestError(err)
 	h.logger.Warn("multi-env plan setup failed; posting failing aggregate",
 		"repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA, "database", database, "error", err)
 	h.postFailingAggregates(ctx, client, repo, pr, prInfo.HeadSHA,
@@ -633,10 +640,36 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 		return true
 	}
 
+	var envConfigErr *environmentConfigError
+	if errors.As(err, &envConfigErr) {
+		h.logger.Warn("schema request: environment configuration error", logFields...)
+		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "environment_config")
+		data.ErrorDetail = envConfigErr.Error()
+		h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
+		return true
+	}
+
+	// An incomplete config discovery is not the command's answer — the same
+	// delivery can discover the full tree on a re-drive — so it stays
+	// retryable, but its message is authored for the user and renders.
+	if errors.Is(err, ghclient.ErrGitTreeTruncated) {
+		h.logger.Error("schema request failed: repository tree truncated, config discovery is incomplete", logFields...)
+		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "git_tree_truncated")
+		if !suppressRetryComments {
+			data.ErrorDetail = err.Error()
+			h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
+		}
+		return false
+	}
+
+	// The remaining errors are internal (GitHub API failures, transport
+	// problems). Their raw text can carry hostnames or driver internals, so the
+	// comment shows a fixed pointer at the server logs, where logFields above
+	// already recorded the raw error.
 	h.logger.Error("schema request failed", logFields...)
 	metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "unexpected")
 	if !suppressRetryComments {
-		data.ErrorDetail = err.Error()
+		data.ErrorDetail = internalErrorDetail("Failed to prepare the schema change request.")
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
 	}
 	return false

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/webhook/templates"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -58,18 +59,74 @@ func (h *Handler) deploymentEnvironmentScope(environment string) []string {
 	return config.AllowedEnvironments
 }
 
+// internalErrorDetail builds the PR-facing detail for a failure inside a
+// SchemaBot-internal operation (storage reads/writes, GitHub API calls, lock
+// bookkeeping). Raw error text from those operations can carry hostnames, DSN
+// fragments, or driver internals, so it never renders on the PR: the comment
+// shows the fixed summary and points at the server logs, where the caller
+// logs the raw error with triage identifiers.
+func internalErrorDetail(summary string) string {
+	return summary + " See SchemaBot server logs for details."
+}
+
+// userFacingError maps an execution error to the text rendered on the PR.
+// Known transport failures are replaced with fixed guidance; other errors
+// render their message, which for plan and apply execution carries the
+// engine's user-actionable detail (for example rejected DDL).
 func userFacingError(err error) string {
-	if message, ok := userFacingConfigNotAuthorizedError(err); ok {
+	if message, ok := mappedUserFacingError(err); ok {
 		return message
+	}
+	return err.Error()
+}
+
+// mappedUserFacingError returns the fixed PR-facing message for errors with a
+// known user-facing mapping, and false when the caller must decide how to
+// render the error itself.
+func mappedUserFacingError(err error) (string, bool) {
+	if message, ok := userFacingConfigNotAuthorizedError(err); ok {
+		return message, true
 	}
 	var remoteErr *api.RemoteDeploymentUnavailableError
 	if errors.As(err, &remoteErr) {
-		return userFacingRemoteUnavailableError(remoteErr.Deployment, remoteErr.Target, err.Error())
+		return userFacingRemoteUnavailableError(remoteErr.Deployment, remoteErr.Target, err.Error()), true
 	}
 	if status.Code(err) == codes.Unavailable {
-		return userFacingRemoteUnavailableError("", "", err.Error())
+		return userFacingRemoteUnavailableError("", "", err.Error()), true
 	}
-	return err.Error()
+	return "", false
+}
+
+// userFacingSchemaRequestError maps a schema discovery or environment
+// validation error for rendering inside a per-environment error cell. Errors
+// whose message is composed for PR display render it; everything else is an
+// internal failure and renders the fixed pointer to server logs.
+func userFacingSchemaRequestError(err error) string {
+	if message, ok := mappedUserFacingError(err); ok {
+		return message
+	}
+	if isUserMeaningfulSchemaRequestError(err) {
+		return err.Error()
+	}
+	return internalErrorDetail("Failed to prepare the schema change request for this environment.")
+}
+
+// isUserMeaningfulSchemaRequestError reports whether a schema request error's
+// message was authored for PR display — configuration and discovery errors
+// composed only of SchemaBot-owned wording and config identifiers.
+func isUserMeaningfulSchemaRequestError(err error) bool {
+	var envConfigErr *environmentConfigError
+	if errors.As(err, &envConfigErr) {
+		return true
+	}
+	var dbNotFoundErr *ghclient.DatabaseNotFoundError
+	if errors.As(err, &dbNotFoundErr) {
+		return true
+	}
+	return errors.Is(err, ghclient.ErrNoConfig) ||
+		errors.Is(err, ghclient.ErrInvalidConfig) ||
+		errors.Is(err, ghclient.ErrMultipleConfigs) ||
+		errors.Is(err, ghclient.ErrGitTreeTruncated)
 }
 
 func userFacingConfigNotAuthorizedError(err error) (string, bool) {
@@ -99,9 +156,13 @@ func userFacingErrorDetail(errorDetail string) string {
 }
 
 func isUserFacingRemoteUnavailableError(lowerDetail string) bool {
-	return strings.Contains(lowerDetail, "schemabot could not reach the remote ") && strings.Contains(lowerDetail, "raw error:")
+	return strings.Contains(lowerDetail, "schemabot could not reach the remote ")
 }
 
+// userFacingRemoteUnavailableError renders fixed guidance for an unreachable
+// remote deployment. The raw error is examined to pick the guidance but never
+// rendered — dial failures carry hostnames and transport internals that do not
+// belong on a PR; callers log it server-side with the deployment identifiers.
 func userFacingRemoteUnavailableError(deployment, target, rawError string) string {
 	service := "remote schema change service"
 	if deployment != "" && target != "" {
@@ -110,7 +171,7 @@ func userFacingRemoteUnavailableError(deployment, target, rawError string) strin
 		service = "remote deployment `" + deployment + "`"
 	}
 	if strings.Contains(strings.ToLower(rawError), "no healthy upstream") {
-		return "SchemaBot could not reach the " + service + ". No healthy upstream is available. The service or network path is unavailable; retry after the upstream is healthy. Raw error: " + rawError
+		return "SchemaBot could not reach the " + service + ". No healthy upstream is available. The service or network path is unavailable; retry after the upstream is healthy. See SchemaBot server logs for the underlying error."
 	}
-	return "SchemaBot could not reach the " + service + ". Retry after the service is healthy. Raw error: " + rawError
+	return "SchemaBot could not reach the " + service + ". Retry after the service is healthy. See SchemaBot server logs for the underlying error."
 }

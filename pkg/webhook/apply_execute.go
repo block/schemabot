@@ -60,7 +60,7 @@ func (h *Handler) executeApply(
 	planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)
 	if err != nil {
 		h.logger.Error("plan execution failed on confirm", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, userFacingError(err))
 		return
 	}
 
@@ -348,7 +348,7 @@ func (h *Handler) executeApply(
 	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply); err != nil {
 		h.logger.Error("failed to mark check in_progress for apply",
 			append(apply.LogAttrs(), "error", err)...)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot could not update the required status check: "+err.Error())
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, internalErrorDetail("Apply was accepted, but SchemaBot could not update the required status check."))
 		return
 	}
 }

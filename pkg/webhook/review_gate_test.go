@@ -25,7 +25,8 @@ func TestReviewGateErrorDetailTeamMembership(t *testing.T) {
 
 	detail := reviewGateErrorDetail(err)
 
-	assert.Contains(t, detail, "Review gate check failed; see server logs for details")
+	assert.Contains(t, detail, "Review gate check failed")
+	assert.Contains(t, detail, "See SchemaBot server logs for details")
 	assert.Contains(t, detail, "GitHub App can read organization members")
 	assert.NotContains(t, detail, "expand team @octocat/schema-admins",
 		"raw error text must never render in PR markdown")
@@ -34,10 +35,11 @@ func TestReviewGateErrorDetailTeamMembership(t *testing.T) {
 func TestReviewGateErrorDetailGeneric(t *testing.T) {
 	detail := reviewGateErrorDetail(assert.AnError)
 
-	assert.Contains(t, detail, "Review gate check failed; see server logs for details")
+	assert.Contains(t, detail, "Review gate check failed")
+	assert.Contains(t, detail, "See SchemaBot server logs for details")
+	assert.NotContains(t, detail, "GitHub App can read organization members")
 	assert.NotContains(t, detail, assert.AnError.Error(),
 		"raw error text must never render in PR markdown")
-	assert.NotContains(t, detail, "GitHub App can read organization members")
 }
 
 func setupReviewGateHandler(t *testing.T, config *api.ServerConfig) (*Handler, *http.ServeMux) {
@@ -599,7 +601,7 @@ func TestEnforceReviewGate(t *testing.T) {
 
 		select {
 		case body := <-comments:
-			assert.Contains(t, body, "Review gate check failed; see server logs")
+			assert.Contains(t, body, "Review gate check failed. See SchemaBot server logs for details.")
 			assert.NotContains(t, body, "Resource not accessible", "raw GitHub error text must never render in PR markdown")
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for evaluation-failure comment")
