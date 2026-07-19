@@ -22,11 +22,13 @@ func TestApplyCommentStore_Upsert(t *testing.T) {
 	apply := createTestApply(t, store, lock, "apply_comment_upsert", 1)
 
 	postedVolume := 3
+	noPhase := ""
 	comment := &storage.ApplyComment{
 		ApplyID:         apply.ID,
 		CommentState:    state.Comment.Progress,
 		GitHubCommentID: 111222333,
 		PostedVolume:    &postedVolume,
+		PostedPhase:     &noPhase,
 	}
 
 	// Insert
@@ -41,25 +43,33 @@ func TestApplyCommentStore_Upsert(t *testing.T) {
 	assert.Equal(t, int64(111222333), retrieved.GitHubCommentID)
 	require.NotNil(t, retrieved.PostedVolume)
 	assert.Equal(t, 3, *retrieved.PostedVolume)
+	require.NotNil(t, retrieved.PostedPhase)
+	assert.Empty(t, *retrieved.PostedPhase)
 	assert.NotZero(t, retrieved.ID)
 	assert.NotZero(t, retrieved.CreatedAt)
 	assert.NotZero(t, retrieved.UpdatedAt)
 
-	// Upsert with new comment ID and level (simulates a volume-change rotation)
+	// Upsert with new comment ID, level, and control phase (simulates a
+	// rotation to a fresh comment)
 	comment.GitHubCommentID = 444555666
 	newVolume := 5
 	comment.PostedVolume = &newVolume
+	reverting := "reverting"
+	comment.PostedPhase = &reverting
 	require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
 
-	// Verify upsert updated the comment ID and recorded level
+	// Verify upsert updated the comment ID and recorded level and phase
 	retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
 	require.NoError(t, err)
 	require.NotNil(t, retrieved)
 	assert.Equal(t, int64(444555666), retrieved.GitHubCommentID)
 	require.NotNil(t, retrieved.PostedVolume)
 	assert.Equal(t, 5, *retrieved.PostedVolume)
+	require.NotNil(t, retrieved.PostedPhase)
+	assert.Equal(t, "reverting", *retrieved.PostedPhase)
 
-	// A summary comment carries no level; the column stays NULL and reads back nil.
+	// A summary comment carries no level or control phase; the columns stay
+	// NULL and read back nil.
 	summary := &storage.ApplyComment{
 		ApplyID:         apply.ID,
 		CommentState:    state.Comment.Summary,
@@ -70,6 +80,7 @@ func TestApplyCommentStore_Upsert(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, retrieved)
 	assert.Nil(t, retrieved.PostedVolume)
+	assert.Nil(t, retrieved.PostedPhase)
 }
 
 func TestApplyCommentStore_Get(t *testing.T) {

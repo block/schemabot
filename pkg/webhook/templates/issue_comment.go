@@ -315,15 +315,26 @@ type VolumeSupersededProgressData struct {
 // freeze retry can tell an already-frozen comment from a live one.
 const volumeSupersededPrefix = "⏩ Volume changed to"
 
+// renderSupersededFold renders the frozen body written over a superseded
+// comment: a headline pointing at the successor comment, with the superseded
+// comment's last rendered body preserved inside a collapsed details block.
+// Every rotation flavor shares this shape and differs only in its headline
+// (which must start with that flavor's superseded prefix) and fold label.
+func renderSupersededFold(headline, foldLabel, repo string, pr int, newCommentID int64, previousBody string) string {
+	return fmt.Sprintf(
+		headline+" [a new progress comment](https://github.com/%s/pull/%d#issuecomment-%d).\n\n"+
+			"<details>\n<summary>%s</summary>\n\n%s\n\n</details>\n",
+		repo, pr, newCommentID, foldLabel, previousBody)
+}
+
 // RenderVolumeSupersededProgressComment renders the frozen body written over a
 // progress comment once a volume change rotates in a fresh one. The old
 // comment's final progress stays on the PR as a record, collapsed into a
 // details block, with a pointer to the comment where progress continues.
 func RenderVolumeSupersededProgressComment(data VolumeSupersededProgressData) string {
-	return fmt.Sprintf(
-		volumeSupersededPrefix+" **%d/%d** — progress continues in [a new progress comment](https://github.com/%s/pull/%d#issuecomment-%d).\n\n"+
-			"<details>\n<summary>Progress before the volume change</summary>\n\n%s\n\n</details>\n",
-		data.Volume, storage.MaxVolume, data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
+	headline := fmt.Sprintf("%s **%d/%d** — progress continues in", volumeSupersededPrefix, data.Volume, storage.MaxVolume)
+	return renderSupersededFold(headline, "Progress before the volume change",
+		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
 }
 
 // ResumeSupersededProgressData contains data for freezing a progress comment
@@ -352,9 +363,99 @@ const resumeSupersededPrefix = "▶️ Schema change resumed"
 // into a details block, with a pointer to the comment where progress
 // continues.
 func RenderResumeSupersededProgressComment(data ResumeSupersededProgressData) string {
-	return fmt.Sprintf(
-		resumeSupersededPrefix+" — progress continues in [a new progress comment](https://github.com/%s/pull/%d#issuecomment-%d).\n\n"+
-			"<details>\n<summary>Progress before the stop</summary>\n\n%s\n\n</details>\n",
+	return renderSupersededFold(resumeSupersededPrefix+" — progress continues in", "Progress before the stop",
+		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
+}
+
+// RevertSupersededProgressData contains data for freezing a progress comment
+// that a user revert has superseded.
+type RevertSupersededProgressData struct {
+	// Repo is the "owner/name" repository, used to link the successor comment.
+	Repo string
+	// PR is the pull request number, used to link the successor comment.
+	PR int
+	// NewCommentID is the GitHub comment ID of the fresh progress comment now
+	// tracking the revert.
+	NewCommentID int64
+	// PreviousBody is the superseded comment's last rendered body, preserved
+	// inside the folded details block.
+	PreviousBody string
+}
+
+// revertSupersededPrefix opens every frozen body written when a revert
+// superseded a progress comment; IsSupersededProgressComment keys on it so a
+// freeze retry can tell an already-frozen comment from a live one.
+const revertSupersededPrefix = "Schema change reverting"
+
+// RenderRevertSupersededProgressComment renders the frozen body written over a
+// progress comment once a user revert rotates in a fresh one. The old
+// comment's final pre-revert progress stays on the PR as a record, collapsed
+// into a details block, with a pointer to the comment where the revert is
+// tracked.
+func RenderRevertSupersededProgressComment(data RevertSupersededProgressData) string {
+	return renderSupersededFold(revertSupersededPrefix+" — the revert is tracked in", "Progress before the revert",
+		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
+}
+
+// SkipRevertSupersededProgressData contains data for freezing a progress
+// comment that a user skip-revert has superseded.
+type SkipRevertSupersededProgressData struct {
+	// Repo is the "owner/name" repository, used to link the successor comment.
+	Repo string
+	// PR is the pull request number, used to link the successor comment.
+	PR int
+	// NewCommentID is the GitHub comment ID of the fresh progress comment now
+	// tracking the finalization.
+	NewCommentID int64
+	// PreviousBody is the superseded comment's last rendered body, preserved
+	// inside the folded details block.
+	PreviousBody string
+}
+
+// skipRevertSupersededPrefix opens every frozen body written when a
+// skip-revert superseded a progress comment; IsSupersededProgressComment keys
+// on it so a freeze retry can tell an already-frozen comment from a live one.
+const skipRevertSupersededPrefix = "Revert skipped"
+
+// RenderSkipRevertSupersededProgressComment renders the frozen body written
+// over a progress comment once a user skip-revert rotates in a fresh one. The
+// old comment's final revert-window rendering stays on the PR as a record,
+// collapsed into a details block, with a pointer to the comment where the
+// finalization is tracked.
+func RenderSkipRevertSupersededProgressComment(data SkipRevertSupersededProgressData) string {
+	return renderSupersededFold(skipRevertSupersededPrefix+" — the schema change is finalizing in", "Progress before the revert was skipped",
+		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
+}
+
+// CutoverSupersededCommentData contains data for freezing a cutover prompt
+// comment once the triggered cutover has completed and a fresh progress
+// comment tracks the apply again.
+type CutoverSupersededCommentData struct {
+	// Repo is the "owner/name" repository, used to link the successor comment.
+	Repo string
+	// PR is the pull request number, used to link the successor comment.
+	PR int
+	// NewCommentID is the GitHub comment ID of the fresh progress comment now
+	// tracking the apply after cutover.
+	NewCommentID int64
+	// PreviousBody is the superseded cutover comment's last rendered body,
+	// preserved inside the folded details block.
+	PreviousBody string
+}
+
+// cutoverSupersededPrefix opens every frozen body written when a completed
+// cutover superseded the cutover prompt comment; IsSupersededProgressComment
+// keys on it so a freeze retry can tell an already-frozen comment from a live
+// one.
+const cutoverSupersededPrefix = "Cutover complete"
+
+// RenderCutoverSupersededComment renders the frozen body written over the
+// cutover prompt comment once the operator's cutover has completed and the
+// apply continues (e.g. into its revert window). The prompt stays on the PR as
+// a record, collapsed into a details block, with a pointer to the comment
+// where progress is tracked.
+func RenderCutoverSupersededComment(data CutoverSupersededCommentData) string {
+	return renderSupersededFold(cutoverSupersededPrefix+" — progress continues in", "Cutover prompt",
 		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
 }
 
@@ -386,19 +487,27 @@ const genericSupersededPrefix = "⏭️ Progress comment superseded"
 // a record, collapsed into a details block, with a pointer to the comment
 // where progress continues.
 func RenderSupersededProgressComment(data SupersededProgressData) string {
-	return fmt.Sprintf(
-		genericSupersededPrefix+" — progress continues in [a new progress comment](https://github.com/%s/pull/%d#issuecomment-%d).\n\n"+
-			"<details>\n<summary>Earlier progress</summary>\n\n%s\n\n</details>\n",
+	return renderSupersededFold(genericSupersededPrefix+" — progress continues in", "Earlier progress",
 		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
 }
 
 // IsSupersededProgressComment reports whether a comment body is already a
-// frozen superseded-progress rendering — either flavor — so a freeze retry
-// does not wrap a frozen body in a second fold.
+// frozen superseded rendering — any rotation flavor — so a freeze retry does
+// not wrap a frozen body in a second fold.
 func IsSupersededProgressComment(body string) bool {
-	return strings.HasPrefix(body, volumeSupersededPrefix) ||
-		strings.HasPrefix(body, resumeSupersededPrefix) ||
-		strings.HasPrefix(body, genericSupersededPrefix)
+	for _, prefix := range []string{
+		volumeSupersededPrefix,
+		resumeSupersededPrefix,
+		revertSupersededPrefix,
+		skipRevertSupersededPrefix,
+		cutoverSupersededPrefix,
+		genericSupersededPrefix,
+	} {
+		if strings.HasPrefix(body, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // RenderCutoverCommandAccepted renders the acknowledgement posted when a PR

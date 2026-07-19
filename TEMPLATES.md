@@ -3137,6 +3137,132 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 </details>
 
 <details>
+<summary><a name="revert-superseded-progress-comment"></a><strong>Revert: Superseded Progress Comment</strong></summary>
+
+
+Schema change reverting — the revert is tracked in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the revert</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Revert Window
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+
+
+---
+
+To skip revert and keep changes:
+```
+schemabot skip-revert apply-a1b2c3d4e5f6 -e staging
+```
+
+To revert:
+```
+schemabot revert apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
+</details>
+
+<details>
+<summary><a name="skip-revert-superseded-progress-comment"></a><strong>Skip Revert: Superseded Progress Comment</strong></summary>
+
+
+Revert skipped — the schema change is finalizing in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the revert was skipped</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Revert Window
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+
+
+---
+
+To skip revert and keep changes:
+```
+schemabot skip-revert apply-a1b2c3d4e5f6 -e staging
+```
+
+To revert:
+```
+schemabot revert apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
+</details>
+
+<details>
+<summary><a name="cutover-complete-superseded-cutover-prompt"></a><strong>Cutover Complete: Superseded Cutover Prompt</strong></summary>
+
+
+Cutover complete — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Cutover prompt</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Waiting for Cutover
+
+**0/1** table(s) ready for cutover — waiting on 1
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+
+
+---
+
+To proceed with cutover:
+```
+schemabot cutover apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
+</details>
+
+<details>
 <summary><a name="retry-superseded-progress-comment-generic"></a><strong>Retry: Superseded Progress Comment (Generic)</strong></summary>
 
 
@@ -5825,6 +5951,135 @@ Paused — to resume from where it stopped:
 ```
 schemabot start apply-a1b2c3d4e5f6 -e staging
 ```
+
+
+</details>
+
+
+</details>
+
+<details>
+<summary><a name="revert-superseded-progress-comment"></a><strong>Revert: Superseded Progress Comment</strong></summary>
+
+
+Schema change reverting — the revert is tracked in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the revert</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Revert Window
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+
+
+---
+
+To skip revert and keep changes:
+```
+schemabot skip-revert apply-a1b2c3d4e5f6 -e staging
+```
+
+To revert:
+```
+schemabot revert apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
+
+</details>
+
+<details>
+<summary><a name="skip-revert-superseded-progress-comment"></a><strong>Skip Revert: Superseded Progress Comment</strong></summary>
+
+
+Revert skipped — the schema change is finalizing in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the revert was skipped</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Revert Window
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+
+
+---
+
+To skip revert and keep changes:
+```
+schemabot skip-revert apply-a1b2c3d4e5f6 -e staging
+```
+
+To revert:
+```
+schemabot revert apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
+
+</details>
+
+<details>
+<summary><a name="cutover-complete-superseded-cutover-prompt"></a><strong>Cutover Complete: Superseded Cutover Prompt</strong></summary>
+
+
+Cutover complete — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Cutover prompt</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Waiting for Cutover
+
+**0/1** table(s) ready for cutover — waiting on 1
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+
+
+---
+
+To proceed with cutover:
+```
+schemabot cutover apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
 
 </details>

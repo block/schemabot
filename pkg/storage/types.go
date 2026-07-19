@@ -1135,6 +1135,16 @@ type ApplyComment struct {
 	// for rows that predate volume tracking — nil never triggers a rotation.
 	PostedVolume *int
 
+	// PostedPhase records the control-operation phase the apply was in when a
+	// progress comment was posted (e.g. reverting, skipping revert, the
+	// post-cutover revert window) — empty when the apply was in no such phase.
+	// An apply in a control phase whose tracked progress comment records a
+	// different phase predates that phase, so the observer rotates in a fresh
+	// comment to track it. Nil (a comment state where the phase is not
+	// meaningful, or a row predating phase tracking) is treated the same as
+	// empty: the comment still predates whatever phase the apply is in now.
+	PostedPhase *string
+
 	// PendingFreezeCommentID records the GitHub comment ID of a progress
 	// comment this row's comment superseded whose frozen rendering has not yet
 	// landed on GitHub. It is written in the same upsert that tracks the
