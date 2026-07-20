@@ -3224,7 +3224,7 @@ Schema change reverting — the revert is tracked in [a new progress comment](ht
 
 **Status**: Revert Window
 
-**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
@@ -3267,7 +3267,7 @@ Revert skipped — the schema change is finalizing in [a new progress comment](h
 
 **Status**: Revert Window
 
-**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
@@ -3321,10 +3321,7 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 ---
 
-To proceed with cutover:
-```
-schemabot cutover apply-a1b2c3d4e5f6 -e staging
-```
+SchemaBot triggers cutover automatically — no action needed.
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
@@ -6090,7 +6087,7 @@ Schema change reverting — the revert is tracked in [a new progress comment](ht
 
 **Status**: Revert Window
 
-**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
@@ -6134,7 +6131,7 @@ Revert skipped — the schema change is finalizing in [a new progress comment](h
 
 **Status**: Revert Window
 
-**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
@@ -6189,10 +6186,7 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 ---
 
-To proceed with cutover:
-```
-schemabot cutover apply-a1b2c3d4e5f6 -e staging
-```
+SchemaBot triggers cutover automatically — no action needed.
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
