@@ -75,6 +75,7 @@ func previewCommentAllOutput() {
 		{"APPLY FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFailed()) }},
 		{"APPLY STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStopped()) }},
 		{"APPLY WAITING FOR CUTOVER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutover()) }},
+		{"APPLY WAITING FOR CUTOVER (AUTOMATIC)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutoverAutomatic()) }},
 		{"APPLY CUTTING OVER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCuttingOver()) }},
 		{"CUTOVER COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted()) }},
 		{"CUTOVER COMMAND ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress()) }},
@@ -263,6 +264,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"CANCELLED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCancelled()) }},
 		// Cutover states
 		{"WAITING FOR CUTOVER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutover()) }},
+		{"WAITING FOR CUTOVER (AUTOMATIC)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutoverAutomatic()) }},
 		{"CUTTING OVER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCuttingOver()) }},
 		// Revert-window states (PlanetScale): deployed-but-revertable, then finalizing.
 		{"REVERT WINDOW", func() { fmt.Print(webhooktemplates.PreviewCommentApplyRevertWindow()) }},

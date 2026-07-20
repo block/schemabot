@@ -265,7 +265,8 @@ Comment Templates (GitHub PR comments):
   comment_apply_failed          Multi-table: failed (with error and cancelled tables)
   comment_apply_retrying        Multi-table: interrupted, retrying automatically (attempt counter)
   comment_apply_stopped         Multi-table: stopped (partial progress)
-  comment_apply_waiting_cutover Waiting for cutover
+  comment_apply_waiting_cutover Waiting for cutover (deferred, operator triggers)
+  comment_apply_waiting_cutover_automatic Waiting for cutover (non-deferred, drive triggers)
   comment_apply_cutting_over    Cutting over
   cli_multi_deploy_in_progress  CLI multi-deployment apply in progress
   cli_multi_deploy_failed       CLI multi-deployment apply with one failed deployment

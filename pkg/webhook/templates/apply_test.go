@@ -1035,11 +1035,12 @@ func TestRenderApplyStatusComment_Cancelled(t *testing.T) {
 
 func TestRenderApplyStatusComment_WaitingForCutover(t *testing.T) {
 	data := ApplyStatusCommentData{
-		Database:    "testapp",
-		Environment: "staging",
-		RequestedBy: "aparajon",
-		State:       "waiting_for_cutover",
-		Engine:      "Spirit",
+		Database:     "testapp",
+		Environment:  "staging",
+		RequestedBy:  "aparajon",
+		State:        "waiting_for_cutover",
+		Engine:       "Spirit",
+		DeferCutover: true,
 		Tables: []TableProgressData{
 			{TableName: "orders", Status: "waiting_for_cutover"},
 			{TableName: "users", Status: "waiting_for_cutover"},
@@ -1051,6 +1052,29 @@ func TestRenderApplyStatusComment_WaitingForCutover(t *testing.T) {
 	assert.Contains(t, result, "Waiting for Cutover")
 	assert.Contains(t, result, "🟨") // yellow bar
 	assert.Contains(t, result, "schemabot cutover")
+}
+
+// A non-deferred apply parked at waiting_for_cutover cuts over on its own —
+// the drive is the cutover actor — so the footer must tell the operator no
+// action is needed instead of offering the manual cutover command.
+func TestRenderApplyStatusComment_WaitingForCutoverAutomatic(t *testing.T) {
+	data := ApplyStatusCommentData{
+		ApplyID:     "apply-abc123",
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.WaitingForCutover,
+		Engine:      "PlanetScale",
+		Tables: []TableProgressData{
+			{TableName: "orders", Status: state.Task.WaitingForCutover, ReadyToComplete: true},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "Waiting for Cutover")
+	assert.Contains(t, result, "SchemaBot triggers cutover automatically — no action needed.")
+	assert.NotContains(t, result, "schemabot cutover", "offering the manual command tells the operator to act when no action is needed")
 }
 
 func TestRenderApplyStatusComment_Recovering(t *testing.T) {
@@ -1320,6 +1344,14 @@ func TestPreviewCommentApplyWaitingForCutover(t *testing.T) {
 
 	assert.Contains(t, result, "Waiting for Cutover")
 	assert.Contains(t, result, "schemabot cutover")
+}
+
+func TestPreviewCommentApplyWaitingForCutoverAutomatic(t *testing.T) {
+	result := PreviewCommentApplyWaitingForCutoverAutomatic()
+
+	assert.Contains(t, result, "Waiting for Cutover")
+	assert.Contains(t, result, "SchemaBot triggers cutover automatically")
+	assert.NotContains(t, result, "schemabot cutover", "a non-deferred apply cuts over on its own — offering the command tells the operator to act when no action is needed")
 }
 
 func TestPreviewCommentApplyCuttingOver(t *testing.T) {
@@ -1814,10 +1846,11 @@ func TestRenderApplyBlockedByInProgressChecks_EmptyList(t *testing.T) {
 
 func TestRenderApplyStatusComment_WaitingForCutover_ReadyNotReady(t *testing.T) {
 	data := ApplyStatusCommentData{
-		ApplyID:     "apply-abc123",
-		Database:    "testapp",
-		Environment: "staging",
-		State:       state.Apply.WaitingForCutover,
+		ApplyID:      "apply-abc123",
+		Database:     "testapp",
+		Environment:  "staging",
+		State:        state.Apply.WaitingForCutover,
+		DeferCutover: true,
 		Tables: []TableProgressData{
 			{TableName: "users", Status: state.Task.WaitingForCutover, ReadyToComplete: true, DDL: "ALTER TABLE users ADD INDEX idx_email (email)"},
 			{TableName: "orders", Status: state.Task.WaitingForCutover, ReadyToComplete: true, DDL: "ALTER TABLE orders ADD INDEX idx_status (status)"},
