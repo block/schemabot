@@ -101,6 +101,14 @@ type ApplyStatusCommentData struct {
 	// status vocabulary from "apply" to "rollback" so a completed rollback is
 	// announced as "Rollback Complete", never as a freshly applied schema change.
 	Rollback bool
+
+	// DeferCutover reports whether cutover waits on an explicit operator
+	// trigger (the apply's durable defer-cutover option). It selects the
+	// waiting-for-cutover footer: deferred applies get the pasteable
+	// `schemabot cutover` command, while non-deferred applies get a note that
+	// the drive triggers cutover automatically — surfacing the command there
+	// would tell the operator to act when no action is needed.
+	DeferCutover bool
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -955,7 +963,12 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.WaitingForDeploy:
 		writeFooterAction(sb, "To deploy:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.WaitingForCutover:
-		writeFooterAction(sb, "To proceed with cutover:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		if data.DeferCutover {
+			writeFooterAction(sb, "To proceed with cutover:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		} else {
+			sb.WriteString("\n---\n\n")
+			sb.WriteString("SchemaBot triggers cutover automatically — no action needed.\n")
+		}
 	case state.Apply.Recovering:
 		sb.WriteString("\n---\n\n")
 		if pct, ok := recoveringCopyPercent(data.Tables); ok {

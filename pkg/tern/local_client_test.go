@@ -1887,16 +1887,16 @@ func TestLocalClient_AutoTriggerCutoverEscalatesWhenNotReadyPersists(t *testing.
 
 	// Within the staging window: retries stay quiet and the trigger event is
 	// recorded exactly once.
-	client.autoTriggerCutover(t.Context(), fakeEngine, apply, controlReq, pollState, start)
-	client.autoTriggerCutover(t.Context(), fakeEngine, apply, controlReq, pollState, start.Add(time.Second))
+	client.autoTriggerCutover(t.Context(), fakeEngine, apply, nil, controlReq, pollState, start)
+	client.autoTriggerCutover(t.Context(), fakeEngine, apply, nil, controlReq, pollState, start.Add(time.Second))
 	assert.Equal(t, 2, fakeEngine.cutoverCount)
 	assert.Equal(t, 1, countLogMessagesContaining(logs.logs, "Auto-triggering cutover"), "retries must not duplicate the trigger event")
 	assert.False(t, hasLogMessageContaining(logs.logs, "has not been accepted by the engine backend"), "no escalation within the staging window")
 
 	// Beyond the staging window: the timeline records the stall exactly once
 	// while the drive keeps retrying every tick.
-	client.autoTriggerCutover(t.Context(), fakeEngine, apply, controlReq, pollState, start.Add(cutoverNotReadyEscalationAfter))
-	client.autoTriggerCutover(t.Context(), fakeEngine, apply, controlReq, pollState, start.Add(cutoverNotReadyEscalationAfter+time.Second))
+	client.autoTriggerCutover(t.Context(), fakeEngine, apply, nil, controlReq, pollState, start.Add(cutoverNotReadyEscalationAfter))
+	client.autoTriggerCutover(t.Context(), fakeEngine, apply, nil, controlReq, pollState, start.Add(cutoverNotReadyEscalationAfter+time.Second))
 	assert.Equal(t, 4, fakeEngine.cutoverCount, "escalation must not stop the retry loop")
 	assert.Equal(t, 1, countLogMessagesContaining(logs.logs, "has not been accepted by the engine backend"), "the escalation event is recorded once")
 	for _, log := range logs.logs {
@@ -1908,9 +1908,107 @@ func TestLocalClient_AutoTriggerCutoverEscalatesWhenNotReadyPersists(t *testing.
 	// The backend accepts: the not-ready tracking resets so a later staging
 	// window escalates on its own clock.
 	fakeEngine.cutoverErr = nil
-	client.autoTriggerCutover(t.Context(), fakeEngine, apply, controlReq, pollState, start.Add(cutoverNotReadyEscalationAfter+2*time.Second))
+	client.autoTriggerCutover(t.Context(), fakeEngine, apply, nil, controlReq, pollState, start.Add(cutoverNotReadyEscalationAfter+2*time.Second))
 	assert.True(t, pollState.cutoverNotReadySince.IsZero(), "an accepted cutover must clear the not-ready clock")
 	assert.False(t, pollState.cutoverNotReadyEscalated, "an accepted cutover must re-arm the escalation event")
+	assert.Zero(t, pollState.consecutiveCutoverFailures, "not-ready rejections must not count as hard cutover failures")
+}
+
+// The drive is the sole cutover actor, so a cutover the backend keeps
+// rejecting with a hard error (revoked cutover permission, persistent API
+// rejection) cannot retry forever — that would pin the apply at
+// waiting_for_cutover holding the database's deploy queue and lock until a
+// human cancels. After the consecutive-failure bound the drive settles the
+// apply as failed and this owner exits, so the check gate stays closed and an
+// operator gets a settled apply to act on instead of a silent spin.
+func TestLocalClient_AutoTriggerCutoverFailsApplyAfterRepeatedHardRejections(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              133,
+		ApplyIdentifier: "apply-auto-cutover-hard-fail",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	task := &storage.Task{
+		ID:             465,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-auto-cutover-hard-fail",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}
+	fakeEngine := &fakeControlEngine{cutoverErr: errors.New("apply deploy request: 403 cutover not permitted")}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:    logs,
+		},
+		planetscaleEngine: fakeEngine,
+		logger:            slog.Default(),
+	}
+	controlReq := &engine.ControlRequest{Database: apply.Database}
+	pollState := &atomicPollState{}
+	now := time.Now()
+
+	for i := 1; i < maxConsecutiveCutoverFailures; i++ {
+		require.False(t, client.autoTriggerCutover(t.Context(), fakeEngine, apply, []*storage.Task{task}, controlReq, pollState, now),
+			"the drive must keep retrying below the consecutive-failure bound (attempt %d)", i)
+		assert.Equal(t, state.Apply.WaitingForCutover, apply.State)
+	}
+
+	require.True(t, client.autoTriggerCutover(t.Context(), fakeEngine, apply, []*storage.Task{task}, controlReq, pollState, now),
+		"the drive owner must exit once the apply is settled")
+	assert.Equal(t, maxConsecutiveCutoverFailures, fakeEngine.cutoverCount)
+	assert.Equal(t, state.Apply.Failed, apply.State, "repeated hard rejections must settle the apply as failed")
+	assert.Equal(t, state.Task.Failed, task.State)
+	assert.Contains(t, apply.ErrorMessage, "cutover failed after 10 consecutive attempts")
+	assert.Contains(t, task.ErrorMessage, "403 cutover not permitted")
+}
+
+// A cutover rejection the engine classifies as permanent (the deploy request
+// no longer exists) can never succeed on retry, so the drive fails the apply
+// on the first rejection instead of burning the consecutive-failure bound.
+func TestLocalClient_AutoTriggerCutoverFailsApplyImmediatelyOnPermanentError(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              134,
+		ApplyIdentifier: "apply-auto-cutover-permanent",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	task := &storage.Task{
+		ID:             466,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-auto-cutover-permanent",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}
+	fakeEngine := &fakeControlEngine{cutoverErr: engine.NewPermanentError("deploy request not found")}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:    &mockApplyLogStore{},
+		},
+		planetscaleEngine: fakeEngine,
+		logger:            slog.Default(),
+	}
+
+	require.True(t, client.autoTriggerCutover(t.Context(), fakeEngine, apply, []*storage.Task{task}, &engine.ControlRequest{Database: apply.Database}, &atomicPollState{}, time.Now()),
+		"a permanent rejection must settle the apply on the first attempt")
+	assert.Equal(t, 1, fakeEngine.cutoverCount)
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Equal(t, state.Task.Failed, task.State)
+	assert.Contains(t, apply.ErrorMessage, "deploy request not found")
 }
 
 func countLogMessagesContaining(logs []*storage.ApplyLog, want string) int {
