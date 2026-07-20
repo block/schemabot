@@ -243,6 +243,13 @@ func (h *Handler) processDurableMergeGroup(ctx context.Context, event *storage.W
 		return false, nil
 	}
 
+	// Bound the GitHub work so a stalled API call cannot be kept alive
+	// indefinitely by the lease heartbeat and monopolize a driver. Matches the
+	// request path's post budget and the durable auto-plan bootstrap. The driver
+	// context stays the parent, so shutdown or lease loss still cancels.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
 		return true, fmt.Errorf("create GitHub client for durable merge_group %s@%s: %w", repo, headSHA, err)

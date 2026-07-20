@@ -158,6 +158,34 @@ func TestDurablePushDriverCompletesUnregisteredRepo(t *testing.T) {
 	}
 }
 
+// A non-deletion push row with an empty head SHA is a corrupted/replayed row,
+// not the all-zeros deletion sentinel, so the driver fails it terminally rather
+// than silently completing it as a no-op and never refreshing the check source.
+func TestDurablePushDriverFailsEmptyHeadSHATerminally(t *testing.T) {
+	event := durablePushEvent()
+	event.Payload = []byte(`{
+		"ref": "refs/heads/main",
+		"after": "",
+		"deleted": false,
+		"repository": {"full_name": "octocat/hello-world", "default_branch": "main"},
+		"installation": {"id": 12345}
+	}`)
+	store := newScriptedWebhookEventStore(event)
+	config := &api.ServerConfig{Repos: map[string]api.RepoConfig{"octocat/hello-world": {}}}
+	h := newDurableDriverHandler(t, store, config, &fakeClientFactory{})
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case failure := <-store.failed:
+		require.Nil(t, failure.retryAfter, "an empty head SHA is malformed and must not be retried")
+		require.Contains(t, failure.errMsg, "missing head SHA")
+	default:
+		t.Fatal("expected empty-head-SHA push delivery to be marked failed")
+	}
+	require.Empty(t, store.completed)
+}
+
 // A GitHub client failure while posting the check is retryable so the ruleset
 // check source is refreshed rather than left to age until the next push.
 func TestDurablePushDriverRetriesClientFailure(t *testing.T) {

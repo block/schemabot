@@ -221,7 +221,13 @@ func (h *Handler) processDurablePush(ctx context.Context, event *storage.Webhook
 		return false, nil
 	}
 
-	if payload.Deleted || headSHA == "" || strings.Trim(headSHA, "0") == "" {
+	if headSHA == "" {
+		// The deletion sentinel is an all-zeros SHA, not an empty one; a truly
+		// empty head SHA is a corrupted/replayed row. Fail terminally so it
+		// surfaces as malformed rather than silently completing as a no-op.
+		return false, fmt.Errorf("durable push delivery %s missing head SHA", event.DeliveryID)
+	}
+	if payload.Deleted || strings.Trim(headSHA, "0") == "" {
 		h.logger.Info("durable push delivery ignored because it is a branch deletion",
 			"delivery_id", event.DeliveryID, "repo", repo, "ref", payload.Ref)
 		return false, nil
@@ -254,6 +260,13 @@ func (h *Handler) processDurablePush(ctx context.Context, event *storage.Webhook
 		// shouldPublishChecks logs and records the skip.
 		return false, nil
 	}
+
+	// Bound the GitHub work so a stalled API call cannot be kept alive
+	// indefinitely by the lease heartbeat and monopolize a driver. Matches the
+	// request path's post budget and the durable auto-plan bootstrap. The driver
+	// context stays the parent, so shutdown or lease loss still cancels.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
