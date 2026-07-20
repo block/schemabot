@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/vschema"
 )
 
 // verifyBranchMatchesDesiredWithRetry retries verifyBranchMatchesDesired up to
@@ -262,13 +263,13 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 		if currentVSchema != nil {
 			currentVSchemaRaw = currentVSchema.Raw
 		}
-		vschemaChanged = VSchemaChanged(currentVSchemaRaw, content)
+		vschemaChanged = vschema.Changed(currentVSchemaRaw, content)
 		if vschemaChanged {
 			e.logger.Info("diffKeyspace: VSchema mismatch detected",
 				"keyspace", ks,
 				"branch", branch,
-				"current_normalized", normalizeVSchemaJSON(currentVSchemaRaw),
-				"desired_normalized", normalizeVSchemaJSON(content),
+				"current_normalized", vschema.Normalize(currentVSchemaRaw),
+				"desired_normalized", vschema.Normalize(content),
 			)
 		}
 	}

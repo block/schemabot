@@ -1,8 +1,15 @@
-package planetscale
+// Package vschema compares and renders diffs of Vitess VSchema JSON
+// documents. Comparison is semantic: whitespace, key ordering, and proto
+// zero-value fields (e.g. "sharded": false) are ignored, matching how Vitess
+// stores VSchema. Any Vitess-family engine can use these helpers to decide
+// whether a desired VSchema differs from the live one and to render the
+// change for operators.
+package vschema
 
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 
 	"github.com/pmezard/go-difflib/difflib"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -10,19 +17,19 @@ import (
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 )
 
-// VSchemaChanged returns true if the current and desired VSchema JSON strings
+// Changed returns true if the current and desired VSchema JSON strings
 // differ semantically (ignoring whitespace and key ordering).
-func VSchemaChanged(current, desired string) bool {
-	current = normalizeVSchemaJSON(current)
-	desired = normalizeVSchemaJSON(desired)
+func Changed(current, desired string) bool {
+	current = Normalize(current)
+	desired = Normalize(desired)
 	return current != desired
 }
 
-// VSchemaDiff returns a unified diff between the current and desired VSchema
+// Diff returns a unified diff between the current and desired VSchema
 // JSON strings. Returns empty string if they are identical.
-func VSchemaDiff(current, desired string) string {
-	currentPretty := prettyJSON(normalizeVSchemaJSON(current))
-	desiredPretty := prettyJSON(normalizeVSchemaJSON(desired))
+func Diff(current, desired string) string {
+	currentPretty := prettyJSON(Normalize(current))
+	desiredPretty := prettyJSON(Normalize(desired))
 
 	if currentPretty == desiredPretty {
 		return ""
@@ -35,18 +42,23 @@ func VSchemaDiff(current, desired string) string {
 		ToFile:   "new",
 		Context:  3,
 	}
+	// The two documents differ at this point, so an empty result would be
+	// indistinguishable from "no change". Surface rendering failure with a
+	// fixed placeholder instead (never the raw error, which could carry
+	// internal detail into PR-facing output).
 	text, err := difflib.GetUnifiedDiffString(diff)
 	if err != nil {
-		return ""
+		return "(VSchema diff unavailable)"
 	}
 	return text
 }
 
-// normalizeVSchemaJSON normalizes a VSchema JSON string for comparison.
+// Normalize canonicalizes a VSchema JSON string for comparison.
 // Uses Vitess protobuf round-trip to strip proto zero-value fields (e.g.,
 // "sharded": false) that are semantically equivalent to being absent.
 // This matches the approach used for VSchema comparison in the tern layer.
-func normalizeVSchemaJSON(s string) string {
+func Normalize(s string) string {
+	s = strings.TrimSpace(s)
 	if s == "" {
 		return "{}"
 	}
