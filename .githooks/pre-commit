@@ -33,7 +33,7 @@ fi
 scripts/lint-fix.sh
 
 # Regenerate TEMPLATES.md if any template source files changed
-TEMPLATE_FILES=$(git diff --cached --name-only -- 'pkg/webhook/templates/*.go' 'pkg/cmd/templates/*.go')
+TEMPLATE_FILES=$(git diff --cached --name-only -- 'pkg/webhook/templates/*.go' 'pkg/cmd/internal/templates/*.go')
 if [ -n "$TEMPLATE_FILES" ]; then
     # Ensure Go is in PATH (hooks may not inherit the full user PATH)
     export PATH="$PATH:$HOME/go/bin:/usr/local/go/bin:/opt/homebrew/bin"

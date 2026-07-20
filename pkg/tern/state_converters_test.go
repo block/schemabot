@@ -150,9 +150,11 @@ func TestPSDisplayMetadataStorageBlobRoundTrip(t *testing.T) {
 	assert.Equal(t, "applied", changes[0].Status)
 }
 
-// The revert-window deadline alone is worth storing: during the revert window a
-// remote apply's progress response may carry only revert_expires_at as display
-// state, and the PR comment needs it to render the countdown.
+// The revert-window deadline is a display field in its own right: the
+// "nothing worth storing" guard counts revert_expires_at like the other
+// display fields, so a map carrying only the deadline still yields a blob
+// rather than being discarded as empty. (Live progress responses carry the
+// deploy-request URL alongside the deadline; this pins the guard itself.)
 func TestPSDisplayMetadataStorageBlobRevertExpiresOnly(t *testing.T) {
 	blob, err := PSDisplayMetadataStorageBlob(map[string]string{
 		"revert_expires_at": "2026-06-29T18:30:00Z",
@@ -165,9 +167,11 @@ func TestPSDisplayMetadataStorageBlobRevertExpiresOnly(t *testing.T) {
 	assert.Equal(t, "2026-06-29T18:30:00Z", got["revert_expires_at"])
 }
 
-// A malformed revert-window deadline is surfaced as an error rather than being
-// silently dropped or stored corrupt, so the mirror logs it and retries on the
-// next poll with the rest of the display state intact.
+// A malformed revert-window deadline fails the whole conversion rather than
+// storing a corrupt or partial blob: the mirror logs the error and persists
+// nothing from that poll, leaving any previously stored blob as-is. A value
+// that no writer emits is a loud version-skew tripwire, not display state to
+// degrade around.
 func TestPSDisplayMetadataStorageBlobBadRevertExpires(t *testing.T) {
 	_, err := PSDisplayMetadataStorageBlob(map[string]string{
 		"deploy_request_url": "https://app.planetscale.com/org/db/deploy-requests/106",
