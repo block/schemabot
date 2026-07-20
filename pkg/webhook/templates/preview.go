@@ -1151,7 +1151,7 @@ func PreviewCommentApplyWaitingForCutover() string {
 	tables := sampleApplyTables()
 	for i := range tables {
 		tables[i].Status = state.Task.WaitingForCutover
-		tables[i].ReadyToComplete = true
+		tables[i].ReadyToComplete = TaskStatusReadyForCutover(tables[i].Status)
 	}
 	data := sampleApplyData(state.Apply.WaitingForCutover, tables)
 	data.DeferCutover = true
@@ -1260,7 +1260,7 @@ func PreviewCommentMultiDeploymentApplyInProgress() string {
 	euTables := sampleApplyTables()
 	for i := range euTables {
 		euTables[i].Status = state.Task.WaitingForCutover
-		euTables[i].ReadyToComplete = true
+		euTables[i].ReadyToComplete = TaskStatusReadyForCutover(euTables[i].Status)
 	}
 
 	usTables := sampleApplyTables()

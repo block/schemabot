@@ -30,7 +30,10 @@ type TableProgressData struct {
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
 	IsInstant           bool
-	ReadyToComplete     bool
+	// ReadyToComplete marks the table as ready for the operator to cut over.
+	// Producers must derive it with TaskStatusReadyForCutover so every render
+	// path agrees on what "ready" means.
+	ReadyToComplete bool
 
 	// ErrorMessage is the task's last error. Rendered for states where the
 	// per-table error explains what the user is seeing (e.g. a retrying task).
@@ -41,6 +44,19 @@ type TableProgressData struct {
 	// while the table is in flight (see renderShardSummary); detailed per-shard
 	// row counts/ETAs stay in the CLI, not the PR comment.
 	Shards []ShardProgressData
+}
+
+// TaskStatusReadyForCutover reports whether a table's task status marks it as
+// ready for the operator to cut over. A task parked at the cutover barrier has
+// finished its copy and verification phases — the remaining binlog catch-up
+// happens under cutover itself — so the barrier state is what makes the table
+// ready. Engines fold any internal readiness signal into the task status they
+// report, so this is the single predicate every TableProgressData producer
+// derives ReadyToComplete from. Accepts raw engine statuses (Spirit
+// "waitingOnSentinelTable", Vitess "ready_to_complete") as well as canonical
+// task states.
+func TaskStatusReadyForCutover(status string) bool {
+	return state.NormalizeTaskStatus(status) == state.Task.WaitingForCutover
 }
 
 // ShardProgressData is the high-level status of one shard, for the compact
@@ -1490,6 +1506,7 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 			PercentComplete: int(t.PercentComplete),
 			ETASeconds:      t.ETASeconds,
 			IsInstant:       t.IsInstant,
+			ReadyToComplete: TaskStatusReadyForCutover(t.Status),
 		})
 	}
 
