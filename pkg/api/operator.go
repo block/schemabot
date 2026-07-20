@@ -556,11 +556,11 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 		return
 	}
 
-	// If the derived state above settled the apply terminally and a stop is still
-	// pending, complete it now so the request does not linger after the rollout
-	// has stopped.
-	if err := s.completePendingStopIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID); err != nil {
-		s.logger.Error("operator: failed to complete pending stop request for resolved apply",
+	// If the derived state above settled the apply terminally and a stop or
+	// cancel is still pending, complete it now so the request does not linger
+	// after the rollout has resolved.
+	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID); err != nil {
+		s.logger.Error("operator: failed to complete pending control requests for resolved apply",
 			append(finalApply.LogAttrs(),
 				"driver", driverID, "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "error", err)...)
 		return
@@ -728,13 +728,13 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 	}
 
 	// Publish the apply-level terminal summary if this drive's projection won the
-	// swap that terminalized the parent. Do this before stop-request cleanup: the
-	// summary depends only on the apply being terminal, and a later cleanup error
-	// must not suppress it.
+	// swap that terminalized the parent. Do this before control-request cleanup:
+	// the summary depends only on the apply being terminal, and a later cleanup
+	// error must not suppress it.
 	s.publishTerminalSummaryIfWon(operationLeaseCtx, driverID, finalApply, result)
 
-	if err := s.completePendingStopIfApplyResolved(operationLeaseCtx, driverID, finalApply.ID); err != nil {
-		s.logger.Error("operator: failed to complete pending stop request for resolved apply",
+	if err := s.completePendingControlRequestsIfApplyResolved(operationLeaseCtx, driverID, finalApply.ID); err != nil {
+		s.logger.Error("operator: failed to complete pending control requests for resolved apply",
 			append(finalApply.LogAttrs(),
 				"driver", driverID, "apply_operation_id", op.ID,
 				"operation_deployment", op.Deployment, "error", err)...)
@@ -904,8 +904,8 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 	// summary; publish it if this projection won the terminal swap.
 	s.publishTerminalSummaryIfWon(applyLeaseCtx, driverID, finalApply, result)
 
-	if err := s.completePendingStopIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID); err != nil {
-		s.logger.Error("operator: failed to complete pending stop request after stop reconciliation",
+	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID); err != nil {
+		s.logger.Error("operator: failed to complete pending control requests after stop reconciliation",
 			append(finalApply.LogAttrs(),
 				"driver", driverID, "error", err)...)
 		return true
@@ -948,37 +948,58 @@ func (s *Service) markPendingOperationsStopped(ctx context.Context, driverID int
 	return nil
 }
 
-// completePendingStopIfApplyResolved completes a pending stop control request
-// once the apply has settled to a terminal state, so the request does not stay
-// pending forever after the rollout stops. The apply is reloaded because the
-// derived-state write operates on a copy and does not mutate the caller's row.
-// No-op when the apply is still non-terminal or no stop is pending.
-func (s *Service) completePendingStopIfApplyResolved(ctx context.Context, driverID int, applyID int64) error {
+// completePendingControlRequestsIfApplyResolved completes pending stop and
+// cancel control requests once the apply has settled to a terminal state, so
+// the requests do not stay pending forever after the rollout resolves. The
+// apply is reloaded because the derived-state write operates on a copy and
+// does not mutate the caller's row. A pending stop completes at any terminal
+// state. A pending cancel completes only when the terminal state is not
+// stopped: a stopped apply remains cancellable, so its pending cancel must
+// stay deliverable for the next drive. No-op when the apply is still
+// non-terminal or nothing is pending.
+func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Context, driverID int, applyID int64) error {
 	apply, err := s.storage.Applies().Get(ctx, applyID)
 	if err != nil {
-		return fmt.Errorf("reload apply %d before completing pending stop: %w", applyID, err)
+		return fmt.Errorf("reload apply %d before completing pending control requests: %w", applyID, err)
 	}
 	if apply == nil {
-		return fmt.Errorf("reload apply %d before completing pending stop: %w", applyID, storage.ErrApplyNotFound)
+		return fmt.Errorf("reload apply %d before completing pending control requests: %w", applyID, storage.ErrApplyNotFound)
 	}
 	if !state.IsTerminalApplyState(apply.State) {
 		return nil
 	}
 
-	controlReq, err := s.storage.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStop)
+	if err := s.completePendingRequestForResolvedApply(ctx, driverID, apply, storage.ControlOperationStop); err != nil {
+		return err
+	}
+	if state.IsState(apply.State, state.Apply.Stopped) {
+		s.logger.Debug("operator: leaving pending cancel request deliverable for stopped apply",
+			"driver", driverID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment, "state", apply.State)
+		return nil
+	}
+	return s.completePendingRequestForResolvedApply(ctx, driverID, apply, storage.ControlOperationCancel)
+}
+
+// completePendingRequestForResolvedApply completes one pending control request
+// for an apply the caller has already established as resolved for that
+// operation. No-op when no request of that operation is pending.
+func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, driverID int, apply *storage.Apply, op storage.ControlOperation) error {
+	controlReq, err := s.storage.ControlRequests().GetPending(ctx, apply.ID, op)
 	if err != nil {
-		return fmt.Errorf("load pending stop request for resolved apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+		return fmt.Errorf("load pending %s request for resolved apply %s (%d): %w", op, apply.ApplyIdentifier, apply.ID, err)
 	}
 	if controlReq == nil {
 		return nil
 	}
 
-	if err := s.storage.ControlRequests().CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
-		return fmt.Errorf("complete pending stop request for resolved apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+	if err := s.storage.ControlRequests().CompletePending(ctx, apply.ID, op); err != nil {
+		return fmt.Errorf("complete pending %s request for resolved apply %s (%d): %w", op, apply.ApplyIdentifier, apply.ID, err)
 	}
-	s.logger.Info("operator: completed pending stop request for resolved apply",
+	s.logger.Info("operator: completed pending control request for resolved apply",
 		"driver", driverID, "apply_id", apply.ApplyIdentifier,
-		"database", apply.Database, "environment", apply.Environment, "state", apply.State)
+		"database", apply.Database, "environment", apply.Environment,
+		"state", apply.State, "operation", op)
 	return nil
 }
 

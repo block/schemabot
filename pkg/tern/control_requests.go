@@ -49,16 +49,22 @@ func completePendingControlRequests(ctx context.Context, store storage.Storage, 
 // requests that a terminal apply moots: a pending stop is settled (the apply
 // can no longer be stopped), a pending revert or skip-revert can no longer
 // act because the revert window is gone, and a pending volume adjustment has
-// no running copy left to retune. Sweeping them keeps a request issued moments
-// before the apply settled — or one that lost to a contradictory command —
-// from lingering pending forever.
+// no running copy left to retune. A pending cancel is mooted by every terminal
+// state except stopped — a stopped apply remains cancellable, so its pending
+// cancel stays deliverable for the next drive. Sweeping the mooted requests
+// keeps a request issued moments before the apply settled — or one that lost
+// to a contradictory command — from lingering pending forever.
 func completePendingRequestsForTerminalApply(ctx context.Context, store storage.Storage, apply *storage.Apply) error {
-	for _, op := range []storage.ControlOperation{
+	ops := []storage.ControlOperation{
 		storage.ControlOperationStop,
 		storage.ControlOperationRevert,
 		storage.ControlOperationSkipRevert,
 		storage.ControlOperationVolume,
-	} {
+	}
+	if !state.IsState(apply.State, state.Apply.Stopped) {
+		ops = append(ops, storage.ControlOperationCancel)
+	}
+	for _, op := range ops {
 		if err := completePendingControlRequests(ctx, store, apply, op); err != nil {
 			return err
 		}

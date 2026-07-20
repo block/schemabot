@@ -781,20 +781,18 @@ func TestUpdateApplyStateFromOperations_ReturnsProjectionResult(t *testing.T) {
 	}
 }
 
-// fakeControlRequestStore is a minimal ControlRequestStore for stop
-// reconciliation tests: GetPending returns the configured pending stop request,
-// and CompletePending records the operations it was asked to complete.
+// fakeControlRequestStore is a minimal ControlRequestStore for control-request
+// reconciliation tests: GetPending returns the configured pending request for
+// the operation, and CompletePending records the operations it was asked to
+// complete.
 type fakeControlRequestStore struct {
 	storage.ControlRequestStore
-	pendingStop *storage.ApplyControlRequest
-	completed   []storage.ControlOperation
+	pending   map[storage.ControlOperation]*storage.ApplyControlRequest
+	completed []storage.ControlOperation
 }
 
 func (s *fakeControlRequestStore) GetPending(_ context.Context, _ int64, op storage.ControlOperation) (*storage.ApplyControlRequest, error) {
-	if op == storage.ControlOperationStop {
-		return s.pendingStop, nil
-	}
-	return nil, nil
+	return s.pending[op], nil
 }
 
 func (s *fakeControlRequestStore) CompletePending(_ context.Context, _ int64, op storage.ControlOperation) error {
@@ -817,8 +815,9 @@ func (s *markPendingStoppedRecordingStore) MarkPendingStoppedByApply(_ context.C
 	return s.count, nil
 }
 
-// getApplyStore returns a fixed apply from Get so completePendingStopIfApplyResolved
-// can be driven against a chosen terminal/non-terminal state.
+// getApplyStore returns a fixed apply from Get so
+// completePendingControlRequestsIfApplyResolved can be driven against a chosen
+// terminal/non-terminal state.
 type getApplyStore struct {
 	storage.ApplyStore
 	apply *storage.Apply
@@ -855,8 +854,8 @@ func TestStopPendingOperationsForPendingStop(t *testing.T) {
 
 	t.Run("stops pending siblings when a stop is pending", func(t *testing.T) {
 		ops := &markPendingStoppedRecordingStore{count: 2}
-		control := &fakeControlRequestStore{pendingStop: &storage.ApplyControlRequest{
-			ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending,
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStop: {ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending},
 		}}
 		svc := newStopReconcileTestService(&getApplyStore{}, ops, control)
 
@@ -867,7 +866,7 @@ func TestStopPendingOperationsForPendingStop(t *testing.T) {
 
 	t.Run("no-op when no stop is pending", func(t *testing.T) {
 		ops := &markPendingStoppedRecordingStore{}
-		control := &fakeControlRequestStore{pendingStop: nil}
+		control := &fakeControlRequestStore{}
 		svc := newStopReconcileTestService(&getApplyStore{}, ops, control)
 
 		require.NoError(t, svc.stopPendingOperationsForPendingStop(t.Context(), 1, apply))
@@ -875,39 +874,72 @@ func TestStopPendingOperationsForPendingStop(t *testing.T) {
 	})
 }
 
-// TestCompletePendingStopIfApplyResolved verifies the operator completes a
-// pending stop request only once the apply has settled terminally.
-func TestCompletePendingStopIfApplyResolved(t *testing.T) {
-	pendingStop := func() *storage.ApplyControlRequest {
-		return &storage.ApplyControlRequest{ApplyID: 9, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending}
+// TestCompletePendingControlRequestsIfApplyResolved verifies the operator
+// completes pending stop and cancel requests only once the apply has settled
+// terminally, and keeps a pending cancel deliverable when the terminal state
+// is stopped — a stopped apply remains cancellable, so completing the cancel
+// there would consume a command the next drive still has to deliver.
+func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
+	pendingRequest := func(op storage.ControlOperation) *storage.ApplyControlRequest {
+		return &storage.ApplyControlRequest{ApplyID: 9, Operation: op, Status: storage.ControlRequestPending}
 	}
 
 	t.Run("completes the stop when the apply is terminal", func(t *testing.T) {
 		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Failed}}
-		control := &fakeControlRequestStore{pendingStop: pendingStop()}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStop: pendingRequest(storage.ControlOperationStop),
+		}}
 		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
 
-		require.NoError(t, svc.completePendingStopIfApplyResolved(t.Context(), 1, 9))
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
 		require.Len(t, control.completed, 1, "a terminal apply with a pending stop completes the request")
 		assert.Equal(t, storage.ControlOperationStop, control.completed[0])
 	})
 
-	t.Run("leaves the stop pending while the apply is non-terminal", func(t *testing.T) {
-		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-running", State: state.Apply.Running}}
-		control := &fakeControlRequestStore{pendingStop: pendingStop()}
+	t.Run("completes the cancel when the apply is terminal", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Cancelled}}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationCancel: pendingRequest(storage.ControlOperationCancel),
+		}}
 		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
 
-		require.NoError(t, svc.completePendingStopIfApplyResolved(t.Context(), 1, 9))
-		assert.Empty(t, control.completed, "a non-terminal apply must not complete the stop request")
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		require.Len(t, control.completed, 1, "a terminal apply with a pending cancel completes the request")
+		assert.Equal(t, storage.ControlOperationCancel, control.completed[0])
 	})
 
-	t.Run("no-op when no stop is pending", func(t *testing.T) {
-		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Failed}}
-		control := &fakeControlRequestStore{pendingStop: nil}
+	t.Run("keeps the cancel pending when the apply settled stopped", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-stopped", State: state.Apply.Stopped}}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStop:   pendingRequest(storage.ControlOperationStop),
+			storage.ControlOperationCancel: pendingRequest(storage.ControlOperationCancel),
+		}}
 		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
 
-		require.NoError(t, svc.completePendingStopIfApplyResolved(t.Context(), 1, 9))
-		assert.Empty(t, control.completed, "no pending stop means nothing to complete")
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		require.Len(t, control.completed, 1, "a stopped apply completes the stop but must keep the cancel deliverable")
+		assert.Equal(t, storage.ControlOperationStop, control.completed[0])
+	})
+
+	t.Run("leaves both requests pending while the apply is non-terminal", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-running", State: state.Apply.Running}}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStop:   pendingRequest(storage.ControlOperationStop),
+			storage.ControlOperationCancel: pendingRequest(storage.ControlOperationCancel),
+		}}
+		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		assert.Empty(t, control.completed, "a non-terminal apply must not complete any control request")
+	})
+
+	t.Run("no-op when nothing is pending", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Failed}}
+		control := &fakeControlRequestStore{}
+		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		assert.Empty(t, control.completed, "no pending requests means nothing to complete")
 	})
 }
 
