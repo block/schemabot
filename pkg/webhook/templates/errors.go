@@ -154,6 +154,16 @@ SchemaBot found a ` + "`schemabot.yaml`" + ` configuration, but this SchemaBot i
 
 Ask a SchemaBot operator to add this directory to ` + "`databases.{{.DatabaseName}}.allowed_dirs`" + ` in the server config, or move the schema config and files under an allowed directory.`
 
+const unmanagedSchemaConfigsNoticeTemplate = `## ⚠️ Schema Changes Not Managed by SchemaBot
+
+This PR changes schema under the following path(s), which this SchemaBot instance is not configured to manage:
+
+{{range .Configs}}- {{.SchemaPath}} — declares database {{.Database}}
+{{end}}
+These schema changes will **not** be planned or applied, and the SchemaBot checks on this PR do not cover them.
+
+If SchemaBot should manage them, ask a SchemaBot operator to add the directory to the database's ` + "`allowed_dirs`" + ` in the server config; otherwise remove these schema changes from this PR.`
+
 const multipleConfigsTemplate = `## ⚠️ Multiple Databases Detected
 
 {{with .EnvironmentHeader}}{{.}}
@@ -191,6 +201,7 @@ var (
 	tmplNoConfigNoDatabase   = template.Must(template.New("noConfigNoDatabase").Parse(noConfigNoDatabaseTemplate))
 	tmplNoConfigWithDatabase = template.Must(template.New("noConfigWithDatabase").Parse(noConfigWithDatabaseTemplate))
 	tmplConfigNotAuthorized  = template.Must(template.New("configOutsideAllowedDirs").Parse(configOutsideAllowedDirsTemplate))
+	tmplUnmanagedNotice      = template.Must(template.New("unmanagedSchemaConfigsNotice").Parse(unmanagedSchemaConfigsNoticeTemplate))
 	tmplMultipleConfigs      = template.Must(template.New("multipleConfigs").Parse(multipleConfigsTemplate))
 	tmplGenericError         = template.Must(template.New("genericError").Parse(genericErrorTemplate))
 )
@@ -217,6 +228,44 @@ func RenderNoConfig(data SchemaErrorData) string {
 // but its schema directory is outside the server-side allowed_dirs boundary.
 func RenderConfigNotAuthorized(data SchemaErrorData) string {
 	return renderTemplate(tmplConfigNotAuthorized, data)
+}
+
+// UnmanagedSchemaConfigNoticeData identifies one schema config discovered in
+// a PR that this deployment is not configured to manage.
+type UnmanagedSchemaConfigNoticeData struct {
+	Database   string
+	SchemaPath string
+}
+
+// RenderUnmanagedSchemaConfigsNotice renders the notice posted when a PR
+// changes schema under configs this deployment is not authorized to manage
+// and no other deployment is expected to handle them. The database names and
+// paths come from the PR's own schemabot.yaml files — untrusted input — so
+// each is normalized into a safe inline code span before rendering.
+func RenderUnmanagedSchemaConfigsNotice(configs []UnmanagedSchemaConfigNoticeData) string {
+	normalized := make([]UnmanagedSchemaConfigNoticeData, len(configs))
+	for i, cfg := range configs {
+		normalized[i] = UnmanagedSchemaConfigNoticeData{
+			Database:   markdownInlineCode(cfg.Database),
+			SchemaPath: markdownInlineCode(cfg.SchemaPath),
+		}
+	}
+	var sb strings.Builder
+	data := struct {
+		Configs []UnmanagedSchemaConfigNoticeData
+	}{Configs: normalized}
+	if err := tmplUnmanagedNotice.Execute(&sb, data); err != nil {
+		return fmt.Sprintf("Error rendering template: %v", err)
+	}
+	return sb.String()
+}
+
+// PreviewCommentUnmanagedSchemaConfigsNotice renders a sample notice for
+// schema changes under configs this deployment does not manage.
+func PreviewCommentUnmanagedSchemaConfigsNotice() string {
+	return RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
+		{Database: "inventory", SchemaPath: "services/inventory/schema"},
+	})
 }
 
 // RenderMultipleConfigs renders the "multiple configs" error comment.

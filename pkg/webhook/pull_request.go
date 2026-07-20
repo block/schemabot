@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
+	"sync"
 	"time"
 
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // pullRequestPayload represents the relevant fields from a GitHub pull_request webhook.
@@ -252,7 +255,16 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		return "schema change under managed directory has no config", nil
 	}
 
+	discovered := slices.Clone(configs)
 	configs = h.filterManagedDiscoveredConfigs(ctx, repo, pr, headSHA, source, configs)
+	// On synchronize the comment cadence compares changed files between SHAs —
+	// a GitHub compare call. The unmanaged-config notice and the plan comments
+	// follow the same cadence, so the decision is memoized and computed at most
+	// once per delivery, only when a caller needs it.
+	shouldPostComment := sync.OnceValue(func() bool {
+		return h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA)
+	})
+	h.notifyUnmanagedDiscoveredConfigs(repo, pr, installationID, source, headSHA, shouldPostComment, discovered, configs)
 
 	// Config discovery and the managed-directory guard just re-verified this
 	// commit, and the clear re-checks allowed-environment coverage for every
@@ -332,7 +344,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		})
 		return "no schema files in PR", nil
 	}
-	postPlanComment := h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA)
+	postPlanComment := shouldPostComment()
 
 	// Launch auto-plan for each discovered config
 	tenant := ""
@@ -347,6 +359,63 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	}
 
 	return "auto-plan started", nil
+}
+
+// notifyUnmanagedDiscoveredConfigs posts a PR-visible notice when auto-plan
+// discovery dropped schema configs this deployment is not configured to
+// manage. On a repo with no aggregate role this deployment is the only
+// responder, so without the notice the drop is invisible on the PR — no plan
+// comment and no check row cover the dropped config, and the author can merge
+// a schema change nothing will ever apply. On an aggregate-role repo (leader
+// or participant) a dropped config is routine cross-deployment fan-out — the
+// owning deployment plans it and posts its own comment and check — so the
+// notice stays a log line there.
+func (h *Handler) notifyUnmanagedDiscoveredConfigs(repo string, pr int, installationID int64, source, headSHA string, shouldPostComment func() bool, discovered, managed []ghclient.DiscoveredConfig) {
+	dropped := droppedDiscoveredConfigs(discovered, managed)
+	if len(dropped) == 0 {
+		return
+	}
+	if config, ok := h.serverConfig(); ok && config.AggregateRoleForRepo(repo) != "" {
+		h.logger.Info("unmanaged schema configs in PR left to their owning deployments on aggregate repo",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source,
+			"unmanaged_configs", len(dropped))
+		return
+	}
+	// Match the plan-comment cadence: a synchronize push that changed no
+	// schema inputs re-verifies checks without re-posting comments, and the
+	// notice follows suit so an active PR is not re-noticed on every push.
+	if !shouldPostComment() {
+		h.logger.Info("unmanaged schema config notice suppressed by comment cadence; PR was already noticed on an earlier commit",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source,
+			"unmanaged_configs", len(dropped))
+		return
+	}
+	notice := make([]templates.UnmanagedSchemaConfigNoticeData, 0, len(dropped))
+	for _, cfg := range dropped {
+		notice = append(notice, templates.UnmanagedSchemaConfigNoticeData{
+			Database:   cfg.Config.Database,
+			SchemaPath: cfg.SchemaDir,
+		})
+	}
+	h.postComment(repo, pr, installationID, templates.RenderUnmanagedSchemaConfigsNotice(notice))
+}
+
+// droppedDiscoveredConfigs returns the discovered configs the managed filter
+// removed. Configs with no parsed config are excluded: the filter already
+// warns about them, and they carry no database identity to report.
+func droppedDiscoveredConfigs(discovered, managed []ghclient.DiscoveredConfig) []ghclient.DiscoveredConfig {
+	managedDirs := make(map[string]bool, len(managed))
+	for _, cfg := range managed {
+		managedDirs[cfg.SchemaDir] = true
+	}
+	var dropped []ghclient.DiscoveredConfig
+	for _, cfg := range discovered {
+		if cfg.Config == nil || managedDirs[cfg.SchemaDir] {
+			continue
+		}
+		dropped = append(dropped, cfg)
+	}
+	return dropped
 }
 
 func (h *Handler) filterManagedDiscoveredConfigs(ctx context.Context, repo string, pr int, headSHA, source string, configs []ghclient.DiscoveredConfig) []ghclient.DiscoveredConfig {

@@ -28,6 +28,7 @@ import (
 
 	"github.com/block/spirit/pkg/utils"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -149,6 +150,119 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeSkipsComment(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		t.Fatalf("expected no comment for application-only synchronize, got: %s", body)
+	case <-time.After(3 * time.Second):
+	}
+}
+
+// TestE2EAutoPlanNoticesUnmanagedConfigOnNonAggregateRepo verifies that when a
+// PR's schema config resolves but its directory is outside the deployment's
+// allowed_dirs on a repo with no aggregate role, auto-plan posts a PR-visible
+// notice naming the ignored path and database. This deployment is the repo's
+// only responder, so without the notice the author sees no plan comment and no
+// check for the change and can merge schema nothing will ever apply.
+func TestE2EAutoPlanNoticesUnmanagedConfigOnNonAggregateRepo(t *testing.T) {
+	dbName := "webhook_autoplan_unmanaged_notice"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"approved"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Schema Changes Not Managed by SchemaBot")
+		assert.Contains(t, body, "`schema`")
+		assert.Contains(t, body, fmt.Sprintf("declares database `%s`", dbName))
+		assert.Contains(t, body, "will **not** be planned or applied")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for unmanaged schema config notice")
+	}
+
+	plans, err := svc.Storage().Plans().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, plan := range plans {
+		assert.NotEqual(t, dbName, plan.Database, "unmanaged config must not produce a plan")
+	}
+}
+
+// TestE2EAutoPlanStaysSilentOnUnmanagedConfigOnAggregateRepo verifies the
+// fan-out contract: on an aggregate-role repo a schema config outside this
+// deployment's allowed_dirs is expected to belong to another deployment, which
+// posts its own plan comment and check — so this deployment must not post an
+// unmanaged-config notice there.
+func TestE2EAutoPlanStaysSilentOnUnmanagedConfigOnAggregateRepo(t *testing.T) {
+	dbName := "webhook_autoplan_unmanaged_agg"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"approved"}
+	svc.Config().Databases[dbName] = dbConfig
+	if svc.Config().Repos == nil {
+		svc.Config().Repos = map[string]api.RepoConfig{}
+	}
+	svc.Config().Repos["octocat/hello-world"] = api.RepoConfig{
+		Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant},
+	}
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// A participant posts neither a comment nor a check run here: the config
+	// belongs to another deployment and the leader owns the aggregate check.
+	select {
+	case body := <-result.comments:
+		t.Fatalf("expected no comment for unmanaged config on aggregate repo, got: %s", body)
+	case cr := <-result.checkRuns:
+		t.Fatalf("expected no check run for unmanaged config on aggregate participant, got: %s (%s)", cr.Name, cr.Conclusion)
 	case <-time.After(3 * time.Second):
 	}
 }
