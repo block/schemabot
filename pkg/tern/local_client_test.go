@@ -821,6 +821,33 @@ func TestGroupedResumeStateRequiresApplyOperationForVitess(t *testing.T) {
 	assert.Empty(t, resumeState.Metadata)
 }
 
+// A Vitess apply dwelling in a revert phase has engine work in flight by
+// definition, so absent persisted resume state cannot mean "start fresh" —
+// a fresh engine apply would re-deploy the reviewed schema change on top of
+// the revert. The resume must fail closed so recovery retries against intact
+// storage instead of re-applying reverted DDL.
+func TestGroupedResumeStateFailsClosedForRevertPhaseVitessApply(t *testing.T) {
+	operationID := int64(11)
+	for _, applyState := range []string{state.Apply.RevertWindow, state.Apply.Reverting, state.Apply.SkippingRevert} {
+		t.Run(applyState, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              4,
+				ApplyIdentifier: "apply-revert-phase",
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeVitess,
+				State:           applyState,
+			}
+			tasks := []*storage.Task{{TaskIdentifier: "task-a", ApplyOperationID: &operationID}}
+			client := groupedResumeStateClient(storage.DatabaseTypeVitess, &exactProgressApplyOperationStore{})
+
+			_, err := client.groupedResumeState(t.Context(), apply, tasks)
+			require.ErrorIs(t, err, errGroupedResumeStateUnavailable)
+			assert.ErrorContains(t, err, "apply-revert-phase")
+			assert.ErrorContains(t, err, applyState)
+		})
+	}
+}
+
 // reattachResumeFixture builds a Vitess apply that has already reattached to an
 // in-flight deploy request: the engine accepts the grouped resume, so the apply
 // owner must not write terminal failure when post-accept resume-state handling
@@ -936,6 +963,23 @@ func TestLaunchAtomicResumeMissingMetadataStaysRecoverable(t *testing.T) {
 	assert.False(t, state.IsTerminalApplyState(applyStore.apply.State),
 		"in-flight apply must stay recoverable, not terminal: got %s", applyStore.apply.State)
 	assert.NotEqual(t, state.Apply.Failed, applyStore.apply.State)
+}
+
+// A resumed apply whose tasks all reached reverted has no remaining engine
+// work, so the resume terminalizes it directly. The terminal state must be
+// derived from the task states — an apply whose schema changes were rolled
+// back finishes as reverted, never as a false completed success.
+func TestLaunchAtomicResumeAllRevertedTasksTerminalizeAsReverted(t *testing.T) {
+	client, apply, tasks, plan, applyStore := reattachResumeFixture(&exactProgressApplyOperationStore{}, nil)
+	apply.State = state.Apply.Reverting
+	tasks[0].State = state.Task.Reverted
+
+	err := client.launchAtomicResume(t.Context(), apply, tasks, plan, apply.GetOptions().Map(), "Recovering from checkpoint", false, false, false)
+
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Reverted, applyStore.apply.State)
+	require.NotNil(t, applyStore.apply.CompletedAt)
+	assert.Equal(t, state.Task.Reverted, tasks[0].State, "terminal task state must not be rewritten by the resume")
 }
 
 // After the engine accepts a grouped Vitess apply, a deploy request is live on

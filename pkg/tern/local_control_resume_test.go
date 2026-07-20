@@ -294,8 +294,22 @@ func TestReplanAndFilterTasks_RevertPhaseTaskStaysActive(t *testing.T) {
 		// re-plan finds no remaining diff for the table.
 		{name: "live schema still matches the reviewed target", replan: &engine.PlanResult{}},
 		// Revert already landed: live is back on the original schema, so the
-		// re-plan reproduces the forward change.
-		{name: "revert already landed", replan: alterUsersEmailPlan()},
+		// re-plan reproduces a forward change. Its DDL deliberately differs
+		// from the reviewed DDL so the subtest is discriminating: the guard
+		// must keep the task active with the reviewed DDL untouched without
+		// consulting the re-plan at all — a re-plan comparison would fail
+		// closed on the divergence, and a re-plan adoption would overwrite
+		// the DDL.
+		{name: "revert already landed", replan: &engine.PlanResult{
+			Changes: []engine.SchemaChange{{
+				Namespace: "testapp",
+				TableChanges: []engine.TableChange{{
+					Table:     "users",
+					Operation: statement.StatementAlterTable,
+					DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(500)",
+				}},
+			}},
+		}},
 	}
 
 	for _, taskState := range []string{state.Task.RevertWindow, state.Task.Reverting} {
@@ -452,4 +466,122 @@ func TestResumeApplyMissingPlanAdoptsConcurrentTerminalState(t *testing.T) {
 	require.Len(t, observer.terminal, 1)
 	assert.True(t, state.IsState(observer.terminal[0].State, state.Apply.Stopped),
 		"observer must see the settled verdict, got %s", observer.terminal[0].State)
+}
+
+// A reverted task is terminal: the revert already landed for it, so the resume
+// re-plan leaves it untouched instead of re-activating it. It contributes no
+// remaining resume work, and its state must survive the re-plan so the apply's
+// terminal state can be derived from it.
+func TestReplanAndFilterTasks_RevertedTaskStaysTerminal(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
+
+	apply := &storage.Apply{Database: "testapp"}
+	tasks := []*storage.Task{{
+		TaskIdentifier: "task_1",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		State:          state.Task.Reverted,
+	}}
+
+	rp, err := c.replanAndFilterTasks(t.Context(), apply, tasks, &storage.Plan{})
+	require.NoError(t, err)
+	assert.Empty(t, rp.ActiveTasks, "a reverted task carries no resume work")
+	assert.Zero(t, rp.CompletedCount)
+	assert.Equal(t, state.Task.Reverted, tasks[0].State, "terminal state is preserved")
+}
+
+// A reclaimed revert-phase apply reattaches to the engine like any other
+// resume, but its persisted revert-phase states are the durable marker that
+// revert-phase handling owns the outcome. The post-reattach persistence must
+// not rewrite them to running: a driver death after that write would hand the
+// next reclaim a forward-running apply whose live schema matches the reviewed
+// target, and the resume re-plan would terminalize it as a success while the
+// engine reverts the schema change underneath it.
+func TestPersistReattachedResumeStates_PreservesRevertPhase(t *testing.T) {
+	cases := []struct {
+		name       string
+		applyState string
+		taskState  string
+	}{
+		{name: "revert window", applyState: state.Apply.RevertWindow, taskState: state.Task.RevertWindow},
+		{name: "reverting", applyState: state.Apply.Reverting, taskState: state.Task.Reverting},
+		{name: "skipping revert", applyState: state.Apply.SkippingRevert, taskState: state.Task.RevertWindow},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              42,
+				ApplyIdentifier: "apply-revert-phase",
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeVitess,
+				State:           tc.applyState,
+			}
+			tasks := []*storage.Task{{
+				ID:             7,
+				ApplyID:        apply.ID,
+				TaskIdentifier: "task-revert-phase",
+				State:          tc.taskState,
+			}}
+			applyStore := &exactProgressApplyStore{apply: apply}
+			client := &LocalClient{
+				config:  LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+				storage: &exactProgressStorage{applies: applyStore, tasks: &exactProgressTaskStore{tasks: tasks}},
+				logger:  slog.Default(),
+			}
+
+			err := client.persistReattachedResumeStates(t.Context(), apply, tasks, false, false, "Resumed after reclaim")
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.applyState, applyStore.apply.State, "apply keeps its revert-phase state")
+			assert.Equal(t, tc.taskState, tasks[0].State, "task keeps its revert-phase state")
+		})
+	}
+}
+
+// Outside a revert phase, the post-reattach persistence projects the resume
+// forward: tasks and the apply move to running, or to recovering during a
+// deferred-cutover recovery.
+func TestPersistReattachedResumeStates_ProjectsForwardStates(t *testing.T) {
+	cases := []struct {
+		name       string
+		applyState string
+		taskState  string
+		wantApply  string
+		wantTask   string
+	}{
+		{name: "resuming moves to running", applyState: state.Apply.Resuming, taskState: state.Task.Stopped, wantApply: state.Apply.Running, wantTask: state.Task.Running},
+		{name: "recovering stays recovering", applyState: state.Apply.Recovering, taskState: state.Task.Recovering, wantApply: state.Apply.Recovering, wantTask: state.Task.Recovering},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              42,
+				ApplyIdentifier: "apply-forward",
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeVitess,
+				State:           tc.applyState,
+			}
+			tasks := []*storage.Task{{
+				ID:             7,
+				ApplyID:        apply.ID,
+				TaskIdentifier: "task-forward",
+				State:          tc.taskState,
+			}}
+			applyStore := &exactProgressApplyStore{apply: apply}
+			client := &LocalClient{
+				config:  LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+				storage: &exactProgressStorage{applies: applyStore, tasks: &exactProgressTaskStore{tasks: tasks}},
+				logger:  slog.Default(),
+			}
+
+			err := client.persistReattachedResumeStates(t.Context(), apply, tasks, false, false, "Resumed after reclaim")
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantApply, applyStore.apply.State)
+			assert.Equal(t, tc.wantTask, tasks[0].State)
+		})
+	}
 }
