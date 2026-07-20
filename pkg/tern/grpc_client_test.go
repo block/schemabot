@@ -2410,6 +2410,33 @@ func TestGRPCClient_ResumeApplyOperationCutoverDoesNotResendWhenAlreadyCuttingOv
 	assert.Empty(t, applyStore.updates, "a multi-op cutover drive must not write the parent applies row")
 }
 
+// A remote that is already unwinding a revert has moved past cutover: the swap
+// happened and the revert owns the outcome. The cutover drive must never send
+// Cutover at a reverting remote — it polls the revert to its terminal state.
+func TestGRPCClient_ResumeApplyOperationCutoverDoesNotResendWhenRemoteReverting(t *testing.T) {
+	server := &capturingTernServer{
+		cutoverAccepted: true,
+		progressStates:  []ternv1.State{ternv1.State_STATE_REVERTING, ternv1.State_STATE_REVERTED},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := newCutoverDriveApply()
+	operationID, siblingID := int64(42), int64(43)
+	st, applyStore, _, task := buildCutoverDriveStorage(apply, operationID, siblingID, state.ApplyOperation.CuttingOver, "remote-op-west")
+	client.storage = st
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperationCutover(ctx, apply, operationID))
+
+	assert.Empty(t, server.getCutoverApplyID(), "a reverting remote must never be cut over")
+	assert.Equal(t, "remote-op-west", server.getProgressApplyID(), "progress must poll the operation's own remote apply id")
+	assert.Empty(t, applyStore.updates, "a multi-op cutover drive must not write the parent applies row")
+	assert.True(t, state.IsState(task.State, state.Task.Reverted),
+		"the operation's task should reconcile to the revert's terminal state; got %q", task.State)
+}
+
 // The remote already being terminal on preflight reconciles from that poll
 // without sending Cutover, and never writes the parent row.
 func TestGRPCClient_ResumeApplyOperationCutoverReconcilesAlreadyTerminalRemote(t *testing.T) {

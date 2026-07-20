@@ -1762,10 +1762,12 @@ func (c *GRPCClient) triggerRemoteOperationCutover(ctx context.Context, apply *s
 		return false, c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now, scope)
 	}
 	switch {
-	case state.IsState(remoteState, state.Apply.CuttingOver), state.IsState(remoteState, state.Apply.RevertWindow), state.IsState(remoteState, state.Apply.SkippingRevert):
-		// A prior driver already started the swap, the engine is in the post-cutover
-		// revert window, or skip-revert is finalizing. Do not re-send Cutover; poll
-		// to terminal.
+	case state.IsState(remoteState, state.Apply.CuttingOver, state.Apply.RevertWindow, state.Apply.Reverting, state.Apply.SkippingRevert):
+		// A prior driver already started the swap, or the remote is past cutover —
+		// holding the revert window open, unwinding a revert, or finalizing
+		// skip-revert. Cutover must never be sent to any of these: the swap
+		// already happened and the post-cutover phase owns the outcome. Do not
+		// re-send Cutover; poll to terminal.
 		apply.State = remoteState
 		return true, nil
 	case state.IsState(remoteState, state.Apply.WaitingForCutover):
