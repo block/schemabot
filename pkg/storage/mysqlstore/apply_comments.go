@@ -14,7 +14,7 @@ import (
 )
 
 // applyCommentColumns lists all columns for SELECT queries.
-const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, posted_volume, pending_freeze_github_comment_id, edit_count, last_edited_at, superseded_at, created_at, updated_at`
+const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, posted_volume, posted_phase, pending_freeze_github_comment_id, edit_count, last_edited_at, superseded_at, created_at, updated_at`
 
 // applyCommentStore implements storage.ApplyCommentStore using MySQL.
 type applyCommentStore struct {
@@ -24,8 +24,9 @@ type applyCommentStore struct {
 
 // Upsert creates or updates a comment record.
 // On conflict (same apply_id + comment_state), updates the github_comment_id,
-// posted_volume, and pending_freeze_github_comment_id so the row always
-// describes the currently tracked comment and the freeze it may still owe.
+// posted_volume, posted_phase, and pending_freeze_github_comment_id so the
+// row always describes the currently tracked comment and the freeze it may
+// still owe.
 func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyComment) error {
 	lease, hasLease, err := applyLeaseFromContext(ctx, comment.ApplyID)
 	if err != nil {
@@ -36,23 +37,24 @@ func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyCo
 		[]UpsertAssignment{
 			{Column: "github_comment_id"},
 			{Column: "posted_volume"},
+			{Column: "posted_phase"},
 			{Column: "pending_freeze_github_comment_id"},
 			{Column: "superseded_at", Expr: "NULL"},
 		},
 	)
 	if !hasLease {
 		_, err := s.db.ExecContext(ctx, `
-			INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_volume, pending_freeze_github_comment_id)
-			VALUES (?, ?, ?, ?, ?)
-			`+upsert, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedVolume, comment.PendingFreezeCommentID)
+			INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_volume, posted_phase, pending_freeze_github_comment_id)
+			VALUES (?, ?, ?, ?, ?, ?)
+			`+upsert, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedVolume, comment.PostedPhase, comment.PendingFreezeCommentID)
 		return err
 	}
 
 	result, err := s.db.ExecContext(ctx, `
-		INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_volume, pending_freeze_github_comment_id)
-		SELECT ?, ?, ?, ?, ? FROM applies a
+		INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_volume, posted_phase, pending_freeze_github_comment_id)
+		SELECT ?, ?, ?, ?, ?, ? FROM applies a
 		WHERE a.id = ? AND a.lease_token = ?
-		`+upsert, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedVolume, comment.PendingFreezeCommentID, comment.ApplyID, lease.Token)
+		`+upsert, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedVolume, comment.PostedPhase, comment.PendingFreezeCommentID, comment.ApplyID, lease.Token)
 	if err != nil {
 		return err
 	}
@@ -309,7 +311,7 @@ func scanApplyCommentInto(s scanner) (*storage.ApplyComment, error) {
 	var comment storage.ApplyComment
 	err := s.Scan(
 		&comment.ID, &comment.ApplyID, &comment.CommentState,
-		&comment.GitHubCommentID, &comment.PostedVolume, &comment.PendingFreezeCommentID, &comment.EditCount,
+		&comment.GitHubCommentID, &comment.PostedVolume, &comment.PostedPhase, &comment.PendingFreezeCommentID, &comment.EditCount,
 		&comment.LastEditedAt, &comment.SupersededAt, &comment.CreatedAt, &comment.UpdatedAt,
 	)
 	if err != nil {

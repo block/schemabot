@@ -1508,7 +1508,63 @@ func PreviewCommentResumeSupersededProgress() string {
 	table.RowsTotal = 7200000
 	table.PercentComplete = 32
 	data := sampleSingleApplyData(state.Apply.Stopped, table)
-	return RenderResumeSupersededProgressComment(ResumeSupersededProgressData{
+	return RenderResumeSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
+// PreviewCommentRevertSupersededProgress renders an old progress comment after
+// a user revert froze it: the final revert-window rendering collapses into a
+// details block under a pointer to the fresh comment now tracking the revert.
+func PreviewCommentRevertSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.RevertWindow
+	table.RowsCopied = 7200000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 100
+	data := sampleSingleApplyData(state.Apply.RevertWindow, table)
+	return RenderRevertSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
+// PreviewCommentSkipRevertSupersededProgress renders an old progress comment
+// after a skip-revert froze it: the final revert-window rendering collapses
+// into a details block under a pointer to the fresh comment now tracking the
+// finalizing schema change.
+func PreviewCommentSkipRevertSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.RevertWindow
+	table.RowsCopied = 7200000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 100
+	data := sampleSingleApplyData(state.Apply.RevertWindow, table)
+	return RenderSkipRevertSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
+// PreviewCommentCutoverSuperseded renders a spent cutover prompt after a
+// deferred cutover completed into a still-active apply: the prompt collapses
+// into a details block under a pointer to the fresh comment now tracking the
+// post-cutover phase.
+func PreviewCommentCutoverSuperseded() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.WaitingForCutover
+	table.RowsCopied = 7200000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 100
+	data := sampleSingleApplyData(state.Apply.WaitingForCutover, table)
+	return RenderCutoverSupersededComment(SupersededProgressData{
 		Repo:         "acme/testapp",
 		PR:           42,
 		NewCommentID: 2222222222,

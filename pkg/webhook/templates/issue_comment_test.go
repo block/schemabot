@@ -223,7 +223,7 @@ func TestRenderVolumeSupersededProgressComment(t *testing.T) {
 // and folds the final pre-stop progress into a details block so the record
 // stays on the PR without looking live.
 func TestRenderResumeSupersededProgressComment(t *testing.T) {
-	rendered := RenderResumeSupersededProgressComment(ResumeSupersededProgressData{
+	rendered := RenderResumeSupersededProgressComment(SupersededProgressData{
 		Repo:         "acme/testapp",
 		PR:           42,
 		NewCommentID: 2222222222,
@@ -262,22 +262,38 @@ func TestRenderSupersededProgressComment(t *testing.T) {
 
 // TestIsSupersededProgressComment verifies the frozen-body predicate accepts
 // every frozen flavor — so a freeze retry never folds a frozen body inside a
-// second fold — and rejects a live progress body.
+// second fold — and rejects live bodies, including ones that open with the
+// same words as a flavor prefix, so a freeze retry never skips a comment that
+// still needs folding.
 func TestIsSupersededProgressComment(t *testing.T) {
-	volume := RenderVolumeSupersededProgressComment(VolumeSupersededProgressData{
-		Volume: 8, Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
-	})
-	resume := RenderResumeSupersededProgressComment(ResumeSupersededProgressData{
+	shared := SupersededProgressData{
 		Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
-	})
-	generic := RenderSupersededProgressComment(SupersededProgressData{
-		Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
-	})
-	assert.True(t, IsSupersededProgressComment(volume), "a volume-frozen body is recognized as frozen")
-	assert.True(t, IsSupersededProgressComment(resume), "a resume-frozen body is recognized as frozen")
-	assert.True(t, IsSupersededProgressComment(generic), "a generic-frozen body is recognized as frozen")
-	assert.False(t, IsSupersededProgressComment("## Schema Change Status — Staging"),
-		"a live progress body is not frozen")
+	}
+	frozen := map[string]string{
+		"volume": RenderVolumeSupersededProgressComment(VolumeSupersededProgressData{
+			Volume: 8, Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
+		}),
+		"resume":      RenderResumeSupersededProgressComment(shared),
+		"revert":      RenderRevertSupersededProgressComment(shared),
+		"skip-revert": RenderSkipRevertSupersededProgressComment(shared),
+		"cutover":     RenderCutoverSupersededComment(shared),
+		"generic":     RenderSupersededProgressComment(shared),
+	}
+	for flavor, body := range frozen {
+		assert.Truef(t, IsSupersededProgressComment(body),
+			"a %s-frozen body is recognized as frozen", flavor)
+	}
+
+	live := map[string]string{
+		"progress body":            "## Schema Change Status — Staging",
+		"cutover-complete wording": "Cutover complete — the schema change is finalizing.",
+		"reverting wording":        "Schema change reverting — see the table below.",
+		"skip-revert wording":      "Revert skipped by the operator.",
+	}
+	for name, body := range live {
+		assert.Falsef(t, IsSupersededProgressComment(body),
+			"a live %s is not frozen", name)
+	}
 }
 
 func TestRenderRevertCommandAccepted(t *testing.T) {
