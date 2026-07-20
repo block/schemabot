@@ -239,6 +239,39 @@ func PreviewCommentSchemaReconciliationCompleted() string {
 	}), previewSupportChannel())
 }
 
+// PreviewCommentSchemaReconciliationAutoNotice renders the reconciliation
+// comment posted automatically when a push removes a schema change whose
+// apply already started: stale-check cleanup retains the block and this
+// notice explains it on the PR timeline.
+func PreviewCommentSchemaReconciliationAutoNotice() string {
+	return RenderSupportChannelFooter(RenderSchemaChangeReconciliationRequired(SchemaChangeReconciliationData{
+		Trigger:   "Triggered automatically by a pull request update",
+		Timestamp: "2026-03-15 14:30:00",
+		Items: []SchemaChangeReconciliationItem{
+			{
+				Database:    "testapp",
+				Environment: "staging",
+				ApplyID:     "apply-09f8ba28fb67492e",
+				State:       state.Apply.Running,
+				InProgress:  true,
+			},
+		},
+	}), previewSupportChannel())
+}
+
+// PreviewCommentNoManagedSchemaChangesChecksRefreshedAfterRollback renders the
+// checks-refreshed comment posted automatically after a rollback completes on
+// a PR whose head no longer contains SchemaBot inputs: the live database
+// matches the target again, so the checks converge to passing without a
+// manual plan.
+func PreviewCommentNoManagedSchemaChangesChecksRefreshedAfterRollback() string {
+	return RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
+		Trigger:   "Triggered automatically after the rollback completed",
+		Timestamp: "2026-03-15 14:30:00",
+		HeadSHA:   previewHeadSHA,
+	})
+}
+
 // PreviewCommentHelp renders the help command reference comment.
 func PreviewCommentHelp() string {
 	return RenderHelpComment()

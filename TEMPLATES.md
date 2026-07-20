@@ -300,7 +300,7 @@ The live database operation was already started and may continue independently o
      ```
      schemabot rollback apply-09f8ba28fb67492e -e staging
      ```
-     After rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan.
+     After the rollback completes, SchemaBot refreshes this PR's checks automatically.
 <!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
@@ -336,10 +336,60 @@ Choose one:
      ```
      schemabot rollback apply-09f8ba28fb67492e -e staging
      ```
-   - after rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan
+   - after the rollback completes, SchemaBot refreshes this PR's checks automatically
 <!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
+</details>
+
+<details>
+<summary><a name="reconciliation-required-auto-notice"></a><strong>Reconciliation Required (Auto Notice)</strong></summary>
+
+
+## ⚠️ Schema Change Reconciliation Required
+
+**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-09f8ba28fb67492e`
+
+*Triggered automatically by a pull request update at 2026-03-15 14:30:00 UTC*
+
+SchemaBot is still applying a schema change from this PR, but the current PR no longer contains that change.
+
+The live database operation was already started and may continue independently of the current PR diff.
+
+### What to do next
+
+1. First, resolve the in-flight apply:
+   - Wait for SchemaBot to post the final apply result, or
+   - If stopping is supported for this database, comment:
+     ```
+     schemabot stop apply-09f8ba28fb67492e -e staging
+     ```
+
+2. Then reconcile the final live schema:
+   - If the live schema change should remain, add the schema change back to the PR, then comment:
+     ```
+     schemabot plan -e staging -d testapp
+     ```
+   - If the live schema change should not remain, roll it back:
+     ```
+     schemabot rollback apply-09f8ba28fb67492e -e staging
+     ```
+     After the rollback completes, SchemaBot refreshes this PR's checks automatically.
+<!-- schemabot:offer-support-channel -->
+
+> 💬 Support: [#schema-help](https://chat.example.com/schema-help).
+</details>
+
+<details>
+<summary><a name="no-managed-schema-changes-after-rollback"></a><strong>No Managed Schema Changes (After Rollback)</strong></summary>
+
+
+## ✅ No Managed Schema Changes
+
+*Triggered automatically after the rollback completed at 2026-03-15 14:30:00 UTC*
+
+This PR does not contain schema changes managed by SchemaBot. The SchemaBot checks were refreshed as passing on `abcdef1234567890abcdef1234567890abcdef12`.
+
 </details>
 
 <details>

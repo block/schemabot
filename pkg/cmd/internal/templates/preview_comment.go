@@ -52,6 +52,10 @@ func previewCommentAllOutput() {
 		}},
 		{"RECONCILIATION REQUIRED (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationInProgress()) }},
 		{"RECONCILIATION REQUIRED (COMPLETED)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationCompleted()) }},
+		{"RECONCILIATION REQUIRED (AUTO NOTICE)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationAutoNotice()) }},
+		{"NO MANAGED SCHEMA CHANGES (AFTER ROLLBACK)", func() {
+			fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshedAfterRollback())
+		}},
 		{"SCHEMA CHANGE APPLY (AUTOMATIC)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlan()) }},
 		{"SCHEMA CHANGE APPLY (DOWNGRADED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanDowngraded()) }},
 		{"SCHEMA CHANGE APPLY (UNSAFE + ALLOWED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanUnsafe()) }},
@@ -141,6 +145,10 @@ func previewCommentPlanAllOutput() {
 		}},
 		{"RECONCILIATION REQUIRED (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationInProgress()) }},
 		{"RECONCILIATION REQUIRED (COMPLETED)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationCompleted()) }},
+		{"RECONCILIATION REQUIRED (AUTO NOTICE)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationAutoNotice()) }},
+		{"NO MANAGED SCHEMA CHANGES (AFTER ROLLBACK)", func() {
+			fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshedAfterRollback())
+		}},
 		{"VITESS PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentVitessPlan()) }},
 		{"SCHEMA CHANGE APPLY (LOCKED + OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessApplyPlan()) }},
 		{"MYSQL MULTI-SCHEMA PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentMySQLMultiSchema()) }},

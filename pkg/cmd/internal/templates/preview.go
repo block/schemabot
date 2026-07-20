@@ -121,6 +121,8 @@ const (
 	PreviewCommentChecksRefreshedTenant        PreviewType = "comment_checks_refreshed_tenant"         // Checks refreshed but gated on tenant deployments
 	PreviewCommentReconcileInProgress          PreviewType = "comment_reconcile_in_progress"           // Empty diff with in-progress apply-owned state
 	PreviewCommentReconcileCompleted           PreviewType = "comment_reconcile_completed"             // Empty diff with completed apply-owned state
+	PreviewCommentReconcileAutoNotice          PreviewType = "comment_reconcile_auto_notice"           // Auto-posted reconciliation notice when a push removes an in-flight schema change
+	PreviewCommentChecksRefreshedAfterRollback PreviewType = "comment_checks_refreshed_after_rollback" // Checks refreshed automatically after a completed rollback
 	PreviewCommentMultiEnv                     PreviewType = "comment_multi_env"                       // Multi-env plan (identical, deduplicated)
 	PreviewCommentMultiEnvDiff                 PreviewType = "comment_multi_env_diff"                  // Multi-env plan (different per env)
 	PreviewCommentMultiEnvLint                 PreviewType = "comment_multi_env_lint"                  // Multi-env plan with lint violations

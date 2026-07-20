@@ -18,6 +18,14 @@ type schemaChangeReconciliationRecord struct {
 	apply *storage.Apply
 }
 
+// checksRefreshedAttribution identifies what produced a checks-refreshed
+// comment: the user who ran the command, or the system trigger when no user
+// requested it (exactly one of the two is set).
+type checksRefreshedAttribution struct {
+	requestedBy string
+	trigger     string
+}
+
 func (h *Handler) handleNoManagedSchemaChangesForCommand(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, commandName, environment, databaseName, requestedBy string) (bool, error) {
 	files, err := client.FetchPRFiles(ctx, repo, pr)
 	if err != nil {
@@ -67,7 +75,7 @@ func (h *Handler) handleNoManagedSchemaChangesForCommand(ctx context.Context, cl
 	// explicitly named database is an explicit ask for that database's plan
 	// and proceeds through normal config discovery instead.
 	if convergesChecks {
-		if err := h.convergeAggregatesForNoManagedSchemaChanges(ctx, client, repo, pr, installationID, files, requestedBy); err != nil {
+		if err := h.convergeAggregatesForNoManagedSchemaChanges(ctx, client, repo, pr, installationID, files, checksRefreshedAttribution{requestedBy: requestedBy}); err != nil {
 			return true, err
 		}
 		return true, nil
@@ -86,9 +94,10 @@ func (h *Handler) handleNoManagedSchemaChangesForCommand(ctx context.Context, cl
 // participant paths are touched routes through the aggregate fold (which
 // fails closed until every expected participant reports), and otherwise
 // passing aggregates are posted on the current head. A comment reports the
-// outcome to the user who ran the command. A closed PR is rejected with an
-// explicit error instead: its close-time cleanup owns the stored check state.
-func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, files []ghclient.PRFile, requestedBy string) error {
+// outcome, attributed to the user who ran the command or to the system
+// trigger. A closed PR is rejected with an explicit error instead: its
+// close-time cleanup owns the stored check state.
+func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, files []ghclient.PRFile, attribution checksRefreshedAttribution) error {
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
 		return fmt.Errorf("fetch PR info to refresh checks for PR with no managed schema changes: %w", err)
@@ -100,8 +109,8 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 	// "refreshed as passing" comment on a PR that can never merge.
 	if prInfo.IsClosed() {
 		if h.isAggregateParticipant(repo) {
-			h.logger.Info("aggregate participant staying silent on plan for closed PR with no managed schema changes",
-				"repo", repo, "pr", pr, "requested_by", requestedBy)
+			h.logger.Info("aggregate participant staying silent on check refresh for closed PR with no managed schema changes",
+				"repo", repo, "pr", pr, "requested_by", attribution.requestedBy, "trigger", attribution.trigger)
 			return nil
 		}
 		return fmt.Errorf("PR #%d in %s is closed; SchemaBot refreshes check state only for open PRs", pr, repo)
@@ -118,17 +127,18 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 	h.cleanupStaleChecks(repo, pr, headSHA, installationID, nil)
 
 	if h.isAggregateParticipant(repo) {
-		h.logger.Info("aggregate participant staying silent on plan for PR with no managed schema changes",
-			"repo", repo, "pr", pr, "head_sha", headSHA, "requested_by", requestedBy)
+		h.logger.Info("aggregate participant staying silent on check refresh for PR with no managed schema changes",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "requested_by", attribution.requestedBy, "trigger", attribution.trigger)
 		return nil
 	}
 
 	if h.leaderExpectsParticipantsForPR(repo, files) {
-		h.logger.Info("plan found no leader-managed schema changes but expected participant paths are touched; aggregate gate will block until participants report",
-			"repo", repo, "pr", pr, "head_sha", headSHA, "requested_by", requestedBy)
+		h.logger.Info("check refresh found no leader-managed schema changes but expected participant paths are touched; aggregate gate will block until participants report",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "requested_by", attribution.requestedBy, "trigger", attribution.trigger)
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 		h.postComment(repo, pr, installationID, templates.RenderNoManagedSchemaChangesChecksRefreshed(templates.NoManagedSchemaChangesChecksRefreshedData{
-			RequestedBy:    requestedBy,
+			RequestedBy:    attribution.requestedBy,
+			Trigger:        attribution.trigger,
 			Timestamp:      timestamp,
 			HeadSHA:        headSHA,
 			GatedOnTenants: true,
@@ -136,15 +146,108 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 		return nil
 	}
 
-	h.logger.Info("plan found no managed schema changes; refreshing passing aggregate checks",
-		"repo", repo, "pr", pr, "head_sha", headSHA, "requested_by", requestedBy)
+	h.logger.Info("no managed schema changes; refreshing passing aggregate checks",
+		"repo", repo, "pr", pr, "head_sha", headSHA, "requested_by", attribution.requestedBy, "trigger", attribution.trigger)
 	h.postPassingAggregates(ctx, client, repo, pr, headSHA)
 	h.postComment(repo, pr, installationID, templates.RenderNoManagedSchemaChangesChecksRefreshed(templates.NoManagedSchemaChangesChecksRefreshedData{
-		RequestedBy: requestedBy,
+		RequestedBy: attribution.requestedBy,
+		Trigger:     attribution.trigger,
 		Timestamp:   timestamp,
 		HeadSHA:     headSHA,
 	}))
 	return nil
+}
+
+// notifyRetainedStartedApplyBlocks posts the reconciliation-required comment
+// for checks that stale cleanup just transitioned into the removed-schema
+// block. The stored blocking reason is the durable dedupe signal: cleanup on
+// later pushes finds the reason already set and does not reach this again, so
+// the notice posts once per retained apply even across pods and webhook
+// redeliveries.
+func (h *Handler) notifyRetainedStartedApplyBlocks(ctx context.Context, repo string, pr int, installationID int64, checks []*storage.Check) {
+	records := make([]schemaChangeReconciliationRecord, 0, len(checks))
+	for _, check := range checks {
+		record := schemaChangeReconciliationRecord{check: check}
+		if check.ApplyID != 0 {
+			apply, err := h.service.Storage().Applies().Get(ctx, check.ApplyID)
+			switch {
+			case err != nil:
+				h.logger.Warn("reconciliation notice will omit apply details; failed to load apply for blocked check",
+					"repo", repo, "pr", pr, "database", check.DatabaseName,
+					"environment", check.Environment, "check_id", check.ID, "error", err)
+			case apply == nil:
+				h.logger.Warn("reconciliation notice will omit apply details; blocked check references a missing apply",
+					"repo", repo, "pr", pr, "database", check.DatabaseName,
+					"environment", check.Environment, "check_id", check.ID)
+			default:
+				record.apply = apply
+			}
+		}
+		records = append(records, record)
+	}
+
+	h.logger.Info("posting reconciliation notice for retained started-apply blocks",
+		"repo", repo, "pr", pr, "check_count", len(records))
+	h.postComment(repo, pr, installationID, templates.RenderSchemaChangeReconciliationRequired(templates.SchemaChangeReconciliationData{
+		Tenant:    h.deploymentTenant(),
+		Trigger:   "Triggered automatically by a pull request update",
+		Timestamp: templates.NowFunc().UTC().Format("2006-01-02 15:04:05"),
+		Items:     schemaChangeReconciliationItems(records),
+	}))
+}
+
+// convergeChecksAfterCompletedRollback refreshes a PR's check state after a
+// rollback completes. The rollback restored the target schema, so a PR whose
+// head no longer contains SchemaBot inputs matches the live database again —
+// without this refresh the operator must know to comment `schemabot plan` to
+// clear the rollback-completed block. A PR that still carries schema inputs
+// keeps the block: its changes were rolled back and must be re-applied or
+// re-planned deliberately. Callers invoke this only after winning the
+// terminal check-state write, so the refresh runs at most once per rollback
+// across pods and observer paths.
+func (h *Handler) convergeChecksAfterCompletedRollback(ctx context.Context, client *ghclient.InstallationClient, a *storage.Apply) {
+	prInfo, err := client.FetchPullRequest(ctx, a.Repository, a.PullRequest)
+	if err != nil {
+		h.logger.Warn("checks not refreshed after completed rollback; failed to fetch PR info",
+			append(a.LogAttrs(), "error", err)...)
+		return
+	}
+	// Rollback is a supported recovery path on closed PRs; close-time cleanup
+	// owns their stored check state, so there is nothing to converge.
+	if prInfo.IsClosed() {
+		h.logger.Info("skipping check refresh after completed rollback: PR is closed", a.LogAttrs()...)
+		return
+	}
+	files, err := client.FetchPRFiles(ctx, a.Repository, a.PullRequest)
+	if err != nil {
+		h.logger.Warn("checks not refreshed after completed rollback; failed to fetch PR files",
+			append(a.LogAttrs(), "error", err)...)
+		return
+	}
+	// The PR still declares schema changes: the rolled-back changes must be
+	// re-applied or re-planned deliberately, so the rollback block stands.
+	if prHasCurrentSchemaBotFiles(files) {
+		h.logger.Info("skipping check refresh after completed rollback: PR still contains SchemaBot schema files",
+			a.LogAttrs()...)
+		return
+	}
+	records, err := h.schemaChangeReconciliationRecords(ctx, a.Repository, a.PullRequest, "", "")
+	if err != nil {
+		h.logger.Warn("checks not refreshed after completed rollback; failed to load apply-owned check state",
+			append(a.LogAttrs(), "error", err)...)
+		return
+	}
+	// Another apply still owns check state on this PR; its own terminal
+	// refresh converges the aggregate when it finishes.
+	if len(records) > 0 {
+		h.logger.Info("skipping check refresh after completed rollback: other applies still own check state on this PR",
+			append(a.LogAttrs(), "record_count", len(records))...)
+		return
+	}
+	if err := h.convergeAggregatesForNoManagedSchemaChanges(ctx, client, a.Repository, a.PullRequest, a.InstallationID, files,
+		checksRefreshedAttribution{trigger: "Triggered automatically after the rollback completed"}); err != nil {
+		h.logger.Warn("failed to refresh checks after completed rollback", append(a.LogAttrs(), "error", err)...)
+	}
 }
 
 func prHasCurrentSchemaBotFiles(files []ghclient.PRFile) bool {
