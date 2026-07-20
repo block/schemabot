@@ -89,10 +89,10 @@ func TestE2EPRCloseCleanup(t *testing.T) {
 
 	h := NewHandler(svc, nil, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
 
-	// Close the PR while the apply is running. The handler is invoked directly
-	// (not through the async webhook goroutine) so the retention assertions
-	// below observe a finished cleanup pass.
-	h.handlePRClosed("octocat/hello-world", 1, 12345, false)
+	// Close the PR while the apply is running. Cleanup is invoked directly (not
+	// through the async webhook goroutine) so the retention assertions below
+	// observe a finished cleanup pass.
+	require.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, false))
 
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)

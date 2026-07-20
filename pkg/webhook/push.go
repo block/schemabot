@@ -3,11 +3,14 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // pushPayload is the subset of the GitHub push webhook payload SchemaBot
@@ -43,7 +46,7 @@ type pushPayload struct {
 // default branch, so a commit already on the default branch has nothing left to
 // verify. Rulesets evaluate required checks on PR and merge-queue commits, never
 // on commits already landed, so this check can never satisfy a merge gate.
-func (h *Handler) handlePush(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte) {
+func (h *Handler) handlePush(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte, deliveryID string) {
 	var payload pushPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid push payload")
@@ -110,6 +113,32 @@ func (h *Handler) handlePush(ctx context.Context, metricApp string, w http.Respo
 		return
 	}
 
+	if h.durableWebhookDispatch {
+		// Enqueue and ACK fast; a leased driver posts the check with retries so
+		// a process restart mid-post cannot drop the delivery. Enqueue failure
+		// is a deliberate 500 with no in-process fallback — it fails loudly (a
+		// red delivery in GitHub's webhook UI) so an operator can Redeliver.
+		inserted, err := h.enqueueDurablePush(ctx, payload, body, deliveryID, installationID)
+		if err != nil {
+			h.logger.Error("failed to enqueue durable default-branch check",
+				"repo", repo, "head_sha", headSHA, "installation_id", installationID,
+				"delivery_id", deliveryID, "error", err)
+			metrics.RecordWebhookEvent(ctx, metricApp, "push", "", repo, "durable_enqueue_failed")
+			h.writeError(w, http.StatusInternalServerError, "failed to enqueue webhook delivery")
+			return
+		}
+		if !inserted {
+			h.logger.Info("durable push delivery already queued",
+				"repo", repo, "head_sha", headSHA, "delivery_id", deliveryID)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "default-branch check already queued"})
+			return
+		}
+		h.logger.Info("durable default-branch check queued",
+			"repo", repo, "head_sha", headSHA, "delivery_id", deliveryID)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "default-branch check queued"})
+		return
+	}
+
 	postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 
@@ -121,13 +150,7 @@ func (h *Handler) handlePush(ctx context.Context, metricApp string, w http.Respo
 		return
 	}
 
-	if err := h.postPassingAggregateChecks(postCtx, client, repo, headSHA, passingAggregateCheckContent{
-		operation: "default_branch_check",
-		title:     "Schema changes are verified before merge",
-		summary: "SchemaBot gates schema changes on pull requests before they reach the default branch, " +
-			"so commits on the default branch require no additional verification. " +
-			"This check also keeps SchemaBot selectable as a required-check source in branch rulesets.",
-	}); err != nil {
+	if err := h.postPassingAggregateChecks(postCtx, client, repo, headSHA, defaultBranchCheckContent()); err != nil {
 		// Return 500 so the delivery is recorded as failed and shows up in the
 		// App's delivery log for redelivery. A missed post only ages the
 		// ruleset source index — the next default-branch push refreshes it —
@@ -144,4 +167,109 @@ func (h *Handler) handlePush(ctx context.Context, metricApp string, w http.Respo
 	}
 
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": "default-branch checks posted"})
+}
+
+// defaultBranchCheckContent is the passing Check Run content published on a
+// default-branch commit. Both the request path and the durable driver use it so
+// a redelivery updates the same check with identical output.
+func defaultBranchCheckContent() passingAggregateCheckContent {
+	return passingAggregateCheckContent{
+		operation: "default_branch_check",
+		title:     "Schema changes are verified before merge",
+		summary: "SchemaBot gates schema changes on pull requests before they reach the default branch, " +
+			"so commits on the default branch require no additional verification. " +
+			"This check also keeps SchemaBot selectable as a required-check source in branch rulesets.",
+	}
+}
+
+// enqueueDurablePush persists a default-branch push delivery in the inbox. The
+// stored TenantID is the resolved installation ID so the driver, which runs
+// outside any HTTP request, does not have to re-resolve a repo-level install.
+func (h *Handler) enqueueDurablePush(ctx context.Context, payload pushPayload, body []byte, deliveryID string, installationID int64) (bool, error) {
+	return h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
+		Provider:   storage.WebhookProviderGitHub,
+		DeliveryID: deliveryID,
+		Event:      "push",
+		Repository: payload.Repository.FullName,
+		HeadSHA:    payload.After,
+		TenantID:   strconv.FormatInt(installationID, 10),
+		Payload:    body,
+	})
+}
+
+// processDurablePush posts the passing default-branch check for a claimed push
+// delivery. It re-validates every enqueue-time guard fail-closed — config can
+// change between enqueue and drive, and rows can arrive via replay — so a
+// delivery the current config would ignore (not the default branch, a deletion,
+// an unregistered repo, a participant, or publishing disabled) completes as a
+// no-op rather than posting. GitHub client and post failures are retryable;
+// posting is idempotent (the check is looked up by name and updated in place),
+// so a retry after a partial post reconciles rather than duplicates.
+func (h *Handler) processDurablePush(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
+	var payload pushPayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return false, fmt.Errorf("decode durable push delivery %s: %w", event.DeliveryID, err)
+	}
+
+	repo := payload.Repository.FullName
+	headSHA := payload.After
+
+	if payload.Repository.DefaultBranch == "" || payload.Ref != "refs/heads/"+payload.Repository.DefaultBranch {
+		h.logger.Info("durable push delivery ignored because it is not the default branch",
+			"delivery_id", event.DeliveryID, "repo", repo, "ref", payload.Ref,
+			"default_branch", payload.Repository.DefaultBranch)
+		return false, nil
+	}
+
+	if payload.Deleted || headSHA == "" || strings.Trim(headSHA, "0") == "" {
+		h.logger.Info("durable push delivery ignored because it is a branch deletion",
+			"delivery_id", event.DeliveryID, "repo", repo, "ref", payload.Ref)
+		return false, nil
+	}
+
+	installationID := h.durableInstallationID(ctx, event, payload.Installation.ID)
+	if installationID == 0 {
+		return false, fmt.Errorf("durable push delivery %s missing installation ID", event.DeliveryID)
+	}
+
+	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
+		h.logger.Warn("durable push delivery from unregistered repository",
+			"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA, "installation_id", installationID)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "push", "", repo)
+		return false, nil
+	}
+
+	if h.isAggregateParticipant(repo) {
+		h.logger.Info("durable push delivery skipped: aggregate participant stays silent; the leader maintains the check source",
+			"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA, "installation_id", installationID)
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "default_branch_check",
+			Repository: repo,
+			Status:     "skipped",
+		})
+		return false, nil
+	}
+
+	if !h.shouldPublishChecks(ctx, repo, "default_branch_check") {
+		// shouldPublishChecks logs and records the skip.
+		return false, nil
+	}
+
+	client, err := h.clientForRepo(repo, installationID)
+	if err != nil {
+		return true, fmt.Errorf("create GitHub client for durable push %s@%s: %w", repo, headSHA, err)
+	}
+
+	if err := h.postPassingAggregateChecks(ctx, client, repo, headSHA, defaultBranchCheckContent()); err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "default_branch_check",
+			Repository: repo,
+			Status:     "error",
+		})
+		return true, fmt.Errorf("post durable default-branch checks for %s@%s: %w", repo, headSHA, err)
+	}
+
+	h.logger.Info("durable default-branch checks posted",
+		"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA)
+	return false, nil
 }
