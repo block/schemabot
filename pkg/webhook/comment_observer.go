@@ -287,17 +287,19 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 		return
 	}
 
-	// While the cutover prompt is live and the apply is still at the cutover
-	// gate, stop editing — the prompt is the active comment and the progress
-	// comment stays frozen. Once the apply moves past the gate (the operator
-	// issued the cutover and it completed into a still-active state such as
-	// the revert window), rotate a fresh progress comment in: the prompt's
-	// call to action is spent, and the operator looks at the bottom of the PR
-	// for the effect of the cutover command. Terminal states are left to
-	// OnTerminal, which completes the cutover comment itself.
+	// While the cutover prompt is live, stop editing — the prompt is the
+	// active comment and the progress comment stays frozen. Rotate a fresh
+	// progress comment in only when the apply has provably moved past the
+	// cutover gate into a post-cutover phase (revert window, reverting,
+	// skipping revert): the prompt's call to action is spent, and the operator
+	// looks at the bottom of the PR for the effect of the cutover command.
+	// Terminal states are left to OnTerminal, which completes the cutover
+	// comment itself. Every other state keeps the observer muted — a restart
+	// recovery re-copying a parked apply, a retryable failure at the gate, a
+	// stop — because no cutover has happened, so a rotation would fold the
+	// unanswered prompt under a false "Cutover complete" record.
 	if o.hasCutoverComment {
-		if state.IsTerminalApplyState(apply.State) ||
-			state.IsState(apply.State, state.Apply.CuttingOver, state.Apply.WaitingForCutover) {
+		if !postCutoverPhase(controlPhase(apply.State)) {
 			return
 		}
 		if adopted && o.rotateProgressCommentAfterCutover(apply, tasks) {
@@ -413,6 +415,21 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		o.logError(apply, "observer: failed to check for cutover comment on terminal", "error", err)
 	} else if cutover != nil && cutover.SupersededAt == nil {
 		activeCommentState = state.Comment.Cutover
+		// A live row whose tracked progress comment records a post-cutover
+		// phase is a spent prompt whose supersede write failed: the rotation
+		// already happened and the fresh progress comment is the active one.
+		// Consume the stale row and complete the fresh comment instead of
+		// overwriting the folded prompt with the terminal summary — this
+		// durable check covers a fresh observer whose only call is OnTerminal.
+		// On a tracked-row read failure the prompt stays the active comment,
+		// the same routing a genuinely died-at-the-gate apply gets.
+		tracked, terr := o.stor.ApplyComments().Get(ctx, o.applyID, state.Comment.Progress)
+		if terr != nil {
+			o.logError(apply, "observer: failed to load tracked progress comment on terminal; completing the cutover comment", "error", terr)
+		} else if tracked != nil && postCutoverPhase(trackedPhase(tracked)) {
+			o.supersedeCutoverComment(ctx, apply)
+			activeCommentState = state.Comment.Progress
+		}
 	}
 
 	// Load the operation rows once and reuse them for the ownership decision and
@@ -432,6 +449,14 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		finalBody := o.summaryCommentFromOps(ctx, apply, ops, opsErr, tasks, shardsByTable)
 		o.editTrackedComment(apply, activeCommentState, finalBody)
 		o.markSummaryPosted(apply, activeCommentState)
+		if state.IsState(apply.State, state.Apply.Stopped) {
+			// Stopped is the only terminal state that returns to active. The
+			// prompt now carries the stop record, so consume its row —
+			// otherwise a resumed drive finds a live prompt row and mutes
+			// behind the stop record instead of tracking the resumed copy in
+			// the fresh comment the resume rotation posts.
+			o.supersedeCutoverComment(ctx, apply)
+		}
 	} else {
 		// Edit the progress comment to its final state (completed bars / error).
 		// This is the per-operation status freeze, not the apply-level summary, so
@@ -1075,21 +1100,35 @@ func (o *CommentObserver) rotateProgressCommentAfterCutover(apply *storage.Apply
 		// the next tick retries.
 		return false
 	}
+	if !trackedNew {
+		// The fresh comment is on the PR, but the tracked row still points at
+		// the pre-cutover comment and the live cutover row remains the durable
+		// marker that this rotation is owed. Remember the fresh comment so the
+		// next tick adopts it — retrying only the tracking write, never
+		// another post — after which the already-rotated branch above folds
+		// the prompt and consumes the row. Consuming the row now would orphan
+		// the fresh comment: nothing else adopts an untracked comment, and no
+		// recorded phase would stop a later observer from rotating again. The
+		// prompt is not folded either: the freeze marker rides the tracking
+		// write, so a fold now could never be retried.
+		o.pendingRotation = &pendingProgressRotation{
+			commentID:           newCommentID,
+			volume:              apply.GetOptions().Volume,
+			phase:               controlPhase(apply.State),
+			reason:              supersededByCutover,
+			supersededCommentID: cutover.GitHubCommentID,
+		}
+		o.logError(apply, "observer: fresh post-cutover progress comment posted but not tracked; the cutover prompt stays live until the next tick adopts the fresh comment",
+			"github_comment_id", newCommentID)
+		return true
+	}
 	o.cutoverRotated = true
 	o.hasCutoverComment = false
 
-	if trackedNew {
-		o.freezeSupersededProgressComment(apply, cutover.GitHubCommentID, newCommentID, supersededByCutover, 0)
-	}
-	// When the fresh comment posted but its tracking write failed
-	// (postAndTrackComment logged it), the cutover prompt must not be folded:
-	// no freeze marker was recorded (it rides the tracking write), so a fold
-	// now could never be retried and the fresh comment would be untracked.
-
+	o.freezeSupersededProgressComment(apply, cutover.GitHubCommentID, newCommentID, supersededByCutover, 0)
 	o.supersedeCutoverComment(ctx, apply)
 
-	o.logger.Info("observer: posted fresh progress comment after deferred cutover",
-		"apply_id", o.applyID, "repo", o.repo, "pr", o.pr, "state", apply.State)
+	o.logInfo(apply, "observer: posted fresh progress comment after deferred cutover", "state", apply.State)
 	return true
 }
 
