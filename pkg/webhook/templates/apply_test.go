@@ -343,7 +343,7 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 
 	// Per-table checks
 	assert.Contains(t, result, "**`orders`**")
-	assert.Contains(t, result, "✓ Complete")
+	assert.Contains(t, result, "✅ Complete")
 	assert.Contains(t, result, "🟩") // green bar for completed
 
 	assert.Contains(t, result, "**`users`**")
@@ -732,7 +732,7 @@ func TestRenderApplyStatusComment_Completed(t *testing.T) {
 	assert.Contains(t, result, "**`orders`**")
 	// Progress summary line
 	assert.Contains(t, result, "📊 2/2 complete")
-	// Each table has "✓ Complete" = 2 total
+	// Each table has "✅ Complete" = 2 total
 	assert.Equal(t, 2, strings.Count(result, "Complete"))
 	assert.NotContains(t, result, "Last updated")
 }
@@ -1006,7 +1006,7 @@ func TestRenderApplyStatusComment_Resuming(t *testing.T) {
 	assert.NotContains(t, result, "21%", "the indeterminate resume window must not show the stale pre-stop percent")
 	assert.NotContains(t, result, "21,000 / 100,000", "the indeterminate resume window must not show stale row counts")
 	// An already-terminal table keeps its final state during resume.
-	assert.Contains(t, result, "✓ Complete")
+	assert.Contains(t, result, "✅ Complete")
 }
 
 // A cancelled schema change (e.g. a PlanetScale deploy request that was stopped,
@@ -1907,7 +1907,7 @@ func TestRenderApplyStatusComment_RevertWindow(t *testing.T) {
 	result := RenderApplyStatusComment(data)
 
 	assert.Contains(t, result, "## Schema Change Status")
-	assert.Contains(t, result, "Complete (pending revert)")
+	assert.Contains(t, result, "Complete (revert window open)")
 	assert.Contains(t, result, "schemabot revert apply-abc123 -e staging")
 	assert.Contains(t, result, "schemabot skip-revert apply-abc123 -e staging")
 	// Skip-revert (finalize) is the likelier action, so it is offered before revert.
