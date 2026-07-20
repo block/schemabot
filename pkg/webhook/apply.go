@@ -133,7 +133,7 @@ func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task, shar
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
 			IsInstant:           t.IsInstant,
-			ReadyToComplete:     templates.TaskStatusReadyForCutover(string(t.State)),
+			ReadyToComplete:     templates.TaskStatusReadyForCutover(t.State),
 			ErrorMessage:        t.ErrorMessage,
 			Shards:              shardProgressForTable(shardsByTable, t.ApplyOperationID, t.Namespace, t.TableName),
 		})

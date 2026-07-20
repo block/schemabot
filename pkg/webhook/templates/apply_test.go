@@ -1211,6 +1211,25 @@ func TestRenderPRCommandAuthorizationUnavailable(t *testing.T) {
 	assert.Contains(t, result, "inspect SchemaBot authorization logs")
 }
 
+func TestTaskStatusReadyForCutover(t *testing.T) {
+	tests := []struct {
+		status string
+		ready  bool
+	}{
+		{state.Task.WaitingForCutover, true},
+		{"WAITING_FOR_CUTOVER", true},
+		{"waitingOnSentinelTable", true}, // raw Spirit status
+		{"ready_to_complete", true},      // raw Vitess status
+		{state.Task.Running, false},
+		{"copyRows", false}, // raw Spirit status
+		{state.Task.Completed, false},
+		{state.Task.Stopped, false},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.ready, TaskStatusReadyForCutover(tt.status), "status %q", tt.status)
+	}
+}
+
 func TestApplyStatusFromProgress(t *testing.T) {
 	resp := &apitypes.ProgressResponse{
 		State:       "running",

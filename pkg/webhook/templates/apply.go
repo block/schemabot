@@ -52,9 +52,10 @@ type TableProgressData struct {
 // happens under cutover itself — so the barrier state is what makes the table
 // ready. Engines report no separate per-task readiness signal, so this is the
 // single predicate every TableProgressData producer derives ReadyToComplete
-// from.
+// from. Accepts raw engine statuses (Spirit "waitingOnSentinelTable", Vitess
+// "ready_to_complete") as well as canonical task states.
 func TaskStatusReadyForCutover(status string) bool {
-	return state.IsState(status, state.Task.WaitingForCutover)
+	return state.NormalizeTaskStatus(status) == state.Task.WaitingForCutover
 }
 
 // ShardProgressData is the high-level status of one shard, for the compact
