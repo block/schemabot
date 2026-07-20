@@ -975,21 +975,21 @@ const (
 func (o *CommentObserver) frozenSupersededProgressBody(reason supersededProgressReason, volume int, newCommentID int64, previousBody string) string {
 	switch reason {
 	case supersededByResume:
-		return templates.RenderResumeSupersededProgressComment(templates.ResumeSupersededProgressData{
+		return templates.RenderResumeSupersededProgressComment(templates.SupersededProgressData{
 			Repo:         o.repo,
 			PR:           o.pr,
 			NewCommentID: newCommentID,
 			PreviousBody: previousBody,
 		})
 	case supersededByRevert:
-		return templates.RenderRevertSupersededProgressComment(templates.RevertSupersededProgressData{
+		return templates.RenderRevertSupersededProgressComment(templates.SupersededProgressData{
 			Repo:         o.repo,
 			PR:           o.pr,
 			NewCommentID: newCommentID,
 			PreviousBody: previousBody,
 		})
 	case supersededBySkipRevert:
-		return templates.RenderSkipRevertSupersededProgressComment(templates.SkipRevertSupersededProgressData{
+		return templates.RenderSkipRevertSupersededProgressComment(templates.SupersededProgressData{
 			Repo:         o.repo,
 			PR:           o.pr,
 			NewCommentID: newCommentID,
