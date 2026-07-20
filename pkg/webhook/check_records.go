@@ -174,8 +174,7 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 			repo, pr, environment, schema.Type, schema.Database, headSHA, prInfo.HeadSHA)
 	}
 
-	tables := planResp.FlatTables()
-	hasChanges := len(tables) > 0
+	hasChanges := planResp.HasChanges()
 	driftBlocked := drift.blocks()
 
 	conclusion := planCheckConclusion(hasChanges, len(planResp.Errors) > 0, driftBlocked)

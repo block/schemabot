@@ -79,9 +79,10 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// No changes — release the lock (keyed on the pending intent this handler
-	// observed, so a lock re-pinned by a newer plan is preserved) and notify.
-	if len(planResp.FlatTables()) == 0 {
+	// No changes (neither table DDL nor a VSchema update) — release the lock
+	// (keyed on the pending intent this handler observed, so a lock re-pinned by
+	// a newer plan is preserved) and notify.
+	if !planResp.HasChanges() {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "no changes to apply")
 		// The target already matches the PR schema — apply found nothing to do.
 		// Record the passing (no-change) check result and refresh the aggregate so

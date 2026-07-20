@@ -125,3 +125,73 @@ func TestPlanResponse_HasErrors(t *testing.T) {
 	resp.LintResults = append(resp.LintResults, &LintViolationResponse{Severity: "error"})
 	assert.True(t, resp.HasErrors())
 }
+
+func TestPlanResponse_HasChanges(t *testing.T) {
+	tests := []struct {
+		name string
+		resp *PlanResponse
+		want bool
+	}{
+		{
+			name: "no changes",
+			resp: &PlanResponse{Changes: []*SchemaChangeResponse{{Namespace: "testdb"}}},
+			want: false,
+		},
+		{
+			name: "table changes only",
+			resp: &PlanResponse{Changes: []*SchemaChangeResponse{{
+				Namespace:    "testdb",
+				TableChanges: []*TableChangeResponse{{TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}},
+			}}},
+			want: true,
+		},
+		{
+			name: "vschema diff only",
+			resp: &PlanResponse{Changes: []*SchemaChangeResponse{{
+				Namespace: "boardgames_sharded",
+				Metadata:  map[string]string{VSchemaDiffMetadataKey: "--- current\n+++ new\n+    \"xxhash\": {\"type\": \"xxhash\"}"},
+			}}},
+			want: true,
+		},
+		{
+			name: "vschema changed flag only",
+			resp: &PlanResponse{Changes: []*SchemaChangeResponse{{
+				Namespace: "boardgames_sharded",
+				Metadata:  map[string]string{VSchemaChangedMetadataKey: "true"},
+			}}},
+			want: true,
+		},
+		{
+			name: "vschema changed flag not true",
+			resp: &PlanResponse{Changes: []*SchemaChangeResponse{{
+				Namespace: "boardgames_sharded",
+				Metadata:  map[string]string{VSchemaChangedMetadataKey: "false"},
+			}}},
+			want: false,
+		},
+		{
+			name: "table changes and vschema",
+			resp: &PlanResponse{Changes: []*SchemaChangeResponse{{
+				Namespace:    "boardgames_sharded",
+				TableChanges: []*TableChangeResponse{{TableName: "games", DDL: "ALTER TABLE `games` ADD COLUMN `rating` int"}},
+				Metadata:     map[string]string{VSchemaDiffMetadataKey: "+ xxhash"},
+			}}},
+			want: true,
+		},
+		{
+			name: "nil change entry",
+			resp: &PlanResponse{Changes: []*SchemaChangeResponse{nil}},
+			want: false,
+		},
+		{
+			name: "empty plan",
+			resp: &PlanResponse{},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.resp.HasChanges())
+		})
+	}
+}

@@ -652,9 +652,9 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			ksData.Statements = append(ksData.Statements, t.DDL)
 		}
 		// Extract VSchema changes from metadata
-		if diff, ok := sc.Metadata["vschema"]; ok {
+		if sc.HasVSchemaChange() {
 			ksData.VSchemaChanged = true
-			ksData.VSchemaDiff = diff
+			ksData.VSchemaDiff = sc.Metadata[apitypes.VSchemaDiffMetadataKey]
 		}
 		data.Changes = append(data.Changes, ksData)
 	}
