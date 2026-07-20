@@ -54,7 +54,7 @@ func TestApplyCommentStore_Upsert(t *testing.T) {
 	comment.GitHubCommentID = 444555666
 	newVolume := 5
 	comment.PostedVolume = &newVolume
-	reverting := "reverting"
+	reverting := state.Apply.Reverting
 	comment.PostedPhase = &reverting
 	require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
 
@@ -66,7 +66,7 @@ func TestApplyCommentStore_Upsert(t *testing.T) {
 	require.NotNil(t, retrieved.PostedVolume)
 	assert.Equal(t, 5, *retrieved.PostedVolume)
 	require.NotNil(t, retrieved.PostedPhase)
-	assert.Equal(t, "reverting", *retrieved.PostedPhase)
+	assert.Equal(t, state.Apply.Reverting, *retrieved.PostedPhase)
 
 	// A summary comment carries no level or control phase; the columns stay
 	// NULL and read back nil.

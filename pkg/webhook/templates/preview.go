@@ -1479,7 +1479,7 @@ func PreviewCommentResumeSupersededProgress() string {
 	table.RowsTotal = 7200000
 	table.PercentComplete = 32
 	data := sampleSingleApplyData(state.Apply.Stopped, table)
-	return RenderResumeSupersededProgressComment(ResumeSupersededProgressData{
+	return RenderResumeSupersededProgressComment(SupersededProgressData{
 		Repo:         "acme/testapp",
 		PR:           42,
 		NewCommentID: 2222222222,
@@ -1497,7 +1497,7 @@ func PreviewCommentRevertSupersededProgress() string {
 	table.RowsTotal = 7200000
 	table.PercentComplete = 100
 	data := sampleSingleApplyData(state.Apply.RevertWindow, table)
-	return RenderRevertSupersededProgressComment(RevertSupersededProgressData{
+	return RenderRevertSupersededProgressComment(SupersededProgressData{
 		Repo:         "acme/testapp",
 		PR:           42,
 		NewCommentID: 2222222222,
@@ -1516,7 +1516,7 @@ func PreviewCommentSkipRevertSupersededProgress() string {
 	table.RowsTotal = 7200000
 	table.PercentComplete = 100
 	data := sampleSingleApplyData(state.Apply.RevertWindow, table)
-	return RenderSkipRevertSupersededProgressComment(SkipRevertSupersededProgressData{
+	return RenderSkipRevertSupersededProgressComment(SupersededProgressData{
 		Repo:         "acme/testapp",
 		PR:           42,
 		NewCommentID: 2222222222,
@@ -1535,7 +1535,7 @@ func PreviewCommentCutoverSuperseded() string {
 	table.RowsTotal = 7200000
 	table.PercentComplete = 100
 	data := sampleSingleApplyData(state.Apply.WaitingForCutover, table)
-	return RenderCutoverSupersededComment(CutoverSupersededCommentData{
+	return RenderCutoverSupersededComment(SupersededProgressData{
 		Repo:         "acme/testapp",
 		PR:           42,
 		NewCommentID: 2222222222,
