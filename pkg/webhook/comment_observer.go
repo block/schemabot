@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -351,6 +352,17 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task) {
 	if !o.leaseStillOwnsObserver(apply, "terminal") {
 		return
+	}
+	// A rotation's fresh comment may be live on the PR but still untracked —
+	// the tracking write failed and no later progress tick landed the
+	// adoption. This is the last chance to adopt it: on success the terminal
+	// rendering below edits the fresh comment and its predecessor is frozen.
+	// If the adoption still fails, the terminal rendering lands on the tracked
+	// (prior) comment and the fresh comment stays at its last progress
+	// rendering on the PR.
+	if o.pendingRotation != nil && !o.adoptPendingRotationComment(apply) {
+		o.logError(apply, "observer: posted-but-untracked rotation comment could not be adopted before the terminal publish; it stays at its last progress rendering",
+			"github_comment_id", o.pendingRotation.commentID)
 	}
 	// Determine which comment to edit to final state.
 	// If a cutover comment exists, edit that and leave the progress comment
@@ -774,15 +786,38 @@ func controlPhase(applyState string) string {
 	return phaseNone
 }
 
-// phaseRotatesProgressComment reports whether an apply entering the phase is
-// the effect of an operator control command that warrants rotating the
-// progress comment. Reverting and skipping-revert are always operator-issued.
-// The cutover-driven phases are not listed here: entering the revert window
-// after an auto-cutover involves no operator command (the comment transitions
-// in place), and while a deferred-cutover prompt is live the observer does
-// not edit progress comments.
+// phaseRotatesProgressComment reports whether an apply entering the phase can
+// be the effect of an operator control command that warrants rotating the
+// progress comment. Reverting always is — it has no non-operator entry path.
+// Skipping-revert only sometimes is, so it additionally requires the durable
+// operator-origin signal (see phaseIsOperatorIssued). The cutover-driven
+// phases are not listed here: entering the revert window after an
+// auto-cutover involves no operator command (the comment transitions in
+// place), and while a deferred-cutover prompt is live the observer does not
+// edit progress comments.
 func phaseRotatesProgressComment(phase string) bool {
 	return phase == phaseReverting || phase == phaseSkippingRevert
+}
+
+// phaseIsOperatorIssued reports whether the apply entered the phase as the
+// effect of an operator control command — the situation comment rotation
+// exists for: an operator watching the bottom of the PR timeline for the
+// effect of the command they just issued. Reverting is always
+// operator-issued. Skipping-revert is operator-issued only when a durable
+// skip-revert control request exists for the apply: the phase is also entered
+// when the revert window expires on its own or when the apply was submitted
+// with skip-revert chosen upfront, and neither involves a command whose
+// effect an operator is waiting to see — the progress comment transitions in
+// place.
+func (o *CommentObserver) phaseIsOperatorIssued(ctx context.Context, phase string) (bool, error) {
+	if phase != phaseSkippingRevert {
+		return true, nil
+	}
+	req, err := o.stor.ControlRequests().GetByOperation(ctx, o.applyID, storage.ControlOperationSkipRevert)
+	if err != nil {
+		return false, fmt.Errorf("load skip-revert control request: %w", err)
+	}
+	return req != nil, nil
 }
 
 // trackedPhase returns the phase recorded on a tracked comment row, treating
@@ -822,6 +857,21 @@ func (o *CommentObserver) rotateProgressCommentForControlPhase(apply *storage.Ap
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	operatorIssued, err := o.phaseIsOperatorIssued(ctx, phase)
+	if err != nil {
+		o.logError(apply, "observer: failed to determine whether the control phase was operator-issued; rotation will be re-checked on the next tick",
+			"error", err, "phase", phase)
+		return false
+	}
+	if !operatorIssued {
+		// The apply entered the phase on its own — no operator command whose
+		// effect needs surfacing at the bottom of the PR. The progress comment
+		// transitions in place; remembered so later ticks skip the re-check.
+		o.markPhaseRotated(phase)
+		o.logInfo(apply, "observer: control phase was not operator-issued; progress comment transitions in place", "phase", phase)
+		return false
+	}
+
 	tracked, err := o.stor.ApplyComments().Get(ctx, o.applyID, state.Comment.Progress)
 	if err != nil {
 		o.logError(apply, "observer: failed to load tracked progress comment before control-phase rotation",
@@ -835,19 +885,21 @@ func (o *CommentObserver) rotateProgressCommentForControlPhase(apply *storage.Ap
 		o.logInfo(apply, "observer: no tracked progress comment yet; skipping control-phase rotation check", "phase", phase)
 		return false
 	}
+	if tracked.PendingFreezeCommentID != nil {
+		// A superseded comment from an earlier rotation is still owed its
+		// frozen rendering — the freeze edit failed or the pod died before it
+		// landed. Retry it now (even when the tracked comment already records
+		// this phase and no new rotation follows); on success the marker is
+		// cleared.
+		o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
+			supersededByPriorRotation, 0)
+	}
 	if trackedPhase(tracked) == phase {
 		// The tracked comment was posted while the apply was already in this
 		// phase — it already tracks the operation, across restarts and drive
 		// re-claims.
 		o.markPhaseRotated(phase)
 		return false
-	}
-	if tracked.PendingFreezeCommentID != nil {
-		// A superseded comment from an earlier rotation is still owed its
-		// frozen rendering — the freeze edit failed or the pod died before it
-		// landed. Retry it now; on success the marker is cleared.
-		o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
-			supersededByPriorRotation, 0)
 	}
 
 	body := o.formatStatusComment(apply, tasks)
