@@ -1127,6 +1127,755 @@ func TestE2EControlPhaseRotationReconcilesPendingFreezeFromPriorDrive(t *testing
 	}
 }
 
+// When a deferred cutover completes into a still-active apply (the revert
+// window), the observer unmutes and posts a fresh progress comment tracking
+// the post-cutover phase — the operator issued the cutover command, so its
+// effect belongs at the bottom of the PR timeline. The spent cutover prompt is
+// frozen into a collapsed details block pointing at the fresh comment, its
+// stored row is superseded so no later observer treats it as the live comment,
+// and later progress edits land on the fresh comment.
+func TestE2EDeferredCutoverRotatesProgressComment(t *testing.T) {
+	ctx := t.Context()
+
+	// The apply copied all rows and paused at the deferred-cutover gate: the
+	// progress comment froze and the cutover prompt was posted.
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-cutover-rotate",
+		pr:         146,
+		database:   "e2e_cutover_rotate_db",
+		applyState: state.Apply.WaitingForCutover,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-cutover-rotate", 146, 12345, apply, state.Comment.Progress, "Copy complete — waiting for cutover")
+	preCutoverProgressID := requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-cutover-rotate", 146, 12345, apply, state.Comment.Cutover, "Ready for cutover — run `schemabot cutover` to proceed")
+	cutoverPromptID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The operator ran the cutover and it completed into the revert window.
+	// The first progress tick past the gate rotates: fresh comment in, prompt
+	// folded.
+	apply.State = state.Apply.RevertWindow
+	task.State = state.Task.RevertWindow
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	var newProgressID int64
+	select {
+	case created := <-capture.creates:
+		newProgressID = created.ID
+		assert.Contains(t, created.Body, "Schema Change Status — Staging")
+		assert.Contains(t, created.Body, "**Status**: Revert Window")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a new progress comment to be posted when the deferred cutover completes")
+	}
+	assert.NotEqual(t, cutoverPromptID, newProgressID, "the rotation must post a new comment, not reuse the cutover prompt")
+	assert.NotEqual(t, preCutoverProgressID, newProgressID, "the rotation must post a new comment, not reuse the frozen progress comment")
+
+	// The spent cutover prompt is frozen into a collapsed details block
+	// pointing at its successor, with the prompt preserved inside the fold.
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, cutoverPromptID, edited.CommentID, "the freeze edit lands on the cutover prompt")
+		assert.Contains(t, edited.Body, "Cutover complete")
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", newProgressID), "the frozen prompt links to its successor")
+		assert.Contains(t, edited.Body, "<details>")
+		assert.Contains(t, edited.Body, "Ready for cutover", "the prompt body is preserved inside the fold")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the cutover prompt to be frozen")
+	}
+
+	// The progress row tracks the new comment with no freeze left owing and
+	// records the post-cutover phase; the cutover row is consumed so no later
+	// observer treats the folded prompt as the live comment.
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, newProgressID, prog.GitHubCommentID)
+	assert.Nil(t, prog.PendingFreezeCommentID)
+	require.NotNil(t, prog.PostedPhase)
+	assert.Equal(t, "revert_window", *prog.PostedPhase, "the fresh comment records the post-cutover phase")
+	cutoverRow, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Cutover)
+	require.NoError(t, err)
+	require.NotNil(t, cutoverRow)
+	assert.NotNil(t, cutoverRow.SupersededAt, "the cutover row is superseded once its prompt is folded")
+
+	// A later tick edits the fresh comment in place — the observer is unmuted
+	// and the rotation happened exactly once.
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, newProgressID, edited.CommentID, "later edits land on the fresh comment")
+	case created := <-capture.creates:
+		t.Fatalf("a deferred cutover must rotate exactly once; got another new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an in-place edit of the fresh progress comment on the next tick")
+	}
+
+	// A fresh observer — a later drive claim after a restart — finds the
+	// superseded cutover row and the recorded post-cutover phase, stays
+	// unmuted, and edits the tracked comment in place.
+	obs2 := f.newObserver(st, fake)
+	task.RowsCopied = 900
+	task.ProgressPercent = 90
+	fake.Advance(activeInterval + time.Second)
+	obs2.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, newProgressID, edited.CommentID, "a fresh observer edits the tracked comment in place")
+	case created := <-capture.creates:
+		t.Fatalf("a fresh observer must not rotate for a cutover already tracked; got new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the fresh observer to edit the tracked progress comment")
+	}
+}
+
+// A post-cutover rotation whose fresh comment lands but whose cutover-row
+// supersede write fails must not re-mute the observer: the rotation already
+// happened, so the still-live row is stale. Later ticks keep editing the
+// fresh comment while retrying the supersede, and once storage heals the row
+// is consumed so later observers neither re-mute on the folded prompt nor
+// complete it on terminal.
+func TestE2EDeferredCutoverSupersedeRetriedUntilItLands(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-cutover-supersede-retry",
+		pr:         149,
+		database:   "e2e_cutover_supersede_retry_db",
+		applyState: state.Apply.WaitingForCutover,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-cutover-supersede-retry", 149, 12345, apply, state.Comment.Progress, "Copy complete — waiting for cutover")
+	requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-cutover-supersede-retry", 149, 12345, apply, state.Comment.Cutover, "Ready for cutover")
+	cutoverPromptID := requireCommentCreate(t, capture)
+
+	failingStorage := &failingCommentSupersedeStorage{Storage: st}
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(failingStorage, fake)
+
+	// The cutover completes into the revert window. The rotation posts the
+	// fresh comment and folds the prompt, but consuming the cutover row fails.
+	apply.State = state.Apply.RevertWindow
+	task.State = state.Task.RevertWindow
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	var freshProgressID int64
+	select {
+	case created := <-capture.creates:
+		freshProgressID = created.ID
+		assert.Contains(t, created.Body, "**Status**: Revert Window")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the rotation to post a fresh progress comment")
+	}
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, cutoverPromptID, edited.CommentID, "the freeze edit lands on the cutover prompt")
+		assert.Contains(t, edited.Body, "Cutover complete")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the cutover prompt to be frozen")
+	}
+	cutoverRow, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Cutover)
+	require.NoError(t, err)
+	require.NotNil(t, cutoverRow)
+	require.Nil(t, cutoverRow.SupersededAt, "the injected outage keeps the cutover row live")
+
+	// While the outage lasts, later ticks keep editing the fresh comment — the
+	// still-live cutover row is known-stale to this observer — and never post
+	// a duplicate rotation.
+	task.RowsCopied = 700
+	task.ProgressPercent = 70
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, freshProgressID, edited.CommentID, "progress edits land on the fresh comment while the supersede is owed")
+	case created := <-capture.creates:
+		t.Fatalf("a deferred cutover must rotate exactly once; got another new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an in-place edit of the fresh progress comment during the outage")
+	}
+
+	// Once storage heals, the next tick's retry consumes the cutover row while
+	// the tick still edits the fresh comment in place.
+	failingStorage.heal()
+	task.RowsCopied = 800
+	task.ProgressPercent = 80
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, freshProgressID, edited.CommentID)
+	case created := <-capture.creates:
+		t.Fatalf("the supersede retry must not post a comment; got %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an in-place edit of the fresh progress comment after healing")
+	}
+	cutoverRow, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Cutover)
+	require.NoError(t, err)
+	require.NotNil(t, cutoverRow)
+	assert.NotNil(t, cutoverRow.SupersededAt, "the retried supersede consumes the cutover row once storage heals")
+}
+
+// While the cutover prompt is live and unanswered, states that do not follow
+// from a completed cutover — a restart recovery re-copying the parked apply, a
+// retryable failure at the gate, the gate state itself — keep the observer
+// muted: no fresh progress comment is posted and the prompt is never folded
+// under a false "Cutover complete" record. Only a post-cutover phase (revert
+// window, reverting, skipping revert) proves the operator's cutover happened
+// and unmutes.
+func TestE2EDeferredCutoverPromptStaysMutedWithoutCutover(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-cutover-muted",
+		pr:         151,
+		database:   "e2e_cutover_muted_db",
+		applyState: state.Apply.WaitingForCutover,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-cutover-muted", 151, 12345, apply, state.Comment.Progress, "Copy complete — waiting for cutover")
+	preCutoverProgressID := requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-cutover-muted", 151, 12345, apply, state.Comment.Cutover, "Ready for cutover")
+	requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+
+	// Each state is observed by a fresh observer — a restart recovery hands
+	// the apply to a new drive claim, which must rediscover the live prompt
+	// and stay muted rather than mistake its own arrival for a cutover.
+	for _, applyState := range []string{state.Apply.Running, state.Apply.FailedRetryable, state.Apply.WaitingForCutover} {
+		obs := f.newObserver(st, fake)
+		apply.State = applyState
+		fake.Advance(activeInterval + time.Second)
+		obs.OnProgress(apply, []*storage.Task{task})
+		select {
+		case created := <-capture.creates:
+			t.Fatalf("state %q must not rotate while the prompt is unanswered; got new comment %d: %s", applyState, created.ID, created.Body)
+		case edited := <-capture.edits:
+			t.Fatalf("state %q must not edit while the prompt is unanswered; got an edit of %d: %s", applyState, edited.CommentID, edited.Body)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	// The prompt row stays live — the gate is still waiting for its answer —
+	// and the tracked progress comment is untouched, recording no post-cutover
+	// phase.
+	cutoverRow, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Cutover)
+	require.NoError(t, err)
+	require.NotNil(t, cutoverRow)
+	assert.Nil(t, cutoverRow.SupersededAt, "the prompt row stays live while no cutover happened")
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, preCutoverProgressID, prog.GitHubCommentID, "the tracked progress comment is unchanged")
+	assert.False(t, postCutoverPhase(trackedPhase(prog)), "no post-cutover phase is recorded without a cutover")
+}
+
+// An apply stopped at the deferred-cutover gate completes the prompt itself:
+// the terminal edit turns the prompt into the stop record and consumes its
+// row, so the prompt is never folded under a false "Cutover complete" record.
+// When the operator resumes, the consumed row no longer mutes the fresh
+// observer, and the summary marker triggers the resume rotation: the resumed
+// apply is tracked in a fresh progress comment at the bottom of the PR while
+// the stop record stays intact on the timeline.
+func TestE2EStopAtCutoverGateThenResumeRotatesFreshComment(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-cutover-stop-resume",
+		pr:         152,
+		database:   "e2e_cutover_stop_resume_db",
+		applyState: state.Apply.WaitingForCutover,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-cutover-stop-resume", 152, 12345, apply, state.Comment.Progress, "Copy complete — waiting for cutover")
+	preStopProgressID := requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-cutover-stop-resume", 152, 12345, apply, state.Comment.Cutover, "Ready for cutover")
+	cutoverPromptID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The operator stops the apply at the gate. The prompt is the active
+	// comment, so the terminal edit lands there as the stop record.
+	apply.State = state.Apply.Stopped
+	task.State = state.Task.Stopped
+	obs.OnTerminal(apply, []*storage.Task{task})
+
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, cutoverPromptID, edited.CommentID, "the stop record lands on the prompt")
+		assert.Contains(t, edited.Body, "Schema Change Stopped")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the cutover prompt to be edited into the stop record")
+	}
+	select {
+	case created := <-capture.creates:
+		t.Fatalf("a stop at the gate completes the prompt itself; got a new comment %d: %s", created.ID, created.Body)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// The stop consumes the prompt row — its call to action is void — and the
+	// summary marker records the stop record as the terminal publish.
+	cutoverRow, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Cutover)
+	require.NoError(t, err)
+	require.NotNil(t, cutoverRow)
+	assert.NotNil(t, cutoverRow.SupersededAt, "the stop consumes the prompt row")
+	marker, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, marker)
+	assert.Equal(t, cutoverPromptID, marker.GitHubCommentID, "the summary marker records the stop record")
+
+	// The operator starts the apply again and a later drive claims it. The
+	// fresh observer finds the consumed prompt row — no mute — and the live
+	// summary marker triggers the resume rotation.
+	apply.State = state.Apply.Resuming
+	task.State = state.Task.Running
+	obs2 := f.newObserver(st, fake)
+	fake.Advance(activeInterval + time.Second)
+	obs2.OnProgress(apply, []*storage.Task{task})
+
+	var resumedProgressID int64
+	select {
+	case created := <-capture.creates:
+		resumedProgressID = created.ID
+		assert.Contains(t, created.Body, "Schema Change Status — Staging")
+		assert.Contains(t, created.Body, "**Status**: Resuming")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the resume to post a fresh progress comment")
+	}
+	assert.NotEqual(t, cutoverPromptID, resumedProgressID, "the resumed apply gets its own comment; the stop record is not reused")
+
+	// The pre-stop progress comment — not the stop record — is folded pointing
+	// at the fresh comment.
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, preStopProgressID, edited.CommentID, "the freeze edit lands on the pre-stop progress comment")
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", resumedProgressID), "the frozen comment links to its successor")
+		assert.NotContains(t, edited.Body, "Cutover complete", "nothing renders a cutover that never happened")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the pre-stop progress comment to be frozen")
+	}
+
+	// The summary marker is consumed and later ticks edit the fresh comment —
+	// the stop record is never touched again.
+	marker, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, marker)
+	assert.NotNil(t, marker.SupersededAt, "the resume consumes the summary marker")
+
+	apply.State = state.Apply.Running
+	task.RowsCopied = 700
+	task.ProgressPercent = 70
+	fake.Advance(activeInterval + time.Second)
+	obs2.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, resumedProgressID, edited.CommentID, "later edits land on the fresh comment")
+	case created := <-capture.creates:
+		t.Fatalf("a resume rotates exactly once; got another new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an in-place edit of the fresh progress comment")
+	}
+}
+
+// A post-cutover rotation whose fresh comment posts to the PR but fails to be
+// recorded as the tracked comment must not fold the prompt or consume the
+// cutover row: the row is the durable marker that the rotation is owed, and
+// the fold marker rides the tracking write. While the outage lasts, later
+// ticks retry only the tracking write (adoption) — never another post — so
+// duplicates stay bounded at one. Once storage heals, the next tick adopts the
+// already-live fresh comment: the tracked row records it with the post-cutover
+// phase, the prompt is folded pointing at it, the cutover row is consumed, and
+// progress edits move to the adopted comment.
+func TestE2EDeferredCutoverUntrackedFreshCommentAdoptedWhenStorageHeals(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-cutover-untracked",
+		pr:         153,
+		database:   "e2e_cutover_untracked_db",
+		applyState: state.Apply.WaitingForCutover,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-cutover-untracked", 153, 12345, apply, state.Comment.Progress, "Copy complete — waiting for cutover")
+	preCutoverProgressID := requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-cutover-untracked", 153, 12345, apply, state.Comment.Cutover, "Ready for cutover")
+	cutoverPromptID := requireCommentCreate(t, capture)
+
+	failingStorage := &failingCommentUpsertStorage{Storage: st}
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(failingStorage, fake)
+
+	// The cutover completes into the revert window. The fresh comment posts,
+	// but recording it as the tracked comment fails — the prompt must not be
+	// folded and the cutover row must stay live.
+	apply.State = state.Apply.RevertWindow
+	task.State = state.Task.RevertWindow
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	var freshProgressID int64
+	select {
+	case created := <-capture.creates:
+		freshProgressID = created.ID
+		assert.Contains(t, created.Body, "**Status**: Revert Window")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the rotation to post a fresh progress comment")
+	}
+	select {
+	case edited := <-capture.edits:
+		t.Fatalf("no comment may be edited when the fresh comment was not tracked; got an edit of %d: %s", edited.CommentID, edited.Body)
+	case <-time.After(100 * time.Millisecond):
+	}
+	cutoverRow, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Cutover)
+	require.NoError(t, err)
+	require.NotNil(t, cutoverRow)
+	assert.Nil(t, cutoverRow.SupersededAt, "the cutover row stays live while the rotation is untracked")
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, preCutoverProgressID, prog.GitHubCommentID, "the tracked row still points at the pre-cutover comment")
+
+	// While the outage lasts, a later tick retries only the tracking write —
+	// no duplicate post, no fold, no progress edit past the still-live prompt.
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case created := <-capture.creates:
+		t.Fatalf("an untracked rotation must not repost; got another new comment %d", created.ID)
+	case edited := <-capture.edits:
+		t.Fatalf("no comment may be edited while adoption is owed; got an edit of %d: %s", edited.CommentID, edited.Body)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Once storage heals, the next tick adopts the already-live fresh comment:
+	// the prompt is folded pointing at it and the cutover row is consumed.
+	failingStorage.heal()
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, cutoverPromptID, edited.CommentID, "the freeze edit lands on the cutover prompt")
+		assert.Contains(t, edited.Body, "Cutover complete")
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", freshProgressID), "the frozen prompt links to its adopted successor")
+	case created := <-capture.creates:
+		t.Fatalf("adoption must not post another comment; got %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the cutover prompt to be frozen after adoption")
+	}
+	prog, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, freshProgressID, prog.GitHubCommentID, "the tracked row records the adopted comment")
+	require.NotNil(t, prog.PostedPhase)
+	assert.Equal(t, "revert_window", *prog.PostedPhase, "adoption records the post-cutover phase durably")
+	assert.Nil(t, prog.PendingFreezeCommentID)
+	cutoverRow, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Cutover)
+	require.NoError(t, err)
+	require.NotNil(t, cutoverRow)
+	assert.NotNil(t, cutoverRow.SupersededAt, "the cutover row is consumed once the rotation is tracked")
+
+	// Later ticks edit the adopted comment in place.
+	task.RowsCopied = 900
+	task.ProgressPercent = 90
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, freshProgressID, edited.CommentID, "progress edits move to the adopted comment")
+	case created := <-capture.creates:
+		t.Fatalf("no further rotation is owed; got new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an in-place edit of the adopted comment")
+	}
+}
+
+// When the apply reaches a terminal state while the cutover row still reads
+// live but the tracked progress comment records a post-cutover phase, the row
+// is a spent prompt whose supersede write never landed: the rotation already
+// happened and the fresh progress comment is the active one. The terminal
+// publish completes the fresh comment and posts the summary — it must not
+// overwrite the folded prompt — and consumes the stale row.
+func TestE2EDeferredCutoverStaleCutoverRowRoutesTerminalToFreshComment(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-cutover-stale-terminal",
+		pr:         154,
+		database:   "e2e_cutover_stale_terminal_db",
+		applyState: state.Apply.WaitingForCutover,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-cutover-stale-terminal", 154, 12345, apply, state.Comment.Progress, "Copy complete — waiting for cutover")
+	requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-cutover-stale-terminal", 154, 12345, apply, state.Comment.Cutover, "Ready for cutover")
+	cutoverPromptID := requireCommentCreate(t, capture)
+
+	// The cutover completes into the revert window and the rotation lands —
+	// fresh comment tracked, prompt folded — but consuming the cutover row
+	// fails, leaving it live.
+	failingStorage := &failingCommentSupersedeStorage{Storage: st}
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(failingStorage, fake)
+	apply.State = state.Apply.RevertWindow
+	task.State = state.Task.RevertWindow
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	var freshProgressID int64
+	select {
+	case created := <-capture.creates:
+		freshProgressID = created.ID
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the rotation to post a fresh progress comment")
+	}
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, cutoverPromptID, edited.CommentID, "the freeze edit lands on the cutover prompt")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the cutover prompt to be frozen")
+	}
+
+	// The revert window expires and the apply completes. A fresh observer —
+	// only its terminal callback runs — reads the stale live row, sees the
+	// tracked comment's post-cutover phase, and routes the terminal publish to
+	// the fresh comment.
+	apply.State = state.Apply.Completed
+	task.State = state.Task.Completed
+	obs2 := f.newObserver(st, fake)
+	obs2.OnTerminal(apply, []*storage.Task{task})
+
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, freshProgressID, edited.CommentID, "the terminal freeze lands on the fresh progress comment, not the folded prompt")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the fresh progress comment to be edited to its final rendering")
+	}
+	select {
+	case created := <-capture.creates:
+		assert.Contains(t, created.Body, "Schema Change Applied")
+		assert.Contains(t, created.Body, apply.ApplyIdentifier)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a summary comment for the completed apply")
+	}
+	select {
+	case edited := <-capture.edits:
+		t.Fatalf("the folded prompt must not be overwritten on terminal; got an edit of %d: %s", edited.CommentID, edited.Body)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// The stale row is consumed on the way through.
+	cutoverRow, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Cutover)
+	require.NoError(t, err)
+	require.NotNil(t, cutoverRow)
+	assert.NotNil(t, cutoverRow.SupersededAt, "the terminal publish consumes the stale cutover row")
+}
+
+// A fresh observer on a later drive claim that finds the cutover row still
+// live but the tracked progress comment recording a post-cutover phase treats
+// the row as a spent prompt whose supersede write never landed: it consumes
+// the row without rotating again — the recorded phase is the durable proof the
+// rotation already happened — and progress edits continue on the fresh
+// comment.
+func TestE2EDeferredCutoverFreshObserverConsumesStaleCutoverRow(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-cutover-stale-row",
+		pr:         155,
+		database:   "e2e_cutover_stale_row_db",
+		applyState: state.Apply.WaitingForCutover,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-cutover-stale-row", 155, 12345, apply, state.Comment.Progress, "Copy complete — waiting for cutover")
+	requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-cutover-stale-row", 155, 12345, apply, state.Comment.Cutover, "Ready for cutover")
+	cutoverPromptID := requireCommentCreate(t, capture)
+
+	// The cutover completes into the revert window and the rotation lands —
+	// fresh comment tracked, prompt folded — but consuming the cutover row
+	// fails, leaving it live for the next drive claim to find.
+	failingStorage := &failingCommentSupersedeStorage{Storage: st}
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(failingStorage, fake)
+	apply.State = state.Apply.RevertWindow
+	task.State = state.Task.RevertWindow
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	var freshProgressID int64
+	select {
+	case created := <-capture.creates:
+		freshProgressID = created.ID
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the rotation to post a fresh progress comment")
+	}
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, cutoverPromptID, edited.CommentID, "the freeze edit lands on the cutover prompt")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the cutover prompt to be frozen")
+	}
+
+	// A fresh observer claims the drive. Its first tick reads the live row,
+	// sees the tracked comment's recorded post-cutover phase, and consumes the
+	// row instead of rotating again — no duplicate comment, no second fold.
+	obs2 := f.newObserver(st, fake)
+	fake.Advance(activeInterval + time.Second)
+	obs2.OnProgress(apply, []*storage.Task{task})
+	select {
+	case created := <-capture.creates:
+		t.Fatalf("a fresh observer must not rotate for a cutover already tracked; got new comment %d", created.ID)
+	case edited := <-capture.edits:
+		t.Fatalf("a fresh observer must not re-fold; got an edit of %d: %s", edited.CommentID, edited.Body)
+	case <-time.After(100 * time.Millisecond):
+	}
+	cutoverRow, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Cutover)
+	require.NoError(t, err)
+	require.NotNil(t, cutoverRow)
+	assert.NotNil(t, cutoverRow.SupersededAt, "the fresh observer consumes the stale cutover row")
+
+	// The next tick edits the fresh comment in place — the observer is unmuted.
+	task.RowsCopied = 900
+	task.ProgressPercent = 90
+	fake.Advance(activeInterval + time.Second)
+	obs2.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, freshProgressID, edited.CommentID, "progress edits continue on the fresh comment")
+	case created := <-capture.creates:
+		t.Fatalf("no further rotation is owed; got new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an in-place edit of the fresh progress comment")
+	}
+}
+
+// A fresh rotation comment that posted but was never recorded (a storage
+// outage between the post and the tracking write) is adopted before the
+// cutover prompt posts and before the post-cutover rotation runs, in the same
+// order the comments landed on the PR. The tracked row therefore always moves
+// forward — prior comment, adopted comment, post-cutover comment — and never
+// regresses to a stale comment after a newer one was tracked.
+func TestE2EPendingRotationAdoptedBeforeCutoverPrompt(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-pending-adoption-cutover",
+		pr:         150,
+		database:   "e2e_pending_adoption_cutover_db",
+		applyState: state.Apply.Running,
+		volume:     3,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-pending-adoption-cutover", 150, 12345, apply, state.Comment.Progress, "Copying at volume 3")
+	initialProgressID := requireCommentCreate(t, capture)
+
+	failingStorage := &failingCommentUpsertStorage{Storage: st}
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(failingStorage, fake)
+
+	// A volume change posts a fresh comment, but recording it as the tracked
+	// comment fails — it stays pending adoption.
+	apply.SetOptions(storage.ApplyOptions{Volume: 5, DeferCutover: true})
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	var volumeProgressID int64
+	select {
+	case created := <-capture.creates:
+		volumeProgressID = created.ID
+		assert.Contains(t, created.Body, "Volume: 5/11")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the volume change to post a fresh progress comment")
+	}
+
+	// Storage heals and the apply reaches the deferred-cutover gate on the
+	// same tick. The pending comment is adopted first — freezing its
+	// predecessor — and only then does the cutover prompt post, matching the
+	// order the comments sit on the PR.
+	failingStorage.heal()
+	apply.State = state.Apply.CuttingOver
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, initialProgressID, edited.CommentID, "adoption freezes the pending comment's predecessor")
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", volumeProgressID), "the frozen comment links to its adopted successor")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the pending comment's predecessor to be frozen at the gate tick")
+	}
+	var cutoverPromptID int64
+	select {
+	case created := <-capture.creates:
+		cutoverPromptID = created.ID
+		assert.Contains(t, created.Body, "**Status**: Cutting Over")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the cutover prompt to be posted at the gate")
+	}
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, volumeProgressID, prog.GitHubCommentID, "the tracked row records the adopted comment before the gate")
+
+	// The cutover completes into the revert window: the post-cutover rotation
+	// posts a fresh comment tracking the new phase and folds the spent prompt.
+	apply.State = state.Apply.RevertWindow
+	task.State = state.Task.RevertWindow
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	var postCutoverProgressID int64
+	select {
+	case created := <-capture.creates:
+		postCutoverProgressID = created.ID
+		assert.Contains(t, created.Body, "**Status**: Revert Window")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the post-cutover rotation to post a fresh progress comment")
+	}
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, cutoverPromptID, edited.CommentID, "the freeze edit lands on the cutover prompt")
+		assert.Contains(t, edited.Body, "Cutover complete")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the cutover prompt to be frozen")
+	}
+
+	// The tracked row records the post-cutover comment and a later tick edits
+	// it in place: nothing regresses the row to the adopted comment.
+	prog, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, postCutoverProgressID, prog.GitHubCommentID, "the tracked row records the post-cutover comment")
+	require.NotNil(t, prog.PostedPhase)
+	assert.Equal(t, "revert_window", *prog.PostedPhase)
+	assert.Nil(t, prog.PendingFreezeCommentID)
+
+	task.RowsCopied = 900
+	task.ProgressPercent = 90
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, postCutoverProgressID, edited.CommentID, "later edits land on the post-cutover comment")
+	case created := <-capture.creates:
+		t.Fatalf("no further rotation is owed; got new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an in-place edit of the post-cutover comment")
+	}
+}
+
 // A control-phase rotation whose fresh comment posts to the PR but fails to
 // be recorded as the tracked comment must not freeze the prior comment: the
 // tracked row still points at it, so later progress edits land there. While
@@ -1416,6 +2165,36 @@ func (s *failingCommentUpsertStorage) ApplyComments() storage.ApplyCommentStore 
 }
 
 func (s *failingCommentUpsertStorage) heal() { s.healed.Store(true) }
+
+// failingCommentSupersedeStore wraps an ApplyCommentStore so every Supersede
+// fails until the outage is healed, modeling a storage outage between posting
+// the post-cutover rotation comment and consuming the cutover row. Reads and
+// every other write pass through.
+type failingCommentSupersedeStore struct {
+	storage.ApplyCommentStore
+	healed *atomic.Bool
+}
+
+func (s *failingCommentSupersedeStore) Supersede(ctx context.Context, applyID int64, commentState string) error {
+	if s.healed.Load() {
+		return s.ApplyCommentStore.Supersede(ctx, applyID, commentState)
+	}
+	return errors.New("injected comment supersede failure")
+}
+
+// failingCommentSupersedeStorage serves the failing comment store while
+// passing every other store through to the real storage. heal ends the outage
+// so later Supersedes land.
+type failingCommentSupersedeStorage struct {
+	storage.Storage
+	healed atomic.Bool
+}
+
+func (s *failingCommentSupersedeStorage) ApplyComments() storage.ApplyCommentStore {
+	return &failingCommentSupersedeStore{ApplyCommentStore: s.Storage.ApplyComments(), healed: &s.healed}
+}
+
+func (s *failingCommentSupersedeStorage) heal() { s.healed.Store(true) }
 
 // A volume-change rotation whose fresh comment posts to the PR but fails to be
 // recorded as the tracked comment must not freeze the prior comment: the
