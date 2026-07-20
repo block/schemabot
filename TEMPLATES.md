@@ -5507,6 +5507,22 @@ Reopen this PR, or open a new PR with the schema change, and apply from there.
 </details>
 
 <details>
+<summary><a name="apply-blocked-pr-merged"></a><strong>Apply Blocked: PR Merged</strong></summary>
+
+
+## ⛔ Apply Blocked: PR Is Merged — Staging
+
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+This PR is already merged, so applies can no longer run from it. SchemaBot only applies schema changes from open PRs.
+
+If the schema change still needs to be applied, open a new PR with it and apply from there.
+
+
+</details>
+
+<details>
 <summary><a name="no-lock-found"></a><strong>No Lock Found</strong></summary>
 
 

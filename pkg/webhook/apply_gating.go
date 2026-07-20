@@ -10,14 +10,17 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
-// enforceOpenPR rejects apply-family commands on closed PRs. A closed PR's
-// schema changes can never merge, so applying them would push schema to the
-// target database from code with no path to the base branch — and the PR's
-// close-time lock cleanup has already run, so a lock acquired by the apply
-// would be orphaned until a manual unlock. Rollback and unlock stay available
-// on closed PRs: they are the recovery paths for an apply that ran while the
-// PR was open. A PR fetch failure blocks the command (fail closed) because
-// the PR state cannot be verified.
+// enforceOpenPR rejects apply-family commands on closed PRs, merged or not.
+// An abandoned PR's schema changes can never merge, so applying them would
+// push schema to the target database from code with no path to the base
+// branch; a merged PR's timeline is no longer the driving surface for new
+// applies. In both cases the PR's close-time lock cleanup has already run, so
+// a lock acquired by the apply would be orphaned until a manual unlock. The
+// rejection copy distinguishes the two so the operator gets recovery guidance
+// that is actually possible (a merged PR cannot be reopened). Rollback and
+// unlock stay available on closed PRs: they are the recovery paths for an
+// apply that ran while the PR was open. A PR fetch failure blocks the command
+// (fail closed) because the PR state cannot be verified.
 //
 // This is a safety re-check, so it bypasses the request-scoped PR-info cache:
 // discovery earlier in the same delivery may have cached the PR as open, and a
@@ -37,8 +40,8 @@ func (h *Handler) enforceOpenPR(ctx context.Context, client *ghclient.Installati
 		return false
 	}
 	h.logger.Info("apply command rejected: PR is closed",
-		"repo", repo, "pr", pr, "environment", environment, "command", commandName, "requested_by", requestedBy)
-	h.postComment(repo, pr, installationID, templates.RenderApplyBlockedClosedPR(environment, requestedBy))
+		"repo", repo, "pr", pr, "environment", environment, "command", commandName, "requested_by", requestedBy, "merged", prInfo.Merged)
+	h.postComment(repo, pr, installationID, templates.RenderApplyBlockedClosedPR(environment, requestedBy, prInfo.Merged))
 	return true
 }
 

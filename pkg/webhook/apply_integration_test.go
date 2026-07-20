@@ -199,6 +199,62 @@ func TestE2EApplyConfirmRejectedOnClosedPR(t *testing.T) {
 	assert.Nil(t, lock)
 }
 
+// TestE2EApplyRejectedOnMergedPR verifies the closed-PR gate's merged flavor:
+// GitHub reports a merged PR as closed, so the gate still blocks the apply,
+// but the rejection copy must not tell the operator to reopen the PR (a
+// merged PR cannot be reopened) or claim its changes can never merge (they
+// did). The operator instead gets pointed at opening a new PR.
+func TestE2EApplyRejectedOnMergedPR(t *testing.T) {
+	dbName := "webhook_apply_merged_pr"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	closedState := "closed"
+	result.PRState.Store(&closedState)
+	result.PRMerged.Store(true)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "PR Is Merged")
+		assert.Contains(t, body, "open PRs")
+		assert.NotContains(t, body, "Reopen this PR")
+		assert.NotContains(t, body, "can never merge")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for merged-PR rejection comment")
+	}
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	assert.Nil(t, lock)
+}
+
 func TestE2EApplyNoChanges(t *testing.T) {
 	dbName := "webhook_apply_nochanges"
 	svc := setupE2EService(t, dbName)

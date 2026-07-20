@@ -756,6 +756,10 @@ type PullRequestInfo struct {
 	// State is the PR's lifecycle state as GitHub reports it: "open" or
 	// "closed" (a merged PR reads as closed).
 	State string
+	// Merged reports whether the PR was merged. GitHub folds merged PRs into
+	// State "closed", so callers that message operators differently for a
+	// merged PR versus an abandoned one must consult this alongside IsClosed.
+	Merged bool
 }
 
 // OpenPullRequest holds the PR metadata needed for operator scans.
@@ -920,6 +924,7 @@ func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string,
 		BaseRef: ghPR.GetBase().GetRef(),
 		User:    ghPR.GetUser().GetLogin(),
 		State:   ghPR.GetState(),
+		Merged:  ghPR.GetMerged(),
 	}, nil
 }
 
