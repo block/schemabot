@@ -50,10 +50,11 @@ type TableProgressData struct {
 // ready for the operator to cut over. A task parked at the cutover barrier has
 // finished its copy and verification phases — the remaining binlog catch-up
 // happens under cutover itself — so the barrier state is what makes the table
-// ready. Engines report no separate per-task readiness signal, so this is the
-// single predicate every TableProgressData producer derives ReadyToComplete
-// from. Accepts raw engine statuses (Spirit "waitingOnSentinelTable", Vitess
-// "ready_to_complete") as well as canonical task states.
+// ready. Engines fold any internal readiness signal into the task status they
+// report, so this is the single predicate every TableProgressData producer
+// derives ReadyToComplete from. Accepts raw engine statuses (Spirit
+// "waitingOnSentinelTable", Vitess "ready_to_complete") as well as canonical
+// task states.
 func TaskStatusReadyForCutover(status string) bool {
 	return state.NormalizeTaskStatus(status) == state.Task.WaitingForCutover
 }
