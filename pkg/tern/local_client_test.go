@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -1741,6 +1742,141 @@ func TestLocalClient_ProcessPendingCutoverControlRequestFailsRejectedRequest(t *
 	require.Len(t, controlRequests.requests, 1)
 	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
 	assert.Equal(t, "not ready for cutover", controlRequests.requests[0].ErrorMessage)
+}
+
+// A cutover request that the engine backend rejects because it has not yet
+// staged the cutover must stay pending: the drive retries it on the next
+// progress tick and the operator's command takes effect without being
+// re-issued. The rejected attempt records neither a trigger nor a failure in
+// the user-visible timeline — only the accepted attempt does.
+func TestLocalClient_ProcessPendingCutoverControlRequestRetriesWhenCutoverNotReady(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              131,
+		ApplyIdentifier: "apply-cutover-not-ready-local",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	task := &storage.Task{
+		ID:             464,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-not-ready-local",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{cutoverErr: engine.NewNotReadyError("changes have not been staged")}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply))
+	assert.Equal(t, 1, fakeEngine.cutoverCount)
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, pending, "a not-ready rejection must keep the cutover request pending for the next tick")
+	assert.Equal(t, storage.ControlRequestPending, pending.Status)
+	assert.False(t, hasLogMessageContaining(logs.logs, "Cutover failed"), "a not-ready rejection must not record a failure in the timeline")
+	assert.False(t, hasLogMessageContaining(logs.logs, "Cutover triggered"), "a rejected attempt must not record a trigger in the timeline")
+
+	// The backend finishes staging: the still-pending request is accepted on
+	// the next tick and completes.
+	fakeEngine.cutoverErr = nil
+	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply))
+	assert.Equal(t, 2, fakeEngine.cutoverCount)
+	pending, err = controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the accepted cutover must complete the pending request")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Cutover triggered (caller: cli:alice)"))
+}
+
+// The drive's auto-cutover records one trigger in the timeline per drive and
+// retries quietly while the engine backend stages the cutover. A rejection
+// that outlives the staging window records a one-time timeline error and
+// escalates to Error logging on every further tick, so a backend that never
+// stages the cutover is visible to operators instead of idling; the retry
+// loop itself never stops, and an accepted cutover resets the escalation.
+func TestLocalClient_AutoTriggerCutoverEscalatesWhenNotReadyPersists(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              132,
+		ApplyIdentifier: "apply-auto-cutover-escalate",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	fakeEngine := &fakeControlEngine{cutoverErr: engine.NewNotReadyError("changes have not been staged")}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			logs:    logs,
+		},
+		planetscaleEngine: fakeEngine,
+		logger:            slog.Default(),
+	}
+	controlReq := &engine.ControlRequest{Database: apply.Database}
+	pollState := &atomicPollState{}
+	start := time.Now()
+
+	// Within the staging window: retries stay quiet and the trigger event is
+	// recorded exactly once.
+	client.autoTriggerCutover(t.Context(), fakeEngine, apply, controlReq, pollState, start)
+	client.autoTriggerCutover(t.Context(), fakeEngine, apply, controlReq, pollState, start.Add(time.Second))
+	assert.Equal(t, 2, fakeEngine.cutoverCount)
+	assert.Equal(t, 1, countLogMessagesContaining(logs.logs, "Auto-triggering cutover"), "retries must not duplicate the trigger event")
+	assert.False(t, hasLogMessageContaining(logs.logs, "has not been accepted by the engine backend"), "no escalation within the staging window")
+
+	// Beyond the staging window: the timeline records the stall exactly once
+	// while the drive keeps retrying every tick.
+	client.autoTriggerCutover(t.Context(), fakeEngine, apply, controlReq, pollState, start.Add(cutoverNotReadyEscalationAfter))
+	client.autoTriggerCutover(t.Context(), fakeEngine, apply, controlReq, pollState, start.Add(cutoverNotReadyEscalationAfter+time.Second))
+	assert.Equal(t, 4, fakeEngine.cutoverCount, "escalation must not stop the retry loop")
+	assert.Equal(t, 1, countLogMessagesContaining(logs.logs, "has not been accepted by the engine backend"), "the escalation event is recorded once")
+	for _, log := range logs.logs {
+		if strings.Contains(log.Message, "has not been accepted by the engine backend") {
+			assert.Equal(t, storage.LogLevelError, log.Level, "the escalation event must be operator-visible at Error level")
+		}
+	}
+
+	// The backend accepts: the not-ready tracking resets so a later staging
+	// window escalates on its own clock.
+	fakeEngine.cutoverErr = nil
+	client.autoTriggerCutover(t.Context(), fakeEngine, apply, controlReq, pollState, start.Add(cutoverNotReadyEscalationAfter+2*time.Second))
+	assert.True(t, pollState.cutoverNotReadySince.IsZero(), "an accepted cutover must clear the not-ready clock")
+	assert.False(t, pollState.cutoverNotReadyEscalated, "an accepted cutover must re-arm the escalation event")
+}
+
+func countLogMessagesContaining(logs []*storage.ApplyLog, want string) int {
+	count := 0
+	for _, log := range logs {
+		if strings.Contains(log.Message, want) {
+			count++
+		}
+	}
+	return count
 }
 
 func TestLocalClient_StopRejectsVitessCancelledApply(t *testing.T) {
