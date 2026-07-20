@@ -101,6 +101,14 @@ type ApplyStatusCommentData struct {
 	// status vocabulary from "apply" to "rollback" so a completed rollback is
 	// announced as "Rollback Complete", never as a freshly applied schema change.
 	Rollback bool
+
+	// DeferCutover reports whether cutover waits on an explicit operator
+	// trigger (the apply's durable defer-cutover option). It selects the
+	// waiting-for-cutover footer: deferred applies get the pasteable
+	// `schemabot cutover` command, while non-deferred applies get a note that
+	// the drive triggers cutover automatically — surfacing the command there
+	// would tell the operator to act when no action is needed.
+	DeferCutover bool
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -651,7 +659,7 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 
 	case state.Task.Completed:
 		bar := ui.ProgressBarComplete()
-		fmt.Fprintf(sb, "**`%s`**: %s \u2713 Complete\n", table.TableName, bar)
+		fmt.Fprintf(sb, "**`%s`**: %s \u2705 Complete\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Checksumming:
@@ -715,8 +723,10 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.RevertWindow:
+		// Deliberately no checkmark: the change is applied but not final while
+		// the revert window is open, and a checkmark reads as "done, walk away".
 		bar := ui.ProgressBarWaitingCutover()
-		fmt.Fprintf(sb, "**`%s`**: %s \u2713 Complete (pending revert)\n", table.TableName, bar)
+		fmt.Fprintf(sb, "**`%s`**: %s Complete (revert window open)\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Reverting:
@@ -955,7 +965,12 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.WaitingForDeploy:
 		writeFooterAction(sb, "To deploy:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.WaitingForCutover:
-		writeFooterAction(sb, "To proceed with cutover:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		if data.DeferCutover {
+			writeFooterAction(sb, "To proceed with cutover:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		} else {
+			sb.WriteString("\n---\n\n")
+			sb.WriteString("SchemaBot triggers cutover automatically — no action needed.\n")
+		}
 	case state.Apply.Recovering:
 		sb.WriteString("\n---\n\n")
 		if pct, ok := recoveringCopyPercent(data.Tables); ok {

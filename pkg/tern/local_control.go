@@ -154,6 +154,19 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 		return nil, fmt.Errorf("build cutover request for apply %d: %w", task.ApplyID, err)
 	}
 
+	result, err := eng.Cutover(ctx, controlReq)
+	if engine.IsNotReady(err) {
+		// The engine's backend advertised the cutover gate before it was ready
+		// to accept the cutover — a self-clearing condition, not a failure. No
+		// timeline event is written for the rejected attempt: the caller
+		// classifies this error and retries, so recording every attempt would
+		// fill the user-visible timeline with triggers that had no effect.
+		return nil, fmt.Errorf("cutover not accepted yet: %w", err)
+	}
+
+	// The trigger event is recorded once the backend has accepted the attempt
+	// into flight or definitively failed it, so the timeline shows one trigger
+	// per effective attempt rather than one per not-ready retry.
 	logMessage := "Cutover triggered"
 	if caller != "" {
 		logMessage += callerApplyLogSuffix(caller)
@@ -161,7 +174,6 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 	c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
 		logMessage, "", "")
 
-	result, err := eng.Cutover(ctx, controlReq)
 	if err != nil {
 		c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Cutover failed: %v", err), "", "")
@@ -289,6 +301,15 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		ApplyId:     apply.ApplyIdentifier,
 		Environment: apply.Environment,
 	}, controlRequestCaller(controlReq))
+	if engine.IsNotReady(err) {
+		// The engine's backend has not finished staging the cutover; the
+		// rejection clears on its own. Leave the request pending so the next
+		// progress tick retries it — terminally failing it would strand a
+		// deferred cutover until an operator notices and re-issues the command.
+		c.logger.Info("pending cutover request not accepted yet by engine backend; retrying at the next progress tick",
+			append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq), "error", err)...)
+		return nil
+	}
 	if err != nil {
 		errorMessage := err.Error()
 		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); failErr != nil {

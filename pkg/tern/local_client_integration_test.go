@@ -1938,7 +1938,7 @@ func TestLocalClient_ResumeApplyGroupedFinalSchemaCheckCompletesWithoutReapply(t
 
 	logs, err := stor.ApplyLogs().GetByApply(ctx, applyID)
 	require.NoError(t, err)
-	assert.True(t, hasLogMessageContaining(logs, "All tasks already completed on resume (final schema check shows no remaining changes)"))
+	assert.True(t, hasLogMessageContaining(logs, "All tasks already terminal on resume (final schema check shows no remaining changes)"))
 }
 
 // This scenario covers restart recovery where storage was waiting for cutover

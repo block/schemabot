@@ -300,6 +300,18 @@ func PreviewCommentApplyInProgress() string {
 	})
 }
 
+// PreviewCommentApplyBlockedClosedPR renders a sample apply rejection for a
+// closed-but-unmerged PR.
+func PreviewCommentApplyBlockedClosedPR() string {
+	return RenderApplyBlockedClosedPR("staging", previewRequestedBy, false)
+}
+
+// PreviewCommentApplyBlockedMergedPR renders a sample apply rejection for a
+// merged PR.
+func PreviewCommentApplyBlockedMergedPR() string {
+	return RenderApplyBlockedClosedPR("staging", previewRequestedBy, true)
+}
+
 // PreviewCommentApplyConfirmNoLock renders a sample "no lock found" comment.
 func PreviewCommentApplyConfirmNoLock() string {
 	return RenderApplyConfirmNoLock("testapp", "staging")
@@ -1132,8 +1144,25 @@ func PreviewCommentApplyCancelled() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Cancelled, tables))
 }
 
-// PreviewCommentApplyWaitingForCutover renders a sample waiting-for-cutover comment.
+// PreviewCommentApplyWaitingForCutover renders a sample waiting-for-cutover
+// comment for a deferred apply, where cutover waits on an explicit operator
+// trigger and the footer offers the pasteable cutover command.
 func PreviewCommentApplyWaitingForCutover() string {
+	tables := sampleApplyTables()
+	for i := range tables {
+		tables[i].Status = state.Task.WaitingForCutover
+		tables[i].ReadyToComplete = true
+	}
+	data := sampleApplyData(state.Apply.WaitingForCutover, tables)
+	data.DeferCutover = true
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyWaitingForCutoverAutomatic renders a sample
+// waiting-for-cutover comment for a non-deferred apply, where the drive
+// triggers cutover automatically and the footer tells the operator no action
+// is needed.
+func PreviewCommentApplyWaitingForCutoverAutomatic() string {
 	tables := sampleApplyTables()
 	for i := range tables {
 		tables[i].Status = state.Task.WaitingForCutover

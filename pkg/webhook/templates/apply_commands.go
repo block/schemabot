@@ -250,6 +250,29 @@ func RenderApplyInProgress(data ApplyLockConflictData) string {
 	return sb.String()
 }
 
+// RenderApplyBlockedClosedPR renders a rejection when an apply command targets
+// a closed PR. merged selects the copy: a merged PR cannot be reopened and its
+// schema changes did merge, so the abandoned-PR guidance ("reopen this PR" /
+// "can never merge") would mislead the operator.
+func RenderApplyBlockedClosedPR(environment, requestedBy string, merged bool) string {
+	var sb strings.Builder
+
+	if merged {
+		writeEnvironmentTitle(&sb, "⛔ Apply Blocked: PR Is Merged", environment)
+		writeRequesterOrTimestamp(&sb, requestedBy)
+		sb.WriteString("\nThis PR is already merged, so applies can no longer run from it. SchemaBot only applies schema changes from open PRs.\n\n")
+		sb.WriteString("If the schema change still needs to be applied, open a new PR with it and apply from there.\n")
+		return sb.String()
+	}
+
+	writeEnvironmentTitle(&sb, "⛔ Apply Blocked: PR Is Closed", environment)
+	writeRequesterOrTimestamp(&sb, requestedBy)
+	sb.WriteString("\nThis PR is closed, so its schema changes can never merge. SchemaBot only applies schema changes from open PRs.\n\n")
+	sb.WriteString("Reopen this PR, or open a new PR with the schema change, and apply from there.\n")
+
+	return sb.String()
+}
+
 // RenderNoLocksFound renders a comment when unlock finds no locks for this PR.
 func RenderNoLocksFound() string {
 	var sb strings.Builder

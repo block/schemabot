@@ -8,6 +8,19 @@ import "encoding/json"
 // so they render VSchema identically.
 const VSchemaChangesMetadataKey = "vschema_changes"
 
+// Plan change-metadata keys under which engines annotate a namespace's VSchema
+// work: a rendered diff, or a flag when the work is known without a rendered
+// diff. Either one marks the namespace as carrying a VSchema change.
+const (
+	VSchemaDiffMetadataKey    = "vschema"
+	VSchemaChangedMetadataKey = "vschema_changed"
+)
+
+// HasVSchemaChange reports whether this namespace's change carries VSchema work.
+func (sc *SchemaChangeResponse) HasVSchemaChange() bool {
+	return sc.Metadata[VSchemaDiffMetadataKey] != "" || sc.Metadata[VSchemaChangedMetadataKey] == "true"
+}
+
 // VSchemaChange is one keyspace's VSchema application state for display. Each
 // keyspace that changes its VSchema carries its own status and diff so a
 // multi-keyspace deploy renders each keyspace independently.

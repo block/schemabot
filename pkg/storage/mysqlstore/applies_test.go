@@ -2017,6 +2017,100 @@ func TestApplyStore_ClaimApplyByIDClaimsStaleSetupPhase(t *testing.T) {
 	assert.NotEmpty(t, claimed.LeaseToken)
 }
 
+// An apply dwells in a revert-phase state (reverting, skipping_revert) while
+// the engine reverts or finalizes the deploy request. If the driver dies there
+// — routine pod churn is enough — a fresh driver must reclaim the apply once
+// the heartbeat goes stale and resume polling the engine to its terminal
+// state; otherwise the apply is stranded non-terminal forever with no driver.
+// While the original driver is alive its heartbeat stays fresh, so the apply
+// is never claimed out from under it.
+func TestApplyStore_FindNextApplyClaimsStaleRevertPhase(t *testing.T) {
+	for _, revertState := range []string{
+		state.Apply.Reverting,
+		state.Apply.SkippingRevert,
+	} {
+		t.Run(revertState, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := New(testDB)
+
+			lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
+			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_revert_"+revertState, 702, revertState, "staging")
+			require.Equal(t, storage.EnginePlanetScale, apply.Engine, "revert-phase states only occur for the PlanetScale engine")
+
+			fresh, err := store.Applies().FindNextApply(ctx, "operator-a")
+			require.NoError(t, err)
+			assert.Nil(t, fresh, "a revert-phase apply with a fresh heartbeat is owned by its active driver")
+
+			_, err = testDB.ExecContext(ctx, `
+				UPDATE applies
+				SET updated_at = NOW() - INTERVAL 2 MINUTE
+				WHERE id = ?
+			`, apply.ID)
+			require.NoError(t, err)
+
+			claimed, err := store.Applies().FindNextApply(ctx, "operator-a")
+			require.NoError(t, err)
+			require.NotNil(t, claimed, "a stale revert-phase apply must be reclaimable for recovery")
+			assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+			assert.Equal(t, revertState, claimed.State, "the caller sees the revert-phase state to resume from")
+			assert.Equal(t, "operator-a", claimed.LeaseOwner)
+			assert.NotEmpty(t, claimed.LeaseToken)
+		})
+	}
+}
+
+// The operation-level claim loop leases the orphaned apply_operations row
+// first and then needs the parent apply lease via ClaimApplyByID, so a stale
+// revert-phase parent must be reclaimable through it as well. The claim only
+// rotates the lease: the persisted state must stay the revert-phase state so
+// the resumed drive re-attaches to the in-flight engine revert instead of
+// restarting the apply.
+func TestApplyStore_ClaimApplyByIDClaimsStaleRevertPhase(t *testing.T) {
+	for _, revertState := range []string{
+		state.Apply.Reverting,
+		state.Apply.SkippingRevert,
+	} {
+		t.Run(revertState, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := New(testDB)
+
+			lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
+			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_revert_"+revertState, 703, revertState, "staging")
+			require.Equal(t, storage.EnginePlanetScale, apply.Engine, "revert-phase states only occur for the PlanetScale engine")
+
+			fresh, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+			require.NoError(t, err)
+			assert.Nil(t, fresh, "a fresh revert-phase apply is owned by its active driver")
+
+			_, err = testDB.ExecContext(ctx, `
+				UPDATE applies
+				SET updated_at = NOW() - INTERVAL 2 MINUTE
+				WHERE id = ?
+			`, apply.ID)
+			require.NoError(t, err)
+
+			claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+			require.NoError(t, err)
+			require.NotNil(t, claimed, "a stale revert-phase parent apply must be reclaimable")
+			assert.Equal(t, revertState, claimed.State)
+			assert.Equal(t, "operator-a", claimed.LeaseOwner)
+			assert.NotEmpty(t, claimed.LeaseToken)
+
+			persisted, err := store.Applies().Get(ctx, apply.ID)
+			require.NoError(t, err)
+			require.NotNil(t, persisted)
+			assert.Equal(t, revertState, persisted.State, "the claim rotates the lease without transitioning the revert-phase state")
+			assert.Equal(t, "operator-a", persisted.LeaseOwner)
+
+			again, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-b")
+			require.NoError(t, err)
+			assert.Nil(t, again, "the reclaimed apply's fresh lease is not stolen by a peer")
+		})
+	}
+}
+
 // ClaimApplyByID requires an owner so a lease can never be acquired without an
 // identity that lease-guarded writes can fail closed against.
 func TestApplyStore_ClaimApplyByIDRequiresOwner(t *testing.T) {

@@ -50,6 +50,14 @@ func (ic *InstallationClient) CreateSchemaRequestFromPR(ctx context.Context, rep
 	if err != nil {
 		return nil, err
 	}
+	return ic.CreateSchemaRequestForConfig(ctx, repo, pr, environment, config, configDir, validateEnvironment)
+}
+
+// CreateSchemaRequestForConfig fetches schema files and builds a plan request
+// for a config the caller has already discovered and selected — for example
+// after filtering a multi-config discovery result down to the one config this
+// deployment manages.
+func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, repo string, pr int, environment string, config *SchemabotConfig, configDir string, validateEnvironment EnvironmentValidator) (*SchemaRequestResult, error) {
 	if validateEnvironment != nil {
 		if err := validateEnvironment(config.Database, environment); err != nil {
 			return nil, err

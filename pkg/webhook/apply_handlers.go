@@ -55,6 +55,10 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 	}
 
+	if blocked := h.enforceOpenPR(ctx, client, repo, pr, installationID, action.Apply, environment, requestedBy); blocked {
+		return
+	}
+
 	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.Apply); blocked {
 		return
 	}
@@ -195,8 +199,9 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		return
 	}
 
-	// No changes — post a regular plan comment (no lock, no confirm footer)
-	if len(planResp.FlatTables()) == 0 {
+	// No changes (neither table DDL nor a VSchema update) — post a regular plan
+	// comment (no lock, no confirm footer)
+	if !planResp.HasChanges() {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 		return
@@ -314,6 +319,10 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	}
 	if err := h.attachServerEnvironments(schemaResult, environment); err != nil {
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err)
+		return
+	}
+
+	if blocked := h.enforceOpenPR(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, requestedBy); blocked {
 		return
 	}
 
@@ -590,18 +599,18 @@ func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, 
 		return "", err
 	}
 
-	config, configDir, err := client.FindConfigForPR(ctx, repo, pr)
-	if errors.Is(err, ghclient.ErrNoConfig) {
-		config, configDir, _, err = client.FindConfigInRepo(ctx, repo, pr)
-	}
+	config, _, err := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, action.Unlock)
 	if err != nil {
+		// Schema another deployment owns — whether outside allowed_dirs or for
+		// a database not in this deployment's registry — means there is nothing
+		// for this deployment to unlock: same outcome as no config at all.
+		if isSchemaUnownedByDeploymentError(err) {
+			return "", ghclient.ErrNoConfig
+		}
 		if errors.Is(err, ghclient.ErrMultipleConfigs) {
 			return "", fmt.Errorf("multiple SchemaBot configs match this PR; retry with `schemabot unlock -d <database> --force`: %w", err)
 		}
 		return "", err
-	}
-	if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Unlock) {
-		return "", ghclient.ErrNoConfig
 	}
 	if config == nil || config.Database == "" {
 		return "", fmt.Errorf("no database found in SchemaBot config")

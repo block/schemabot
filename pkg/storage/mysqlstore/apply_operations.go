@@ -25,7 +25,8 @@ const applyOperationColumns = `id, apply_id, deployment, operation_key, operatio
 
 // applyOperationStore implements storage.ApplyOperationStore using MySQL.
 type applyOperationStore struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect Dialect
 }
 
 // Insert stores a new apply_operations row and returns its ID.
@@ -805,6 +806,8 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// non-completed, and
 	// a gated one would be redundant with the pending clause below. Start
 	// requests resume eligible work; they do not reorder the rollout.
+	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
@@ -856,7 +859,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 			)
 			OR (
 				state IN (%s)
-				AND updated_at < NOW() - INTERVAL %s
+				AND updated_at < %s
 				AND NOT (
 					state = ?
 					AND cutover_policy IN (?, ?)
@@ -895,7 +898,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND (
 							apply_operations.lease_acquired_at IS NULL
 							OR apply_operations.lease_acquired_at < cr.updated_at
-							OR apply_operations.updated_at < NOW() - INTERVAL %s
+							OR apply_operations.updated_at < %s
 						)
 				)
 			)
@@ -909,11 +912,11 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 							(
 								a.state = ?
 								AND a.attempt < ?
-								AND a.updated_at >= NOW() - INTERVAL ? DAY
+								AND a.updated_at >= %s
 							)
 							OR (
 								a.state IN (%s)
-								AND a.updated_at < NOW() - INTERVAL %s
+								AND a.updated_at < %s
 							)
 						)
 				)
@@ -922,7 +925,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, activeStatePlaceholders, applyLeaseStalenessSQL, activeStatePlaceholders, applyLeaseStalenessSQL, activeStatePlaceholders, applyLeaseStalenessSQL), queryArgs...)
+	`, applyOperationColumns, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1169,6 +1172,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 		state.ApplyOperation.RevertWindow,
 	)
 
+	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
@@ -1204,12 +1208,12 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 						AND cr.status = ?
 				)
 			)
-			OR (state IN (?, ?) AND updated_at < NOW() - INTERVAL %s)
+			OR (state IN (?, ?) AND updated_at < %s)
 		)
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, applyLeaseStalenessSQL), queryArgs...)
+	`, applyOperationColumns, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

@@ -18,10 +18,28 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
+
+// waitForStoredAggregate polls until the stored global-aggregate check row for
+// the PR reports the given status and conclusion, then returns it for further
+// assertions. The aggregate Check Run is created on GitHub before the stored
+// row is upserted, so a test that has just observed the Check Run must poll
+// for the stored state instead of reading it once.
+func waitForStoredAggregate(t *testing.T, svc *api.Service, repo string, pr int, status, conclusion string) *storage.Check {
+	t.Helper()
+	var aggregate *storage.Check
+	require.Eventuallyf(t, func() bool {
+		var err error
+		aggregate, err = svc.Storage().Checks().Get(t.Context(), repo, pr, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+		return err == nil && aggregate != nil && aggregate.Status == status && aggregate.Conclusion == conclusion
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond,
+		"stored aggregate check state should report status %q and conclusion %q after the aggregate Check Run is published", status, conclusion)
+	return aggregate
+}
 
 // TestE2EPRCloseCleanup verifies PR-close cleanup against real storage. While
 // the PR has a running apply, closing it retains the database lock (so no other
@@ -281,12 +299,8 @@ func TestE2EReconcileStaleInProgressCheck(t *testing.T) {
 		t.Fatal("timed out waiting for aggregate check run")
 	}
 
-	aggregate, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
-	require.NoError(t, err)
-	require.NotNil(t, aggregate)
+	aggregate := waitForStoredAggregate(t, svc, "octocat/hello-world", 1, checkStatusInProgress, "")
 	assert.Equal(t, "abc123", aggregate.HeadSHA)
-	assert.Equal(t, checkStatusInProgress, aggregate.Status)
-	assert.Empty(t, aggregate.Conclusion)
 }
 
 // TestE2EReconcileStaleInProgressCheckFailure verifies startup/webhook
@@ -598,12 +612,8 @@ func TestE2EPRCloseReopenRetainsStartedApplyBlock(t *testing.T) {
 		}
 	}
 
-	aggregate, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
-	require.NoError(t, err)
-	require.NotNil(t, aggregate)
+	aggregate := waitForStoredAggregate(t, svc, "octocat/hello-world", 1, checkStatusCompleted, checkConclusionActionRequired)
 	assert.Equal(t, "abc123", aggregate.HeadSHA)
-	assert.Equal(t, checkStatusCompleted, aggregate.Status)
-	assert.Equal(t, checkConclusionActionRequired, aggregate.Conclusion)
 }
 
 // TestE2EUnmergedCloseRetainsSuccessfulApplyOwnedCheck verifies that closing a
@@ -745,10 +755,6 @@ func TestE2EUnmergedCloseRetainsSuccessfulApplyOwnedCheck(t *testing.T) {
 		}
 	}
 
-	aggregate, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
-	require.NoError(t, err)
-	require.NotNil(t, aggregate)
+	aggregate := waitForStoredAggregate(t, svc, "octocat/hello-world", 1, checkStatusCompleted, checkConclusionActionRequired)
 	assert.Equal(t, "abc123", aggregate.HeadSHA)
-	assert.Equal(t, checkStatusCompleted, aggregate.Status)
-	assert.Equal(t, checkConclusionActionRequired, aggregate.Conclusion)
 }

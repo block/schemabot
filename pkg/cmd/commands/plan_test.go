@@ -197,6 +197,25 @@ func TestPlanFingerprint_DifferentPlans(t *testing.T) {
 	assert.NotEqual(t, fp1, fp2, "Expected different fingerprints for different plans")
 }
 
+func TestPlanFingerprint_VSchemaOnlyPlans(t *testing.T) {
+	vschemaOnly := func(diff string) *apitypes.PlanResponse {
+		return &apitypes.PlanResponse{
+			Changes: []*apitypes.SchemaChangeResponse{{
+				Namespace: "commerce",
+				Metadata:  map[string]string{apitypes.VSchemaDiffMetadataKey: diff},
+			}},
+		}
+	}
+
+	fp1 := planFingerprint(vschemaOnly(`+ "sequence": true`))
+	fp2 := planFingerprint(vschemaOnly(`+ "sequence": true`))
+	fpOther := planFingerprint(vschemaOnly(`- "sequence": true`))
+
+	assert.NotEqual(t, "no-changes", fp1, "a VSchema-only plan carries work and must not fingerprint as no-changes")
+	assert.Equal(t, fp1, fp2, "identical VSchema-only plans must dedupe")
+	assert.NotEqual(t, fp1, fpOther, "plans with differing VSchema diffs must not dedupe")
+}
+
 func TestPlanFingerprint_NoChanges(t *testing.T) {
 	plan := &apitypes.PlanResponse{}
 

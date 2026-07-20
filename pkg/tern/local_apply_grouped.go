@@ -781,11 +781,8 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 	// Auto-trigger cutover if waiting and not in defer mode
 	if result.State == engine.StateWaitingForCutover && !opts.DeferCutover {
-		c.logger.Info("auto-triggering cutover (not in defer mode)", "apply_id", apply.ApplyIdentifier)
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
-			"Auto-triggering cutover (defer_cutover not set)", "", "")
-		if _, err := eng.Cutover(ctx, controlReq); err != nil {
-			c.logger.Error("auto-cutover failed", append(apply.LogAttrs(), "error", err)...)
+		if c.autoTriggerCutover(ctx, eng, apply, tasks, controlReq, ps, now) {
+			return true
 		}
 	}
 
@@ -1099,6 +1096,86 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	if state.IsTerminalApplyState(opState) || state.IsState(opState, state.Apply.FailedRetryable) {
 		c.logger.Info("operation settled while apply continues; exiting operation drive",
 			"mode", groupedApplyMode(apply, options), "apply_id", apply.ApplyIdentifier, "operation_state", opState, "apply_state", apply.State)
+		return true
+	}
+	return false
+}
+
+// autoTriggerCutover fires the engine cutover for a drive that is not
+// deferring cutover, pacing the operator-visible signal around the backend's
+// staging window: the trigger event is recorded once per drive so retries do
+// not duplicate it, a not-ready rejection retries quietly on the next progress
+// tick, and a rejection that outlives the staging window escalates to Error
+// logging on every further tick plus a one-time timeline event, so a backend
+// that never stages the cutover pages instead of idling.
+//
+// The drive is the sole cutover actor, so a hard rejection cannot be left to
+// retry forever: each one counts toward a consecutive-failure bound (mirroring
+// the progress-poll bound) that settles the apply — failed, or paused for
+// operator retry — instead of holding the database's deploy queue and lock
+// indefinitely. Returns true when the apply was settled and this owner must
+// exit the drive.
+func (c *LocalClient) autoTriggerCutover(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, controlReq *engine.ControlRequest, ps *atomicPollState, now time.Time) bool {
+	if !ps.cutoverTriggerLogged {
+		c.logger.Info("auto-triggering cutover (not in defer mode)", "apply_id", apply.ApplyIdentifier)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
+			"Auto-triggering cutover (defer_cutover not set)", "", "")
+		ps.cutoverTriggerLogged = true
+	}
+	switch _, err := eng.Cutover(ctx, controlReq); {
+	case err == nil:
+		ps.cutoverNotReadySince = time.Time{}
+		ps.cutoverNotReadyEscalated = false
+		ps.consecutiveCutoverFailures = 0
+	case engine.IsNotReady(err):
+		// The engine's backend advertised the cutover gate before it was ready
+		// to accept the cutover; the drive reattempts on the next progress
+		// tick, once it catches up. Self-clearing, so it does not count toward
+		// the consecutive-failure bound — its own escalation below covers a
+		// staging window that never closes.
+		ps.consecutiveCutoverFailures = 0
+		if ps.cutoverNotReadySince.IsZero() {
+			ps.cutoverNotReadySince = now
+		}
+		notReadyFor := now.Sub(ps.cutoverNotReadySince)
+		if notReadyFor < cutoverNotReadyEscalationAfter {
+			c.logger.Info("auto-cutover not accepted yet; retrying at the next progress tick",
+				append(apply.LogAttrs(), "not_ready_for", notReadyFor, "error", err)...)
+			return false
+		}
+		if !ps.cutoverNotReadyEscalated {
+			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+				fmt.Sprintf("Cutover has not been accepted by the engine backend for %s; SchemaBot keeps retrying every progress tick", notReadyFor.Round(time.Second)), "", "")
+			ps.cutoverNotReadyEscalated = true
+		}
+		c.logger.Error("auto-cutover has been rejected as not-ready beyond the staging window; the engine backend is not staging the cutover and the drive keeps retrying",
+			append(apply.LogAttrs(), "not_ready_for", notReadyFor, "error", err)...)
+	default:
+		metrics.RecordAutoCutoverFailure(ctx, apply.Database, apply.Deployment, apply.Environment)
+		// Permanent rejections (e.g., the deploy request no longer exists) can
+		// never succeed on retry; fail the apply immediately.
+		var permanent *engine.PermanentError
+		if errors.As(err, &permanent) {
+			c.logger.Error("auto-cutover failed with permanent error",
+				append(apply.LogAttrs(), "error", err)...)
+			c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("cutover failed: %v", err))
+			return true
+		}
+		ps.consecutiveCutoverFailures++
+		c.logger.Error("auto-cutover failed",
+			append(apply.LogAttrs(), "error", err, "consecutive_cutover_failures", ps.consecutiveCutoverFailures)...)
+		if ps.consecutiveCutoverFailures < maxConsecutiveCutoverFailures {
+			return false
+		}
+		if c.shouldRetryEngineError(err) {
+			c.logger.Warn("auto-cutover failed repeatedly, pausing apply for operator retry",
+				append(apply.LogAttrs(), "consecutive_cutover_failures", ps.consecutiveCutoverFailures)...)
+			c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("cutover failed after %d consecutive attempts: %v", ps.consecutiveCutoverFailures, err))
+			return true
+		}
+		c.logger.Error("auto-cutover failed repeatedly, failing apply",
+			append(apply.LogAttrs(), "consecutive_cutover_failures", ps.consecutiveCutoverFailures)...)
+		c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("cutover failed after %d consecutive attempts: %v", ps.consecutiveCutoverFailures, err))
 		return true
 	}
 	return false

@@ -426,94 +426,36 @@ func (ic *InstallationClient) FindConfigByDatabaseNameInRepo(ctx context.Context
 	return config, configDir, nil
 }
 
-// FindConfigForPR finds the schemabot.yaml config by searching changed config files and directories of changed schema files.
+// FindConfigForPR resolves the single schemabot.yaml config that manages the
+// PR's changed files, using the same discovery as auto-plan: changed config
+// files plus the nearest config above each changed schema file. A PR whose
+// changes resolve to more than one config is ambiguous for single-database
+// callers and returns ErrMultipleConfigs naming every candidate — the caller
+// must scope the command with -d.
 func (ic *InstallationClient) FindConfigForPR(ctx context.Context, repo string, pr int) (*SchemabotConfig, string, error) {
-	prInfo, err := ic.FetchPullRequest(ctx, repo, pr)
-	if err != nil {
-		return nil, "", fmt.Errorf("fetch PR info: %w", err)
-	}
-
-	configs, err := ic.findConfigsChangedInPR(ctx, repo, pr, prInfo.HeadSHA)
+	configs, err := ic.FindAllConfigsForPR(ctx, repo, pr)
 	if err != nil {
 		return nil, "", err
 	}
-	if len(configs) == 1 {
+	return SingleDiscoveredConfig(configs)
+}
+
+// SingleDiscoveredConfig reduces a discovery result to the one config a
+// single-database code path can act on: ErrNoConfig when nothing was
+// discovered, the config itself when exactly one was, and ErrMultipleConfigs
+// naming every candidate database when the changed files span several configs.
+func SingleDiscoveredConfig(configs []DiscoveredConfig) (*SchemabotConfig, string, error) {
+	switch len(configs) {
+	case 0:
+		return nil, "", ErrNoConfig
+	case 1:
 		return configs[0].Config, configs[0].SchemaDir, nil
 	}
-	if len(configs) > 1 {
-		var databases []string
-		for _, dc := range configs {
-			databases = append(databases, fmt.Sprintf("`%s` (%s)", dc.Config.Database, dc.SchemaDir))
-		}
-		return nil, "", fmt.Errorf("%w: %s", ErrMultipleConfigs, strings.Join(databases, ", "))
+	var databases []string
+	for _, dc := range configs {
+		databases = append(databases, fmt.Sprintf("`%s` (%s)", dc.Config.Database, dc.SchemaDir))
 	}
-
-	files, err := ic.FetchPRFiles(ctx, repo, pr)
-	if err != nil {
-		return nil, "", fmt.Errorf("fetch PR files: %w", err)
-	}
-
-	var schemaFiles []string
-	for _, file := range files {
-		if IsSchemaFile(file.Filename) {
-			schemaFiles = append(schemaFiles, file.Filename)
-		}
-	}
-
-	if len(schemaFiles) == 0 {
-		return nil, "", ErrNoConfig
-	}
-
-	// Collect all unique directories to search for config
-	dirsToSearch := make(map[string]bool)
-	for _, file := range schemaFiles {
-		dir := path.Dir(file)
-		for dir != "." && dir != "" {
-			dirsToSearch[dir] = true
-			dir = path.Dir(dir)
-		}
-		dirsToSearch["."] = true
-	}
-
-	// Search for config starting from shallowest directory
-	var bestConfig *SchemabotConfig
-	var bestConfigDir string
-	bestDepth := -1
-
-	for dir := range dirsToSearch {
-		configPath := dir + "/" + ConfigFileName
-		if dir == "." {
-			configPath = ConfigFileName
-		}
-
-		config, err := ic.FetchConfig(ctx, repo, configPath, prInfo.HeadSHA)
-		if err != nil {
-			if errors.Is(err, ErrNoConfig) {
-				continue
-			}
-			// Config not found at this path is expected — the search
-			// walks up parent directories. Other errors (auth failures,
-			// rate limits, server errors) must propagate.
-			return nil, "", err
-		}
-
-		depth := strings.Count(dir, "/")
-		if dir == "." {
-			depth = 0
-		}
-
-		if bestConfig == nil || depth < bestDepth {
-			bestConfig = config
-			bestConfigDir = dir
-			bestDepth = depth
-		}
-	}
-
-	if bestConfig == nil {
-		return nil, "", ErrNoConfig
-	}
-
-	return bestConfig, bestConfigDir, nil
+	return nil, "", fmt.Errorf("%w: %s", ErrMultipleConfigs, strings.Join(databases, ", "))
 }
 
 // FindAllConfigsForPR finds ALL schemabot.yaml configs that apply to the changed files in a PR.
@@ -723,31 +665,6 @@ func newDiscoveredConfig(config *SchemabotConfig, dir string) DiscoveredConfig {
 		Path:      configPath,
 		SchemaDir: dir,
 	}
-}
-
-func (ic *InstallationClient) findConfigsChangedInPR(ctx context.Context, repo string, pr int, ref string) ([]DiscoveredConfig, error) {
-	files, err := ic.FetchPRFiles(ctx, repo, pr)
-	if err != nil {
-		return nil, fmt.Errorf("fetch PR files: %w", err)
-	}
-
-	configsByPath := make(map[string]DiscoveredConfig)
-	for _, file := range files {
-		if !isConfigFile(file.Filename) {
-			continue
-		}
-		if isRemovedPRFile(file.Status) {
-			continue
-		}
-		configDir := path.Dir(file.Filename)
-		config, err := ic.FetchConfig(ctx, repo, file.Filename, ref)
-		if err != nil {
-			return nil, fmt.Errorf("fetch changed config %s: %w", file.Filename, err)
-		}
-		configsByPath[configDir] = newDiscoveredConfig(config, configDir)
-	}
-
-	return sortedConfigs(configsByPath), nil
 }
 
 func selectConfigByDatabaseName(databaseName string, configs []DiscoveredConfig) (*SchemabotConfig, string, bool, error) {

@@ -134,16 +134,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	}
 
 	// Check if there are any changes (DDL or VSchema)
-	hasChanges := len(planResult.FlatTables()) > 0
-	if !hasChanges {
-		for _, sc := range planResult.Changes {
-			if sc.Metadata["vschema"] != "" {
-				hasChanges = true
-				break
-			}
-		}
-	}
-	if !hasChanges {
+	if !planResult.HasChanges() {
 		fmt.Println("No changes. Your schema is up-to-date.")
 		return nil
 	}

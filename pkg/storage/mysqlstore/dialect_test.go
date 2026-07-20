@@ -62,3 +62,88 @@ func TestMySQLDialectUpsertClause(t *testing.T) {
 		})
 	}
 }
+
+func TestMySQLDialectCurrentTimestamp(t *testing.T) {
+	d := MySQLDialect{}
+	assert.Equal(t, "NOW()", d.CurrentTimestamp(TimestampPrecisionDefault))
+	assert.Equal(t, "NOW(6)", d.CurrentTimestamp(TimestampPrecisionMicrosecond))
+}
+
+// RelativeTime must render the exact MySQL expressions the store used before the
+// dialect seam, including the DATE_ADD form for additions and a single "?"
+// placeholder for parameterized magnitudes.
+func TestMySQLDialectRelativeTime(t *testing.T) {
+	d := MySQLDialect{}
+
+	tests := []struct {
+		name      string
+		precision TimestampPrecision
+		direction RelativeTimeDirection
+		amount    IntervalAmount
+		unit      IntervalUnit
+		want      string
+	}{
+		{
+			name:      "literal minute before",
+			precision: TimestampPrecisionDefault,
+			direction: BeforeCurrentTime,
+			amount:    LiteralIntervalAmount(1),
+			unit:      IntervalMinute,
+			want:      "NOW() - INTERVAL 1 MINUTE",
+		},
+		{
+			name:      "literal hour before",
+			precision: TimestampPrecisionDefault,
+			direction: BeforeCurrentTime,
+			amount:    LiteralIntervalAmount(1),
+			unit:      IntervalHour,
+			want:      "NOW() - INTERVAL 1 HOUR",
+		},
+		{
+			name:      "parameterized second before",
+			precision: TimestampPrecisionDefault,
+			direction: BeforeCurrentTime,
+			amount:    ParameterIntervalAmount(),
+			unit:      IntervalSecond,
+			want:      "NOW() - INTERVAL ? SECOND",
+		},
+		{
+			name:      "parameterized day before",
+			precision: TimestampPrecisionDefault,
+			direction: BeforeCurrentTime,
+			amount:    ParameterIntervalAmount(),
+			unit:      IntervalDay,
+			want:      "NOW() - INTERVAL ? DAY",
+		},
+		{
+			name:      "parameterized microsecond after at microsecond precision",
+			precision: TimestampPrecisionMicrosecond,
+			direction: AfterCurrentTime,
+			amount:    ParameterIntervalAmount(),
+			unit:      IntervalMicrosecond,
+			want:      "DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := d.RelativeTime(tc.precision, tc.direction, tc.amount, tc.unit)
+			assert.Equal(t, tc.want, got)
+			if tc.amount.parameterized {
+				assert.Equal(t, 1, countPlaceholders(got), "parameterized amount must emit exactly one ?")
+			} else {
+				assert.Equal(t, 0, countPlaceholders(got), "literal amount must emit no ?")
+			}
+		})
+	}
+}
+
+func countPlaceholders(s string) int {
+	n := 0
+	for _, r := range s {
+		if r == '?' {
+			n++
+		}
+	}
+	return n
+}
