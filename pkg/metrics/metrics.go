@@ -195,6 +195,22 @@ func RecordApply(ctx context.Context, repo, database, deployment, environment, s
 	)
 }
 
+// RecordAutoCutoverFailure increments the counter for a drive auto-cutover
+// attempt the engine backend rejected with a hard error (not a self-clearing
+// not-ready rejection). The drive is the sole cutover actor, so a spike means
+// applies are pinned at waiting_for_cutover with the drive unable to complete
+// them — investigate the engine backend's cutover permissions and API health
+// for the database. The drive settles the apply (failed, or paused for
+// operator retry) after repeated consecutive failures.
+func RecordAutoCutoverFailure(ctx context.Context, database, deployment, environment string) {
+	addCounter(ctx, "schemabot.apply.auto_cutover_failure.total",
+		"Drive auto-cutover attempts rejected by the engine backend with a hard error", "{failure}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+	)
+}
+
 // RecordApplyDuration records the duration of an apply operation (API call time,
 // not the full Spirit run which can take hours).
 func RecordApplyDuration(ctx context.Context, duration time.Duration, repo, database, deployment, environment, status string) {

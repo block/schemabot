@@ -251,6 +251,13 @@ const (
 	// persisting this long means the backend is not staging the cutover and an
 	// operator needs to investigate.
 	cutoverNotReadyEscalationAfter = 2 * time.Minute
+
+	// maxConsecutiveCutoverFailures is how many consecutive hard cutover
+	// rejections the drive tolerates before settling the apply. The drive is
+	// the sole cutover actor, so an unbounded retry would hold the database's
+	// deploy queue and lock indefinitely; the bound mirrors the progress-poll
+	// consecutive-error bound.
+	maxConsecutiveCutoverFailures = 10
 )
 
 // atomicPollState tracks mutable state across polling ticks in atomic mode.
@@ -280,6 +287,11 @@ type atomicPollState struct {
 	// cutoverNotReadyEscalationAfter and the timeline event was written, so
 	// that event is recorded once while the Error log repeats every tick.
 	cutoverNotReadyEscalated bool
+
+	// consecutiveCutoverFailures tracks hard (not self-clearing) cutover
+	// rejections so the drive settles the apply instead of retrying forever;
+	// reset when a cutover is accepted or rejected as merely not ready.
+	consecutiveCutoverFailures int
 
 	// consecutiveErrors tracks progress poll failures to fail fast when the
 	// engine is unreachable (e.g., branch deleted mid-apply).
