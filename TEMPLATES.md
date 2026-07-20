@@ -3061,6 +3061,17 @@ The `-v` flag is required and must be a number between 1 (slowest) and 11 (faste
 </details>
 
 <details>
+<summary><a name="volume-command-missing-apply-id"></a><strong>Volume Command Missing Apply ID</strong></summary>
+
+
+## Missing Apply ID
+
+Usage: `schemabot volume <apply-id> -e <environment> -v <1-11>`
+
+Use `schemabot status -e <environment>` to find the apply ID.
+</details>
+
+<details>
 <summary><a name="volume-changed-superseded-progress-comment"></a><strong>Volume Changed: Superseded Progress Comment</strong></summary>
 
 
@@ -5751,6 +5762,18 @@ Volume change to 8 requested. SchemaBot will adjust the speed of this schema cha
 Usage: `schemabot volume <apply-id> -e <environment> -v <level>`
 
 The `-v` flag is required and must be a number between 1 (slowest) and 11 (fastest).
+
+</details>
+
+<details>
+<summary><a name="volume-command-missing-apply-id"></a><strong>Volume Command Missing Apply ID</strong></summary>
+
+
+## Missing Apply ID
+
+Usage: `schemabot volume <apply-id> -e <environment> -v <1-11>`
+
+Use `schemabot status -e <environment>` to find the apply ID.
 
 </details>
 

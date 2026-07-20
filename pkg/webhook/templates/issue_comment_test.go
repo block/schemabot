@@ -43,6 +43,14 @@ func TestRenderControlMissingApplyID(t *testing.T) {
 	assert.Contains(t, rendered, "Missing Apply ID")
 	assert.Contains(t, rendered, "schemabot stop <apply-id> -e <environment>")
 	assert.Contains(t, rendered, "schemabot status")
+	assert.NotContains(t, rendered, "-v <")
+}
+
+func TestRenderControlMissingApplyIDVolumeShowsRequiredLevelFlag(t *testing.T) {
+	rendered := RenderControlMissingApplyID("volume")
+	assert.Contains(t, rendered, "Missing Apply ID")
+	assert.Contains(t, rendered, "schemabot volume <apply-id> -e <environment> -v <1-11>")
+	assert.Contains(t, rendered, "schemabot status")
 }
 
 func TestRenderStopCommandAccepted(t *testing.T) {
