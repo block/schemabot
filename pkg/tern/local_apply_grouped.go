@@ -781,12 +781,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 	// Auto-trigger cutover if waiting and not in defer mode
 	if result.State == engine.StateWaitingForCutover && !opts.DeferCutover {
-		c.logger.Info("auto-triggering cutover (not in defer mode)", "apply_id", apply.ApplyIdentifier)
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
-			"Auto-triggering cutover (defer_cutover not set)", "", "")
-		if _, err := eng.Cutover(ctx, controlReq); err != nil {
-			c.logger.Error("auto-cutover failed", append(apply.LogAttrs(), "error", err)...)
-		}
+		c.autoTriggerCutover(ctx, eng, apply, controlReq, ps, now)
 	}
 
 	// Timeout: cancel the apply if waiting for manual deploy too long.
@@ -1102,6 +1097,49 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		return true
 	}
 	return false
+}
+
+// autoTriggerCutover fires the engine cutover for a drive that is not
+// deferring cutover, pacing the operator-visible signal around the backend's
+// staging window: the trigger event is recorded once per drive so retries do
+// not duplicate it, a not-ready rejection retries quietly on the next progress
+// tick, and a rejection that outlives the staging window escalates to Error
+// logging on every further tick plus a one-time timeline event, so a backend
+// that never stages the cutover pages instead of idling.
+func (c *LocalClient) autoTriggerCutover(ctx context.Context, eng engine.Engine, apply *storage.Apply, controlReq *engine.ControlRequest, ps *atomicPollState, now time.Time) {
+	if !ps.cutoverTriggerLogged {
+		c.logger.Info("auto-triggering cutover (not in defer mode)", "apply_id", apply.ApplyIdentifier)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
+			"Auto-triggering cutover (defer_cutover not set)", "", "")
+		ps.cutoverTriggerLogged = true
+	}
+	switch _, err := eng.Cutover(ctx, controlReq); {
+	case err == nil:
+		ps.cutoverNotReadySince = time.Time{}
+		ps.cutoverNotReadyEscalated = false
+	case engine.IsNotReady(err):
+		// The engine's backend advertised the cutover gate before it was ready
+		// to accept the cutover; the drive reattempts on the next progress
+		// tick, once it catches up.
+		if ps.cutoverNotReadySince.IsZero() {
+			ps.cutoverNotReadySince = now
+		}
+		notReadyFor := now.Sub(ps.cutoverNotReadySince)
+		if notReadyFor < cutoverNotReadyEscalationAfter {
+			c.logger.Info("auto-cutover not accepted yet; retrying at the next progress tick",
+				append(apply.LogAttrs(), "not_ready_for", notReadyFor, "error", err)...)
+			return
+		}
+		if !ps.cutoverNotReadyEscalated {
+			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+				fmt.Sprintf("Cutover has not been accepted by the engine backend for %s; SchemaBot keeps retrying every progress tick", notReadyFor.Round(time.Second)), "", "")
+			ps.cutoverNotReadyEscalated = true
+		}
+		c.logger.Error("auto-cutover has been rejected as not-ready beyond the staging window; the engine backend is not staging the cutover and the drive keeps retrying",
+			append(apply.LogAttrs(), "not_ready_for", notReadyFor, "error", err)...)
+	default:
+		c.logger.Error("auto-cutover failed", append(apply.LogAttrs(), "error", err)...)
+	}
 }
 
 // markRevertSkipped records skip-revert on the apply so progress consumers know

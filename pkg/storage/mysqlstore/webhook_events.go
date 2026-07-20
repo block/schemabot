@@ -20,7 +20,8 @@ const webhookEventColumns = `id, provider, delivery_id, event, action, repositor
 	received_at, started_at, completed_at, created_at, updated_at`
 
 type webhookEventStore struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect Dialect
 }
 
 func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
@@ -103,7 +104,7 @@ func (s *webhookEventStore) reopenTerminalWebhookEvent(ctx context.Context, prov
 			lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
 			retry_after = NULL, completed_at = NULL, started_at = NULL, updated_at = NOW()
 		WHERE provider = ? AND delivery_id = ?
-			AND (state IN (?, ?) OR (state = ? AND lease_expires_at <= NOW(6)))
+			AND (state IN (?, ?) OR (state = ? AND lease_expires_at <= `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+`))
 	`, storage.WebhookEventPending, payload, receivedAt, provider, deliveryID,
 		storage.WebhookEventFailed, storage.WebhookEventCompleted, storage.WebhookEventProcessing)
 	if err != nil {
@@ -135,11 +136,13 @@ func (s *webhookEventStore) GetByDeliveryID(ctx context.Context, provider, deliv
 // single source so the "ready to claim" definition cannot drift between what a
 // driver picks up and what the backlog gauge measures. Bind its placeholders
 // with webhookClaimableArgs.
-const webhookClaimablePredicate = `(
+func (s *webhookEventStore) webhookClaimablePredicate() string {
+	return `(
 			state = ?
-			OR (state = ? AND (retry_after IS NULL OR retry_after <= NOW()) AND attempts < ?)
-			OR (state = ? AND lease_expires_at <= NOW(6) AND attempts < ?)
+			OR (state = ? AND (retry_after IS NULL OR retry_after <= ` + s.dialect.CurrentTimestamp(TimestampPrecisionDefault) + `) AND attempts < ?)
+			OR (state = ? AND lease_expires_at <= ` + s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond) + ` AND attempts < ?)
 		)`
+}
 
 // webhookClaimableArgs returns the placeholder bindings for
 // webhookClaimablePredicate, in order.
@@ -190,7 +193,7 @@ func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDur
 	row := tx.QueryRowContext(ctx, `
 		SELECT `+webhookEventColumns+`
 		FROM webhook_events
-		WHERE `+webhookClaimablePredicate+`
+		WHERE `+s.webhookClaimablePredicate()+`
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
@@ -210,7 +213,7 @@ func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDur
 	_, err = tx.ExecContext(ctx, `
 		UPDATE webhook_events
 		SET state = ?, attempts = attempts + 1, lease_owner = ?, lease_token = ?,
-			lease_expires_at = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND),
+			lease_expires_at = `+s.dialect.RelativeTime(TimestampPrecisionMicrosecond, AfterCurrentTime, ParameterIntervalAmount(), IntervalMicrosecond)+`,
 			retry_after = NULL, started_at = COALESCE(started_at, NOW()), updated_at = NOW()
 		WHERE id = ?
 	`, storage.WebhookEventProcessing, owner, leaseToken, leaseDuration.Microseconds(), event.ID)
@@ -250,7 +253,7 @@ func (s *webhookEventStore) Heartbeat(ctx context.Context, id int64, leaseToken 
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE webhook_events
-		SET lease_expires_at = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW()
+		SET lease_expires_at = `+s.dialect.RelativeTime(TimestampPrecisionMicrosecond, AfterCurrentTime, ParameterIntervalAmount(), IntervalMicrosecond)+`, updated_at = NOW()
 		WHERE id = ? AND lease_token = ?
 	`, leaseDuration.Microseconds(), id, leaseToken)
 	if err != nil {
@@ -343,7 +346,7 @@ func (s *webhookEventStore) TerminateStuckProcessing(ctx context.Context, reason
 		SET state = ?, last_error = ?, completed_at = COALESCE(completed_at, NOW()),
 			lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
 			retry_after = NULL, updated_at = NOW()
-		WHERE state = ? AND lease_expires_at <= NOW(6) AND attempts >= ?
+		WHERE state = ? AND lease_expires_at <= `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+` AND attempts >= ?
 	`, storage.WebhookEventFailed, nullString(reason),
 		storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts)
 	if err != nil {
@@ -431,9 +434,9 @@ func (s *webhookEventStore) InboxStats(ctx context.Context) (*storage.WebhookInb
 	// NULL (nothing waiting) scans into a zero age.
 	var oldestAgeSeconds sql.NullFloat64
 	err = s.db.QueryRowContext(ctx, `
-		SELECT TIMESTAMPDIFF(MICROSECOND, MIN(received_at), NOW(6)) / 1e6
+		SELECT TIMESTAMPDIFF(MICROSECOND, MIN(received_at), `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+`) / 1e6
 		FROM webhook_events
-		WHERE `+webhookClaimablePredicate+`
+		WHERE `+s.webhookClaimablePredicate()+`
 	`, webhookClaimableArgs()...).Scan(&oldestAgeSeconds)
 	if err != nil {
 		return nil, fmt.Errorf("measure oldest claimable webhook inbox row: %w", err)
@@ -444,7 +447,7 @@ func (s *webhookEventStore) InboxStats(ctx context.Context) (*storage.WebhookInb
 
 	err = s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM webhook_events
-		WHERE state = ? AND lease_expires_at <= NOW(6) AND attempts >= ?
+		WHERE state = ? AND lease_expires_at <= `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+` AND attempts >= ?
 	`, storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts).Scan(&stats.StuckProcessing)
 	if err != nil {
 		return nil, fmt.Errorf("count stuck processing webhook inbox rows: %w", err)

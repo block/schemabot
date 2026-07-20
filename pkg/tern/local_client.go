@@ -1318,6 +1318,28 @@ func (c *LocalClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*t
 	}
 
 	changes, violations, protoShards := c.planResultToProtoChanges(result)
+	// Log the resulting change set so a diverged deployment is triageable from
+	// this side's logs alone: change count plus one line per table change, with
+	// DDL length instead of the DDL body.
+	changeCount := 0
+	for _, ch := range changes {
+		changeCount += len(ch.TableChanges)
+	}
+	c.logger.Info("LocalClient.PlanDiff: plan diff response",
+		"database", c.config.Database,
+		"change_count", changeCount,
+	)
+	for _, ch := range changes {
+		for _, tc := range ch.TableChanges {
+			c.logger.Info("LocalClient.PlanDiff: table change",
+				"database", c.config.Database,
+				"namespace", tc.Namespace,
+				"table", tc.TableName,
+				"change_type", tc.ChangeType.String(),
+				"ddl_len", len(tc.Ddl),
+			)
+		}
+	}
 	return &ternv1.PlanDiffResponse{
 		Engine:         c.protoEngine(),
 		Changes:        changes,

@@ -85,12 +85,24 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
 	return e.controlDeployRequest(ctx, engine.ControlCutover, req, "cutover", "Cutover initiated for",
 		func(ctx context.Context, client psclient.PSClient, number uint64) (*ps.DeployRequest, error) {
-			return client.ApplyDeployRequest(ctx, &ps.ApplyDeployRequestRequest{
+			dr, err := client.ApplyDeployRequest(ctx, &ps.ApplyDeployRequestRequest{
 				Organization: credOrg(req.Credentials),
 				Database:     req.Database,
 				Number:       number,
 			})
+			if err != nil && isDeployNotStagedError(err) {
+				return nil, engine.NewNotReadyError("deploy request has not staged its changes yet: %w", err)
+			}
+			return dr, err
 		})
+}
+
+// isDeployNotStagedError reports whether the PlanetScale API rejected a
+// cutover because the deploy request has not staged its changes yet. The API
+// briefly reports pending_cutover before the staged changes are visible to the
+// apply endpoint, so the rejection clears on its own once staging completes.
+func isDeployNotStagedError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "changes have not been staged")
 }
 
 // Revert rolls back a completed schema change during the revert window.
@@ -150,6 +162,12 @@ func (e *Engine) controlDeployRequest(
 
 	dr, err := mutate(ctx, client, meta.DeployRequestID)
 	if err != nil {
+		// A not-ready rejection means the deploy request exists and will accept
+		// the operation once its backend catches up — the deleted-deploy-request
+		// hint would misdirect whoever reads the message.
+		if engine.IsNotReady(err) {
+			return nil, fmt.Errorf("%s deploy request #%d: %w", errVerb, meta.DeployRequestID, err)
+		}
 		return nil, fmt.Errorf("%s deploy request #%d (may have been deleted): %w", errVerb, meta.DeployRequestID, err)
 	}
 

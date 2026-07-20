@@ -449,6 +449,28 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 		if task.State == state.Task.Completed {
 			continue
 		}
+		if state.IsState(task.State, state.Task.Reverted) {
+			// Terminal: the revert already landed for this task. It carries no
+			// remaining resume work, and re-activating it would flip a terminal
+			// task back to running until the engine re-terminalizes it.
+			c.logger.Debug("leaving reverted task terminal during resume re-plan", task.LogAttrs()...)
+			continue
+		}
+		if taskInRevertPhase(task) {
+			// Post-cutover, the live schema matches the reviewed target by
+			// definition: the change is applied and the engine is holding the
+			// revert window open or unwinding it. A schema match therefore says
+			// nothing about this task settling — completing it here would
+			// terminalize the apply as a success while the engine reverts the
+			// schema change underneath it. The task stays active (reviewed DDL
+			// untouched) so the resume reattaches to the engine and the task's
+			// terminal state comes from engine progress, never from this
+			// schema comparison.
+			c.logger.Info("keeping revert-phase task active through resume re-plan; engine progress decides its terminal state",
+				task.LogAttrs()...)
+			activeTasks = append(activeTasks, task)
+			continue
+		}
 		ddl, stillNeeded := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
 		if !stillNeeded {
 			// The re-plan diffs the reviewed target (plan.SchemaFiles) against
@@ -474,6 +496,26 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 	}
 
 	return &replanResult{ActiveTasks: activeTasks, CompletedCount: completedCount}, nil
+}
+
+// taskInRevertPhase reports whether the task sits in an engine-monitored
+// revert-phase state: the revert window is open or a revert is in flight.
+// While a task is in one of these states, comparing live schema against the
+// reviewed target proves nothing about the task's outcome — a match is the
+// expected live state until a revert lands, and a mismatch just means the
+// revert already landed.
+func taskInRevertPhase(task *storage.Task) bool {
+	return state.IsState(task.State, state.Task.RevertWindow, state.Task.Reverting)
+}
+
+// applyInRevertPhase reports whether the apply dwells in an engine-monitored
+// revert-phase state: the revert window is open, a revert is in flight, or the
+// window is being skipped. An apply in one of these states always has engine
+// work in flight, and the persisted state is the durable signal that
+// revert-phase handling — never fresh forward-apply handling — owns its
+// outcome.
+func applyInRevertPhase(apply *storage.Apply) bool {
+	return state.IsState(apply.State, state.Apply.RevertWindow, state.Apply.Reverting, state.Apply.SkippingRevert)
 }
 
 // verifyReplannedTaskDDL fails closed when the DDL a resume re-plan would now
@@ -658,14 +700,25 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	}
 	tasks = rp.ActiveTasks
 	if len(tasks) == 0 {
-		c.logger.Info("final schema check found no remaining grouped resume work; completing apply",
+		// Every task is already terminal (the re-plan keeps anything with
+		// remaining work active), so the apply's terminal state is derived from
+		// the task states: all completed → completed, any reverted → reverted.
+		// An apply whose tasks all reverted must terminalize as reverted, never
+		// as a success.
+		taskStates := make([]string, 0, len(allTasks))
+		for _, t := range allTasks {
+			taskStates = append(taskStates, t.State)
+		}
+		terminalState := state.DeriveApplyState(taskStates)
+		c.logger.Info("final schema check found no remaining grouped resume work; terminalizing apply",
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
 			"database_type", apply.DatabaseType,
-			"task_count", len(allTasks))
+			"task_count", len(allTasks),
+			"terminal_state", terminalState)
 		oldApplyState := apply.State
 		now := time.Now()
-		apply.State = state.Apply.Completed
+		apply.State = terminalState
 		apply.CompletedAt = &now
 		apply.UpdatedAt = now
 		// The drive's tasks are already terminal, so the operator derives this
@@ -676,7 +729,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		}
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
-			return fmt.Errorf("mark grouped resume apply %s completed after final schema check: %w", apply.ApplyIdentifier, err)
+			return fmt.Errorf("mark grouped resume apply %s %s after final schema check: %w", apply.ApplyIdentifier, terminalState, err)
 		}
 		if startRequested {
 			if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
@@ -687,7 +740,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-			"All tasks already completed on resume (final schema check shows no remaining changes)", oldApplyState, state.Apply.Completed)
+			"All tasks already terminal on resume (final schema check shows no remaining changes)", oldApplyState, terminalState)
 		c.notifyTerminalObserver(apply, allTasks)
 		return nil
 	}
@@ -750,38 +803,8 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		return fmt.Errorf("%w: engine accepted grouped resume of Vitess apply %s (database %s) without resume state metadata", errGroupedResumeStateUnavailable, apply.ApplyIdentifier, apply.Database)
 	}
 
-	now := time.Now()
-	oldApplyState := apply.State
-	recovering := state.IsState(oldApplyState, state.Apply.Recovering)
-
-	for _, task := range tasks {
-		taskState := state.Task.Running
-		if recovering {
-			taskState = state.Task.Recovering
-		}
-		c.transitionTaskState(ctx, task, 0, taskState, "")
-	}
-
-	apply.State = state.Apply.Running
-	if recovering {
-		apply.State = state.Apply.Recovering
-	}
-	apply.UpdatedAt = now
-	// A multi-operation drive does not write the parent running state or complete
-	// parent start requests; the operator projected the parent running before the
-	// drive. Tasks are already running/recovering above.
-	if !suppressParent {
-		if err := c.storage.Applies().Update(ctx, apply); err != nil {
-			c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
-			return fmt.Errorf("mark grouped resume apply %s %s: %w", apply.ApplyIdentifier, apply.State, err)
-		}
-		if startRequested {
-			if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
-				return err
-			}
-		}
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-			logMessage, oldApplyState, apply.State)
+	if err := c.persistReattachedResumeStates(ctx, apply, tasks, suppressParent, startRequested, logMessage); err != nil {
+		return err
 	}
 
 	if block {
@@ -816,6 +839,59 @@ func (c *LocalClient) startParentApplyHeartbeat(ctx context.Context, apply *stor
 		return func() {}
 	}
 	return c.startApplyHeartbeat(ctx, apply, cancelApply...)
+}
+
+// persistReattachedResumeStates persists task and apply states after the
+// engine accepts a grouped resume: tasks and the apply move to running
+// (recovering, during a deferred-cutover recovery). Revert-phase task and
+// apply states are preserved instead — the persisted revert-phase state is the
+// durable marker that revert-phase handling owns the outcome, and it must
+// survive until engine progress moves it so a later reclaim never mistakes the
+// apply for a forward-running one.
+func (c *LocalClient) persistReattachedResumeStates(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, suppressParent, startRequested bool, logMessage string) error {
+	now := time.Now()
+	oldApplyState := apply.State
+	recovering := state.IsState(oldApplyState, state.Apply.Recovering)
+
+	for _, task := range tasks {
+		if taskInRevertPhase(task) {
+			c.logger.Info("preserving revert-phase task state through resume reattach", task.LogAttrs()...)
+			continue
+		}
+		taskState := state.Task.Running
+		if recovering {
+			taskState = state.Task.Recovering
+		}
+		c.transitionTaskState(ctx, task, 0, taskState, "")
+	}
+
+	switch {
+	case recovering:
+		apply.State = state.Apply.Recovering
+	case applyInRevertPhase(apply):
+		// The apply keeps its revert-phase state, mirroring the tasks above.
+	default:
+		apply.State = state.Apply.Running
+	}
+	apply.UpdatedAt = now
+	// A multi-operation drive does not write the parent running state or complete
+	// parent start requests; the operator projected the parent running before the
+	// drive. Tasks are already persisted above.
+	if suppressParent {
+		return nil
+	}
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
+		return fmt.Errorf("mark grouped resume apply %s %s: %w", apply.ApplyIdentifier, apply.State, err)
+	}
+	if startRequested {
+		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
+			return err
+		}
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+		logMessage, oldApplyState, apply.State)
+	return nil
 }
 
 // errGroupedResumeStateUnavailable marks a resume attempt whose persisted engine
@@ -853,6 +929,16 @@ func (c *LocalClient) groupedResumeState(ctx context.Context, apply *storage.App
 
 	stored, err := c.loadEngineResumeStateForOperation(ctx, operationID)
 	if errors.Is(err, storage.ErrEngineResumeStateNotFound) {
+		// An apply dwelling in a revert phase has engine work in flight by
+		// definition — a revert window held open, a revert or skip underway —
+		// so a missing resume-state row can never legitimately mean "start
+		// fresh". A fresh engine apply would re-deploy the reviewed schema
+		// change on top of the revert. Fail the attempt so recovery retries
+		// against intact storage.
+		if c.config.Type == storage.DatabaseTypeVitess && applyInRevertPhase(apply) {
+			return nil, fmt.Errorf("%w: no persisted engine resume state for revert-phase apply %s operation %d (database %s, state %s)",
+				errGroupedResumeStateUnavailable, apply.ApplyIdentifier, operationID, apply.Database, apply.State)
+		}
 		c.logger.Info("no persisted engine resume state for apply operation; engine apply will start from the schema change context",
 			"apply_id", apply.ApplyIdentifier,
 			"apply_operation_id", operationID,

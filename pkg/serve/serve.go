@@ -88,6 +88,7 @@ type webhookRuntime struct {
 	handler                         http.Handler
 	startDurableWebhookDispatch     func(context.Context)
 	stopDurableWebhookDispatch      func()
+	drainInProcessWebhookWork       func(context.Context)
 	reconcileMissingSummaryComments func(context.Context)
 }
 
@@ -409,6 +410,11 @@ const (
 	storageBootRetryInterval = 5 * time.Second
 )
 
+// inProcessWebhookDrainTimeout bounds how long Close waits for detached
+// in-process webhook goroutines to finish before giving up and letting the
+// process exit. It sits within the deployment's overall shutdown grace period.
+const inProcessWebhookDrainTimeout = 25 * time.Second
+
 // bootStorage brings up the storage database for a booting server: it applies
 // the storage schema, opens the pool, and verifies connectivity, retrying
 // failed attempts until the boot budget is spent. The DSN is re-resolved on
@@ -552,6 +558,15 @@ func (s *Server) Close() error {
 	s.svc.StopPendingDropsCleaner()
 	if s.webhook.stopDurableWebhookDispatch != nil {
 		s.webhook.stopDurableWebhookDispatch()
+	}
+	// Drain the detached in-process webhook goroutines (non-durable event types)
+	// before closing storage below, since that already-acked work can still read
+	// or write the database. Run/embedders stop the HTTP server before Close, so
+	// no new deliveries arrive during the drain.
+	if s.webhook.drainInProcessWebhookWork != nil {
+		drainCtx, cancelDrain := context.WithTimeout(context.Background(), inProcessWebhookDrainTimeout)
+		s.webhook.drainInProcessWebhookWork(drainCtx)
+		cancelDrain()
 	}
 	// Stop the operator before closing the gRPC client below: RegisterGRPC set
 	// that client as the service's default, so until the drivers drain, a claim
@@ -736,6 +751,7 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 	return webhookRuntime{
 		startDurableWebhookDispatch:     handler.StartDurableWebhookDispatch,
 		stopDurableWebhookDispatch:      handler.StopDurableWebhookDispatch,
+		drainInProcessWebhookWork:       handler.DrainInProcessWebhookWork,
 		handler:                         handler,
 		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,
 	}, nil
@@ -813,6 +829,7 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 	return webhookRuntime{
 		startDurableWebhookDispatch:     handler.StartDurableWebhookDispatch,
 		stopDurableWebhookDispatch:      handler.StopDurableWebhookDispatch,
+		drainInProcessWebhookWork:       handler.DrainInProcessWebhookWork,
 		handler:                         handler,
 		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,
 	}, nil

@@ -53,7 +53,8 @@ const (
 
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect Dialect
 }
 
 type applyWriteTx struct {
@@ -88,6 +89,20 @@ type txBeginner interface {
 // holds while waiting for the data plane to leave stopped after a start. A
 // stale heartbeat there means the driver died mid-resume, and recovery must be
 // able to reclaim and finish driving it to a terminal state.
+//
+// The revert-phase states (reverting, skipping_revert) are included because an
+// apply can dwell in them while the engine works: a driver killed by routine
+// pod churn mid-revert must not strand the apply non-terminal forever. Recovery
+// re-attaches to the engine (the deploy request keeps reverting or finalizing
+// server-side) and drives the apply to its terminal state. The durable
+// revert/skip-revert signals mean a re-claim normally does not re-issue the
+// command; a crash between the engine accepting the command and the durable
+// write can cause a harmless re-issue, which the engine treats as idempotent.
+//
+// Every non-terminal state an apply can dwell in must appear here (or have its
+// own claim arm, like pending and stopped-with-start): the stale-heartbeat
+// re-claim is the only recovery path after a driver dies, and a dwellable state
+// missing from this list is orphaned by any pod restart.
 func claimableApplyStates() []string {
 	return []string{
 		state.Apply.Running,
@@ -99,6 +114,8 @@ func claimableApplyStates() []string {
 		"recovering_cutover",
 		state.Apply.CuttingOver,
 		state.Apply.RevertWindow,
+		state.Apply.Reverting,
+		state.Apply.SkippingRevert,
 		state.Apply.PreparingBranch,
 		state.Apply.ApplyingBranchChanges,
 		state.Apply.ValidatingBranch,
@@ -1167,6 +1184,9 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 		state.Apply.WaitingForDeploy,
 		storage.ControlOperationStart, storage.ControlRequestPending)
 
+	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
+
 	// Apply creation/update enforces at most one active apply per
 	// database/type/environment. The claim query only needs to find stale work;
 	// FOR UPDATE SKIP LOCKED prevents concurrent drivers from claiming the same row.
@@ -1183,8 +1203,8 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 					EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id)
 					OR EXISTS (SELECT 1 FROM apply_operations ao WHERE ao.apply_id = a.id)
 				))
-				OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL %s)
-				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= NOW() - INTERVAL ? DAY)
+				OR (a.state IN (%s) AND a.updated_at < %s)
+				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= %s)
 				OR (
 					a.state = ?
 					AND EXISTS (
@@ -1210,7 +1230,7 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 						AND (
 							a.lease_acquired_at IS NULL
 							OR a.lease_acquired_at < cr.updated_at
-							OR a.updated_at < NOW() - INTERVAL %s
+							OR a.updated_at < %s
 						)
 					)
 				)
@@ -1218,7 +1238,7 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 		ORDER BY a.created_at
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyColumns, activeStatePlaceholders, applyLeaseStalenessSQL, applyLeaseStalenessSQL), queryArgs...)
+	`, applyColumns, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, staleClaimCutoff), queryArgs...)
 
 	apply, err := scanApplyInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1280,6 +1300,9 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 		state.Apply.WaitingForDeploy,
 		storage.ControlOperationStart, storage.ControlRequestPending)
 
+	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
+
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM applies a
@@ -1289,8 +1312,8 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 					EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id)
 					OR EXISTS (SELECT 1 FROM apply_operations ao WHERE ao.apply_id = a.id)
 				))
-				OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL %s)
-				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= NOW() - INTERVAL ? DAY)
+				OR (a.state IN (%s) AND a.updated_at < %s)
+				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= %s)
 				OR (
 					a.state = ?
 					AND EXISTS (
@@ -1316,14 +1339,14 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 						AND (
 							a.lease_acquired_at IS NULL
 							OR a.lease_acquired_at < cr.updated_at
-							OR a.updated_at < NOW() - INTERVAL %s
+							OR a.updated_at < %s
 						)
 					)
 				)
 			)
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyColumns, activeStatePlaceholders, applyLeaseStalenessSQL, applyLeaseStalenessSQL), queryArgs...)
+	`, applyColumns, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, staleClaimCutoff), queryArgs...)
 
 	apply, err := scanApplyInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1735,7 +1758,7 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 		FROM applies
 		WHERE state = ? AND (
 			attempt >= ?
-			OR updated_at < NOW() - INTERVAL ? DAY
+			OR updated_at < `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)+`
 		)
 		FOR UPDATE
 	`, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
@@ -2003,12 +2026,12 @@ func (s *applyStore) FindMissingSummaryComment(ctx context.Context) ([]*storage.
 		  AND a.pull_request > 0
 		  AND a.installation_id > 0
 		  AND (
-			(a.state IN (?, ?, ?, ?) AND a.completed_at > NOW() - INTERVAL 1 HOUR)
-			OR (a.state = ? AND a.updated_at > NOW() - INTERVAL 1 HOUR)
+			(a.state IN (?, ?, ?, ?) AND a.completed_at > `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(1), IntervalHour)+`)
+			OR (a.state = ? AND a.updated_at > `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(1), IntervalHour)+`)
 		  )
 		  AND (
 			acs.id IS NULL
-			OR (acs.github_comment_id = 0 AND acs.updated_at < NOW() - INTERVAL ? SECOND)
+			OR (acs.github_comment_id = 0 AND acs.updated_at < `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalSecond)+`)
 		  )
 		ORDER BY a.updated_at DESC
 	`, state.Apply.Completed, state.Apply.Failed, state.Apply.Reverted, state.Apply.Cancelled,
