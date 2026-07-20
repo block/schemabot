@@ -243,6 +243,14 @@ const (
 	// defaultRevertWindowDuration is the default revert window period.
 	// 30 minutes matches PlanetScale's default.
 	defaultRevertWindowDuration = 30 * time.Minute
+
+	// cutoverNotReadyEscalationAfter is how long consecutive not-ready cutover
+	// rejections stay at Info before the drive escalates to Error logging and
+	// records a timeline event. The window between a backend advertising the
+	// cutover gate and accepting a cutover normally lasts seconds; a rejection
+	// persisting this long means the backend is not staging the cutover and an
+	// operator needs to investigate.
+	cutoverNotReadyEscalationAfter = 2 * time.Minute
 )
 
 // atomicPollState tracks mutable state across polling ticks in atomic mode.
@@ -257,6 +265,21 @@ type atomicPollState struct {
 
 	// revertSkipped is set after SkipRevert is called to prevent repeated calls.
 	revertSkipped bool
+
+	// cutoverTriggerLogged is set after the drive records the auto-cutover
+	// trigger event, so retries of a not-yet-accepted cutover do not fill the
+	// user-visible timeline with duplicate triggers.
+	cutoverTriggerLogged bool
+
+	// cutoverNotReadySince is when the engine backend first rejected an
+	// auto-cutover as not ready; cleared when a cutover is accepted. Used to
+	// escalate when the normally seconds-long staging window persists.
+	cutoverNotReadySince time.Time
+
+	// cutoverNotReadyEscalated is set once the not-ready window has outlived
+	// cutoverNotReadyEscalationAfter and the timeline event was written, so
+	// that event is recorded once while the Error log repeats every tick.
+	cutoverNotReadyEscalated bool
 
 	// consecutiveErrors tracks progress poll failures to fail fast when the
 	// engine is unreachable (e.g., branch deleted mid-apply).
