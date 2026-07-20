@@ -298,6 +298,16 @@ type planFlowResult struct {
 	HeadSHAs    []string
 	headSHACall atomic.Int64
 
+	// PRState overrides the lifecycle state served by /pulls/1. Empty (the
+	// default) serves "open"; tests exercising the closed-PR command gate set
+	// "closed" before issuing the webhook request.
+	PRState atomic.Pointer[string]
+
+	// PRMerged marks the PR served by /pulls/1 as merged. GitHub reports a
+	// merged PR with state "closed" and merged true, so tests exercising the
+	// merged-PR rejection copy set this together with PRState "closed".
+	PRMerged atomic.Bool
+
 	// CheckStatusNodes optionally overrides the default passing-checks REST
 	// responses installed by setupFakeGitHubForPlan. Tests that need to drive
 	// different check-gate responses across consecutive calls (e.g. PASS at the
@@ -376,7 +386,14 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	// preserves the historical "abc123" for every existing test).
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
 		sha := result.nextHeadSHA()
+		prState := "open"
+		if override := result.PRState.Load(); override != nil {
+			prState = *override
+		}
+		merged := result.PRMerged.Load()
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			State:  &prState,
+			Merged: &merged,
 			Head: &gh.PullRequestBranch{
 				Ref: new("feature-branch"),
 				SHA: &sha,

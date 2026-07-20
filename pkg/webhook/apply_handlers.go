@@ -55,6 +55,10 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 	}
 
+	if blocked := h.enforceOpenPR(ctx, client, repo, pr, installationID, action.Apply, environment, requestedBy); blocked {
+		return
+	}
+
 	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.Apply); blocked {
 		return
 	}
@@ -314,6 +318,10 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	}
 	if err := h.attachServerEnvironments(schemaResult, environment); err != nil {
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err)
+		return
+	}
+
+	if blocked := h.enforceOpenPR(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, requestedBy); blocked {
 		return
 	}
 

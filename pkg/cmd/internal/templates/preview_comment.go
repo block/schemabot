@@ -121,6 +121,8 @@ func previewApplyCommandAllOutput() {
 		{"APPLY BLOCKED BY OTHER PR", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByOtherPR()) }},
 		{"APPLY BLOCKED BY CLI", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByCLI()) }},
 		{"APPLY ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyInProgress()) }},
+		{"APPLY BLOCKED: PR CLOSED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedClosedPR()) }},
+		{"APPLY BLOCKED: PR MERGED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedMergedPR()) }},
 		{"NO LOCK FOUND", func() { fmt.Print(webhooktemplates.PreviewCommentApplyConfirmNoLock()) }},
 		{"BASE SCHEMA CHANGED SINCE PR DIVERGED", func() { fmt.Print(webhooktemplates.PreviewCommentBaseSchemaFreshnessRejected()) }},
 		{"BLOCKED BY PRIOR ENV (PENDING)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnv()) }},

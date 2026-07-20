@@ -300,6 +300,18 @@ func PreviewCommentApplyInProgress() string {
 	})
 }
 
+// PreviewCommentApplyBlockedClosedPR renders a sample apply rejection for a
+// closed-but-unmerged PR.
+func PreviewCommentApplyBlockedClosedPR() string {
+	return RenderApplyBlockedClosedPR("staging", previewRequestedBy, false)
+}
+
+// PreviewCommentApplyBlockedMergedPR renders a sample apply rejection for a
+// merged PR.
+func PreviewCommentApplyBlockedMergedPR() string {
+	return RenderApplyBlockedClosedPR("staging", previewRequestedBy, true)
+}
+
 // PreviewCommentApplyConfirmNoLock renders a sample "no lock found" comment.
 func PreviewCommentApplyConfirmNoLock() string {
 	return RenderApplyConfirmNoLock("testapp", "staging")
