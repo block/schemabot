@@ -598,18 +598,18 @@ func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, 
 		return "", err
 	}
 
-	config, configDir, err := client.FindConfigForPR(ctx, repo, pr)
-	if errors.Is(err, ghclient.ErrNoConfig) {
-		config, configDir, _, err = client.FindConfigInRepo(ctx, repo, pr)
-	}
+	config, _, err := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, action.Unlock)
 	if err != nil {
+		// Schema another deployment owns — whether outside allowed_dirs or for
+		// a database not in this deployment's registry — means there is nothing
+		// for this deployment to unlock: same outcome as no config at all.
+		if isSchemaUnownedByDeploymentError(err) {
+			return "", ghclient.ErrNoConfig
+		}
 		if errors.Is(err, ghclient.ErrMultipleConfigs) {
 			return "", fmt.Errorf("multiple SchemaBot configs match this PR; retry with `schemabot unlock -d <database> --force`: %w", err)
 		}
 		return "", err
-	}
-	if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Unlock) {
-		return "", ghclient.ErrNoConfig
 	}
 	if config == nil || config.Database == "" {
 		return "", fmt.Errorf("no database found in SchemaBot config")

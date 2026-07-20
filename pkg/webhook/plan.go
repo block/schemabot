@@ -251,13 +251,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 		schemaDatabase = config.Database
 	} else {
-		config, configDir, findErr := client.FindConfigForPR(ctx, repo, pr)
+		config, _, findErr := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, action.Plan)
 		if findErr != nil {
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr)
-			return
-		}
-		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Plan) {
-			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, newSchemaConfigOutsideAllowedDirsError(config, configDir))
 			return
 		}
 		schemaDatabase = config.Database
