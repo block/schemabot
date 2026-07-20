@@ -1229,6 +1229,14 @@ func TestApplyStatusFromProgress(t *testing.T) {
 				ETASeconds:      120,
 			},
 			{
+				TableName:       "orders",
+				DDL:             "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)",
+				Status:          state.Task.WaitingForCutover,
+				RowsCopied:      10000,
+				RowsTotal:       10000,
+				PercentComplete: 100,
+			},
+			{
 				TableName: "", // empty table name should be filtered
 			},
 		},
@@ -1242,10 +1250,13 @@ func TestApplyStatusFromProgress(t *testing.T) {
 	assert.Equal(t, "running", data.State)
 	assert.Equal(t, "Spirit", data.Engine)
 	assert.Equal(t, "apply_abc123", data.ApplyID)
-	require.Len(t, data.Tables, 1) // empty table name filtered
+	require.Len(t, data.Tables, 2) // empty table name filtered
 	assert.Equal(t, "users", data.Tables[0].TableName)
 	assert.Equal(t, int64(5000), data.Tables[0].RowsCopied)
 	assert.Equal(t, 50, data.Tables[0].PercentComplete)
+	assert.False(t, data.Tables[0].ReadyToComplete, "a copying table is not ready for cutover")
+	assert.Equal(t, "orders", data.Tables[1].TableName)
+	assert.True(t, data.Tables[1].ReadyToComplete, "a table parked at the cutover barrier renders as ready")
 }
 
 func TestPreviewCommentApplyProgress(t *testing.T) {

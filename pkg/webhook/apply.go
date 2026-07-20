@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -134,21 +133,12 @@ func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task, shar
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
 			IsInstant:           t.IsInstant,
-			ReadyToComplete:     taskReadyForCutover(t),
+			ReadyToComplete:     templates.TaskStatusReadyForCutover(string(t.State)),
 			ErrorMessage:        t.ErrorMessage,
 			Shards:              shardProgressForTable(shardsByTable, t.ApplyOperationID, t.Namespace, t.TableName),
 		})
 	}
 	return out
-}
-
-// taskReadyForCutover reports whether a table's task is ready for the operator
-// to cut over. A task parked at the cutover barrier has finished its copy and
-// verification phases — the remaining binlog catch-up happens under cutover
-// itself — so the barrier state is what makes the table ready. Engines report
-// no separate per-task readiness signal.
-func taskReadyForCutover(t *storage.Task) bool {
-	return state.IsState(t.State, state.Task.WaitingForCutover)
 }
 
 // shardProgressForTable returns the per-shard summary rows for a table, sorted by
