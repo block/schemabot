@@ -246,6 +246,7 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 			DDL:            tbl.DDL,
 			ChangeType:     tbl.ChangeType,
 			Status:         tbl.Status,
+			ErrorMessage:   tbl.ErrorMessage,
 			RowsCopied:     tbl.RowsCopied,
 			RowsTotal:      tbl.RowsTotal,
 			Percent:        int(tbl.PercentComplete),

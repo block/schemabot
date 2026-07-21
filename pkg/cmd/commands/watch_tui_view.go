@@ -312,6 +312,7 @@ func toTemplateTables(tables []tableProgress) []templates.TableProgress {
 			DDL:             t.DDL,
 			ChangeType:      t.ChangeType,
 			Status:          state.NormalizeTaskStatus(t.Status),
+			ErrorMessage:    t.ErrorMessage,
 			RowsCopied:      t.RowsCopied,
 			RowsTotal:       t.RowsTotal,
 			PercentComplete: t.Percent,

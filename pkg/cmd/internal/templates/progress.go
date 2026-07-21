@@ -521,8 +521,12 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
 	case state.Apply.Failed:
-		bar := ui.ProgressBarFailed(ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ❌ Failed\n", t.TableName, bar)
+		if ui.TableSkippedByFailure(t.Status, t.PercentComplete, t.RowsCopied, t.ErrorMessage) {
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⏭️ Skipped (blocked by earlier failure)\n", t.TableName)
+		} else {
+			bar := ui.ProgressBarFailed(ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ❌ Failed\n", t.TableName, bar)
+		}
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}

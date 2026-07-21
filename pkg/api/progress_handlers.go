@@ -439,9 +439,10 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 
 	setRevertSkippedMetadata(httpResp, apply)
 
-	// Overlay per-table timestamps from task records. The proto response
-	// doesn't carry task timestamps, but storage has them from engine
-	// progress polling (e.g., SHOW VITESS_MIGRATIONS started_timestamp).
+	// Overlay per-table timestamps and error detail from task records. The
+	// proto response doesn't carry task timestamps or per-table errors, but
+	// storage has them from engine progress polling (e.g., SHOW
+	// VITESS_MIGRATIONS started_timestamp) and failure handling.
 	if tasks, err := s.storage.Tasks().GetByApplyID(r.Context(), apply.ID); err == nil {
 		taskByTable := make(map[string]*storage.Task, len(tasks))
 		for _, t := range tasks {
@@ -455,6 +456,9 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 				}
 				if task.CompletedAt != nil && tpr.CompletedAt == "" {
 					tpr.CompletedAt = task.CompletedAt.Format(time.RFC3339)
+				}
+				if task.ErrorMessage != "" && tpr.ErrorMessage == "" {
+					tpr.ErrorMessage = task.ErrorMessage
 				}
 			}
 		}
@@ -1017,6 +1021,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			ChecksumRowsTotal:   task.ChecksumRowsTotal,
 			IsInstant:           task.IsInstant,
 			TaskID:              task.TaskIdentifier,
+			ErrorMessage:        task.ErrorMessage,
 		}
 		if task.ApplyOperationID != nil {
 			if deployment, ok := deploymentByOperationID[*task.ApplyOperationID]; ok {

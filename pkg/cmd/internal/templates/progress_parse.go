@@ -53,12 +53,16 @@ type ProgressOperation struct {
 
 // TableProgress represents progress for a single table schema change.
 type TableProgress struct {
-	TableName       string
-	Deployment      string
-	Namespace       string // Keyspace (Vitess) or schema name (MySQL)
-	ChangeType      string // create, alter, drop
-	DDL             string
-	Status          string
+	TableName  string
+	Deployment string
+	Namespace  string // Keyspace (Vitess) or schema name (MySQL)
+	ChangeType string // create, alter, drop
+	DDL        string
+	Status     string
+	// ErrorMessage is the table's own engine error, set when this table's work
+	// failed. Empty for a table that was marked failed without ever starting
+	// (blocked behind an earlier failure in the same apply).
+	ErrorMessage    string
 	RowsCopied      int64
 	RowsTotal       int64
 	PercentComplete int
@@ -175,6 +179,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			ChangeType:          tbl.ChangeType,
 			DDL:                 tbl.DDL,
 			Status:              state.NormalizeState(tbl.Status),
+			ErrorMessage:        tbl.ErrorMessage,
 			RowsCopied:          tbl.RowsCopied,
 			RowsTotal:           tbl.RowsTotal,
 			PercentComplete:     int(tbl.PercentComplete),

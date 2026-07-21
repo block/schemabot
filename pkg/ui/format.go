@@ -216,6 +216,19 @@ func TableStatePriority(taskState string) int {
 	}
 }
 
+// TableSkippedByFailure reports whether a failed table row represents work
+// that never started. When an apply fails, the tables still queued behind the
+// failure are marked failed alongside it, but the engine recorded no row-copy
+// progress and no error of their own for them. Renders label these tables as
+// skipped so the table that actually failed stands out. A table that failed
+// before copying any rows still carries its own engine error, so it renders
+// as failed, not skipped.
+// Used by both CLI and PR comment rendering so the two surfaces agree.
+func TableSkippedByFailure(status string, percentComplete int, rowsCopied int64, errorMessage string) bool {
+	return state.NormalizeTaskStatus(status) == state.Task.Failed &&
+		percentComplete <= 0 && rowsCopied <= 0 && errorMessage == ""
+}
+
 // CleanLintReason strips severity prefixes like "[ERROR] linter_name:" from
 // Spirit's raw lint violation strings for cleaner display. Handles multiple
 // violations joined by "; " by cleaning each segment individually.

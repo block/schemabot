@@ -456,8 +456,9 @@ func previewVitessFailedOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users", Namespace: "myapp_sharded",
-				DDL:    "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
-				Status: state.Apply.Failed,
+				DDL:          "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
+				Status:       state.Apply.Failed,
+				ErrorMessage: "vschema_error: table users has a changed column vindex",
 			},
 		},
 	}
@@ -862,8 +863,10 @@ func previewFailedOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users", Namespace: "testapp",
-				DDL:    "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
-				Status: state.Apply.Failed,
+				DDL:          "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
+				Status:       state.Apply.Failed,
+				ErrorMessage: "lock wait timeout exceeded; try restarting transaction",
+				RowsCopied:   358400, RowsTotal: 1120000, PercentComplete: 32,
 			},
 		},
 	}
