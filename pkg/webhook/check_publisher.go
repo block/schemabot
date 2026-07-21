@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -219,8 +220,21 @@ func prFilePaths(files []ghclient.PRFile) []string {
 	return paths
 }
 
-// upsertAggregateCheckRun computes the aggregate conclusion from the given checks
-// and creates or updates a GitHub check run with the specified name.
+// upsertAggregateCheckRun is the fire-and-forget wrapper used by the callers
+// that have no way to react to a failed aggregate write. It records the same
+// metrics and logs as upsertAggregateCheckRunOnce and discards the returned
+// error. Callers that own a retry mechanism (the durable dispatch path) call
+// upsertAggregateCheckRunOnce directly.
+func (h *Handler) upsertAggregateCheckRun(
+	ctx context.Context, client *ghclient.InstallationClient,
+	repo string, pr int, headSHA string,
+	dbChecks []*storage.Check, checkName string, environment string,
+) {
+	_ = h.upsertAggregateCheckRunOnce(ctx, client, repo, pr, headSHA, dbChecks, checkName, environment)
+}
+
+// upsertAggregateCheckRunOnce computes the aggregate conclusion from the given
+// checks and creates or updates a GitHub check run with the specified name.
 //
 // The environment parameter controls the storage key: for per-environment aggregates
 // it is the real environment name (e.g., "staging"), for the global aggregate it is
@@ -236,11 +250,16 @@ func prFilePaths(files []ghclient.PRFile) []string {
 //     in-progress placeholder instead of their stored conclusion, so results
 //     computed for a previous commit can never pass the aggregate on the
 //     current one.
-func (h *Handler) upsertAggregateCheckRun(
+//
+// It records the same operation metrics and logs as before and additionally
+// returns the underlying error so a caller with a retry mechanism can react to a
+// failed GitHub or storage write. A stored blocking reason is an intentional
+// fail-closed skip, not an operational failure, so it returns nil.
+func (h *Handler) upsertAggregateCheckRunOnce(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, headSHA string,
 	dbChecks []*storage.Check, checkName string, environment string,
-) {
+) error {
 	// Look up existing aggregate check state using the environment-specific key.
 	existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, environment, aggregateSentinel, aggregateSentinel)
 	if err != nil {
@@ -251,7 +270,7 @@ func (h *Handler) upsertAggregateCheckRun(
 			Status:      "error",
 		})
 		h.logger.Error("failed to look up aggregate check", "repo", repo, "pr", pr, "environment", environment, "error", err)
-		return
+		return fmt.Errorf("look up aggregate check for %s#%d (env %s): %w", repo, pr, environment, err)
 	}
 
 	// A stored blocking reason means a PR-level guard failed the aggregate
@@ -271,7 +290,7 @@ func (h *Handler) upsertAggregateCheckRun(
 			"blocked_head_sha", existing.HeadSHA,
 			"blocking_reason", existing.BlockingReason,
 			"check_run_id", existing.CheckRunID)
-		return
+		return nil
 	}
 
 	contributions, staleCount := normalizeStaleContributions(dbChecks, headSHA)
@@ -316,7 +335,7 @@ func (h *Handler) upsertAggregateCheckRun(
 				"environment", environment, "check_run_id", existing.CheckRunID,
 				"head_sha", headSHA, "status", status,
 				"conclusion", conclusion, "error", err)
-			return
+			return fmt.Errorf("update aggregate check run %d for %s#%d (env %s): %w", existing.CheckRunID, repo, pr, environment, err)
 		}
 		checkRunID = existing.CheckRunID
 	} else {
@@ -337,7 +356,7 @@ func (h *Handler) upsertAggregateCheckRun(
 				"repo", repo, "pr", pr, "check_name", checkName,
 				"environment", environment, "head_sha", headSHA,
 				"status", status, "conclusion", conclusion, "error", err)
-			return
+			return fmt.Errorf("create aggregate check run for %s#%d@%s (env %s): %w", repo, pr, headSHA, environment, err)
 		}
 		checkRunID = id
 	}
@@ -366,7 +385,7 @@ func (h *Handler) upsertAggregateCheckRun(
 			"environment", environment, "check_run_id", checkRunID,
 			"head_sha", headSHA, "status", status,
 			"conclusion", conclusion, "error", err)
-		return
+		return fmt.Errorf("store aggregate check state for %s#%d (env %s): %w", repo, pr, environment, err)
 	}
 
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -380,6 +399,7 @@ func (h *Handler) upsertAggregateCheckRun(
 		"environment", environment, "check_run_id", checkRunID,
 		"status", status, "conclusion", conclusion,
 		"per_database_checks", len(dbChecks))
+	return nil
 }
 
 // postPassingAggregates posts a passing aggregate check for each allowed environment.
