@@ -333,3 +333,105 @@ func TestPlanCommentMinimizeFailureRetriesOnNextSupersede(t *testing.T) {
 	assert.ElementsMatch(t, []string{"IC_node1001", "IC_node1002"}, fake.minimizedNodes())
 	assert.Equal(t, []string{"shaC"}, unminimizedHeads(t, st, repo, 42, "orders", "mysql"))
 }
+
+// insertPlanCommentRow records an already-posted plan comment directly in
+// storage, so a test can lay out a slot's history without the supersede pass
+// that posting through the handler would run.
+func insertPlanCommentRow(t *testing.T, st storage.Storage, repo string, pr int, database, scope, headSHA string, commentID int64, nodeID string) {
+	t.Helper()
+	require.NoError(t, st.PlanComments().Insert(t.Context(), &storage.PlanComment{
+		Repository:       repo,
+		PullRequest:      pr,
+		DatabaseName:     database,
+		DatabaseType:     "mysql",
+		EnvironmentScope: scope,
+		HeadSHA:          headSHA,
+		GitHubCommentID:  commentID,
+		GitHubNodeID:     nodeID,
+	}))
+}
+
+// TestStalePlanCommentsMinimizedWithoutNewComment exercises the up-to-date-PR
+// UX: when the current head's plan outcome supersedes prior comments without
+// posting a new comment — an auto-plan that resolves to no changes — plan
+// comments rendered at older heads collapse, since the pending DDL and apply
+// prompt they advertise no longer match the branch. A comment already
+// rendered at the current head stays expanded (it may be the only visible
+// plan for its environment scope), other databases' slots are untouched, and
+// the sweep never posts a comment of its own.
+func TestStalePlanCommentsMinimizedWithoutNewComment(t *testing.T) {
+	const repo = "org/plan-min-stale-sweep"
+	h, st, fake := setupPlanCommentHandler(t, repo)
+
+	insertPlanCommentRow(t, st, repo, 42, "orders", "production,staging", "shaA", 9001, "IC_stale_shaA")
+	insertPlanCommentRow(t, st, repo, 42, "orders", "staging", "shaB", 9002, "IC_current_shaB")
+	insertPlanCommentRow(t, st, repo, 42, "billing", "production,staging", "shaA", 9003, "IC_billing_shaA")
+
+	client, err := h.clientForRepo(repo, 12345)
+	require.NoError(t, err)
+	h.minimizeStalePlanComments(t.Context(), client, repo, 42, "orders", "mysql", "shaB")
+
+	assert.Equal(t, []string{"IC_stale_shaA"}, fake.minimizedNodes(),
+		"only the prior-head orders comment is minimized")
+	assert.Equal(t, []string{"shaB"}, unminimizedHeads(t, st, repo, 42, "orders", "mysql"),
+		"the current-head comment stays expanded and the stale row is recorded minimized")
+	assert.Equal(t, []string{"shaA"}, unminimizedHeads(t, st, repo, 42, "billing", "mysql"),
+		"another database's slot is untouched")
+	assert.Equal(t, 0, fake.createCount(), "the sweep posts no comment")
+}
+
+// TestStalePlanCommentSweepKeepsApplyOwnedHeadExpanded covers the safety hold
+// on the no-new-comment sweep: once an apply exists for the head a plan
+// comment was rendered at, that comment is the operational record of what ran.
+// A later head resolving to no changes — for example after the applied change
+// lands and the schema converges — must not hide it.
+func TestStalePlanCommentSweepKeepsApplyOwnedHeadExpanded(t *testing.T) {
+	const repo = "org/plan-min-stale-apply-owned"
+	h, st, fake := setupPlanCommentHandler(t, repo)
+	ctx := t.Context()
+
+	insertPlanCommentRow(t, st, repo, 42, "inventory", "staging", "shaA", 9001, "IC_owned_shaA")
+
+	// The shaA plan becomes an apply before the next push.
+	planID, err := st.Plans().Create(ctx, &storage.Plan{
+		PlanIdentifier: "plan_stale_owned_shaA",
+		Database:       "inventory",
+		DatabaseType:   "mysql",
+		Repository:     repo,
+		PullRequest:    42,
+		Environment:    "staging",
+		HeadSHA:        "shaA",
+		CreatedAt:      time.Now(),
+	})
+	require.NoError(t, err)
+	lock := &storage.Lock{
+		DatabaseName: "inventory",
+		DatabaseType: "mysql",
+		Repository:   repo,
+		PullRequest:  42,
+		Owner:        fmt.Sprintf("%s#42", repo),
+	}
+	require.NoError(t, st.Locks().Acquire(ctx, lock))
+	lock, err = st.Locks().Get(ctx, "inventory", "mysql")
+	require.NoError(t, err)
+	_, err = st.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply_stale_owned_shaA",
+		LockID:          lock.ID,
+		PlanID:          planID,
+		Database:        "inventory",
+		DatabaseType:    "mysql",
+		Repository:      repo,
+		PullRequest:     42,
+		Environment:     "staging",
+		Engine:          "spirit",
+		State:           state.Apply.Running,
+	})
+	require.NoError(t, err)
+
+	client, err := h.clientForRepo(repo, 12345)
+	require.NoError(t, err)
+	h.minimizeStalePlanComments(t.Context(), client, repo, 42, "inventory", "mysql", "shaB")
+
+	assert.Empty(t, fake.minimizedNodes(), "the apply-owned shaA comment must stay expanded")
+	assert.Equal(t, []string{"shaA"}, unminimizedHeads(t, st, repo, 42, "inventory", "mysql"))
+}

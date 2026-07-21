@@ -90,28 +90,58 @@ func (h *Handler) postTrackedPlanComment(repo string, pr int, installationID int
 }
 
 // minimizeSupersededPlanComments collapses the unminimized plan comments that
-// the newly posted comment supersedes. A comment whose plan became an apply
-// is kept expanded: the apply makes it the operational record of what ran,
-// and hiding it costs more than the noise it saves. Every failure keeps the
-// comment expanded and its row unminimized, so the next supersede retries it.
+// the newly posted comment supersedes, per planCommentSupersedes.
 func (h *Handler) minimizeSupersededPlanComments(ctx context.Context, client *ghclient.InstallationClient, posted *storage.PlanComment) {
+	h.minimizePlanCommentsForSlot(ctx, client,
+		posted.Repository, posted.PullRequest, posted.DatabaseName, posted.DatabaseType, posted.HeadSHA, posted)
+}
+
+// minimizeStalePlanComments collapses the slot's unminimized plan comments
+// rendered at a head other than the current one, for plan outcomes that
+// supersede prior comments without posting a new comment — an auto-plan
+// resolving to no changes still moves the head past every older comment,
+// whose pending DDL and apply prompt no longer match the branch. Same-head
+// comments stay expanded: one may be the only visible plan for its
+// environment scope.
+func (h *Handler) minimizeStalePlanComments(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database, databaseType, headSHA string) {
+	if database == "" || headSHA == "" {
+		// Without a database and head there is no slot identity to sweep;
+		// treating the empty identity as a slot could collapse untracked
+		// error-only comments across databases.
+		h.logger.Info("skipping stale plan comment minimize because no database or head resolved to key the slot",
+			"repo", repo, "pr", pr, "database", database, "database_type", databaseType, "head_sha", headSHA)
+		return
+	}
+	h.minimizePlanCommentsForSlot(ctx, client, repo, pr, database, databaseType, headSHA, nil)
+}
+
+// minimizePlanCommentsForSlot sweeps the slot's unminimized plan comments and
+// collapses the superseded ones. posted is the newly posted comment when the
+// sweep follows a post: its own row is skipped and supersession follows
+// planCommentSupersedes. When posted is nil the sweep follows an outcome with
+// no new comment, and only comments from heads other than headSHA are
+// superseded. A comment whose plan became an apply is kept expanded: the
+// apply makes it the operational record of what ran, and hiding it costs more
+// than the noise it saves. Every failure keeps the comment expanded and its
+// row unminimized, so the next sweep retries it.
+func (h *Handler) minimizePlanCommentsForSlot(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database, databaseType, headSHA string, posted *storage.PlanComment) {
 	slotAttrs := []any{
-		"repo", posted.Repository, "pr", posted.PullRequest,
-		"database", posted.DatabaseName, "database_type", posted.DatabaseType,
-		"head_sha", posted.HeadSHA,
+		"repo", repo, "pr", pr,
+		"database", database, "database_type", databaseType,
+		"head_sha", headSHA,
 	}
 
 	priors, err := h.service.Storage().PlanComments().ListUnminimizedForSlot(ctx,
-		posted.Repository, posted.PullRequest, posted.DatabaseName, posted.DatabaseType)
+		repo, pr, database, databaseType)
 	if err != nil {
-		h.logger.Error("failed to list prior plan comments; superseded plan comments stay expanded until the next plan comment posts",
+		h.logger.Error("failed to list prior plan comments; superseded plan comments stay expanded until the next supersede sweep",
 			append(slotAttrs, "error", err)...)
 		return
 	}
 
 	for _, prior := range priors {
 		// Skip the comment that was just posted (its row is in the list too).
-		if prior.ID == posted.ID || prior.GitHubCommentID == posted.GitHubCommentID {
+		if posted != nil && (prior.ID == posted.ID || prior.GitHubCommentID == posted.GitHubCommentID) {
 			continue
 		}
 		priorAttrs := []any{
@@ -120,8 +150,13 @@ func (h *Handler) minimizeSupersededPlanComments(ctx context.Context, client *gh
 			"environment_scope", prior.EnvironmentScope, "head_sha", prior.HeadSHA,
 			"comment_id", prior.GitHubCommentID,
 		}
-		if !planCommentSupersedes(posted, prior) {
-			h.logger.Debug("keeping plan comment expanded: not superseded (same head, different environment scope)", priorAttrs...)
+		if posted != nil {
+			if !planCommentSupersedes(posted, prior) {
+				h.logger.Debug("keeping plan comment expanded: not superseded (same head, different environment scope)", priorAttrs...)
+				continue
+			}
+		} else if prior.HeadSHA == headSHA {
+			h.logger.Debug("keeping plan comment expanded: it renders the current head", priorAttrs...)
 			continue
 		}
 
@@ -140,7 +175,7 @@ func (h *Handler) minimizeSupersededPlanComments(ctx context.Context, client *gh
 		}
 
 		if err := client.MinimizeComment(ctx, prior.Repository, prior.GitHubNodeID); err != nil {
-			h.logger.Error("failed to minimize superseded plan comment; it stays expanded and is retried on the next plan comment",
+			h.logger.Error("failed to minimize superseded plan comment; it stays expanded and is retried on the next supersede sweep",
 				append(priorAttrs, "error", err)...)
 			metrics.RecordPlanCommentMinimize(ctx, prior.Repository, "minimize_error")
 			continue
