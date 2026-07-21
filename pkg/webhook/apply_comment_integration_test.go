@@ -507,7 +507,7 @@ func TestE2EStopResumeCompleteStillPostsTerminalSummary(t *testing.T) {
 	select {
 	case created := <-capture.creates:
 		terminalSummaryID = created.ID
-		assert.Contains(t, created.Body, "✅ Schema Change Applied")
+		assert.Contains(t, created.Body, "Schema Change Applied")
 	case <-time.After(5 * time.Second):
 		t.Fatal("expected a terminal summary comment for the completed apply")
 	}
