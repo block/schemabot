@@ -129,6 +129,7 @@ const (
 	PreviewCommentUnsafeBlocked                PreviewType = "comment_unsafe_blocked"                  // Unsafe changes blocked (no --allow-unsafe)
 	PreviewCommentDropColumnBlocked            PreviewType = "comment_drop_column_blocked"             // Drop column blocked with destructive-drop guidance
 	PreviewCommentDropIndexBlocked             PreviewType = "comment_drop_index_blocked"              // Drop index blocked with destructive-drop guidance
+	PreviewCommentLintErrorsBlocked            PreviewType = "comment_lint_errors_blocked"             // Error-severity schema lint violations block apply
 	PreviewCommentApplyPlan                    PreviewType = "comment_apply_plan"                      // Locked apply-plan comment
 	PreviewCommentApplyPlanOptions             PreviewType = "comment_apply_plan_options"              // Locked apply-plan with options
 	PreviewCommentApplyPlanUnsafe              PreviewType = "comment_apply_plan_unsafe"               // Locked apply-plan with unsafe warning
@@ -196,5 +197,4 @@ const (
 	PreviewCommentCutoverActive         PreviewType = "comment_cutover_active"               // Cutover command when cutover is already in progress
 	PreviewCommentVolumeAccepted        PreviewType = "comment_volume_accepted"              // Volume command accepted
 	PreviewCommentVolumeInvalid         PreviewType = "comment_volume_invalid"               // Volume command with a missing or invalid level
-	PreviewCommentApplyAllType          PreviewType = "comment_apply_all"                    // Show all apply comment previews
 )

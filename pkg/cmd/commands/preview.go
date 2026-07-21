@@ -110,7 +110,6 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyBlocked, templates.PreviewCommentApplyBlockedCLI,
 		templates.PreviewCommentApplyActive,
 		templates.PreviewCommentApplyNoLock, templates.PreviewCommentBaseSchemaStale,
-		templates.PreviewCommentApplyAllType,
 		templates.PreviewCommentChecksGateNotPassing, templates.PreviewCommentChecksGateInProgress,
 		templates.PreviewCommentActorNotAuthorized, templates.PreviewCommentActorAuthUnavailable,
 		templates.PreviewCommentDatabaseNotConfigured,
@@ -307,7 +306,6 @@ Apply Command Comments (GitHub PR apply commands):
   comment_cutover_active        Cutover already in progress
   comment_volume_accepted       Volume request accepted
   comment_volume_invalid        Volume command with a missing or invalid level
-  comment_apply_all             Show all apply command previews
 
 Aggregate Types (grouped PR + CLI pairs):
   comment_plan_all              PR plan & status comments

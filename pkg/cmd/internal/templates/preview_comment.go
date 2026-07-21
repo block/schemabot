@@ -27,7 +27,7 @@ func previewCommentErrorsOutput() {
 		if i > 0 {
 			fmt.Println()
 		}
-		fmt.Println("---", s.name, strings.Repeat("-", 50-len(s.name)))
+		fmt.Println("---", s.name, strings.Repeat("-", max(50-len(s.name), 3)))
 		fmt.Println()
 		fmt.Print(s.fn())
 		fmt.Println()
@@ -55,6 +55,7 @@ func previewCommentAllOutput() {
 		{"UNSAFE CHANGES BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentUnsafeBlocked()) }},
 		{"DROP COLUMN BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentDropColumnBlocked()) }},
 		{"DROP INDEX BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentDropIndexBlocked()) }},
+		{"SCHEMA LINT ERRORS BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentLintErrorsBlocked()) }},
 		{"MULTI-ENV PLAN (IDENTICAL)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiEnvPlan()) }},
 		{"MULTI-ENV PLAN (DIFFERENT)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiEnvPlanDiff()) }},
 		{"MULTI-ENV PLAN (ERROR)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiEnvPlanError()) }},
@@ -107,70 +108,7 @@ func previewCommentAllOutput() {
 		if i > 0 {
 			fmt.Println()
 		}
-		fmt.Println("---", s.name, strings.Repeat("-", 50-len(s.name)))
-		fmt.Println()
-		s.fn()
-		fmt.Println()
-	}
-}
-
-func previewApplyCommandAllOutput() {
-	sections := []struct {
-		name string
-		fn   func()
-	}{
-		{"APPLY GATE: SCHEMA CHANGE APPLY (AUTOMATIC)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlan()) }},
-		{"APPLY GATE: SCHEMA CHANGE APPLY (WITH OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanOptions()) }},
-		{"APPLY GATE: SCHEMA CHANGE APPLY (DOWNGRADED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanDowngraded()) }},
-		{"APPLY STARTED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStarted()) }},
-		{"UNLOCK SUCCESS", func() { fmt.Print(webhooktemplates.PreviewCommentUnlockSuccess()) }},
-		{"APPLY BLOCKED BY OTHER PR", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByOtherPR()) }},
-		{"APPLY BLOCKED BY CLI", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByCLI()) }},
-		{"APPLY ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyInProgress()) }},
-		{"APPLY BLOCKED: PR CLOSED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedClosedPR()) }},
-		{"APPLY BLOCKED: PR MERGED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedMergedPR()) }},
-		{"NO LOCK FOUND", func() { fmt.Print(webhooktemplates.PreviewCommentApplyConfirmNoLock()) }},
-		{"BASE SCHEMA CHANGED SINCE PR DIVERGED", func() { fmt.Print(webhooktemplates.PreviewCommentBaseSchemaFreshnessRejected()) }},
-		{"BLOCKED BY PRIOR ENV (PENDING)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnv()) }},
-		{"BLOCKED BY PRIOR ENV (FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvFailed()) }},
-		{"BLOCKED BY PRIOR ENV (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvInProgress()) }},
-		{"REVIEW REQUIRED", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequired()) }},
-		{"REVIEW GATE ERROR (FAIL-CLOSED)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewGateError()) }},
-		{"ACTOR AUTHORIZATION: NOT AUTHORIZED", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandNotAuthorized()) }},
-		{"ACTOR AUTHORIZATION: UNAVAILABLE", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandAuthorizationUnavailable()) }},
-		{"ACTOR AUTHORIZATION: DATABASE NOT CONFIGURED", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandDatabaseNotConfigured()) }},
-		{"START COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentStartCommandAccepted()) }},
-		{"START COMMAND ALREADY PENDING", func() { fmt.Print(webhooktemplates.PreviewCommentStartCommandAlreadyRequested()) }},
-		{"CUTOVER COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted()) }},
-		{"CUTOVER COMMAND ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress()) }},
-		{"VOLUME COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted()) }},
-		{"VOLUME COMMAND INVALID LEVEL", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel()) }},
-		{"VOLUME COMMAND MISSING APPLY ID", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeMissingApplyID()) }},
-		{"VOLUME CHANGED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeSupersededProgress()) }},
-		{"RESUMED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentResumeSupersededProgress()) }},
-		{"REVERT: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentRevertSupersededProgress()) }},
-		{"SKIP REVERT: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentSkipRevertSupersededProgress()) }},
-		{"CUTOVER COMPLETE: SUPERSEDED CUTOVER PROMPT", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverSuperseded()) }},
-		{"RETRY: SUPERSEDED PROGRESS COMMENT (GENERIC)", func() { fmt.Print(webhooktemplates.PreviewCommentSupersededProgress()) }},
-		{"CHECKS GATE: NOT PASSING", func() {
-			fmt.Print(webhooktemplates.RenderApplyBlockedByNonPassingChecks("staging", []webhooktemplates.BlockingCheck{
-				{Name: "CI / unit-tests", State: "failure"},
-				{Name: "CI / lint", State: "timed_out"},
-			}))
-		}},
-		{"CHECKS GATE: IN PROGRESS", func() {
-			fmt.Print(webhooktemplates.RenderApplyBlockedByInProgressChecks("staging", []webhooktemplates.BlockingCheck{
-				{Name: "CI / unit-tests", State: "in_progress"},
-				{Name: "CI / integration-tests", State: "queued"},
-			}, nil))
-		}},
-	}
-
-	for i, s := range sections {
-		if i > 0 {
-			fmt.Println()
-		}
-		fmt.Println("---", s.name, strings.Repeat("-", 50-len(s.name)))
+		fmt.Println("---", s.name, strings.Repeat("-", max(50-len(s.name), 3)))
 		fmt.Println()
 		s.fn()
 		fmt.Println()
@@ -205,6 +143,7 @@ func previewCommentPlanAllOutput() {
 		{"MULTI-ENV PLAN (LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiEnvPlanLint()) }},
 		{"DROP COLUMN BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentDropColumnBlocked()) }},
 		{"DROP INDEX BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentDropIndexBlocked()) }},
+		{"SCHEMA LINT ERRORS BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentLintErrorsBlocked()) }},
 		{"HELP COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentHelp()) }},
 		{"SUPPORT CHANNEL FOOTER", func() { fmt.Print(webhooktemplates.PreviewCommentSupportChannel()) }},
 		{"NO CONFIG (NO -D FLAG)", func() { fmt.Print(webhooktemplates.PreviewCommentErrorNoConfig()) }},
@@ -225,16 +164,8 @@ func previewCommentLockingAllOutput() {
 		name string
 		fn   func()
 	}{
-		{"APPLY BLOCKED BY OTHER PR", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByOtherPR()) }},
-		{"APPLY BLOCKED BY CLI", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByCLI()) }},
 		{"UNLOCK SUCCESS", func() { fmt.Print(webhooktemplates.PreviewCommentUnlockSuccess()) }},
-		{"APPLY ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyInProgress()) }},
 		{"NO LOCK FOUND", func() { fmt.Print(webhooktemplates.PreviewCommentApplyConfirmNoLock()) }},
-		{"BLOCKED BY PRIOR ENV (PENDING)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnv()) }},
-		{"BLOCKED BY PRIOR ENV (FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvFailed()) }},
-		{"BLOCKED BY PRIOR ENV (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvInProgress()) }},
-		{"REVIEW REQUIRED", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequired()) }},
-		{"REVIEW GATE ERROR (FAIL-CLOSED)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewGateError()) }},
 	}
 	printSections(sections)
 }
@@ -249,6 +180,40 @@ func previewCommentApplyFlowAllOutput() {
 		{"SCHEMA CHANGE APPLY (DOWNGRADED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanDowngraded()) }},
 		{"SCHEMA CHANGE APPLY (VITESS + OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessApplyPlan()) }},
 		{"APPLY STARTED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStarted()) }},
+		// Blocked applies: the apply command was rejected before starting
+		{"APPLY BLOCKED BY OTHER PR", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByOtherPR()) }},
+		{"APPLY BLOCKED BY CLI", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByCLI()) }},
+		{"APPLY BLOCKED: ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyInProgress()) }},
+		{"APPLY BLOCKED: PR CLOSED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedClosedPR()) }},
+		{"APPLY BLOCKED: PR MERGED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedMergedPR()) }},
+		{"APPLY BLOCKED: BASE SCHEMA CHANGED SINCE PR DIVERGED", func() { fmt.Print(webhooktemplates.PreviewCommentBaseSchemaFreshnessRejected()) }},
+		{"APPLY BLOCKED: SCHEMA STALE (NEW COMMITS)", func() { fmt.Print(webhooktemplates.PreviewCommentStaleSchemaRejected()) }},
+		{"APPLY BLOCKED: CONFIRMED PLAN STALE", func() { fmt.Print(webhooktemplates.PreviewCommentStalePlanRejected()) }},
+		{"APPLY BLOCKED BY PRIOR ENV (PENDING)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnv()) }},
+		{"APPLY BLOCKED BY PRIOR ENV (FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvFailed()) }},
+		{"APPLY BLOCKED BY PRIOR ENV (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvInProgress()) }},
+		{"APPLY BLOCKED: PRIOR ENV CHECK MISSING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByMissingPriorEnvCheck()) }},
+		{"APPLY BLOCKED: PRIOR ENV CHECK READ ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvCheckError()) }},
+		{"APPLY BLOCKED: PRIOR ENV CHECK UNTRUSTED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByUntrustedPriorEnvCheck()) }},
+		{"APPLY BLOCKED: ENVIRONMENT NOT IN PROMOTION ORDER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByUnlistedEnvironment()) }},
+		{"APPLY BLOCKED: REVIEW REQUIRED", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequired()) }},
+		{"APPLY BLOCKED: REVIEW GATE ERROR (FAIL-CLOSED)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewGateError()) }},
+		{"APPLY BLOCKED: CHECKS NOT PASSING", func() {
+			fmt.Print(webhooktemplates.RenderApplyBlockedByNonPassingChecks("staging", []webhooktemplates.BlockingCheck{
+				{Name: "CI / unit-tests", State: "failure"},
+				{Name: "CI / lint", State: "timed_out"},
+			}))
+		}},
+		{"APPLY BLOCKED: CHECKS IN PROGRESS", func() {
+			fmt.Print(webhooktemplates.RenderApplyBlockedByInProgressChecks("staging", []webhooktemplates.BlockingCheck{
+				{Name: "CI / unit-tests", State: "in_progress"},
+				{Name: "CI / integration-tests", State: "queued"},
+			}, nil))
+		}},
+		{"APPLY BLOCKED: CHECK STATUS READ ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByCheckStatusError()) }},
+		{"APPLY BLOCKED: ACTOR NOT AUTHORIZED", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandNotAuthorized()) }},
+		{"ACTOR AUTHORIZATION: UNAVAILABLE", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandAuthorizationUnavailable()) }},
+		{"ACTOR AUTHORIZATION: DATABASE NOT CONFIGURED", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandDatabaseNotConfigured()) }},
 		// Single-table (most common case)
 		{"SINGLE TABLE: RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplySingleProgress()) }},
 		{"SINGLE TABLE: RUNNING (VOLUME TUNED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplySingleProgressVolume()) }},
@@ -448,8 +413,9 @@ func printSections(sections []struct {
 		}
 		// Clamp the trailing rule so a section name longer than the target width
 		// doesn't pass a negative count to strings.Repeat (which panics and would
-		// abort the whole TEMPLATES.md regeneration).
-		dashes := max(50-len(s.name), 0)
+		// abort the whole TEMPLATES.md regeneration). Keep at least a few dashes
+		// so the section-marker line still matches the wrapper's pattern.
+		dashes := max(50-len(s.name), 3)
 		fmt.Println("---", s.name, strings.Repeat("-", dashes))
 		fmt.Println()
 		s.fn()
