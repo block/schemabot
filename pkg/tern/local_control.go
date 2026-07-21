@@ -380,12 +380,12 @@ func (c *LocalClient) requestCancel(ctx context.Context, req *ternv1.CancelReque
 		return nil, fmt.Errorf("schema change %s is already terminal (state: %s)", apply.ApplyIdentifier, apply.State)
 	}
 
-	if revertWindow, err := c.applyHasRevertWindowTask(ctx, apply); err != nil {
+	if revertPhase, err := c.applyRevertPhaseBlock(ctx, apply); err != nil {
 		return nil, err
-	} else if revertWindow {
-		c.logger.Warn("cancel rejected: schema change is in the revert window and has already cut over",
-			"apply_id", apply.ApplyIdentifier, "state", apply.State)
-		return nil, errors.New(revertWindowStopRejectionMessage(apply.ApplyIdentifier))
+	} else if revertPhase != "" {
+		c.logger.Warn("cancel rejected: schema change is in a revert phase and has already cut over",
+			"apply_id", apply.ApplyIdentifier, "state", apply.State, "revert_phase", revertPhase)
+		return nil, errors.New(revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase))
 	}
 
 	controlStore := c.storage.ControlRequests()
@@ -438,13 +438,14 @@ func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, 
 		return nil, fmt.Errorf("no active schema change")
 	}
 
-	if revertWindow, err := c.applyHasRevertWindowTask(ctx, apply); err != nil {
+	if revertPhase, err := c.applyRevertPhaseBlock(ctx, apply); err != nil {
 		return nil, err
-	} else if revertWindow {
-		c.logger.Warn("stop rejected: schema change is in the revert window and has already cut over",
+	} else if revertPhase != "" {
+		c.logger.Warn("stop rejected: schema change is in a revert phase and has already cut over",
 			"apply_id", apply.ApplyIdentifier,
-			"state", apply.State)
-		return nil, errors.New(revertWindowStopRejectionMessage(apply.ApplyIdentifier))
+			"state", apply.State,
+			"revert_phase", revertPhase)
+		return nil, errors.New(revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase))
 	}
 
 	controlStore := c.storage.ControlRequests()
@@ -506,15 +507,23 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 		targetApply = apply
 	}
 
-	// A task in the revert window has already cut over: the new schema is live.
-	// Stop must not finalize it as cancelled — that would record a deployed
-	// change as if nothing happened. Reject so the operator chooses explicitly
-	// between revert (undo the deployed change) and skip-revert (finalize it).
-	if revertTask := firstRevertWindowTask(tasks, targetApplyID); revertTask != nil {
-		applyIdentifier := c.resolveRevertWindowApplyIdentifier(ctx, req, targetApply, revertTask)
-		c.logger.Warn("stop rejected: schema change is in the revert window and has already cut over",
+	// A task in a revert phase has already cut over: the new schema is live (or
+	// being unwound). Stop must not finalize it as cancelled — that would record
+	// a deployed change as if nothing happened, or record an in-flight revert as
+	// settled. Reject so the operator chooses revert or skip-revert, or waits
+	// for the in-flight revert to finish.
+	if revertTask := firstRevertPhaseTask(tasks, targetApplyID); revertTask != nil {
+		applyIdentifier := c.resolveRevertPhaseApplyIdentifier(ctx, req, targetApply, revertTask)
+		c.logger.Warn("stop rejected: schema change is in a revert phase and has already cut over",
 			"apply_id", applyIdentifier, "task_id", revertTask.TaskIdentifier, "state", revertTask.State)
-		return nil, errors.New(revertWindowStopRejectionMessage(applyIdentifier))
+		return nil, errors.New(revertPhaseControlRejectionMessage(applyIdentifier, revertTask.State))
+	}
+	// Skip-revert finalization has no task marker (the tasks are already
+	// terminal), so the resolved apply's own state is the only signal.
+	if targetApply != nil && applyInRevertPhase(targetApply) {
+		c.logger.Warn("stop rejected: schema change is in a revert phase and has already cut over",
+			append(targetApply.LogAttrs(), "revert_phase", targetApply.State)...)
+		return nil, errors.New(revertPhaseControlRejectionMessage(targetApply.ApplyIdentifier, targetApply.State))
 	}
 
 	eng := c.getEngine()
@@ -631,11 +640,18 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		targetApply = apply
 	}
 
-	if revertTask := firstRevertWindowTask(tasks, targetApplyID); revertTask != nil {
-		applyIdentifier := c.resolveRevertWindowApplyIdentifier(ctx, &ternv1.StopRequest{ApplyId: req.ApplyId, Environment: req.Environment}, targetApply, revertTask)
-		c.logger.Warn("cancel rejected: schema change is in the revert window and has already cut over",
+	if revertTask := firstRevertPhaseTask(tasks, targetApplyID); revertTask != nil {
+		applyIdentifier := c.resolveRevertPhaseApplyIdentifier(ctx, &ternv1.StopRequest{ApplyId: req.ApplyId, Environment: req.Environment}, targetApply, revertTask)
+		c.logger.Warn("cancel rejected: schema change is in a revert phase and has already cut over",
 			append(revertTask.LogAttrs(), "apply_id", applyIdentifier)...)
-		return nil, errors.New(revertWindowStopRejectionMessage(applyIdentifier))
+		return nil, errors.New(revertPhaseControlRejectionMessage(applyIdentifier, revertTask.State))
+	}
+	// Skip-revert finalization has no task marker (the tasks are already
+	// terminal), so the resolved apply's own state is the only signal.
+	if targetApply != nil && applyInRevertPhase(targetApply) {
+		c.logger.Warn("cancel rejected: schema change is in a revert phase and has already cut over",
+			append(targetApply.LogAttrs(), "revert_phase", targetApply.State)...)
+		return nil, errors.New(revertPhaseControlRejectionMessage(targetApply.ApplyIdentifier, targetApply.State))
 	}
 
 	eng := c.getEngine()
@@ -922,18 +938,19 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		return c.stopHandledUnlessStartPending(ctx, apply)
 	}
 
-	// A revert-window apply has already cut over. Stop is a permanent rejection,
+	// A revert-phase apply has already cut over. Stop is a permanent rejection,
 	// not a retryable error: failing the durable request resolves it terminally
 	// so the operator-owned retry loop stops re-running stop. The operator must
-	// revert (undo) or skip-revert (finalize) instead.
-	if revertWindow, err := c.applyHasRevertWindowTask(ctx, apply); err != nil {
+	// revert (undo) or skip-revert (finalize), or wait out an in-flight revert.
+	if revertPhase, err := c.applyRevertPhaseBlock(ctx, apply); err != nil {
 		return true, err
-	} else if revertWindow {
-		message := revertWindowStopRejectionMessage(apply.ApplyIdentifier)
-		c.logger.Warn("rejecting pending stop request: schema change is in the revert window and has already cut over",
+	} else if revertPhase != "" {
+		message := revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase)
+		c.logger.Warn("rejecting pending stop request: schema change is in a revert phase and has already cut over",
 			"apply_id", apply.ApplyIdentifier,
 			"requested_by", controlRequestCaller(controlReq),
-			"state", apply.State)
+			"state", apply.State,
+			"revert_phase", revertPhase)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending stop request rejected: %s%s", message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop, message); err != nil {
@@ -985,12 +1002,12 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		}
 		return true, nil
 	}
-	if revertWindow, err := c.applyHasRevertWindowTask(ctx, apply); err != nil {
+	if revertPhase, err := c.applyRevertPhaseBlock(ctx, apply); err != nil {
 		return true, err
-	} else if revertWindow {
-		message := revertWindowStopRejectionMessage(apply.ApplyIdentifier)
-		c.logger.Warn("rejecting pending cancel request: schema change is in the revert window and has already cut over",
-			append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
+	} else if revertPhase != "" {
+		message := revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase)
+		c.logger.Warn("rejecting pending cancel request: schema change is in a revert phase and has already cut over",
+			append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq), "revert_phase", revertPhase)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending cancel request rejected: %s%s", message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel, message); err != nil {
@@ -1027,43 +1044,57 @@ func (c *LocalClient) processPendingCancelOrStopControlRequest(ctx context.Conte
 	return c.processPendingStopControlRequest(ctx, apply)
 }
 
-// firstRevertWindowTask returns the first targeted task that is in the revert
-// window, or nil if none are. A revert-window task has already cut over, so the
-// stop path must reject rather than treat it as a cancellable in-flight change.
+// firstRevertPhaseTask returns the first targeted task that is in a revert
+// phase (revert window held open, or a revert in flight), or nil if none are. A
+// revert-phase task has already cut over, so the stop and cancel paths must
+// reject rather than treat it as a cancellable in-flight change: a revert-window
+// task needs the operator to choose revert or skip-revert, and a reverting task
+// has the engine unwinding the change — cancelling the deploy request there
+// would interrupt the revert at an arbitrary point.
 //
 // When targetApplyID is 0 (an untargeted stop with no apply id), any
-// revert-window task on the database rejects the whole stop, even one belonging
+// revert-phase task on the database rejects the whole stop, even one belonging
 // to a different apply. This is bounded by the one-active-apply-per-target
 // invariant: storage permits at most one active apply per (database, database
 // type, environment), and LocalClient is scoped to a single such target, so a
-// revert-window task from a second, distinct apply cannot coexist with another
+// revert-phase task from a second, distinct apply cannot coexist with another
 // active apply on the same target. Cross-apply coexistence is therefore not a
 // case this scope has to disambiguate.
-func firstRevertWindowTask(tasks []*storage.Task, targetApplyID int64) *storage.Task {
+func firstRevertPhaseTask(tasks []*storage.Task, targetApplyID int64) *storage.Task {
 	for _, task := range tasks {
 		if targetApplyID > 0 && task.ApplyID != targetApplyID {
 			continue
 		}
-		if state.IsState(task.State, state.Task.RevertWindow) {
+		if state.IsState(task.State, state.Task.RevertWindow, state.Task.Reverting) {
 			return task
 		}
 	}
 	return nil
 }
 
-// revertWindowStopRejectionMessage is the operator-facing reason a stop targeting
-// a revert-window schema change is permanently rejected. The change has already
-// cut over, so the operator must choose revert or skip-revert.
-func revertWindowStopRejectionMessage(applyIdentifier string) string {
-	return fmt.Sprintf("schema change %s is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it", applyIdentifier)
+// revertPhaseControlRejectionMessage is the operator-facing reason a stop or
+// cancel targeting a revert-phase schema change is permanently rejected. The
+// change has already cut over, so the operator's options depend on the phase:
+// in the revert window they must choose revert or skip-revert; once a revert or
+// skip-revert is underway the engine finishes it on its own and no control
+// operation can meaningfully interrupt it.
+func revertPhaseControlRejectionMessage(applyIdentifier, phase string) string {
+	switch {
+	case state.IsState(phase, state.Apply.Reverting):
+		return fmt.Sprintf("schema change %s is being reverted and has already been applied: the revert is in progress and will complete on its own", applyIdentifier)
+	case state.IsState(phase, state.Apply.SkippingRevert):
+		return fmt.Sprintf("schema change %s is finalizing skip-revert and has already been applied: skip-revert is in progress and will complete on its own", applyIdentifier)
+	default:
+		return fmt.Sprintf("schema change %s is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it", applyIdentifier)
+	}
 }
 
-// resolveRevertWindowApplyIdentifier returns the apply-level identifier an
+// resolveRevertPhaseApplyIdentifier returns the apply-level identifier an
 // operator supplied or recognizes, not the per-table task identifier. It prefers
 // the requested apply id, then the resolved target apply, then a lookup of the
 // revert task's apply, falling back to the task identifier only if the apply
 // cannot be loaded.
-func (c *LocalClient) resolveRevertWindowApplyIdentifier(ctx context.Context, req *ternv1.StopRequest, targetApply *storage.Apply, revertTask *storage.Task) string {
+func (c *LocalClient) resolveRevertPhaseApplyIdentifier(ctx context.Context, req *ternv1.StopRequest, targetApply *storage.Apply, revertTask *storage.Task) string {
 	if req.ApplyId != "" {
 		return req.ApplyId
 	}
@@ -1072,27 +1103,36 @@ func (c *LocalClient) resolveRevertWindowApplyIdentifier(ctx context.Context, re
 	}
 	apply, err := c.storage.Applies().Get(ctx, revertTask.ApplyID)
 	if err != nil {
-		c.logger.Warn("could not load apply to resolve revert-window stop identifier; using task identifier",
+		c.logger.Warn("could not load apply to resolve revert-phase rejection identifier; using task identifier",
 			"task_id", revertTask.TaskIdentifier, "error", err)
 		return revertTask.TaskIdentifier
 	}
 	if apply == nil {
-		c.logger.Warn("apply not found while resolving revert-window stop identifier; using task identifier",
+		c.logger.Warn("apply not found while resolving revert-phase rejection identifier; using task identifier",
 			"task_id", revertTask.TaskIdentifier)
 		return revertTask.TaskIdentifier
 	}
 	return apply.ApplyIdentifier
 }
 
-// applyHasRevertWindowTask reports whether any task for the apply is in the
-// revert window. It reads the stored tasks directly so the durable stop path
-// detects the same cut-over condition the synchronous stop path rejects on.
-func (c *LocalClient) applyHasRevertWindowTask(ctx context.Context, apply *storage.Apply) (bool, error) {
+// applyRevertPhaseBlock returns the revert-phase state that blocks a stop or
+// cancel of this apply, or "" when the apply is not in a revert phase. The
+// apply state covers phases with no task marker (skip-revert finalization, and
+// task-less applies such as VSchema-only changes); the stored tasks are read
+// directly so the durable control path detects the same cut-over condition the
+// synchronous path rejects on even when the apply row lags the task states.
+func (c *LocalClient) applyRevertPhaseBlock(ctx context.Context, apply *storage.Apply) (string, error) {
+	if applyInRevertPhase(apply) {
+		return apply.State, nil
+	}
 	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
-		return false, fmt.Errorf("load tasks for apply %s to detect revert window before stop: %w", apply.ApplyIdentifier, err)
+		return "", fmt.Errorf("load tasks for apply %s to detect a revert phase before stop or cancel: %w", apply.ApplyIdentifier, err)
 	}
-	return firstRevertWindowTask(tasks, apply.ID) != nil, nil
+	if revertTask := firstRevertPhaseTask(tasks, apply.ID); revertTask != nil {
+		return revertTask.State, nil
+	}
+	return "", nil
 }
 
 // hasLiveEngineWork reports whether a task in this state has live engine or
@@ -1116,6 +1156,12 @@ func (c *LocalClient) applyHasRevertWindowTask(ctx context.Context, apply *stora
 //     other live states avoid. eng.Stop (CancelDeployRequest) is keyed only on the
 //     persisted deploy request id, so cancelling a retryable task is safe; stop is
 //     a terminal operator action that ends the apply rather than retrying it.
+//
+// Reverting is deliberately absent even though the engine is actively unwinding
+// the change: the control gates permanently reject stop/cancel for revert-phase
+// tasks before any engine sweep runs, because cancelling a deploy request
+// mid-revert would interrupt the unwind at an arbitrary point. The revert owns
+// the terminal outcome.
 func hasLiveEngineWork(taskState string) bool {
 	return state.IsState(taskState,
 		state.Task.Running,
@@ -1394,6 +1440,15 @@ func (c *LocalClient) markApplyCancelled(ctx context.Context, applyID int64) err
 	}
 	if apply == nil {
 		return fmt.Errorf("load apply %d for cancelled state: %w", applyID, storage.ErrApplyNotFound)
+	}
+	// A revert-phase apply has cut over and its outcome is owned by the engine's
+	// revert or skip-revert; recording it cancelled would settle storage while
+	// the provider keeps working. The control gates reject stop/cancel before
+	// reaching here — this backstop keeps any other path fail-closed.
+	if applyInRevertPhase(apply) {
+		c.logger.Warn("refusing to mark revert-phase apply cancelled; the in-flight revert phase owns the outcome",
+			apply.LogAttrs()...)
+		return fmt.Errorf("mark apply %s cancelled: %s", apply.ApplyIdentifier, revertPhaseControlRejectionMessage(apply.ApplyIdentifier, apply.State))
 	}
 	now := time.Now()
 	apply.State = state.Apply.Cancelled
