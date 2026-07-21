@@ -82,6 +82,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentHelp, templates.PreviewCommentSupportChannel,
 		templates.PreviewCommentErrors, templates.PreviewCommentUnsafeBlocked,
 		templates.PreviewCommentDropColumnBlocked, templates.PreviewCommentDropIndexBlocked,
+		templates.PreviewCommentLintErrorsBlocked,
 		templates.PreviewCommentApplyPlan, templates.PreviewCommentApplyPlanOptions,
 		templates.PreviewCommentApplyPlanUnsafe,
 		templates.PreviewCommentApplyProgress, templates.PreviewCommentApplyCompleted,
@@ -110,7 +111,6 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyBlocked, templates.PreviewCommentApplyBlockedCLI,
 		templates.PreviewCommentApplyActive,
 		templates.PreviewCommentApplyNoLock, templates.PreviewCommentBaseSchemaStale,
-		templates.PreviewCommentApplyAllType,
 		templates.PreviewCommentChecksGateNotPassing, templates.PreviewCommentChecksGateInProgress,
 		templates.PreviewCommentActorNotAuthorized, templates.PreviewCommentActorAuthUnavailable,
 		templates.PreviewCommentDatabaseNotConfigured,
@@ -255,6 +255,7 @@ Comment Templates (GitHub PR comments):
   comment_unsafe_blocked        Unsafe changes blocked (no --allow-unsafe)
   comment_drop_column_blocked   Drop column blocked with destructive-drop guidance
   comment_drop_index_blocked    Drop index blocked with destructive-drop guidance
+  comment_lint_errors_blocked   Error-severity schema lint violations block apply
   comment_single_progress       Single table: running (most common case)
   comment_single_complete       Single table: completed
   comment_single_failed         Single table: failed
@@ -307,7 +308,6 @@ Apply Command Comments (GitHub PR apply commands):
   comment_cutover_active        Cutover already in progress
   comment_volume_accepted       Volume request accepted
   comment_volume_invalid        Volume command with a missing or invalid level
-  comment_apply_all             Show all apply command previews
 
 Aggregate Types (grouped PR + CLI pairs):
   comment_plan_all              PR plan & status comments

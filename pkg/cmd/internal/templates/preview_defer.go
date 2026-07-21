@@ -247,7 +247,7 @@ func previewDeferAllOutput() {
 		if i > 0 {
 			fmt.Println()
 		}
-		fmt.Println("---", s.name, strings.Repeat("-", 50-len(s.name)))
+		fmt.Println("---", s.name, strings.Repeat("-", max(50-len(s.name), 3)))
 		fmt.Println()
 		s.fn()
 	}

@@ -43,8 +43,8 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
 ⚠️ **Lint Warnings**:
-- [orders] New column uses floating-point data type
-- [users] Column added without DEFAULT value
+- [users] Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
+- [products] Index 'idx_category' on columns (category) is redundant - covered by index 'idx_category_price' on columns (category, price)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -670,8 +670,8 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 </details>
 
 ⚠️ **Lint Warnings**:
-- [orders] Primary key uses signed integer type (should be UNSIGNED)
-- [users] Column uses utf8 charset (should be utf8mb4)
+- [users] Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
+- [products] Index 'idx_category' on columns (category) is redundant - covered by index 'idx_category_price' on columns (category, price)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -745,6 +745,37 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 **Destructive drop guidance:**
 
 Before dropping an index in MySQL, first make the dropped index invisible and verify application queries no longer rely on it for safe performance.
+
+**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
+```
+schemabot apply -e staging --allow-unsafe
+```
+
+</details>
+
+<details>
+<summary><a name="schema-lint-errors-blocked"></a><strong>Schema Lint Errors Blocked</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` MODIFY COLUMN `id` int NOT NULL AUTO_INCREMENT;
+
+ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
+```
+
+📋 **Plan**: **2** tables to alter
+
+---
+
+**⛔ 2 Unsafe Changes Detected:**
+- `orders`: Primary key column "id" has type "int"
+- `users`: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
 
 **🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
 ```
@@ -1309,47 +1340,6 @@ Apply in progress
 ### PR Comments
 
 <details>
-<summary><a name="apply-blocked-by-other-pr"></a><strong>Apply Blocked By Other PR</strong></summary>
-
-
-## 🔒 Apply Blocked — Staging
-
-**Database**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-Another PR currently holds the lock for this database.
-
-**Locked by**: [block/myapp#42](https://github.com/block/myapp/pull/42)
-**Since**: 2026-03-15 12:30:00 UTC
-
-Wait for the other PR to complete or ask the lock holder to run `schemabot unlock`.
-
-</details>
-
-<details>
-<summary><a name="apply-blocked-by-cli"></a><strong>Apply Blocked By CLI</strong></summary>
-
-
-## 🔒 Apply Blocked — Staging
-
-**Database**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-A CLI session currently holds the lock for this database.
-
-**Locked by**: `cli:jackjackbits@macbook.local`
-**Since**: 2026-03-15 14:00:00 UTC
-
-Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock with:
-```
-schemabot unlock -d testapp --force
-```
-
-</details>
-
-<details>
 <summary><a name="unlock-success"></a><strong>Unlock Success</strong></summary>
 
 
@@ -1360,22 +1350,6 @@ schemabot unlock -d testapp --force
 *Released by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 The database is now available for schema changes.
-
-</details>
-
-<details>
-<summary><a name="apply-already-in-progress"></a><strong>Apply Already In Progress</strong></summary>
-
-
-## ⚠️ Apply Already In Progress — Staging
-
-**Database**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-An apply is already running for this PR (apply ID: `apply-a1b2c3d4e5f6`, state: `running`).
-
-Wait for it to complete or stop it first.
 
 </details>
 
@@ -1392,93 +1366,6 @@ No apply lock is held for this database. Run `apply` first to generate a plan an
 ```
 schemabot apply -e staging
 ```
-
-</details>
-
-<details>
-<summary><a name="blocked-by-prior-env-pending"></a><strong>Blocked By Prior Env (Pending)</strong></summary>
-
-
-## ❌ Apply Blocked — Production
-
-**Database**: `testapp`
-
-Staging has pending changes. Apply staging first before applying to production.
-
-```
-schemabot apply -e staging
-```
-
-</details>
-
-<details>
-<summary><a name="blocked-by-prior-env-failed"></a><strong>Blocked By Prior Env (Failed)</strong></summary>
-
-
-## ❌ Apply Blocked — Production
-
-**Database**: `testapp`
-
-Staging failed. Fix the issue and re-apply staging before applying to production.
-
-```
-schemabot apply -e staging
-```
-
-</details>
-
-<details>
-<summary><a name="blocked-by-prior-env-in-progress"></a><strong>Blocked By Prior Env (In Progress)</strong></summary>
-
-
-## ⏳ Apply Blocked — Production
-
-**Database**: `testapp`
-
-Staging is currently in progress. Wait for it to complete before applying to production.
-
-Once staging completes, retry:
-```
-schemabot apply -e production
-```
-
-</details>
-
-<details>
-<summary><a name="review-required"></a><strong>Review Required</strong></summary>
-
-
-## Review Required
-
-**Database**: `testapp` | **Environment**: `staging`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-Schema changes require approval from an authorized reviewer before applying.
-
-**Authorized reviewers**:
-- @acme/schema-reviewers
-- @jdoe
-
-### Next steps
-1. Request a review from an authorized reviewer above
-2. Once approved, run `schemabot apply -e staging` again
-
-</details>
-
-<details>
-<summary><a name="review-gate-error-failclosed"></a><strong>Review Gate Error (Fail-closed)</strong></summary>
-
-
-## ❌ Apply Failed
-
-**Environment**: `staging`
-
-*Requested by @jackjackbits at  UTC*
-
-### Error
-
-> Review gate check failed: expand team @acme/schema-reviewers: team membership cannot be read. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
 </details>
 
 ### CLI Output
@@ -1879,6 +1766,401 @@ CREATE TABLE `addresses` (
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 Schema changes are being applied. This comment will be updated with progress.
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-by-other-pr"></a><strong>Apply Blocked By Other PR</strong></summary>
+
+
+## 🔒 Apply Blocked — Staging
+
+**Database**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+Another PR currently holds the lock for this database.
+
+**Locked by**: [block/myapp#42](https://github.com/block/myapp/pull/42)
+**Since**: 2026-03-15 12:30:00 UTC
+
+Wait for the other PR to complete or ask the lock holder to run `schemabot unlock`.
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-by-cli"></a><strong>Apply Blocked By CLI</strong></summary>
+
+
+## 🔒 Apply Blocked — Staging
+
+**Database**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+A CLI session currently holds the lock for this database.
+
+**Locked by**: `cli:jackjackbits@macbook.local`
+**Since**: 2026-03-15 14:00:00 UTC
+
+Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock with:
+```
+schemabot unlock -d testapp --force
+```
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-already-in-progress"></a><strong>Apply Blocked: Already In Progress</strong></summary>
+
+
+## ⚠️ Apply Already In Progress — Staging
+
+**Database**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+An apply is already running for this PR (apply ID: `apply-a1b2c3d4e5f6`, state: `running`).
+
+Wait for it to complete or stop it first.
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-pr-closed"></a><strong>Apply Blocked: PR Closed</strong></summary>
+
+
+## ⛔ Apply Blocked: PR Is Closed — Staging
+
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+This PR is closed, so its schema changes can never merge. SchemaBot only applies schema changes from open PRs.
+
+Reopen this PR, or open a new PR with the schema change, and apply from there.
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-pr-merged"></a><strong>Apply Blocked: PR Merged</strong></summary>
+
+
+## ⛔ Apply Blocked: PR Is Merged — Staging
+
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+This PR is already merged, so applies can no longer run from it. SchemaBot only applies schema changes from open PRs.
+
+If the schema change still needs to be applied, open a new PR with it and apply from there.
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-base-schema-changed-since-pr-diverged"></a><strong>Apply Blocked: Base Schema Changed Since PR Diverged</strong></summary>
+
+
+## ⚠️ Apply rejected — base schema is newer — Production
+
+**Database**: `testapp`
+
+The base branch contains newer changes to the schema directory `schema/testapp` that are not included in this PR. Applying this branch could revert those changes.
+
+Merge or rebase the current base branch into this PR, review the updated plan, then run `apply` again.
+
+_Requested by @jackjackbits_
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-schema-stale-new-commits"></a><strong>Apply Blocked: Schema Stale (New Commits)</strong></summary>
+
+
+## ⚠️ Rejected — new commits since discovery — Staging
+
+**Database**: `testapp`
+
+Schema files were loaded at `0123456789abcdef0123456789abcdef01234567`, but the current PR HEAD is `abcdef1234567890abcdef1234567890abcdef12`. These files no longer match what is on the branch.
+
+Re-run the command to use the current HEAD:
+
+```
+schemabot apply -e staging
+```
+
+_Requested by @jackjackbits_
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-confirmed-plan-stale"></a><strong>Apply Blocked: Confirmed Plan Stale</strong></summary>
+
+
+## ⚠️ Rejected — the plan you confirmed is stale — Staging
+
+**Database**: `testapp`
+
+The confirmation plan was rendered at `0123456789abcdef0123456789abcdef01234567`, but the current PR HEAD is `abcdef1234567890abcdef1234567890abcdef12`. New commits have landed since the plan was posted, so the DDL you reviewed no longer matches what is on the branch.
+
+Re-run `apply` to generate a fresh plan against the current HEAD:
+
+```
+schemabot apply -e staging
+```
+
+_Requested by @jackjackbits_
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-by-prior-env-pending"></a><strong>Apply Blocked By Prior Env (Pending)</strong></summary>
+
+
+## ❌ Apply Blocked — Production
+
+**Database**: `testapp`
+
+Staging has pending changes. Apply staging first before applying to production.
+
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-by-prior-env-failed"></a><strong>Apply Blocked By Prior Env (Failed)</strong></summary>
+
+
+## ❌ Apply Blocked — Production
+
+**Database**: `testapp`
+
+Staging failed. Fix the issue and re-apply staging before applying to production.
+
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-by-prior-env-in-progress"></a><strong>Apply Blocked By Prior Env (In Progress)</strong></summary>
+
+
+## ⏳ Apply Blocked — Production
+
+**Database**: `testapp`
+
+Staging is currently in progress. Wait for it to complete before applying to production.
+
+Once staging completes, retry:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-prior-env-check-missing"></a><strong>Apply Blocked: Prior Env Check Missing</strong></summary>
+
+
+## ❌ Apply Blocked
+
+SchemaBot could not find a completed `staging` check for this PR.
+
+SchemaBot must verify `staging` before applying a later environment. Create the missing `staging` status with:
+```
+schemabot plan -e staging
+```
+
+If the plan finds changes, apply `staging` and wait for the SchemaBot check to succeed. Then retry this apply.
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-prior-env-check-read-error"></a><strong>Apply Blocked: Prior Env Check Read Error</strong></summary>
+
+
+## ❌ Apply Blocked
+
+Could not verify staging status: failed to query check runs. Retry the apply command.
+
+_Error: list check runs for ref: 502 Bad Gateway_
+</details>
+
+<details>
+<summary><a name="apply-blocked-prior-env-check-untrusted"></a><strong>Apply Blocked: Prior Env Check Untrusted</strong></summary>
+
+
+## ❌ Apply Blocked
+
+A `staging` check named `SchemaBot (staging)` exists on this PR, but it was created by a GitHub App this SchemaBot deployment does not trust:
+
+- `acme-automation`
+
+SchemaBot only verifies `staging` through check runs created by trusted SchemaBot deployment Apps.
+
+### Next steps
+- If the App above is the SchemaBot deployment that owns `staging`, an operator must add its slug to `github.trusted-check-app-slugs` in this deployment's server config.
+- If you do not recognize the App, do not trust it — the check may be impersonating SchemaBot.
+
+Re-running `schemabot plan -e staging` will not resolve this.
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-environment-not-in-promotion-order"></a><strong>Apply Blocked: Environment Not In Promotion Order</strong></summary>
+
+
+## ❌ Apply Blocked — Development
+
+`development` is not in the configured promotion order, so SchemaBot cannot determine which environments must be applied before it and cannot enforce staging-first ordering.
+
+Configured promotion order: `staging` → `production`
+
+Add `development` to `environment_order` so SchemaBot knows where it sits in the promotion sequence, then retry the apply.
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-review-required"></a><strong>Apply Blocked: Review Required</strong></summary>
+
+
+## Review Required
+
+**Database**: `testapp` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+Schema changes require approval from an authorized reviewer before applying.
+
+**Authorized reviewers**:
+- @acme/schema-reviewers
+- @jdoe
+
+### Next steps
+1. Request a review from an authorized reviewer above
+2. Once approved, run `schemabot apply -e staging` again
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-review-gate-error-failclosed"></a><strong>Apply Blocked: Review Gate Error (Fail-closed)</strong></summary>
+
+
+## ❌ Apply Failed
+
+**Environment**: `staging`
+
+*Requested by @jackjackbits at  UTC*
+
+### Error
+
+> Review gate check failed: expand team @acme/schema-reviewers: team membership cannot be read. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
+</details>
+
+<details>
+<summary><a name="apply-blocked-checks-not-passing"></a><strong>Apply Blocked: Checks Not Passing</strong></summary>
+
+
+## ❌ Apply Blocked — Staging
+
+Cannot apply while PR checks are not passing:
+
+| Check | Status |
+|-------|--------|
+| `CI / unit-tests` | failure |
+| `CI / lint` | timed_out |
+
+Get the checks passing — fix failures and re-run cancelled or stale checks — then retry:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-checks-in-progress"></a><strong>Apply Blocked: Checks In Progress</strong></summary>
+
+
+## ⏳ Apply Blocked — Staging
+
+Cannot apply while PR checks are still running:
+
+| Check | Status |
+|-------|--------|
+| `CI / unit-tests` | in_progress |
+| `CI / integration-tests` | queued |
+
+Wait for checks to complete and retry:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-check-status-read-error"></a><strong>Apply Blocked: Check Status Read Error</strong></summary>
+
+
+## ❌ Apply Blocked — Staging
+
+The SchemaBot GitHub App `schemabot-app` cannot read PR check statuses for this repository.
+
+The diagnostic REST probes indicate the installation is missing or has not accepted:
+- **Checks: Read**
+- **Commit statuses: Read**
+
+Grant or accept those permissions, then retry:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-actor-not-authorized"></a><strong>Apply Blocked: Actor Not Authorized</strong></summary>
+
+
+## SchemaBot Command Not Authorized
+
+**Database**: `orders` | **Environment**: `staging`
+
+@mona is not authorized to run `schemabot apply` for this database.
+
+A configured SchemaBot admin/database operator must run this command.
+
+</details>
+
+<details>
+<summary><a name="actor-authorization-unavailable"></a><strong>Actor Authorization: Unavailable</strong></summary>
+
+
+## SchemaBot Authorization Check Failed
+
+**Database**: `orders` | **Environment**: `production`
+**Requested by**: @mona
+
+SchemaBot could not verify authorization for `schemabot apply-confirm`. No schema change was started.
+
+If access is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
+
+A configured SchemaBot admin/database operator should inspect SchemaBot authorization logs before retrying.
+
+</details>
+
+<details>
+<summary><a name="actor-authorization-database-not-configured"></a><strong>Actor Authorization: Database Not Configured</strong></summary>
+
+
+## SchemaBot Command Not Authorized
+
+**Database**: `payments`
+
+`schemabot unlock` cannot run because database `payments` is not configured on this SchemaBot instance.
+
+Verify the database name, or run the command against the SchemaBot instance that manages this database.
 
 </details>
 
@@ -5436,844 +5718,6 @@ No schema changes found for database 'new-db'
 ```
 </details>
 
-
-## Apply Gates
-
-### PR Comments
-
-<details>
-<summary><a name="apply-gate-schema-change-apply-automatic"></a><strong>Apply Gate: Schema Change Apply (Automatic)</strong></summary>
-
-
-## Schema Change Apply — Staging
-
-**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
-
-🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
-
-```sql
-CREATE TABLE `users` (
-    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-    `email` varchar(255) NOT NULL,
-    `created_at` timestamp DEFAULT current_timestamp(),
-    PRIMARY KEY(`id`),
-    INDEX `idx_email`(`email`)
-) ENGINE InnoDB,
-  CHARSET utf8mb4,
-  COLLATE utf8mb4_0900_ai_ci;
-
-CREATE TABLE `orders` (
-    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-    `user_id` bigint NOT NULL,
-    `total_cents` bigint NOT NULL,
-    `status` varchar(50) NOT NULL DEFAULT 'pending',
-    PRIMARY KEY(`id`),
-    INDEX `idx_user_id`(`user_id`)
-) ENGINE InnoDB,
-  CHARSET utf8mb4,
-  COLLATE utf8mb4_0900_ai_ci;
-
-ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
-```
-
-📋 **Plan**: **2** tables to create, **1** table to alter
-
-
----
-
-**Applying automatically**
-
-
-</details>
-
-<details>
-<summary><a name="apply-gate-schema-change-apply-with-options"></a><strong>Apply Gate: Schema Change Apply (With Options)</strong></summary>
-
-
-## Schema Change Apply — Staging
-
-**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
-
-🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
-
-```sql
-CREATE TABLE `users` (
-    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-    `email` varchar(255) NOT NULL,
-    `created_at` timestamp DEFAULT current_timestamp(),
-    PRIMARY KEY(`id`),
-    INDEX `idx_email`(`email`)
-) ENGINE InnoDB,
-  CHARSET utf8mb4,
-  COLLATE utf8mb4_0900_ai_ci;
-
-CREATE TABLE `orders` (
-    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-    `user_id` bigint NOT NULL,
-    `total_cents` bigint NOT NULL,
-    `status` varchar(50) NOT NULL DEFAULT 'pending',
-    PRIMARY KEY(`id`),
-    INDEX `idx_user_id`(`user_id`)
-) ENGINE InnoDB,
-  CHARSET utf8mb4,
-  COLLATE utf8mb4_0900_ai_ci;
-
-ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
-```
-
-📋 **Plan**: **2** tables to create, **1** table to alter
-
-
-**Options**: ⏸️ Defer Cutover | ⏩ Skip Revert
-
----
-
-**Applying automatically**
-
-
-</details>
-
-<details>
-<summary><a name="apply-gate-schema-change-apply-downgraded"></a><strong>Apply Gate: Schema Change Apply (Downgraded)</strong></summary>
-
-
-## Schema Change Apply — Staging
-
-**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
-
-🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
-
-```sql
-CREATE TABLE `users` (
-    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-    `email` varchar(255) NOT NULL,
-    `created_at` timestamp DEFAULT current_timestamp(),
-    PRIMARY KEY(`id`),
-    INDEX `idx_email`(`email`)
-) ENGINE InnoDB,
-  CHARSET utf8mb4,
-  COLLATE utf8mb4_0900_ai_ci;
-
-CREATE TABLE `orders` (
-    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-    `user_id` bigint NOT NULL,
-    `total_cents` bigint NOT NULL,
-    `status` varchar(50) NOT NULL DEFAULT 'pending',
-    PRIMARY KEY(`id`),
-    INDEX `idx_user_id`(`user_id`)
-) ENGINE InnoDB,
-  CHARSET utf8mb4,
-  COLLATE utf8mb4_0900_ai_ci;
-
-ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
-```
-
-📋 **Plan**: **2** tables to create, **1** table to alter
-
-
----
-
-⚠️ **Automatic apply paused**: Schema changes differ from auto-plan — review and confirm manually
-
-Review the plan above, then confirm manually:
-```
-schemabot apply-confirm -e staging
-```
-
-🔓 To discard this plan and unlock, comment:
-```
-schemabot unlock
-```
-
-
-</details>
-
-<details>
-<summary><a name="apply-started"></a><strong>Apply Started</strong></summary>
-
-
-## Schema Change Status — Staging
-
-**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-Schema changes are being applied. This comment will be updated with progress.
-
-
-</details>
-
-<details>
-<summary><a name="unlock-success"></a><strong>Unlock Success</strong></summary>
-
-
-## 🔓 Lock Released — Staging
-
-**Database**: `testapp`
-
-*Released by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-The database is now available for schema changes.
-
-
-</details>
-
-<details>
-<summary><a name="apply-blocked-by-other-pr"></a><strong>Apply Blocked By Other PR</strong></summary>
-
-
-## 🔒 Apply Blocked — Staging
-
-**Database**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-Another PR currently holds the lock for this database.
-
-**Locked by**: [block/myapp#42](https://github.com/block/myapp/pull/42)
-**Since**: 2026-03-15 12:30:00 UTC
-
-Wait for the other PR to complete or ask the lock holder to run `schemabot unlock`.
-
-
-</details>
-
-<details>
-<summary><a name="apply-blocked-by-cli"></a><strong>Apply Blocked By CLI</strong></summary>
-
-
-## 🔒 Apply Blocked — Staging
-
-**Database**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-A CLI session currently holds the lock for this database.
-
-**Locked by**: `cli:jackjackbits@macbook.local`
-**Since**: 2026-03-15 14:00:00 UTC
-
-Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock with:
-```
-schemabot unlock -d testapp --force
-```
-
-
-</details>
-
-<details>
-<summary><a name="apply-already-in-progress"></a><strong>Apply Already In Progress</strong></summary>
-
-
-## ⚠️ Apply Already In Progress — Staging
-
-**Database**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-An apply is already running for this PR (apply ID: `apply-a1b2c3d4e5f6`, state: `running`).
-
-Wait for it to complete or stop it first.
-
-
-</details>
-
-<details>
-<summary><a name="apply-blocked-pr-closed"></a><strong>Apply Blocked: PR Closed</strong></summary>
-
-
-## ⛔ Apply Blocked: PR Is Closed — Staging
-
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-This PR is closed, so its schema changes can never merge. SchemaBot only applies schema changes from open PRs.
-
-Reopen this PR, or open a new PR with the schema change, and apply from there.
-
-
-</details>
-
-<details>
-<summary><a name="apply-blocked-pr-merged"></a><strong>Apply Blocked: PR Merged</strong></summary>
-
-
-## ⛔ Apply Blocked: PR Is Merged — Staging
-
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-This PR is already merged, so applies can no longer run from it. SchemaBot only applies schema changes from open PRs.
-
-If the schema change still needs to be applied, open a new PR with it and apply from there.
-
-
-</details>
-
-<details>
-<summary><a name="no-lock-found"></a><strong>No Lock Found</strong></summary>
-
-
-## 🔒 No Lock Found — Staging
-
-**Database**: `testapp`
-
-No apply lock is held for this database. Run `apply` first to generate a plan and acquire the lock.
-
-```
-schemabot apply -e staging
-```
-
-
-</details>
-
-<details>
-<summary><a name="base-schema-changed-since-pr-diverged"></a><strong>Base Schema Changed Since PR Diverged</strong></summary>
-
-
-## ⚠️ Apply rejected — base schema is newer — Production
-
-**Database**: `testapp`
-
-The base branch contains newer changes to the schema directory `schema/testapp` that are not included in this PR. Applying this branch could revert those changes.
-
-Merge or rebase the current base branch into this PR, review the updated plan, then run `apply` again.
-
-_Requested by @jackjackbits_
-
-
-</details>
-
-<details>
-<summary><a name="blocked-by-prior-env-pending"></a><strong>Blocked By Prior Env (Pending)</strong></summary>
-
-
-## ❌ Apply Blocked — Production
-
-**Database**: `testapp`
-
-Staging has pending changes. Apply staging first before applying to production.
-
-```
-schemabot apply -e staging
-```
-
-
-</details>
-
-<details>
-<summary><a name="blocked-by-prior-env-failed"></a><strong>Blocked By Prior Env (Failed)</strong></summary>
-
-
-## ❌ Apply Blocked — Production
-
-**Database**: `testapp`
-
-Staging failed. Fix the issue and re-apply staging before applying to production.
-
-```
-schemabot apply -e staging
-```
-
-
-</details>
-
-<details>
-<summary><a name="blocked-by-prior-env-in-progress"></a><strong>Blocked By Prior Env (In Progress)</strong></summary>
-
-
-## ⏳ Apply Blocked — Production
-
-**Database**: `testapp`
-
-Staging is currently in progress. Wait for it to complete before applying to production.
-
-Once staging completes, retry:
-```
-schemabot apply -e production
-```
-
-
-</details>
-
-<details>
-<summary><a name="review-required"></a><strong>Review Required</strong></summary>
-
-
-## Review Required
-
-**Database**: `testapp` | **Environment**: `staging`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-Schema changes require approval from an authorized reviewer before applying.
-
-**Authorized reviewers**:
-- @acme/schema-reviewers
-- @jdoe
-
-### Next steps
-1. Request a review from an authorized reviewer above
-2. Once approved, run `schemabot apply -e staging` again
-
-
-</details>
-
-<details>
-<summary><a name="review-gate-error-failclosed"></a><strong>Review Gate Error (Fail-closed)</strong></summary>
-
-
-## ❌ Apply Failed
-
-**Environment**: `staging`
-
-*Requested by @jackjackbits at  UTC*
-
-### Error
-
-> Review gate check failed: expand team @acme/schema-reviewers: team membership cannot be read. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
-
-</details>
-
-<details>
-<summary><a name="actor-authorization-not-authorized"></a><strong>Actor Authorization: Not Authorized</strong></summary>
-
-
-## SchemaBot Command Not Authorized
-
-**Database**: `orders` | **Environment**: `staging`
-
-@mona is not authorized to run `schemabot apply` for this database.
-
-A configured SchemaBot admin/database operator must run this command.
-
-
-</details>
-
-<details>
-<summary><a name="actor-authorization-unavailable"></a><strong>Actor Authorization: Unavailable</strong></summary>
-
-
-## SchemaBot Authorization Check Failed
-
-**Database**: `orders` | **Environment**: `production`
-**Requested by**: @mona
-
-SchemaBot could not verify authorization for `schemabot apply-confirm`. No schema change was started.
-
-If access is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
-
-A configured SchemaBot admin/database operator should inspect SchemaBot authorization logs before retrying.
-
-
-</details>
-
-<details>
-<summary><a name="actor-authorization-database-not-configured"></a><strong>Actor Authorization: Database Not Configured</strong></summary>
-
-
-## SchemaBot Command Not Authorized
-
-**Database**: `payments`
-
-`schemabot unlock` cannot run because database `payments` is not configured on this SchemaBot instance.
-
-Verify the database name, or run the command against the SchemaBot instance that manages this database.
-
-
-</details>
-
-<details>
-<summary><a name="start-command-accepted"></a><strong>Start Command Accepted</strong></summary>
-
-
-## Start Request Accepted
-
-**Apply**: `apply-a1b2c3d4e5f67890`
-**Environment**: `staging`
-**Requested by**: @alice
-
-Start request accepted. SchemaBot will resume this schema change; status remains available from the PR progress comment or CLI.
-
-**Tasks selected for start**: 1 started, 0 skipped.
-
-
-</details>
-
-<details>
-<summary><a name="start-command-already-pending"></a><strong>Start Command Already Pending</strong></summary>
-
-
-## Start Request Accepted
-
-**Apply**: `apply-a1b2c3d4e5f67890`
-**Environment**: `staging`
-**Requested by**: @alice
-
-Start was already requested. SchemaBot will keep the existing start request pending until the operator owner finishes it.
-
-**Tasks selected for start**: 1 started, 0 skipped.
-
-
-</details>
-
-<details>
-<summary><a name="cutover-command-accepted"></a><strong>Cutover Command Accepted</strong></summary>
-
-
-## Cutover Request Accepted
-
-**Apply**: `apply-a1b2c3d4e5f67890`
-**Environment**: `staging`
-**Requested by**: @alice
-
-Cutover request accepted. SchemaBot will complete this schema change; status remains available from the PR progress comment or CLI.
-
-
-</details>
-
-<details>
-<summary><a name="cutover-command-already-in-progress"></a><strong>Cutover Command Already In Progress</strong></summary>
-
-
-## Cutover Request Accepted
-
-**Apply**: `apply-a1b2c3d4e5f67890`
-**Environment**: `staging`
-**Requested by**: @alice
-
-Cutover is already in progress. SchemaBot will keep reporting progress from the existing apply.
-
-
-</details>
-
-<details>
-<summary><a name="volume-command-accepted"></a><strong>Volume Command Accepted</strong></summary>
-
-
-## Volume Request Accepted
-
-**Apply**: `apply-a1b2c3d4e5f67890`
-**Environment**: `staging`
-**Requested by**: @alice
-
-Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly; once the new level takes effect, a fresh progress comment will track the schema change at the new volume.
-
-
-</details>
-
-<details>
-<summary><a name="volume-command-invalid-level"></a><strong>Volume Command Invalid Level</strong></summary>
-
-
-## Missing or Invalid Volume Level
-
-Usage: `schemabot volume <apply-id> -e <environment> -v <level>`
-
-The `-v` flag is required and must be a number between 1 (slowest) and 11 (fastest).
-
-</details>
-
-<details>
-<summary><a name="volume-command-missing-apply-id"></a><strong>Volume Command Missing Apply ID</strong></summary>
-
-
-## Missing Apply ID
-
-Usage: `schemabot volume <apply-id> -e <environment> -v <1-11>`
-
-Use `schemabot status -e <environment>` to find the apply ID.
-
-</details>
-
-<details>
-<summary><a name="volume-changed-superseded-progress-comment"></a><strong>Volume Changed: Superseded Progress Comment</strong></summary>
-
-
-⏩ Volume changed to **8/11** — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
-
-<details>
-<summary>Progress before the volume change</summary>
-
-## Schema Change Status — Staging
-
-**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-**Status**: In Progress | Volume: 3/11
-
-**`users`**: 🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 32%
-
-```sql
-ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-```
-Rows: 2,300,000 / 7,200,000 · ETA: 13m 0s
-
-
----
-
-To stop this schema change:
-```
-schemabot stop apply-a1b2c3d4e5f6 -e staging
-```
-
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
-
-
-</details>
-
-
-</details>
-
-<details>
-<summary><a name="resumed-superseded-progress-comment"></a><strong>Resumed: Superseded Progress Comment</strong></summary>
-
-
-▶️ Schema change resumed — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
-
-<details>
-<summary>Progress before the stop</summary>
-
-## Schema Change Status — Staging
-
-**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-**Status**: Stopped
-
-**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 32%
-
-```sql
-ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-```
-Rows: 2,300,000 / 7,200,000
-
-
----
-
-Paused — to resume from where it stopped:
-```
-schemabot start apply-a1b2c3d4e5f6 -e staging
-```
-
-
-</details>
-
-
-</details>
-
-<details>
-<summary><a name="revert-superseded-progress-comment"></a><strong>Revert: Superseded Progress Comment</strong></summary>
-
-
-Schema change reverting — the revert is tracked in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
-
-<details>
-<summary>Progress before the revert</summary>
-
-## Schema Change Status — Staging
-
-**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-**Status**: Revert Window
-
-**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
-
-```sql
-ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-```
-
-
----
-
-To skip revert and keep changes:
-```
-schemabot skip-revert apply-a1b2c3d4e5f6 -e staging
-```
-
-To revert:
-```
-schemabot revert apply-a1b2c3d4e5f6 -e staging
-```
-
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
-
-
-</details>
-
-
-</details>
-
-<details>
-<summary><a name="skip-revert-superseded-progress-comment"></a><strong>Skip Revert: Superseded Progress Comment</strong></summary>
-
-
-Revert skipped — the schema change is finalizing in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
-
-<details>
-<summary>Progress before the revert was skipped</summary>
-
-## Schema Change Status — Staging
-
-**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-**Status**: Revert Window
-
-**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
-
-```sql
-ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-```
-
-
----
-
-To skip revert and keep changes:
-```
-schemabot skip-revert apply-a1b2c3d4e5f6 -e staging
-```
-
-To revert:
-```
-schemabot revert apply-a1b2c3d4e5f6 -e staging
-```
-
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
-
-
-</details>
-
-
-</details>
-
-<details>
-<summary><a name="cutover-complete-superseded-cutover-prompt"></a><strong>Cutover Complete: Superseded Cutover Prompt</strong></summary>
-
-
-Cutover complete — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
-
-<details>
-<summary>Cutover prompt</summary>
-
-## Schema Change Status — Staging
-
-**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-**Status**: Waiting for Cutover
-
-**0/1** table(s) ready for cutover — waiting on 1
-
-**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
-
-```sql
-ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-```
-
-
----
-
-SchemaBot triggers cutover automatically — no action needed.
-
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
-
-
-</details>
-
-
-</details>
-
-<details>
-<summary><a name="retry-superseded-progress-comment-generic"></a><strong>Retry: Superseded Progress Comment (Generic)</strong></summary>
-
-
-⏭️ Progress comment superseded — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
-
-<details>
-<summary>Earlier progress</summary>
-
-## Schema Change Status — Staging
-
-**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-**Status**: Stopped
-
-**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 32%
-
-```sql
-ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-```
-Rows: 2,300,000 / 7,200,000
-
-
----
-
-Paused — to resume from where it stopped:
-```
-schemabot start apply-a1b2c3d4e5f6 -e staging
-```
-
-
-</details>
-
-
-</details>
-
-<details>
-<summary><a name="checks-gate-not-passing"></a><strong>Checks Gate: Not Passing</strong></summary>
-
-
-## ❌ Apply Blocked — Staging
-
-Cannot apply while PR checks are not passing:
-
-| Check | Status |
-|-------|--------|
-| `CI / unit-tests` | failure |
-| `CI / lint` | timed_out |
-
-Get the checks passing — fix failures and re-run cancelled or stale checks — then retry:
-```
-schemabot apply -e staging
-```
-
-
-</details>
-
-<details>
-<summary><a name="checks-gate-in-progress"></a><strong>Checks Gate: In Progress</strong></summary>
-
-
-## ⏳ Apply Blocked — Staging
-
-Cannot apply while PR checks are still running:
-
-| Check | Status |
-|-------|--------|
-| `CI / unit-tests` | in_progress |
-| `CI / integration-tests` | queued |
-
-Wait for checks to complete and retry:
-```
-schemabot apply -e staging
-```
-
-</details>
 
 ## Multi-Deployment Apply
 
