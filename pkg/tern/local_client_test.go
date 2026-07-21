@@ -3327,3 +3327,56 @@ func TestLocalClient_VitessProgressRendersShardsFromStored(t *testing.T) {
 		assert.NotEqual(t, "live-only", sh.Shard, "stored rows are preferred over the live engine result")
 	}
 }
+
+// Progress renders a non-sharded table's headline figures — rows, percent,
+// checksum progress, and ETA — from the stored task row the operator drive
+// maintains, so a running MySQL apply shows the same copy estimate on the CLI
+// and PR progress surfaces that the data plane computed.
+func TestLocalClient_ProgressRendersNonShardedTableFromStoredTask(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-nonsharded-eta",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:                  7,
+		ApplyID:             apply.ID,
+		TaskIdentifier:      "task-users",
+		Database:            "testdb",
+		DatabaseType:        storage.DatabaseTypeMySQL,
+		Engine:              storage.EngineSpirit,
+		TableName:           "users",
+		State:               state.Task.Running,
+		DDLAction:           "alter",
+		RowsCopied:          400,
+		RowsTotal:           1000,
+		ProgressPercent:     40,
+		ETASeconds:          90,
+		ChecksumRowsChecked: 10,
+		ChecksumRowsTotal:   1000,
+	}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{task}},
+		},
+		logger: slog.Default(),
+	}
+
+	progress, err := client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: apply.ApplyIdentifier, Environment: "staging"})
+	require.NoError(t, err)
+	require.Len(t, progress.Tables, 1)
+
+	tp := progress.Tables[0]
+	assert.Equal(t, "users", tp.TableName)
+	assert.Equal(t, int32(40), tp.PercentComplete)
+	assert.Equal(t, int64(400), tp.RowsCopied)
+	assert.Equal(t, int64(1000), tp.RowsTotal)
+	assert.Equal(t, int64(90), tp.EtaSeconds, "ETA comes from the stored task row")
+	assert.Equal(t, int64(10), tp.ChecksumRowsChecked)
+	assert.Equal(t, int64(1000), tp.ChecksumRowsTotal)
+	assert.Empty(t, tp.Shards, "a non-sharded table has no per-shard breakdown")
+}
