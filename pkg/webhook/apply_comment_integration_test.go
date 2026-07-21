@@ -448,6 +448,79 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	}
 }
 
+// An apply that is stopped, resumed, and then driven to completion must still
+// get its terminal summary comment: the stop posts a summary, the resume
+// rotation consumes (supersedes) that summary marker, and completion claims
+// the summary again — the superseded marker converts back into a claim
+// sentinel instead of blocking the claim — so the operator sees the final
+// result at the bottom of the PR rather than the apply ending silently.
+func TestE2EStopResumeCompleteStillPostsTerminalSummary(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-stop-resume",
+		pr:         143,
+		database:   "e2e_stop_resume_db",
+		applyState: state.Apply.Resuming,
+	})
+	st, apply, task, capture := f.st, f.apply, f.task, f.capture
+
+	// Seed the comments the stop left behind: the progress comment frozen at
+	// "Stopped" and the stopped summary marker.
+	f.handler.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, 12345, apply, state.Comment.Progress, "Stopped at 50%")
+	requireCommentCreate(t, capture)
+	f.handler.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, 12345, apply, state.Comment.Summary, "Schema Change Stopped")
+	stoppedSummaryID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The first progress tick after resume rotates the progress comment and
+	// consumes the stopped summary marker by superseding it.
+	obs.OnProgress(apply, []*storage.Task{task})
+	requireCommentCreate(t, capture)
+	select {
+	case <-capture.edits: // freeze of the superseded progress comment
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the superseded progress comment to be frozen")
+	}
+	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	require.NotNil(t, summary.SupersededAt, "resume rotation must supersede the stopped summary marker")
+
+	// The resumed copy finishes and the apply completes.
+	apply.State = state.Apply.Completed
+	task.State = state.Task.Completed
+	task.RowsCopied = 1000
+	task.ProgressPercent = 100
+	obs.OnTerminal(apply, []*storage.Task{task})
+
+	// The terminal publish edits the progress comment to its final rendering
+	// and posts a fresh terminal summary comment.
+	select {
+	case <-capture.edits:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the progress comment to be edited to its final rendering")
+	}
+	var terminalSummaryID int64
+	select {
+	case created := <-capture.creates:
+		terminalSummaryID = created.ID
+		assert.Contains(t, created.Body, "✅ Schema Change Applied")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a terminal summary comment for the completed apply")
+	}
+	assert.NotEqual(t, stoppedSummaryID, terminalSummaryID, "the terminal summary is a fresh comment, not the stop's")
+
+	// The summary marker now records the terminal summary and is active again.
+	summary, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Equal(t, terminalSummaryID, summary.GitHubCommentID)
+	assert.Nil(t, summary.SupersededAt)
+}
+
 // Across repeated stop/start iterations, each resume folds the progress
 // comment it supersedes, so the PR timeline keeps exactly one live progress
 // comment. A resume rotation also reconciles a freeze that a prior drive owed

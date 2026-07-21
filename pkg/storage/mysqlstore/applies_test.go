@@ -3241,6 +3241,37 @@ func TestApplyStore_FindMissingSummaryComment_SummaryClaimSentinels(t *testing.T
 	assert.Equal(t, staleClaim.ApplyIdentifier, applies[0].ApplyIdentifier)
 }
 
+// TestApplyStore_FindMissingSummaryComment_SupersededSummaryMarker verifies a
+// superseded summary marker counts as missing: a stop's summary consumed by a
+// resume rotation belongs to an earlier terminal state, so once the apply
+// reaches its next terminal state, reconciliation must repair the summary
+// rather than treating the stale marker as posted.
+func TestApplyStore_FindMissingSummaryComment_SupersededSummaryMarker(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	superseded := seedApplyMissingSummary(t, store, "apply_summary_superseded", state.Apply.Completed, 720)
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         superseded.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 2003,
+	}))
+	require.NoError(t, store.ApplyComments().Supersede(ctx, superseded.ID, state.Comment.Summary))
+
+	live := seedApplyMissingSummary(t, store, "apply_summary_live", state.Apply.Completed, 721)
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         live.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 2004,
+	}))
+
+	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, superseded.ApplyIdentifier, applies[0].ApplyIdentifier)
+}
+
 func TestApplyStore_GetByPR(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

@@ -446,7 +446,10 @@ func TestApplyCommentStore_DeleteByApply_DBError(t *testing.T) {
 // claim is first-writer-wins: the first claim inserts the sentinel
 // (github_comment_id = 0) and wins, every later claim for the same apply loses,
 // and a summary marker that already records a real comment also blocks the
-// claim. Claims for different applies are independent.
+// claim. A superseded marker — a stop's summary consumed by a resume rotation —
+// does not block: it converts back into a claim sentinel exactly once, so the
+// apply's next terminal state still gets its summary. Claims for different
+// applies are independent.
 func TestApplyCommentStore_ClaimSummaryComment(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -482,6 +485,24 @@ func TestApplyCommentStore_ClaimSummaryComment(t *testing.T) {
 	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
 	require.NoError(t, err)
 	assert.False(t, won, "a posted summary must block the claim")
+
+	// A superseded summary — a stop's summary marker consumed by a resume
+	// rotation — no longer describes the current terminal state, so it must not
+	// block the claim: the row converts back into a claim sentinel.
+	require.NoError(t, store.ApplyComments().Supersede(ctx, apply.ID, state.Comment.Summary))
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.True(t, won, "a superseded summary marker must be reclaimable")
+
+	claimed, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, int64(0), claimed.GitHubCommentID, "reclaimed marker is the sentinel form")
+	assert.Nil(t, claimed.SupersededAt, "reclaimed marker is active again")
+
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, won, "exactly one claimant reclaims a superseded summary")
 }
 
 // TestApplyCommentStore_ReclaimStaleSummaryClaim verifies crashed-publisher

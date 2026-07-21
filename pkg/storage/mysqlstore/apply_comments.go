@@ -225,10 +225,15 @@ func (s *applyCommentStore) ClearPendingFreeze(ctx context.Context, applyID int6
 // apply by inserting the summary marker as a claim sentinel
 // (github_comment_id = 0). The unique key on (apply_id, comment_state) makes
 // this a race-safe first-writer-wins: the insert that lands the row wins the
-// claim; a duplicate-key loss means another writer already claimed or posted
-// the summary. Deliberately lease-agnostic — the claim itself is the
-// exactly-once authority, so a publisher whose apply lease was re-claimed can
-// still win or lose cleanly.
+// claim. When the row already exists but is superseded — a stop's summary
+// marker consumed by a resume rotation — that summary belongs to an earlier
+// terminal state, so the current terminal state's summary is still owed: the
+// conditional update converts the superseded row back into a claim sentinel,
+// and exactly one concurrent claimant sees the affected row. Losing both
+// paths means another writer already claimed or posted the summary for the
+// current terminal state. Deliberately lease-agnostic — the claim itself is
+// the exactly-once authority, so a publisher whose apply lease was re-claimed
+// can still win or lose cleanly.
 func (s *applyCommentStore) ClaimSummaryComment(ctx context.Context, applyID int64) (bool, error) {
 	result, err := s.db.ExecContext(ctx, `
 		INSERT IGNORE INTO apply_comments (apply_id, comment_state, github_comment_id)
@@ -240,6 +245,22 @@ func (s *applyCommentStore) ClaimSummaryComment(ctx context.Context, applyID int
 	rows, err := result.RowsAffected()
 	if err != nil {
 		return false, fmt.Errorf("read summary claim rows affected for apply %d: %w", applyID, err)
+	}
+	if rows == 1 {
+		return true, nil
+	}
+
+	result, err = s.db.ExecContext(ctx, `
+		UPDATE apply_comments
+		SET github_comment_id = 0, superseded_at = NULL
+		WHERE apply_id = ? AND comment_state = ? AND superseded_at IS NOT NULL
+	`, applyID, state.Comment.Summary)
+	if err != nil {
+		return false, fmt.Errorf("reclaim superseded summary comment for apply %d: %w", applyID, err)
+	}
+	rows, err = result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read superseded summary reclaim rows affected for apply %d: %w", applyID, err)
 	}
 	return rows == 1, nil
 }

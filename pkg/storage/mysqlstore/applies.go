@@ -2008,10 +2008,12 @@ func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, enviro
 // terminal state recently but whose progress comment was never followed by a
 // summary comment. Used to post missing summaries after restart.
 //
-// Two forms of "missing" qualify: no summary marker at all (the publisher never
-// ran), and a summary claim sentinel (github_comment_id = 0) stale for longer
-// than storage.SummaryClaimStaleAfter (the publisher claimed, then crashed
-// before posting). A fresh sentinel is an in-flight publish and is left alone.
+// Three forms of "missing" qualify: no summary marker at all (the publisher
+// never ran); a superseded marker (a stop's summary consumed by a resume
+// rotation, so the summary for the current terminal state was never posted);
+// and a summary claim sentinel (github_comment_id = 0) stale for longer than
+// storage.SummaryClaimStaleAfter (the publisher claimed, then crashed before
+// posting). A fresh sentinel is an in-flight publish and is left alone.
 //
 // Recency is judged per state family: most terminal states stamp completed_at,
 // but a stopped apply is resumable and keeps completed_at NULL, so it qualifies
@@ -2031,6 +2033,7 @@ func (s *applyStore) FindMissingSummaryComment(ctx context.Context) ([]*storage.
 		  )
 		  AND (
 			acs.id IS NULL
+			OR acs.superseded_at IS NOT NULL
 			OR (acs.github_comment_id = 0 AND acs.updated_at < `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalSecond)+`)
 		  )
 		ORDER BY a.updated_at DESC

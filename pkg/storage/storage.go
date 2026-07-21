@@ -468,10 +468,12 @@ type ApplyStore interface {
 	// FindMissingSummaryComment returns GitHub-backed applies that recently
 	// reached a terminal state (including stopped, judged by updated_at since a
 	// resumable stop keeps completed_at NULL) but whose progress comment was
-	// never followed by a summary comment — either no summary marker exists, or
-	// only a claim sentinel stale for longer than SummaryClaimStaleAfter
-	// remains from a publisher that crashed before posting. Used by startup
-	// reconciliation to post missing summary comments after restarts.
+	// never followed by a summary comment — no summary marker exists, the
+	// marker is superseded (a stop's summary consumed by a resume rotation, so
+	// the current terminal state's summary was never posted), or only a claim
+	// sentinel stale for longer than SummaryClaimStaleAfter remains from a
+	// publisher that crashed before posting. Used by startup reconciliation to
+	// post missing summary comments after restarts.
 	FindMissingSummaryComment(ctx context.Context) ([]*Apply, error)
 
 	// GetByPR returns all applies for a PR.
@@ -619,7 +621,10 @@ type ApplyCommentStore interface {
 
 	// ClaimSummaryComment atomically claims the right to publish the terminal
 	// summary comment for an apply by inserting the summary marker as a claim
-	// sentinel (github_comment_id = 0). Exactly one caller wins per apply: the
+	// sentinel (github_comment_id = 0). A superseded marker — a stop's summary
+	// consumed by a resume rotation — does not block the claim: it is converted
+	// back into a claim sentinel, since the summary it recorded belongs to an
+	// earlier terminal state. Exactly one caller wins per terminal state: the
 	// winner posts the summary and records the real comment ID via Upsert; every
 	// loser skips. The claim — not the apply lease — is the exactly-once
 	// authority for the summary, so a writer whose lease was re-claimed (stop
