@@ -17,6 +17,7 @@ const (
 	PreviewErrorMiddleFailed = "lock wait timeout exceeded; try restarting transaction"
 	previewRepository        = "block/schemabot"
 	previewHeadSHA           = "abcdef1234567890abcdef1234567890abcdef12"
+	previewStaleSHA          = "0123456789abcdef0123456789abcdef01234567"
 	previewRequestedBy       = "jackjackbits"
 )
 
@@ -47,10 +48,7 @@ func PreviewCommentPlan() string {
 				},
 			},
 		},
-		LintViolations: []LintViolationData{
-			{Message: "New column uses floating-point data type", Table: "orders", LinterName: "has_float"},
-			{Message: "Column added without DEFAULT value", Table: "users", LinterName: "no_default"},
-		},
+		LintViolations: sampleLintWarnings(),
 	})
 }
 
@@ -396,6 +394,68 @@ func PreviewCommentApplyBlockedByPriorEnvInProgress() string {
 	return RenderApplyBlockedByPriorEnvInProgress("testapp", "production", "staging")
 }
 
+// PreviewCommentApplyBlockedByCheckStatusError renders a sample fail-closed
+// block for a check-status read that failed because the GitHub App
+// installation is missing permissions.
+func PreviewCommentApplyBlockedByCheckStatusError() string {
+	return RenderApplyBlockedByCheckStatusError("staging",
+		fmt.Errorf("list check runs for ref: Resource not accessible by integration"),
+		&CheckStatusAccessDetails{
+			GitHubApp:          "schemabot-app",
+			MissingPermissions: []string{"Checks: Read", "Commit statuses: Read"},
+		})
+}
+
+// PreviewCommentApplyBlockedByPriorEnvCheckError renders a sample fail-closed
+// block for a prior-environment check that could not be read.
+func PreviewCommentApplyBlockedByPriorEnvCheckError() string {
+	return RenderApplyBlockedByPriorEnvCheckError("staging", "query check runs",
+		fmt.Errorf("list check runs for ref: 502 Bad Gateway"))
+}
+
+// PreviewCommentApplyBlockedByMissingPriorEnvCheck renders a sample block for
+// a prior environment with no completed SchemaBot check on the PR.
+func PreviewCommentApplyBlockedByMissingPriorEnvCheck() string {
+	return RenderApplyBlockedByMissingPriorEnvCheck("staging")
+}
+
+// PreviewCommentApplyBlockedByUntrustedPriorEnvCheck renders a sample block
+// for a prior-environment check created only by untrusted GitHub Apps.
+func PreviewCommentApplyBlockedByUntrustedPriorEnvCheck() string {
+	return RenderApplyBlockedByUntrustedPriorEnvCheck("staging", "SchemaBot (staging)", []string{"acme-automation"})
+}
+
+// PreviewCommentApplyBlockedByUnlistedEnvironment renders a sample block for a
+// target environment missing from the configured promotion order.
+func PreviewCommentApplyBlockedByUnlistedEnvironment() string {
+	return RenderApplyBlockedByUnlistedEnvironment("development", []string{"staging", "production"})
+}
+
+// PreviewCommentStaleSchemaRejected renders a sample rejection for schema
+// files loaded at an older commit than the current PR HEAD.
+func PreviewCommentStaleSchemaRejected() string {
+	return RenderStaleSchemaRejection(StaleSchemaRejectionData{
+		RequestedBy:  previewRequestedBy,
+		Database:     "testapp",
+		Environment:  "staging",
+		DiscoverySHA: previewStaleSHA,
+		CurrentSHA:   previewHeadSHA,
+		Action:       "apply",
+	})
+}
+
+// PreviewCommentStalePlanRejected renders a sample rejection for a confirmed
+// plan rendered against a commit that is no longer the PR HEAD.
+func PreviewCommentStalePlanRejected() string {
+	return RenderStalePlanRejection(StalePlanRejectionData{
+		RequestedBy: previewRequestedBy,
+		Database:    "testapp",
+		Environment: "staging",
+		PlanSHA:     previewStaleSHA,
+		CurrentSHA:  previewHeadSHA,
+	})
+}
+
 // sampleTime returns a fixed time for preview rendering consistency.
 func sampleTime() time.Time {
 	return time.Date(2026, 3, 15, 14, 30, 0, 0, time.UTC)
@@ -412,6 +472,15 @@ func samplePlanChanges() []KeyspaceChangeData {
 				"ALTER TABLE `products` ADD INDEX `idx_category_price` (`category`, `price`);",
 			},
 		},
+	}
+}
+
+// sampleLintWarnings returns warning-severity lint findings that match the
+// statements in samplePlanChanges, in the message format Spirit's linters emit.
+func sampleLintWarnings() []LintViolationData {
+	return []LintViolationData{
+		{Message: `Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.`, Table: "users", LinterName: "has_timestamp"},
+		{Message: `Index 'idx_category' on columns (category) is redundant - covered by index 'idx_category_price' on columns (category, price)`, Table: "products", LinterName: "redundant_indexes"},
 	}
 }
 
@@ -496,6 +565,35 @@ func PreviewCommentDropIndexBlocked() string {
 				Table:  "customers",
 				Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`",
 			},
+		},
+	})
+}
+
+// PreviewCommentLintErrorsBlocked renders a sample plan where error-severity
+// schema lint violations block the apply. The reasons carry the raw
+// "[ERROR] linter:" prefixes engines report; the renderer strips them.
+func PreviewCommentLintErrorsBlocked() string {
+	return RenderUnsafeChangesBlocked(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` MODIFY COLUMN `id` int NOT NULL AUTO_INCREMENT;",
+					"ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;",
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "orders", Reason: `[ERROR] primary_key: Primary key column "id" has type "int"`},
+			{Table: "users", Reason: `[ERROR] rename_column: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled`},
 		},
 	})
 }
@@ -741,10 +839,7 @@ func PreviewCommentMultiEnvPlan() string {
 // with lint violations included in each environment's plan.
 func PreviewCommentMultiEnvPlanLint() string {
 	changes := samplePlanChanges()
-	lintViolations := []LintViolationData{
-		{Message: "Primary key uses signed integer type (should be UNSIGNED)", Table: "orders", LinterName: "primary_key"},
-		{Message: "Column uses utf8 charset (should be utf8mb4)", Table: "users", LinterName: "allow_charset"},
-	}
+	lintViolations := sampleLintWarnings()
 	return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database:     "testapp",
 		SchemaName:   "testapp",

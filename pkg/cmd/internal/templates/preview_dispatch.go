@@ -152,6 +152,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentDropColumnBlocked())
 	case PreviewCommentDropIndexBlocked:
 		fmt.Print(webhooktemplates.PreviewCommentDropIndexBlocked())
+	case PreviewCommentLintErrorsBlocked:
+		fmt.Print(webhooktemplates.PreviewCommentLintErrorsBlocked())
 	case PreviewCommentApplyPlan:
 		fmt.Print(webhooktemplates.PreviewCommentApplyPlan())
 	case PreviewCommentApplyPlanOptions:
@@ -281,8 +283,6 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted())
 	case PreviewCommentVolumeInvalid:
 		fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel())
-	case PreviewCommentApplyAllType:
-		previewApplyCommandAllOutput()
 	// Paired aggregate previews (PR + CLI subsections)
 	case PreviewCommentPlanAll:
 		previewCommentPlanAllOutput()
