@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/block/schemabot/pkg/api"
@@ -28,6 +29,18 @@ func (h *Handler) shouldPublishChecks(ctx context.Context, repo string, operatio
 // SHA. It records a metric and logs the reason before every false return so
 // callers can stop without adding duplicate log noise.
 func (h *Handler) verifyHeadSHAStillCurrentForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, operation string) bool {
+	current, _ := h.verifyHeadSHACurrency(ctx, client, repo, pr, headSHA, operation)
+	return current
+}
+
+// verifyHeadSHACurrency is the lossless form of verifyHeadSHAStillCurrentForPR:
+// it returns the same current bool plus the underlying error so a caller with a
+// retry mechanism can tell a transient failure (empty head SHA or a PR-fetch
+// error, both non-nil) apart from a genuinely superseded head (current=false,
+// err=nil), which must never be retried as if GitHub had failed. It records the
+// same metrics and logs as before. A superseded head is not an operational
+// failure, so it returns a nil error.
+func (h *Handler) verifyHeadSHACurrency(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, operation string) (bool, error) {
 	if headSHA == "" {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  operation,
@@ -35,7 +48,7 @@ func (h *Handler) verifyHeadSHAStillCurrentForPR(ctx context.Context, client *gh
 			Status:     "error",
 		})
 		h.logger.Error("refusing to update status check without head SHA", "repo", repo, "pr", pr, "operation", operation)
-		return false
+		return false, fmt.Errorf("verify head SHA for %s#%d (%s): missing head SHA", repo, pr, operation)
 	}
 
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
@@ -47,7 +60,7 @@ func (h *Handler) verifyHeadSHAStillCurrentForPR(ctx context.Context, client *gh
 		})
 		h.logger.Error("failed to verify status check head SHA before update",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "operation", operation, "error", err)
-		return false
+		return false, fmt.Errorf("verify head SHA for %s#%d (%s): %w", repo, pr, operation, err)
 	}
 	if prInfo.HeadSHA != headSHA {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -58,13 +71,49 @@ func (h *Handler) verifyHeadSHAStillCurrentForPR(ctx context.Context, client *gh
 		h.logger.Info("skipping stale status check update because head SHA is no longer current for PR",
 			"repo", repo, "pr", pr, "operation", operation,
 			"stale_head_sha", headSHA, "current_head_sha", prInfo.HeadSHA)
-		return false
+		return false, nil
 	}
-	return true
+	return true, nil
 }
 
-// updateAggregateCheck recomputes and creates/updates aggregate check runs that roll
-// up per-database checks for a PR.
+// aggregateFoldFollowUp names the post-fold side effect a caller must apply
+// after updateAggregateCheckOnce returns. The one-shot fold never schedules a
+// timer or mutates the re-fold budget itself, so the owner of retries (the
+// updateAggregateCheck wrapper today; the durable dispatch path later) decides
+// how to act on the disposition. A ScheduleParticipantRefold follow-up with a
+// nil error is a successful fold whose participant convergence is still pending
+// — distinct from a failed fold, which also returns a non-nil error.
+type aggregateFoldFollowUp uint8
+
+const (
+	aggregateFoldNoFollowUp aggregateFoldFollowUp = iota
+	aggregateFoldClearParticipantRefoldBudget
+	aggregateFoldScheduleLeaderRefold
+	aggregateFoldScheduleParticipantRefold
+)
+
+// updateAggregateCheck is the fire-and-forget wrapper: it folds the aggregate
+// and applies the returned follow-up (timer scheduling / budget clearing) that
+// the callers with no way to react to a failed fold rely on. Callers that own a
+// retry mechanism call updateAggregateCheckOnce directly and act on its error.
+func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string) {
+	followUp, _ := h.updateAggregateCheckOnce(ctx, client, repo, pr, headSHA)
+	switch followUp {
+	case aggregateFoldNoFollowUp:
+	case aggregateFoldClearParticipantRefoldBudget:
+		h.clearParticipantRefoldBudget(repo, pr)
+	case aggregateFoldScheduleLeaderRefold:
+		h.scheduleLeaderRefoldIfConfigured(ctx, repo, pr, client.InstallationID())
+	case aggregateFoldScheduleParticipantRefold:
+		h.scheduleParticipantRefold(ctx, repo, pr, client.InstallationID())
+	}
+}
+
+// updateAggregateCheckOnce recomputes and creates/updates aggregate check runs
+// that roll up per-database checks for a PR. It does the fold exactly once and
+// returns the follow-up its caller must apply plus the underlying error, so a
+// caller with a retry mechanism can react to a failed fold. It never schedules a
+// timer or mutates the re-fold budget itself.
 //
 // When allowed_environments is configured, per-environment aggregates are created
 // (e.g., "SchemaBot (staging)") that only roll up checks for that environment.
@@ -80,19 +129,19 @@ func (h *Handler) verifyHeadSHAStillCurrentForPR(ctx context.Context, client *gh
 //   - ANY check "action_required" → aggregate "action_required"
 //   - ALL checks "success"        → aggregate "success"
 //   - NO per-database checks      → no aggregate (PR doesn't touch schema)
-func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string) {
+func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string) (aggregateFoldFollowUp, error) {
 	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
-		return
+		return aggregateFoldNoFollowUp, nil
 	}
 
-	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
-		// False covers a transient PR-fetch failure as well as a genuinely
-		// newer head; either way a leader's next re-fold fetches the
-		// then-current head, so arming a bounded re-fold converges the
-		// aggregate instead of stranding one waiting on a participant re-read.
-		// verifyHeadSHAStillCurrentForPR already logged the reason.
-		h.scheduleLeaderRefoldIfConfigured(ctx, repo, pr, client.InstallationID())
-		return
+	current, err := h.verifyHeadSHACurrency(ctx, client, repo, pr, headSHA, "aggregate_check_sync")
+	if !current {
+		// A non-current head covers a transient PR-fetch failure (non-nil err)
+		// as well as a genuinely newer head (nil err); either way a leader's
+		// next re-fold fetches the then-current head, so arm a bounded re-fold
+		// instead of stranding an aggregate waiting on a participant re-read.
+		// verifyHeadSHACurrency already logged the reason.
+		return aggregateFoldScheduleLeaderRefold, err
 	}
 
 	checks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
@@ -106,8 +155,7 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 		// A storage blip must not end a leader's retry chain while its
 		// aggregate renders unresolved participants as in_progress; the
 		// bounded re-fold retries the read.
-		h.scheduleLeaderRefoldIfConfigured(ctx, repo, pr, client.InstallationID())
-		return
+		return aggregateFoldScheduleLeaderRefold, fmt.Errorf("fetch checks for aggregate %s#%d: %w", repo, pr, err)
 	}
 
 	// Filter out aggregate checks — only per-database checks contribute
@@ -143,8 +191,7 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 			})
 			h.logger.Error("aggregate leader cannot fetch PR files, not publishing aggregate",
 				"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
-			h.scheduleParticipantRefold(ctx, repo, pr, client.InstallationID())
-			return
+			return aggregateFoldScheduleParticipantRefold, fmt.Errorf("fetch PR files for aggregate leader %s#%d: %w", repo, pr, err)
 		}
 		expectedParticipants = config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))
 	}
@@ -159,7 +206,7 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 			Status:     "noop",
 		})
 		h.logger.Debug("no per-database checks or expected participants for aggregate", "repo", repo, "pr", pr)
-		return
+		return aggregateFoldNoFollowUp, nil
 	}
 
 	checkNameBase := h.aggregateCheckNameForRepo(repo)
@@ -174,6 +221,12 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 	// applies.
 	participantsRetriable := false
 	retryPending := h.participantRefoldBudgetRemaining(repo, pr)
+
+	// Every configured environment is attempted even if an earlier upsert fails,
+	// and the failures are joined so the participant follow-up below is still
+	// decided from the full fold — a single environment's write failure must not
+	// skip the others or drop the re-fold decision.
+	var upsertErrs []error
 
 	if len(config.AllowedEnvironments) > 0 {
 		// Per-environment aggregates: create one aggregate per allowed environment.
@@ -190,7 +243,9 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 				continue
 			}
 			checkName := aggregateCheckNameForEnv(checkNameBase, env)
-			h.upsertAggregateCheckRun(ctx, client, repo, pr, headSHA, envChecks, checkName, env)
+			if err := h.upsertAggregateCheckRunOnce(ctx, client, repo, pr, headSHA, envChecks, checkName, env); err != nil {
+				upsertErrs = append(upsertErrs, err)
+			}
 		}
 	} else {
 		// Single aggregate. Uses aggregateSentinel for the environment field
@@ -200,14 +255,15 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 		aggChecks := make([]*storage.Check, 0, len(dbChecks)+len(participantChecks))
 		aggChecks = append(aggChecks, dbChecks...)
 		aggChecks = append(aggChecks, participantChecks...)
-		h.upsertAggregateCheckRun(ctx, client, repo, pr, headSHA, aggChecks, checkNameBase, aggregateSentinel)
+		if err := h.upsertAggregateCheckRunOnce(ctx, client, repo, pr, headSHA, aggChecks, checkNameBase, aggregateSentinel); err != nil {
+			upsertErrs = append(upsertErrs, err)
+		}
 	}
 
 	if participantsRetriable {
-		h.scheduleParticipantRefold(ctx, repo, pr, client.InstallationID())
-	} else {
-		h.clearParticipantRefoldBudget(repo, pr)
+		return aggregateFoldScheduleParticipantRefold, errors.Join(upsertErrs...)
 	}
+	return aggregateFoldClearParticipantRefoldBudget, errors.Join(upsertErrs...)
 }
 
 // prFilePaths extracts the changed-file paths from a PR file listing for
@@ -218,19 +274,6 @@ func prFilePaths(files []ghclient.PRFile) []string {
 		paths = append(paths, f.Filename)
 	}
 	return paths
-}
-
-// upsertAggregateCheckRun is the fire-and-forget wrapper used by the callers
-// that have no way to react to a failed aggregate write. It records the same
-// metrics and logs as upsertAggregateCheckRunOnce and discards the returned
-// error. Callers that own a retry mechanism (the durable dispatch path) call
-// upsertAggregateCheckRunOnce directly.
-func (h *Handler) upsertAggregateCheckRun(
-	ctx context.Context, client *ghclient.InstallationClient,
-	repo string, pr int, headSHA string,
-	dbChecks []*storage.Check, checkName string, environment string,
-) {
-	_ = h.upsertAggregateCheckRunOnce(ctx, client, repo, pr, headSHA, dbChecks, checkName, environment)
 }
 
 // upsertAggregateCheckRunOnce computes the aggregate conclusion from the given
