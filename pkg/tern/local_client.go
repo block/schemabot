@@ -512,14 +512,27 @@ func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *st
 		return false, false, nil
 	}
 	// Resolve credentials through the task namespace so the lookup addresses
-	// the schema the apply actually runs against: a namespace-free target DSN
-	// needs the namespace injected (and mapped, under schema overrides) or the
-	// signal query would silently run without a schema and miss the sentinel.
+	// the schema the apply actually runs against. The engine's sentinel query
+	// is schema-qualified (DSN database first, request database as fallback),
+	// so without injecting the mapped task namespace it would address the
+	// canonical database name and miss a sentinel that lives in a different
+	// physical schema.
+	//
+	// A deferred-cutover apply's tasks share exactly one namespace (grouped
+	// applies enforce this at credential resolution). Guard that invariant
+	// here: with mixed namespaces the lookup would silently depend on task
+	// order, so fail loudly instead.
 	namespace := ""
 	for _, task := range tasks {
-		if task != nil && task.Namespace != "" {
+		if task == nil || task.Namespace == "" {
+			continue
+		}
+		if namespace == "" {
 			namespace = task.Namespace
-			break
+			continue
+		}
+		if task.Namespace != namespace {
+			return false, true, fmt.Errorf("deferred cutover signal lookup for apply %s database %s: tasks span multiple namespaces (%q, %q)", apply.ApplyIdentifier, apply.Database, namespace, task.Namespace)
 		}
 	}
 	creds, err := c.credentialsForMySQLNamespace(namespace)
@@ -669,15 +682,11 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 	physical := namespace
 	targetDSN := c.config.TargetDSN
 	if c.config.Type == storage.DatabaseTypeMySQL {
-		var err error
-		physical, err = c.physicalMySQLNamespace(namespace)
+		creds, resolvedPhysical, err := c.credentialsForMySQLPullNamespace(namespace)
 		if err != nil {
-			return nil, fmt.Errorf("resolve database %s namespace %s physical schema for schema pull: %w", c.config.Database, namespace, err)
+			return nil, fmt.Errorf("resolve database %s namespace %s target for schema pull: %w", c.config.Database, namespace, err)
 		}
-		creds, err := c.credentialsForMySQLPullNamespace(namespace)
-		if err != nil {
-			return nil, fmt.Errorf("resolve database %s namespace %s credentials for schema pull: %w", c.config.Database, namespace, err)
-		}
+		physical = resolvedPhysical
 		targetDSN = creds.DSN
 	}
 
@@ -916,21 +925,21 @@ func (c *LocalClient) pullNamespaceCatalog(ctx context.Context, db *sql.DB, name
 	return catalog, nil
 }
 
-func (c *LocalClient) loadTableCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+func (c *LocalClient) loadTableCatalog(ctx context.Context, db *sql.DB, physicalSchema string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
 	rows, err := db.QueryContext(ctx, `
 		SELECT table_name, table_type, table_comment
 		FROM information_schema.tables
 		WHERE table_schema = ?
-		ORDER BY table_name`, namespace)
+		ORDER BY table_name`, physicalSchema)
 	if err != nil {
-		return fmt.Errorf("load table catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("load table catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	defer utils.CloseAndLog(rows)
 
 	for rows.Next() {
 		var tableName, tableType, tableComment string
 		if err := rows.Scan(&tableName, &tableType, &tableComment); err != nil {
-			return fmt.Errorf("scan table catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+			return fmt.Errorf("scan table catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 		}
 		if _, ok := pulledTables[tableName]; ok {
 			catalog[tableName] = &ternv1.TableCatalog{
@@ -941,7 +950,7 @@ func (c *LocalClient) loadTableCatalog(ctx context.Context, db *sql.DB, namespac
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate table catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("iterate table catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	return nil
 }
@@ -950,14 +959,14 @@ func (c *LocalClient) loadTableCatalog(ctx context.Context, db *sql.DB, namespac
 // estimates from information_schema.tables. These are approximations (NULL for
 // views, stale until statistics are refreshed) and are only loaded at DETAILED
 // catalog detail.
-func (c *LocalClient) loadTableEstimates(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+func (c *LocalClient) loadTableEstimates(ctx context.Context, db *sql.DB, physicalSchema string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
 	rows, err := db.QueryContext(ctx, `
 		SELECT table_name, table_rows, data_length, index_length
 		FROM information_schema.tables
 		WHERE table_schema = ?
-		ORDER BY table_name`, namespace)
+		ORDER BY table_name`, physicalSchema)
 	if err != nil {
-		return fmt.Errorf("load table estimates for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("load table estimates for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -965,7 +974,7 @@ func (c *LocalClient) loadTableEstimates(ctx context.Context, db *sql.DB, namesp
 		var tableName string
 		var tableRows, dataLength, indexLength sql.NullInt64
 		if err := rows.Scan(&tableName, &tableRows, &dataLength, &indexLength); err != nil {
-			return fmt.Errorf("scan table estimates for database %s namespace %s: %w", c.config.Database, namespace, err)
+			return fmt.Errorf("scan table estimates for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 		}
 		if _, ok := pulledTables[tableName]; ok {
 			tableCatalog := ensurePulledTableCatalog(catalog, tableName)
@@ -974,19 +983,19 @@ func (c *LocalClient) loadTableEstimates(ctx context.Context, db *sql.DB, namesp
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate table estimates for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("iterate table estimates for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	return nil
 }
 
-func (c *LocalClient) loadColumnCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+func (c *LocalClient) loadColumnCatalog(ctx context.Context, db *sql.DB, physicalSchema string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
 	rows, err := db.QueryContext(ctx, `
 		SELECT table_name, column_name, column_type, is_nullable, column_default, column_comment, extra
 		FROM information_schema.columns
 		WHERE table_schema = ?
-		ORDER BY table_name, ordinal_position`, namespace)
+		ORDER BY table_name, ordinal_position`, physicalSchema)
 	if err != nil {
-		return fmt.Errorf("load column catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("load column catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -994,7 +1003,7 @@ func (c *LocalClient) loadColumnCatalog(ctx context.Context, db *sql.DB, namespa
 		var tableName, columnName, columnType, nullable, comment, extra string
 		var defaultValue sql.NullString
 		if err := rows.Scan(&tableName, &columnName, &columnType, &nullable, &defaultValue, &comment, &extra); err != nil {
-			return fmt.Errorf("scan column catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+			return fmt.Errorf("scan column catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 		}
 		if _, ok := pulledTables[tableName]; ok {
 			tableCatalog := ensurePulledTableCatalog(catalog, tableName)
@@ -1018,19 +1027,19 @@ func (c *LocalClient) loadColumnCatalog(ctx context.Context, db *sql.DB, namespa
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate column catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("iterate column catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	return nil
 }
 
-func (c *LocalClient) loadIndexCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+func (c *LocalClient) loadIndexCatalog(ctx context.Context, db *sql.DB, physicalSchema string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
 	rows, err := db.QueryContext(ctx, `
 		SELECT table_name, index_name, non_unique, column_name, expression
 		FROM information_schema.statistics
 		WHERE table_schema = ?
-		ORDER BY table_name, index_name, seq_in_index`, namespace)
+		ORDER BY table_name, index_name, seq_in_index`, physicalSchema)
 	if err != nil {
-		return fmt.Errorf("load index catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("load index catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -1040,7 +1049,7 @@ func (c *LocalClient) loadIndexCatalog(ctx context.Context, db *sql.DB, namespac
 		var columnName, expression sql.NullString
 		var nonUnique int32
 		if err := rows.Scan(&tableName, &indexName, &nonUnique, &columnName, &expression); err != nil {
-			return fmt.Errorf("scan index catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+			return fmt.Errorf("scan index catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 		}
 		if _, ok := pulledTables[tableName]; ok {
 			indexedValue := ""
@@ -1050,7 +1059,7 @@ func (c *LocalClient) loadIndexCatalog(ctx context.Context, db *sql.DB, namespac
 			case expression.Valid:
 				indexedValue = expression.String
 			default:
-				c.logger.Warn("LocalClient.PullSchema: skipping index part without column or expression", "database", c.config.Database, "namespace", namespace, "table", tableName, "index", indexName)
+				c.logger.Warn("LocalClient.PullSchema: skipping index part without column or expression", "database", c.config.Database, "physical_schema", physicalSchema, "table", tableName, "index", indexName)
 				continue
 			}
 			tableCatalog := ensurePulledTableCatalog(catalog, tableName)
@@ -1071,7 +1080,7 @@ func (c *LocalClient) loadIndexCatalog(ctx context.Context, db *sql.DB, namespac
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate index catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("iterate index catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	return nil
 }
@@ -1081,7 +1090,7 @@ func (c *LocalClient) loadIndexCatalog(ctx context.Context, db *sql.DB, namespac
 // per-constraint ON UPDATE / ON DELETE rules). referential_constraints
 // contains only foreign-key constraints, so the join naturally restricts to
 // them; primary-key and unique constraints are already represented as indexes.
-func (c *LocalClient) loadForeignKeyCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+func (c *LocalClient) loadForeignKeyCatalog(ctx context.Context, db *sql.DB, physicalSchema string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
 	rows, err := db.QueryContext(ctx, `
 		SELECT kcu.table_name, kcu.constraint_name, kcu.column_name,
 		       kcu.referenced_table_name, kcu.referenced_column_name,
@@ -1091,9 +1100,9 @@ func (c *LocalClient) loadForeignKeyCatalog(ctx context.Context, db *sql.DB, nam
 		  ON rc.constraint_schema = kcu.constraint_schema
 		 AND rc.constraint_name = kcu.constraint_name
 		WHERE kcu.table_schema = ?
-		ORDER BY kcu.table_name, kcu.constraint_name, kcu.ordinal_position`, namespace)
+		ORDER BY kcu.table_name, kcu.constraint_name, kcu.ordinal_position`, physicalSchema)
 	if err != nil {
-		return fmt.Errorf("load foreign key catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("load foreign key catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -1102,7 +1111,7 @@ func (c *LocalClient) loadForeignKeyCatalog(ctx context.Context, db *sql.DB, nam
 		var tableName, constraintName string
 		var columnName, referencedTable, referencedColumn, updateRule, deleteRule sql.NullString
 		if err := rows.Scan(&tableName, &constraintName, &columnName, &referencedTable, &referencedColumn, &updateRule, &deleteRule); err != nil {
-			return fmt.Errorf("scan foreign key catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+			return fmt.Errorf("scan foreign key catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 		}
 		if _, ok := pulledTables[tableName]; !ok {
 			continue
@@ -1126,7 +1135,7 @@ func (c *LocalClient) loadForeignKeyCatalog(ctx context.Context, db *sql.DB, nam
 		fk.ReferencedColumns = append(fk.ReferencedColumns, referencedColumn.String)
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate foreign key catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("iterate foreign key catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	return nil
 }
@@ -1158,35 +1167,38 @@ func (c *LocalClient) pullResponseDatabase(req *ternv1.PullSchemaRequest) string
 	return c.config.Database
 }
 
-func (c *LocalClient) credentialsForMySQLPullNamespace(namespace string) (*engine.Credentials, error) {
+// credentialsForMySQLPullNamespace resolves the connection credentials and the
+// physical schema a pull for the requested canonical namespace reads, so the
+// pull path resolves the schema-override mapping exactly once.
+func (c *LocalClient) credentialsForMySQLPullNamespace(namespace string) (*engine.Credentials, string, error) {
 	if c.config.Type != storage.DatabaseTypeMySQL {
-		return c.credentials(), nil
+		return c.credentials(), namespace, nil
 	}
 	database, err := mysqlDSNDatabase(c.config.TargetDSN)
 	if err != nil {
-		return nil, fmt.Errorf("inspect MySQL target DSN for namespace injection: %w", err)
+		return nil, "", fmt.Errorf("inspect MySQL target DSN for namespace injection: %w", err)
 	}
 	if database != "" {
 		if database != namespace {
-			return nil, fmt.Errorf("target DSN database %q does not match requested namespace %q", database, namespace)
+			return nil, "", fmt.Errorf("target DSN database %q does not match requested namespace %q", database, namespace)
 		}
-		return c.credentials(), nil
+		return c.credentials(), namespace, nil
 	}
 	if namespace == "" {
-		return nil, fmt.Errorf("MySQL namespace is required for a namespace-free target DSN")
+		return nil, "", fmt.Errorf("MySQL namespace is required for a namespace-free target DSN")
 	}
 	physical, err := c.physicalMySQLNamespace(namespace)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	dsn, err := mysqlDSNWithDatabase(c.config.TargetDSN, physical)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	return &engine.Credentials{
 		DSN:      dsn,
 		Metadata: c.config.Metadata,
-	}, nil
+	}, physical, nil
 }
 
 func pulledSchemaFileContent(database string, tableName string, tableDDL string) (string, error) {

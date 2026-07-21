@@ -155,6 +155,12 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		return false
 	}
 
+	// The raw target credentials (no namespace mapping) are safe here only
+	// because Spirit's Progress is purely in-memory and never queries by
+	// request database or connection schema. An engine whose Progress inspects
+	// the database must resolve credentials per task (credentialsForTask)
+	// before this probe, or under schema overrides it would address the
+	// canonical name instead of the physical schema.
 	result, err := eng.Progress(ctx, &engine.ProgressRequest{
 		Database:    database,
 		Credentials: c.credentials(),

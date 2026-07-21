@@ -279,8 +279,9 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 	}
 	e.mu.Unlock()
 
-	// Stateless cutover (no in-memory schema change, e.g. after a restart)
-	// addresses the schema the DSN connects to.
+	// Stateless cutover — no in-memory schema change, or one without a
+	// recorded database (e.g. after a restart) — addresses the schema the
+	// DSN connects to.
 	if database == "" {
 		var err error
 		database, err = statelessControlDatabase(req.Credentials.DSN, req.Database)

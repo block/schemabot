@@ -3060,11 +3060,12 @@ func TestLocalClient_CredentialsNamespaceResolution(t *testing.T) {
 			TargetDSN: "root@tcp(localhost:3306)/orders_schema",
 		}, logger: slog.Default()}
 
-		creds, err := c.credentialsForMySQLPullNamespace("orders_schema")
+		creds, physical, err := c.credentialsForMySQLPullNamespace("orders_schema")
 		require.NoError(t, err)
 		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
+		assert.Equal(t, "orders_schema", physical)
 
-		_, err = c.credentialsForMySQLPullNamespace("audit_schema")
+		_, _, err = c.credentialsForMySQLPullNamespace("audit_schema")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "does not match requested namespace")
 	})
@@ -3075,9 +3076,10 @@ func TestLocalClient_CredentialsNamespaceResolution(t *testing.T) {
 			TargetDSN: "root@tcp(localhost:3306)/",
 		}, logger: slog.Default()}
 
-		creds, err := c.credentialsForMySQLPullNamespace("orders_schema")
+		creds, physical, err := c.credentialsForMySQLPullNamespace("orders_schema")
 		require.NoError(t, err)
 		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
+		assert.Equal(t, "orders_schema", physical)
 	})
 
 	t.Run("namespace-free DSN without a namespace is an error", func(t *testing.T) {
@@ -3187,9 +3189,10 @@ func TestLocalClient_SchemaOverrides(t *testing.T) {
 	})
 
 	t.Run("pull credentials inject the mapped physical schema", func(t *testing.T) {
-		creds, err := newClient().credentialsForMySQLPullNamespace("bikeshare")
+		creds, physical, err := newClient().credentialsForMySQLPullNamespace("bikeshare")
 		require.NoError(t, err)
 		assert.Equal(t, "root@tcp(localhost:3306)/bikeshare_eu_qa", creds.DSN)
+		assert.Equal(t, "bikeshare_eu_qa", physical)
 	})
 
 	t.Run("task credentials map the persisted canonical namespace", func(t *testing.T) {
