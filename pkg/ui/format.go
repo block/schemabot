@@ -219,7 +219,7 @@ func TableStatePriority(taskState string) int {
 // TableSkippedByFailure reports whether a failed table row represents work
 // that never started. When an apply fails, the tables still queued behind the
 // failure are marked failed alongside it, but the engine recorded no row-copy
-// progress and no error of their own for them. Renders label these tables as
+// progress and no error of their own for them. Renderers label these tables as
 // skipped so the table that actually failed stands out. A table that failed
 // before copying any rows still carries its own engine error, so it renders
 // as failed, not skipped.
