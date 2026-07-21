@@ -236,6 +236,23 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 	}, nil
 }
 
+// statelessControlDatabase resolves the schema a stateless control operation
+// (cutover or sentinel lookup without an in-memory schema change) addresses.
+// The DSN's database wins: it carries the physical schema name, which can
+// differ from the request's logical database name when the target maps
+// namespaces to per-deployment physical schemas. The request database is only
+// a fallback for DSNs without a schema.
+func statelessControlDatabase(dsn, requestDatabase string) (string, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return "", err
+	}
+	if cfg.DBName != "" {
+		return cfg.DBName, nil
+	}
+	return requestDatabase, nil
+}
+
 // Cutover triggers the final table swap.
 // When DeferCutOver was used, this triggers the deferred cutover by dropping
 // Spirit's sentinel table (_spirit_sentinel).
@@ -249,7 +266,7 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 
 	e.mu.Lock()
 	rm := e.runningSchemaChange
-	database := req.Database
+	database := ""
 	if rm != nil {
 		if !rm.deferCutover {
 			e.mu.Unlock()
@@ -258,18 +275,18 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 				Message:  "schema change was not started with defer_cutover",
 			}, nil
 		}
-		if rm.database != "" {
-			database = rm.database
-		}
+		database = rm.database
 	}
 	e.mu.Unlock()
 
+	// Stateless cutover (no in-memory schema change, e.g. after a restart)
+	// addresses the schema the DSN connects to.
 	if database == "" {
-		cfg, err := mysql.ParseDSN(req.Credentials.DSN)
+		var err error
+		database, err = statelessControlDatabase(req.Credentials.DSN, req.Database)
 		if err != nil {
 			return nil, fmt.Errorf("parse DSN for cutover database: %w", err)
 		}
-		database = cfg.DBName
 	}
 	if database == "" {
 		return nil, fmt.Errorf("database is required for cutover")
@@ -312,13 +329,10 @@ func (e *Engine) DeferredCutoverSignalExists(ctx context.Context, req *engine.De
 		return false, fmt.Errorf("DSN credentials required for deferred cutover signal lookup")
 	}
 
-	database := req.Database
-	if database == "" {
-		cfg, err := mysql.ParseDSN(req.Credentials.DSN)
-		if err != nil {
-			return false, fmt.Errorf("parse DSN for deferred cutover signal database: %w", err)
-		}
-		database = cfg.DBName
+	// The sentinel lives in the schema the DSN connects to.
+	database, err := statelessControlDatabase(req.Credentials.DSN, req.Database)
+	if err != nil {
+		return false, fmt.Errorf("parse DSN for deferred cutover signal database: %w", err)
 	}
 	if database == "" {
 		return false, fmt.Errorf("database is required for deferred cutover signal lookup")

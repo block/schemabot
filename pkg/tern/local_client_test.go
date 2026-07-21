@@ -3146,6 +3146,171 @@ func TestLocalClient_CredentialsNamespaceResolution(t *testing.T) {
 	})
 }
 
+// recordingSignalChecker records the deferred cutover signal request so tests
+// can assert the request database stays canonical while the credentials DSN
+// carries the physical schema.
+type recordingSignalChecker struct {
+	engine.Engine
+	req *engine.DeferredCutoverSignalRequest
+}
+
+func (e *recordingSignalChecker) DeferredCutoverSignalExists(_ context.Context, req *engine.DeferredCutoverSignalRequest) (bool, error) {
+	e.req = req
+	return true, nil
+}
+
+// Per-deployment schema overrides map a requested (canonical) MySQL namespace
+// to the physical schema name at the data-plane seam: the canonical name stays
+// in requests, plans, tasks, and pull responses; the physical name only enters
+// the connection schema. A non-empty map is a strict allowlist and requires a
+// namespace-free target DSN.
+func TestLocalClient_SchemaOverrides(t *testing.T) {
+	overrides := map[string]string{"bikeshare": "bikeshare_eu_qa"}
+	newClient := func() *LocalClient {
+		return &LocalClient{config: LocalConfig{
+			Type:            storage.DatabaseTypeMySQL,
+			TargetDSN:       "root@tcp(localhost:3306)/",
+			SchemaOverrides: overrides,
+		}, logger: slog.Default()}
+	}
+
+	t.Run("credentials inject the mapped physical schema", func(t *testing.T) {
+		creds, err := newClient().credentialsForMySQLNamespace("bikeshare")
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/bikeshare_eu_qa", creds.DSN)
+	})
+
+	t.Run("unmapped canonical namespace fails closed", func(t *testing.T) {
+		_, err := newClient().credentialsForMySQLNamespace("orders")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "does not authorize MySQL namespace")
+	})
+
+	t.Run("pull credentials inject the mapped physical schema", func(t *testing.T) {
+		creds, err := newClient().credentialsForMySQLPullNamespace("bikeshare")
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/bikeshare_eu_qa", creds.DSN)
+	})
+
+	t.Run("task credentials map the persisted canonical namespace", func(t *testing.T) {
+		creds, err := newClient().credentialsForTask(&storage.Task{Namespace: "bikeshare"})
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/bikeshare_eu_qa", creds.DSN)
+	})
+
+	t.Run("grouped apply credentials map the plan namespace", func(t *testing.T) {
+		creds, err := newClient().credentialsForGroupedApply(&storage.Plan{
+			Namespaces: map[string]*storage.NamespacePlanData{"bikeshare": {}},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/bikeshare_eu_qa", creds.DSN)
+	})
+
+	t.Run("namespace discovery returns canonical keys, not physical names", func(t *testing.T) {
+		namespaces, err := newClient().discoverPullNamespaces(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, []string{"bikeshare"}, namespaces)
+	})
+
+	t.Run("no overrides preserves identity mapping", func(t *testing.T) {
+		c := &LocalClient{config: LocalConfig{
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/",
+		}, logger: slog.Default()}
+
+		creds, err := c.credentialsForMySQLNamespace("bikeshare")
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/bikeshare", creds.DSN)
+	})
+
+	t.Run("deferred cutover signal lookup sends physical DSN with canonical database", func(t *testing.T) {
+		checker := &recordingSignalChecker{}
+		c := &LocalClient{
+			config: LocalConfig{
+				Type:            storage.DatabaseTypeMySQL,
+				TargetDSN:       "root@tcp(localhost:3306)/",
+				SchemaOverrides: overrides,
+			},
+			spiritEngine: checker,
+			logger:       slog.Default(),
+		}
+
+		exists, supported, err := c.deferredCutoverSignalExists(t.Context(),
+			&storage.Apply{ApplyIdentifier: "apply-1", Database: "bikeshare"},
+			[]*storage.Task{{Namespace: "bikeshare"}},
+		)
+		require.NoError(t, err)
+		assert.True(t, supported)
+		assert.True(t, exists)
+		require.NotNil(t, checker.req)
+		assert.Equal(t, "bikeshare", checker.req.Database)
+		assert.Equal(t, "root@tcp(localhost:3306)/bikeshare_eu_qa", checker.req.Credentials.DSN)
+	})
+
+	t.Run("NewLocalClient rejects overrides for non-MySQL targets", func(t *testing.T) {
+		_, err := NewLocalClient(LocalConfig{
+			Database:        "bikeshare",
+			Type:            storage.DatabaseTypeVitess,
+			SchemaOverrides: overrides,
+		}, nil, slog.Default())
+		require.ErrorContains(t, err, "only supported for mysql")
+	})
+
+	t.Run("NewLocalClient rejects more than one mapping", func(t *testing.T) {
+		_, err := NewLocalClient(LocalConfig{
+			Database:  "bikeshare",
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/",
+			SchemaOverrides: map[string]string{
+				"bikeshare": "bikeshare_eu_qa",
+				"orders":    "orders_eu_qa",
+			},
+		}, nil, slog.Default())
+		require.ErrorContains(t, err, "exactly one mapping")
+	})
+
+	t.Run("NewLocalClient rejects an empty physical schema name", func(t *testing.T) {
+		_, err := NewLocalClient(LocalConfig{
+			Database:        "bikeshare",
+			Type:            storage.DatabaseTypeMySQL,
+			TargetDSN:       "root@tcp(localhost:3306)/",
+			SchemaOverrides: map[string]string{"bikeshare": ""},
+		}, nil, slog.Default())
+		require.ErrorContains(t, err, "must not be empty")
+	})
+
+	t.Run("NewLocalClient rejects an unsafe physical schema name", func(t *testing.T) {
+		_, err := NewLocalClient(LocalConfig{
+			Database:        "bikeshare",
+			Type:            storage.DatabaseTypeMySQL,
+			TargetDSN:       "root@tcp(localhost:3306)/",
+			SchemaOverrides: map[string]string{"bikeshare": "bikeshare-eu-qa"},
+		}, nil, slog.Default())
+		require.ErrorContains(t, err, "unsupported character")
+	})
+
+	t.Run("NewLocalClient rejects overrides with a database-bearing DSN", func(t *testing.T) {
+		_, err := NewLocalClient(LocalConfig{
+			Database:        "bikeshare",
+			Type:            storage.DatabaseTypeMySQL,
+			TargetDSN:       "root@tcp(localhost:3306)/bikeshare_eu_qa",
+			SchemaOverrides: overrides,
+		}, nil, slog.Default())
+		require.ErrorContains(t, err, "namespace-free")
+	})
+
+	t.Run("NewLocalClient accepts overrides with a namespace-free DSN", func(t *testing.T) {
+		client, err := NewLocalClient(LocalConfig{
+			Database:        "bikeshare",
+			Type:            storage.DatabaseTypeMySQL,
+			TargetDSN:       "root@tcp(localhost:3306)/",
+			SchemaOverrides: overrides,
+		}, nil, slog.Default())
+		require.NoError(t, err)
+		require.NotNil(t, client)
+	})
+}
+
 func TestLocalClient_PlanNamespaceUsesConfiguredDatabase(t *testing.T) {
 	client := &LocalClient{config: LocalConfig{
 		Database: "testdb",

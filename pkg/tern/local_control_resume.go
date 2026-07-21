@@ -1499,7 +1499,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 
 	deferredCutoverSignalAbsent := false
 	if shouldInspectCutoverSignalForResume(apply, forceCutoverResume) {
-		signalExists, signalSupported, err := c.deferredCutoverSignalExists(ctx, apply)
+		signalExists, signalSupported, err := c.deferredCutoverSignalExists(ctx, apply, tasks)
 		if err != nil {
 			c.logger.Warn("deferred cutover recovery could not verify engine cutover signal; operator will retry",
 				"apply_id", apply.ApplyIdentifier,

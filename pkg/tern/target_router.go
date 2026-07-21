@@ -522,10 +522,11 @@ func (r *TargetRouter) clientForTarget(ctx context.Context, target, databaseType
 	}
 
 	client, err := r.factory(LocalConfig{
-		Database:  namespace,
-		Type:      resolved.DatabaseType,
-		TargetDSN: resolved.DSN,
-		Metadata:  maps.Clone(resolved.Metadata),
+		Database:        namespace,
+		Type:            resolved.DatabaseType,
+		TargetDSN:       resolved.DSN,
+		Metadata:        maps.Clone(resolved.Metadata),
+		SchemaOverrides: maps.Clone(resolved.SchemaOverrides),
 	}, r.storage, r.logger)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create local client for target %q database %q: %w", target, namespace, err)

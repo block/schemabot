@@ -92,6 +92,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -109,6 +110,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
 	"github.com/block/schemabot/pkg/engine/spirit"
+	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -147,6 +149,16 @@ type LocalConfig struct {
 	// Keys used by Spirit: pending_drops ("false" disables the pending drops
 	// quarantine so DROP TABLE executes directly).
 	Metadata map[string]string
+
+	// SchemaOverrides maps a requested (canonical) MySQL namespace to the
+	// physical schema name on this target, for targets whose physical schema
+	// names embed environment or region. When non-empty it is a strict
+	// allowlist consulted wherever a namespace is turned into a connection
+	// schema: a requested namespace without a mapping fails rather than
+	// falling back to the canonical name. Empty preserves the default
+	// behavior where the requested namespace is the physical schema. MySQL
+	// only, and requires a namespace-free TargetDSN.
+	SchemaOverrides map[string]string
 
 	// WakeOperator notifies the owner loop after durable work is recorded — a
 	// queued apply from a dispatch, or an external control request. The callback
@@ -215,6 +227,26 @@ var _ Client = (*LocalClient)(nil)
 // NewLocalClient creates a new local Tern client that calls the Spirit engine directly.
 // The storage parameter should be SchemaBot's storage instance for plan/task management.
 func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) (*LocalClient, error) {
+	// Schema overrides select a MySQL connection schema, so they only make
+	// sense for MySQL and only with a namespace-free target DSN (a DSN that
+	// already names a database would silently win over the mapping). Enforce
+	// the full mapping contract here as well as at inventory-config load so a
+	// custom resolver cannot hand an invalid combination straight to the
+	// client, and clone the map so the client's view cannot be mutated later.
+	if len(cfg.SchemaOverrides) > 0 {
+		if err := inventory.ValidateSchemaOverrides(cfg.Type, cfg.SchemaOverrides); err != nil {
+			return nil, err
+		}
+		hasDatabase, err := mysqlDSNHasDatabase(cfg.TargetDSN)
+		if err != nil {
+			return nil, fmt.Errorf("inspect MySQL target DSN for schema overrides: %w", err)
+		}
+		if hasDatabase {
+			return nil, fmt.Errorf("schema overrides require a namespace-free target DSN; the DSN already names a database")
+		}
+		cfg.SchemaOverrides = maps.Clone(cfg.SchemaOverrides)
+	}
+
 	// For Vitess databases, create a PlanetScale engine with a client factory
 	// that points at the API base URL from metadata (e.g., "http://localscale:8080").
 	// TargetDSN is the vtgate MySQL DSN for SHOW VITESS_MIGRATIONS.
@@ -371,6 +403,8 @@ func (c *LocalClient) credentialsForMySQLNamespace(namespace string) (*engine.Cr
 	// The data-plane model is a namespace-free DSN with the schema injected per
 	// operation (below); existing static/local configs still carry the database
 	// in the DSN, and those keep working until they migrate to namespace-free.
+	// (A DSN-with-database target cannot carry schema overrides; NewLocalClient
+	// rejects that combination.)
 	if hasDatabase {
 		return c.credentials(), nil
 	}
@@ -379,7 +413,11 @@ func (c *LocalClient) credentialsForMySQLNamespace(namespace string) (*engine.Cr
 	if namespace == "" {
 		return nil, fmt.Errorf("MySQL namespace is required for a namespace-free target DSN")
 	}
-	dsn, err := mysqlDSNWithDatabase(c.config.TargetDSN, namespace)
+	physical, err := c.physicalMySQLNamespace(namespace)
+	if err != nil {
+		return nil, err
+	}
+	dsn, err := mysqlDSNWithDatabase(c.config.TargetDSN, physical)
 	if err != nil {
 		return nil, err
 	}
@@ -387,6 +425,27 @@ func (c *LocalClient) credentialsForMySQLNamespace(namespace string) (*engine.Cr
 		DSN:      dsn,
 		Metadata: c.config.Metadata,
 	}, nil
+}
+
+// physicalMySQLNamespace resolves the physical schema name for a requested
+// (canonical) namespace. Without configured overrides the requested namespace
+// is the physical schema. With overrides the map is a strict allowlist: an
+// unmapped namespace fails rather than falling back to the canonical name, so
+// a request misrouted to this target cannot land in the wrong physical schema.
+func (c *LocalClient) physicalMySQLNamespace(namespace string) (string, error) {
+	if len(c.config.SchemaOverrides) == 0 {
+		return namespace, nil
+	}
+	physical, ok := c.config.SchemaOverrides[namespace]
+	if !ok {
+		return "", fmt.Errorf("target does not authorize MySQL namespace %q; configured schema overrides map only %v", namespace, slices.Sorted(maps.Keys(c.config.SchemaOverrides)))
+	}
+	c.logger.Debug("resolved schema override for namespace",
+		"database", c.config.Database,
+		"namespace", namespace,
+		"physical_schema", physical,
+	)
+	return physical, nil
 }
 
 func (c *LocalClient) credentialsForTask(task *storage.Task) (*engine.Credentials, error) {
@@ -443,7 +502,7 @@ func mysqlDSNDatabase(dsn string) (string, error) {
 	return cfg.DBName, nil
 }
 
-func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *storage.Apply) (bool, bool, error) {
+func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) (bool, bool, error) {
 	if apply == nil {
 		return false, false, fmt.Errorf("apply is required for deferred cutover signal lookup")
 	}
@@ -452,9 +511,24 @@ func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *st
 	if !ok {
 		return false, false, nil
 	}
+	// Resolve credentials through the task namespace so the lookup addresses
+	// the schema the apply actually runs against: a namespace-free target DSN
+	// needs the namespace injected (and mapped, under schema overrides) or the
+	// signal query would silently run without a schema and miss the sentinel.
+	namespace := ""
+	for _, task := range tasks {
+		if task != nil && task.Namespace != "" {
+			namespace = task.Namespace
+			break
+		}
+	}
+	creds, err := c.credentialsForMySQLNamespace(namespace)
+	if err != nil {
+		return false, true, fmt.Errorf("resolve credentials for deferred cutover signal lookup for apply %s database %s: %w", apply.ApplyIdentifier, apply.Database, err)
+	}
 	exists, err := checker.DeferredCutoverSignalExists(ctx, &engine.DeferredCutoverSignalRequest{
 		Database:    apply.Database,
-		Credentials: c.credentials(),
+		Credentials: creds,
 	})
 	if err != nil {
 		return false, true, fmt.Errorf("check deferred cutover signal for apply %s database %s: %w", apply.ApplyIdentifier, apply.Database, err)
@@ -537,6 +611,16 @@ func (c *LocalClient) discoverPullNamespaces(ctx context.Context) ([]string, err
 		return []string{database}, nil
 	}
 
+	// A target with schema overrides serves exactly the mapped canonical
+	// namespaces. Return those keys rather than scanning the cluster, which
+	// would surface physical names (and unrelated databases) the requested
+	// canonical namespace model must not leak.
+	if len(c.config.SchemaOverrides) > 0 {
+		namespaces := slices.Sorted(maps.Keys(c.config.SchemaOverrides))
+		c.logger.Info("LocalClient.PullSchema: using schema-override namespaces", "database", c.config.Database, "namespace_count", len(namespaces))
+		return namespaces, nil
+	}
+
 	attrs := []any{"database", c.config.Database}
 	attrs = append(attrs, dsnLogAttrs(c.config.TargetDSN)...)
 	c.logger.Info("LocalClient.PullSchema: discovering live namespaces", attrs...)
@@ -579,8 +663,17 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 		return c.pullVitessSchemaNamespace(ctx, req, namespace)
 	}
 
+	// The physical schema is what MySQL is addressed by (connection schema and
+	// information_schema predicates); the requested canonical namespace stays
+	// the response key so callers never see physical names.
+	physical := namespace
 	targetDSN := c.config.TargetDSN
 	if c.config.Type == storage.DatabaseTypeMySQL {
+		var err error
+		physical, err = c.physicalMySQLNamespace(namespace)
+		if err != nil {
+			return nil, fmt.Errorf("resolve database %s namespace %s physical schema for schema pull: %w", c.config.Database, namespace, err)
+		}
 		creds, err := c.credentialsForMySQLPullNamespace(namespace)
 		if err != nil {
 			return nil, fmt.Errorf("resolve database %s namespace %s credentials for schema pull: %w", c.config.Database, namespace, err)
@@ -588,7 +681,7 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 		targetDSN = creds.DSN
 	}
 
-	attrs := []any{"database", c.config.Database, "namespace", namespace}
+	attrs := []any{"database", c.config.Database, "namespace", namespace, "physical_schema", physical}
 	attrs = append(attrs, dsnLogAttrs(targetDSN)...)
 	c.logger.Info("LocalClient.PullSchema: loading live schema", attrs...)
 
@@ -616,7 +709,7 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 		}
 		pulledTables[tbl.Name] = content
 	}
-	catalog, err := c.pullNamespaceCatalog(ctx, db, namespace, pulledTables, req.GetCatalogDetail())
+	catalog, err := c.pullNamespaceCatalog(ctx, db, namespace, physical, pulledTables, req.GetCatalogDetail())
 	if err != nil {
 		return nil, err
 	}
@@ -785,13 +878,15 @@ type pulledCatalog struct {
 	tables    map[string]*ternv1.TableCatalog
 }
 
-func (c *LocalClient) pullNamespaceCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalogDetail ternv1.PullCatalogDetail) (*pulledCatalog, error) {
+func (c *LocalClient) pullNamespaceCatalog(ctx context.Context, db *sql.DB, namespace, physical string, pulledTables map[string]string, catalogDetail ternv1.PullCatalogDetail) (*pulledCatalog, error) {
 	// BASIC pulls only canonical DDL and artifacts (the pre-catalog pull shape):
 	// no namespace or table catalog. The full structured catalog is built only
 	// at DETAILED detail.
 	if catalogDetail != ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED {
 		return &pulledCatalog{}, nil
 	}
+	// The catalog is named by the requested canonical namespace; the live rows
+	// are read from the physical schema (they differ under schema overrides).
 	catalog := &pulledCatalog{
 		namespace: &ternv1.NamespaceCatalog{
 			Name:       namespace,
@@ -803,19 +898,19 @@ func (c *LocalClient) pullNamespaceCatalog(ctx context.Context, db *sql.DB, name
 	if len(pulledTables) == 0 {
 		return catalog, nil
 	}
-	if err := c.loadTableCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+	if err := c.loadTableCatalog(ctx, db, physical, pulledTables, catalog.tables); err != nil {
 		return nil, err
 	}
-	if err := c.loadColumnCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+	if err := c.loadColumnCatalog(ctx, db, physical, pulledTables, catalog.tables); err != nil {
 		return nil, err
 	}
-	if err := c.loadIndexCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+	if err := c.loadIndexCatalog(ctx, db, physical, pulledTables, catalog.tables); err != nil {
 		return nil, err
 	}
-	if err := c.loadForeignKeyCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+	if err := c.loadForeignKeyCatalog(ctx, db, physical, pulledTables, catalog.tables); err != nil {
 		return nil, err
 	}
-	if err := c.loadTableEstimates(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+	if err := c.loadTableEstimates(ctx, db, physical, pulledTables, catalog.tables); err != nil {
 		return nil, err
 	}
 	return catalog, nil
@@ -1080,7 +1175,11 @@ func (c *LocalClient) credentialsForMySQLPullNamespace(namespace string) (*engin
 	if namespace == "" {
 		return nil, fmt.Errorf("MySQL namespace is required for a namespace-free target DSN")
 	}
-	dsn, err := mysqlDSNWithDatabase(c.config.TargetDSN, namespace)
+	physical, err := c.physicalMySQLNamespace(namespace)
+	if err != nil {
+		return nil, err
+	}
+	dsn, err := mysqlDSNWithDatabase(c.config.TargetDSN, physical)
 	if err != nil {
 		return nil, err
 	}
