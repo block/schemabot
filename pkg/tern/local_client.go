@@ -235,7 +235,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 	// client, and clone the map so the client's view cannot be mutated later.
 	if len(cfg.SchemaOverrides) > 0 {
 		if err := inventory.ValidateSchemaOverrides(cfg.Type, cfg.SchemaOverrides); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("local client for database %q: %w", cfg.Database, err)
 		}
 		hasDatabase, err := mysqlDSNHasDatabase(cfg.TargetDSN)
 		if err != nil {
