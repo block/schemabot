@@ -453,7 +453,7 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		// comment still gets its final per-operation status freeze — it last
 		// rendered the cutover gate and its pasteable cutover command, and must
 		// not keep advertising a spent gate as live.
-		o.finalizeTrackedProgressCommentAtTerminal(ctx, apply, cutover.GitHubCommentID, ops, opsErr, tasks, shardsByTable)
+		o.finalizeTrackedProgressCommentAtTerminal(apply, cutover.GitHubCommentID, ops, opsErr, tasks, shardsByTable)
 		if state.IsState(apply.State, state.Apply.Stopped) {
 			// Stopped is the only terminal state that returns to active. The
 			// prompt now carries the stop record, so consume its row —
@@ -533,15 +533,18 @@ func (o *CommentObserver) shouldPublishSeparateSummary(apply *storage.Apply, ops
 // folded into a details block pointing at its successor and must not be
 // unfolded by an edit; a row tracking the prompt's own GitHub comment already
 // carries the terminal summary and must not be edited over it.
-func (o *CommentObserver) finalizeTrackedProgressCommentAtTerminal(ctx context.Context, apply *storage.Apply, promptCommentID int64, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) {
+func (o *CommentObserver) finalizeTrackedProgressCommentAtTerminal(apply *storage.Apply, promptCommentID int64, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	tracked, err := o.stor.ApplyComments().Get(ctx, o.applyID, state.Comment.Progress)
 	if err != nil {
 		o.logError(apply, "observer: failed to load tracked progress comment for its terminal status freeze; it stays at its last progress rendering", "error", err)
 		return
 	}
 	if tracked == nil {
-		// No tracked progress comment exists — nothing renders the gate, so
-		// there is nothing to freeze.
+		// Nothing renders the gate, so there is nothing to freeze.
+		o.logInfo(apply, "observer: no tracked progress comment to freeze at terminal")
 		return
 	}
 	if tracked.SupersededAt != nil {
