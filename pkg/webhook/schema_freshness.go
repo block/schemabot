@@ -74,13 +74,15 @@ func metricActionKey(action string) string {
 	return strings.ReplaceAll(action, "-", "_")
 }
 
-// assertBaseSchemaStillCurrent enforces the opt-in repository policy that a PR
-// must include every base-branch change under its managed schema directory.
-// It compares Git tree object IDs at the PR merge base and the current tip of
-// the base branch (resolved from prInfo.BaseRef — the PR object's base SHA is
-// a creation-time snapshot that never observes later base commits), so
-// unrelated commits elsewhere in a monorepo never block an apply. GitHub read
-// uncertainty rejects the apply rather than silently bypassing the guard.
+// assertBaseSchemaStillCurrent enforces the invariant that a PR must include
+// every base-branch change under its managed schema directory before it can
+// apply — a stale branch's plan would otherwise revert schema that already
+// landed. It compares Git tree object IDs at the PR merge base and the
+// current tip of the base branch (resolved from prInfo.BaseRef — the PR
+// object's base SHA is a creation-time snapshot that never observes later
+// base commits), so unrelated commits elsewhere in a monorepo never block an
+// apply. GitHub read uncertainty rejects the apply rather than silently
+// bypassing the guard.
 func (h *Handler) assertBaseSchemaStillCurrent(
 	ctx context.Context,
 	client *ghclient.InstallationClient,
@@ -93,11 +95,6 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 	requestedBy string,
 	action string,
 ) bool {
-	config, ok := h.serverConfig()
-	if !ok || !config.RequiresUpToDateWithBase(repo) {
-		return false
-	}
-
 	schemaPaths := []string{schema.SchemaPath}
 	if schema.SchemaLinkPath != "" {
 		schemaPaths = append(schemaPaths, schema.SchemaLinkPath)

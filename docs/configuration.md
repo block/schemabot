@@ -452,14 +452,9 @@ Set `require_passing_checks: false` to disable this gate.
 
 ## Base Branch Schema Freshness
 
-SchemaBot can reject `apply` and `apply-confirm` when a PR does not include
-schema changes that landed on its base branch after the PR diverged:
-
-```yaml
-repos:
-  myorg/monorepo:
-    require_up_to_date_with_base: true
-```
+SchemaBot rejects `apply` and `apply-confirm` when a PR does not include
+schema changes that landed on its base branch after the PR diverged. A stale
+branch's plan would otherwise revert schema that already landed.
 
 This is path-scoped rather than a whole-branch freshness requirement. At apply
 time, SchemaBot resolves the base branch ref to its current tip commit and
@@ -474,9 +469,7 @@ unsafe-change prompt: a stale branch whose plan would revert newer base schema
 is told to update the branch, never to re-run with `--allow-unsafe`.
 
 The gate fails closed when GitHub cannot resolve the base branch tip, the
-merge base, or either tree. It defaults to disabled for compatibility; enable
-it per repository after confirming the repository's schema directories are
-dedicated to schema inputs.
+merge base, or either tree.
 
 ## Review Gate
 

@@ -24,7 +24,6 @@ import (
 
 	"github.com/block/spirit/pkg/utils"
 
-	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -1567,9 +1566,6 @@ func TestE2EApplyAutoConfirmRejectsWhenHEADAdvanced(t *testing.T) {
 func TestE2EApplyAutoConfirmRejectsStaleBaseSchema(t *testing.T) {
 	dbName := "webhook_auto_confirm_stale_base"
 	svc := setupE2EService(t, dbName)
-	svc.Config().Repos = map[string]api.RepoConfig{
-		"octocat/hello-world": {RequireUpToDateWithBase: true},
-	}
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -1583,7 +1579,7 @@ func TestE2EApplyAutoConfirmRejectsStaleBaseSchema(t *testing.T) {
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
-	registerStaleBaseSchemaComparison(t, mux)
+	registerStaleBaseSchemaComparison(t, mux, result)
 
 	h := newE2EHandler(t, svc, client)
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -1626,9 +1622,6 @@ func TestE2EApplyAutoConfirmRejectsStaleBaseSchema(t *testing.T) {
 func TestE2EApplyStaleBaseSchemaOutranksUnsafePrompt(t *testing.T) {
 	dbName := "webhook_stale_base_unsafe"
 	svc := setupE2EService(t, dbName)
-	svc.Config().Repos = map[string]api.RepoConfig{
-		"octocat/hello-world": {RequireUpToDateWithBase: true},
-	}
 
 	// The live target already carries the column the newer base commit added.
 	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
@@ -1649,7 +1642,7 @@ func TestE2EApplyStaleBaseSchemaOutranksUnsafePrompt(t *testing.T) {
 	result := setupFakeGitHubForPlan(t, mux, map[string]string{
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}, schemabotConfig, dbName)
-	registerStaleBaseSchemaComparison(t, mux)
+	registerStaleBaseSchemaComparison(t, mux, result)
 
 	h := newE2EHandler(t, svc, client)
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -1693,9 +1686,6 @@ func TestE2EApplyStaleBaseSchemaOutranksUnsafePrompt(t *testing.T) {
 func TestE2EApplyConfirmStaleBaseSchemaAtFinalGateOutranksUnsafePrompt(t *testing.T) {
 	dbName := "webhook_confirm_final_stale_base"
 	svc := setupE2EService(t, dbName)
-	svc.Config().Repos = map[string]api.RepoConfig{
-		"octocat/hello-world": {RequireUpToDateWithBase: true},
-	}
 
 	const pendingPlanID = "plan-pending-confirmation"
 	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
@@ -1754,16 +1744,13 @@ func TestE2EApplyConfirmStaleBaseSchemaAtFinalGateOutranksUnsafePrompt(t *testin
 	// tree is immutable; only the ref moves, so the gate detects the advance
 	// only if it re-resolves the ref rather than reusing an earlier tip.
 	var refReads atomic.Int32
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
-		tipSHA := "base-tip-1"
+	tip := func() string {
 		if refReads.Add(1) > 1 {
-			tipSHA = "base-tip-2"
+			return "base-tip-2"
 		}
-		require.NoError(t, json.NewEncoder(w).Encode(gh.Reference{
-			Ref:    new("refs/heads/main"),
-			Object: &gh.GitObject{Type: new("commit"), SHA: &tipSHA},
-		}))
-	})
+		return "base-tip-1"
+	}
+	result.BaseTip.Store(&tip)
 	for _, tipSHA := range []string{"base-tip-1", "base-tip-2"} {
 		mux.HandleFunc("GET /repos/octocat/hello-world/compare/"+tipSHA+"...abc123", func(w http.ResponseWriter, _ *http.Request) {
 			require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
@@ -1818,9 +1805,6 @@ func TestE2EApplyConfirmStaleBaseSchemaAtFinalGateOutranksUnsafePrompt(t *testin
 func TestE2EApplyConfirmRejectsStaleBaseSchema(t *testing.T) {
 	dbName := "webhook_confirm_stale_base"
 	svc := setupE2EService(t, dbName)
-	svc.Config().Repos = map[string]api.RepoConfig{
-		"octocat/hello-world": {RequireUpToDateWithBase: true},
-	}
 	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
 		DatabaseName:  dbName,
 		DatabaseType:  "mysql",
@@ -1840,7 +1824,7 @@ func TestE2EApplyConfirmRejectsStaleBaseSchema(t *testing.T) {
 	result := setupFakeGitHubForPlan(t, mux, map[string]string{
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}, schemabotConfig, dbName)
-	registerStaleBaseSchemaComparison(t, mux)
+	registerStaleBaseSchemaComparison(t, mux, result)
 
 	h := newE2EHandler(t, svc, client)
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -1873,12 +1857,9 @@ func TestE2EApplyConfirmRejectsStaleBaseSchema(t *testing.T) {
 
 // apply-confirm validates lock intent before running freshness checks. A
 // rollback lock owned by the same PR must never be released by the apply path.
-func TestE2EApplyConfirmPreservesRollbackLockWithBaseFreshnessEnabled(t *testing.T) {
+func TestE2EApplyConfirmPreservesRollbackLock(t *testing.T) {
 	dbName := "webhook_confirm_rollback_lock"
 	svc := setupE2EService(t, dbName)
-	svc.Config().Repos = map[string]api.RepoConfig{
-		"octocat/hello-world": {RequireUpToDateWithBase: true},
-	}
 	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
 		DatabaseName:  dbName,
 		DatabaseType:  "mysql",
@@ -1927,9 +1908,6 @@ func TestE2EApplyConfirmPreservesRollbackLockWithBaseFreshnessEnabled(t *testing
 func TestE2EApplyConfirmFreshnessRacePreservesReplacementRollbackLock(t *testing.T) {
 	dbName := "webhook_confirm_rollback_race"
 	svc := setupE2EService(t, dbName)
-	svc.Config().Repos = map[string]api.RepoConfig{
-		"octocat/hello-world": {RequireUpToDateWithBase: true},
-	}
 	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
 		DatabaseName:  dbName,
 		DatabaseType:  "mysql",
@@ -1949,7 +1927,7 @@ func TestE2EApplyConfirmFreshnessRacePreservesReplacementRollbackLock(t *testing
 	result := setupFakeGitHubForPlan(t, mux, map[string]string{
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}, schemabotConfig, dbName)
-	registerStaleBaseSchemaComparisonWithHook(t, mux, func() {
+	registerStaleBaseSchemaComparisonWithHook(t, mux, result, func() {
 		require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
 			DatabaseName:  dbName,
 			DatabaseType:  "mysql",
@@ -1982,9 +1960,9 @@ func TestE2EApplyConfirmFreshnessRacePreservesReplacementRollbackLock(t *testing
 	assert.Equal(t, rollbackPendingPlanPrefix+"replacement", lock.PendingPlanID)
 }
 
-func registerStaleBaseSchemaComparison(t *testing.T, mux *http.ServeMux) {
+func registerStaleBaseSchemaComparison(t *testing.T, mux *http.ServeMux, result *planFlowResult) {
 	t.Helper()
-	registerStaleBaseSchemaComparisonWithHook(t, mux, nil)
+	registerStaleBaseSchemaComparisonWithHook(t, mux, result, nil)
 }
 
 // registerStaleBaseSchemaComparisonWithHook wires the fake GitHub endpoints
@@ -1994,14 +1972,10 @@ func registerStaleBaseSchemaComparison(t *testing.T, mux *http.ServeMux) {
 // base, so only resolving the base ref reveals the advanced tip, whose schema
 // tree differs from the merge base's. The optional hook runs when the
 // merge-base comparison is fetched, mid-way through the gate's reads.
-func registerStaleBaseSchemaComparisonWithHook(t *testing.T, mux *http.ServeMux, hook func()) {
+func registerStaleBaseSchemaComparisonWithHook(t *testing.T, mux *http.ServeMux, result *planFlowResult, hook func()) {
 	t.Helper()
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(gh.Reference{
-			Ref:    new("refs/heads/main"),
-			Object: &gh.GitObject{Type: new("commit"), SHA: new("base-tip-sha")},
-		}))
-	})
+	tip := func() string { return "base-tip-sha" }
+	result.BaseTip.Store(&tip)
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...abc123", func(w http.ResponseWriter, _ *http.Request) {
 		if hook != nil {
 			hook()
@@ -2352,6 +2326,7 @@ func TestE2EApplyConfirmRejectsWhenPlanSHAStale(t *testing.T) {
 	// cross-delivery guard must still reject because the stored plan's
 	// HeadSHA ("abc123") doesn't match.
 	result.HeadSHAs = []string{"newsha456"}
+	registerFreshBaseComparison(t, mux, "newsha456")
 	h := newE2EHandler(t, svc, client)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -2621,6 +2596,7 @@ func TestE2EApplyConfirmRejectsWhenPlainPlanSupersedesApplyPlan(t *testing.T) {
 	// Current HEAD seen by every PR fetch in this delivery — matches the
 	// later plain plan, not the confirmation plan.
 	result.HeadSHAs = []string{"newsha456"}
+	registerFreshBaseComparison(t, mux, "newsha456")
 	h := newE2EHandler(t, svc, client)
 
 	confirmReq := buildWebhookRequest(t, webhookPayloadOpts{
