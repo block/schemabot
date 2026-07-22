@@ -242,8 +242,10 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	// Check if a cutover comment was posted by an external handler. A
 	// superseded row is an already-rotated-away prompt from an earlier drive,
 	// not a live cutover comment — treating it as live would re-mute the
-	// observer. This must happen before the CuttingOver branch below — without
-	// it, the observer would post a duplicate cutover comment.
+	// observer. This must happen before the deferred-cutover-gate branch below
+	// — it is the restart-time dedup: an apply can park at the gate for days,
+	// and without the durable-row check every fresh observer on a restart or
+	// re-claimed drive would post a duplicate prompt.
 	if !o.hasCutoverComment {
 		checkCtx, checkCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		cutover, err := o.stor.ApplyComments().Get(checkCtx, o.applyID, state.Comment.Cutover)
@@ -274,11 +276,11 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	// the tracked one.
 	adopted := o.pendingRotation == nil || o.adoptPendingRotationComment(apply)
 
-	// Post cutover comment when entering cutting_over with defer_cutover,
+	// Post the cutover prompt when the apply is at the deferred-cutover gate,
 	// but only if one hasn't been posted already. A failed post leaves
 	// hasCutoverComment unset so the next tick retries, instead of muting the
 	// observer for the rest of the drive over one transient GitHub error.
-	if currentState == state.Apply.CuttingOver && o.shouldDeferCutover(apply) && !o.hasCutoverComment {
+	if atDeferredCutoverGate(currentState) && o.shouldDeferCutover(apply) && !o.hasCutoverComment {
 		body := o.formatStatusComment(apply, tasks)
 		if _, posted, _ := o.postAndTrackComment(apply, state.Comment.Cutover, body, nil); posted {
 			o.hasCutoverComment = true
@@ -449,6 +451,11 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		finalBody := o.summaryCommentFromOps(ctx, apply, ops, opsErr, tasks, shardsByTable)
 		o.editTrackedComment(apply, activeCommentState, finalBody)
 		o.markSummaryPosted(apply, activeCommentState)
+		// The prompt is the completion comment, but the tracked progress
+		// comment still gets its final per-operation status freeze — it last
+		// rendered the cutover gate and its pasteable cutover command, and must
+		// not keep advertising a spent gate as live.
+		o.finalizeTrackedProgressCommentAtTerminal(apply, cutover.GitHubCommentID, ops, opsErr, tasks, shardsByTable)
 		if state.IsState(apply.State, state.Apply.Stopped) {
 			// Stopped is the only terminal state that returns to active. The
 			// prompt now carries the stop record, so consume its row —
@@ -515,6 +522,43 @@ func (o *CommentObserver) shouldPublishSeparateSummary(apply *storage.Apply, ops
 		return false
 	}
 	return true
+}
+
+// finalizeTrackedProgressCommentAtTerminal edits the tracked progress comment
+// to its final per-operation status rendering when the cutover prompt is the
+// completion comment. The prompt carries the terminal summary, and the
+// progress comment gets the same status freeze the non-cutover terminal path
+// writes, so no comment on the timeline keeps rendering the cutover gate as
+// live. It runs for every terminal state, including stopped — a stopped
+// rendering is a correct record, and the resume rotation posts the fresh
+// comment when the apply returns to active. A superseded row was already
+// folded into a details block pointing at its successor and must not be
+// unfolded by an edit; a row tracking the prompt's own GitHub comment already
+// carries the terminal summary and must not be edited over it.
+func (o *CommentObserver) finalizeTrackedProgressCommentAtTerminal(apply *storage.Apply, promptCommentID int64, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tracked, err := o.stor.ApplyComments().Get(ctx, o.applyID, state.Comment.Progress)
+	if err != nil {
+		o.logError(apply, "observer: failed to load tracked progress comment for its terminal status freeze; it stays at its last progress rendering", "error", err)
+		return
+	}
+	if tracked == nil {
+		// Nothing renders the gate, so there is nothing to freeze.
+		o.logInfo(apply, "observer: no tracked progress comment to freeze at terminal")
+		return
+	}
+	if tracked.SupersededAt != nil {
+		o.logInfo(apply, "observer: tracked progress comment already superseded; skipping its terminal status freeze")
+		return
+	}
+	if tracked.GitHubCommentID == promptCommentID {
+		o.logInfo(apply, "observer: tracked progress comment is the cutover prompt; the terminal summary already covers it")
+		return
+	}
+	finalBody := o.statusCommentFromOps(apply, ops, opsErr, tasks, shardsByTable)
+	o.editTrackedComment(apply, state.Comment.Progress, finalBody)
 }
 
 // formatStatusComment renders the apply's progress/cutover status comment,
@@ -631,6 +675,15 @@ func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *stor
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {
 	return o.deferCutover || apply.GetOptions().DeferCutover
+}
+
+// atDeferredCutoverGate reports whether the apply is at the deferred-cutover
+// gate, where the cutover prompt comment belongs. waiting_for_cutover is the
+// parked state the apply holds until the operator's cutover command;
+// cutting_over is the transient window while the cutover executes. A tick can
+// first observe the apply in either state, so the prompt posts from both.
+func atDeferredCutoverGate(applyState string) bool {
+	return state.IsState(applyState, state.Apply.WaitingForCutover, state.Apply.CuttingOver)
 }
 
 func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation string) bool {

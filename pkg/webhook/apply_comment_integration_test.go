@@ -550,13 +550,15 @@ func requireCommentCreate(t *testing.T, capture *commentCapture) int64 {
 }
 
 // applyCommentFixtureParams names the per-test identity of a comment-rotation
-// fixture. A zero volume seeds the apply without volume options.
+// fixture. A zero volume with deferCutover unset seeds the apply without
+// options.
 type applyCommentFixtureParams struct {
-	repo       string
-	pr         int
-	database   string
-	applyState string
-	volume     int
+	repo         string
+	pr           int
+	database     string
+	applyState   string
+	volume       int
+	deferCutover bool
 }
 
 // applyCommentFixture bundles the storage seeding and fake-GitHub plumbing the
@@ -619,8 +621,8 @@ func setupApplyCommentFixture(t *testing.T, p applyCommentFixtureParams) *applyC
 		Engine:          "spirit",
 		State:           p.applyState,
 	}
-	if p.volume != 0 {
-		apply.SetOptions(storage.ApplyOptions{Volume: p.volume})
+	if p.volume != 0 || p.deferCutover {
+		apply.SetOptions(storage.ApplyOptions{Volume: p.volume, DeferCutover: p.deferCutover})
 	}
 	applyID, err := st.Applies().Create(ctx, apply)
 	require.NoError(t, err)
@@ -1378,6 +1380,163 @@ func TestE2EDeferredCutoverPromptStaysMutedWithoutCutover(t *testing.T) {
 	assert.False(t, postCutoverPhase(trackedPhase(prog)), "no post-cutover phase is recorded without a cutover")
 }
 
+// A deferred-cutover apply parks at the gate in waiting_for_cutover until the
+// operator's cutover command arrives. The first observer tick that finds the
+// apply parked posts the cutover prompt — carrying the pasteable cutover
+// command — as a fresh comment at the bottom of the PR timeline rather than
+// an edit of the tracked progress comment, tracks it as the cutover comment,
+// and mutes progress edits behind it so later ticks at the gate change
+// nothing.
+func TestE2EDeferredCutoverParkedGatePostsPrompt(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:         "org/repo-cutover-parked",
+		pr:           154,
+		database:     "e2e_cutover_parked_db",
+		applyState:   state.Apply.WaitingForCutover,
+		deferCutover: true,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-cutover-parked", 154, 12345, apply, state.Comment.Progress, "Copy complete — waiting for cutover")
+	progressID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The first tick at the parked gate posts the prompt as a new comment.
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	var promptID int64
+	select {
+	case created := <-capture.creates:
+		promptID = created.ID
+		assert.Contains(t, created.Body, "**Status**: Waiting for Cutover")
+		assert.Contains(t, created.Body, "To proceed with cutover:")
+		assert.Contains(t, created.Body, fmt.Sprintf("schemabot cutover %s -e staging", apply.ApplyIdentifier))
+	case edited := <-capture.edits:
+		t.Fatalf("the parked gate posts the prompt as a new comment, not an edit; got an edit of %d: %s", edited.CommentID, edited.Body)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the cutover prompt to be posted at the parked gate")
+	}
+	assert.NotEqual(t, progressID, promptID, "the prompt is its own comment, not the progress comment")
+
+	// The cutover row tracks the prompt so a restart's fresh observer finds it.
+	cutoverRow, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Cutover)
+	require.NoError(t, err)
+	require.NotNil(t, cutoverRow)
+	assert.Equal(t, promptID, cutoverRow.GitHubCommentID)
+	assert.Nil(t, cutoverRow.SupersededAt, "the prompt row stays live while the gate waits for its answer")
+
+	// Later ticks at the gate are muted behind the live prompt: nothing is
+	// posted and nothing is edited.
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case created := <-capture.creates:
+		t.Fatalf("a later tick at the gate must not post another comment; got %d: %s", created.ID, created.Body)
+	case edited := <-capture.edits:
+		t.Fatalf("a later tick at the gate must not edit while the prompt is live; got an edit of %d: %s", edited.CommentID, edited.Body)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// A pod restart or re-claimed drive hands the parked apply to a fresh
+	// observer with no in-memory record of the prompt. The durable cutover row
+	// is what keeps a multi-day park from re-posting the prompt on every
+	// restart: the fresh observer rehydrates from the row and stays muted.
+	obs2 := f.newObserver(st, fake)
+	fake.Advance(activeInterval + time.Second)
+	obs2.OnProgress(apply, []*storage.Task{task})
+	select {
+	case created := <-capture.creates:
+		t.Fatalf("a fresh observer at the parked gate must not re-post the prompt; got %d: %s", created.ID, created.Body)
+	case edited := <-capture.edits:
+		t.Fatalf("a fresh observer at the parked gate must not edit while the prompt is live; got an edit of %d: %s", edited.CommentID, edited.Body)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// When the operator's cutover on a parked deferred-cutover apply resolves
+// directly to a terminal state, the cutover prompt is the completion comment:
+// the terminal edit turns it into the applied summary and the summary marker
+// records it as the terminal publish. The tracked progress comment — still
+// rendering the cutover gate and its pasteable cutover command — also
+// receives its final per-operation status freeze, so no comment on the
+// timeline keeps advertising the spent gate as live.
+func TestE2EDeferredCutoverFastTerminalFinalizesProgressComment(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:         "org/repo-cutover-fast-terminal",
+		pr:           155,
+		database:     "e2e_cutover_fast_terminal_db",
+		applyState:   state.Apply.WaitingForCutover,
+		deferCutover: true,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-cutover-fast-terminal", 155, 12345, apply, state.Comment.Progress, "Copy complete — waiting for cutover")
+	progressID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The tick at the parked gate posts and tracks the cutover prompt.
+	obs.OnProgress(apply, []*storage.Task{task})
+	promptID := requireCommentCreate(t, capture)
+
+	// The operator's cutover completes the apply before another progress tick
+	// lands.
+	apply.State = state.Apply.Completed
+	task.State = state.Task.Completed
+	task.RowsCopied = 1000
+	task.ProgressPercent = 100
+	obs.OnTerminal(apply, []*storage.Task{task})
+
+	// The prompt is edited into the terminal summary — it is the completion
+	// comment.
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, promptID, edited.CommentID, "the terminal summary lands on the cutover prompt")
+		assert.Contains(t, edited.Body, "✅ Schema Change Applied")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the cutover prompt to be edited into the terminal summary")
+	}
+
+	// The tracked progress comment receives its final status freeze: the
+	// completed rendering, with no live cutover instruction left behind.
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, progressID, edited.CommentID, "the status freeze lands on the tracked progress comment")
+		assert.Contains(t, edited.Body, "**Status**: Applied")
+		assert.NotContains(t, edited.Body, "To proceed with cutover:", "the frozen progress comment must not advertise the spent gate")
+		assert.NotContains(t, edited.Body, "schemabot cutover", "the frozen progress comment must not carry a live cutover command")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the tracked progress comment to be frozen at its final status")
+	}
+
+	// No extra comment is posted — the prompt already sits at the bottom of
+	// the PR as the summary.
+	select {
+	case created := <-capture.creates:
+		t.Fatalf("a cutover apply's terminal publish edits the prompt, it must not post a new comment; got %d: %s", created.ID, created.Body)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// The summary marker records the prompt as the terminal publish, and the
+	// progress row — never superseded — still tracks its own comment.
+	marker, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, marker)
+	assert.Equal(t, promptID, marker.GitHubCommentID, "the summary marker records the completed prompt")
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, progressID, prog.GitHubCommentID)
+	assert.Nil(t, prog.SupersededAt, "the frozen progress comment stays tracked, not superseded")
+}
+
 // An apply stopped at the deferred-cutover gate completes the prompt itself:
 // the terminal edit turns the prompt into the stop record and consumes its
 // row, so the prompt is never folded under a false "Cutover complete" record.
@@ -1416,6 +1575,16 @@ func TestE2EStopAtCutoverGateThenResumeRotatesFreshComment(t *testing.T) {
 		assert.Contains(t, edited.Body, "Schema Change Stopped")
 	case <-time.After(5 * time.Second):
 		t.Fatal("expected the cutover prompt to be edited into the stop record")
+	}
+	// The tracked progress comment is frozen at the stopped rendering too, so
+	// it stops advertising the gate's cutover command.
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, preStopProgressID, edited.CommentID, "the status freeze lands on the pre-stop progress comment")
+		assert.Contains(t, edited.Body, "**Status**: Stopped")
+		assert.NotContains(t, edited.Body, "schemabot cutover", "the frozen progress comment must not carry a live cutover command")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the tracked progress comment to be frozen at the stopped rendering")
 	}
 	select {
 	case created := <-capture.creates:
