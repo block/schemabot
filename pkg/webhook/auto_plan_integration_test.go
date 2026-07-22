@@ -114,10 +114,21 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeSkipsComment(t *testing.T) {
 	}
 
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	result.HeadSHAs = []string{"newsha"}
 	registerCompareFiles(t, mux, "oldsha", "newsha", []*gh.CommitFile{{
 		Filename: new("app/service.go"),
 		Status:   new("modified"),
 	}})
+	require.NoError(t, svc.Storage().PlanComments().Insert(t.Context(), &storage.PlanComment{
+		Repository:       "octocat/hello-world",
+		PullRequest:      1,
+		DatabaseName:     dbName,
+		DatabaseType:     "mysql",
+		EnvironmentScope: "staging",
+		HeadSHA:          "oldsha",
+		GitHubCommentID:  98,
+		GitHubNodeID:     "IC_98",
+	}))
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
@@ -152,6 +163,78 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeSkipsComment(t *testing.T) {
 		t.Fatalf("expected no comment for application-only synchronize, got: %s", body)
 	case <-time.After(3 * time.Second):
 	}
+}
+
+// A non-schema push posts a replacement plan when the visible plan predates
+// schema changes, covering a schema-changing webhook that was never processed
+// followed by an empty retrigger commit.
+func TestE2EAutoPlanSynchronizeApplicationOnlyChangeRefreshesStalePlan(t *testing.T) {
+	dbName := "webhook_autoplan_app_only_sync_stale_plan"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	result.HeadSHAs = []string{"newsha"}
+	registerCompareFiles(t, mux, "oldsha", "newsha", []*gh.CommitFile{{
+		Filename: new("app/service.go"),
+		Status:   new("modified"),
+	}})
+	registerCompareFiles(t, mux, "plannedsha", "newsha", []*gh.CommitFile{{
+		Filename: new("schema/" + dbName + "/users.sql"),
+		Status:   new("modified"),
+	}})
+	require.NoError(t, svc.Storage().PlanComments().Insert(t.Context(), &storage.PlanComment{
+		Repository:       "octocat/hello-world",
+		PullRequest:      1,
+		DatabaseName:     dbName,
+		DatabaseType:     "mysql",
+		EnvironmentScope: "staging",
+		HeadSHA:          "plannedsha",
+		GitHubCommentID:  97,
+		GitHubNodeID:     "IC_97",
+	}))
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:    "synchronize",
+		beforeSHA: "oldsha",
+		headSHA:   "newsha",
+		headRef:   "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "## Schema Change Plan")
+		assert.Contains(t, body, dbName)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for replacement auto-plan comment")
+	}
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		comments, err := svc.Storage().PlanComments().ListUnminimizedForSlot(
+			t.Context(), "octocat/hello-world", 1, dbName, "mysql")
+		if !assert.NoError(collect, err) || !assert.NotEmpty(collect, comments) {
+			return
+		}
+		assert.Equal(collect, "newsha", comments[len(comments)-1].HeadSHA)
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond)
 }
 
 // TestE2EAutoPlanNoticesUnmanagedConfigOnNonAggregateRepo verifies that when a
