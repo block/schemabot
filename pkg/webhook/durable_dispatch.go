@@ -644,14 +644,7 @@ func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *st
 }
 
 func (h *Handler) enqueueDurablePullRequest(ctx context.Context, payload pullRequestPayload, body []byte, deliveryID string, installationID int64) (bool, error) {
-	store := h.webhookEventStore()
-	if store == nil {
-		return false, fmt.Errorf("webhook event storage is unavailable")
-	}
-	if deliveryID == "" {
-		return false, fmt.Errorf("missing GitHub delivery ID")
-	}
-	inserted, err := store.Create(ctx, &storage.WebhookEvent{
+	return h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
 		DeliveryID:  deliveryID,
 		Event:       "pull_request",
@@ -662,32 +655,10 @@ func (h *Handler) enqueueDurablePullRequest(ctx context.Context, payload pullReq
 		TenantID:    strconv.FormatInt(installationID, 10),
 		Payload:     body,
 	})
-	if err != nil {
-		return false, fmt.Errorf("store durable pull_request delivery %s: %w", deliveryID, err)
-	}
-	if inserted {
-		h.wakeDurableWebhookDispatch()
-	}
-	return inserted, nil
 }
 
 func (h *Handler) enqueueDurableCheckRun(ctx context.Context, payload checkRunPayload, body []byte, deliveryID string, pr int, installationID int64) (bool, error) {
-	store := h.webhookEventStore()
-	if store == nil {
-		return false, fmt.Errorf("webhook event storage is unavailable")
-	}
-	if deliveryID == "" {
-		return false, fmt.Errorf("missing GitHub delivery ID")
-	}
-	// The enqueue is the durability boundary: once persisted, the durable driver
-	// owns delivery. On graceful shutdown the request ctx is cancelled, which
-	// would abort this INSERT and 500 — and GitHub never auto-retries a
-	// check_run rerequest, so the delivery would be lost. Detach from request
-	// cancellation (but keep a bounded deadline so a wedged DB can't stall
-	// shutdown) so the row still persists.
-	enqueueCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	inserted, err := store.Create(enqueueCtx, &storage.WebhookEvent{
+	return h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
 		DeliveryID:  deliveryID,
 		Event:       "check_run",
@@ -698,8 +669,29 @@ func (h *Handler) enqueueDurableCheckRun(ctx context.Context, payload checkRunPa
 		TenantID:    strconv.FormatInt(installationID, 10),
 		Payload:     body,
 	})
+}
+
+// enqueueDurableWebhookEvent persists a delivery into the durable inbox. The
+// enqueue is the durability boundary: once the row is inserted, the durable
+// driver owns the delivery. On graceful shutdown the request ctx is
+// cancelled, which would abort the INSERT and 500 the delivery — and GitHub
+// does not auto-retry failed webhook deliveries, so the work would be lost
+// until an operator manually redelivers it. Detach from request cancellation
+// (but keep a bounded deadline so a wedged DB can't stall shutdown) so the
+// row still persists.
+func (h *Handler) enqueueDurableWebhookEvent(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
+	store := h.webhookEventStore()
+	if store == nil {
+		return false, fmt.Errorf("webhook event storage is unavailable")
+	}
+	if event.DeliveryID == "" {
+		return false, fmt.Errorf("missing GitHub delivery ID")
+	}
+	enqueueCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	inserted, err := store.Create(enqueueCtx, event)
 	if err != nil {
-		return false, fmt.Errorf("store durable check_run delivery %s: %w", deliveryID, err)
+		return false, fmt.Errorf("store durable %s delivery %s: %w", event.Event, event.DeliveryID, err)
 	}
 	if inserted {
 		h.wakeDurableWebhookDispatch()
