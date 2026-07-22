@@ -78,6 +78,11 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 			}
 			fmt.Printf("  %s\n", path)
 		}
+		strays, strayErr := plan.strayFiles()
+		if strayErr != nil {
+			return strayErr
+		}
+		printStrayFileWarning(strays)
 		return nil
 	}
 
@@ -88,10 +93,15 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 	for _, path := range plan.paths() {
 		fmt.Printf("  %s\n", path)
 	}
+	strays, strayErr := plan.strayFiles()
+	if strayErr != nil {
+		return strayErr
+	}
+	printStrayFileWarning(strays)
 	if !cmd.SkipVerify {
 		fmt.Println()
 		fmt.Println("Verifying pulled schema against the source environment...")
-		if err := verifyOnboardPlan(ep, resp, cmd.SchemaDir); err != nil {
+		if err := verifyOnboardPlan(ep, resp, plan); err != nil {
 			return err
 		}
 		fmt.Println("Verified: pulled schema produces no schema changes in the source environment.")
@@ -260,6 +270,64 @@ func (p *onboardWritePlan) checkConflicts(force bool) error {
 	return nil
 }
 
+// strayFiles returns schema files in the pulled namespace directories that
+// this pull did not write. The pull covers every table in each pulled
+// namespace, so a leftover file there describes a table absent in the target:
+// verification will fail on it as a spurious create, and an onboard PR would
+// propose recreating the table.
+func (p *onboardWritePlan) strayFiles() ([]string, error) {
+	planned := make(map[string]struct{}, len(p.files))
+	namespaceDirs := make(map[string]struct{})
+	for relativePath := range p.files {
+		planned[relativePath] = struct{}{}
+		if dir := filepath.Dir(relativePath); dir != "." {
+			namespaceDirs[dir] = struct{}{}
+		}
+	}
+	var strays []string
+	for dir := range namespaceDirs {
+		path := filepath.Join(p.root, dir)
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			// A namespace directory that doesn't exist yet (dry run before any
+			// write) has nothing to scan.
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("scan namespace directory %s for stray files: %w", path, err)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			// Only files SchemaBot reads as schema inputs can go stray; other
+			// files (docs, tooling) are ignored by plans and applies alike.
+			if !strings.HasSuffix(name, ".sql") && name != "vschema.json" {
+				continue
+			}
+			relativePath := filepath.Join(dir, name)
+			if _, ok := planned[relativePath]; !ok {
+				strays = append(strays, filepath.Join(p.root, relativePath))
+			}
+		}
+	}
+	sort.Strings(strays)
+	return strays, nil
+}
+
+func printStrayFileWarning(strays []string) {
+	if len(strays) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Printf("%sWarning:%s the schema root contains schema files this pull did not write — their tables are absent in the target. Verification will fail on them, and an onboard PR would propose recreating the tables:\n", templates.ANSIYellow, templates.ANSIReset)
+	for _, path := range strays {
+		fmt.Printf("  %s\n", path)
+	}
+	fmt.Println("Delete the stray files, or restore the missing tables in the target before onboarding.")
+}
+
 func fileStatusForDryRun(path string) (exists bool, statErr error) {
 	_, err := os.Stat(path)
 	if err == nil {
@@ -293,11 +361,11 @@ func formatOnboardWriteError(operation, path string, written []string, err error
 	return fmt.Errorf("%s %s after writing files:\n  %s\nerror: %w", operation, path, strings.Join(written, "\n  "), err)
 }
 
-func verifyOnboardPlan(endpoint string, resp *apitypes.PullSchemaResponse, schemaDir string) error {
+func verifyOnboardPlan(endpoint string, resp *apitypes.PullSchemaResponse, plan *onboardWritePlan) error {
 	var planResult *apitypes.PlanResponse
 	err := withLoading("Verifying pulled schema...", true, func() error {
 		var planErr error
-		planResult, planErr = client.CallPlanAPI(endpoint, resp.Database, resp.Type, resp.Environment, schemaDir, "", 0)
+		planResult, planErr = client.CallPlanAPI(endpoint, resp.Database, resp.Type, resp.Environment, plan.root, "", 0)
 		return planErr
 	})
 	if err != nil {
@@ -306,20 +374,65 @@ func verifyOnboardPlan(endpoint string, resp *apitypes.PullSchemaResponse, schem
 		}
 		return fmt.Errorf("verify pulled schema for database %s environment %s: %w", resp.Database, resp.Environment, err)
 	}
-	return validateOnboardPlanResult(planResult)
-}
-
-func validateOnboardPlanResult(result *apitypes.PlanResponse) error {
-	if result == nil {
-		return fmt.Errorf("verify pulled schema: plan response is empty")
-	}
-	if len(result.Errors) > 0 {
-		return fmt.Errorf("verify pulled schema: plan returned errors:\n  %s", strings.Join(result.Errors, "\n  "))
-	}
-	if hasResultChanges(result) {
-		return fmt.Errorf("verify pulled schema: pulled files still produce schema changes in %s", result.Environment)
+	if validateErr := validateOnboardPlanResult(planResult, resp.Database, resp.Environment); validateErr != nil {
+		strays, strayErr := plan.strayFiles()
+		if strayErr != nil {
+			return errors.Join(validateErr, strayErr)
+		}
+		if len(strays) > 0 {
+			return fmt.Errorf("%w\nstray schema files not written by this pull (their tables are absent in the target; delete the files or restore the tables):\n  %s", validateErr, strings.Join(strays, "\n  "))
+		}
+		return validateErr
 	}
 	return nil
+}
+
+func validateOnboardPlanResult(result *apitypes.PlanResponse, database, environment string) error {
+	if result == nil {
+		return fmt.Errorf("verify pulled schema for database %s environment %s: plan response is empty", database, environment)
+	}
+	if len(result.Errors) > 0 {
+		return fmt.Errorf("verify pulled schema for database %s environment %s: plan returned errors:\n  %s", database, environment, strings.Join(result.Errors, "\n  "))
+	}
+	if hasResultChanges(result) {
+		return fmt.Errorf("verify pulled schema for database %s environment %s: pulled files still produce schema changes:\n  %s", database, environment, strings.Join(describeOnboardPlanChanges(result), "\n  "))
+	}
+	return nil
+}
+
+// onboardVerifyDDLPreviewLimit bounds the single-line DDL preview in a failed
+// verification's change listing so a full CREATE TABLE body doesn't drown the
+// table-by-table summary.
+const onboardVerifyDDLPreviewLimit = 120
+
+// describeOnboardPlanChanges renders one line per planned change so a failed
+// verification names the offending tables and DDL without a separate plan run.
+func describeOnboardPlanChanges(result *apitypes.PlanResponse) []string {
+	var lines []string
+	for _, change := range result.Changes {
+		if change == nil {
+			continue
+		}
+		for _, tableChange := range change.TableChanges {
+			if tableChange == nil {
+				continue
+			}
+			lines = append(lines, fmt.Sprintf("%s/%s (%s): %s", change.Namespace, tableChange.TableName, strings.ToLower(tableChange.ChangeType), onboardDDLPreview(tableChange.DDL)))
+		}
+		if change.HasVSchemaChange() {
+			lines = append(lines, fmt.Sprintf("%s: vschema change", change.Namespace))
+		}
+	}
+	return lines
+}
+
+func onboardDDLPreview(ddl string) string {
+	collapsed := strings.Join(strings.Fields(ddl), " ")
+	runes := []rune(collapsed)
+	if len(runes) > onboardVerifyDDLPreviewLimit {
+		return string(runes[:onboardVerifyDDLPreviewLimit]) + "…"
+	}
+	return collapsed
 }
 
 func outputSchemaPullRequestError(operation, database, environment string, err error) bool {
