@@ -803,6 +803,219 @@ func dsnWithoutDatabase(t *testing.T, dsn string) string {
 	return cfg.FormatDSN()
 }
 
+// Under per-target schema overrides a pull requested by the canonical
+// namespace reads the physical schema end to end: response keys, pulled DDL,
+// and catalog names stay canonical while the tables, columns, indexes, and
+// size estimates come from the physical schema's live rows. A decoy schema
+// under the canonical name proves a wrong-schema read (canonical instead of
+// physical) would be caught.
+func TestLocalClient_PullSchemaOverridesReadPhysicalSchema(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	container, dsn := setupMySQLContainer(t)
+	_ = container // container is managed by TestMain
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err, "open database")
+	defer utils.CloseAndLog(db)
+
+	const (
+		canonical = "pull_ovr_bikeshare"
+		physical  = "pull_ovr_bikeshare_region2_env1"
+	)
+
+	for _, stmt := range []string{
+		"CREATE DATABASE IF NOT EXISTS `" + physical + "`",
+		// Decoy schema under the canonical name: reading the canonical name
+		// instead of the physical schema would surface `decoy` and miss
+		// `riders`.
+		"CREATE DATABASE IF NOT EXISTS `" + canonical + "`",
+		"CREATE TABLE IF NOT EXISTS `" + physical + "`.`riders` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL COMMENT 'login email', PRIMARY KEY (`id`), UNIQUE KEY `idx_email` (`email`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='riders table'",
+		"CREATE TABLE IF NOT EXISTS `" + canonical + "`.`decoy` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	} {
+		_, err = db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, "prepare schema override pull schema")
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		require.NoError(t, cleanupErr, "open database for schema override pull cleanup")
+		defer utils.CloseAndLog(cleanupDB)
+		for _, stmt := range []string{
+			"DROP DATABASE IF EXISTS `" + physical + "`",
+			"DROP DATABASE IF EXISTS `" + canonical + "`",
+		} {
+			_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, stmt)
+			assert.NoError(t, cleanupErr, "cleanup schema override pull schema")
+		}
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	client, err := NewLocalClient(LocalConfig{
+		Database:        "logicaldb",
+		Type:            storage.DatabaseTypeMySQL,
+		TargetDSN:       dsnWithoutDatabase(t, dsn),
+		SchemaOverrides: map[string]string{canonical: physical},
+	}, nil, logger)
+	require.NoError(t, err, "create client")
+	defer utils.CloseAndLog(client)
+
+	resp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:      "logicaldb",
+		Type:          storage.DatabaseTypeMySQL,
+		Environment:   localClientTestEnvironment,
+		Namespace:     canonical,
+		CatalogDetail: ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED,
+	})
+	require.NoError(t, err, "pull canonical namespace")
+	require.Len(t, resp.Namespaces, 1, "pull returns exactly the requested canonical namespace")
+	require.Contains(t, resp.Namespaces, canonical, "response is keyed by the canonical namespace")
+	assert.NotContains(t, resp.Namespaces, physical, "physical schema name must not leak into response keys")
+
+	pulled := resp.Namespaces[canonical]
+	require.Contains(t, pulled.Tables, "riders", "DDL comes from the physical schema")
+	assert.Contains(t, pulled.Tables["riders"], "CREATE TABLE `riders`")
+	assert.NotContains(t, pulled.Tables, "decoy", "the canonical-name decoy schema must not be read")
+
+	require.NotNil(t, pulled.NamespaceCatalog)
+	assert.Equal(t, canonical, pulled.NamespaceCatalog.Name, "catalog is named by the canonical namespace")
+	require.Contains(t, pulled.TableCatalog, "riders", "catalog rows come from the physical schema")
+	assert.NotContains(t, pulled.TableCatalog, "decoy")
+	riders := pulled.TableCatalog["riders"]
+	assert.Equal(t, "riders table", riders.Comment)
+	require.Len(t, riders.Columns, 2, "column catalog reads the physical schema")
+	assert.Equal(t, "id", riders.Columns[0].Name)
+	assert.Equal(t, "email", riders.Columns[1].Name)
+	assert.Equal(t, "login email", riders.Columns[1].Comment)
+	require.Len(t, riders.Indexes, 2, "index catalog reads the physical schema")
+	assert.Positive(t, riders.DataSizeBytes, "size estimates read the physical schema")
+
+	// A pull without an explicit namespace serves exactly the canonical
+	// override keys — it never scans the cluster or surfaces physical names.
+	allResp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:    "logicaldb",
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err, "pull all namespaces")
+	require.Len(t, allResp.Namespaces, 1, "pull-all serves exactly the mapped canonical namespaces")
+	assert.Contains(t, allResp.Namespaces, canonical)
+
+	// The override map is a strict allowlist: requesting the physical name
+	// directly fails closed.
+	_, err = client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:    "logicaldb",
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: localClientTestEnvironment,
+		Namespace:   physical,
+	})
+	require.Error(t, err, "pulling the physical schema name directly is rejected")
+	assert.Contains(t, err.Error(), "does not authorize MySQL namespace")
+}
+
+// A plan and apply for a canonical namespace with a schema override must run
+// entirely against the physical schema: the plan diffs the physical schema's
+// current state, and the apply lands the change there — never in a schema that
+// happens to carry the canonical name.
+func TestLocalClient_ApplySchemaOverridesTargetPhysicalSchema(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	container, dsn := setupMySQLContainer(t)
+	_ = container              // container is managed by TestMain
+	setupStorageSchema(t, dsn) // need storage tables
+
+	ctx := t.Context()
+
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err, "open database")
+	defer utils.CloseAndLog(db)
+
+	const (
+		canonical = "apply_ovr_bikeshare"
+		physical  = "apply_ovr_bikeshare_region2_env1"
+	)
+
+	for _, stmt := range []string{
+		"CREATE DATABASE IF NOT EXISTS `" + physical + "`",
+		// Decoy schema under the canonical name: an apply that addresses the
+		// canonical name instead of the physical schema would land here.
+		"CREATE DATABASE IF NOT EXISTS `" + canonical + "`",
+		"CREATE TABLE IF NOT EXISTS `" + physical + "`.`riders` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		"CREATE TABLE IF NOT EXISTS `" + canonical + "`.`riders` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	} {
+		_, err = db.ExecContext(ctx, stmt)
+		require.NoError(t, err, "prepare schema override apply schema")
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		require.NoError(t, cleanupErr, "open database for schema override apply cleanup")
+		defer utils.CloseAndLog(cleanupDB)
+		for _, stmt := range []string{
+			"DROP DATABASE IF EXISTS `" + physical + "`",
+			"DROP DATABASE IF EXISTS `" + canonical + "`",
+		} {
+			_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, stmt)
+			assert.NoError(t, cleanupErr, "cleanup schema override apply schema")
+		}
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:        "logicaldb",
+		Type:            storage.DatabaseTypeMySQL,
+		TargetDSN:       dsnWithoutDatabase(t, dsn),
+		SchemaOverrides: map[string]string{canonical: physical},
+	}, stor, logger)
+	require.NoError(t, err, "create client")
+	defer utils.CloseAndLog(client)
+	startTestOperator(t, stor, client)
+
+	// The plan diffs the physical schema, so the desired schema only needs the
+	// physical schema's tables — the decoy's identical table must not shadow it.
+	planResp, err := client.Plan(ctx, &ternv1.PlanRequest{
+		Type:     storage.DatabaseTypeMySQL,
+		Database: "logicaldb",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			canonical: {
+				Files: map[string]string{
+					"riders.sql": "CREATE TABLE riders (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, email VARCHAR(255), PRIMARY KEY (id))",
+				},
+			},
+		},
+	})
+	require.NoError(t, err, "Plan() returned error")
+	require.NotEmpty(t, planResp.PlanId, "expected plan_id")
+
+	applyResp, err := client.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId:      planResp.PlanId,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err, "Apply() returned error")
+	require.True(t, applyResp.Accepted, "expected apply to be accepted, got error: %s", applyResp.ErrorMessage)
+
+	waitForApplyComplete(t, client, ctx, applyResp.ApplyId)
+
+	// The change landed in the physical schema.
+	var physicalCount int
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'riders' AND COLUMN_NAME = 'email'", physical).Scan(&physicalCount)
+	require.NoError(t, err, "query physical schema columns")
+	assert.Equal(t, 1, physicalCount, "apply must add the column in the physical schema")
+
+	// The canonical-name decoy schema is untouched.
+	var canonicalCount int
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'riders' AND COLUMN_NAME = 'email'", canonical).Scan(&canonicalCount)
+	require.NoError(t, err, "query canonical schema columns")
+	assert.Zero(t, canonicalCount, "apply must not touch the canonical-name decoy schema")
+}
+
 func TestLocalClient_Plan(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
