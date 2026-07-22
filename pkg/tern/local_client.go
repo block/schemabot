@@ -494,6 +494,28 @@ func mysqlDSNHasDatabase(dsn string) (bool, error) {
 	return database != "", nil
 }
 
+// singleTaskNamespace returns the single non-empty namespace shared by the
+// tasks, or "" when no task carries one (a DSN-with-database target). Tasks
+// that drive one Spirit execution must agree on the namespace — it selects the
+// connection schema, so with mixed namespaces the schema addressed would
+// silently depend on task order. Fail loudly instead.
+func singleTaskNamespace(tasks []*storage.Task) (string, error) {
+	namespace := ""
+	for _, task := range tasks {
+		if task == nil || task.Namespace == "" {
+			continue
+		}
+		if namespace == "" {
+			namespace = task.Namespace
+			continue
+		}
+		if task.Namespace != namespace {
+			return "", fmt.Errorf("tasks span multiple namespaces (%q, %q)", namespace, task.Namespace)
+		}
+	}
+	return namespace, nil
+}
+
 func mysqlDSNDatabase(dsn string) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
@@ -522,18 +544,9 @@ func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *st
 	// applies enforce this at credential resolution). Guard that invariant
 	// here: with mixed namespaces the lookup would silently depend on task
 	// order, so fail loudly instead.
-	namespace := ""
-	for _, task := range tasks {
-		if task == nil || task.Namespace == "" {
-			continue
-		}
-		if namespace == "" {
-			namespace = task.Namespace
-			continue
-		}
-		if task.Namespace != namespace {
-			return false, true, fmt.Errorf("deferred cutover signal lookup for apply %s database %s: tasks span multiple namespaces (%q, %q)", apply.ApplyIdentifier, apply.Database, namespace, task.Namespace)
-		}
+	namespace, err := singleTaskNamespace(tasks)
+	if err != nil {
+		return false, true, fmt.Errorf("deferred cutover signal lookup for apply %s database %s: %w", apply.ApplyIdentifier, apply.Database, err)
 	}
 	creds, err := c.credentialsForMySQLNamespace(namespace)
 	if err != nil {

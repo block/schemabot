@@ -915,6 +915,107 @@ func TestLocalClient_PullSchemaOverridesReadPhysicalSchema(t *testing.T) {
 	assert.Contains(t, err.Error(), "does not authorize MySQL namespace")
 }
 
+// A plan and apply for a canonical namespace with a schema override must run
+// entirely against the physical schema: the plan diffs the physical schema's
+// current state, and the apply lands the change there — never in a schema that
+// happens to carry the canonical name.
+func TestLocalClient_ApplySchemaOverridesTargetPhysicalSchema(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	container, dsn := setupMySQLContainer(t)
+	_ = container              // container is managed by TestMain
+	setupStorageSchema(t, dsn) // need storage tables
+
+	ctx := t.Context()
+
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err, "open database")
+	defer utils.CloseAndLog(db)
+
+	const (
+		canonical = "apply_ovr_bikeshare"
+		physical  = "apply_ovr_bikeshare_region2_env1"
+	)
+
+	for _, stmt := range []string{
+		"CREATE DATABASE IF NOT EXISTS `" + physical + "`",
+		// Decoy schema under the canonical name: an apply that addresses the
+		// canonical name instead of the physical schema would land here.
+		"CREATE DATABASE IF NOT EXISTS `" + canonical + "`",
+		"CREATE TABLE IF NOT EXISTS `" + physical + "`.`riders` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		"CREATE TABLE IF NOT EXISTS `" + canonical + "`.`riders` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	} {
+		_, err = db.ExecContext(ctx, stmt)
+		require.NoError(t, err, "prepare schema override apply schema")
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		require.NoError(t, cleanupErr, "open database for schema override apply cleanup")
+		defer utils.CloseAndLog(cleanupDB)
+		for _, stmt := range []string{
+			"DROP DATABASE IF EXISTS `" + physical + "`",
+			"DROP DATABASE IF EXISTS `" + canonical + "`",
+		} {
+			_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, stmt)
+			assert.NoError(t, cleanupErr, "cleanup schema override apply schema")
+		}
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:        "logicaldb",
+		Type:            storage.DatabaseTypeMySQL,
+		TargetDSN:       dsnWithoutDatabase(t, dsn),
+		SchemaOverrides: map[string]string{canonical: physical},
+	}, stor, logger)
+	require.NoError(t, err, "create client")
+	defer utils.CloseAndLog(client)
+	startTestOperator(t, stor, client)
+
+	// The plan diffs the physical schema, so the desired schema only needs the
+	// physical schema's tables — the decoy's identical table must not shadow it.
+	planResp, err := client.Plan(ctx, &ternv1.PlanRequest{
+		Type:     storage.DatabaseTypeMySQL,
+		Database: "logicaldb",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			canonical: {
+				Files: map[string]string{
+					"riders.sql": "CREATE TABLE riders (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, email VARCHAR(255), PRIMARY KEY (id))",
+				},
+			},
+		},
+	})
+	require.NoError(t, err, "Plan() returned error")
+	require.NotEmpty(t, planResp.PlanId, "expected plan_id")
+
+	applyResp, err := client.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId:      planResp.PlanId,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err, "Apply() returned error")
+	require.True(t, applyResp.Accepted, "expected apply to be accepted, got error: %s", applyResp.ErrorMessage)
+
+	waitForApplyComplete(t, client, ctx, applyResp.ApplyId)
+
+	// The change landed in the physical schema.
+	var physicalCount int
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'riders' AND COLUMN_NAME = 'email'", physical).Scan(&physicalCount)
+	require.NoError(t, err, "query physical schema columns")
+	assert.Equal(t, 1, physicalCount, "apply must add the column in the physical schema")
+
+	// The canonical-name decoy schema is untouched.
+	var canonicalCount int
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'riders' AND COLUMN_NAME = 'email'", canonical).Scan(&canonicalCount)
+	require.NoError(t, err, "query canonical schema columns")
+	assert.Zero(t, canonicalCount, "apply must not touch the canonical-name decoy schema")
+}
+
 func TestLocalClient_Plan(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
