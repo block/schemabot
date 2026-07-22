@@ -109,6 +109,15 @@ const (
 // retry mechanism call updateAggregateCheckOnce directly and act on its error.
 func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string) {
 	followUp, _ := h.updateAggregateCheckOnce(ctx, client, repo, pr, headSHA)
+	h.applyAggregateFoldFollowUp(ctx, client, repo, pr, headSHA, followUp)
+}
+
+// applyAggregateFoldFollowUp applies the in-memory post-fold side effect
+// updateAggregateCheckOnce returns: scheduling a bounded re-fold timer or
+// clearing the participant re-fold budget. It is shared by the fire-and-forget
+// wrapper and the durable dispatch path so both react to a disposition the same
+// way; the fold core never mutates timers or the budget itself.
+func (h *Handler) applyAggregateFoldFollowUp(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, followUp aggregateFoldFollowUp) {
 	switch followUp {
 	case aggregateFoldNoFollowUp:
 	case aggregateFoldClearParticipantRefoldBudget:
@@ -118,7 +127,7 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 	case aggregateFoldScheduleParticipantRefold:
 		h.scheduleParticipantRefold(ctx, repo, pr, client.InstallationID())
 	default:
-		// A follow-up the fold core returns but the wrapper doesn't apply would
+		// A follow-up the fold core returns but this switch doesn't apply would
 		// silently drop the post-fold side effect (a re-fold that never gets
 		// scheduled, a budget that never clears). Fail loud so a new disposition
 		// can't no-op here unnoticed.
