@@ -217,7 +217,9 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 		return true
 	}
 
-	comparedHeads := make(map[string]bool)
+	// The synchronize range was just proven schema-neutral. Reuse that result
+	// when the visible plan was rendered at the immediately preceding head.
+	comparedHeads := map[string]bool{beforeSHA: true}
 	for _, cfg := range configs {
 		environments, err := h.allowedDatabaseEnvironments(cfg.Config.Database)
 		if err != nil {
