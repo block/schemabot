@@ -30,17 +30,17 @@ func New(db *sql.DB) *Storage {
 	return &Storage{
 		db:              db,
 		locks:           &lockStore{db: db},
-		plans:           &planStore{db: db},
-		applies:         &applyStore{db: db, dialect: MySQLDialect{}},
-		tasks:           &taskStore{db: db},
-		applyLogs:       &applyLogStore{db: db},
-		controlRequests: &controlRequestStore{db: db},
+		plans:           &planStore{db: db, identity: MySQLDialect{}},
+		applies:         &applyStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}},
+		tasks:           &taskStore{db: db, identity: MySQLDialect{}},
+		applyLogs:       &applyLogStore{db: db, identity: MySQLDialect{}},
+		controlRequests: &controlRequestStore{db: db, identity: MySQLDialect{}},
 		applyComments:   &applyCommentStore{db: db, dialect: MySQLDialect{}},
-		planComments:    &planCommentStore{db: db},
-		applyOperations: &applyOperationStore{db: db, dialect: MySQLDialect{}},
+		planComments:    &planCommentStore{db: db, identity: MySQLDialect{}},
+		applyOperations: &applyOperationStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}},
 		checks:          &checkStore{db: db, dialect: MySQLDialect{}},
 		settings:        &settingsStore{db: db, dialect: MySQLDialect{}},
-		webhookEvents:   &webhookEventStore{db: db, dialect: MySQLDialect{}},
+		webhookEvents:   &webhookEventStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}},
 	}
 }
 

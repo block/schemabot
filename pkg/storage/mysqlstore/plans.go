@@ -20,7 +20,8 @@ const planColumns = `id, plan_identifier, database_name, database_type,
 
 // planStore implements storage.PlanStore using MySQL.
 type planStore struct {
-	db *sql.DB
+	db       *sql.DB
+	identity identityInserter
 }
 
 // Create stores a new plan and returns its ID.
@@ -35,7 +36,7 @@ func (s *planStore) Create(ctx context.Context, plan *storage.Plan) (int64, erro
 		return 0, fmt.Errorf("marshal schema files: %w", err)
 	}
 
-	result, err := s.db.ExecContext(ctx, `
+	id, err := s.identity.InsertID(ctx, s.db, `
 		INSERT INTO plans (plan_identifier, database_name, database_type, deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, head_sha, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, plan.PlanIdentifier, plan.Database, plan.DatabaseType, plan.Deployment, plan.Target, plan.Repository, plan.PullRequest, plan.SchemaPath, plan.Environment, string(schemaFilesJSON), string(planDataJSON), plan.HeadSHA, plan.CreatedAt)
@@ -43,11 +44,6 @@ func (s *planStore) Create(ctx context.Context, plan *storage.Plan) (int64, erro
 		if isDuplicateKeyError(err) {
 			return 0, storage.ErrPlanIDExists
 		}
-		return 0, err
-	}
-
-	id, err := result.LastInsertId()
-	if err != nil {
 		return 0, err
 	}
 
