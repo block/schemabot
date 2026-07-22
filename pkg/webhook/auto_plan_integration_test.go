@@ -604,6 +604,12 @@ func TestE2EAutoPlanWithLintViolations(t *testing.T) {
 	}
 }
 
+// TestE2EAutoPlanNoChangesSkipsComment exercises the up-to-date-PR UX through
+// the full webhook path: a synchronize delivery whose auto-plan resolves to no
+// changes posts no plan comment (the check run alone reports the green state),
+// and the outcome supersedes the slot's plan comments from prior heads — their
+// pending DDL and apply prompt no longer match the branch, so they collapse
+// even though no new comment replaces them.
 func TestE2EAutoPlanNoChangesSkipsComment(t *testing.T) {
 	dbName := "webhook_autoplan_nochange"
 	svc := setupE2EService(t, dbName)
@@ -631,6 +637,26 @@ func TestE2EAutoPlanNoChangesSkipsComment(t *testing.T) {
 
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
 
+	// A plan comment from a prior head is still expanded on the PR; the
+	// no-changes outcome must collapse it.
+	insertPlanCommentRow(t, svc.Storage(), "octocat/hello-world", 1, dbName, "staging", "priorsha", 9001, "IC_stale_prior")
+
+	minimized := make(chan string, 4)
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		var gql struct {
+			Variables map[string]string `json:"variables"`
+		}
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&gql))
+		minimized <- gql.Variables["id"]
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"minimizeComment": map[string]any{
+					"minimizedComment": map[string]any{"isMinimized": true},
+				},
+			},
+		})
+	})
+
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
@@ -657,6 +683,18 @@ func TestE2EAutoPlanNoChangesSkipsComment(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for check run")
 	}
+
+	// The prior head's plan comment collapses even though no new comment is
+	// posted: the no-changes outcome supersedes it.
+	select {
+	case node := <-minimized:
+		assert.Equal(t, "IC_stale_prior", node)
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for the prior head's plan comment to be minimized")
+	}
+	require.Eventually(t, func() bool {
+		return len(unminimizedHeads(t, svc.Storage(), "octocat/hello-world", 1, dbName, "mysql")) == 0
+	}, 10*time.Second, 100*time.Millisecond, "the minimized plan comment must be recorded in storage")
 
 	// No comment should be posted — give it a moment to confirm nothing arrives
 	select {
