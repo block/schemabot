@@ -109,6 +109,28 @@ func setupFakeGitHubForReviewGate(
 		})
 	})
 
+	// Base-branch freshness endpoints: the base ref still points at the PR's
+	// base commit, which is therefore also the merge base, so the base-schema
+	// freshness gate lets applies proceed.
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.Reference{
+			Ref:    new("refs/heads/main"),
+			Object: &gh.GitObject{Type: new("commit"), SHA: new("def456")},
+		})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/def456...abc123", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.CommitsComparison{
+			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("def456")},
+		})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/def456", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.Tree{
+			SHA:       new("def456"),
+			Entries:   treeEntries,
+			Truncated: new(false),
+		})
+	})
+
 	// Blob content
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/blobs/", func(w http.ResponseWriter, r *http.Request) {
 		sha := r.URL.Path[len("/repos/octocat/hello-world/git/blobs/"):]
