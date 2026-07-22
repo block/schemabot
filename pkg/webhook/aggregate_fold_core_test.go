@@ -59,7 +59,11 @@ func (s *foldStorage) Checks() storage.CheckStore {
 func newFoldHandler(t *testing.T, cfg *api.ServerConfig, checks storage.CheckStore) (*Handler, *http.ServeMux, *ghclient.InstallationClient) {
 	t.Helper()
 	client, mux := setupGitHubServer(t)
-	installClient := ghclient.NewInstallationClient(client, testLogger())
+	// Resolve the App slug so a participant Check Run read that finds no run
+	// classifies as a clean "not reported" (retriable, no error) rather than an
+	// ownership-unverifiable read error — letting a test exercise the genuine
+	// pending-convergence path distinctly from a participant read failure.
+	installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
 	h := &Handler{
 		service:   api.New(&foldStorage{checks: checks}, cfg, nil, testLogger()),
 		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
@@ -77,6 +81,32 @@ func serveHeadSHA(t *testing.T, mux *http.ServeMux, sha string) {
 			"head": map[string]any{"sha": sha, "ref": "feature-branch"},
 			"base": map[string]any{"sha": "def456", "ref": "main"},
 			"user": map[string]any{"login": "testuser"},
+		}))
+	})
+}
+
+// serveLeaderPRFiles registers the changed-files lookup the aggregate leader
+// performs to resolve which participants a PR requires, reporting the given path
+// as modified so the participant covering it becomes expected.
+func serveLeaderPRFiles(t *testing.T, mux *http.ServeMux, path string) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode([]map[string]string{{
+			"filename": path,
+			"status":   "modified",
+		}}))
+	})
+}
+
+// serveParticipantCheckRunsEmpty registers the commit check-runs lookup
+// FindCheckRunByName performs, reporting no runs on the commit so an expected
+// participant reads as not-yet-reported (a retriable, still-pending outcome).
+func serveParticipantCheckRunsEmpty(t *testing.T, mux *http.ServeMux, sha string) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/"+sha+"/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"total_count": 0,
+			"check_runs":  []any{},
 		}))
 	})
 }
@@ -173,6 +203,40 @@ func TestUpdateAggregateCheckOnceFollowUpContract(t *testing.T) {
 
 		assert.Equal(t, aggregateFoldScheduleParticipantRefold, followUp)
 		assert.Error(t, err)
+	})
+
+	t.Run("participant that has not reported schedules a participant re-fold with no error", func(t *testing.T) {
+		h, mux, client := newFoldHandler(t, aggregateLeaderConfig(), &foldCheckStore{})
+		serveHeadSHA(t, mux, "abc123")
+		serveLeaderPRFiles(t, mux, "tenant-b/schema/orders.sql")
+		serveParticipantCheckRunsEmpty(t, mux, "abc123")
+		serveCheckRunCreate(t, mux)
+
+		followUp, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "abc123")
+
+		assert.Equal(t, aggregateFoldScheduleParticipantRefold, followUp)
+		assert.NoError(t, err)
+	})
+
+	t.Run("participant check read failure schedules a participant re-fold with no error", func(t *testing.T) {
+		// A failed participant Check Run read is deliberately conveyed only
+		// through the retriable disposition, not the error return: participant
+		// convergence is owned by the re-fold budget, so folding the read error
+		// in would make a retry-owning caller and the re-fold timer double-retry
+		// the same condition. The fold reports the aggregate as
+		// published-but-unconverged with a nil error.
+		h, mux, client := newFoldHandler(t, aggregateLeaderConfig(), &foldCheckStore{})
+		serveHeadSHA(t, mux, "abc123")
+		serveLeaderPRFiles(t, mux, "tenant-b/schema/orders.sql")
+		mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		})
+		serveCheckRunCreate(t, mux)
+
+		followUp, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "abc123")
+
+		assert.Equal(t, aggregateFoldScheduleParticipantRefold, followUp)
+		assert.NoError(t, err)
 	})
 
 	t.Run("successful fold clears the participant re-fold budget with no error", func(t *testing.T) {

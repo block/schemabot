@@ -81,8 +81,19 @@ func (h *Handler) verifyHeadSHACurrency(ctx context.Context, client *ghclient.In
 // timer or mutates the re-fold budget itself, so the owner of retries (the
 // updateAggregateCheck wrapper today; the durable dispatch path later) decides
 // how to act on the disposition. A ScheduleParticipantRefold follow-up with a
-// nil error is a successful fold whose participant convergence is still pending
-// — distinct from a failed fold, which also returns a non-nil error.
+// nil error means the aggregate was published but at least one expected
+// participant has not yet converged (not reported, not terminal, or its Check
+// Run read failed).
+//
+// Participant Check Run *read* failures are deliberately conveyed only through
+// this retriable disposition, not the error return: participant convergence is
+// owned by the re-fold budget, and folding those reads into the error would make
+// a retry-owning caller (the durable path) and the re-fold timer double-retry
+// the same condition. So a nil error here does NOT assert that no operational
+// GitHub read failed during the fold — only that the fold itself completed and
+// the aggregate was written. Operational failures the caller must react to (head
+// verification, PR-files fetch, per-environment upserts) do return a non-nil
+// error alongside their disposition.
 type aggregateFoldFollowUp uint8
 
 const (
@@ -106,6 +117,13 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 		h.scheduleLeaderRefoldIfConfigured(ctx, repo, pr, client.InstallationID())
 	case aggregateFoldScheduleParticipantRefold:
 		h.scheduleParticipantRefold(ctx, repo, pr, client.InstallationID())
+	default:
+		// A follow-up the fold core returns but the wrapper doesn't apply would
+		// silently drop the post-fold side effect (a re-fold that never gets
+		// scheduled, a budget that never clears). Fail loud so a new disposition
+		// can't no-op here unnoticed.
+		h.logger.Error("unhandled aggregate fold follow-up, post-fold side effect dropped",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "follow_up", followUp)
 	}
 }
 
