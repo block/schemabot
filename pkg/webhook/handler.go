@@ -709,7 +709,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleIssueComment(ctx, metricApp, sw, body)
 		recordProcessed()
 	case "check_run":
-		h.handleCheckRun(ctx, sw, body)
+		h.handleCheckRun(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
 		recordProcessed()
 	case "pull_request":
 		h.handlePullRequest(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
