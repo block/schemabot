@@ -3417,7 +3417,7 @@ Use `schemabot status -e <environment>` to find the apply ID.
 <summary><a name="volume-changed-superseded-progress-comment"></a><strong>Volume Changed: Superseded Progress Comment</strong></summary>
 
 
-⏩ Volume changed to **8/11** — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+⏩ Progress at volume **3/11** — superseded by the change to **8/11**; progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
 
 <details>
 <summary>Progress before the volume change</summary>
@@ -3456,7 +3456,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="resumed-superseded-progress-comment"></a><strong>Resumed: Superseded Progress Comment</strong></summary>
 
 
-▶️ Schema change resumed — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+⏸️ Progress before the stop — the schema change resumed in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
 
 <details>
 <summary>Progress before the stop</summary>
@@ -3493,7 +3493,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 <summary><a name="revert-superseded-progress-comment"></a><strong>Revert: Superseded Progress Comment</strong></summary>
 
 
-Schema change reverting — the revert is tracked in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+⏪ Progress before the revert — the revert is tracked in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
 
 <details>
 <summary>Progress before the revert</summary>
@@ -3536,7 +3536,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="skip-revert-superseded-progress-comment"></a><strong>Skip Revert: Superseded Progress Comment</strong></summary>
 
 
-Revert skipped — the schema change is finalizing in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+⏭️ Revert window before the skip — the schema change is finalizing in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
 
 <details>
 <summary>Progress before the revert was skipped</summary>
@@ -3579,7 +3579,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary><a name="cutover-complete-superseded-cutover-prompt"></a><strong>Cutover Complete: Superseded Cutover Prompt</strong></summary>
 
 
-Cutover complete — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+⏸️ Cutover prompt — the cutover completed; progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
 
 <details>
 <summary>Cutover prompt</summary>

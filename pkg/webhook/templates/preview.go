@@ -1585,11 +1585,12 @@ func PreviewCommentVolumeSupersededProgress() string {
 	data := sampleSingleApplyData(state.Apply.Running, table)
 	data.Volume = 3
 	return RenderVolumeSupersededProgressComment(VolumeSupersededProgressData{
-		Volume:       8,
-		Repo:         "acme/testapp",
-		PR:           42,
-		NewCommentID: 2222222222,
-		PreviousBody: RenderApplyStatusComment(data),
+		Volume:         8,
+		PreviousVolume: 3,
+		Repo:           "acme/testapp",
+		PR:             42,
+		NewCommentID:   2222222222,
+		PreviousBody:   RenderApplyStatusComment(data),
 	})
 }
 

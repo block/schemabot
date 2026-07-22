@@ -103,6 +103,10 @@ type pendingProgressRotation struct {
 	commentID int64
 	// volume is the level the comment was posted at.
 	volume int
+	// previousVolume is the level the superseded comment was posted at, read
+	// only for the volume-change fold so the adoption freeze renders the same
+	// era-descriptive headline as the direct path.
+	previousVolume int
 	// phase is the control phase the comment was posted in (empty when none),
 	// recorded on the tracked row at adoption so the durable rotation signal
 	// survives the retried write.
@@ -297,7 +301,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	// comment itself. Every other state keeps the observer muted — a restart
 	// recovery re-copying a parked apply, a retryable failure at the gate, a
 	// stop — because no cutover has happened, so a rotation would fold the
-	// unanswered prompt under a false "Cutover complete" record.
+	// unanswered prompt under a false record claiming the cutover completed.
 	if o.hasCutoverComment {
 		if !postCutoverPhase(controlPhase(apply.State)) {
 			return
@@ -784,7 +788,7 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 			// frozen rendering — the freeze edit failed or the pod died before it
 			// landed. Retry it now; on success the marker is cleared.
 			o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
-				supersededByPriorRotation, 0)
+				supersededByPriorRotation, 0, 0)
 		}
 		pendingFreeze = &tracked.GitHubCommentID
 	}
@@ -801,7 +805,7 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 	o.resumeRotated = true
 
 	if trackedNew && tracked != nil {
-		o.freezeSupersededProgressComment(apply, tracked.GitHubCommentID, newCommentID, supersededByResume, 0)
+		o.freezeSupersededProgressComment(apply, tracked.GitHubCommentID, newCommentID, supersededByResume, 0, 0)
 	}
 	// When the fresh comment posted but its tracking write failed
 	// (postAndTrackComment logged it), the prior comment is still the tracked
@@ -962,7 +966,7 @@ func (o *CommentObserver) rotateProgressCommentForControlPhase(apply *storage.Ap
 		// this phase and no new rotation follows); on success the marker is
 		// cleared.
 		o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
-			supersededByPriorRotation, 0)
+			supersededByPriorRotation, 0, 0)
 	}
 	if trackedPhase(tracked) == phase {
 		// The tracked comment was posted while the apply was already in this
@@ -998,7 +1002,7 @@ func (o *CommentObserver) rotateProgressCommentForControlPhase(apply *storage.Ap
 	}
 	o.markPhaseRotated(phase)
 
-	o.freezeSupersededProgressComment(apply, tracked.GitHubCommentID, newCommentID, supersededReasonForPhase(phase), 0)
+	o.freezeSupersededProgressComment(apply, tracked.GitHubCommentID, newCommentID, supersededReasonForPhase(phase), 0, 0)
 
 	o.logger.Info("observer: posted fresh progress comment for control phase",
 		"apply_id", o.applyID, "repo", o.repo, "pr", o.pr, "state", apply.State, "phase", phase)
@@ -1074,7 +1078,7 @@ func (o *CommentObserver) rotateProgressCommentAfterCutover(apply *storage.Apply
 		// Retry any fold still owed, then resume normal editing.
 		if tracked != nil && tracked.PendingFreezeCommentID != nil {
 			o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
-				supersededByPriorRotation, 0)
+				supersededByPriorRotation, 0, 0)
 		}
 		if cutover.SupersededAt == nil {
 			o.supersedeCutoverComment(ctx, apply)
@@ -1089,7 +1093,7 @@ func (o *CommentObserver) rotateProgressCommentAfterCutover(apply *storage.Apply
 		// frozen rendering — the freeze edit failed or the pod died before it
 		// landed. Retry it now; on success the marker is cleared.
 		o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
-			supersededByPriorRotation, 0)
+			supersededByPriorRotation, 0, 0)
 	}
 
 	body := o.formatStatusComment(apply, tasks)
@@ -1125,7 +1129,7 @@ func (o *CommentObserver) rotateProgressCommentAfterCutover(apply *storage.Apply
 	o.cutoverRotated = true
 	o.hasCutoverComment = false
 
-	o.freezeSupersededProgressComment(apply, cutover.GitHubCommentID, newCommentID, supersededByCutover, 0)
+	o.freezeSupersededProgressComment(apply, cutover.GitHubCommentID, newCommentID, supersededByCutover, 0, 0)
 	o.supersedeCutoverComment(ctx, apply)
 
 	o.logInfo(apply, "observer: posted fresh progress comment after deferred cutover", "state", apply.State)
@@ -1162,9 +1166,10 @@ const (
 )
 
 // frozenSupersededProgressBody renders the folded body written over a
-// superseded progress comment, headlined by the reason it was rotated away
-// from. volume is read only for the volume-change rendering.
-func (o *CommentObserver) frozenSupersededProgressBody(reason supersededProgressReason, volume int, newCommentID int64, previousBody string) string {
+// superseded progress comment, headlined by the era the comment covered.
+// volume (the new level) and previousVolume (the level the superseded comment
+// was posted at) are read only for the volume-change rendering.
+func (o *CommentObserver) frozenSupersededProgressBody(reason supersededProgressReason, volume, previousVolume int, newCommentID int64, previousBody string) string {
 	switch reason {
 	case supersededByResume:
 		return templates.RenderResumeSupersededProgressComment(templates.SupersededProgressData{
@@ -1203,11 +1208,12 @@ func (o *CommentObserver) frozenSupersededProgressBody(reason supersededProgress
 		})
 	}
 	return templates.RenderVolumeSupersededProgressComment(templates.VolumeSupersededProgressData{
-		Volume:       volume,
-		Repo:         o.repo,
-		PR:           o.pr,
-		NewCommentID: newCommentID,
-		PreviousBody: previousBody,
+		Volume:         volume,
+		PreviousVolume: previousVolume,
+		Repo:           o.repo,
+		PR:             o.pr,
+		NewCommentID:   newCommentID,
+		PreviousBody:   previousBody,
 	})
 }
 
@@ -1283,7 +1289,7 @@ func (o *CommentObserver) rotateProgressCommentForVolumeChange(apply *storage.Ap
 		// frozen rendering — the freeze edit failed or the pod died before it
 		// landed. Retry it now; on success the marker is cleared.
 		o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
-			supersededByPriorRotation, 0)
+			supersededByPriorRotation, 0, 0)
 	}
 	o.trackedPostedVolume = *tracked.PostedVolume
 	o.trackedPostedVolumeKnown = true
@@ -1308,6 +1314,7 @@ func (o *CommentObserver) rotateProgressCommentForVolumeChange(apply *storage.Ap
 		o.pendingRotation = &pendingProgressRotation{
 			commentID:           newCommentID,
 			volume:              currentVolume,
+			previousVolume:      *tracked.PostedVolume,
 			phase:               controlPhase(apply.State),
 			reason:              supersededByVolumeChange,
 			supersededCommentID: tracked.GitHubCommentID,
@@ -1319,7 +1326,7 @@ func (o *CommentObserver) rotateProgressCommentForVolumeChange(apply *storage.Ap
 	o.volumeRotatedTo = currentVolume
 	o.logInfo(apply, "observer: posted fresh progress comment for volume change",
 		"previous_volume", *tracked.PostedVolume, "volume", currentVolume)
-	o.freezeSupersededProgressComment(apply, tracked.GitHubCommentID, newCommentID, supersededByVolumeChange, currentVolume)
+	o.freezeSupersededProgressComment(apply, tracked.GitHubCommentID, newCommentID, supersededByVolumeChange, currentVolume, *tracked.PostedVolume)
 	return true
 }
 
@@ -1355,7 +1362,7 @@ func (o *CommentObserver) adoptPendingRotationComment(apply *storage.Apply) bool
 	}
 	o.logInfo(apply, "observer: adopted posted-but-untracked progress comment; progress edits now land on it",
 		"github_comment_id", p.commentID, "volume", p.volume, "phase", p.phase)
-	o.freezeSupersededProgressComment(apply, p.supersededCommentID, p.commentID, p.reason, p.volume)
+	o.freezeSupersededProgressComment(apply, p.supersededCommentID, p.commentID, p.reason, p.volume, p.previousVolume)
 	return true
 }
 
@@ -1364,12 +1371,12 @@ func (o *CommentObserver) adoptPendingRotationComment(apply *storage.Apply) bool
 // the comment that replaced it. Collapsing rather than deleting keeps the
 // pre-change progress on the PR as a record while decluttering the timeline;
 // without the fold a reader has no way to tell a frozen comment from a live
-// one. reason selects the fold's headline (volume is read only for the
-// volume-change rendering). A failure leaves the tracked row's pending-freeze
-// marker in place (it is written alongside the successor's tracking), so a
-// later tick or a later drive's observer retries; the marker is cleared only
-// once the frozen rendering is on GitHub.
-func (o *CommentObserver) freezeSupersededProgressComment(apply *storage.Apply, oldCommentID, newCommentID int64, reason supersededProgressReason, volume int) {
+// one. reason selects the fold's headline (volume and previousVolume are read
+// only for the volume-change rendering). A failure leaves the tracked row's
+// pending-freeze marker in place (it is written alongside the successor's
+// tracking), so a later tick or a later drive's observer retries; the marker
+// is cleared only once the frozen rendering is on GitHub.
+func (o *CommentObserver) freezeSupersededProgressComment(apply *storage.Apply, oldCommentID, newCommentID int64, reason supersededProgressReason, volume, previousVolume int) {
 	if !o.leaseStillOwnsObserver(apply, "create GitHub client before freezing superseded comment") {
 		return
 	}
@@ -1394,7 +1401,7 @@ func (o *CommentObserver) freezeSupersededProgressComment(apply *storage.Apply, 
 		if !o.leaseStillOwnsObserver(apply, "freeze superseded progress comment") {
 			return
 		}
-		frozen := o.frozenSupersededProgressBody(reason, volume, newCommentID, oldBody)
+		frozen := o.frozenSupersededProgressBody(reason, volume, previousVolume, newCommentID, oldBody)
 		if err := client.EditIssueComment(ctx, o.repo, oldCommentID, frozen); err != nil {
 			o.logError(apply, "observer: failed to freeze superseded progress comment; the pending-freeze marker stays set and the next observer pass that reads the tracked row retries",
 				"error", err, "github_comment_id", oldCommentID)
