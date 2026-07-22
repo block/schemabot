@@ -503,6 +503,15 @@ func TestApplyCommentStore_ClaimSummaryComment(t *testing.T) {
 	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
 	require.NoError(t, err)
 	assert.False(t, won, "exactly one claimant reclaims a superseded summary")
+
+	// A superseded claim sentinel belongs to a publish that is still in flight
+	// or crashed mid-publish — converting it back into an active sentinel would
+	// hand two writers the same claim. It is recovered by the stale-claim
+	// machinery (ReclaimStaleSummaryClaim), never by a competing claim.
+	require.NoError(t, store.ApplyComments().Supersede(ctx, apply.ID, state.Comment.Summary))
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, won, "a superseded claim sentinel is not reclaimable")
 }
 
 // TestApplyCommentStore_ReclaimStaleSummaryClaim verifies crashed-publisher
