@@ -66,7 +66,6 @@ type tableProgress struct {
 	DDL            string
 	ChangeType     string
 	Status         string
-	ErrorMessage   string
 	RowsCopied     int64
 	RowsTotal      int64
 	Percent        int

@@ -733,14 +733,10 @@ type TableProgressResponse struct {
 	DDL       string `json:"ddl"`
 	// Deployment attributes this table/task to a deployment in a multi-deployment apply.
 	// Empty for single-deployment applies.
-	Deployment string `json:"deployment,omitempty"`
-	Keyspace   string `json:"keyspace,omitempty"`
-	ChangeType string `json:"change_type,omitempty"` // create, alter, drop
-	Status     string `json:"status"`
-	// ErrorMessage is the table's own engine error, set when this table's work
-	// failed. Empty for a table that was marked failed without ever starting
-	// (blocked behind an earlier failure in the same apply).
-	ErrorMessage    string `json:"error_message,omitempty"`
+	Deployment      string `json:"deployment,omitempty"`
+	Keyspace        string `json:"keyspace,omitempty"`
+	ChangeType      string `json:"change_type,omitempty"` // create, alter, drop
+	Status          string `json:"status"`
 	RowsCopied      int64  `json:"rows_copied"`
 	RowsTotal       int64  `json:"rows_total"`
 	PercentComplete int32  `json:"percent_complete"`

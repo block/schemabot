@@ -1154,24 +1154,21 @@ func PreviewCommentApplyCompleted() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Completed, tables))
 }
 
-// PreviewCommentApplyFirstFailed renders an apply comment where the first
-// table failed and the tables queued behind it never started, rendering as
-// skipped.
+// PreviewCommentApplyFirstFailed renders an apply comment where the first table failed.
 func PreviewCommentApplyFirstFailed() string {
 	tables := sampleApplyTables()
 	tables[0].Status = state.Task.Failed
 	tables[0].RowsCopied = 12045
 	tables[0].RowsTotal = 1466232
 	tables[0].PercentComplete = 1
-	tables[1].Status = state.Task.Failed
-	tables[2].Status = state.Task.Failed
+	tables[1].Status = state.Task.Cancelled
+	tables[2].Status = state.Task.Cancelled
 	data := sampleApplyData(state.Apply.Failed, tables)
 	data.ErrorMessage = PreviewErrorFirstFailed
 	return RenderApplyStatusComment(data)
 }
 
-// PreviewCommentApplyFailed renders an apply comment where the middle table
-// failed and the table queued behind it never started, rendering as skipped.
+// PreviewCommentApplyFailed renders an apply comment where the middle table failed.
 func PreviewCommentApplyFailed() string {
 	tables := sampleApplyTables()
 	tables[0].Status = state.Task.Completed
@@ -1179,7 +1176,7 @@ func PreviewCommentApplyFailed() string {
 	tables[1].RowsCopied = 439870
 	tables[1].RowsTotal = 1466232
 	tables[1].PercentComplete = 30
-	tables[2].Status = state.Task.Failed
+	tables[2].Status = state.Task.Cancelled
 	data := sampleApplyData(state.Apply.Failed, tables)
 	data.ErrorMessage = PreviewErrorMiddleFailed
 	return RenderApplyStatusComment(data)
@@ -1405,8 +1402,7 @@ func PreviewCommentMultiDeploymentApplyFailed() string {
 	usTables[1].RowsCopied = 439870
 	usTables[1].RowsTotal = 1466232
 	usTables[1].PercentComplete = 30
-	usTables[1].ErrorMessage = PreviewErrorMiddleFailed
-	usTables[2].Status = state.Task.Failed
+	usTables[2].Status = state.Task.Cancelled
 	usDetail := sampleDeploymentDetail("payments_us", state.Apply.Failed, usTables)
 	usDetail.ErrorMessage = PreviewErrorMiddleFailed
 
@@ -1508,11 +1504,7 @@ func PreviewCommentMultiDeploymentApplySummaryFailed() string {
 	usTables := sampleApplyTables()
 	usTables[0].Status = state.Task.Completed
 	usTables[1].Status = state.Task.Failed
-	usTables[1].RowsCopied = 439870
-	usTables[1].RowsTotal = 1466232
-	usTables[1].PercentComplete = 30
-	usTables[1].ErrorMessage = PreviewErrorMiddleFailed
-	usTables[2].Status = state.Task.Failed
+	usTables[2].Status = state.Task.Cancelled
 	usDetail := sampleDeploymentDetail("payments_us", state.Apply.Failed, usTables)
 	usDetail.ErrorMessage = PreviewErrorMiddleFailed
 
@@ -1820,7 +1812,7 @@ func PreviewCommentSummaryFailed() string {
 	tables[1].RowsCopied = 439870
 	tables[1].RowsTotal = 1466232
 	tables[1].PercentComplete = 30
-	tables[2].Status = state.Task.Failed
+	tables[2].Status = state.Task.Cancelled
 	data := sampleSummaryData(state.Apply.Failed, tables)
 	data.ErrorMessage = "table users failed: schema change failed: unsafe warning: Field 'name' doesn't have a default value"
 	return RenderApplySummaryComment(data) +
@@ -1873,9 +1865,9 @@ func PreviewCommentSummaryFailedLarge() string {
 		{Namespace: "testapp", TableName: "products", DDL: "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)", Status: state.Task.Completed},
 		{Namespace: "testapp", TableName: "payments", DDL: "ALTER TABLE `payments` ADD INDEX `idx_order_id` (`order_id`)", Status: state.Task.Completed},
 		{Namespace: "testapp", TableName: "addresses", DDL: "ALTER TABLE `addresses` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Task.Failed, PercentComplete: 45},
-		{Namespace: "testapp", TableName: "sessions", DDL: "ALTER TABLE `sessions` ADD INDEX `idx_expires_at` (`expires_at`)", Status: state.Task.Failed},
-		{Namespace: "testapp", TableName: "audit_logs", DDL: "ALTER TABLE `audit_logs` ADD INDEX `idx_created_at` (`created_at`)", Status: state.Task.Failed},
-		{Namespace: "testapp", TableName: "notifications", DDL: "ALTER TABLE `notifications` ADD INDEX `idx_user_status` (`user_id`, `status`)", Status: state.Task.Failed},
+		{Namespace: "testapp", TableName: "sessions", DDL: "ALTER TABLE `sessions` ADD INDEX `idx_expires_at` (`expires_at`)", Status: state.Task.Cancelled},
+		{Namespace: "testapp", TableName: "audit_logs", DDL: "ALTER TABLE `audit_logs` ADD INDEX `idx_created_at` (`created_at`)", Status: state.Task.Cancelled},
+		{Namespace: "testapp", TableName: "notifications", DDL: "ALTER TABLE `notifications` ADD INDEX `idx_user_status` (`user_id`, `status`)", Status: state.Task.Cancelled},
 	}
 	data := sampleSummaryDataWithDuration(state.Apply.Failed, tables, 3*time.Hour+30*time.Minute)
 	data.ErrorMessage = "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"
@@ -1890,7 +1882,7 @@ func PreviewCommentSummaryMultiNamespaceFailed() string {
 		{Namespace: "commerce", TableName: "payments", DDL: "ALTER TABLE `payments` ADD INDEX `idx_order_id` (`order_id`)", Status: state.Task.Completed},
 		{Namespace: "customers", TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL", Status: state.Task.Completed},
 		{Namespace: "customers", TableName: "addresses", DDL: "ALTER TABLE `addresses` ADD INDEX `idx_zip` (`zip_code`)", Status: state.Task.Failed, PercentComplete: 60},
-		{Namespace: "analytics", TableName: "events", DDL: "ALTER TABLE `events` ADD INDEX `idx_created_at` (`created_at`)", Status: state.Task.Failed},
+		{Namespace: "analytics", TableName: "events", DDL: "ALTER TABLE `events` ADD INDEX `idx_created_at` (`created_at`)", Status: state.Task.Cancelled},
 	}
 	data := sampleSummaryData(state.Apply.Failed, tables)
 	data.ErrorMessage = "table customers.addresses failed: Error 1205: Lock wait timeout exceeded"

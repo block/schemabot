@@ -418,7 +418,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		return
 	}
 
-	var completed, running, checksumming, queued, failed, skipped, retrying, stopped, readyForCutover, waiting, recovering, cutting, cancelled int
+	var completed, running, checksumming, queued, failed, retrying, stopped, readyForCutover, waiting, recovering, cutting, cancelled int
 	var runningPct int
 	var runningEstimateExceeded bool
 
@@ -451,11 +451,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		case state.Task.CuttingOver:
 			cutting++
 		case state.Task.Failed:
-			if tableSkippedByFailure(t) {
-				skipped++
-			} else {
-				failed++
-			}
+			failed++
 		case state.Task.FailedRetryable:
 			retrying++
 		case state.Task.Stopped:
@@ -528,13 +524,6 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			parts = append(parts, fmt.Sprintf("%d failed", failed))
 		} else {
 			parts = append(parts, "failed")
-		}
-	}
-	if skipped > 0 {
-		if multi {
-			parts = append(parts, fmt.Sprintf("%d skipped", skipped))
-		} else {
-			parts = append(parts, "skipped")
 		}
 	}
 	if retrying > 0 {
@@ -732,11 +721,6 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Failed:
-		if tableSkippedByFailure(table) {
-			fmt.Fprintf(sb, "**`%s`**: \u23ed\ufe0f Skipped (blocked by earlier failure)\n", table.TableName)
-			writeDDLLine(sb, table.DDL)
-			break
-		}
 		bar := ui.ProgressBarFailed(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
 		fmt.Fprintf(sb, "**`%s`**: %s \u274c Failed\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
@@ -1054,14 +1038,14 @@ func writeFooterAction(sb *strings.Builder, label, command string) {
 func RenderApplySummaryComment(data ApplyStatusCommentData) string {
 	var sb strings.Builder
 
-	completedCount, _, skippedCount := countTableOutcomes(data.Tables)
+	completedCount, failedCount := countTableOutcomes(data.Tables)
 	totalTables := len(data.Tables)
 
 	switch data.State {
 	case state.Apply.Completed:
 		writeSummaryCompleted(&sb, data, totalTables)
 	case state.Apply.Failed:
-		writeSummaryFailed(&sb, data, completedCount, skippedCount, totalTables)
+		writeSummaryFailed(&sb, data, completedCount, failedCount, totalTables)
 	case state.Apply.Stopped:
 		writeSummaryStopped(&sb, data, completedCount, totalTables)
 	case state.Apply.Cancelled:
@@ -1074,27 +1058,14 @@ func RenderApplySummaryComment(data ApplyStatusCommentData) string {
 	return sb.String()
 }
 
-// tableSkippedByFailure reports whether this table was marked failed without
-// its work ever starting — a table blocked behind an earlier failure in the
-// same apply, not a failure of its own.
-func tableSkippedByFailure(t TableProgressData) bool {
-	return ui.TableSkippedByFailure(t.Status, t.PercentComplete, t.RowsCopied, t.ErrorMessage)
-}
-
-// countTableOutcomes counts completed, failed, and skipped tables. A skipped
-// table holds the failed state but never started (see tableSkippedByFailure);
-// it is excluded from the failed count so summaries report only real failures.
-func countTableOutcomes(tables []TableProgressData) (completed, failed, skipped int) {
+// countTableOutcomes counts completed and failed tables.
+func countTableOutcomes(tables []TableProgressData) (completed, failed int) {
 	for _, t := range tables {
 		switch state.NormalizeTaskStatus(t.Status) {
 		case state.Task.Completed:
 			completed++
 		case state.Task.Failed:
-			if tableSkippedByFailure(t) {
-				skipped++
-			} else {
-				failed++
-			}
+			failed++
 		}
 	}
 	return
@@ -1128,7 +1099,7 @@ func writeSummaryCompletedMetadata(sb *strings.Builder, data ApplyStatusCommentD
 	sb.WriteString("\n")
 }
 
-func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, completedCount, skippedCount, totalTables int) {
+func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, completedCount, _, totalTables int) {
 	writeApplyHeader(sb, data)
 	writeSummaryMetadata(sb, data)
 
@@ -1136,14 +1107,8 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 		writeErrorBlock(sb, data.ErrorMessage)
 	}
 
-	if completedCount > 0 || skippedCount > 0 {
-		sb.WriteString("\n")
-	}
 	if completedCount > 0 {
-		fmt.Fprintf(sb, "%d of %d %s completed before failure.\n", completedCount, totalTables, pluralize("table", totalTables))
-	}
-	if skippedCount > 0 {
-		fmt.Fprintf(sb, "%d %s skipped (blocked by earlier failure).\n", skippedCount, pluralize("table", skippedCount))
+		fmt.Fprintf(sb, "\n%d of %d %s completed before failure.\n", completedCount, totalTables, pluralize("table", totalTables))
 	}
 
 	writeSummaryTableList(sb, data)
@@ -1450,25 +1415,13 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 }
 
 // groupStateEmoji returns the aggregate emoji for a group of tables.
-// A skipped table (marked failed without ever starting) does not pull the
-// group to ❌ — only a real failure does — so the failed group is the one an
-// operator investigates.
 func groupStateEmoji(tables []TableProgressData) string {
 	states := make(map[string]bool)
-	var anyFailed, anySkipped bool
 	for _, t := range tables {
-		normalized := state.NormalizeTaskStatus(t.Status)
-		states[normalized] = true
-		if normalized == state.Task.Failed {
-			if tableSkippedByFailure(t) {
-				anySkipped = true
-			} else {
-				anyFailed = true
-			}
-		}
+		states[state.NormalizeTaskStatus(t.Status)] = true
 	}
 
-	if anyFailed {
+	if states[state.Task.Failed] {
 		return "❌"
 	}
 	if states["reverted"] {
@@ -1479,9 +1432,6 @@ func groupStateEmoji(tables []TableProgressData) string {
 	}
 	if states[state.Task.Cancelled] && !states[state.Task.Completed] {
 		return "⊘"
-	}
-	if anySkipped {
-		return "⏭️"
 	}
 	return "✅"
 }
@@ -1495,10 +1445,6 @@ func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData) {
 	case state.Task.Completed:
 		fmt.Fprintf(sb, "**`%s`**\n", t.TableName)
 	case state.Task.Failed:
-		if tableSkippedByFailure(t) {
-			fmt.Fprintf(sb, "**`%s`** — Skipped (blocked by earlier failure)\n", t.TableName)
-			break
-		}
 		label := "Failed"
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
 			label = fmt.Sprintf("Failed at %d%%", ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))

@@ -852,7 +852,7 @@ That command wasn't recognized. Available commands:
 
 **Status**: Failed
 
-📊 1/3 complete · 1 failed · 1 skipped
+📊 1/3 complete · 1 failed · 1 cancelled
 
 **Schema `testapp`**
 
@@ -862,16 +862,16 @@ That command wasn't recognized. Available commands:
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: ⏭️ Skipped (blocked by earlier failure)
-
-```sql
-ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
-```
-
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`products`**: ⊘ Cancelled (not started)
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
@@ -2863,7 +2863,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Status**: Failed
 
-📊 1 failed · 2 skipped
+📊 1 failed · 2 cancelled
 
 **Schema `testapp`**
 
@@ -2873,13 +2873,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: ⏭️ Skipped (blocked by earlier failure)
+**`users`**: ⊘ Cancelled (not started)
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: ⏭️ Skipped (blocked by earlier failure)
+**`products`**: ⊘ Cancelled (not started)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -2909,7 +2909,7 @@ schemabot apply -e staging
 
 **Status**: Failed
 
-📊 1/3 complete · 1 failed · 1 skipped
+📊 1/3 complete · 1 failed · 1 cancelled
 
 **Schema `testapp`**
 
@@ -2919,16 +2919,16 @@ schemabot apply -e staging
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: ⏭️ Skipped (blocked by earlier failure)
-
-```sql
-ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
-```
-
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`products`**: ⊘ Cancelled (not started)
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
@@ -3697,7 +3697,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 > ⚠️ **Error:** table users failed: schema change failed: unsafe warning: Field 'name' doesn't have a default value
 
 1 of 3 tables completed before failure.
-1 table skipped (blocked by earlier failure).
 
 **`users`** — Failed at 30%
 ```sql
@@ -3712,14 +3711,14 @@ ALTER TABLE `users`
     ADD UNIQUE `idx_email`(`email`);
 ```
 
-**`products`** — Skipped (blocked by earlier failure)
-```sql
-ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
-```
-
 **`orders`**
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`products`** — Cancelled
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
@@ -3946,26 +3945,10 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 > ⚠️ **Error:** Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'
 
 4 of 8 tables completed before failure.
-3 tables skipped (blocked by earlier failure).
 
 **`addresses`** — Failed at 45%
 ```sql
 ALTER TABLE `addresses` ADD INDEX `idx_user_id`(`user_id`);
-```
-
-**`sessions`** — Skipped (blocked by earlier failure)
-```sql
-ALTER TABLE `sessions` ADD INDEX `idx_expires_at`(`expires_at`);
-```
-
-**`audit_logs`** — Skipped (blocked by earlier failure)
-```sql
-ALTER TABLE `audit_logs` ADD INDEX `idx_created_at`(`created_at`);
-```
-
-**`notifications`** — Skipped (blocked by earlier failure)
-```sql
-ALTER TABLE `notifications` ADD INDEX `idx_user_status`(`user_id`, `status`);
 ```
 
 **`orders`**
@@ -3986,6 +3969,21 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 **`payments`**
 ```sql
 ALTER TABLE `payments` ADD INDEX `idx_order_id`(`order_id`);
+```
+
+**`sessions`** — Cancelled
+```sql
+ALTER TABLE `sessions` ADD INDEX `idx_expires_at`(`expires_at`);
+```
+
+**`audit_logs`** — Cancelled
+```sql
+ALTER TABLE `audit_logs` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+**`notifications`** — Cancelled
+```sql
+ALTER TABLE `notifications` ADD INDEX `idx_user_status`(`user_id`, `status`);
 ```
 
 
@@ -4024,7 +4022,6 @@ schemabot apply -e staging
 > ⚠️ **Error:** table customers.addresses failed: Error 1205: Lock wait timeout exceeded
 
 3 of 5 tables completed before failure.
-1 table skipped (blocked by earlier failure).
 
 ### ❌ customers
 
@@ -4039,14 +4036,6 @@ ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 ```
 
 
-### ⏭️ analytics
-
-**`events`** — Skipped (blocked by earlier failure)
-```sql
-ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
-```
-
-
 ### ✅ commerce
 
 **`orders`**
@@ -4057,6 +4046,14 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 **`payments`**
 ```sql
 ALTER TABLE `payments` ADD INDEX `idx_order_id`(`order_id`);
+```
+
+
+### ⊘ analytics
+
+**`events`** — Cancelled
+```sql
+ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 ```
 
 
@@ -4268,7 +4265,7 @@ Single table progress (default):
 
   ── testapp ──
 
-     ~ users: 🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+     ~ users: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 
@@ -4542,7 +4539,7 @@ Sequential mode: All tables completed successfully
 
 ```
 
-Sequential mode: First table failed (later tables skipped)
+Sequential mode: First table failed (others cancelled)
 
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
@@ -4557,10 +4554,10 @@ Sequential mode: First table failed (later tables skipped)
      ~ users: 🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-     ~ orders: ⏭️ Skipped (blocked by earlier failure)
+     ~ orders: ⊘ Cancelled (not started)
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-     ~ products: ⏭️ Skipped (blocked by earlier failure)
+     ~ products: ⊘ Cancelled (not started)
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
@@ -4575,7 +4572,7 @@ The new apply will only process tables that haven't completed.
 
 ```
 
-Sequential mode: Middle table failed (last table skipped)
+Sequential mode: Middle table failed
 
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
@@ -4590,11 +4587,11 @@ Sequential mode: Middle table failed (last table skipped)
      ~ orders: 🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-     ~ products: ⏭️ Skipped (blocked by earlier failure)
-       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
-
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+
+     ~ products: ⊘ Cancelled (not started)
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -5919,7 +5916,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 **Status**: Failed
 
-📊 1/3 complete · 1 failed · 1 skipped
+📊 1/3 complete · 1 failed · 1 cancelled
 
 **Schema `testapp`**
 
@@ -5929,16 +5926,16 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: ⏭️ Skipped (blocked by earlier failure)
-
-```sql
-ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
-```
-
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`products`**: ⊘ Cancelled (not started)
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
@@ -6279,23 +6276,22 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 > ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
 
 1 of 3 tables completed before failure.
-1 table skipped (blocked by earlier failure).
 
 ### ❌ testapp
 
-**`users`** — Failed at 30%
+**`users`** — Failed
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
-```
-
-**`products`** — Skipped (blocked by earlier failure)
-```sql
-ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 **`orders`**
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`products`** — Cancelled
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
@@ -6798,7 +6794,7 @@ Sequential mode: All tables completed successfully
 
 ```
 
-Sequential mode: First table failed (later tables skipped)
+Sequential mode: First table failed (others cancelled)
 
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
@@ -6813,10 +6809,10 @@ Sequential mode: First table failed (later tables skipped)
      ~ users: 🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-     ~ orders: ⏭️ Skipped (blocked by earlier failure)
+     ~ orders: ⊘ Cancelled (not started)
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-     ~ products: ⏭️ Skipped (blocked by earlier failure)
+     ~ products: ⊘ Cancelled (not started)
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
@@ -6831,7 +6827,7 @@ The new apply will only process tables that haven't completed.
 
 ```
 
-Sequential mode: Middle table failed (last table skipped)
+Sequential mode: Middle table failed
 
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
@@ -6846,11 +6842,11 @@ Sequential mode: Middle table failed (last table skipped)
      ~ orders: 🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-     ~ products: ⏭️ Skipped (blocked by earlier failure)
-       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
-
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+
+     ~ products: ⊘ Cancelled (not started)
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 To recover: Fix the issue above, then run a new apply.

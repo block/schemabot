@@ -143,7 +143,7 @@ func previewSeqAllDoneOutput() {
 }
 
 func previewSeqFirstFailOutput() {
-	fmt.Println("Sequential mode: First table failed (later tables skipped)")
+	fmt.Println("Sequential mode: First table failed (others cancelled)")
 	fmt.Println()
 
 	data := ProgressData{
@@ -155,15 +155,15 @@ func previewSeqFirstFailOutput() {
 		ErrorMessage: "lock wait timeout exceeded; try restarting transaction",
 		Tables: []TableProgress{
 			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Failed, PercentComplete: 65},
-			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Apply.Failed},
-			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Failed},
+			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: TaskCancelled},
+			{TableName: "products", DDL: seqDDLs[2].ddl, Status: TaskCancelled},
 		},
 	}
 	WriteProgress(data)
 }
 
 func previewSeqMidFailOutput() {
-	fmt.Println("Sequential mode: Middle table failed (last table skipped)")
+	fmt.Println("Sequential mode: Middle table failed")
 	fmt.Println()
 
 	data := ProgressData{
@@ -176,7 +176,7 @@ func previewSeqMidFailOutput() {
 		Tables: []TableProgress{
 			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
 			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Apply.Failed, PercentComplete: 45},
-			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Failed},
+			{TableName: "products", DDL: seqDDLs[2].ddl, Status: TaskCancelled},
 		},
 	}
 	WriteProgress(data)

@@ -392,50 +392,6 @@ func TestFormatTableProgress_FailedRetryableKeepsProgress(t *testing.T) {
 	})
 }
 
-// When a multi-table apply fails mid-chain, the tables queued behind the
-// failure are marked failed even though their work never started. The CLI must
-// render those tables as skipped — clearly distinct from the table that
-// actually failed, which carries its own engine error or copy progress.
-func TestFormatTableProgress_FailedDistinguishesSkippedFromFailed(t *testing.T) {
-	t.Run("never started renders skipped", func(t *testing.T) {
-		tp := TableProgress{
-			TableName:  "products",
-			ChangeType: "alter",
-			Status:     state.Apply.Failed,
-		}
-
-		output := FormatTableProgress(tp)
-		assert.Contains(t, output, "products: ⏭️ Skipped (blocked by earlier failure)")
-		assert.NotContains(t, output, "❌ Failed")
-	})
-
-	t.Run("failed with progress renders failed", func(t *testing.T) {
-		tp := TableProgress{
-			TableName:       "users",
-			ChangeType:      "alter",
-			Status:          state.Apply.Failed,
-			PercentComplete: 45,
-		}
-
-		output := FormatTableProgress(tp)
-		assert.Contains(t, output, "users: "+ui.ProgressBarFailed(45)+" ❌ Failed")
-		assert.NotContains(t, output, "Skipped")
-	})
-
-	t.Run("failed before copying with its own error renders failed", func(t *testing.T) {
-		tp := TableProgress{
-			TableName:    "users",
-			ChangeType:   "alter",
-			Status:       state.Apply.Failed,
-			ErrorMessage: "duplicate key name 'idx_email'",
-		}
-
-		output := FormatTableProgress(tp)
-		assert.Contains(t, output, "users: "+ui.ProgressBarFailed(0)+" ❌ Failed")
-		assert.NotContains(t, output, "Skipped")
-	})
-}
-
 func TestFormatTableProgress_EstimateExceeded(t *testing.T) {
 	t.Run("structured progress", func(t *testing.T) {
 		tp := TableProgress{

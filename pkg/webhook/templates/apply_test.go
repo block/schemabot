@@ -804,87 +804,6 @@ func TestRenderApplyStatusComment_Failed(t *testing.T) {
 	assert.Contains(t, result, "schemabot apply -e staging")
 }
 
-// A sequential multi-table apply that fails mid-chain marks the tables queued
-// behind the failure as failed even though their work never started. The
-// status comment must render those tables as skipped — clearly distinct from
-// the table that actually failed — and the progress summary must count them
-// separately so the failed count reports only real failures.
-func TestRenderApplyStatusComment_FailedWithSkippedTables(t *testing.T) {
-	data := ApplyStatusCommentData{
-		Database:     "testapp",
-		Environment:  "staging",
-		RequestedBy:  "aparajon",
-		State:        state.Apply.Failed,
-		Engine:       "Spirit",
-		ErrorMessage: "table users failed: lock wait timeout exceeded",
-		Tables: []TableProgressData{
-			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Task.Completed},
-			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: state.Task.Failed, PercentComplete: 30, ErrorMessage: "lock wait timeout exceeded"},
-			{TableName: "products", DDL: "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)", Status: state.Task.Failed},
-		},
-	}
-
-	result := RenderApplyStatusComment(data)
-
-	assert.Contains(t, result, "**`users`**: "+ui.ProgressBarFailed(30)+" ❌ Failed")
-	assert.Contains(t, result, "**`products`**: ⏭️ Skipped (blocked by earlier failure)")
-	// Counts report only the real failure, never the skipped table.
-	assert.Contains(t, result, "📊 1/3 complete")
-	assert.Contains(t, result, "1 failed")
-	assert.Contains(t, result, "1 skipped")
-	assert.NotContains(t, result, "2 failed")
-}
-
-// The terminal failure summary for the same mid-chain failure must label the
-// never-started table as skipped and keep both the completed-before-failure
-// and skipped counts truthful.
-func TestRenderApplySummaryComment_FailedWithSkippedTables(t *testing.T) {
-	data := ApplyStatusCommentData{
-		ApplyID:      "apply-a1b2c3d4e5f6",
-		Database:     "testapp",
-		Environment:  "staging",
-		State:        state.Apply.Failed,
-		Engine:       "Spirit",
-		ErrorMessage: "table users failed: lock wait timeout exceeded",
-		Tables: []TableProgressData{
-			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Task.Completed},
-			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: state.Task.Failed, PercentComplete: 30, ErrorMessage: "lock wait timeout exceeded"},
-			{TableName: "products", DDL: "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)", Status: state.Task.Failed},
-		},
-	}
-
-	result := RenderApplySummaryComment(data)
-
-	assert.Contains(t, result, "❌ Schema Change Failed")
-	assert.Contains(t, result, "1 of 3 tables completed before failure.")
-	assert.Contains(t, result, "1 table skipped (blocked by earlier failure).")
-	assert.Contains(t, result, "**`users`** — Failed at 30%")
-	assert.Contains(t, result, "**`products`** — Skipped (blocked by earlier failure)")
-	assert.NotContains(t, result, "**`products`** — Failed")
-}
-
-// A table that failed before copying any rows still carries its own engine
-// error, so it renders as the failure — never as skipped — even with an empty
-// progress bar.
-func TestRenderApplySummaryComment_FailedBeforeCopyIsNotSkipped(t *testing.T) {
-	data := ApplyStatusCommentData{
-		ApplyID:      "apply-a1b2c3d4e5f6",
-		Database:     "testapp",
-		Environment:  "staging",
-		State:        state.Apply.Failed,
-		Engine:       "Spirit",
-		ErrorMessage: "table users failed: duplicate key name 'idx_email'",
-		Tables: []TableProgressData{
-			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: state.Task.Failed, ErrorMessage: "duplicate key name 'idx_email'"},
-		},
-	}
-
-	result := RenderApplySummaryComment(data)
-
-	assert.Contains(t, result, "**`users`** — Failed")
-	assert.NotContains(t, result, "Skipped")
-}
-
 func TestTerminalStatusAndSummaryCommentTitlesAreDistinct(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:     "testapp",
@@ -1420,7 +1339,7 @@ func TestPreviewCommentApplyFailed(t *testing.T) {
 	assert.Contains(t, result, "Schema Change Status")
 	assert.Contains(t, result, "**Status**: Failed")
 	assert.Contains(t, result, "lock wait timeout")
-	assert.Contains(t, result, "⏭️ Skipped (blocked by earlier failure)")
+	assert.Contains(t, result, "Cancelled (not started)")
 }
 
 func TestPreviewCommentApplyStopped(t *testing.T) {
@@ -1489,12 +1408,11 @@ func TestPreviewCommentSummaryFailed(t *testing.T) {
 	assert.Contains(t, result, "Schema Change Failed")
 	assert.Contains(t, result, "unsafe warning")
 	assert.Contains(t, result, "1 of 3 tables completed before failure.")
-	assert.Contains(t, result, "1 table skipped (blocked by earlier failure).")
 	// Single namespace — no header, but table entries present
 	assert.NotContains(t, result, "### ")
 	assert.Contains(t, result, "**`users`** — Failed at 30%")
 	assert.Contains(t, result, "**`orders`**")
-	assert.Contains(t, result, "**`products`** — Skipped (blocked by earlier failure)")
+	assert.Contains(t, result, "**`products`** — Cancelled")
 }
 
 func TestPreviewCommentSummaryStopped(t *testing.T) {
@@ -1636,7 +1554,7 @@ func TestRenderApplySummaryCommentMixedNamespacesKeepEmoji(t *testing.T) {
 		State:       state.Apply.Failed,
 		Tables: []TableProgressData{
 			{TableName: "orders", Namespace: "commerce", Status: state.Task.Completed},
-			{TableName: "users", Namespace: "identity", Status: state.Task.Failed, ErrorMessage: "lock wait timeout exceeded"},
+			{TableName: "users", Namespace: "identity", Status: state.Task.Failed},
 		},
 	}
 
