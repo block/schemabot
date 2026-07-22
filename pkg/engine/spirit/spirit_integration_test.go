@@ -281,6 +281,97 @@ func TestEngine_Plan_DropTable(t *testing.T) {
 	require.NoError(t, err, "drop table")
 }
 
+// A desired schema that swaps a table's primary key diffs to a DROP PRIMARY
+// KEY, and one that introduces a referential constraint diffs to an ADD
+// FOREIGN KEY — both statements Spirit deterministically refuses at apply
+// time. The plan carries the execution-mode verdict on those changes — mode
+// "blocked" with the engine's reason — so the operator learns at plan time
+// that the apply will fail, while an ordinary change in the same plan stays
+// on the engine's default path.
+func TestEngine_Plan_ExecutionVerdictBlocked(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE accounts (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create accounts table")
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE notes (
+		id INT NOT NULL AUTO_INCREMENT,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create notes table")
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE orders (
+		id INT NOT NULL AUTO_INCREMENT,
+		note_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create orders table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"accounts.sql": `CREATE TABLE accounts (
+				id INT NOT NULL AUTO_INCREMENT,
+				tenant_id INT NOT NULL,
+				PRIMARY KEY (id, tenant_id)
+			)`,
+			"notes.sql": `CREATE TABLE notes (
+				id INT NOT NULL AUTO_INCREMENT,
+				body TEXT,
+				PRIMARY KEY (id)
+			)`,
+			"orders.sql": `CREATE TABLE orders (
+				id INT NOT NULL AUTO_INCREMENT,
+				note_id INT NOT NULL,
+				PRIMARY KEY (id),
+				CONSTRAINT fk_orders_note FOREIGN KEY (note_id) REFERENCES notes (id)
+			)`,
+		}),
+		Credentials: &engine.Credentials{
+			DSN: dsn,
+		},
+	})
+	require.NoError(t, err, "Plan()")
+	require.False(t, result.NoChanges, "expected changes, got NoChanges")
+
+	verdicts := make(map[string]engine.TableChange)
+	for _, tc := range result.FlatTableChanges() {
+		t.Logf("table %s: ddl=%s mode=%q reason=%q", tc.Table, tc.DDL, tc.ExecutionMode, tc.ModeReason)
+		verdicts[tc.Table] = tc
+	}
+
+	accounts, ok := verdicts["accounts"]
+	require.True(t, ok, "plan carries the accounts change")
+	assert.Contains(t, accounts.DDL, "DROP PRIMARY KEY")
+	assert.Equal(t, "blocked", accounts.ExecutionMode, "the refused statement carries the blocked verdict")
+	assert.Equal(t, "dropping primary key is not supported", accounts.ModeReason)
+
+	notes, ok := verdicts["notes"]
+	require.True(t, ok, "plan carries the notes change")
+	assert.Empty(t, notes.ExecutionMode, "an ordinary ADD COLUMN stays on the engine's default path")
+	assert.Empty(t, notes.ModeReason)
+
+	orders, ok := verdicts["orders"]
+	require.True(t, ok, "plan carries the orders change")
+	assert.Contains(t, orders.DDL, "FOREIGN KEY")
+	assert.Contains(t, orders.DDL, "fk_orders_note")
+	assert.Equal(t, "blocked", orders.ExecutionMode, "adding a foreign key carries the blocked verdict")
+	assert.Equal(t, "adding foreign key constraints is not supported", orders.ModeReason)
+
+	_, err = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS `orders`")
+	require.NoError(t, err, "drop orders table")
+	_, err = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS `accounts`")
+	require.NoError(t, err, "drop accounts table")
+	_, err = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS `notes`")
+	require.NoError(t, err, "drop notes table")
+}
+
 func TestEngine_Plan_NoChanges(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db) // Start with clean database

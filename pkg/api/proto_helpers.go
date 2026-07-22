@@ -185,12 +185,14 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 		}
 		for _, t := range sc.TableChanges {
 			apiSC.TableChanges = append(apiSC.TableChanges, &apitypes.TableChangeResponse{
-				TableName:    t.TableName,
-				Namespace:    t.Namespace,
-				DDL:          t.Ddl,
-				ChangeType:   protoChangeTypeToOperation(t.ChangeType),
-				IsUnsafe:     t.IsUnsafe,
-				UnsafeReason: t.UnsafeReason,
+				TableName:     t.TableName,
+				Namespace:     t.Namespace,
+				DDL:           t.Ddl,
+				ChangeType:    protoChangeTypeToOperation(t.ChangeType),
+				IsUnsafe:      t.IsUnsafe,
+				UnsafeReason:  t.UnsafeReason,
+				ExecutionMode: t.ExecutionMode,
+				ModeReason:    t.ModeReason,
 			})
 		}
 		httpResp.Changes = append(httpResp.Changes, apiSC)
@@ -220,12 +222,14 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 				continue
 			}
 			apiSP.Changes = append(apiSP.Changes, &apitypes.TableChangeResponse{
-				TableName:    t.TableName,
-				Namespace:    t.Namespace,
-				DDL:          t.Ddl,
-				ChangeType:   protoChangeTypeToOperation(t.ChangeType),
-				IsUnsafe:     t.IsUnsafe,
-				UnsafeReason: t.UnsafeReason,
+				TableName:     t.TableName,
+				Namespace:     t.Namespace,
+				DDL:           t.Ddl,
+				ChangeType:    protoChangeTypeToOperation(t.ChangeType),
+				IsUnsafe:      t.IsUnsafe,
+				UnsafeReason:  t.UnsafeReason,
+				ExecutionMode: t.ExecutionMode,
+				ModeReason:    t.ModeReason,
 			})
 		}
 		// An empty shard plan is a shard that already matches the desired schema
@@ -258,11 +262,13 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange, schemaFiles map[st
 		nsData := &storage.NamespacePlanData{}
 		for _, t := range sc.TableChanges {
 			nsData.Tables = append(nsData.Tables, storage.TableChange{
-				Table:        t.TableName,
-				DDL:          t.Ddl,
-				Operation:    protoChangeTypeToOperation(t.ChangeType),
-				IsUnsafe:     t.IsUnsafe,
-				UnsafeReason: t.UnsafeReason,
+				Table:         t.TableName,
+				DDL:           t.Ddl,
+				Operation:     protoChangeTypeToOperation(t.ChangeType),
+				IsUnsafe:      t.IsUnsafe,
+				UnsafeReason:  t.UnsafeReason,
+				ExecutionMode: t.ExecutionMode,
+				ModeReason:    t.ModeReason,
 			})
 		}
 		if len(sc.OriginalFiles) > 0 {
@@ -333,12 +339,14 @@ func protoShardPlansToStorage(shards []*ternv1.ShardPlan) ([]storage.ShardPlan, 
 				return nil, fmt.Errorf("shard plan %d shard %q change %d (table %q) namespace %q disagrees with shard namespace %q", i, shardName, j, table, cn, namespace)
 			}
 			sp.Changes = append(sp.Changes, storage.TableChange{
-				Namespace:    namespace,
-				Table:        table,
-				DDL:          changeDDL,
-				Operation:    protoChangeTypeToOperation(ch.ChangeType),
-				IsUnsafe:     ch.IsUnsafe,
-				UnsafeReason: ch.UnsafeReason,
+				Namespace:     namespace,
+				Table:         table,
+				DDL:           changeDDL,
+				Operation:     protoChangeTypeToOperation(ch.ChangeType),
+				IsUnsafe:      ch.IsUnsafe,
+				UnsafeReason:  ch.UnsafeReason,
+				ExecutionMode: ch.ExecutionMode,
+				ModeReason:    ch.ModeReason,
 			})
 		}
 		out = append(out, sp)
