@@ -101,7 +101,7 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 	if !cmd.SkipVerify {
 		fmt.Println()
 		fmt.Println("Verifying pulled schema against the source environment...")
-		if err := verifyOnboardPlan(ep, resp, plan); err != nil {
+		if err := verifyOnboardPlan(ep, cmd.Database, cmd.Environment, plan); err != nil {
 			return err
 		}
 		fmt.Println("Verified: pulled schema produces no schema changes in the source environment.")
@@ -113,8 +113,9 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 }
 
 type onboardWritePlan struct {
-	root  string
-	files map[string]string
+	root         string
+	databaseType string
+	files        map[string]string
 }
 
 func onboardPullNamespaces(namespaces []string) ([]string, error) {
@@ -222,7 +223,7 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse)
 		}
 	}
 
-	return &onboardWritePlan{root: root, files: files}, nil
+	return &onboardWritePlan{root: root, databaseType: resp.Type, files: files}, nil
 }
 
 func validateRelativePathPart(kind, value string) error {
@@ -272,9 +273,10 @@ func (p *onboardWritePlan) checkConflicts(force bool) error {
 
 // strayFiles returns schema files in the pulled namespace directories that
 // this pull did not write. The pull covers every table in each pulled
-// namespace, so a leftover file there describes a table absent in the target:
-// verification will fail on it as a spurious create, and an onboard PR would
-// propose recreating the table.
+// namespace, so a leftover table file there describes a table absent in the
+// target, and a leftover vschema.json (Vitess) proposes a VSchema the target
+// doesn't have: verification will fail on either as a spurious change, and an
+// onboard PR would propose applying it.
 func (p *onboardWritePlan) strayFiles() ([]string, error) {
 	planned := make(map[string]struct{}, len(p.files))
 	namespaceDirs := make(map[string]struct{})
@@ -301,9 +303,13 @@ func (p *onboardWritePlan) strayFiles() ([]string, error) {
 				continue
 			}
 			name := entry.Name()
-			// Only files SchemaBot reads as schema inputs can go stray; other
+			// Only files the engine reads as schema inputs can go stray; other
 			// files (docs, tooling) are ignored by plans and applies alike.
-			if !strings.HasSuffix(name, ".sql") && name != "vschema.json" {
+			// vschema.json is a schema input for Vitess only — MySQL planning
+			// never reads it.
+			isSchemaInput := strings.HasSuffix(name, ".sql") ||
+				(name == "vschema.json" && p.databaseType == storage.DatabaseTypeVitess)
+			if !isSchemaInput {
 				continue
 			}
 			relativePath := filepath.Join(dir, name)
@@ -321,11 +327,11 @@ func printStrayFileWarning(strays []string) {
 		return
 	}
 	fmt.Println()
-	fmt.Printf("%sWarning:%s the schema root contains schema files this pull did not write — their tables are absent in the target. Verification will fail on them, and an onboard PR would propose recreating the tables:\n", templates.ANSIYellow, templates.ANSIReset)
+	fmt.Printf("%sWarning:%s the schema root contains schema files this pull did not write. Verification will fail on them, and an onboard PR would propose the spurious changes they describe (recreating absent tables, or an unexpected VSchema change):\n", templates.ANSIYellow, templates.ANSIReset)
 	for _, path := range strays {
 		fmt.Printf("  %s\n", path)
 	}
-	fmt.Println("Delete the stray files, or restore the missing tables in the target before onboarding.")
+	fmt.Println("Delete the stray files, or restore the missing tables or VSchema in the target before onboarding.")
 }
 
 func fileStatusForDryRun(path string) (exists bool, statErr error) {
@@ -361,26 +367,26 @@ func formatOnboardWriteError(operation, path string, written []string, err error
 	return fmt.Errorf("%s %s after writing files:\n  %s\nerror: %w", operation, path, strings.Join(written, "\n  "), err)
 }
 
-func verifyOnboardPlan(endpoint string, resp *apitypes.PullSchemaResponse, plan *onboardWritePlan) error {
+func verifyOnboardPlan(endpoint, database, environment string, plan *onboardWritePlan) error {
 	var planResult *apitypes.PlanResponse
 	err := withLoading("Verifying pulled schema...", true, func() error {
 		var planErr error
-		planResult, planErr = client.CallPlanAPI(endpoint, resp.Database, resp.Type, resp.Environment, plan.root, "", 0)
+		planResult, planErr = client.CallPlanAPI(endpoint, database, plan.databaseType, environment, plan.root, "", 0)
 		return planErr
 	})
 	if err != nil {
-		if outputPlanRequestError(resp.Database, resp.Environment, err) {
+		if outputPlanRequestError(database, environment, err) {
 			return ErrSilent
 		}
-		return fmt.Errorf("verify pulled schema for database %s environment %s: %w", resp.Database, resp.Environment, err)
+		return fmt.Errorf("verify pulled schema for database %s environment %s: %w", database, environment, err)
 	}
-	if validateErr := validateOnboardPlanResult(planResult, resp.Database, resp.Environment); validateErr != nil {
+	if validateErr := validateOnboardPlanResult(planResult, database, environment); validateErr != nil {
 		strays, strayErr := plan.strayFiles()
 		if strayErr != nil {
 			return errors.Join(validateErr, strayErr)
 		}
 		if len(strays) > 0 {
-			return fmt.Errorf("%w\nstray schema files not written by this pull (their tables are absent in the target; delete the files or restore the tables):\n  %s", validateErr, strings.Join(strays, "\n  "))
+			return fmt.Errorf("%w\nstray schema files not written by this pull (delete them, or restore the missing tables or VSchema in the target):\n  %s", validateErr, strings.Join(strays, "\n  "))
 		}
 		return validateErr
 	}

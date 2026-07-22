@@ -317,12 +317,35 @@ func TestOnboardWritePlanStrayFiles(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "vschema.json"), []byte("{}"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "README.md"), []byte("docs"), 0o644))
 
+	// MySQL planning never reads vschema.json, so only the table file is stray.
 	strays, err = plan.strayFiles()
 	require.NoError(t, err)
 	assert.Equal(t, []string{
 		filepath.Join(root, "orders", "legacy_bak.sql"),
-		filepath.Join(root, "orders", "vschema.json"),
 	}, strays)
+}
+
+// For Vitess, vschema.json is a schema input: a leftover copy the pull did not
+// write proposes a VSchema the target doesn't have, so it must be flagged
+// alongside stray table files.
+func TestOnboardWritePlanStrayFilesFlagsVSchemaForVitess(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "vitess",
+		Environment: "production",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "vschema.json"), []byte("{\"sharded\": true}"), 0o644))
+
+	strays, err := plan.strayFiles()
+	require.NoError(t, err)
+	assert.Equal(t, []string{filepath.Join(root, "orders", "vschema.json")}, strays)
 }
 
 func validPullSchemaResponse() *apitypes.PullSchemaResponse {
