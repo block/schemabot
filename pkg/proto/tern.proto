@@ -613,6 +613,10 @@ message TableProgress {
   // Populated while the table is checksumming (verifying copied data), 0 otherwise.
   int64 checksum_rows_checked = 14;
   int64 checksum_rows_total = 15;
+  // This table's own engine error, from the data plane's stored task record.
+  // Empty for tables that never produced an error themselves — including tables
+  // that failed only because an earlier table's failure blocked them.
+  string error_message = 16;
 }
 
 // ProgressResponse contains detailed progress information.

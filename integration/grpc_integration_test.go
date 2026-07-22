@@ -458,6 +458,172 @@ func TestGRPC_TaskStateUpdatedOnCompletion(t *testing.T) {
 	}
 }
 
+// TestGRPC_FailedTableErrorSurfacesInTaskRecord drives a schema change through a
+// remote Tern over gRPC that fails at the engine: adding a unique index over
+// duplicate rows. The control plane never polls the engine directly, so the only
+// way the PR comment / CLI can show which table's engine error caused the
+// failure is the remote's per-table error being mirrored into SchemaBot's own
+// stored task row. The failed table must carry the engine error on its task
+// record, not just on the apply record.
+func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
+	ctx := t.Context()
+
+	// Create a unique target database for this test
+	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	require.NoError(t, err, "open target db")
+	defer utils.CloseAndLog(targetDB)
+
+	appDBName := fmt.Sprintf("tblerr_%d", time.Now().UnixNano()%100000)
+	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+appDBName)
+	require.NoError(t, err, "create app database")
+	t.Cleanup(func() {
+		_, _ = targetDB.ExecContext(t.Context(), "DROP DATABASE IF EXISTS "+appDBName)
+	})
+
+	// Seed a table with duplicate values so adding a unique index must fail in
+	// the engine with this table's own error.
+	_, err = targetDB.ExecContext(ctx, "CREATE TABLE `"+appDBName+"`.`dup_users` ("+
+		"`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, "+
+		"`name` VARCHAR(255) NOT NULL"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err, "create seeded table")
+	_, err = targetDB.ExecContext(ctx, "INSERT INTO `"+appDBName+"`.`dup_users` (`name`) VALUES ('a'), ('a')")
+	require.NoError(t, err, "seed duplicate rows")
+
+	appDSN := strings.Replace(targetDSN, "/target_test", "/"+appDBName, 1)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	// Set up a separate Tern gRPC server for this test (backed by LocalClient)
+	ternGRPCAddr, err := startTernGRPC(ctx, appDSN, ternStorageDSN)
+	require.NoError(t, err, "start tern grpc")
+
+	// Create SchemaBot with its own storage and a GRPCClient to remote Tern.
+	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	require.NoError(t, err, "open schemabot db")
+	defer utils.CloseAndLog(schemabotDB)
+	schemabotStorage := schemabotmysql.New(schemabotDB)
+
+	ternClient, err := tern.NewGRPCClient(tern.Config{
+		Address: ternGRPCAddr,
+		Storage: schemabotStorage,
+	})
+	require.NoError(t, err, "create tern client")
+	defer utils.CloseAndLog(ternClient)
+
+	serverConfig := &schemabotapi.ServerConfig{
+		Databases: map[string]schemabotapi.DatabaseConfig{
+			appDBName: {
+				Type: "mysql",
+				Environments: map[string]schemabotapi.EnvironmentConfig{
+					"staging": {Target: appDBName + "-target", Deployment: "default"},
+				},
+			},
+		},
+		TernDeployments: schemabotapi.TernConfig{
+			"default": {"staging": ternGRPCAddr},
+		},
+	}
+	svc := schemabotapi.New(schemabotStorage, serverConfig, map[string]tern.Client{
+		"default/staging": ternClient,
+	}, logger)
+	startTestOperator(t, svc)
+	defer utils.CloseAndLog(svc)
+
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "localhost:0")
+	require.NoError(t, err, "listen")
+	server := &http.Server{Handler: mux}
+	go func() { _ = server.Serve(listener) }()
+	defer utils.CloseAndLog(server)
+	schemabotAddr := listener.Addr().String()
+
+	// Wait for HTTP server readiness
+	testutil.Poll(t, 5*time.Second, 10*time.Millisecond,
+		func() bool {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+schemabotAddr+"/health", nil)
+			require.NoError(t, err)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return false
+			}
+			_ = resp.Body.Close()
+			return resp.StatusCode == http.StatusOK
+		},
+		func() string { return "schemabot HTTP server did not become healthy" },
+	)
+
+	// Step 1: Plan — add a unique index the seeded duplicate rows cannot satisfy
+	schemaSQL := `CREATE TABLE dup_users (
+		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		name VARCHAR(255) NOT NULL,
+		UNIQUE KEY uniq_name (name)
+	);`
+	planResp := postJSON(t, "http://"+schemabotAddr+"/api/plan", map[string]any{
+		"database":    appDBName,
+		"environment": "staging",
+		"type":        "mysql",
+		"schema_files": map[string]any{
+			"default": map[string]any{
+				"files": map[string]string{
+					"dup_users.sql": schemaSQL,
+				},
+			},
+		},
+		"repository":   "test/tableerror",
+		"pull_request": 148,
+	})
+	planID, ok := planResp["plan_id"].(string)
+	require.True(t, ok && planID != "", "plan response missing plan_id: %v", planResp)
+
+	// Step 2: Apply
+	applyResp := postJSON(t, "http://"+schemabotAddr+"/api/apply", map[string]any{
+		"plan_id":     planID,
+		"environment": "staging",
+	})
+	require.True(t, applyResp["accepted"] == true, "apply not accepted: %v", applyResp)
+	applyID, ok := applyResp["apply_id"].(string)
+	require.True(t, ok && applyID != "", "apply response missing apply_id: %v", applyResp)
+
+	// Step 3: Wait for the apply to fail on the duplicate rows
+	waitForState(t, "http://"+schemabotAddr, applyID, "failed", 15*time.Second)
+
+	// Step 4: Wait for the local apply record to be updated by pollForCompletion.
+	var storedApply *storage.Apply
+	testutil.Poll(t, 5*time.Second, 100*time.Millisecond,
+		func() bool {
+			storedApply, err = schemabotStorage.Applies().GetByApplyIdentifier(ctx, applyID)
+			require.NoError(t, err, "get apply by identifier")
+			require.NotNil(t, storedApply, "apply not found")
+			return storedApply.State == state.Apply.Failed
+		},
+		func() string {
+			return fmt.Sprintf("apply record should be failed in local storage, last state: %q", storedApply.State)
+		},
+	)
+	require.NotEmpty(t, storedApply.ErrorMessage, "failed apply record should carry the engine error")
+
+	// Step 5: The failed table's own engine error must be on SchemaBot's stored
+	// task row — the record the PR comment and CLI render from.
+	tasks, err := schemabotStorage.Tasks().GetByApplyID(ctx, storedApply.ID)
+	require.NoError(t, err, "get tasks by apply ID")
+	require.NotEmpty(t, tasks, "expected task records for apply %s", applyID)
+
+	var dupTask *storage.Task
+	for _, task := range tasks {
+		if task.TableName == "dup_users" && task.Shard == "" {
+			dupTask = task
+			break
+		}
+	}
+	require.NotNil(t, dupTask, "expected a task record for table dup_users")
+	assert.Equal(t, state.Task.Failed, dupTask.State,
+		"task %s should be failed, but is %q", dupTask.TaskIdentifier, dupTask.State)
+	assert.NotEmpty(t, dupTask.ErrorMessage,
+		"failed task should carry its own engine error mirrored from the remote per-table progress")
+}
+
 // TestGRPC_ServerSideTargetPlan verifies that HTTP plan succeeds when the
 // target is configured server-side. The Tern proto still exposes target for
 // remote implementations, but SchemaBot HTTP callers do not provide it.

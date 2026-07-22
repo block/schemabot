@@ -1481,6 +1481,117 @@ func TestLocalClient_Progress(t *testing.T) {
 	assert.Equal(t, task.DDL, progress.Tables[0].Ddl)
 }
 
+// TestLocalClient_ProgressCarriesPerTableError exercises the Progress read
+// projection for a failed apply where one table produced its own engine error
+// and another failed only because that earlier failure blocked it. The response
+// must attribute the engine error to the failing table alone — a remote control
+// plane mirrors these per-table errors into its stored task rows, and the
+// blocked table staying error-free is what lets the PR comment distinguish the
+// root-cause table from tables that never ran.
+func TestLocalClient_ProgressCarriesPerTableError(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	now := time.Now()
+	engineError := "ERROR 1062 (23000): Duplicate entry 'a' for key 'users.uniq_name'"
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-table-error-%d", now.UnixNano()),
+		PlanID:          1,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Environment:     localClientTestEnvironment,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Failed,
+		ErrorMessage:    engineError,
+		Caller:          "test",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+
+	failedTask := &storage.Task{
+		TaskIdentifier: fmt.Sprintf("task-table-error-failed-%d", now.UnixNano()),
+		ApplyID:        applyID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         apply.Engine,
+		Environment:    apply.Environment,
+		State:          state.Task.Failed,
+		Namespace:      "testdb",
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD UNIQUE KEY `uniq_name` (`name`)",
+		DDLAction:      "alter",
+		ErrorMessage:   engineError,
+		CompletedAt:    &now,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	_, err = stor.Tasks().Create(ctx, failedTask)
+	require.NoError(t, err)
+
+	blockedTask := &storage.Task{
+		TaskIdentifier: fmt.Sprintf("task-table-error-blocked-%d", now.UnixNano()),
+		ApplyID:        applyID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         apply.Engine,
+		Environment:    apply.Environment,
+		State:          state.Task.Failed,
+		Namespace:      "testdb",
+		TableName:      "orders",
+		DDL:            "ALTER TABLE `orders` ADD COLUMN `note` VARCHAR(255)",
+		DDLAction:      "alter",
+		CompletedAt:    &now,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	_, err = stor.Tasks().Create(ctx, blockedTask)
+	require.NoError(t, err)
+
+	progress, err := client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, ternv1.State_STATE_FAILED, progress.State)
+	assert.Equal(t, engineError, progress.ErrorMessage)
+	require.Len(t, progress.Tables, 2)
+	byTable := make(map[string]*ternv1.TableProgress, len(progress.Tables))
+	for _, tp := range progress.Tables {
+		byTable[tp.TableName] = tp
+	}
+	require.Contains(t, byTable, "users")
+	require.Contains(t, byTable, "orders")
+	assert.Equal(t, state.Task.Failed, byTable["users"].Status)
+	assert.Equal(t, engineError, byTable["users"].ErrorMessage)
+	assert.Equal(t, state.Task.Failed, byTable["orders"].Status)
+	assert.Empty(t, byTable["orders"].ErrorMessage)
+}
+
 func TestLocalClient_GroupedApplyKeepsClaimLeaseRunning(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")

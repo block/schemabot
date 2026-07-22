@@ -3071,6 +3071,13 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 			storedTask.ChecksumRowsChecked = remoteTask.ChecksumRowsChecked
 			storedTask.ChecksumRowsTotal = remoteTask.ChecksumRowsTotal
 		}
+		// Mirror the table's own engine error so the PR comment / CLI can tell
+		// which table caused a failure. An empty remote error never wipes a
+		// stored one: a stale progress snapshot must not erase a durable error,
+		// and clearing on retry is owned by the dispatch path.
+		if remoteTask.ErrorMessage != "" {
+			storedTask.ErrorMessage = remoteTask.ErrorMessage
+		}
 		if state.IsState(storedTask.State, state.Task.Completed) && storedTask.ProgressPercent != 100 {
 			storedTask.ProgressPercent = 100
 		}

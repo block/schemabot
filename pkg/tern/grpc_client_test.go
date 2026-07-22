@@ -3859,6 +3859,77 @@ func TestGRPCClient_SyncStoredTasksFromRemoteTasksUsesRemoteTaskState(t *testing
 	}
 }
 
+func TestGRPCClient_SyncStoredTasksFromRemoteTasksMirrorsTableError(t *testing.T) {
+	// A remote table's own engine error must land on the control plane's stored
+	// task row so the PR comment / CLI can tell which table caused a failure. A
+	// table without its own error (e.g. one that failed only because an earlier
+	// table's failure blocked it) must stay error-free, and an empty error in a
+	// stale remote snapshot must never wipe a durable stored error.
+	now := time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC)
+	testCases := []struct {
+		name            string
+		storedTaskState string
+		storedTaskError string
+		remoteTaskState string
+		remoteTaskError string
+		wantStoredError string
+	}{
+		{
+			name:            "failed remote table carries its engine error onto the stored task",
+			storedTaskState: state.Task.Running,
+			remoteTaskState: state.Task.Failed,
+			remoteTaskError: "ERROR 1062 (23000): Duplicate entry 'a' for key 'users.uniq_name'",
+			wantStoredError: "ERROR 1062 (23000): Duplicate entry 'a' for key 'users.uniq_name'",
+		},
+		{
+			name:            "failed remote table without its own error leaves the stored task error empty",
+			storedTaskState: state.Task.Running,
+			remoteTaskState: state.Task.Failed,
+			wantStoredError: "",
+		},
+		{
+			name:            "empty error in a remote snapshot keeps the stored task error",
+			storedTaskState: state.Task.Failed,
+			storedTaskError: "ERROR 1062 (23000): Duplicate entry 'a' for key 'users.uniq_name'",
+			remoteTaskState: state.Task.Running,
+			wantStoredError: "ERROR 1062 (23000): Duplicate entry 'a' for key 'users.uniq_name'",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			storedApply := &storage.Apply{
+				ID:              18,
+				ApplyIdentifier: "apply-remote-table-error",
+				State:           state.Apply.Running,
+			}
+			storedTask := &storage.Task{
+				ID:             22,
+				TaskIdentifier: "task-remote-table-error",
+				ApplyID:        storedApply.ID,
+				TableName:      "users",
+				State:          tc.storedTaskState,
+				ErrorMessage:   tc.storedTaskError,
+			}
+			client := &GRPCClient{
+				storage: &mockStorage{
+					tasks: &mockTaskStore{tasks: []*storage.Task{storedTask}},
+					logs:  &mockApplyLogStore{},
+				},
+			}
+
+			err := client.syncStoredTasksFromRemoteTasks(t.Context(), storedApply, []*storage.Task{storedTask}, []*ternv1.TableProgress{{
+				TableName:    "users",
+				Status:       tc.remoteTaskState,
+				ErrorMessage: tc.remoteTaskError,
+			}}, now)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.wantStoredError, storedTask.ErrorMessage)
+		})
+	}
+}
+
 func TestGRPCClient_SyncShardProgressFromRemote(t *testing.T) {
 	// A remote Tern Progress response carries per-shard ShardProgress. The control
 	// plane is a reader/mirror, so it must encode those into per-(table, shard) task

@@ -2397,13 +2397,16 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 
 	for _, t := range currentApplyTasks {
 		tp := &ternv1.TableProgress{
-			TableName:  t.TableName,
-			Ddl:        t.DDL,
-			Namespace:  t.Namespace,
-			Status:     t.State,
-			TaskId:     t.TaskIdentifier,
-			IsInstant:  t.IsInstant || vitessApplyIsInstant,
-			ChangeType: ddlActionToProtoChangeType(t.DDLAction),
+			TableName: t.TableName,
+			Ddl:       t.DDL,
+			Namespace: t.Namespace,
+			Status:    t.State,
+			TaskId:    t.TaskIdentifier,
+			IsInstant: t.IsInstant || vitessApplyIsInstant,
+			// The task's own engine error, so a remote control plane can tell
+			// which table caused a failure apart from tables its failure blocked.
+			ErrorMessage: t.ErrorMessage,
+			ChangeType:   ddlActionToProtoChangeType(t.DDLAction),
 		}
 
 		// Table figures come from the stored task row the drive maintains.

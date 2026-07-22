@@ -2252,8 +2252,12 @@ type TableProgress struct {
 	// Populated while the table is checksumming (verifying copied data), 0 otherwise.
 	ChecksumRowsChecked int64 `protobuf:"varint,14,opt,name=checksum_rows_checked,json=checksumRowsChecked,proto3" json:"checksum_rows_checked,omitempty"`
 	ChecksumRowsTotal   int64 `protobuf:"varint,15,opt,name=checksum_rows_total,json=checksumRowsTotal,proto3" json:"checksum_rows_total,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// This table's own engine error, from the data plane's stored task record.
+	// Empty for tables that never produced an error themselves — including tables
+	// that failed only because an earlier table's failure blocked them.
+	ErrorMessage  string `protobuf:"bytes,16,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *TableProgress) Reset() {
@@ -2389,6 +2393,13 @@ func (x *TableProgress) GetChecksumRowsTotal() int64 {
 		return x.ChecksumRowsTotal
 	}
 	return 0
+}
+
+func (x *TableProgress) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
 }
 
 // ProgressResponse contains detailed progress information.
@@ -3642,7 +3653,7 @@ const file_tern_proto_rawDesc = "" +
 	"etaSeconds\x12)\n" +
 	"\x10cutover_attempts\x18\x06 \x01(\x05R\x0fcutoverAttempts\x120\n" +
 	"\x14last_cutover_attempt\x18\a \x01(\tR\x12lastCutoverAttempt\x12*\n" +
-	"\x11ready_to_complete\x18\b \x01(\bR\x0freadyToComplete\"\xad\x04\n" +
+	"\x11ready_to_complete\x18\b \x01(\bR\x0freadyToComplete\"\xd2\x04\n" +
 	"\rTableProgress\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12\x1d\n" +
@@ -3665,7 +3676,8 @@ const file_tern_proto_rawDesc = "" +
 	"\vchange_type\x18\r \x01(\x0e2\x13.tern.v1.ChangeTypeR\n" +
 	"changeType\x122\n" +
 	"\x15checksum_rows_checked\x18\x0e \x01(\x03R\x13checksumRowsChecked\x12.\n" +
-	"\x13checksum_rows_total\x18\x0f \x01(\x03R\x11checksumRowsTotal\"\xc7\x03\n" +
+	"\x13checksum_rows_total\x18\x0f \x01(\x03R\x11checksumRowsTotal\x12#\n" +
+	"\rerror_message\x18\x10 \x01(\tR\ferrorMessage\"\xc7\x03\n" +
 	"\x10ProgressResponse\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12$\n" +
 	"\x05state\x18\x02 \x01(\x0e2\x0e.tern.v1.StateR\x05state\x12'\n" +
