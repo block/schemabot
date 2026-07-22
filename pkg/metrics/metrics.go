@@ -874,6 +874,7 @@ var knownWebhookActions = map[string]bool{
 	"ready_for_review":       true,
 	"reopened":               true,
 	"requested":              true,
+	"rerequested":            true,
 	"review_request_removed": true,
 	"review_requested":       true,
 	"submitted":              true,
