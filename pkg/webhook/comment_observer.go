@@ -242,8 +242,10 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	// Check if a cutover comment was posted by an external handler. A
 	// superseded row is an already-rotated-away prompt from an earlier drive,
 	// not a live cutover comment — treating it as live would re-mute the
-	// observer. This must happen before the CuttingOver branch below — without
-	// it, the observer would post a duplicate cutover comment.
+	// observer. This must happen before the deferred-cutover-gate branch below
+	// — it is the restart-time dedup: an apply can park at the gate for days,
+	// and without the durable-row check every fresh observer on a restart or
+	// re-claimed drive would post a duplicate prompt.
 	if !o.hasCutoverComment {
 		checkCtx, checkCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		cutover, err := o.stor.ApplyComments().Get(checkCtx, o.applyID, state.Comment.Cutover)
@@ -681,8 +683,7 @@ func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {
 // cutting_over is the transient window while the cutover executes. A tick can
 // first observe the apply in either state, so the prompt posts from both.
 func atDeferredCutoverGate(applyState string) bool {
-	return state.IsState(applyState, state.Apply.WaitingForCutover) ||
-		state.IsState(applyState, state.Apply.CuttingOver)
+	return state.IsState(applyState, state.Apply.WaitingForCutover, state.Apply.CuttingOver)
 }
 
 func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation string) bool {

@@ -1440,6 +1440,21 @@ func TestE2EDeferredCutoverParkedGatePostsPrompt(t *testing.T) {
 		t.Fatalf("a later tick at the gate must not edit while the prompt is live; got an edit of %d: %s", edited.CommentID, edited.Body)
 	case <-time.After(100 * time.Millisecond):
 	}
+
+	// A pod restart or re-claimed drive hands the parked apply to a fresh
+	// observer with no in-memory record of the prompt. The durable cutover row
+	// is what keeps a multi-day park from re-posting the prompt on every
+	// restart: the fresh observer rehydrates from the row and stays muted.
+	obs2 := f.newObserver(st, fake)
+	fake.Advance(activeInterval + time.Second)
+	obs2.OnProgress(apply, []*storage.Task{task})
+	select {
+	case created := <-capture.creates:
+		t.Fatalf("a fresh observer at the parked gate must not re-post the prompt; got %d: %s", created.ID, created.Body)
+	case edited := <-capture.edits:
+		t.Fatalf("a fresh observer at the parked gate must not edit while the prompt is live; got an edit of %d: %s", edited.CommentID, edited.Body)
+	case <-time.After(100 * time.Millisecond):
+	}
 }
 
 // When the operator's cutover on a parked deferred-cutover apply resolves
