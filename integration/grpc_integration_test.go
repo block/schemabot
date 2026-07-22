@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -472,25 +473,32 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db")
 	defer utils.CloseAndLog(targetDB)
+	require.NoError(t, targetDB.PingContext(ctx), "ping target db")
 
 	appDBName := fmt.Sprintf("tblerr_%d", time.Now().UnixNano()%100000)
-	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+appDBName)
+	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+quoteIdentifier(appDBName))
 	require.NoError(t, err, "create app database")
 	t.Cleanup(func() {
-		_, _ = targetDB.ExecContext(t.Context(), "DROP DATABASE IF EXISTS "+appDBName)
+		// Cleanup runs after the test context is cancelled, so it needs its own context.
+		if _, err := targetDB.ExecContext(t.Context(), "DROP DATABASE IF EXISTS "+quoteIdentifier(appDBName)); err != nil {
+			t.Logf("cleanup: drop database %s: %v", appDBName, err)
+		}
 	})
 
 	// Seed a table with duplicate values so adding a unique index must fail in
 	// the engine with this table's own error.
-	_, err = targetDB.ExecContext(ctx, "CREATE TABLE `"+appDBName+"`.`dup_users` ("+
+	_, err = targetDB.ExecContext(ctx, "CREATE TABLE "+quoteIdentifier(appDBName)+".`dup_users` ("+
 		"`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, "+
 		"`name` VARCHAR(255) NOT NULL"+
 		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err, "create seeded table")
-	_, err = targetDB.ExecContext(ctx, "INSERT INTO `"+appDBName+"`.`dup_users` (`name`) VALUES ('a'), ('a')")
+	_, err = targetDB.ExecContext(ctx, "INSERT INTO "+quoteIdentifier(appDBName)+".`dup_users` (`name`) VALUES ('a'), ('a')")
 	require.NoError(t, err, "seed duplicate rows")
 
-	appDSN := strings.Replace(targetDSN, "/target_test", "/"+appDBName, 1)
+	appCfg, err := mysql.ParseDSN(targetDSN)
+	require.NoError(t, err, "parse target DSN")
+	appCfg.DBName = appDBName
+	appDSN := appCfg.FormatDSN()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
@@ -502,6 +510,7 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	schemabotDB, err := sql.Open("mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	defer utils.CloseAndLog(schemabotDB)
+	require.NoError(t, schemabotDB.PingContext(ctx), "ping schemabot db")
 	schemabotStorage := schemabotmysql.New(schemabotDB)
 
 	ternClient, err := tern.NewGRPCClient(tern.Config{
