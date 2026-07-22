@@ -448,6 +448,239 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	}
 }
 
+// A resume rotation whose fresh comment lands but whose summary-marker
+// consumption fails must not leave the marker active for the rest of the
+// drive: the marker is the durable signal that the next terminal summary needs
+// posting fresh, and a rotated-away marker still recorded as active would cost
+// the apply its eventual terminal summary. Later ticks retry only the
+// supersede — never a second rotation — and once storage heals the marker is
+// consumed.
+func TestE2EResumeSummaryMarkerSupersedeRetriedUntilItLands(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-resume-marker-retry",
+		pr:         156,
+		database:   "e2e_resume_marker_retry_db",
+		applyState: state.Apply.Resuming,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	// Seed the pre-resume comments left by the stop: the progress comment frozen
+	// at "Stopped" and the stopped summary marker that signals a resume rotation
+	// is owed.
+	h.postAndTrackComment(ctx, "org/repo-resume-marker-retry", 156, 12345, apply, state.Comment.Progress, "Stopped at 21%")
+	stoppedProgressID := requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-resume-marker-retry", 156, 12345, apply, state.Comment.Summary, "Schema Change Stopped")
+	requireCommentCreate(t, capture)
+
+	failingStorage := &failingCommentSupersedeStorage{Storage: st}
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(failingStorage, fake)
+
+	// The first tick rotates: the fresh comment posts and the stopped one is
+	// frozen, but consuming the summary marker fails at storage.
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	var newProgressID int64
+	select {
+	case created := <-capture.creates:
+		newProgressID = created.ID
+		assert.Contains(t, created.Body, "**Status**: Resuming")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the resume rotation to post a fresh progress comment")
+	}
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, stoppedProgressID, edited.CommentID, "the freeze edit lands on the superseded comment")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the superseded progress comment to be frozen")
+	}
+	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Nil(t, summary.SupersededAt, "the storage outage leaves the marker recorded as active")
+
+	// While the outage lasts, later ticks retry only the supersede: progress
+	// edits land in place on the fresh comment and no duplicate rotation posts.
+	apply.State = state.Apply.Running
+	fake.Advance(activeInterval + time.Second)
+	task.RowsCopied = 700
+	task.ProgressPercent = 70
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, newProgressID, edited.CommentID, "ticks during the outage keep editing the rotated comment")
+	case created := <-capture.creates:
+		t.Fatalf("the supersede retry must not rotate again; got another new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an in-place edit of the rotated comment during the outage")
+	}
+	summary, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Nil(t, summary.SupersededAt, "the marker stays active until the supersede lands")
+
+	// Storage heals: the next tick's retry consumes the marker without touching
+	// the rotated comment beyond its normal in-place edit.
+	failingStorage.heal()
+	fake.Advance(activeInterval + time.Second)
+	task.RowsCopied = 800
+	task.ProgressPercent = 80
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, newProgressID, edited.CommentID, "the healed tick still edits the rotated comment in place")
+	case created := <-capture.creates:
+		t.Fatalf("the healed retry must not rotate again; got another new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an in-place edit of the rotated comment after storage heals")
+	}
+	summary, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.NotNil(t, summary.SupersededAt, "the retried supersede consumes the marker once storage heals")
+}
+
+// While a terminal-summary publish is in flight — the summary marker exists
+// only as a claim sentinel that has not yet recorded its posted comment — a
+// resumed apply's ticks must not rotate: superseding the sentinel mid-publish
+// would transfer the claim and let a later writer post a duplicate summary.
+// The rotation waits until the marker records its posted comment, then rotates
+// on the next tick.
+func TestE2EResumeRotationWaitsForSummaryClaimSentinel(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-resume-sentinel",
+		pr:         157,
+		database:   "e2e_resume_sentinel_db",
+		applyState: state.Apply.Resuming,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-resume-sentinel", 157, 12345, apply, state.Comment.Progress, "Stopped at 21%")
+	stoppedProgressID := requireCommentCreate(t, capture)
+
+	// A stop-side publisher has claimed the summary but not yet posted it: the
+	// marker row is a claim sentinel with no comment ID.
+	won, err := st.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	require.True(t, won, "the claim sentinel is created for the in-flight publish")
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// Ticks while the sentinel is live edit the tracked comment in place and do
+	// not rotate.
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case created := <-capture.creates:
+		t.Fatalf("rotation must wait for the in-flight summary publish; got new comment %d: %s", created.ID, created.Body)
+	case edited := <-capture.edits:
+		assert.Equal(t, stoppedProgressID, edited.CommentID, "ticks keep editing the tracked comment while the publish is in flight")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an in-place edit of the tracked comment while the sentinel is live")
+	}
+
+	// The publisher finishes: the marker records its posted summary comment.
+	// The next tick sees an active posted marker and rotates.
+	require.NoError(t, st.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         apply.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 70001,
+	}))
+	fake.Advance(activeInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	select {
+	case created := <-capture.creates:
+		assert.Contains(t, created.Body, "**Status**: Resuming")
+		assert.NotEqual(t, stoppedProgressID, created.ID, "the rotation posts a new comment, not a reuse of the stopped one")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the rotation once the summary marker records its posted comment")
+	}
+	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.NotNil(t, summary.SupersededAt, "the rotation consumes the posted marker")
+}
+
+// An apply that is stopped, resumed, and then driven to completion must still
+// get its terminal summary comment: the stop posts a summary, the resume
+// rotation consumes (supersedes) that summary marker, and completion claims
+// the summary again — the superseded marker converts back into a claim
+// sentinel instead of blocking the claim — so the operator sees the final
+// result at the bottom of the PR rather than the apply ending silently.
+func TestE2EStopResumeCompleteStillPostsTerminalSummary(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-stop-resume",
+		pr:         143,
+		database:   "e2e_stop_resume_db",
+		applyState: state.Apply.Resuming,
+	})
+	st, apply, task, capture := f.st, f.apply, f.task, f.capture
+
+	// Seed the comments the stop left behind: the progress comment frozen at
+	// "Stopped" and the stopped summary marker.
+	f.handler.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, 12345, apply, state.Comment.Progress, "Stopped at 50%")
+	requireCommentCreate(t, capture)
+	f.handler.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, 12345, apply, state.Comment.Summary, "Schema Change Stopped")
+	stoppedSummaryID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The first progress tick after resume rotates the progress comment and
+	// consumes the stopped summary marker by superseding it.
+	obs.OnProgress(apply, []*storage.Task{task})
+	requireCommentCreate(t, capture)
+	select {
+	case <-capture.edits: // freeze of the superseded progress comment
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the superseded progress comment to be frozen")
+	}
+	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	require.NotNil(t, summary.SupersededAt, "resume rotation must supersede the stopped summary marker")
+
+	// The resumed copy finishes and the apply completes.
+	apply.State = state.Apply.Completed
+	task.State = state.Task.Completed
+	task.RowsCopied = 1000
+	task.ProgressPercent = 100
+	obs.OnTerminal(apply, []*storage.Task{task})
+
+	// The terminal publish edits the progress comment to its final rendering
+	// and posts a fresh terminal summary comment.
+	select {
+	case <-capture.edits:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the progress comment to be edited to its final rendering")
+	}
+	var terminalSummaryID int64
+	select {
+	case created := <-capture.creates:
+		terminalSummaryID = created.ID
+		assert.Contains(t, created.Body, "Schema Change Applied")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a terminal summary comment for the completed apply")
+	}
+	assert.NotEqual(t, stoppedSummaryID, terminalSummaryID, "the terminal summary is a fresh comment, not the stop's")
+
+	// The summary marker now records the terminal summary and is active again.
+	summary, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Equal(t, terminalSummaryID, summary.GitHubCommentID)
+	assert.Nil(t, summary.SupersededAt)
+}
+
 // Across repeated stop/start iterations, each resume folds the progress
 // comment it supersedes, so the PR timeline keeps exactly one live progress
 // comment. A resume rotation also reconciles a freeze that a prior drive owed

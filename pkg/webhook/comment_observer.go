@@ -64,6 +64,14 @@ type CommentObserver struct {
 	resumeRotated     bool
 	volumeRotatedTo   int
 
+	// resumeSupersedePending marks that this observer's resume rotation posted
+	// its fresh comment but failed to consume the summary marker. The marker is
+	// the durable "summary owed" signal: left active with a posted comment ID,
+	// the next terminal publish would lose both claim legs and the completion
+	// summary would never post. Later ticks retry only the supersede until it
+	// lands.
+	resumeSupersedePending bool
+
 	// rotatedPhases records the control phases this observer already rotated
 	// for (or confirmed the tracked comment postdates), keyed by phase name,
 	// so later ticks skip the storage re-read. Guarded by mu like the other
@@ -804,9 +812,13 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 	if o.resumeRotated {
 		// This observer already rotated for the current resume. Guard against
 		// re-rotating (and posting duplicate fresh comments) on later ticks if the
-		// summary-marker delete below failed to land. A fresh observer on a later
-		// drive claim starts with this unset and rotates once more, bounding any
-		// duplicate to one per drive rather than one per tick.
+		// summary-marker supersede failed to land — retry only the supersede so
+		// the marker cannot sit active for the rest of the drive. A fresh
+		// observer on a later drive claim starts with this unset and rotates once
+		// more, bounding any duplicate to one per drive rather than one per tick.
+		if o.resumeSupersedePending {
+			o.supersedeResumeSummaryMarker(apply)
+		}
 		return false
 	}
 
@@ -822,6 +834,15 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 		// No active summary comment — either the apply has not been stopped, or a
 		// prior resume already consumed the marker. Nothing to rotate. This is the
 		// common path on every progress tick.
+		return false
+	}
+	if summary.GitHubCommentID == 0 {
+		// The marker is a claim sentinel: a terminal-summary publish is in
+		// flight. Rotating now would supersede the sentinel mid-publish and
+		// transfer the claim, so wait for the marker to record its posted
+		// comment before rotating. A crashed publisher's abandoned sentinel is
+		// recovered by the stale-claim machinery, not by this rotation.
+		o.logInfo(apply, "observer: summary claim sentinel is live; deferring resume rotation until the summary posts")
 		return false
 	}
 
@@ -861,13 +882,28 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 	// live one, so it must not be folded; no freeze marker was recorded either,
 	// since the marker rides the tracking write.
 
-	if err := o.stor.ApplyComments().Supersede(o.contextWithApplyLease(ctx, apply), o.applyID, state.Comment.Summary); err != nil {
-		o.logError(apply, "observer: failed to consume summary marker after resume rotation", "error", err)
-		return true
-	}
+	o.supersedeResumeSummaryMarker(apply)
 	o.logger.Info("observer: posted fresh progress comment for resumed apply",
 		"apply_id", o.applyID, "repo", o.repo, "pr", o.pr, "state", apply.State)
 	return true
+}
+
+// supersedeResumeSummaryMarker consumes the summary marker after a resume
+// rotation under its own deadline: the rotation's GitHub round-trips can spend
+// most of the tick's context budget, and this write is the durable record that
+// the rotation happened — left unconsumed, the marker keeps advertising a
+// summary that was already rotated away, and the next terminal publish would
+// lose both claim legs and never post its summary. On failure the pending flag
+// keeps later ticks retrying just this write until it lands.
+func (o *CommentObserver) supersedeResumeSummaryMarker(apply *storage.Apply) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := o.stor.ApplyComments().Supersede(o.contextWithApplyLease(ctx, apply), o.applyID, state.Comment.Summary); err != nil {
+		o.resumeSupersedePending = true
+		o.logError(apply, "observer: failed to consume summary marker after resume rotation; retrying on the next tick", "error", err)
+		return
+	}
+	o.resumeSupersedePending = false
 }
 
 // Control-operation phases recorded on tracked progress comments

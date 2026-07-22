@@ -146,6 +146,13 @@ func (s *applyCommentStore) DeleteByApply(ctx context.Context, applyID int64) er
 // active comment for its state (so it is not edited again and does not re-trigger
 // resume detection). A missing or already-superseded row is not an error. A later
 // Upsert for the same state clears superseded_at, making the row active again.
+//
+// Superseding the summary marker also re-arms terminal-summary publishing:
+// ClaimSummaryComment treats a superseded posted marker as reclaimable, so any
+// caller that supersedes a summary row is signing up the next terminal publish
+// to post a fresh summary comment. Callers that merely observe a summary must
+// not supersede it, or the apply gains a duplicate summary at its next
+// terminal transition.
 func (s *applyCommentStore) Supersede(ctx context.Context, applyID int64, commentState string) error {
 	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
 	if err != nil {
@@ -225,10 +232,19 @@ func (s *applyCommentStore) ClearPendingFreeze(ctx context.Context, applyID int6
 // apply by inserting the summary marker as a claim sentinel
 // (github_comment_id = 0). The unique key on (apply_id, comment_state) makes
 // this a race-safe first-writer-wins: the insert that lands the row wins the
-// claim; a duplicate-key loss means another writer already claimed or posted
-// the summary. Deliberately lease-agnostic — the claim itself is the
-// exactly-once authority, so a publisher whose apply lease was re-claimed can
-// still win or lose cleanly.
+// claim. When the row already exists but is superseded — a stop's posted
+// summary marker consumed by a resume rotation — that summary belongs to an
+// earlier terminal state, so the current terminal state's summary is still
+// owed: the conditional update converts the superseded row back into a claim
+// sentinel, and exactly one concurrent claimant sees the affected row. Only a
+// row that records a posted comment is reclaimable this way — a superseded
+// claim sentinel belongs to a publish that is still in flight or crashed
+// mid-publish, and stealing it here would hand two writers the same claim;
+// abandoned sentinels are recovered by ReclaimStaleSummaryClaim instead.
+// Losing both paths means another writer already claimed or posted the
+// summary for the current terminal state. Deliberately lease-agnostic — the
+// claim itself is the exactly-once authority, so a publisher whose apply
+// lease was re-claimed can still win or lose cleanly.
 func (s *applyCommentStore) ClaimSummaryComment(ctx context.Context, applyID int64) (bool, error) {
 	result, err := s.db.ExecContext(ctx, `
 		INSERT IGNORE INTO apply_comments (apply_id, comment_state, github_comment_id)
@@ -240,6 +256,23 @@ func (s *applyCommentStore) ClaimSummaryComment(ctx context.Context, applyID int
 	rows, err := result.RowsAffected()
 	if err != nil {
 		return false, fmt.Errorf("read summary claim rows affected for apply %d: %w", applyID, err)
+	}
+	if rows == 1 {
+		return true, nil
+	}
+
+	result, err = s.db.ExecContext(ctx, `
+		UPDATE apply_comments
+		SET github_comment_id = 0, superseded_at = NULL
+		WHERE apply_id = ? AND comment_state = ? AND superseded_at IS NOT NULL
+		  AND github_comment_id != 0
+	`, applyID, state.Comment.Summary)
+	if err != nil {
+		return false, fmt.Errorf("reclaim superseded summary comment for apply %d: %w", applyID, err)
+	}
+	rows, err = result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read superseded summary reclaim rows affected for apply %d: %w", applyID, err)
 	}
 	return rows == 1, nil
 }
