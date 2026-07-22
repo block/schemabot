@@ -679,7 +679,15 @@ func (h *Handler) enqueueDurableCheckRun(ctx context.Context, payload checkRunPa
 	if deliveryID == "" {
 		return false, fmt.Errorf("missing GitHub delivery ID")
 	}
-	inserted, err := store.Create(ctx, &storage.WebhookEvent{
+	// The enqueue is the durability boundary: once persisted, the durable driver
+	// owns delivery. On graceful shutdown the request ctx is cancelled, which
+	// would abort this INSERT and 500 — and GitHub never auto-retries a
+	// check_run rerequest, so the delivery would be lost. Detach from request
+	// cancellation (but keep a bounded deadline so a wedged DB can't stall
+	// shutdown) so the row still persists.
+	enqueueCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	inserted, err := store.Create(enqueueCtx, &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
 		DeliveryID:  deliveryID,
 		Event:       "check_run",
