@@ -814,6 +814,11 @@ for the same set of environments. A same-commit comment covering different
 environments is kept expanded — it may be the only visible plan for those
 environments.
 
+A plan outcome can also supersede without posting: when an auto-plan resolves
+to no changes, no new comment appears (the check run alone reports the green
+state), but plan comments from prior commits still collapse — the pending DDL
+and apply prompt they show no longer match the branch.
+
 One safety hold: a plan comment whose commit produced an apply is never
 minimized, even after new pushes. That comment is the record of what actually
 ran against the database, and it stays visible until an operator reconciles

@@ -112,6 +112,28 @@ func (h *Handler) minimizeStalePlanComments(ctx context.Context, client *ghclien
 			"repo", repo, "pr", pr, "database", database, "database_type", databaseType, "head_sha", headSHA)
 		return
 	}
+
+	// With no newly posted comment anchoring the sweep, headSHA must be the
+	// PR's current head before anything is hidden. The sweep's head comes from
+	// the delivery's cached PR fetch, so a concurrent push can make it stale:
+	// sweeping on the old head would collapse the newer head's live comment
+	// with nothing replacing it, and no un-minimize path exists. Verify
+	// against a fresh fetch and leave the slot alone when the branch has
+	// moved on — the newer head's own plan outcome sweeps the slot instead.
+	freshPR, err := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("failed to verify PR head for stale plan comment sweep; prior plan comments stay expanded until the next supersede sweep",
+			"repo", repo, "pr", pr, "database", database, "database_type", databaseType,
+			"head_sha", headSHA, "error", err)
+		return
+	}
+	if freshPR.HeadSHA != headSHA {
+		h.logger.Info("skipping stale plan comment sweep because the PR head moved past this plan outcome; the current head's own plan outcome sweeps the slot",
+			"repo", repo, "pr", pr, "database", database, "database_type", databaseType,
+			"head_sha", headSHA, "current_head_sha", freshPR.HeadSHA)
+		return
+	}
+
 	h.minimizePlanCommentsForSlot(ctx, client, repo, pr, database, databaseType, headSHA, nil)
 }
 
