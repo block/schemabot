@@ -2,6 +2,7 @@ package inventory
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/go-sql-driver/mysql"
@@ -396,6 +397,100 @@ func TestNewStaticResolverValidatesConfig(t *testing.T) {
 			name:    "missing dsn",
 			config:  StaticConfig{Targets: map[string]StaticTarget{"target-1": {DatabaseType: "mysql"}}},
 			wantErr: "target \"target-1\" missing dsn or dsn_from",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewStaticResolver(tt.config)
+			assert.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
+func TestStaticResolverResolveTargetSchemaOverrides(t *testing.T) {
+	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+		"eu-bikeshare-qa": {
+			DatabaseType:    "mysql",
+			DSN:             "root@tcp(localhost:3306)/",
+			SchemaOverrides: map[string]string{"bikeshare": "bikeshare_eu_qa"},
+		},
+	}})
+	require.NoError(t, err)
+
+	got, err := resolver.ResolveTarget(t.Context(), Request{Target: "eu-bikeshare-qa"})
+
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"bikeshare": "bikeshare_eu_qa"}, got.SchemaOverrides)
+}
+
+func TestStaticResolverResolveTargetClonesSchemaOverrides(t *testing.T) {
+	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+		"target-1": {
+			DatabaseType:    "mysql",
+			DSN:             "root@tcp(localhost:3306)/",
+			SchemaOverrides: map[string]string{"bikeshare": "bikeshare_eu_qa"},
+		},
+	}})
+	require.NoError(t, err)
+
+	first, err := resolver.ResolveTarget(t.Context(), Request{Target: "target-1"})
+	require.NoError(t, err)
+	first.SchemaOverrides["bikeshare"] = "mutated"
+
+	second, err := resolver.ResolveTarget(t.Context(), Request{Target: "target-1"})
+	require.NoError(t, err)
+	assert.Equal(t, "bikeshare_eu_qa", second.SchemaOverrides["bikeshare"])
+}
+
+func TestNewStaticResolverValidatesSchemaOverrides(t *testing.T) {
+	target := func(overrides map[string]string, databaseType string) StaticConfig {
+		return StaticConfig{Targets: map[string]StaticTarget{
+			"target-1": {
+				DatabaseType:    databaseType,
+				DSN:             "root@tcp(localhost:3306)/",
+				SchemaOverrides: overrides,
+			},
+		}}
+	}
+
+	tests := []struct {
+		name    string
+		config  StaticConfig
+		wantErr string
+	}{
+		{
+			name:    "non-mysql target",
+			config:  target(map[string]string{"bikeshare": "bikeshare_eu_qa"}, "vitess"),
+			wantErr: "schema_overrides is only supported for mysql",
+		},
+		{
+			name: "more than one mapping",
+			config: target(map[string]string{
+				"bikeshare": "bikeshare_eu_qa",
+				"orders":    "orders_eu_qa",
+			}, "mysql"),
+			wantErr: "supports exactly one mapping",
+		},
+		{
+			name:    "empty canonical key",
+			config:  target(map[string]string{"": "bikeshare_eu_qa"}, "mysql"),
+			wantErr: "schema name must not be empty",
+		},
+		{
+			name:    "empty physical value",
+			config:  target(map[string]string{"bikeshare": ""}, "mysql"),
+			wantErr: "schema name must not be empty",
+		},
+		{
+			name:    "physical name with unsupported character",
+			config:  target(map[string]string{"bikeshare": "bikeshare-eu-qa"}, "mysql"),
+			wantErr: "unsupported character",
+		},
+		{
+			name:    "physical name over the MySQL identifier limit",
+			config:  target(map[string]string{"bikeshare": strings.Repeat("a", 65)}, "mysql"),
+			wantErr: "64-character identifier limit",
 		},
 	}
 

@@ -471,3 +471,33 @@ func TestVolumeConcurrentWithSettingsReads(t *testing.T) {
 	readers.Wait()
 	eng.Drain()
 }
+
+// Stateless control operations (cutover, deferred cutover sentinel lookup)
+// must address the schema the DSN connects to: under per-deployment schema
+// overrides the DSN carries the physical schema name while the request carries
+// the logical (canonical) database name. The request database is only a
+// fallback for DSNs without a schema.
+func TestStatelessControlDatabase(t *testing.T) {
+	t.Run("DSN database wins over request database", func(t *testing.T) {
+		got, err := statelessControlDatabase("root@tcp(localhost:3306)/bikeshare_eu_qa", "bikeshare")
+		require.NoError(t, err)
+		assert.Equal(t, "bikeshare_eu_qa", got)
+	})
+
+	t.Run("request database is the fallback for a namespace-free DSN", func(t *testing.T) {
+		got, err := statelessControlDatabase("root@tcp(localhost:3306)/", "bikeshare")
+		require.NoError(t, err)
+		assert.Equal(t, "bikeshare", got)
+	})
+
+	t.Run("empty when neither names a schema", func(t *testing.T) {
+		got, err := statelessControlDatabase("root@tcp(localhost:3306)/", "")
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("invalid DSN is an error", func(t *testing.T) {
+		_, err := statelessControlDatabase("not a dsn", "bikeshare")
+		require.Error(t, err)
+	})
+}

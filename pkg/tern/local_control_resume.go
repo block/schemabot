@@ -182,6 +182,16 @@ func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Ap
 	if eng == nil {
 		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
+	// The deferred deploy resolves credentials from applyTasks[0] and drives
+	// every task with them, so all tasks must share one namespace: for MySQL it
+	// selects the connection schema (per-target overrides can remap it to a
+	// different physical schema), so with mixed namespaces every task would
+	// silently run against tasks[0]'s schema.
+	if c.config.Type == storage.DatabaseTypeMySQL {
+		if _, err := singleTaskNamespace(applyTasks); err != nil {
+			return nil, fmt.Errorf("deferred deploy for apply %s: %w", apply.ApplyIdentifier, err)
+		}
+	}
 	creds, err := c.credentialsForTask(applyTasks[0])
 	if err != nil {
 		return nil, fmt.Errorf("resolve credentials for deferred deploy task %s: %w", applyTasks[0].TaskIdentifier, err)
@@ -1499,7 +1509,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 
 	deferredCutoverSignalAbsent := false
 	if shouldInspectCutoverSignalForResume(apply, forceCutoverResume) {
-		signalExists, signalSupported, err := c.deferredCutoverSignalExists(ctx, apply)
+		signalExists, signalSupported, err := c.deferredCutoverSignalExists(ctx, apply, tasks)
 		if err != nil {
 			c.logger.Warn("deferred cutover recovery could not verify engine cutover signal; operator will retry",
 				"apply_id", apply.ApplyIdentifier,

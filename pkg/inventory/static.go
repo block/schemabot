@@ -43,6 +43,16 @@ type StaticTarget struct {
 	// availability risk are negligible. Prefer file: refs until that follow-up.
 	DSNFrom  *StaticDSNFromConfig `yaml:"dsn_from,omitempty"`
 	Metadata map[string]string    `yaml:"metadata,omitempty"`
+	// SchemaOverrides maps a requested (canonical) MySQL namespace to the
+	// physical schema name on this target, for targets whose physical schema
+	// names embed environment or region (e.g. bikeshare → bikeshare_eu_qa).
+	// The target DSN stays namespace-free; the mapped physical name is injected
+	// per operation instead of the requested namespace. When non-empty it is a
+	// strict allowlist: a requested namespace without a mapping fails rather
+	// than falling back to the canonical name, so a misrouted request cannot
+	// land in the wrong physical schema. MySQL only; currently limited to a
+	// single mapping per target.
+	SchemaOverrides map[string]string `yaml:"schema_overrides,omitempty"`
 }
 
 // StaticDSNFromConfig assembles a namespace-free MySQL DSN for a static target
@@ -88,6 +98,10 @@ type staticTargetEntry struct {
 	target       string
 	databaseType string
 	metadata     map[string]string
+	// schemaOverrides is the validated canonical→physical MySQL schema
+	// allowlist for this target; empty means the requested namespace is the
+	// physical schema.
+	schemaOverrides map[string]string
 	// dsn is set (non-nil) for entries resolved once at construction.
 	dsn *string
 	// dsnFrom is set for entries assembled fresh on every request.
@@ -138,10 +152,11 @@ func (r *StaticResolver) ResolveTarget(ctx context.Context, req Request) (*Targe
 		return nil, err
 	}
 	return &Target{
-		Target:       entry.target,
-		DatabaseType: entry.databaseType,
-		DSN:          dsn,
-		Metadata:     maps.Clone(entry.metadata),
+		Target:          entry.target,
+		DatabaseType:    entry.databaseType,
+		DSN:             dsn,
+		Metadata:        maps.Clone(entry.metadata),
+		SchemaOverrides: maps.Clone(entry.schemaOverrides),
 	}, nil
 }
 
@@ -161,10 +176,14 @@ func newStaticTargetEntry(target string, entry StaticTarget) (*staticTargetEntry
 	case !hasDSN && !hasDSNFrom:
 		return nil, fmt.Errorf("target %q missing dsn or dsn_from", target)
 	}
+	if err := ValidateSchemaOverrides(databaseType, entry.SchemaOverrides); err != nil {
+		return nil, fmt.Errorf("target %q: %w", target, err)
+	}
 	prepared := &staticTargetEntry{
-		target:       target,
-		databaseType: databaseType,
-		metadata:     maps.Clone(entry.Metadata),
+		target:          target,
+		databaseType:    databaseType,
+		metadata:        maps.Clone(entry.Metadata),
+		schemaOverrides: maps.Clone(entry.SchemaOverrides),
 	}
 	if hasDSNFrom {
 		if databaseType != "mysql" {
@@ -208,6 +227,56 @@ func (e staticTargetEntry) resolveDSN(ctx context.Context, req Request) (string,
 
 func canonicalDatabaseType(databaseType string) string {
 	return strings.ToLower(strings.TrimSpace(databaseType))
+}
+
+// ValidateSchemaOverrides checks a canonical→physical schema mapping. The
+// mapping is MySQL-only (it selects a MySQL schema; for Vitess the namespace
+// is a keyspace, a different concept) and is currently limited to a single
+// entry: SchemaBot's MySQL operations address one schema per target, and a
+// wider map would silently permit multi-schema routing this feature does not
+// support yet. It is exported so every consumer of a resolved target (not just
+// static inventory) enforces the same contract; a custom resolver cannot hand
+// an invalid mapping past it.
+func ValidateSchemaOverrides(databaseType string, overrides map[string]string) error {
+	if len(overrides) == 0 {
+		return nil
+	}
+	if databaseType != "mysql" {
+		return fmt.Errorf("schema_overrides is only supported for mysql, not %q", databaseType)
+	}
+	if len(overrides) > 1 {
+		return fmt.Errorf("schema_overrides supports exactly one mapping, got %d", len(overrides))
+	}
+	for canonical, physical := range overrides {
+		if err := validateSchemaIdentifier(canonical); err != nil {
+			return fmt.Errorf("schema_overrides key %q: %w", canonical, err)
+		}
+		if err := validateSchemaIdentifier(physical); err != nil {
+			return fmt.Errorf("schema_overrides value %q for key %q: %w", physical, canonical, err)
+		}
+	}
+	return nil
+}
+
+// validateSchemaIdentifier requires an unquoted-identifier-safe MySQL schema
+// name. Mapped names are injected into DSNs and SQL, so restrict them to the
+// character set that never needs quoting rather than supporting MySQL's full
+// quoted-identifier grammar.
+func validateSchemaIdentifier(name string) error {
+	if name == "" {
+		return fmt.Errorf("schema name must not be empty")
+	}
+	if len(name) > 64 {
+		return fmt.Errorf("schema name exceeds MySQL's 64-character identifier limit")
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '$':
+		default:
+			return fmt.Errorf("schema name contains unsupported character %q; only [a-zA-Z0-9_$] is allowed", r)
+		}
+	}
+	return nil
 }
 
 func validateResolvedStaticTargetDSN(target, databaseType, dsn string) error {

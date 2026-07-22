@@ -26,7 +26,7 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 
-	_ "github.com/go-sql-driver/mysql"
+	drivermysql "github.com/go-sql-driver/mysql"
 )
 
 // Shared test infrastructure
@@ -2020,4 +2020,76 @@ func containsHelper(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// Stateless control operations (cutover and deferred-cutover sentinel lookup
+// without an in-memory schema change) must address the schema the DSN connects
+// to, not the request's logical database name: under per-deployment schema
+// overrides the DSN carries the physical schema while the request carries the
+// canonical name. Addressing the request database instead would silently no-op
+// the sentinel drop (the cutover reports success while the sentinel survives)
+// and report the deferred-cutover signal as absent.
+func TestEngine_StatelessControlAddressesDSNSchema(t *testing.T) {
+	ctx := t.Context()
+	db, err := sql.Open("mysql", sharedDSN)
+	require.NoError(t, err, "open database")
+	defer utils.CloseAndLog(db)
+
+	const (
+		canonical      = "ctl_ovr_bikeshare"
+		physicalSchema = "ctl_ovr_bikeshare_region2_env1"
+	)
+
+	_, err = db.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+physicalSchema+"`")
+	require.NoError(t, err, "create physical schema")
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		cleanupDB, cleanupErr := sql.Open("mysql", sharedDSN)
+		require.NoError(t, cleanupErr, "open database for stateless control cleanup")
+		defer utils.CloseAndLog(cleanupDB)
+		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, "DROP DATABASE IF EXISTS `"+physicalSchema+"`")
+		assert.NoError(t, cleanupErr, "drop physical schema")
+	})
+	_, err = db.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS `"+physicalSchema+"`.`_spirit_sentinel` (`id` int NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB")
+	require.NoError(t, err, "create sentinel table in physical schema")
+
+	// The DSN names the physical schema; the request carries the canonical
+	// database name, which exists as no schema on this cluster.
+	cfg, err := drivermysql.ParseDSN(sharedDSN)
+	require.NoError(t, err, "parse shared DSN")
+	cfg.DBName = physicalSchema
+	creds := &engine.Credentials{DSN: cfg.FormatDSN()}
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	eng := New(Config{Logger: logger})
+
+	exists, err := eng.DeferredCutoverSignalExists(ctx, &engine.DeferredCutoverSignalRequest{
+		Database:    canonical,
+		Credentials: creds,
+	})
+	require.NoError(t, err, "deferred cutover signal lookup")
+	assert.True(t, exists, "sentinel in the DSN's physical schema is found despite the canonical request database")
+
+	result, err := eng.Cutover(ctx, &engine.ControlRequest{
+		Database:    canonical,
+		Credentials: creds,
+	})
+	require.NoError(t, err, "stateless cutover")
+	require.NotNil(t, result)
+	assert.True(t, result.Accepted, "stateless cutover is accepted")
+
+	var count int
+	require.NoError(t, db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = '_spirit_sentinel'",
+		physicalSchema,
+	).Scan(&count), "count sentinel tables")
+	assert.Zero(t, count, "cutover drops the sentinel in the DSN's physical schema, not the canonical name")
+
+	exists, err = eng.DeferredCutoverSignalExists(ctx, &engine.DeferredCutoverSignalRequest{
+		Database:    canonical,
+		Credentials: creds,
+	})
+	require.NoError(t, err, "deferred cutover signal lookup after cutover")
+	assert.False(t, exists, "signal is reported absent after the sentinel drop")
 }
