@@ -154,37 +154,3 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 	h.updateAggregateCheck(ctx, client, repo, pr, check.HeadSHA)
 	return nil
 }
-
-// updateCheckRunAfterUnlock updates a check run to neutral after lock release.
-func (h *Handler) updateCheckRunAfterUnlock(ctx context.Context, repo string, pr int, lock *storage.Lock, installationID int64) {
-	client, err := h.clientForRepo(repo, installationID)
-	if err != nil {
-		h.logger.Error("failed to create GitHub client for check run update",
-			"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
-		return
-	}
-
-	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
-	if err != nil {
-		h.logger.Error("failed to fetch PR for check run update",
-			"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
-		return
-	}
-
-	checkName := fmt.Sprintf("SchemaBot Apply: /%s/%s", lock.DatabaseType, lock.DatabaseName)
-
-	opts := ghclient.CheckRunOptions{
-		Name:       checkName,
-		Status:     checkStatusCompleted,
-		Conclusion: checkConclusionNeutral,
-		Output: &ghclient.CheckRunOutput{
-			Title:   "Lock released",
-			Summary: "Schema change cancelled. Lock has been released.",
-		},
-	}
-
-	if _, err := client.CreateCheckRun(ctx, repo, prInfo.HeadSHA, opts); err != nil {
-		h.logger.Error("failed to update check run after unlock",
-			"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "head_sha", prInfo.HeadSHA, "error", err)
-	}
-}

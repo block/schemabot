@@ -127,28 +127,12 @@ func TestUnlockRefusedWhenActiveApplyLookupFails(t *testing.T) {
 
 // TestUnlockReleasesLockWhenNoActiveApplies verifies the unlock happy path:
 // when the active-apply check confirms no non-terminal apply exists for the
-// locked database, the PR-owned lock is released, a success comment is
-// posted, and the apply check run is set to neutral.
+// locked database, the PR-owned lock is released and a success comment is
+// posted. Unlock never writes Check Runs: lock state is not check state, and
+// the aggregate check must keep reflecting the stored apply outcomes.
 func TestUnlockReleasesLockWhenNoActiveApplies(t *testing.T) {
 	client, mux := setupGitHubServer(t)
 	comments := recordComments(t, mux)
-	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"head": map[string]any{"ref": "feature-branch", "sha": "abc123"},
-			"base": map[string]any{"ref": "main", "sha": "def456"},
-			"user": map[string]any{"login": "testuser"},
-		}))
-	})
-	checkRuns := make(chan string, 2)
-	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Conclusion string `json:"conclusion"`
-		}
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
-		checkRuns <- body.Conclusion
-		w.WriteHeader(http.StatusCreated)
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 1}))
-	})
 
 	lockStore := &unlockTestLockStore{locks: []*storage.Lock{{
 		DatabaseName: "orders",
@@ -172,12 +156,5 @@ func TestUnlockReleasesLockWhenNoActiveApplies(t *testing.T) {
 		assert.Contains(t, body, "@testuser")
 	case <-time.After(2 * time.Second):
 		require.FailNow(t, "timed out waiting for unlock success comment")
-	}
-
-	select {
-	case conclusion := <-checkRuns:
-		assert.Equal(t, "neutral", conclusion)
-	case <-time.After(2 * time.Second):
-		require.FailNow(t, "timed out waiting for check run update after unlock")
 	}
 }

@@ -323,6 +323,14 @@ type planFlowResult struct {
 	// own re-fetch. False (the default) always serves the files.
 	FailPRFilesAfterFirstFetch atomic.Bool
 	prFilesRequests            atomic.Int64
+
+	// BaseTip overrides the commit SHA that /git/ref/heads/main resolves to.
+	// Nil (the default) serves "def456" — the same commit /pulls/1 reports as
+	// the PR base, so the base branch appears unmoved and the base-schema
+	// freshness gate lets applies proceed. Tests that simulate the base
+	// branch advancing after the PR diverged install a provider returning
+	// the moved tip and register comparison fixtures for it.
+	BaseTip atomic.Pointer[func() string]
 }
 
 func (p *planFlowResult) nextHeadSHA() string {
@@ -406,6 +414,22 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		})
 	})
 
+	// Base-branch freshness endpoints. By default the base ref still points
+	// at the PR's base commit, which is therefore also the merge base of the
+	// default head — the schema tree cannot differ from itself, so the
+	// base-schema freshness gate lets applies proceed.
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+		tip := "def456"
+		if provider := result.BaseTip.Load(); provider != nil {
+			tip = (*provider)()
+		}
+		_ = json.NewEncoder(w).Encode(gh.Reference{
+			Ref:    new("refs/heads/main"),
+			Object: &gh.GitObject{Type: new("commit"), SHA: &tip},
+		})
+	})
+	registerFreshBaseComparison(t, mux, "abc123")
+
 	// PR changed files — report schema files changed (in namespace subdir)
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, r *http.Request) {
 		if result.FailPRFilesAfterFirstFetch.Load() && result.prFilesRequests.Add(1) > 1 {
@@ -472,6 +496,20 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, r *http.Request) {
 		sha := r.URL.Path[len("/repos/octocat/hello-world/git/trees/"):]
+		if sha == "def456" {
+			// The base commit's shallow root tree. The base-schema freshness
+			// gate walks this level looking for the managed "schema"
+			// directory entry; serving it as a real tree entry exercises the
+			// gate's path resolution rather than the path-absent shortcut.
+			_ = json.NewEncoder(w).Encode(gh.Tree{
+				SHA: &sha,
+				Entries: []*gh.TreeEntry{
+					{Path: new("schema"), Type: new("tree"), SHA: new("schema-tree-base")},
+				},
+				Truncated: new(false),
+			})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(gh.Tree{
 			SHA:       &sha,
 			Entries:   treeEntries,
@@ -562,11 +600,24 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	return result
 }
 
+// registerFreshBaseComparison serves the merge-base comparison for a head
+// whose merge base is the unmoved base tip "def456", so the base-schema
+// freshness gate sees no base-branch schema change for that head. Tests that
+// serve a head other than the default "abc123" register their head here.
+func registerFreshBaseComparison(t *testing.T, mux *http.ServeMux, headSHA string) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/def456..."+headSHA, func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
+			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("def456")},
+		}))
+	})
+}
+
 func registerCompareFiles(t *testing.T, mux *http.ServeMux, baseSHA, headSHA string, files []*gh.CommitFile) {
 	t.Helper()
 
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/"+baseSHA+"..."+headSHA, func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{Files: files}))
+		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{Status: new("ahead"), Files: files}))
 	})
 }
 

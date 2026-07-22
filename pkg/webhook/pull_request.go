@@ -198,7 +198,7 @@ func (h *Handler) autoPlanBootstrap(parent context.Context, repo string, install
 	return ctx, cancel, client, nil
 }
 
-func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclient.InstallationClient, action, repo string, pr int, beforeSHA, headSHA string) bool {
+func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclient.InstallationClient, action, repo string, pr int, beforeSHA, headSHA string, configs []ghclient.DiscoveredConfig) bool {
 	if action != "synchronize" {
 		return true
 	}
@@ -216,7 +216,64 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 	if ghclient.HasSchemaInputFiles(files) {
 		return true
 	}
-	h.logger.Info("auto-plan will refresh checks without posting a plan comment because synchronize changed no schema inputs",
+
+	// The synchronize range was just proven schema-neutral. Reuse that result
+	// when the visible plan was rendered at the immediately preceding head.
+	comparedHeads := map[string]bool{beforeSHA: true}
+	for _, cfg := range configs {
+		environments, err := h.allowedDatabaseEnvironments(cfg.Config.Database)
+		if err != nil {
+			h.logger.Warn("auto-plan will post plan comment because the expected environment scope could not be resolved",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "head_sha", headSHA, "error", err)
+			return true
+		}
+		expectedScope := (planCommentSlot{Environments: environments}).environmentScope()
+		comments, err := h.service.Storage().PlanComments().ListUnminimizedForSlot(ctx,
+			repo, pr, cfg.Config.Database, string(cfg.Config.GetType()))
+		if err != nil {
+			h.logger.Warn("auto-plan will post plan comment because prior plan comment state could not be read",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "head_sha", headSHA, "error", err)
+			return true
+		}
+		var prior *storage.PlanComment
+		for i := len(comments) - 1; i >= 0; i-- {
+			if comments[i].EnvironmentScope == expectedScope {
+				prior = comments[i]
+				break
+			}
+		}
+		if prior == nil {
+			h.logger.Info("auto-plan will post plan comment because no prior visible plan comment is tracked",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "environment_scope", expectedScope,
+				"head_sha", headSHA)
+			return true
+		}
+
+		planHeadSHA := prior.HeadSHA
+		if planHeadSHA == headSHA || comparedHeads[planHeadSHA] {
+			continue
+		}
+		filesSincePlan, err := client.FetchChangedFilesBetween(ctx, repo, planHeadSHA, headSHA)
+		if err != nil {
+			h.logger.Warn("auto-plan will post plan comment because plan freshness could not be compared",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "plan_head_sha", planHeadSHA,
+				"head_sha", headSHA, "error", err)
+			return true
+		}
+		if ghclient.HasSchemaInputFiles(filesSincePlan) {
+			h.logger.Info("auto-plan will post plan comment because the visible plan predates schema input changes",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "plan_head_sha", planHeadSHA,
+				"head_sha", headSHA)
+			return true
+		}
+		comparedHeads[planHeadSHA] = true
+	}
+	h.logger.Info("auto-plan will refresh checks without posting a plan comment because the visible plan covers the current schema inputs",
 		"repo", repo, "pr", pr, "before_sha", beforeSHA, "head_sha", headSHA)
 	return false
 }
@@ -262,7 +319,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// follow the same cadence, so the decision is memoized and computed at most
 	// once per delivery, only when a caller needs it.
 	shouldPostComment := sync.OnceValue(func() bool {
-		return h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA)
+		return h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA, configs)
 	})
 	h.notifyUnmanagedDiscoveredConfigs(repo, pr, installationID, source, headSHA, shouldPostComment, discovered, configs)
 

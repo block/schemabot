@@ -543,12 +543,6 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 
 		h.postComment(repo, pr, installationID, templates.RenderUnlockSuccess(
 			lock.DatabaseName, "", requestedBy))
-
-		// Update check run to neutral for PR-owned locks. CLI-owned locks have no
-		// associated PR check record to update.
-		if lock.Repository != "" && lock.PullRequest != 0 {
-			h.updateCheckRunAfterUnlock(ctx, repo, pr, lock, installationID)
-		}
 	}
 }
 

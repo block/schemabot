@@ -856,6 +856,10 @@ func recoveringLogMessage(tbl *apitypes.TableProgressResponse) string {
 func (e *logEmitter) emitProgressHeartbeat(tbl *apitypes.TableProgressResponse, ts *tableLogState) {
 	kvs := tableKVs("Copying rows", tbl, ts)
 	if ui.EstimateExceeded(tbl.RowsCopied, tbl.RowsTotal) {
+		// A table past its row estimate has outlived the figure the ETA was
+		// derived from — in a multi-table apply the shared runner estimate can
+		// still be nonzero here, so appending it would contradict the
+		// "Finalizing copy" wording.
 		kvs = append(kvs,
 			"progress", "Finalizing copy",
 			"rows_copied", fmt.Sprintf("%s so far", ui.FormatNumber(tbl.RowsCopied)),
@@ -866,10 +870,9 @@ func (e *logEmitter) emitProgressHeartbeat(tbl *apitypes.TableProgressResponse, 
 			"progress", fmt.Sprintf("%d%%", pct),
 			"rows", fmt.Sprintf("%s/%s", ui.FormatNumber(ui.ClampRows(tbl.RowsCopied, tbl.RowsTotal)), ui.FormatNumber(tbl.RowsTotal)),
 		)
-	}
-
-	if tbl.ETASeconds > 0 {
-		kvs = append(kvs, "eta", ui.FormatETA(tbl.ETASeconds))
+		if tbl.ETASeconds > 0 {
+			kvs = append(kvs, "eta", ui.FormatETA(tbl.ETASeconds))
+		}
 	}
 
 	kvs = appendShardSummary(kvs, tbl.Shards)

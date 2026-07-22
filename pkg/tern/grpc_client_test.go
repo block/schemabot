@@ -4310,6 +4310,65 @@ func TestGRPCClient_PollReconcilesLaggingTaskWhenRemoteApplyStoppedAndTaskProgre
 		"lagging stored task should be reconciled to the apply's stopped state, got %q", task.State)
 }
 
+// When a remote apply fails and no longer reports per-task progress, the
+// lagging stored tasks resolve by what they were doing when the apply died: a
+// task that had started fails with the apply, while a pending task that never
+// started is cancelled — it was blocked behind the failure, and marking it
+// failed would misattribute the failure to a table that did no work. Status
+// surfaces then show the operator which table to investigate.
+func TestGRPCClient_PollReconcilesPendingTaskToCancelledWhenRemoteApplyFailed(t *testing.T) {
+	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{
+		progressState:    ternv1.State_STATE_FAILED,
+		progressStateSet: true,
+		progressError:    "copy row chunk: disk full",
+		// No progressTables: the terminal remote apply no longer reports tasks.
+	})
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              32,
+		ApplyIdentifier: "apply-failed-terminal-remote",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-failed-terminal-apply",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	startedTask := &storage.Task{
+		ID:             42,
+		TaskIdentifier: "task-failed-terminal-started",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	pendingTask := &storage.Task{
+		ID:             43,
+		TaskIdentifier: "task-failed-terminal-pending",
+		ApplyID:        apply.ID,
+		TableName:      "orders",
+		State:          state.Task.Pending,
+	}
+	applyStore := &mockApplyStore{apply: &storedApply}
+	client.storage = &mockStorage{
+		applies: applyStore,
+		tasks:   &mockTaskStore{tasks: []*storage.Task{startedTask, pendingTask}},
+		logs:    &mockApplyLogStore{},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
+	require.NoError(t, err)
+
+	assert.Equal(t, state.Apply.Failed, applyStore.apply.State)
+	assert.Equal(t, state.Task.Failed, startedTask.State,
+		"a task that was in flight when the apply died fails with it")
+	require.NotNil(t, startedTask.CompletedAt)
+	assert.Equal(t, state.Task.Cancelled, pendingTask.State,
+		"a task that never started is cancelled, not failed")
+	require.NotNil(t, pendingTask.CompletedAt)
+}
+
 // terminalTaskStateForApply must map every terminal apply state a remote can
 // report — including the less-common cancelled and reverted outcomes — to the
 // task state a lagging stored task adopts. A terminal apply state with no

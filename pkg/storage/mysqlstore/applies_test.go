@@ -2753,7 +2753,10 @@ func TestApplyStore_FindNextApplyConcurrentPendingClaims(t *testing.T) {
 
 // TestApplyStore_ExpireRetryable verifies retryable expiry at the storage
 // layer. A retryable apply that has used all attempts becomes failed, and
-// unfinished tasks are finalized as failed with completion timestamps.
+// unfinished tasks are finalized with completion timestamps: the task that
+// had started work is failed, while a pending task that never started is
+// cancelled — it was blocked behind the failure, and marking it failed would
+// misattribute the failure to a table that did no work.
 func TestApplyStore_ExpireRetryable(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -2818,7 +2821,7 @@ func TestApplyStore_ExpireRetryable(t *testing.T) {
 	pendingTask, err := store.Tasks().Get(ctx, "task_retryable_pending")
 	require.NoError(t, err)
 	require.NotNil(t, pendingTask)
-	assert.Equal(t, state.Task.Failed, pendingTask.State)
+	assert.Equal(t, state.Task.Cancelled, pendingTask.State, "a task that never started is cancelled, not failed")
 	assert.NotNil(t, pendingTask.CompletedAt)
 }
 
@@ -3239,6 +3242,37 @@ func TestApplyStore_FindMissingSummaryComment_SummaryClaimSentinels(t *testing.T
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
 	assert.Equal(t, staleClaim.ApplyIdentifier, applies[0].ApplyIdentifier)
+}
+
+// TestApplyStore_FindMissingSummaryComment_SupersededSummaryMarker verifies a
+// superseded summary marker counts as missing: a stop's summary consumed by a
+// resume rotation belongs to an earlier terminal state, so once the apply
+// reaches its next terminal state, reconciliation must repair the summary
+// rather than treating the stale marker as posted.
+func TestApplyStore_FindMissingSummaryComment_SupersededSummaryMarker(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	superseded := seedApplyMissingSummary(t, store, "apply_summary_superseded", state.Apply.Completed, 720)
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         superseded.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 2003,
+	}))
+	require.NoError(t, store.ApplyComments().Supersede(ctx, superseded.ID, state.Comment.Summary))
+
+	live := seedApplyMissingSummary(t, store, "apply_summary_live", state.Apply.Completed, 721)
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         live.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 2004,
+	}))
+
+	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, superseded.ApplyIdentifier, applies[0].ApplyIdentifier)
 }
 
 func TestApplyStore_GetByPR(t *testing.T) {
