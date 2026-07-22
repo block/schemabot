@@ -566,7 +566,7 @@ func registerCompareFiles(t *testing.T, mux *http.ServeMux, baseSHA, headSHA str
 	t.Helper()
 
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/"+baseSHA+"..."+headSHA, func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{Files: files}))
+		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{Status: new("ahead"), Files: files}))
 	})
 }
 
