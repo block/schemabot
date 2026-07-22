@@ -496,6 +496,20 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, r *http.Request) {
 		sha := r.URL.Path[len("/repos/octocat/hello-world/git/trees/"):]
+		if sha == "def456" {
+			// The base commit's shallow root tree. The base-schema freshness
+			// gate walks this level looking for the managed "schema"
+			// directory entry; serving it as a real tree entry exercises the
+			// gate's path resolution rather than the path-absent shortcut.
+			_ = json.NewEncoder(w).Encode(gh.Tree{
+				SHA: &sha,
+				Entries: []*gh.TreeEntry{
+					{Path: new("schema"), Type: new("tree"), SHA: new("schema-tree-base")},
+				},
+				Truncated: new(false),
+			})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(gh.Tree{
 			SHA:       &sha,
 			Entries:   treeEntries,

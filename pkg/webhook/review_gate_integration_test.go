@@ -123,10 +123,14 @@ func setupFakeGitHubForReviewGate(
 			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("def456")},
 		})
 	})
+	// The base commit's shallow root tree: the gate walks this level looking
+	// for the managed "schema" directory entry.
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/def456", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(gh.Tree{
-			SHA:       new("def456"),
-			Entries:   treeEntries,
+			SHA: new("def456"),
+			Entries: []*gh.TreeEntry{
+				{Path: new("schema"), Type: new("tree"), SHA: new("schema-tree-base")},
+			},
 			Truncated: new(false),
 		})
 	})
