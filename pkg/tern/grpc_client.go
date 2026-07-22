@@ -3227,16 +3227,20 @@ func (c *GRPCClient) reconcileStoredTasksForTerminalRemoteApply(ctx context.Cont
 			continue
 		}
 		oldTaskState := storedTask.State
-		storedTask.State = terminalTaskState
-		if state.IsState(terminalTaskState, state.Task.Completed) {
+		resolvedState := terminalTaskState
+		if taskCancelledByRemoteApplyFailure(terminalTaskState, oldTaskState) {
+			resolvedState = state.Task.Cancelled
+		}
+		storedTask.State = resolvedState
+		if state.IsState(resolvedState, state.Task.Completed) {
 			storedTask.ProgressPercent = 100
 		}
-		if state.IsTerminalTaskState(terminalTaskState) && storedTask.CompletedAt == nil {
+		if state.IsTerminalTaskState(resolvedState) && storedTask.CompletedAt == nil {
 			storedTask.CompletedAt = &now
 		}
 		storedTask.UpdatedAt = now
 		if err := c.storage.Tasks().Update(ctx, storedTask); err != nil {
-			return fmt.Errorf("reconcile lagging task %s to %s for terminal remote gRPC apply %s: %w", storedTask.TaskIdentifier, terminalTaskState, storedApply.ApplyIdentifier, err)
+			return fmt.Errorf("reconcile lagging task %s to %s for terminal remote gRPC apply %s: %w", storedTask.TaskIdentifier, resolvedState, storedApply.ApplyIdentifier, err)
 		}
 		slog.Warn("reconciled lagging stored task to terminal remote gRPC apply state",
 			"apply_id", storedApply.ApplyIdentifier,
@@ -3245,10 +3249,22 @@ func (c *GRPCClient) reconcileStoredTasksForTerminalRemoteApply(ctx context.Cont
 			"task_id", storedTask.TaskIdentifier,
 			"table", storedTask.TableName,
 			"old_task_state", oldTaskState,
-			"new_task_state", terminalTaskState)
-		c.logTaskStateTransition(ctx, storedApply.ID, storedTask, fmt.Sprintf("Task %s reconciled to %s for terminal remote apply state %s", storedTask.TableName, terminalTaskState, remoteApply.State), oldTaskState)
+			"new_task_state", resolvedState)
+		c.logTaskStateTransition(ctx, storedApply.ID, storedTask, fmt.Sprintf("Task %s reconciled to %s for terminal remote apply state %s", storedTask.TableName, resolvedState, remoteApply.State), oldTaskState)
 	}
 	return nil
+}
+
+// taskCancelledByRemoteApplyFailure reports whether a stored task lagging
+// behind a failed remote apply resolves to cancelled instead of failed. A
+// pending task never started: the remote failure happened before this table's
+// work began, so it is cancelled — mirroring how a sequential drive resolves
+// the tables queued behind a failed one — rather than failed, which would
+// misattribute the failure to a table that did no work. A task that had
+// started keeps the failed resolution: it was in flight when the apply died.
+func taskCancelledByRemoteApplyFailure(terminalTaskState, storedTaskState string) bool {
+	return state.IsState(terminalTaskState, state.Task.Failed) &&
+		state.IsState(storedTaskState, state.Task.Pending)
 }
 
 // terminalTaskStateForApply maps a terminal apply state to the task state a

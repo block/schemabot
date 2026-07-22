@@ -1787,6 +1787,22 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 		})
 	}
 
+	// A pending task never started: it was blocked behind the failure that made
+	// the apply retryable, so expiring the apply cancels it — mirroring how a
+	// sequential drive resolves the tables queued behind a failed one. Marking
+	// it failed instead would misattribute the failure to a table that did no
+	// work.
+	cancelArgs := []any{state.Task.Cancelled, state.Task.Pending}
+	cancelArgs = append(cancelArgs, applyIDs...)
+	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE tasks t
+		SET t.state = ?, t.completed_at = COALESCE(t.completed_at, NOW()), t.updated_at = NOW()
+		WHERE t.state = ? AND t.apply_id IN (%s)
+	`, placeholders(len(applyIDs))), cancelArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("cancel pending tasks for expired retryable applies: %w", err)
+	}
+
 	taskArgs := []any{state.Task.Failed}
 	taskArgs = append(taskArgs, stringArgs(state.TerminalTaskStates)...)
 	taskArgs = append(taskArgs, applyIDs...)
