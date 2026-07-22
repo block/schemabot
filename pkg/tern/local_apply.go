@@ -269,6 +269,14 @@ func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Tas
 	oldState := task.State
 	task.State = newState
 	task.UpdatedAt = time.Now()
+	// An ETA is only meaningful while an engine is actively driving the task
+	// and refreshing the estimate. Clear it when the task comes to rest
+	// (terminal, stopped, retryable, pending) so the stored row never carries
+	// a frozen estimate; a resumed or retried task gets a fresh figure from
+	// the first engine poll.
+	if !state.IsInFlightTaskState(newState) {
+		task.ETASeconds = 0
+	}
 	if err := c.storage.Tasks().Update(ctx, task); err != nil {
 		c.logger.Error("failed to update task state", append(task.LogAttrs(), "error", err)...)
 	}

@@ -2288,6 +2288,10 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		tp.RowsTotal = t.RowsTotal
 		tp.ChecksumRowsChecked = t.ChecksumRowsChecked
 		tp.ChecksumRowsTotal = t.ChecksumRowsTotal
+		// For Spirit the stored figure is the runner-wide remaining-copy
+		// estimate stamped on every still-copying table (see
+		// buildSpiritTableProgress), so in a multi-table apply each table
+		// reports the whole run's ETA rather than its own.
 		tp.EtaSeconds = int64(t.ETASeconds)
 		// Clamp to 100% only for successfully completed tasks — Vitess row
 		// counts can lag slightly due to concurrent inserts during copy.
