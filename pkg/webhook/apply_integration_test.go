@@ -431,24 +431,8 @@ func TestE2EUnlock(t *testing.T) {
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	// For unlock, we still need PR info for the check run
-	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.PullRequest{
-			Head: &gh.PullRequestBranch{
-				Ref: new("feature-branch"),
-				SHA: new("abc123"),
-			},
-			Base: &gh.PullRequestBranch{
-				Ref: new("main"),
-				SHA: new("def456"),
-			},
-			User: &gh.User{Login: new("testuser")},
-		})
-	})
-
 	comments := make(chan string, 10)
 	reactions := make(chan string, 10)
-	checkRuns := make(chan checkRunCapture, 10)
 
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -465,13 +449,6 @@ func TestE2EUnlock(t *testing.T) {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		reactions <- body.Content
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
-	})
-	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		var body checkRunCapture
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		checkRuns <- body
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
 	})
@@ -507,15 +484,6 @@ func TestE2EUnlock(t *testing.T) {
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)
 	assert.Nil(t, lock, "expected lock to be released")
-
-	// Verify check run updated to neutral
-	select {
-	case cr := <-checkRuns:
-		assert.Equal(t, "completed", cr.Status)
-		assert.Equal(t, "neutral", cr.Conclusion)
-	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for check run")
-	}
 }
 
 func TestE2EUnlockForceInfersDatabaseForCLILock(t *testing.T) {
@@ -663,21 +631,6 @@ func TestE2EUnlockDoesNotPassAggregateWithPendingChanges(t *testing.T) {
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	// The current PR commit is still the same commit that owns the pending plan.
-	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.PullRequest{
-			Head: &gh.PullRequestBranch{
-				Ref: new("feature-branch"),
-				SHA: new("abc123"),
-			},
-			Base: &gh.PullRequestBranch{
-				Ref: new("main"),
-				SHA: new("def456"),
-			},
-			User: &gh.User{Login: new("testuser")},
-		})
-	})
-
 	comments := make(chan string, 10)
 	checkRuns := make(chan checkRunCapture, 10)
 
@@ -728,15 +681,14 @@ func TestE2EUnlockDoesNotPassAggregateWithPendingChanges(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, lock)
 
-	// Unlock updates the command-specific "SchemaBot Apply" check to neutral,
-	// but must not make the aggregate safety gate pass.
+	// Unlock never writes Check Runs: check state must keep reflecting stored
+	// apply outcomes only. The "Lock Released" comment is the final action in
+	// the release flow, so an empty channel here proves no check-run write
+	// happened.
 	select {
 	case cr := <-checkRuns:
-		assert.Contains(t, cr.Name, "SchemaBot Apply")
-		assert.Equal(t, checkStatusCompleted, cr.Status)
-		assert.Equal(t, checkConclusionNeutral, cr.Conclusion)
-	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for unlock check run")
+		t.Fatalf("unlock unexpectedly wrote a check run: %+v", cr)
+	default:
 	}
 
 	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
