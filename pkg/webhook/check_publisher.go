@@ -316,6 +316,14 @@ func prFilePaths(files []ghclient.PRFile) []string {
 // returns the underlying error so a caller with a retry mechanism can react to a
 // failed GitHub or storage write. A stored blocking reason is an intentional
 // fail-closed skip, not an operational failure, so it returns nil.
+// rewindsConcludedCheckRun reports whether publishing the recomputed status to
+// the stored Check Run would move an already-concluded run out of "completed".
+// The GitHub Checks API does not allow that transition on an existing run, so
+// callers must publish the rewind as a fresh Check Run instead.
+func rewindsConcludedCheckRun(existing *storage.Check, status string) bool {
+	return existing.Status == checkStatusCompleted && status != checkStatusCompleted
+}
+
 func (h *Handler) upsertAggregateCheckRunOnce(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, headSHA string,
@@ -382,8 +390,31 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 	// Create a new check run if no existing record, or if the HEAD SHA changed
 	// (new commit pushed). Updating an old check run tied to a previous SHA is
 	// invisible on the PR — GitHub only shows checks for the HEAD commit.
+	//
+	// A concluded Check Run also cannot be reused: GitHub does not move a
+	// completed run back to in_progress — it applies the new output but keeps
+	// the stored conclusion, leaving a passing Check Run whose text says an
+	// apply is running. Publish the rewind as a fresh Check Run on the same
+	// name and SHA instead; GitHub surfaces the most recent run per name, so
+	// the new in-progress run replaces the concluded one on the PR and in
+	// branch protection.
+	reuseExistingRun := existing != nil && existing.CheckRunID != 0 && existing.HeadSHA == headSHA
+	if reuseExistingRun && rewindsConcludedCheckRun(existing, status) {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:   "aggregate_check_sync",
+			Repository:  repo,
+			Environment: environment,
+			Status:      "recreated",
+		})
+		h.logger.Info("re-creating aggregate check run: the existing run already concluded and GitHub cannot move it back out of completed",
+			"repo", repo, "pr", pr, "check_name", checkName,
+			"environment", environment, "head_sha", headSHA,
+			"concluded_check_run_id", existing.CheckRunID,
+			"stored_conclusion", existing.Conclusion, "status", status)
+		reuseExistingRun = false
+	}
 	var checkRunID int64
-	if existing != nil && existing.CheckRunID != 0 && existing.HeadSHA == headSHA {
+	if reuseExistingRun {
 		if err := client.UpdateCheckRun(ctx, repo, existing.CheckRunID, opts); err != nil {
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 				Operation:   "aggregate_check_sync",

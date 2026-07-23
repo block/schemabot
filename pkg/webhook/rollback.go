@@ -444,7 +444,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 			"apply_id", applyID)
 		return
 	}
-	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID); err != nil {
+	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply); err != nil {
 		h.logger.Error("failed to mark check in_progress for rollback",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", dbType, "environment", environment,

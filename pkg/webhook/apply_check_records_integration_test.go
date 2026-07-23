@@ -115,7 +115,7 @@ func TestUpdateCheckRecordForApplyStart_ConvergesWhenApplyAlreadyTerminal(t *tes
 	// stored check state to the apply's terminal outcome instead of leaving the
 	// row in_progress with no writer left to complete it.
 	schema := &ghclient.SchemaRequestResult{Type: "mysql", Database: dbn}
-	require.NoError(t, h.updateCheckRecordForApplyStart(ctx, installClient, repo, pr, schema, env, applyID))
+	require.NoError(t, h.updateCheckRecordForApplyStart(ctx, installClient, repo, pr, schema, env, apply))
 
 	check, err = st.Checks().Get(ctx, repo, pr, env, "mysql", dbn)
 	require.NoError(t, err)
@@ -179,6 +179,7 @@ func TestUpdateCheckRecordForApplyStart_KeepsInProgressForRunningApply(t *testin
 	}
 	applyID, err := st.Applies().Create(ctx, apply)
 	require.NoError(t, err)
+	apply.ID = applyID
 
 	require.NoError(t, st.Checks().Upsert(ctx, &storage.Check{
 		Repository:   repo,
@@ -194,7 +195,7 @@ func TestUpdateCheckRecordForApplyStart_KeepsInProgressForRunningApply(t *testin
 	}))
 
 	schema := &ghclient.SchemaRequestResult{Type: "mysql", Database: dbn}
-	require.NoError(t, h.updateCheckRecordForApplyStart(ctx, installClient, repo, pr, schema, env, applyID))
+	require.NoError(t, h.updateCheckRecordForApplyStart(ctx, installClient, repo, pr, schema, env, apply))
 
 	check, err := st.Checks().Get(ctx, repo, pr, env, "mysql", dbn)
 	require.NoError(t, err)

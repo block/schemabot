@@ -27,6 +27,7 @@ type foldCheckStore struct {
 	getErr      error
 	upsertErr   error
 	upsertCalls int
+	upserted    []*storage.Check
 }
 
 func (s *foldCheckStore) GetByPR(_ context.Context, _ string, _ int) ([]*storage.Check, error) {
@@ -37,8 +38,9 @@ func (s *foldCheckStore) Get(_ context.Context, _ string, _ int, _, _, _ string)
 	return s.get, s.getErr
 }
 
-func (s *foldCheckStore) Upsert(_ context.Context, _ *storage.Check) error {
+func (s *foldCheckStore) Upsert(_ context.Context, check *storage.Check) error {
 	s.upsertCalls++
+	s.upserted = append(s.upserted, check)
 	return s.upsertErr
 }
 
