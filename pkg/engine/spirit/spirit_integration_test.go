@@ -291,6 +291,12 @@ func TestEngine_Plan_DropTable(t *testing.T) {
 func TestEngine_Plan_ExecutionVerdictBlocked(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
+	t.Cleanup(func() {
+		for _, table := range []string{"orders", "accounts", "notes"} {
+			_, err := db.ExecContext(t.Context(), "DROP TABLE IF EXISTS `"+table+"`")
+			assert.NoError(t, err, "drop table %s", table)
+		}
+	})
 
 	_, err := db.ExecContext(t.Context(), `CREATE TABLE accounts (
 		id INT NOT NULL AUTO_INCREMENT,
@@ -363,13 +369,6 @@ func TestEngine_Plan_ExecutionVerdictBlocked(t *testing.T) {
 	assert.Contains(t, orders.DDL, "fk_orders_note")
 	assert.Equal(t, "blocked", orders.ExecutionMode, "adding a foreign key carries the blocked verdict")
 	assert.Equal(t, "adding foreign key constraints is not supported", orders.ModeReason)
-
-	_, err = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS `orders`")
-	require.NoError(t, err, "drop orders table")
-	_, err = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS `accounts`")
-	require.NoError(t, err, "drop accounts table")
-	_, err = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS `notes`")
-	require.NoError(t, err, "drop notes table")
 }
 
 func TestEngine_Plan_NoChanges(t *testing.T) {

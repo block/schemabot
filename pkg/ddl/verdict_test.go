@@ -61,7 +61,7 @@ func TestEngineRefusalReason(t *testing.T) {
 			stmt: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
 		},
 		{
-			name: "replacing the primary key without dropping it runs on the engine",
+			name: "modifying a primary-key column runs on the engine",
 			stmt: "ALTER TABLE `users` MODIFY COLUMN `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT",
 		},
 		{
