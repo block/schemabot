@@ -5,7 +5,9 @@ package webhook
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"testing"
@@ -204,4 +206,151 @@ func TestUpdateCheckRecordForApplyStart_KeepsInProgressForRunningApply(t *testin
 	assert.Empty(t, check.Conclusion)
 	assert.Equal(t, applyID, check.ApplyID)
 	assert.True(t, check.HasChanges)
+}
+
+// The full merge-gate chain for an apply that starts on a commit whose
+// aggregate Check Run already concluded green — the rollback-confirm flow: the
+// original apply completed and concluded the aggregate as success, then a
+// rollback begins on the same head SHA. The check claim must flip the stored
+// per-database state to in_progress, and the aggregate recompute must publish
+// the rewind as a fresh in-progress Check Run rather than updating the
+// concluded one (GitHub keeps a concluded run's conclusion, which would leave
+// a passing merge gate over the active rollback drive).
+func TestUpdateCheckRecordForApplyStart_RollbackOnConcludedAggregatePublishesFreshCheckRun(t *testing.T) {
+	ctx := t.Context()
+
+	db, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, db.PingContext(ctx))
+	t.Cleanup(func() { assert.NoError(t, db.Close()) })
+
+	const (
+		repo    = "octocat/rollback-green-gate"
+		pr      = 12
+		dbn     = "rollback_green_gate_db"
+		env     = "staging"
+		headSHA = "abc123"
+	)
+
+	clear := func(c context.Context) {
+		_, err := db.ExecContext(c, "DELETE FROM checks WHERE repository = ? AND pull_request = ?", repo, pr)
+		require.NoError(t, err)
+		_, err = db.ExecContext(c, "DELETE FROM applies WHERE repository = ? AND pull_request = ?", repo, pr)
+		require.NoError(t, err)
+	}
+	clear(ctx)
+	// Cleanup runs after t.Context() is cancelled, so derive a non-cancelled
+	// context from it for the cleanup deletes.
+	t.Cleanup(func() { clear(context.WithoutCancel(ctx)) })
+
+	st := mysqlstore.New(db)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := api.New(st, &api.ServerConfig{Repos: map[string]api.RepoConfig{repo: {}}}, nil, logger)
+
+	ghClient, mux := setupGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/rollback-green-gate/pulls/12", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"head": map[string]any{"sha": headSHA, "ref": "feature-branch"},
+			"base": map[string]any{"sha": "def456", "ref": "main"},
+			"user": map[string]any{"login": "testuser"},
+		}))
+	})
+	var created []rewindCheckRunBody
+	mux.HandleFunc("POST /repos/octocat/rollback-green-gate/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body rewindCheckRunBody
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		created = append(created, body)
+		w.WriteHeader(http.StatusCreated)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 999}))
+	})
+	var patched bool
+	mux.HandleFunc("PATCH /repos/octocat/rollback-green-gate/check-runs/", func(w http.ResponseWriter, _ *http.Request) {
+		patched = true
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 555}))
+	})
+	installClient := ghclient.NewInstallationClient(ghClient, logger)
+	factory := &fakeClientFactory{client: installClient}
+	h := NewHandler(svc, factory, nil, logger)
+
+	// The original apply completed; its per-database check and the aggregate
+	// Check Run both concluded success.
+	originalApply := &storage.Apply{
+		ApplyIdentifier: "apply-original-completed",
+		Database:        dbn,
+		DatabaseType:    "mysql",
+		Repository:      repo,
+		PullRequest:     pr,
+		Environment:     env,
+		Engine:          storage.EngineSpirit,
+		InstallationID:  4242,
+		State:           state.Apply.Completed,
+	}
+	originalApplyID, err := st.Applies().Create(ctx, originalApply)
+	require.NoError(t, err)
+
+	require.NoError(t, st.Checks().Upsert(ctx, &storage.Check{
+		Repository:   repo,
+		PullRequest:  pr,
+		HeadSHA:      headSHA,
+		Environment:  env,
+		DatabaseType: "mysql",
+		DatabaseName: dbn,
+		ApplyID:      originalApplyID,
+		HasChanges:   true,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionSuccess,
+	}))
+	require.NoError(t, st.Checks().Upsert(ctx, &storage.Check{
+		Repository:   repo,
+		PullRequest:  pr,
+		HeadSHA:      headSHA,
+		Environment:  aggregateSentinel,
+		DatabaseType: aggregateSentinel,
+		DatabaseName: aggregateSentinel,
+		CheckRunID:   555,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionSuccess,
+	}))
+
+	// The rollback apply is running on the same head SHA.
+	rollbackApply := &storage.Apply{
+		ApplyIdentifier: "apply-rollback-drive",
+		Database:        dbn,
+		DatabaseType:    "mysql",
+		Repository:      repo,
+		PullRequest:     pr,
+		Environment:     env,
+		Engine:          storage.EngineSpirit,
+		InstallationID:  4242,
+		State:           state.Apply.Running,
+	}
+	rollbackApplyID, err := st.Applies().Create(ctx, rollbackApply)
+	require.NoError(t, err)
+	rollbackApply.ID = rollbackApplyID
+
+	schema := &ghclient.SchemaRequestResult{Type: "mysql", Database: dbn}
+	require.NoError(t, h.updateCheckRecordForApplyStart(ctx, installClient, repo, pr, schema, env, rollbackApply))
+
+	// The rollback now owns the per-database check, back in progress.
+	check, err := st.Checks().Get(ctx, repo, pr, env, "mysql", dbn)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, checkStatusInProgress, check.Status)
+	assert.Empty(t, check.Conclusion)
+	assert.Equal(t, rollbackApplyID, check.ApplyID)
+
+	// The concluded Check Run was not reused; a fresh in-progress run gates the
+	// PR and the stored aggregate state tracks it.
+	assert.False(t, patched, "the concluded Check Run must not be reused: GitHub keeps its conclusion, leaving a passing check over the rollback drive")
+	require.Len(t, created, 1, "the rewind must publish exactly one fresh Check Run")
+	assert.Equal(t, aggregateCheckName, created[0].Name)
+	assert.Equal(t, checkStatusInProgress, created[0].Status)
+	assert.Empty(t, created[0].Conclusion)
+
+	aggregate, err := st.Checks().Get(ctx, repo, pr, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, aggregate)
+	assert.Equal(t, int64(999), aggregate.CheckRunID)
+	assert.Equal(t, checkStatusInProgress, aggregate.Status)
+	assert.Empty(t, aggregate.Conclusion)
 }
