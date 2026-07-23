@@ -36,7 +36,7 @@ func (cmd *UnlockCmd) Run(g *Globals) error {
 			return fmt.Errorf("check lock: %w", err)
 		}
 		if existingLock == nil {
-			templates.WriteNoLockFound(cmd.Database, cmd.Type)
+			reportNoLockFound(ep, cmd.Database, cmd.Type)
 			return nil
 		}
 
@@ -54,7 +54,7 @@ func (cmd *UnlockCmd) Run(g *Globals) error {
 		return client.ReleaseLock(ep, cmd.Database, cmd.Type, owner)
 	})
 	if errors.Is(err, client.ErrLockNotFound) {
-		templates.WriteNoLockFound(cmd.Database, cmd.Type)
+		reportNoLockFound(ep, cmd.Database, cmd.Type)
 		return nil
 	}
 	if errors.Is(err, client.ErrLockNotOwned) {
@@ -76,5 +76,36 @@ func (cmd *UnlockCmd) Run(g *Globals) error {
 	}
 
 	templates.WriteLockReleased(cmd.Database, cmd.Type)
+	return nil
+}
+
+// reportNoLockFound explains a missing lock. Lock lookups are keyed by
+// (database, type) and the type flag defaults to mysql, so an operator
+// releasing a vitess (or strata/postgres) database lock without -t searches
+// the wrong namespace. When the database is locked under a different type,
+// name that lock and the command that targets it instead of reporting a bare
+// miss.
+func reportNoLockFound(ep, database, dbType string) {
+	locks, err := client.ListLocks(ep)
+	if err != nil {
+		templates.WriteNoLockFound(database, dbType)
+		templates.WriteLockTypeScanFailed(err)
+		return
+	}
+	if other := lockUnderOtherType(locks, database, dbType); other != nil {
+		templates.WriteLockExistsUnderOtherType(database, dbType, other.DatabaseType)
+		return
+	}
+	templates.WriteNoLockFound(database, dbType)
+}
+
+// lockUnderOtherType returns a lock held on the database under a database
+// type other than the requested one, or nil if none exists.
+func lockUnderOtherType(locks []*client.LockInfo, database, dbType string) *client.LockInfo {
+	for _, lock := range locks {
+		if lock.Database == database && lock.DatabaseType != dbType {
+			return lock
+		}
+	}
 	return nil
 }

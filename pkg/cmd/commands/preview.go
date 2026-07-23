@@ -40,7 +40,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 	// Lock types
 	case templates.PreviewLockAcquired, templates.PreviewLockConflict,
 		templates.PreviewLockConflictCLI, templates.PreviewNoLockFound,
-		templates.PreviewUnlockNotOwned,
+		templates.PreviewLockOtherType, templates.PreviewUnlockNotOwned,
 		templates.PreviewLockReleased, templates.PreviewLocksList:
 		templates.PreviewCLIOutput(previewType)
 	// Sequential mode types
@@ -177,6 +177,7 @@ Lock Types:
   lock_released         Show lock released messages
   locks_list            Show locks list output
   no_lock_found         Show no lock found message
+  lock_other_type       Show lock exists under another database type message
   unlock_not_owned      Show unlock not owned message
 
 Sequential Mode (multi-table, one at a time):

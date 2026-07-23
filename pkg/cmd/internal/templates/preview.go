@@ -35,6 +35,7 @@ const (
 	PreviewLockReleased      PreviewType = "lock_released"
 	PreviewLocksList         PreviewType = "locks_list"
 	PreviewNoLockFound       PreviewType = "no_lock_found"
+	PreviewLockOtherType     PreviewType = "lock_other_type"
 	PreviewUnlockNotOwned    PreviewType = "unlock_not_owned"
 	PreviewAll               PreviewType = "all"
 
