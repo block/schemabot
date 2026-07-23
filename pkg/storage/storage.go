@@ -400,6 +400,17 @@ type ApplyStore interface {
 	// Note: For recovery, use FindNextApply which handles locking.
 	GetInProgress(ctx context.Context) ([]*Apply, error)
 
+	// FindStuckPendingApplies returns pending applies that FindNextApply should
+	// already have claimed — pending with child rows (the same claimable-pending
+	// predicate FindNextApply uses) — but whose created_at is older than
+	// olderThan, ordered oldest first and capped at limit. It is a read-only
+	// diagnostic: apply creation rejects a second active apply for the same
+	// target rather than queuing it, so a pending apply this old is not waiting
+	// its turn — either no driver is claiming (a starved or crash-looping
+	// operator pool) or the claim path is wedged. Returns an empty slice when
+	// nothing is stuck. A non-positive limit means no cap.
+	FindStuckPendingApplies(ctx context.Context, olderThan time.Duration, limit int) ([]*Apply, error)
+
 	// FindNextApply atomically claims the next apply that needs attention.
 	// A claim selects one apply that needs work and refreshes its heartbeat in
 	// the same transaction. The owner is stored with a freshly generated lease

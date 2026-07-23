@@ -789,6 +789,33 @@ func RecordOperatorClaimFailure(ctx context.Context, reason string) {
 	)
 }
 
+// RecordOperatorStuckPendingApplies records how many pending applies are older
+// than the stuck threshold while still carrying the child rows that make them
+// claimable — work a driver should already have picked up. Apply creation
+// rejects a concurrent apply for the same target rather than queuing it, so a
+// nonzero value is not normal backpressure: it means the operator driver pool is
+// not claiming (all drivers saturated on long-running applies, an
+// operator-less/crash-looping deployment, or a wedged claim path). The expected
+// operator action is to check driver liveness and claim-failure metrics/logs.
+func RecordOperatorStuckPendingApplies(ctx context.Context, count int64) {
+	recordGauge(ctx, "schemabot.operator.stuck_pending_applies", count,
+		"Number of pending applies past the stuck threshold that a driver should have claimed", "{apply}",
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordOperatorStuckPendingScanFailure counts failed stuck-pending scans. The
+// stuck-pending gauge is a last-value instrument, so a failed scan leaves it
+// frozen at its last-good value — indistinguishable from a healthy operator.
+// This counter is the liveness signal for the gauge: a nonzero rate means the
+// stuck-pending value is stale and must not be trusted.
+func RecordOperatorStuckPendingScanFailure(ctx context.Context) {
+	addCounter(ctx, "schemabot.operator.stuck_pending_scan_failures",
+		"Total number of failed operator stuck-pending apply scans", "{failure}",
+		EnvironmentAttribute(""),
+	)
+}
+
 var knownOperatorTerminalSummaryFailureReasons = map[string]bool{
 	"reload_apply_error":           true,
 	"apply_missing":                true,
