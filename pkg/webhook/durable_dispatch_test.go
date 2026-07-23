@@ -299,7 +299,7 @@ func TestDurableWebhookDriverCompletesUnsupportedEvent(t *testing.T) {
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
 		Provider:   storage.WebhookProviderGitHub,
 		DeliveryID: "delivery-unsupported",
-		Event:      "push",
+		Event:      "issue_comment",
 		Payload:    []byte(`{}`),
 	})
 	h := newDurableDriverHandler(t, store, nil, nil)
@@ -440,9 +440,9 @@ func TestDurableWebhookDriverStopsRetryingAtAttemptCap(t *testing.T) {
 // a burst of queued deliveries is worked down without waiting for the next tick.
 func TestDurableWebhookDrainProcessesBacklogInOnePass(t *testing.T) {
 	store := newScriptedWebhookEventStore(
-		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d1", Event: "push", Payload: []byte(`{}`)},
-		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d2", Event: "push", Payload: []byte(`{}`)},
-		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d3", Event: "push", Payload: []byte(`{}`)},
+		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d1", Event: "issue_comment", Payload: []byte(`{}`)},
+		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d2", Event: "issue_comment", Payload: []byte(`{}`)},
+		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d3", Event: "issue_comment", Payload: []byte(`{}`)},
 	)
 	h := newDurableDriverHandler(t, store, nil, nil)
 
@@ -570,7 +570,7 @@ func TestDurableWebhookDispatchLifecycleDrainsQueuedEvent(t *testing.T) {
 		Provider:   storage.WebhookProviderGitHub,
 		DeliveryID: "delivery-lifecycle",
 		Event:      "push",
-		Payload:    []byte(`{}`),
+		Payload:    []byte(`{"ref": "refs/heads/feature", "after": "abc123def456", "repository": {"full_name": "octocat/hello-world", "default_branch": "main"}}`),
 	})
 	h := newDurableDriverHandler(t, store, nil, nil)
 	h.durableWebhookPollInterval = 10 * time.Millisecond

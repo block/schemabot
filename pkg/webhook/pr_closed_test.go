@@ -13,7 +13,7 @@ import (
 )
 
 // prClosedTestStorage serves a fixed set of locks and applies and records
-// which cleanup operations handlePRClosed performed, so tests can verify
+// which cleanup operations runPRCloseCleanup performed, so tests can verify
 // whether locks were released and check state was deleted.
 type prClosedTestStorage struct {
 	emptyStorage
@@ -120,7 +120,7 @@ func TestPRClosedRetainsLockAndChecksForInFlightApply(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	h.handlePRClosed("octocat/hello-world", 1, 12345, true)
+	assert.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, true))
 
 	assert.Empty(t, lockStore.released, "lock for a database with an in-flight apply must not be released on PR close")
 	assert.Equal(t, 0, checkStore.deleteCalls, "stored check state must not be deleted while an apply is in flight")
@@ -144,7 +144,7 @@ func TestPRClosedReleasesOnlyLocksWithoutInFlightApply(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	h.handlePRClosed("octocat/hello-world", 1, 12345, true)
+	assert.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, true))
 
 	assert.Equal(t, []string{"billing"}, lockStore.released, "only the lock without an in-flight apply is released")
 	assert.Equal(t, 0, checkStore.deleteCalls, "stored check state must not be deleted while any apply is in flight")
@@ -166,7 +166,7 @@ func TestPRClosedCleansUpWhenAllAppliesTerminal(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	h.handlePRClosed("octocat/hello-world", 1, 12345, true)
+	assert.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, true))
 
 	assert.Equal(t, []string{"orders", "billing"}, lockStore.released, "all locks are released when applies are terminal")
 	assert.Equal(t, 1, checkStore.deleteCalls, "stored check state is deleted when applies are terminal")
@@ -189,7 +189,7 @@ func TestPRClosedCleansUpWhenPRHasNoApplies(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	h.handlePRClosed("octocat/hello-world", 1, 12345, false)
+	assert.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, false))
 
 	assert.Equal(t, []string{"orders"}, lockStore.released, "locks are released when the PR has no applies")
 	assert.Equal(t, 1, checkStore.deleteCalls, "stored check state is deleted when the PR has no applies")
@@ -210,7 +210,8 @@ func TestPRClosedSkipsCleanupWhenApplyLookupFails(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	h.handlePRClosed("octocat/hello-world", 1, 12345, true)
+	assert.Error(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, true),
+		"a failed apply lookup must be returned so the durable driver retries")
 
 	assert.Empty(t, lockStore.released, "no lock is released when apply state is unknown")
 	assert.Equal(t, 0, checkStore.deleteCalls, "no check state is deleted when apply state is unknown")
