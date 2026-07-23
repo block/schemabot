@@ -86,7 +86,12 @@ func (cmd *UnlockCmd) Run(g *Globals) error {
 // name that lock and the command that targets it instead of reporting a bare
 // miss.
 func reportNoLockFound(ep, database, dbType string) {
-	locks, err := client.ListLocks(ep)
+	var locks []*client.LockInfo
+	err := withLoading("Checking database locks...", true, func() error {
+		var listErr error
+		locks, listErr = client.ListLocks(ep)
+		return listErr
+	})
 	if err != nil {
 		templates.WriteNoLockFound(database, dbType)
 		templates.WriteLockTypeScanFailed(err)
