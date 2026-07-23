@@ -291,9 +291,10 @@ func TestEngine_Plan_DropTable(t *testing.T) {
 func TestEngine_Plan_ExecutionVerdictBlocked(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
+	cleanupCtx := context.WithoutCancel(t.Context())
 	t.Cleanup(func() {
 		for _, table := range []string{"orders", "accounts", "notes"} {
-			_, err := db.ExecContext(t.Context(), "DROP TABLE IF EXISTS `"+table+"`")
+			_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `"+table+"`")
 			assert.NoError(t, err, "drop table %s", table)
 		}
 	})
