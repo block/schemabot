@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -151,10 +152,11 @@ func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int
 }
 
 // runControlCommand runs the shared lifecycle of a PR control command and
-// returns the typed response only when the operation was accepted. It loads and
-// authorizes the apply, executes the operation, and converts any failure
-// (error, missing response, or rejection) into a PR comment. On a non-nil
-// return the caller renders the operation-specific acceptance comment.
+// returns the typed response, along with the loaded apply, only when the
+// operation was accepted. It loads and authorizes the apply, executes the
+// operation, and converts any failure (error, missing response, or rejection)
+// into a PR comment. On a non-nil return the caller renders the
+// operation-specific acceptance comment.
 func runControlCommand[R any](
 	h *Handler,
 	ctx context.Context,
@@ -164,21 +166,21 @@ func runControlCommand[R any](
 	execute func(ctx context.Context, req apitypes.ControlRequest) (*R, error),
 	accepted func(*R) bool,
 	errorMessage func(*R) string,
-) *R {
+) (*R, *storage.Apply) {
 	apply, ok := h.loadApplyForPRControl(ctx, repo, pr, installationID, requestedBy, result, actionName)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, apply.Database, result.Environment, actionName)
 	if blocked {
-		return nil
+		return nil, nil
 	}
 	// Control commands are not durable cores, so an authorization evaluation
 	// failure and a merit denial both stop the command here; the gate has
 	// already logged and posted the distinction.
 	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, apply.Database, apply.DatabaseType, result.Environment, actionName)
 	if authErr != nil || blocked {
-		return nil
+		return nil, nil
 	}
 
 	caller := formatGitHubCaller(requestedBy, repo, pr)
@@ -190,7 +192,7 @@ func runControlCommand[R any](
 	if err != nil {
 		h.logControlCommandError(actionName, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
 		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, err.Error())
-		return nil
+		return nil, nil
 	}
 	if resp == nil {
 		h.logger.Error(actionName+" PR command returned no response",
@@ -201,7 +203,7 @@ func runControlCommand[R any](
 			"requested_by", requestedBy)
 		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy,
 			fmt.Sprintf("SchemaBot accepted the %s command but returned no response", actionName))
-		return nil
+		return nil, nil
 	}
 	if !accepted(resp) {
 		detail := errorMessage(resp)
@@ -216,9 +218,9 @@ func runControlCommand[R any](
 			"requested_by", requestedBy,
 			"error_message", errorMessage(resp))
 		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, detail)
-		return nil
+		return nil, nil
 	}
-	return resp
+	return resp, apply
 }
 
 // handleStopCommand handles the "schemabot stop <apply-id> -e <env>" PR
@@ -227,7 +229,7 @@ func (h *Handler) handleStopCommand(repo string, pr int, installationID int64, r
 	ctx, cancel := h.commandContext(commandTimeout)
 	defer cancel()
 
-	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Stop,
+	resp, _ := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Stop,
 		h.service.ExecuteStop,
 		func(r *apitypes.StopResponse) bool { return r.Accepted },
 		func(r *apitypes.StopResponse) string { return r.ErrorMessage })
@@ -260,7 +262,7 @@ func (h *Handler) handleCancelCommand(repo string, pr int, installationID int64,
 	ctx, cancel := h.commandContext(commandTimeout)
 	defer cancel()
 
-	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Cancel,
+	resp, _ := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Cancel,
 		h.service.ExecuteCancel,
 		func(r *apitypes.CancelResponse) bool { return r.Accepted },
 		func(r *apitypes.CancelResponse) string { return r.ErrorMessage })
@@ -293,7 +295,7 @@ func (h *Handler) handleStartCommand(repo string, pr int, installationID int64, 
 	ctx, cancel := h.commandContext(commandTimeout)
 	defer cancel()
 
-	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Start,
+	resp, _ := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Start,
 		h.service.ExecuteStart,
 		func(r *apitypes.StartResponse) bool { return r.Accepted },
 		func(r *apitypes.StartResponse) string { return r.ErrorMessage })
@@ -327,7 +329,7 @@ func (h *Handler) handleReleaseCommand(repo string, pr int, installationID int64
 	ctx, cancel := h.commandContext(commandTimeout)
 	defer cancel()
 
-	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Release,
+	resp, _ := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Release,
 		h.service.ExecuteRelease,
 		func(r *apitypes.ReleaseResponse) bool { return r.Accepted },
 		func(r *apitypes.ReleaseResponse) string { return r.ErrorMessage })
@@ -356,7 +358,7 @@ func (h *Handler) handleCutoverCommand(repo string, pr int, installationID int64
 	ctx, cancel := h.commandContext(commandTimeout)
 	defer cancel()
 
-	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Cutover,
+	resp, apply := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Cutover,
 		h.service.ExecuteCutover,
 		func(r *apitypes.ControlResponse) bool { return r.Accepted },
 		func(r *apitypes.ControlResponse) string { return r.ErrorMessage })
@@ -371,12 +373,18 @@ func (h *Handler) handleCutoverCommand(repo string, pr int, installationID int64
 		"environment", result.Environment,
 		"requested_by", requestedBy,
 		"apply_status", resp.Status)
-	h.postComment(repo, pr, installationID, templates.RenderCutoverCommandAccepted(templates.CutoverCommandAcceptedData{
-		ApplyID:     result.ApplyID,
-		Environment: result.Environment,
-		RequestedBy: requestedBy,
-		Status:      resp.Status,
-	}))
+	// The ack is posted as a tracked comment so the driver's observer can fold
+	// it once the outcome lands: when the cutover resolves the apply directly
+	// to a terminal state, the completion summary is an in-place edit of the
+	// cutover prompt above this ack, and an unfolded ack would stay the
+	// bottom-most comment on the PR, hiding the outcome above it.
+	h.postAndTrackComment(ctx, repo, pr, installationID, apply, state.Comment.CutoverAck,
+		templates.RenderCutoverCommandAccepted(templates.CutoverCommandAcceptedData{
+			ApplyID:     result.ApplyID,
+			Environment: result.Environment,
+			RequestedBy: requestedBy,
+			Status:      resp.Status,
+		}))
 }
 
 // volumeCommandLevelValid reports whether the parsed command carries a usable
@@ -423,7 +431,7 @@ func (h *Handler) handleVolumeCommand(repo string, pr int, installationID int64,
 		return
 	}
 
-	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Volume,
+	resp, _ := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Volume,
 		func(ctx context.Context, req apitypes.ControlRequest) (*apitypes.VolumeResponse, error) {
 			return h.service.ExecuteVolume(ctx, req, result.VolumeLevel)
 		},
@@ -452,7 +460,7 @@ func (h *Handler) handleSkipRevertCommand(repo string, pr int, installationID in
 	ctx, cancel := h.commandContext(commandTimeout)
 	defer cancel()
 
-	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.SkipRevert,
+	resp, _ := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.SkipRevert,
 		h.service.ExecuteSkipRevert,
 		func(r *apitypes.ControlResponse) bool { return r.Accepted },
 		func(r *apitypes.ControlResponse) string { return r.ErrorMessage })
@@ -477,7 +485,7 @@ func (h *Handler) handleRevertCommand(repo string, pr int, installationID int64,
 	ctx, cancel := h.commandContext(commandTimeout)
 	defer cancel()
 
-	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Revert,
+	resp, _ := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Revert,
 		h.service.ExecuteRevert,
 		func(r *apitypes.ControlResponse) bool { return r.Accepted },
 		func(r *apitypes.ControlResponse) string { return r.ErrorMessage })

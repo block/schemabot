@@ -3832,6 +3832,28 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="cutover-ack-superseded-at-terminal"></a><strong>Cutover Ack: Superseded At Terminal</strong></summary>
+
+
+⏭️ Cutover request superseded — the outcome is posted in [the schema change summary](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Cutover request acknowledgement</summary>
+
+## Cutover Request Accepted
+
+**Apply**: `apply-a1b2c3d4e5f67890`
+**Environment**: `staging`
+**Requested by**: @alice
+
+Cutover request accepted. SchemaBot will complete this schema change; status remains available from the PR progress comment or CLI.
+
+
+</details>
+
+</details>
+
+<details>
 <summary><a name="retry-superseded-progress-comment-generic"></a><strong>Retry: Superseded Progress Comment (Generic)</strong></summary>
 
 

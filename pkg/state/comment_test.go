@@ -9,11 +9,12 @@ import (
 func TestCommentConstants(t *testing.T) {
 	assert.Equal(t, "progress", Comment.Progress)
 	assert.Equal(t, "cutover", Comment.Cutover)
+	assert.Equal(t, "cutover_ack", Comment.CutoverAck)
 	assert.Equal(t, "summary", Comment.Summary)
 }
 
 func TestCommentConstantsAreDistinct(t *testing.T) {
-	states := []string{Comment.Progress, Comment.Cutover, Comment.Summary}
+	states := []string{Comment.Progress, Comment.Cutover, Comment.CutoverAck, Comment.Summary}
 	seen := make(map[string]bool)
 	for _, s := range states {
 		assert.False(t, seen[s], "duplicate comment state: %s", s)

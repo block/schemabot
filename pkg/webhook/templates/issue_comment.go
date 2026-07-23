@@ -357,10 +357,20 @@ type SupersededProgressData struct {
 // Every rotation flavor shares this shape and differs only in its headline
 // (which must start with that flavor's superseded prefix) and fold label.
 func renderSupersededFold(headline, foldLabel, repo string, pr int, newCommentID int64, previousBody string) string {
+	return renderFold(headline+supersededFoldMarker, foldLabel, repo, pr, newCommentID, previousBody)
+}
+
+// renderFold renders the shared folded-comment shape: a headline whose
+// trailing successor link points at the comment that now matters, with the
+// folded comment's last rendered body preserved inside a collapsed details
+// block. headlineWithLinkOpen must end with the flavor's link-open marker
+// (the link text and "](https://github.com/") so detection helpers can key on
+// the headline.
+func renderFold(headlineWithLinkOpen, foldLabel, repo string, pr int, newCommentID int64, previousBody string) string {
 	return fmt.Sprintf(
-		"%s"+supersededFoldMarker+"%s/pull/%d#issuecomment-%d).\n\n"+
+		"%s%s/pull/%d#issuecomment-%d).\n\n"+
 			"<details>\n<summary>%s</summary>\n\n%s\n\n</details>\n",
-		headline, repo, pr, newCommentID, foldLabel, previousBody)
+		headlineWithLinkOpen, repo, pr, newCommentID, foldLabel, previousBody)
 }
 
 // RenderVolumeSupersededProgressComment renders the frozen body written over a
@@ -474,6 +484,40 @@ func IsSupersededProgressComment(body string) bool {
 		}
 	}
 	return false
+}
+
+// cutoverAckSupersededPrefix opens every frozen body written over a spent
+// cutover command acknowledgement; IsSupersededCutoverAckComment keys on it so
+// a fold retry can tell an already-folded ack from a live one.
+const cutoverAckSupersededPrefix = "⏭️ Cutover request superseded"
+
+// cutoverAckFoldMarker is the successor-link text the cutover ack fold embeds
+// in its headline. IsSupersededCutoverAckComment requires it alongside the
+// prefix, so a live comment that merely opens with the same words is never
+// misread as already folded.
+const cutoverAckFoldMarker = " [the schema change summary](https://github.com/"
+
+// RenderCutoverAckSupersededComment renders the frozen body written over the
+// cutover command acknowledgement once the cutover-driven apply reaches its
+// terminal state. The ack's call to wait is spent — the outcome comment is
+// what matters now — so the ack collapses into a details block under a pointer
+// to the schema change summary, keeping the outcome the last meaningful
+// comment on the PR timeline.
+func RenderCutoverAckSupersededComment(data SupersededProgressData) string {
+	return renderFold(cutoverAckSupersededPrefix+" — the outcome is posted in"+cutoverAckFoldMarker,
+		"Cutover request acknowledgement",
+		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
+}
+
+// IsSupersededCutoverAckComment reports whether a comment body is already the
+// frozen cutover-ack rendering, so a fold retry after a failed supersede write
+// does not wrap the folded body in a second fold. Both the prefix and the
+// successor link on the same headline are required, so a live body that merely
+// opens with the same words is never mistaken for a folded one.
+func IsSupersededCutoverAckComment(body string) bool {
+	headline, _, _ := strings.Cut(body, "\n")
+	return strings.HasPrefix(headline, cutoverAckSupersededPrefix) &&
+		strings.Contains(headline, cutoverAckFoldMarker)
 }
 
 // RenderCutoverCommandAccepted renders the acknowledgement posted when a PR

@@ -4,9 +4,14 @@ package state
 var Comment = struct {
 	Progress string
 	Cutover  string
-	Summary  string
+	// CutoverAck tracks the acknowledgement posted when an operator's cutover
+	// command records durable cutover intent, so the ack can be folded once
+	// the outcome lands.
+	CutoverAck string
+	Summary    string
 }{
-	Progress: "progress",
-	Cutover:  "cutover",
-	Summary:  "summary",
+	Progress:   "progress",
+	Cutover:    "cutover",
+	CutoverAck: "cutover_ack",
+	Summary:    "summary",
 }

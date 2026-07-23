@@ -469,8 +469,16 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 			// prompt now carries the stop record, so consume its row —
 			// otherwise a resumed drive finds a live prompt row and mutes
 			// behind the stop record instead of tracking the resumed copy in
-			// the fresh comment the resume rotation posts.
+			// the fresh comment the resume rotation posts. The cutover ack, if
+			// one exists, stays live: the accepted cutover is still owed its
+			// outcome once the apply resumes.
 			o.supersedeCutoverComment(ctx, apply)
+		} else {
+			// The prompt above the ack is now the completion summary, so the
+			// operator's cutover ack — the bottom-most comment — is spent.
+			// Fold it pointing at the outcome so readers at the bottom of the
+			// PR are not left on a request ack with the outcome above it.
+			o.foldCutoverAckComment(apply, cutover.GitHubCommentID)
 		}
 	} else {
 		// Edit the progress comment to its final state (completed bars / error).
@@ -1219,6 +1227,83 @@ func (o *CommentObserver) rotateProgressCommentAfterCutover(apply *storage.Apply
 
 	o.logInfo(apply, "observer: posted fresh progress comment after deferred cutover", "state", apply.State)
 	return true
+}
+
+// foldCutoverAckComment collapses the operator's cutover command
+// acknowledgement into a details block pointing at the completion comment once
+// the cutover-driven apply reaches its terminal state. The ack lands at the
+// bottom of the PR when the operator issues the cutover command; when the
+// cutover prompt above it is finalized in place as the completion comment, the
+// unfolded ack would stay the bottom-most comment and send readers scrolling
+// up for the outcome. The tracked ack row is the operator-origin signal — an
+// apply that cuts over without a cutover command never posts an ack, has no
+// row, and is untouched. The row's supersede is the durable at-most-once
+// marker: a fresh observer on a later drive claim finds the superseded row and
+// skips, and a fold whose supersede write failed is retried without nesting
+// because the already-folded body is detected before editing. The fold runs
+// for failed terminals too — the ack carries no failure signal of its own, and
+// the failure summary it points at is the comment that does.
+func (o *CommentObserver) foldCutoverAckComment(apply *storage.Apply, outcomeCommentID int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ack, err := o.stor.ApplyComments().Get(ctx, o.applyID, state.Comment.CutoverAck)
+	if err != nil {
+		o.logError(apply, "observer: failed to load cutover ack comment at terminal; the ack stays unfolded until a later observer pass retries", "error", err)
+		return
+	}
+	if ack == nil {
+		// The apply reached its terminal state without an acknowledged PR
+		// cutover command (an auto cutover, or a command acknowledged through
+		// another surface), so there is no ack to fold.
+		o.logInfo(apply, "observer: no cutover ack comment tracked at terminal; nothing to fold")
+		return
+	}
+	if ack.SupersededAt != nil {
+		o.logInfo(apply, "observer: cutover ack comment already folded; skipping",
+			"github_comment_id", ack.GitHubCommentID)
+		return
+	}
+
+	if !o.leaseStillOwnsObserver(apply, "create GitHub client before folding cutover ack") {
+		return
+	}
+	client, err := o.ghClient.ForInstallation(o.installationID)
+	if err != nil {
+		o.logError(apply, "observer: failed to create GitHub client to fold cutover ack comment", "error", err)
+		return
+	}
+	ackBody, err := client.GetIssueComment(ctx, o.repo, ack.GitHubCommentID)
+	if err != nil {
+		o.logError(apply, "observer: failed to load cutover ack comment body before folding it",
+			"error", err, "github_comment_id", ack.GitHubCommentID)
+		return
+	}
+	// A retry after a failed supersede write finds the folded body already on
+	// GitHub; only a still-live body is edited so the fold is never nested.
+	if !templates.IsSupersededCutoverAckComment(ackBody) {
+		if !o.leaseStillOwnsObserver(apply, "fold cutover ack comment") {
+			return
+		}
+		folded := templates.RenderCutoverAckSupersededComment(templates.SupersededProgressData{
+			Repo:         o.repo,
+			PR:           o.pr,
+			NewCommentID: outcomeCommentID,
+			PreviousBody: ackBody,
+		})
+		if err := client.EditIssueComment(ctx, o.repo, ack.GitHubCommentID, folded); err != nil {
+			o.logError(apply, "observer: failed to fold cutover ack comment; the live ack row keeps the next observer pass retrying",
+				"error", err, "github_comment_id", ack.GitHubCommentID)
+			return
+		}
+	}
+	if err := o.stor.ApplyComments().Supersede(o.contextWithApplyLease(ctx, apply), o.applyID, state.Comment.CutoverAck); err != nil {
+		o.logError(apply, "observer: failed to supersede cutover ack row after folding it; a later observer pass finds the folded body and retries only this write",
+			"error", err, "github_comment_id", ack.GitHubCommentID)
+		return
+	}
+	o.logInfo(apply, "observer: folded cutover ack comment pointing at the completion comment",
+		"github_comment_id", ack.GitHubCommentID, "outcome_comment_id", outcomeCommentID)
 }
 
 // supersedeCutoverComment consumes the live cutover row after a post-cutover
