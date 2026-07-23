@@ -634,6 +634,7 @@ func AdjustActiveApplies(ctx context.Context, delta int64, database, deployment,
 var knownControlOperations = map[string]bool{
 	"cutover":       true,
 	"stop":          true,
+	"cancel":        true,
 	"start":         true,
 	"volume":        true,
 	"revert":        true,
@@ -655,6 +656,25 @@ func RecordControlOperation(ctx context.Context, operation, database, deployment
 		DeploymentAttribute(deployment),
 		EnvironmentAttribute(environment),
 		attribute.String("status", status),
+	)
+}
+
+// RecordRemoteControlRequestStale counts retransmissions of a durable
+// stop/cancel control request that the data plane accepted but has not
+// consumed within the stale threshold. A non-zero rate means an accepted
+// operator command is not taking effect on the remote apply — the data plane's
+// own driver is failing to consume it (its logs carry the failing consume
+// error) — and the apply will not converge until that is resolved.
+func RecordRemoteControlRequestStale(ctx context.Context, operation, database, deployment, environment string) {
+	if !knownControlOperations[operation] {
+		operation = "unknown"
+	}
+	addCounter(ctx, "schemabot.remote_control_requests.stale_resends_total",
+		"Total retransmissions of remote control requests still unconsumed by the data plane past the stale threshold", "{resend}",
+		attribute.String("operation", operation),
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
 	)
 }
 

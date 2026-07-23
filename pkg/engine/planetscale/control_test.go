@@ -65,6 +65,102 @@ func TestStart_AcceptsDeferredDeploy(t *testing.T) {
 	assert.NotContains(t, err.Error(), "not supported")
 }
 
+// cancelDeployRequestClient fails every cancel attempt with a fixed error and
+// serves a fixed deploy request (or read error) for the follow-up state read.
+type cancelDeployRequestClient struct {
+	psclient.PSClient
+	cancelErr error
+	dr        *ps.DeployRequest
+	getErr    error
+}
+
+func (c *cancelDeployRequestClient) CancelDeployRequest(context.Context, *ps.CancelDeployRequestRequest) (*ps.DeployRequest, error) {
+	return nil, c.cancelErr
+}
+
+func (c *cancelDeployRequestClient) GetDeployRequest(context.Context, *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
+	if c.getErr != nil {
+		return nil, c.getErr
+	}
+	return c.dr, nil
+}
+
+// PlanetScale rejects a cancel of a deploy request that is already closed, and
+// a prior cancel attempt may be what closed it — cancel is retried across
+// drives and pods, so a rejection of an already-cancelled deploy request must
+// read as success. A deploy request that closed any other way (completed,
+// errored) must stay an error naming its live state: reporting a successful
+// cancel there would misrepresent a schema change that actually landed.
+func TestCancel_AlreadyClosedDeployRequest(t *testing.T) {
+	meta, err := encodePSMetadata(&psMetadata{
+		BranchName:       "schemabot-mydb-abc",
+		DeployRequestID:  121,
+		DeployRequestURL: "https://example.test/deploys/121",
+	})
+	require.NoError(t, err)
+
+	controlReq := func() *engine.ControlRequest {
+		return &engine.ControlRequest{
+			Database:    "mydb",
+			ResumeState: &engine.ResumeState{Metadata: meta},
+			Credentials: &engine.Credentials{Metadata: map[string]string{
+				"organization": "org",
+				"token_name":   "tn",
+				"token_value":  "tv",
+			}},
+		}
+	}
+
+	newEngine := func(client *cancelDeployRequestClient) *Engine {
+		return NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+			func(_, _ string) (psclient.PSClient, error) {
+				return client, nil
+			})
+	}
+	closedErr := errors.New("The deploy request is closed.")
+
+	for _, cancelledState := range []string{deployState.InProgressCancel, deployState.CompleteCancel, deployState.Cancelled} {
+		t.Run("cancelled deploy request in state "+cancelledState+" reads as success", func(t *testing.T) {
+			e := newEngine(&cancelDeployRequestClient{
+				cancelErr: closedErr,
+				dr:        &ps.DeployRequest{Number: 121, DeploymentState: cancelledState},
+			})
+
+			result, err := e.Cancel(t.Context(), controlReq())
+
+			require.NoError(t, err)
+			assert.True(t, result.Accepted)
+			assert.Contains(t, result.Message, "Deploy request #121 already cancelled")
+		})
+	}
+
+	t.Run("deploy request closed by completing stays an error naming its state", func(t *testing.T) {
+		e := newEngine(&cancelDeployRequestClient{
+			cancelErr: closedErr,
+			dr:        &ps.DeployRequest{Number: 121, DeploymentState: deployState.Complete},
+		})
+
+		_, err := e.Cancel(t.Context(), controlReq())
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `cancel deploy request #121 rejected in deployment state "complete"`)
+		assert.Contains(t, err.Error(), "The deploy request is closed.")
+	})
+
+	t.Run("failed state read keeps both errors", func(t *testing.T) {
+		e := newEngine(&cancelDeployRequestClient{
+			cancelErr: closedErr,
+			getErr:    errors.New("deploy request not found"),
+		})
+
+		_, err := e.Cancel(t.Context(), controlReq())
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cancel deploy request #121 (may have been deleted; state read also failed: deploy request not found)")
+		assert.Contains(t, err.Error(), "The deploy request is closed.")
+	})
+}
+
 // applyDeployRequestErrorClient fails every cutover attempt with a fixed error.
 type applyDeployRequestErrorClient struct {
 	psclient.PSClient

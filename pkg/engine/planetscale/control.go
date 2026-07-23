@@ -35,7 +35,30 @@ func (e *Engine) cancelDeployRequest(ctx context.Context, operation engine.Contr
 		Database:     req.Database,
 		Number:       meta.DeployRequestID,
 	}); err != nil {
-		return nil, fmt.Errorf("cancel deploy request #%d (may have been deleted): %w", meta.DeployRequestID, err)
+		// Cancel must be idempotent: PlanetScale rejects a cancel of a deploy
+		// request that is already closed, and a prior cancel attempt (this
+		// driver's or another's) may have closed it. Read the deploy request's
+		// live state to distinguish "already cancelled" — the goal state, report
+		// success — from a deploy request that closed by completing or failing,
+		// where reporting a successful cancel would misrepresent a schema change
+		// that actually landed.
+		dr, getErr := client.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+			Organization: credOrg(req.Credentials),
+			Database:     req.Database,
+			Number:       meta.DeployRequestID,
+		})
+		if getErr != nil {
+			return nil, fmt.Errorf("cancel deploy request #%d (may have been deleted; state read also failed: %w): %w", meta.DeployRequestID, getErr, err)
+		}
+		switch dr.DeploymentState {
+		case deployState.InProgressCancel, deployState.CompleteCancel, deployState.Cancelled:
+			return &engine.ControlResult{
+				Accepted:    true,
+				Message:     fmt.Sprintf("Deploy request #%d already cancelled", meta.DeployRequestID),
+				ResumeState: req.ResumeState,
+			}, nil
+		}
+		return nil, fmt.Errorf("cancel deploy request #%d rejected in deployment state %q: %w", meta.DeployRequestID, dr.DeploymentState, err)
 	}
 
 	return &engine.ControlResult{
