@@ -41,26 +41,23 @@ var terminalTaskStatesSQL = func() string {
 
 // taskStore implements storage.TaskStore using MySQL.
 type taskStore struct {
-	db *sql.DB
-}
-
-type taskInserter interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	db       *sql.DB
+	identity identityInserter
 }
 
 // Create stores a new task.
 func (s *taskStore) Create(ctx context.Context, task *storage.Task) (int64, error) {
-	return insertTask(ctx, s.db, task)
+	return insertTask(ctx, s.db, s.identity, task)
 }
 
-func insertTask(ctx context.Context, execer taskInserter, task *storage.Task) (int64, error) {
+func insertTask(ctx context.Context, exec queryExecer, identity identityInserter, task *storage.Task) (int64, error) {
 	// Ensure options has valid JSON (empty object if nil)
 	options := task.Options
 	if len(options) == 0 {
 		options = []byte("{}")
 	}
 
-	result, err := execer.ExecContext(ctx, `
+	id, err := identity.InsertID(ctx, exec, `
 		INSERT INTO tasks (
 			task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
 			namespace, table_name, shard, ddl, ddl_action,
@@ -78,11 +75,6 @@ func insertTask(ctx context.Context, execer taskInserter, task *storage.Task) (i
 		task.IsInstant, task.ReadyToComplete, nullString(task.EngineMigrationID),
 		task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
 	)
-	if err != nil {
-		return 0, err
-	}
-
-	id, err := result.LastInsertId()
 	if err != nil {
 		return 0, err
 	}
@@ -309,7 +301,7 @@ func shardTaskInsertValues(task *storage.Task) (string, []any) {
 func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Task, opLease storage.OperationLease) error {
 	values, args := shardTaskInsertValues(task)
 	args = append(args, opLease.OperationID, opLease.Token)
-	result, err := s.db.ExecContext(ctx, `
+	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db, `
 		INSERT INTO tasks (`+shardTaskInsertColumns+`)
 		SELECT `+values+`
 		FROM apply_operations ao
@@ -319,17 +311,11 @@ func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Ta
 		return fmt.Errorf("insert shard task for operation %d %s.%s shard %q: %w",
 			opLease.OperationID, task.Namespace, task.TableName, task.Shard, err)
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("read shard task insert rows affected for operation %d: %w", opLease.OperationID, err)
-	}
-	if rows == 0 {
+	if !inserted {
 		// Zero rows inserted means the operation lease is no longer current.
 		return ensureOperationLeaseStillOwned(ctx, s.db, opLease)
 	}
-	if newID, err := result.LastInsertId(); err == nil {
-		task.ID = newID
-	}
+	task.ID = id
 	return nil
 }
 
@@ -341,7 +327,7 @@ func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Ta
 func (s *taskStore) insertShardTaskGuardedByApply(ctx context.Context, task *storage.Task, lease storage.ApplyLease) error {
 	values, args := shardTaskInsertValues(task)
 	args = append(args, lease.ApplyID, lease.Token)
-	result, err := s.db.ExecContext(ctx, `
+	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db, `
 		INSERT INTO tasks (`+shardTaskInsertColumns+`)
 		SELECT `+values+`
 		FROM applies a
@@ -351,17 +337,11 @@ func (s *taskStore) insertShardTaskGuardedByApply(ctx context.Context, task *sto
 		return fmt.Errorf("insert shard task for apply %d %s.%s shard %q: %w",
 			lease.ApplyID, task.Namespace, task.TableName, task.Shard, err)
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("read shard task insert rows affected for apply %d: %w", lease.ApplyID, err)
-	}
-	if rows == 0 {
+	if !inserted {
 		// Zero rows inserted means the apply lease is no longer current.
 		return ensureApplyLeaseStillOwned(ctx, s.db, lease)
 	}
-	if newID, err := result.LastInsertId(); err == nil {
-		task.ID = newID
-	}
+	task.ID = id
 	return nil
 }
 

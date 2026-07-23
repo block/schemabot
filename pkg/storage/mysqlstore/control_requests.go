@@ -14,7 +14,8 @@ const controlRequestColumns = `id, apply_id, operation, status,
 	requested_by, error_message, metadata, completed_at, created_at, updated_at`
 
 type controlRequestStore struct {
-	db *sql.DB
+	db       *sql.DB
+	identity identityInserter
 }
 
 func (s *controlRequestStore) RequestPending(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
@@ -88,7 +89,7 @@ func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.A
 		return updated, false, nil
 	}
 
-	result, err := tx.ExecContext(ctx, `
+	id, err := s.identity.InsertID(ctx, tx, `
 		INSERT INTO apply_control_requests (
 			apply_id, operation, status, requested_by, error_message, metadata
 		) VALUES (?, ?, ?, ?, ?, ?)
@@ -98,10 +99,6 @@ func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.A
 	)
 	if err != nil {
 		return nil, false, fmt.Errorf("create control request for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return nil, false, fmt.Errorf("read control request id for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
 	}
 	req.ID = id
 	created, err := s.getByIDForUpdate(ctx, tx, id)
