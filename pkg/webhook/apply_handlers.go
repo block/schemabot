@@ -38,6 +38,12 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 //     user-facing rejection; an unexpected failure there (for example a
 //     transient GitHub config read) stays retryable.
 //
+// Gate blocks are terminal even when the gate blocked because it could not
+// evaluate its own inputs (for example a GitHub read inside the gate failed):
+// gates fail closed and post their own retry guidance, so the block is the
+// command's answer and recovery is the user re-issuing the command, not a
+// driver re-driving the delivery.
+//
 // A posted PR comment does not imply a terminal disposition: retryable sites
 // post best-effort error comments too, so a durable driver re-driving one may
 // post the same comment again.
@@ -229,9 +235,11 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 		if isTransientRemotePlanError(err) {
 			return true, fmt.Errorf("apply command plan %s#%d: %w", repo, pr, err)
 		}
-		// Policy, validation, and planning failures are deterministic: the
-		// posted error is the command's answer, and a re-drive would only
-		// reproduce it.
+		// Failures other than remote-deployment unavailability are treated
+		// as deterministic: the posted error is the command's answer. Some
+		// of them are not truly deterministic (planning runs against a live
+		// target database, which can be briefly unreachable), so recovery
+		// for those is the user re-issuing the command.
 		return false, nil
 	}
 
