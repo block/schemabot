@@ -118,7 +118,11 @@ func (s *applyLogStore) GetRecentByApply(ctx context.Context, applyID int64, lim
 	return logs, nil
 }
 
-// List returns logs matching the filter criteria, ordered by created_at.
+// List returns the newest Limit logs matching the filter criteria, ordered by
+// created_at ascending so the result reads chronologically. Ties on created_at
+// (second precision) are broken by id so entries keep their insertion order.
+// Callers rendering a bounded tail (like the CLI logs command) need the newest
+// entries — a long-running apply accumulates far more log rows than the window.
 func (s *applyLogStore) List(ctx context.Context, filter storage.ApplyLogFilter) ([]*storage.ApplyLog, error) {
 	// Build query with filters
 	query := `
@@ -141,7 +145,7 @@ func (s *applyLogStore) List(ctx context.Context, filter storage.ApplyLogFilter)
 		args = append(args, filter.EventType)
 	}
 
-	query += " ORDER BY created_at ASC"
+	query += " ORDER BY created_at DESC, id DESC"
 
 	limit := filter.Limit
 	if limit <= 0 {
@@ -156,7 +160,12 @@ func (s *applyLogStore) List(ctx context.Context, filter storage.ApplyLogFilter)
 	}
 	defer utils.CloseAndLog(rows)
 
-	return scanApplyLogs(rows)
+	logs, err := scanApplyLogs(rows)
+	if err != nil {
+		return nil, err
+	}
+	slices.Reverse(logs)
+	return logs, nil
 }
 
 // scanApplyLogs scans multiple apply log rows.

@@ -17,7 +17,7 @@ type LogsCmd struct {
 	Database    string `short:"d" help:"Database name (required unless apply_id provided)"`
 	Environment string `short:"e" help:"Target environment (required unless apply_id provided)"`
 	ApplyID     string `short:"a" help:"Apply ID (e.g., apply_abc123)" name:"apply-id"`
-	Limit       int    `short:"n" help:"Number of log entries to show" default:"50"`
+	Limit       int    `short:"n" help:"Show the newest N log entries" default:"50"`
 	Follow      bool   `short:"f" help:"Follow logs in real-time"`
 	Deployment  string `help:"Read logs from the selected data-plane deployment"`
 	JSON        bool   `help:"Output as JSON"`
