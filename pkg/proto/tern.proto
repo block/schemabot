@@ -436,6 +436,11 @@ message TableChange {
   // Unsafe change tracking
   bool is_unsafe = 5;
   string unsafe_reason = 6;
+  // Execution-mode verdict: how the engine will run this statement at apply
+  // time. Empty means the engine's default path; "blocked" means the engine
+  // deterministically refuses the statement and the apply will fail.
+  string execution_mode = 7;
+  string mode_reason = 8;
 }
 
 // SchemaChange is a namespace-level bundle. A PlanResponse must include at most

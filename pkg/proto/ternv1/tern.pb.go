@@ -1126,8 +1126,13 @@ type TableChange struct {
 	ChangeType ChangeType             `protobuf:"varint,3,opt,name=change_type,json=changeType,proto3,enum=tern.v1.ChangeType" json:"change_type,omitempty"`
 	Namespace  string                 `protobuf:"bytes,4,opt,name=namespace,proto3" json:"namespace,omitempty"`
 	// Unsafe change tracking
-	IsUnsafe      bool   `protobuf:"varint,5,opt,name=is_unsafe,json=isUnsafe,proto3" json:"is_unsafe,omitempty"`
-	UnsafeReason  string `protobuf:"bytes,6,opt,name=unsafe_reason,json=unsafeReason,proto3" json:"unsafe_reason,omitempty"`
+	IsUnsafe     bool   `protobuf:"varint,5,opt,name=is_unsafe,json=isUnsafe,proto3" json:"is_unsafe,omitempty"`
+	UnsafeReason string `protobuf:"bytes,6,opt,name=unsafe_reason,json=unsafeReason,proto3" json:"unsafe_reason,omitempty"`
+	// Execution-mode verdict: how the engine will run this statement at apply
+	// time. Empty means the engine's default path; "blocked" means the engine
+	// deterministically refuses the statement and the apply will fail.
+	ExecutionMode string `protobuf:"bytes,7,opt,name=execution_mode,json=executionMode,proto3" json:"execution_mode,omitempty"`
+	ModeReason    string `protobuf:"bytes,8,opt,name=mode_reason,json=modeReason,proto3" json:"mode_reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1200,6 +1205,20 @@ func (x *TableChange) GetIsUnsafe() bool {
 func (x *TableChange) GetUnsafeReason() string {
 	if x != nil {
 		return x.UnsafeReason
+	}
+	return ""
+}
+
+func (x *TableChange) GetExecutionMode() string {
+	if x != nil {
+		return x.ExecutionMode
+	}
+	return ""
+}
+
+func (x *TableChange) GetModeReason() string {
+	if x != nil {
+		return x.ModeReason
 	}
 	return ""
 }
@@ -3531,7 +3550,7 @@ const file_tern_proto_rawDesc = "" +
 	"schemaPath\x1aT\n" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
-	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01J\x04\b\a\x10\b\"\xd4\x01\n" +
+	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01J\x04\b\a\x10\b\"\x9c\x02\n" +
 	"\vTableChange\x12\x1d\n" +
 	"\n" +
 	"table_name\x18\x01 \x01(\tR\ttableName\x12\x10\n" +
@@ -3540,7 +3559,10 @@ const file_tern_proto_rawDesc = "" +
 	"changeType\x12\x1c\n" +
 	"\tnamespace\x18\x04 \x01(\tR\tnamespace\x12\x1b\n" +
 	"\tis_unsafe\x18\x05 \x01(\bR\bisUnsafe\x12#\n" +
-	"\runsafe_reason\x18\x06 \x01(\tR\funsafeReason\"\xb0\x03\n" +
+	"\runsafe_reason\x18\x06 \x01(\tR\funsafeReason\x12%\n" +
+	"\x0eexecution_mode\x18\a \x01(\tR\rexecutionMode\x12\x1f\n" +
+	"\vmode_reason\x18\b \x01(\tR\n" +
+	"modeReason\"\xb0\x03\n" +
 	"\fSchemaChange\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x129\n" +
 	"\rtable_changes\x18\x02 \x03(\v2\x14.tern.v1.TableChangeR\ftableChanges\x12?\n" +
