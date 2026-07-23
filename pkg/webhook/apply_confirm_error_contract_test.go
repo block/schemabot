@@ -16,8 +16,7 @@ import (
 
 // applyConfirmCommandCore returns a durability disposition (retry, err) that a
 // future durable issue_comment driver consumes. The synchronous goSafe wrapper
-// discards it, so these tests pin the contract directly on the core. See
-// decision 0002.
+// discards it, so these tests pin the contract directly on the core.
 
 // A command bootstrap failure (here, the per-installation GitHub client cannot be
 // created) is a transient infrastructure failure the same delivery could clear on
