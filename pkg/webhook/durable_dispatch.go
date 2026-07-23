@@ -663,11 +663,13 @@ type durableRerequestAutoPlan struct {
 // request. Config discovery and plan dispatch run under the delivery lease,
 // while per-database plan execution still runs in detached goroutines whose
 // durability is owned by the applies/tasks layer. Like the synchronous request
-// path it stops before discovery when the rerequested head is no longer the
-// PR's current head: planning a stale head would list the current PR's files
-// against a stale config snapshot, and a newer push already enqueued its own
-// delivery. A GitHub failure verifying the head keeps the delivery retryable
-// rather than completing it, so a transient outage cannot drop the re-plan.
+// path it stops before discovery when the PR is closed (closed PRs are
+// read-only history whose stored check state was removed at close) or when
+// the rerequested head is no longer the PR's current head: planning a stale
+// head would list the current PR's files against a stale config snapshot, and
+// a newer push already enqueued its own delivery. A GitHub failure verifying
+// the target keeps the delivery retryable rather than completing it, so a
+// transient outage cannot drop the re-plan.
 func (h *Handler) processDurableRerequestAutoPlan(ctx context.Context, event *storage.WebhookEvent, req durableRerequestAutoPlan) (retry bool, err error) {
 	installationID, err := durableInstallationID(event)
 	if err != nil {
@@ -686,30 +688,16 @@ func (h *Handler) processDurableRerequestAutoPlan(ctx context.Context, event *st
 	}
 	defer cancel()
 
-	// Verify the rerequested head is still the PR's current head before
-	// discovery. A GitHub failure here is uncertainty, not staleness: keep the
-	// delivery retryable so a transient outage cannot silently complete (and
-	// drop) the re-plan. A confirmed newer head means a later push already
-	// enqueued its own delivery, so complete this one without planning a stale
-	// snapshot.
-	prInfo, err := client.FetchPullRequest(ctx, req.repo, req.pr)
-	if err != nil {
-		metrics.RecordStatusCheckOperation(runCtx, metrics.StatusCheckOperation{
-			Operation:  req.metricsOperation,
-			Repository: req.repo,
-			Status:     "error",
-		})
-		return true, fmt.Errorf("verify current head for durable %s rerequest %s (%s#%d): %w", req.event, event.DeliveryID, req.repo, req.pr, err)
+	// Verify the target PR is still plannable before discovery. A GitHub
+	// failure here is uncertainty, not a decline: keep the delivery retryable
+	// so a transient outage cannot silently complete (and drop) the re-plan.
+	// A confirmed closed PR or superseded head means there is nothing valid to
+	// re-plan, so complete the delivery without planning.
+	plannable, verifyErr := h.rerequestTargetIsPlannable(ctx, client, req.repo, req.pr, req.headSHA, req.metricsOperation, event.DeliveryID)
+	if verifyErr != nil {
+		return true, fmt.Errorf("verify re-run target for durable %s rerequest %s (%s#%d): %w", req.event, event.DeliveryID, req.repo, req.pr, verifyErr)
 	}
-	if prInfo.HeadSHA != req.headSHA {
-		metrics.RecordStatusCheckOperation(runCtx, metrics.StatusCheckOperation{
-			Operation:  req.metricsOperation,
-			Repository: req.repo,
-			Status:     "stale",
-		})
-		h.logger.Info("durable re-run request ignored because head SHA is no longer current for PR",
-			"delivery_id", event.DeliveryID, "event", req.event, "repo", req.repo, "pr", req.pr,
-			"stale_head_sha", req.headSHA, "current_head_sha", prInfo.HeadSHA)
+	if !plannable {
 		return false, nil
 	}
 

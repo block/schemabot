@@ -242,6 +242,33 @@ func TestDurableCheckSuiteDriverCompletesStaleHead(t *testing.T) {
 	require.Equal(t, int64(0), fileListCalls.Load(), "a stale rerequest must stop before config discovery")
 }
 
+// A durable check_suite rerequest for a closed (merged) PR is completed without
+// running discovery: closed PRs are read-only history — apply commands are
+// rejected on them and PR-close cleanup removed their stored check state — so
+// a re-plan would recreate deleted state and post a plan nobody can act on.
+func TestDurableCheckSuiteDriverCompletesClosedPR(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableCheckSuiteRerequestEvent(t))
+	ghClient, mux := setupGitHubServer(t)
+	serveMergedCheckRunPR(t, mux, "head-sha")
+	var fileListCalls atomic.Int64
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7/files", func(w http.ResponseWriter, _ *http.Request) {
+		fileListCalls.Add(1)
+		require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{}))
+	})
+	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghClient, testLogger())}
+	h := newDurableDriverHandler(t, store, nil, factory)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case <-store.completed:
+	default:
+		t.Fatal("expected a closed-PR check_suite rerequest to be marked completed")
+	}
+	require.Empty(t, store.failed)
+	require.Equal(t, int64(0), fileListCalls.Load(), "a closed-PR rerequest must stop before config discovery")
+}
+
 // A GitHub failure verifying the current head is uncertainty, not staleness, so
 // the delivery stays retryable rather than silently completing and dropping the
 // re-plan.
@@ -259,7 +286,7 @@ func TestDurableCheckSuiteDriverRetriesHeadVerificationFailure(t *testing.T) {
 	select {
 	case failure := <-store.failed:
 		require.NotNil(t, failure.retryAfter, "head-verification failure must stay retryable")
-		require.Contains(t, failure.errMsg, "verify current head for durable check_suite rerequest")
+		require.Contains(t, failure.errMsg, "verify re-run target for durable check_suite rerequest")
 	default:
 		t.Fatal("expected head-verification failure to be marked failed")
 	}

@@ -235,8 +235,19 @@ func (h *Handler) handleCheckRunRerequest(ctx context.Context, metricApp string,
 	}
 	defer cancel()
 
-	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, payload.CheckRun.HeadSHA, "check_run_rerequest") {
-		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run rerequest ignored for stale head SHA"})
+	plannable, err := h.rerequestTargetIsPlannable(ctx, client, repo, pr, payload.CheckRun.HeadSHA, "check_run_rerequest", deliveryID)
+	if err != nil {
+		// The synchronous path has no retry mechanism, so an unverifiable
+		// target is logged and the delivery acknowledged without planning.
+		h.logger.Error("failed to verify check_run rerequest target",
+			"repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA,
+			"check_run_id", payload.CheckRun.ID, "check_name", payload.CheckRun.Name,
+			"delivery_id", deliveryID, "error", err)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run rerequest ignored: could not verify PR"})
+		return
+	}
+	if !plannable {
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run rerequest ignored for closed PR or stale head"})
 		return
 	}
 

@@ -26,11 +26,11 @@ type checkSuitePayload struct {
 }
 
 // handleCheckSuite routes check_suite deliveries. A rerequested action is the
-// GitHub UI's "Re-run all checks" — the only re-run affordance on a merged
-// PR — and re-runs the SchemaBot evaluation for the suite's commit. Other
-// actions (created, completed) fire on every commit as part of the normal
-// check lifecycle and carry no operator intent, so they are acknowledged
-// without work.
+// GitHub UI's "Re-run all checks" button and re-runs the SchemaBot evaluation
+// for the suite's commit while the PR is open; on a closed PR the re-run is
+// declined, since closed PRs are read-only history. Other actions (created,
+// completed) fire on every commit as part of the normal check lifecycle and
+// carry no operator intent, so they are acknowledged without work.
 func (h *Handler) handleCheckSuite(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte, deliveryID string) {
 	var payload checkSuitePayload
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -148,8 +148,19 @@ func (h *Handler) handleCheckSuiteRerequest(ctx context.Context, metricApp strin
 	}
 	defer cancel()
 
-	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, payload.CheckSuite.HeadSHA, "check_suite_rerequest") {
-		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_suite rerequest ignored for stale head SHA"})
+	plannable, err := h.rerequestTargetIsPlannable(ctx, client, repo, pr, payload.CheckSuite.HeadSHA, "check_suite_rerequest", deliveryID)
+	if err != nil {
+		// The synchronous path has no retry mechanism, so an unverifiable
+		// target is logged and the delivery acknowledged without planning.
+		h.logger.Error("failed to verify check_suite rerequest target",
+			"repo", repo, "pr", pr, "head_sha", payload.CheckSuite.HeadSHA,
+			"check_suite_id", payload.CheckSuite.ID,
+			"delivery_id", deliveryID, "error", err)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_suite rerequest ignored: could not verify PR"})
+		return
+	}
+	if !plannable {
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_suite rerequest ignored for closed PR or stale head"})
 		return
 	}
 

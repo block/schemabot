@@ -222,15 +222,31 @@ func TestDurableCheckRunDriverCompletesNonSchemaBotCheck(t *testing.T) {
 	}
 }
 
-// serveCheckRunPRHead registers the PR lookup the driver's pre-dispatch head
-// check performs, reporting currentHeadSHA as the PR's current head.
+// serveCheckRunPRHead registers the PR lookup the driver's pre-dispatch target
+// check performs, reporting currentHeadSHA as the current head of an open PR.
 func serveCheckRunPRHead(t *testing.T, mux *http.ServeMux, currentHeadSHA string) {
 	t.Helper()
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"head": map[string]any{"sha": currentHeadSHA, "ref": "feature-branch"},
-			"base": map[string]any{"sha": "def456", "ref": "main"},
-			"user": map[string]any{"login": "testuser"},
+			"head":  map[string]any{"sha": currentHeadSHA, "ref": "feature-branch"},
+			"base":  map[string]any{"sha": "def456", "ref": "main"},
+			"user":  map[string]any{"login": "testuser"},
+			"state": "open",
+		}))
+	})
+}
+
+// serveMergedCheckRunPR registers the PR lookup reporting a merged (closed) PR
+// whose head is still currentHeadSHA.
+func serveMergedCheckRunPR(t *testing.T, mux *http.ServeMux, currentHeadSHA string) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"head":   map[string]any{"sha": currentHeadSHA, "ref": "feature-branch"},
+			"base":   map[string]any{"sha": "def456", "ref": "main"},
+			"user":   map[string]any{"login": "testuser"},
+			"state":  "closed",
+			"merged": true,
 		}))
 	})
 }
@@ -261,6 +277,33 @@ func TestDurableCheckRunDriverCompletesStaleHead(t *testing.T) {
 	require.Equal(t, int64(0), fileListCalls.Load(), "a stale rerequest must stop before config discovery")
 }
 
+// A durable rerequest for a closed (merged) PR is completed without running
+// discovery: closed PRs are read-only history — apply commands are rejected on
+// them and PR-close cleanup removed their stored check state — so a re-plan
+// would recreate deleted state and post a plan nobody can act on.
+func TestDurableCheckRunDriverCompletesClosedPR(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableCheckRunRerequestEvent(t))
+	ghClient, mux := setupGitHubServer(t)
+	serveMergedCheckRunPR(t, mux, "head-sha")
+	var fileListCalls atomic.Int64
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7/files", func(w http.ResponseWriter, _ *http.Request) {
+		fileListCalls.Add(1)
+		require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{}))
+	})
+	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghClient, testLogger())}
+	h := newDurableDriverHandler(t, store, nil, factory)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case <-store.completed:
+	default:
+		t.Fatal("expected a closed-PR rerequest to be marked completed")
+	}
+	require.Empty(t, store.failed)
+	require.Equal(t, int64(0), fileListCalls.Load(), "a closed-PR rerequest must stop before config discovery")
+}
+
 // A GitHub failure verifying the current head is uncertainty, not staleness, so
 // the delivery stays retryable rather than silently completing and dropping the
 // re-plan.
@@ -278,7 +321,7 @@ func TestDurableCheckRunDriverRetriesHeadVerificationFailure(t *testing.T) {
 	select {
 	case failure := <-store.failed:
 		require.NotNil(t, failure.retryAfter, "head-verification failure must stay retryable")
-		require.Contains(t, failure.errMsg, "verify current head for durable check_run rerequest")
+		require.Contains(t, failure.errMsg, "verify re-run target for durable check_run rerequest")
 	default:
 		t.Fatal("expected head-verification failure to be marked failed")
 	}
