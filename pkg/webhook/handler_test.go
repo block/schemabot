@@ -548,6 +548,45 @@ func TestWebhookUnknownEnvironmentRejected(t *testing.T) {
 	}
 }
 
+// A repository registered on only this instance has no peer to answer
+// unscoped commands, so its repo-level respond_to_unscoped override makes
+// this instance reject an unknown environment with a usage comment even when
+// the instance-level policy defers to a (nonexistent) peer responder.
+func TestWebhookUnknownEnvironmentRepoOverrideAnswers(t *testing.T) {
+	h, comments, reactions := newTestHandler(t)
+	instanceSilent := false
+	repoAnswers := true
+	h.service.Config().AllowedEnvironments = []string{"staging"}
+	h.service.Config().RespondToUnscoped = &instanceSilent
+	h.service.Config().Repos["octocat/hello-world"] = api.RepoConfig{RespondToUnscoped: &repoAnswers}
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e prod",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "unknown environment")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Invalid Environment")
+		assert.Contains(t, body, "`staging`")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the invalid environment comment")
+	}
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the acknowledgment reaction")
+	}
+}
+
 // An environment owned by a peer instance stays silent here: the peer
 // processes the command from its own webhook delivery, and a reaction or
 // comment from this instance would be noise next to the peer's real response.
