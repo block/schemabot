@@ -1266,15 +1266,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	// Store the plan in SchemaBot's storage
 	ddlChanges := make([]storage.TableChange, len(result.FlatTableChanges()))
 	for i, t := range result.FlatTableChanges() {
-		ddlChanges[i] = storage.TableChange{
-			Table:         t.Table,
-			DDL:           t.DDL,
-			Operation:     ddl.StatementTypeToOp(t.Operation),
-			IsUnsafe:      t.IsUnsafe,
-			UnsafeReason:  t.UnsafeReason,
-			ExecutionMode: t.ExecutionMode,
-			ModeReason:    t.ModeReason,
-		}
+		ddlChanges[i] = storageTableChangeFromEngine(t, "")
 	}
 
 	// Build per-namespace plan data from the engine's changes.
@@ -1298,15 +1290,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 				continue
 			}
 			seenTable[ns][tc.Table] = true
-			nsData.Tables = append(nsData.Tables, storage.TableChange{
-				Table:         tc.Table,
-				DDL:           tc.DDL,
-				Operation:     ddl.StatementTypeToOp(tc.Operation),
-				IsUnsafe:      tc.IsUnsafe,
-				UnsafeReason:  tc.UnsafeReason,
-				ExecutionMode: tc.ExecutionMode,
-				ModeReason:    tc.ModeReason,
-			})
+			nsData.Tables = append(nsData.Tables, storageTableChangeFromEngine(tc, ""))
 		}
 		// Record each changing shard's own changes so apply-create can rebuild
 		// per-shard operation groups with per-shard DDL (a keyspace whose shards
@@ -1316,16 +1300,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		if shardName := strings.TrimSpace(sc.Shard.Name); shardName != "" {
 			sp := storage.ShardPlan{Shard: shardName, Namespace: ns}
 			for _, tc := range sc.TableChanges {
-				sp.Changes = append(sp.Changes, storage.TableChange{
-					Namespace:     ns,
-					Table:         tc.Table,
-					DDL:           tc.DDL,
-					Operation:     ddl.StatementTypeToOp(tc.Operation),
-					IsUnsafe:      tc.IsUnsafe,
-					UnsafeReason:  tc.UnsafeReason,
-					ExecutionMode: tc.ExecutionMode,
-					ModeReason:    tc.ModeReason,
-				})
+				sp.Changes = append(sp.Changes, storageTableChangeFromEngine(tc, ns))
 			}
 			nsData.Shards = append(nsData.Shards, sp)
 			allShardPlans = append(allShardPlans, sp)
@@ -1508,32 +1483,14 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 				continue
 			}
 			protoTableSeen[ns][t.Table] = true
-			protoSC.TableChanges = append(protoSC.TableChanges, &ternv1.TableChange{
-				TableName:     t.Table,
-				ChangeType:    changeTypeToProto(t.Operation),
-				Ddl:           t.DDL,
-				IsUnsafe:      t.IsUnsafe,
-				UnsafeReason:  t.UnsafeReason,
-				ExecutionMode: t.ExecutionMode,
-				ModeReason:    t.ModeReason,
-				Namespace:     ns,
-			})
+			protoSC.TableChanges = append(protoSC.TableChanges, protoTableChangeFromEngine(t, ns))
 		}
 		// A SchemaChange with an empty shard targets the whole namespace
 		// (non-sharded engines) and contributes no shard rows.
 		if shardName := strings.TrimSpace(sc.Shard.Name); shardName != "" {
 			protoSP := &ternv1.ShardPlan{Shard: shardName, Namespace: ns}
 			for _, t := range sc.TableChanges {
-				protoSP.Changes = append(protoSP.Changes, &ternv1.TableChange{
-					Namespace:     ns,
-					TableName:     t.Table,
-					Ddl:           t.DDL,
-					ChangeType:    changeTypeToProto(t.Operation),
-					IsUnsafe:      t.IsUnsafe,
-					UnsafeReason:  t.UnsafeReason,
-					ExecutionMode: t.ExecutionMode,
-					ModeReason:    t.ModeReason,
-				})
+				protoSP.Changes = append(protoSP.Changes, protoTableChangeFromEngine(t, ns))
 			}
 			shards = append(shards, protoSP)
 		}
@@ -1674,16 +1631,7 @@ func scopedDispatchDDLChanges(changes []*ternv1.TableChange) ([]storage.TableCha
 		if op == "unknown" || op == "vschema_update" {
 			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d (table %q) has unsupported change type %v", i, table, ch.ChangeType)
 		}
-		out = append(out, storage.TableChange{
-			Namespace:     namespace,
-			Table:         table,
-			DDL:           ddl,
-			Operation:     op,
-			IsUnsafe:      ch.IsUnsafe,
-			UnsafeReason:  ch.UnsafeReason,
-			ExecutionMode: ch.ExecutionMode,
-			ModeReason:    ch.ModeReason,
-		})
+		out = append(out, StorageTableChangeFromProto(ch, namespace, table, ddl, op))
 	}
 	return out, nil
 }
@@ -1839,16 +1787,7 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 			return nil, err
 		}
 		nsData := ensure(ch.Namespace)
-		nsData.Tables = append(nsData.Tables, storage.TableChange{
-			Namespace:     ch.Namespace,
-			Table:         ch.TableName,
-			DDL:           ch.Ddl,
-			Operation:     op,
-			IsUnsafe:      ch.IsUnsafe,
-			UnsafeReason:  ch.UnsafeReason,
-			ExecutionMode: ch.ExecutionMode,
-			ModeReason:    ch.ModeReason,
-		})
+		nsData.Tables = append(nsData.Tables, StorageTableChangeFromProto(ch, ch.Namespace, ch.TableName, ch.Ddl, op))
 	}
 
 	for ns := range vschemaChangedNamespaces {
