@@ -139,16 +139,17 @@ func TestE2EStaleCheckCleanup(t *testing.T) {
 
 	// Seed a check for a database that WON'T be in the next auto-plan
 	err := svc.Storage().Checks().Upsert(t.Context(), &storage.Check{
-		Repository:   "octocat/hello-world",
-		PullRequest:  1,
-		HeadSHA:      "old-sha",
-		Environment:  "staging",
-		DatabaseType: "mysql",
-		DatabaseName: "removed_database",
-		CheckRunID:   42,
-		HasChanges:   true,
-		Status:       "completed",
-		Conclusion:   "action_required",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		HeadSHA:       "old-sha",
+		Environment:   "staging",
+		DatabaseType:  "mysql",
+		DatabaseName:  "removed_database",
+		CheckRunID:    42,
+		HasChanges:    true,
+		Status:        "completed",
+		Conclusion:    "action_required",
+		ChangeSummary: "1 alter",
 	})
 	require.NoError(t, err)
 
@@ -190,14 +191,20 @@ func TestE2EStaleCheckCleanup(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	// The stale check (removed_database) should be updated to success
+	// The stale check (removed_database) should be updated to success, with the
+	// superseded plan's change summary cleared so the aggregate renders the
+	// database as having no pending schema change.
+	var staleCheck *storage.Check
 	require.Eventually(t, func() bool {
 		check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", "removed_database")
 		if err != nil || check == nil {
 			return false
 		}
+		staleCheck = check
 		return check.Conclusion == "success"
 	}, 10*time.Second, 200*time.Millisecond, "stale check should be updated to success")
+	assert.False(t, staleCheck.HasChanges)
+	assert.Empty(t, staleCheck.ChangeSummary)
 
 	// The active check (dbName) should still exist (may be updated by auto-plan)
 	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)

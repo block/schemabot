@@ -877,6 +877,10 @@ func (h *Handler) markStalePlanOnlyCheckStateSuccessful(ctx context.Context, rep
 	check.ApplyID = 0
 	check.BlockingReason = ""
 	check.ErrorMessage = ""
+	// The stored summary describes the superseded plan; the current head no
+	// longer touches this database, so the aggregate row must render as a
+	// database with no pending schema change, not repeat the old plan's counts.
+	check.ChangeSummary = ""
 
 	// The success write is guarded against in-flight apply-owned rows: an apply
 	// that started after this cleanup read the row must keep blocking the PR.

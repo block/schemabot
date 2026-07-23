@@ -666,7 +666,9 @@ func TestCheckStore_RecoverApplyOwnedCheckWithNoOpPlanRequiresNoOpSuccess(t *tes
 
 // When a database drops out of a PR and its stored check state is a plan-only
 // result with no started apply, stale cleanup marks it successful so the PR is
-// no longer blocked by a database it no longer touches.
+// no longer blocked by a database it no longer touches. The superseded plan's
+// change summary is cleared with it, so the aggregate renders the database as
+// having no pending schema change instead of repeating the old plan's counts.
 func TestCheckStore_MarkStalePlanSuccessfulMarksPlanOnlyCheck(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -684,6 +686,7 @@ func TestCheckStore_MarkStalePlanSuccessfulMarksPlanOnlyCheck(t *testing.T) {
 		Conclusion:     "action_required",
 		BlockingReason: "schema_change_pending",
 		ErrorMessage:   "schema change pending apply",
+		ChangeSummary:  "1 alter",
 	}))
 
 	marked, err := store.Checks().MarkStalePlanSuccessful(ctx, &storage.Check{
@@ -710,6 +713,7 @@ func TestCheckStore_MarkStalePlanSuccessfulMarksPlanOnlyCheck(t *testing.T) {
 	require.Equal(t, int64(0), retrieved.ApplyID)
 	require.Empty(t, retrieved.BlockingReason)
 	require.Empty(t, retrieved.ErrorMessage)
+	require.Empty(t, retrieved.ChangeSummary)
 }
 
 // A database can drop out of a PR at the same moment an apply for it begins. If
@@ -724,17 +728,18 @@ func TestCheckStore_MarkStalePlanSuccessfulLeavesInProgressApplyBlocking(t *test
 
 	apply := createCheckStoreApply(t, store, "apply-claimed-after-cleanup-read", state.Apply.Running)
 	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
-		Repository:   "org/repo",
-		PullRequest:  123,
-		HeadSHA:      "oldsha",
-		Environment:  "staging",
-		DatabaseType: "mysql",
-		DatabaseName: "testdb",
-		CheckRunID:   100,
-		ApplyID:      apply.ID,
-		HasChanges:   true,
-		Status:       "in_progress",
-		Conclusion:   "",
+		Repository:    "org/repo",
+		PullRequest:   123,
+		HeadSHA:       "oldsha",
+		Environment:   "staging",
+		DatabaseType:  "mysql",
+		DatabaseName:  "testdb",
+		CheckRunID:    100,
+		ApplyID:       apply.ID,
+		HasChanges:    true,
+		Status:        "in_progress",
+		Conclusion:    "",
+		ChangeSummary: "1 alter",
 	}))
 
 	marked, err := store.Checks().MarkStalePlanSuccessful(ctx, &storage.Check{
@@ -759,6 +764,8 @@ func TestCheckStore_MarkStalePlanSuccessfulLeavesInProgressApplyBlocking(t *test
 	require.Empty(t, retrieved.Conclusion)
 	require.True(t, retrieved.HasChanges)
 	require.Equal(t, apply.ID, retrieved.ApplyID)
+	require.Equal(t, "1 alter", retrieved.ChangeSummary,
+		"apply-owned row keeps its change summary — the apply's schema change is still what the row describes")
 }
 
 // A terminal apply-owned row (apply ID still set after the apply finished) keeps
@@ -830,6 +837,7 @@ func TestCheckStore_MarkStalePlanSuccessfulIsIdempotentUnderChangedRows(t *testi
 		Conclusion:     "action_required",
 		BlockingReason: "schema_change_pending",
 		ErrorMessage:   "schema change pending apply",
+		ChangeSummary:  "1 alter",
 	}))
 
 	successCheck := &storage.Check{
@@ -864,6 +872,7 @@ func TestCheckStore_MarkStalePlanSuccessfulIsIdempotentUnderChangedRows(t *testi
 	require.Equal(t, int64(0), retrieved.ApplyID)
 	require.Empty(t, retrieved.BlockingReason)
 	require.Empty(t, retrieved.ErrorMessage)
+	require.Empty(t, retrieved.ChangeSummary)
 }
 
 // Under changed-rows semantics, a row claimed by a started apply between the
