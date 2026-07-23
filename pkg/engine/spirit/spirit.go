@@ -319,15 +319,20 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 
 		// Execution-mode verdict: surface statements Spirit deterministically
 		// refuses so the operator learns at plan time that the apply will fail.
-		reason, refused, err := ddl.EngineRefusalReason(pc.Statement)
-		if err != nil {
-			return nil, fmt.Errorf("execution verdict for table %q: %w", pc.TableName, err)
-		}
-		if refused {
-			change.ExecutionMode = ddl.ExecutionModeBlocked
-			change.ModeReason = reason
-			e.logger.Info("plan contains a statement the engine will refuse at apply time",
-				"database", req.Database, "table", pc.TableName, "reason", reason)
+		// Only ALTERs can be refused, and gating here keeps the verdict — an
+		// informational field — from ever failing the plan on a statement type
+		// the verdict's own parser doesn't accept.
+		if stmtType == statement.StatementAlterTable {
+			reason, refused, err := ddl.EngineRefusalReason(pc.Statement)
+			if err != nil {
+				return nil, fmt.Errorf("execution verdict for table %q: %w", pc.TableName, err)
+			}
+			if refused {
+				change.ExecutionMode = ddl.ExecutionModeBlocked
+				change.ModeReason = reason
+				e.logger.Info("plan contains a statement the engine will refuse at apply time",
+					"database", database, "table", pc.TableName, "reason", reason)
+			}
 		}
 
 		changes = append(changes, change)

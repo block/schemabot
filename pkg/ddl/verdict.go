@@ -38,10 +38,12 @@ const (
 // be claimed here — it surfaces as an apply-time failure instead.
 //
 // Statements a preflight check would refuse but that can complete through the
-// engine's instant-DDL fast path never reach that check, so they are not
-// reported here — the verdict must never claim an apply will fail when it can
-// succeed. Only ALTER TABLE statements can be refused; everything else
-// returns false.
+// engine's instant-DDL fast path are not reported here — the verdict must
+// never claim an apply will fail when it can succeed. The fast path is only
+// guaranteed for single-ALTER applies: when the engine batches several ALTERs
+// into one run it may skip the fast path and refuse such a statement anyway.
+// That is a tolerated false negative — the verdict errs toward silence.
+// Only ALTER TABLE statements can be refused; everything else returns false.
 func EngineRefusalReason(stmt string) (string, bool, error) {
 	stmts, err := statement.New(stmt)
 	if err != nil {

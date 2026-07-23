@@ -9,10 +9,11 @@ import (
 
 func TestEngineRefusalReason(t *testing.T) {
 	tests := []struct {
-		name        string
-		stmt        string
-		wantRefused bool
-		wantReason  string
+		name               string
+		stmt               string
+		wantRefused        bool
+		wantReason         string
+		wantReasonContains string
 	}{
 		{
 			name:        "drop primary key is refused",
@@ -27,14 +28,16 @@ func TestEngineRefusalReason(t *testing.T) {
 			wantReason:  "dropping primary key is not supported",
 		},
 		{
-			name:        "explicit algorithm clause is refused",
-			stmt:        "ALTER TABLE `users` ADD COLUMN `email` VARCHAR(255), ALGORITHM=INPLACE",
-			wantRefused: true,
+			name:               "explicit algorithm clause is refused",
+			stmt:               "ALTER TABLE `users` ADD COLUMN `email` VARCHAR(255), ALGORITHM=INPLACE",
+			wantRefused:        true,
+			wantReasonContains: "ALGORITHM",
 		},
 		{
-			name:        "explicit lock clause is refused",
-			stmt:        "ALTER TABLE `users` ADD COLUMN `email` VARCHAR(255), LOCK=NONE",
-			wantRefused: true,
+			name:               "explicit lock clause is refused",
+			stmt:               "ALTER TABLE `users` ADD COLUMN `email` VARCHAR(255), LOCK=NONE",
+			wantRefused:        true,
+			wantReasonContains: "LOCK",
 		},
 		{
 			name:        "add foreign key is refused",
@@ -81,6 +84,9 @@ func TestEngineRefusalReason(t *testing.T) {
 			assert.Equal(t, tt.wantRefused, refused)
 			if tt.wantReason != "" {
 				assert.Equal(t, tt.wantReason, reason)
+			}
+			if tt.wantReasonContains != "" {
+				assert.Contains(t, reason, tt.wantReasonContains)
 			}
 			if refused {
 				assert.NotEmpty(t, reason)
