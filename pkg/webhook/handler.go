@@ -711,6 +711,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "check_run":
 		h.handleCheckRun(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
 		recordProcessed()
+	case "check_suite":
+		h.handleCheckSuite(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
+		recordProcessed()
 	case "pull_request":
 		h.handlePullRequest(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
 		recordProcessed()

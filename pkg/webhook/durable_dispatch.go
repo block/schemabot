@@ -414,6 +414,8 @@ func (h *Handler) processDurableWebhookEvent(ctx context.Context, event *storage
 		return h.processDurablePullRequest(ctx, event)
 	case "check_run":
 		return h.processDurableCheckRun(ctx, event)
+	case "check_suite":
+		return h.processDurableCheckSuite(ctx, event)
 	case "merge_group":
 		return h.processDurableMergeGroup(ctx, event)
 	case "push":
@@ -540,15 +542,10 @@ func (h *Handler) processDurableCheckRun(ctx context.Context, event *storage.Web
 	}
 }
 
-// processDurableCheckRunRerequest re-runs auto-plan for a claimed check_run
-// rerequest. Config discovery and plan dispatch run under the delivery lease,
-// while per-database plan execution still runs in detached goroutines whose
-// durability is owned by the applies/tasks layer. Like the synchronous request
-// path it stops before discovery when the rerequested head is no longer the
-// PR's current head: planning a stale head would list the current PR's files
-// against a stale config snapshot, and a newer push already enqueued its own
-// delivery. A GitHub failure verifying the head keeps the delivery retryable
-// rather than completing it, so a transient outage cannot drop the re-plan.
+// processDurableCheckRunRerequest validates a claimed check_run rerequest —
+// it must carry a pull request, target a registered repository, and name a
+// SchemaBot aggregate check — then re-runs auto-plan through the shared
+// re-run tail (processDurableRerequestAutoPlan).
 func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *storage.WebhookEvent, payload checkRunPayload) (retry bool, err error) {
 	repo := payload.Repository.FullName
 	pr, ok := checkRunPullRequestNumber(payload)
@@ -578,6 +575,100 @@ func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *st
 		return false, nil
 	}
 
+	return h.processDurableRerequestAutoPlan(ctx, event, durableRerequestAutoPlan{
+		repo:             repo,
+		pr:               pr,
+		headSHA:          payload.CheckRun.HeadSHA,
+		event:            "check_run",
+		action:           payload.Action,
+		metricsOperation: "check_run_rerequest",
+		source:           "check_run.rerequested",
+	})
+}
+
+func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
+	var payload checkSuitePayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return false, fmt.Errorf("decode durable check_suite delivery %s: %w", event.DeliveryID, err)
+	}
+	switch payload.Action {
+	case "rerequested":
+		return h.processDurableCheckSuiteRerequest(ctx, event, payload)
+	default:
+		h.logger.Info("durable check_suite delivery ignored because action is unsupported",
+			"delivery_id", event.DeliveryID, "action", payload.Action,
+			"repo", event.Repository, "pr", event.PullRequest)
+		return false, nil
+	}
+}
+
+// processDurableCheckSuiteRerequest validates a claimed check_suite
+// rerequest — it must carry a pull request and target a registered
+// repository — then re-runs auto-plan through the shared re-run tail
+// (processDurableRerequestAutoPlan). A suite rerequest ("Re-run all checks")
+// covers every check this App owns on the commit, so unlike a check_run
+// rerequest there is no per-check name filter: the re-plan republishes the
+// full aggregate.
+func (h *Handler) processDurableCheckSuiteRerequest(ctx context.Context, event *storage.WebhookEvent, payload checkSuitePayload) (retry bool, err error) {
+	repo := payload.Repository.FullName
+	pr, ok := checkSuitePullRequestNumber(payload)
+	if !ok {
+		h.logger.Info("durable check_suite rerequest ignored without pull request",
+			"delivery_id", event.DeliveryID, "repo", repo,
+			"check_suite_id", payload.CheckSuite.ID, "head_sha", payload.CheckSuite.HeadSHA)
+		return false, nil
+	}
+	if repo == "" || payload.CheckSuite.HeadSHA == "" {
+		return false, fmt.Errorf("durable check_suite rerequest %s missing repo or head SHA", event.DeliveryID)
+	}
+	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
+		h.logger.Warn("durable check_suite rerequest from unregistered repository",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr,
+			"check_suite_id", payload.CheckSuite.ID, "head_sha", payload.CheckSuite.HeadSHA)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "check_suite", payload.Action, repo)
+		return false, nil
+	}
+
+	return h.processDurableRerequestAutoPlan(ctx, event, durableRerequestAutoPlan{
+		repo:             repo,
+		pr:               pr,
+		headSHA:          payload.CheckSuite.HeadSHA,
+		event:            "check_suite",
+		action:           payload.Action,
+		metricsOperation: "check_suite_rerequest",
+		source:           "check_suite.rerequested",
+	})
+}
+
+// durableRerequestAutoPlan identifies a claimed re-run request delivery whose
+// auto-plan tail is shared by the check_run and check_suite processors: both
+// resolve the same installation, verify the same head currency, and dispatch
+// the same re-plan — they differ only in the payload shape validated by their
+// own processors.
+type durableRerequestAutoPlan struct {
+	repo    string
+	pr      int
+	headSHA string
+	// event and action label webhook metrics for this delivery.
+	event  string
+	action string
+	// metricsOperation names the status-check operation recorded around head
+	// verification.
+	metricsOperation string
+	// source labels the auto-plan trigger in logs and plan records.
+	source string
+}
+
+// processDurableRerequestAutoPlan re-runs auto-plan for a claimed re-run
+// request. Config discovery and plan dispatch run under the delivery lease,
+// while per-database plan execution still runs in detached goroutines whose
+// durability is owned by the applies/tasks layer. Like the synchronous request
+// path it stops before discovery when the rerequested head is no longer the
+// PR's current head: planning a stale head would list the current PR's files
+// against a stale config snapshot, and a newer push already enqueued its own
+// delivery. A GitHub failure verifying the head keeps the delivery retryable
+// rather than completing it, so a transient outage cannot drop the re-plan.
+func (h *Handler) processDurableRerequestAutoPlan(ctx context.Context, event *storage.WebhookEvent, req durableRerequestAutoPlan) (retry bool, err error) {
 	installationID, err := durableInstallationID(event)
 	if err != nil {
 		return false, err
@@ -588,10 +679,10 @@ func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *st
 	// must distinguish "shutdown or lease loss" (runCtx) from "the work outran
 	// its own timeout after already succeeding" (ctx).
 	runCtx := ctx
-	ctx, cancel, client, err := h.autoPlanBootstrap(ctx, repo, installationID)
+	ctx, cancel, client, err := h.autoPlanBootstrap(ctx, req.repo, installationID)
 	if err != nil {
-		metrics.RecordWebhookEvent(runCtx, h.metricAppForRepo(repo), "check_run", payload.Action, repo, "auto_plan_bootstrap_failed")
-		return true, fmt.Errorf("bootstrap durable check_run rerequest %s for %s#%d: %w", event.DeliveryID, repo, pr, err)
+		metrics.RecordWebhookEvent(runCtx, h.metricAppForRepo(req.repo), req.event, req.action, req.repo, "auto_plan_bootstrap_failed")
+		return true, fmt.Errorf("bootstrap durable %s rerequest %s for %s#%d: %w", req.event, event.DeliveryID, req.repo, req.pr, err)
 	}
 	defer cancel()
 
@@ -601,39 +692,39 @@ func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *st
 	// drop) the re-plan. A confirmed newer head means a later push already
 	// enqueued its own delivery, so complete this one without planning a stale
 	// snapshot.
-	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	prInfo, err := client.FetchPullRequest(ctx, req.repo, req.pr)
 	if err != nil {
 		metrics.RecordStatusCheckOperation(runCtx, metrics.StatusCheckOperation{
-			Operation:  "check_run_rerequest",
-			Repository: repo,
+			Operation:  req.metricsOperation,
+			Repository: req.repo,
 			Status:     "error",
 		})
-		return true, fmt.Errorf("verify current head for durable check_run rerequest %s (%s#%d): %w", event.DeliveryID, repo, pr, err)
+		return true, fmt.Errorf("verify current head for durable %s rerequest %s (%s#%d): %w", req.event, event.DeliveryID, req.repo, req.pr, err)
 	}
-	if prInfo.HeadSHA != payload.CheckRun.HeadSHA {
+	if prInfo.HeadSHA != req.headSHA {
 		metrics.RecordStatusCheckOperation(runCtx, metrics.StatusCheckOperation{
-			Operation:  "check_run_rerequest",
-			Repository: repo,
+			Operation:  req.metricsOperation,
+			Repository: req.repo,
 			Status:     "stale",
 		})
-		h.logger.Info("durable check_run rerequest ignored because head SHA is no longer current for PR",
-			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr,
-			"stale_head_sha", payload.CheckRun.HeadSHA, "current_head_sha", prInfo.HeadSHA)
+		h.logger.Info("durable re-run request ignored because head SHA is no longer current for PR",
+			"delivery_id", event.DeliveryID, "event", req.event, "repo", req.repo, "pr", req.pr,
+			"stale_head_sha", req.headSHA, "current_head_sha", prInfo.HeadSHA)
 		return false, nil
 	}
 
-	message, planErr := h.runAutoPlanForPR(ctx, client, repo, pr, payload.CheckRun.HeadSHA, installationID, "check_run.rerequested", "check_run.rerequested", "", event.DeliveryID)
+	message, planErr := h.runAutoPlanForPR(ctx, client, req.repo, req.pr, req.headSHA, installationID, req.source, req.source, "", event.DeliveryID)
 	if planErr != nil {
-		return true, fmt.Errorf("auto-plan for durable check_run rerequest %s (%s#%d): %w", event.DeliveryID, repo, pr, planErr)
+		return true, fmt.Errorf("auto-plan for durable %s rerequest %s (%s#%d): %w", req.event, event.DeliveryID, req.repo, req.pr, planErr)
 	}
 	if ctxErr := runCtx.Err(); ctxErr != nil {
 		// The run was cancelled (shutdown or lease loss) — the dispatch may be
 		// partial, so keep the delivery retryable instead of completing it.
-		return true, fmt.Errorf("durable check_run rerequest %s run cancelled during auto-plan dispatch: %w", event.DeliveryID, ctxErr)
+		return true, fmt.Errorf("durable %s rerequest %s run cancelled during auto-plan dispatch: %w", req.event, event.DeliveryID, ctxErr)
 	}
-	h.logger.Info("durable check_run rerequest auto-plan dispatched",
-		"action", payload.Action, "repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA,
-		"delivery_id", event.DeliveryID, "outcome", message)
+	h.logger.Info("durable re-run request auto-plan dispatched",
+		"event", req.event, "action", req.action, "repo", req.repo, "pr", req.pr,
+		"head_sha", req.headSHA, "delivery_id", event.DeliveryID, "outcome", message)
 	return false, nil
 }
 
@@ -660,6 +751,20 @@ func (h *Handler) enqueueDurableCheckRun(ctx context.Context, payload checkRunPa
 		Repository:  payload.Repository.FullName,
 		PullRequest: pr,
 		HeadSHA:     payload.CheckRun.HeadSHA,
+		TenantID:    strconv.FormatInt(installationID, 10),
+		Payload:     body,
+	})
+}
+
+func (h *Handler) enqueueDurableCheckSuite(ctx context.Context, payload checkSuitePayload, body []byte, deliveryID string, pr int, installationID int64) (bool, error) {
+	return h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
+		Provider:    storage.WebhookProviderGitHub,
+		DeliveryID:  deliveryID,
+		Event:       "check_suite",
+		Action:      payload.Action,
+		Repository:  payload.Repository.FullName,
+		PullRequest: pr,
+		HeadSHA:     payload.CheckSuite.HeadSHA,
 		TenantID:    strconv.FormatInt(installationID, 10),
 		Payload:     body,
 	})
