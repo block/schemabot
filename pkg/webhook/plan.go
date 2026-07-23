@@ -497,8 +497,12 @@ func (h *Handler) postFailingAggregateForMultiEnvSetupError(ctx context.Context,
 		h.aggregateMessagesForAllEnvironments(userError))
 }
 
-// handleSchemaRequestError maps schema request errors to GitHub comments.
-func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID int64, environment, databaseName, requestedBy, commandName string, err error) {
+// handleSchemaRequestError maps schema request errors to GitHub comments. It
+// reports whether the error is a recognized user-facing rejection — the
+// command's answer, which the same input will always reproduce — as opposed to
+// an unexpected failure (for example a transient GitHub read error) that a
+// durable driver may re-drive.
+func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID int64, environment, databaseName, requestedBy, commandName string, err error) bool {
 	data := templates.SchemaErrorData{
 		RequestedBy:  requestedBy,
 		Timestamp:    time.Now().UTC().Format("2006-01-02 15:04:05"),
@@ -520,7 +524,7 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 		h.logger.Warn("schema request: database not found", logFields...)
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "database_not_found")
 		h.postComment(repo, pr, installationID, templates.RenderDatabaseNotFound(data))
-		return
+		return true
 	}
 
 	var configNotAuthorizedErr *schemaConfigOutsideAllowedDirsError
@@ -533,21 +537,21 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 			"schema_path", data.SchemaPath, "action", commandName, "error", err)
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, data.DatabaseName, environment, "config_not_authorized")
 		h.postComment(repo, pr, installationID, templates.RenderConfigNotAuthorized(data))
-		return
+		return true
 	}
 
 	if errors.Is(err, ghclient.ErrInvalidConfig) {
 		h.logger.Warn("schema request: invalid config", logFields...)
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "invalid_config")
 		h.postComment(repo, pr, installationID, templates.RenderInvalidConfig(data))
-		return
+		return true
 	}
 
 	if errors.Is(err, ghclient.ErrNoConfig) {
 		h.logger.Warn("schema request: no config found", logFields...)
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "no_config")
 		h.postComment(repo, pr, installationID, templates.RenderNoConfig(data))
-		return
+		return true
 	}
 
 	if errors.Is(err, ghclient.ErrMultipleConfigs) {
@@ -555,13 +559,32 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "multiple_configs")
 		data.AvailableDatabases = templates.FormatAvailableDatabases(err.Error())
 		h.postComment(repo, pr, installationID, templates.RenderMultipleConfigs(data))
-		return
+		return true
+	}
+
+	var dbNotConfiguredErr *api.DatabaseNotConfiguredError
+	if errors.As(err, &dbNotConfiguredErr) {
+		h.logger.Warn("schema request: database not configured on this server", logFields...)
+		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "database_not_configured")
+		data.ErrorDetail = err.Error()
+		h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
+		return true
+	}
+
+	var envNotConfiguredErr *environmentNotConfiguredError
+	if errors.As(err, &envNotConfiguredErr) {
+		h.logger.Warn("schema request: environment not configured on this server", logFields...)
+		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "environment_not_configured")
+		data.ErrorDetail = err.Error()
+		h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
+		return true
 	}
 
 	h.logger.Error("schema request failed", logFields...)
 	metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "unexpected")
 	data.ErrorDetail = err.Error()
 	h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
+	return false
 }
 
 // shardedUnsafeChanges collects unsafe per-shard changes, grouped by (table,
