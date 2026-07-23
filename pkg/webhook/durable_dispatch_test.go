@@ -570,7 +570,7 @@ func TestDurableWebhookDispatchLifecycleDrainsQueuedEvent(t *testing.T) {
 		Provider:   storage.WebhookProviderGitHub,
 		DeliveryID: "delivery-lifecycle",
 		Event:      "push",
-		Payload:    []byte(`{}`),
+		Payload:    []byte(`{"ref": "refs/heads/feature", "after": "abc123def456", "repository": {"full_name": "octocat/hello-world", "default_branch": "main"}}`),
 	})
 	h := newDurableDriverHandler(t, store, nil, nil)
 	h.durableWebhookPollInterval = 10 * time.Millisecond

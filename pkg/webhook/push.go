@@ -214,6 +214,14 @@ func (h *Handler) processDurablePush(ctx context.Context, event *storage.Webhook
 	repo := payload.Repository.FullName
 	headSHA := payload.After
 
+	// The deletion sentinel is an all-zeros SHA, not an empty one; an empty
+	// repo or head SHA is a corrupted/replayed row. Fail terminally before the
+	// routine skips below so corruption surfaces as malformed rather than
+	// silently completing as a non-default-branch or unregistered-repo skip.
+	if repo == "" || headSHA == "" {
+		return false, fmt.Errorf("durable push delivery %s missing repo or head SHA", event.DeliveryID)
+	}
+
 	if payload.Repository.DefaultBranch == "" || payload.Ref != "refs/heads/"+payload.Repository.DefaultBranch {
 		h.logger.Info("durable push delivery ignored because it is not the default branch",
 			"delivery_id", event.DeliveryID, "repo", repo, "ref", payload.Ref,
@@ -221,12 +229,6 @@ func (h *Handler) processDurablePush(ctx context.Context, event *storage.Webhook
 		return false, nil
 	}
 
-	if headSHA == "" {
-		// The deletion sentinel is an all-zeros SHA, not an empty one; a truly
-		// empty head SHA is a corrupted/replayed row. Fail terminally so it
-		// surfaces as malformed rather than silently completing as a no-op.
-		return false, fmt.Errorf("durable push delivery %s missing head SHA", event.DeliveryID)
-	}
 	if payload.Deleted || strings.Trim(headSHA, "0") == "" {
 		h.logger.Info("durable push delivery ignored because it is a branch deletion",
 			"delivery_id", event.DeliveryID, "repo", repo, "ref", payload.Ref)

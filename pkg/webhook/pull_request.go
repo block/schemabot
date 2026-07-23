@@ -96,6 +96,11 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			return
 		}
 		h.goSafe(payload.Repository.FullName, payload.PullRequest.Number, installationID, func() {
+			// One-shot: a failure here (including a lock lookup/release error,
+			// which also skips the check-state delete) is logged and not
+			// retried. That direction is fail-closed — retained locks and
+			// check state block until an operator or a reopen reconciles;
+			// nothing is wrongly unblocked. The durable path retries instead.
 			if err := h.runPRCloseCleanup(context.Background(), payload.Repository.FullName, payload.PullRequest.Number, payload.PullRequest.Merged); err != nil {
 				h.logger.Error("PR close cleanup failed",
 					"repo", payload.Repository.FullName, "pr", payload.PullRequest.Number, "error", err)
@@ -575,9 +580,10 @@ func (h *Handler) aggregateMessagesForAllEnvironments(message string) map[string
 // It takes a context so the durable driver can bound it to the delivery lease
 // (shutdown or lease loss cancels it) while the legacy request path passes a
 // detached context. Every failure is returned so a caller with a retry
-// mechanism (the durable driver) can retry: each step — the applies read, lock
-// releases, and the check delete — is idempotent, so re-running the whole
-// cleanup after a partial failure reconciles rather than double-acts.
+// mechanism (the durable driver) can retry: each step — the applies read, the
+// list-then-release lock pass, and the check delete — is safe to re-run, so
+// re-running the whole cleanup after a partial failure reconciles rather than
+// double-acts.
 func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, merged bool) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -685,8 +691,14 @@ func (h *Handler) inFlightAppliesForClosedPR(ctx context.Context, repo string, p
 // releaseLocksForClosedPR releases the closed PR's locks, except locks on
 // databases that still have an in-flight apply. Every release is attempted even
 // if an earlier one fails, and the failures are joined and returned so a caller
-// with a retry mechanism re-attempts the still-held locks; Release is
-// idempotent, so re-releasing an already-released lock is a no-op.
+// with a retry mechanism re-attempts the still-held locks. Release itself is
+// not idempotent — a missing row returns storage.ErrLockNotFound and a
+// re-acquired lock returns storage.ErrLockNotOwned — so re-running converges
+// only because each attempt re-lists the PR's locks first and a released
+// lock's row is deleted, never reappearing in a later attempt. A concurrent
+// manual unlock between the list and the release surfaces as a spurious
+// ErrLockNotFound that fails that attempt; the next retry no longer sees the
+// row and converges.
 func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr int, inFlight map[closedPRDatabase]bool) error {
 	locks, err := h.service.Storage().Locks().GetByPR(ctx, repo, pr)
 	if err != nil {

@@ -158,32 +158,67 @@ func TestDurablePushDriverCompletesUnregisteredRepo(t *testing.T) {
 	}
 }
 
-// A non-deletion push row with an empty head SHA is a corrupted/replayed row,
-// not the all-zeros deletion sentinel, so the driver fails it terminally rather
-// than silently completing it as a no-op and never refreshing the check source.
-func TestDurablePushDriverFailsEmptyHeadSHATerminally(t *testing.T) {
-	event := durablePushEvent()
-	event.Payload = []byte(`{
-		"ref": "refs/heads/main",
-		"after": "",
-		"deleted": false,
-		"repository": {"full_name": "octocat/hello-world", "default_branch": "main"},
-		"installation": {"id": 12345}
-	}`)
-	store := newScriptedWebhookEventStore(event)
-	config := &api.ServerConfig{Repos: map[string]api.RepoConfig{"octocat/hello-world": {}}}
-	h := newDurableDriverHandler(t, store, config, &fakeClientFactory{})
-
-	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
-
-	select {
-	case failure := <-store.failed:
-		require.Nil(t, failure.retryAfter, "an empty head SHA is malformed and must not be retried")
-		require.Contains(t, failure.errMsg, "missing head SHA")
-	default:
-		t.Fatal("expected empty-head-SHA push delivery to be marked failed")
+// A push row with an empty repo or an empty head SHA is a corrupted/replayed
+// row (the deletion sentinel is an all-zeros SHA, not an empty one), so the
+// driver fails it terminally — even when the corruption also blanks the fields
+// a routine skip would match, such as the ref and default branch — rather than
+// silently completing it as a non-default-branch or unregistered-repo skip.
+func TestDurablePushDriverFailsMalformedRowTerminally(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{
+			name: "empty head SHA",
+			payload: `{
+				"ref": "refs/heads/main",
+				"after": "",
+				"deleted": false,
+				"repository": {"full_name": "octocat/hello-world", "default_branch": "main"},
+				"installation": {"id": 12345}
+			}`,
+		},
+		{
+			name: "empty head SHA with empty ref and default branch",
+			payload: `{
+				"ref": "",
+				"after": "",
+				"deleted": false,
+				"repository": {"full_name": "octocat/hello-world", "default_branch": ""},
+				"installation": {"id": 12345}
+			}`,
+		},
+		{
+			name: "empty repo",
+			payload: `{
+				"ref": "refs/heads/main",
+				"after": "abc123def456",
+				"deleted": false,
+				"repository": {"full_name": "", "default_branch": "main"},
+				"installation": {"id": 12345}
+			}`,
+		},
 	}
-	require.Empty(t, store.completed)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := durablePushEvent()
+			event.Payload = []byte(tt.payload)
+			store := newScriptedWebhookEventStore(event)
+			config := &api.ServerConfig{Repos: map[string]api.RepoConfig{"octocat/hello-world": {}}}
+			h := newDurableDriverHandler(t, store, config, &fakeClientFactory{})
+
+			h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+			select {
+			case failure := <-store.failed:
+				require.Nil(t, failure.retryAfter, "a malformed push row must not be retried")
+				require.Contains(t, failure.errMsg, "missing repo or head SHA")
+			default:
+				t.Fatal("expected malformed push delivery to be marked failed")
+			}
+			require.Empty(t, store.completed)
+		})
+	}
 }
 
 // A GitHub client failure while posting the check is retryable so the ruleset
