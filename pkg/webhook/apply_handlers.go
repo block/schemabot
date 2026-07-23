@@ -17,9 +17,8 @@ import (
 
 // handleApplyCommand handles the "schemabot apply -e <env>" PR comment command.
 // It is the synchronous goSafe entry point: it runs applyCommandCore and
-// discards the durability disposition, so behaviour is identical to before the
-// error-contract rework. The disposition (retry-vs-terminal) is consumed only by
-// the durable issue_comment driver (WH-9b); see decision 0002.
+// discards the durability disposition, which only a durable issue_comment
+// driver consumes.
 func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) {
 	_, _ = h.applyCommandCore(repo, pr, environment, databaseName, installationID, requestedBy, result)
 }
@@ -31,10 +30,17 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 //   - retry=true, err!=nil — a transient infrastructure failure (command
 //     bootstrap, a GitHub read, or a storage operation) that a durable driver
 //     should re-drive; the same window may succeed on a later attempt.
-//   - retry=false, err=nil — a terminal outcome that is the command's answer,
-//     including every user-facing block or error it already posted (lock
-//     conflict, apply-in-progress, gate blocks, stale-schema rejection, no
-//     changes, unsafe changes, downgrade-to-manual, or a dispatched apply).
+//   - retry=false, err=nil — a terminal outcome that is the command's answer
+//     (lock conflict, apply-in-progress, gate blocks, stale-schema rejection,
+//     no changes, unsafe changes, deterministic plan rejections,
+//     downgrade-to-manual, or a dispatched apply). A schema-request failure is
+//     terminal only when handleSchemaRequestError recognizes it as a
+//     user-facing rejection; an unexpected failure there (for example a
+//     transient GitHub config read) stays retryable.
+//
+// A posted PR comment does not imply a terminal disposition: retryable sites
+// post best-effort error comments too, so a durable driver re-driving one may
+// post the same comment again.
 //
 // The core logs each failure at its site, so the synchronous wrapper can discard
 // the result without losing observability.
@@ -64,12 +70,16 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 				"repo", repo, "pr", pr, "environment", environment, "error", err)
 			return false, nil
 		}
-		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err)
-		return false, nil
+		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err) {
+			return false, nil
+		}
+		return true, fmt.Errorf("apply command schema request %s#%d: %w", repo, pr, err)
 	}
 	if err := h.attachServerEnvironments(schemaResult, environment); err != nil {
-		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err)
-		return false, nil
+		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err) {
+			return false, nil
+		}
+		return true, fmt.Errorf("apply command attach server environments %s#%d: %w", repo, pr, err)
 	}
 	if !ackedEarly {
 		h.acknowledgeCommandActPoint(repo, pr, installationID, result)
@@ -216,7 +226,13 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 	if err != nil {
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
-		return true, fmt.Errorf("apply command plan %s#%d: %w", repo, pr, err)
+		if isTransientRemotePlanError(err) {
+			return true, fmt.Errorf("apply command plan %s#%d: %w", repo, pr, err)
+		}
+		// Policy, validation, and planning failures are deterministic: the
+		// posted error is the command's answer, and a re-drive would only
+		// reproduce it.
+		return false, nil
 	}
 
 	// No changes (neither table DDL nor a VSchema update) — post a regular plan
@@ -247,6 +263,14 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 		PendingPlanID: planResp.PlanID,
 	}
 	if err := h.service.Storage().Locks().Acquire(ctx, lock); err != nil {
+		if errors.Is(err, storage.ErrLockHeld) {
+			// Another owner won the lock between the pre-check above and this
+			// acquire: the same answer the pre-check gives, so it is terminal.
+			h.logger.Info("apply blocked by lock conflict at acquire",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment)
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to acquire lock: "+err.Error())
+			return false, nil
+		}
 		h.logger.Error("failed to acquire lock", "error", err)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to acquire lock: "+err.Error())
 		return true, fmt.Errorf("apply command acquire lock %s#%d: %w", repo, pr, err)

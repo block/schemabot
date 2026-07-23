@@ -68,6 +68,18 @@ func (h *Handler) silentOnUnscopedFanOut(repo, tenant string) bool {
 	return config.AggregateRoleForRepo(repo) != ""
 }
 
+// environmentNotConfiguredError reports that the requested environment has no
+// entry for the database on this server — a targeting rejection the same
+// command will always reproduce, not a transient failure.
+type environmentNotConfiguredError struct {
+	Database    string
+	Environment string
+}
+
+func (e *environmentNotConfiguredError) Error() string {
+	return fmt.Sprintf("database %q environment %q is not configured on this server", e.Database, e.Environment)
+}
+
 type schemaConfigOutsideAllowedDirsError struct {
 	Database     string
 	DatabaseType string
@@ -208,7 +220,7 @@ func (h *Handler) validateRequestedDatabaseEnvironment(database, environment str
 	if slices.Contains(environments, environment) {
 		return nil
 	}
-	return fmt.Errorf("database %q environment %q is not configured on this server", database, environment)
+	return &environmentNotConfiguredError{Database: database, Environment: environment}
 }
 
 func (h *Handler) configPathManagedByRepo(ctx context.Context, repo string, pr int, headSHA string, config *ghclient.SchemabotConfig, schemaPath, source string) bool {
