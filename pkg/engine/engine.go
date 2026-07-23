@@ -250,6 +250,14 @@ type TableChange struct {
 	// Unsafe change tracking
 	IsUnsafe     bool   // True if this is a destructive/unsafe change
 	UnsafeReason string // Human-readable reason (e.g., "DROP COLUMN removes data")
+
+	// Execution-mode verdict: how the engine will run this statement at apply
+	// time. Empty means the engine's default path. "blocked" means the engine
+	// deterministically refuses the statement — the apply will fail, and the
+	// plan surfaces that up front. Distinct from IsUnsafe, which flags a
+	// change the engine *can* run but the operator must acknowledge.
+	ExecutionMode string
+	ModeReason    string // Engine's reason when ExecutionMode is "blocked"
 }
 
 // ApplyRequest contains the input for starting a schema change.

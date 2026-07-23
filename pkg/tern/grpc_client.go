@@ -146,6 +146,10 @@ type GRPCClient struct {
 	observerMu      sync.RWMutex
 	observers       map[int64]ProgressObserver
 	pendingObserver ProgressObserver
+
+	// controlSendGate throttles retransmission of pending stop/cancel control
+	// requests to the data plane (see remoteControlResendInterval).
+	controlSendGate remoteControlSendGate
 }
 
 // Compile-time check that GRPCClient implements Client.
@@ -814,6 +818,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 			return true, err
 		}
+		c.controlSendGate.clear(controlReq.ID)
 		return true, nil
 	}
 	remoteID := scope.remoteApplyID(apply)
@@ -840,27 +845,36 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		return true, nil
 	}
 
-	resp, err := c.client.Stop(ctx, &ternv1.StopRequest{
-		ApplyId:     remoteID,
-		Environment: apply.Environment,
-	})
-	if err != nil {
-		if completed, completeErr := c.completeRemoteStopFromTerminalProgress(ctx, apply, controlReq, scope); completeErr == nil && completed {
-			return true, nil
-		} else if completeErr != nil {
-			return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %w; terminal progress reconciliation also failed: %w", apply.ApplyIdentifier, remoteID, err, completeErr)
+	// The data plane stores the stop durably on first receipt and its own
+	// driver consumes it, so retransmission is redelivery insurance on a bounded
+	// cadence — not a per-tick send (see the cancel counterpart).
+	if now := time.Now(); c.controlSendGate.shouldSend(controlReq.ID, now) {
+		resp, err := c.client.Stop(ctx, &ternv1.StopRequest{
+			ApplyId:     remoteID,
+			Environment: apply.Environment,
+		})
+		if err != nil {
+			if completed, completeErr := c.completeRemoteStopFromTerminalProgress(ctx, apply, controlReq, scope); completeErr == nil && completed {
+				return true, nil
+			} else if completeErr != nil {
+				return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %w; terminal progress reconciliation also failed: %w", apply.ApplyIdentifier, remoteID, err, completeErr)
+			}
+			return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 		}
-		return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
-	}
-	if resp == nil || !resp.Accepted {
-		errorMessage := "not accepted"
-		if resp != nil && resp.ErrorMessage != "" {
-			errorMessage = resp.ErrorMessage
+		if resp == nil || !resp.Accepted {
+			errorMessage := "not accepted"
+			if resp != nil && resp.ErrorMessage != "" {
+				errorMessage = resp.ErrorMessage
+			}
+			return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %s", apply.ApplyIdentifier, remoteID, errorMessage)
 		}
-		return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %s", apply.ApplyIdentifier, remoteID, errorMessage)
+		if c.controlSendGate.recordSend(controlReq.ID, now) {
+			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
+				fmt.Sprintf("Remote stop accepted for apply %s%s", remoteID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		} else {
+			logRemoteControlResend(ctx, apply, controlReq, now)
+		}
 	}
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
-		fmt.Sprintf("Remote stop accepted for apply %s%s", remoteID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 
 	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
 		ApplyId:     remoteID,
@@ -901,6 +915,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 			return true, err
 		}
+		c.controlSendGate.clear(controlReq.ID)
 		if hasPendingStart, startErr := hasPendingStartControlRequest(ctx, c.storage, apply); startErr != nil {
 			return true, startErr
 		} else if hasPendingStart {
@@ -945,30 +960,42 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
 			return true, err
 		}
+		c.controlSendGate.clear(controlReq.ID)
 		return true, nil
 	}
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
 		return true, fmt.Errorf("cancel gRPC apply %s: remote apply id is not available", apply.ApplyIdentifier)
 	}
-	resp, err := c.client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: remoteID, Environment: apply.Environment})
-	if err != nil {
-		if completed, completeErr := c.completeRemoteCancelFromTerminalProgress(ctx, apply, controlReq, scope); completeErr == nil && completed {
-			return true, nil
-		} else if completeErr != nil {
-			return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: %w; terminal progress reconciliation also failed: %w", apply.ApplyIdentifier, remoteID, err, completeErr)
+	// The data plane stores the cancel durably on first receipt and its own
+	// driver consumes it, so retransmission is redelivery insurance on a bounded
+	// cadence — not a per-tick send, which floods the data plane with duplicate
+	// cancels and the apply log with duplicate accept events while the remote
+	// works (or fails) to consume the first one.
+	if now := time.Now(); c.controlSendGate.shouldSend(controlReq.ID, now) {
+		resp, err := c.client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: remoteID, Environment: apply.Environment})
+		if err != nil {
+			if completed, completeErr := c.completeRemoteCancelFromTerminalProgress(ctx, apply, controlReq, scope); completeErr == nil && completed {
+				return true, nil
+			} else if completeErr != nil {
+				return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: %w; terminal progress reconciliation also failed: %w", apply.ApplyIdentifier, remoteID, err, completeErr)
+			}
+			return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 		}
-		return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
-	}
-	if resp == nil || !resp.Accepted {
-		errorMessage := "not accepted"
-		if resp != nil && resp.ErrorMessage != "" {
-			errorMessage = resp.ErrorMessage
+		if resp == nil || !resp.Accepted {
+			errorMessage := "not accepted"
+			if resp != nil && resp.ErrorMessage != "" {
+				errorMessage = resp.ErrorMessage
+			}
+			return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: %s", apply.ApplyIdentifier, remoteID, errorMessage)
 		}
-		return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: %s", apply.ApplyIdentifier, remoteID, errorMessage)
+		if c.controlSendGate.recordSend(controlReq.ID, now) {
+			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested,
+				fmt.Sprintf("Remote cancel accepted for apply %s%s", remoteID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		} else {
+			logRemoteControlResend(ctx, apply, controlReq, now)
+		}
 	}
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested,
-		fmt.Sprintf("Remote cancel accepted for apply %s%s", remoteID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{ApplyId: remoteID, Environment: apply.Environment})
 	if err != nil {
 		return true, fmt.Errorf("sync remote gRPC cancel for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
@@ -996,6 +1023,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
 			return true, err
 		}
+		c.controlSendGate.clear(controlReq.ID)
 		return true, nil
 	}
 	if _, err := c.persistParentApply(ctx, apply, scope, "sync nonterminal gRPC cancel"); err != nil {
@@ -1066,6 +1094,7 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 		return false, err
 	}
+	c.controlSendGate.clear(controlReq.ID)
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
 		fmt.Sprintf("Remote stop request completed from terminal progress (remote state: %s) after stop error%s", remoteState, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 	return true, nil
@@ -1147,6 +1176,7 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
 		return false, err
 	}
+	c.controlSendGate.clear(controlReq.ID)
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested,
 		fmt.Sprintf("Remote cancel request completed from terminal progress (remote state: %s) after cancel error%s", remoteState, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 	return true, nil
