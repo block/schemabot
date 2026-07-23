@@ -258,20 +258,33 @@ func releaseApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, o
 	defer cancel()
 
 	released, err := applyTargetLocker.Release(releaseCtx, conn, lockName)
-	if err != nil || !released {
+	switch {
+	case err != nil:
 		slog.WarnContext(releaseCtx, "failed to release apply target lock; discarding connection",
 			"operation", operation,
 			"lock", lockName,
 			"error", err)
-		if rawErr := conn.Raw(func(any) error { return driver.ErrBadConn }); rawErr != nil && !errors.Is(rawErr, driver.ErrBadConn) {
-			slog.WarnContext(releaseCtx, "failed to discard apply target lock connection",
-				"operation", operation,
-				"lock", lockName,
-				"error", rawErr)
-		}
+		discardApplyTargetLockConn(releaseCtx, conn, lockName, operation)
+	case !released:
+		slog.WarnContext(releaseCtx, "apply target lock was not held by this session; discarding connection",
+			"operation", operation,
+			"lock", lockName)
+		discardApplyTargetLockConn(releaseCtx, conn, lockName, operation)
 	}
 
 	closeApplyTargetLockConn(releaseCtx, conn, lockName, operation)
+}
+
+// discardApplyTargetLockConn marks the pinned connection as bad so the pool
+// destroys it instead of reusing a session whose advisory-lock state is
+// uncertain.
+func discardApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, operation string) {
+	if rawErr := conn.Raw(func(any) error { return driver.ErrBadConn }); rawErr != nil && !errors.Is(rawErr, driver.ErrBadConn) {
+		slog.WarnContext(ctx, "failed to discard apply target lock connection",
+			"operation", operation,
+			"lock", lockName,
+			"error", rawErr)
+	}
 }
 
 func closeApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, operation string) {

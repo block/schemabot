@@ -73,8 +73,8 @@ func openConn(t *testing.T) *sql.Conn {
 	conn, err := db.Conn(t.Context())
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_ = conn.Close()
-		_ = db.Close()
+		assert.NoError(t, conn.Close())
+		assert.NoError(t, db.Close())
 	})
 	return conn
 }

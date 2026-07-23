@@ -11,6 +11,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -40,11 +41,18 @@ var _ Locker = MySQL{}
 
 // Acquire runs GET_LOCK(name, wait). GET_LOCK returns 1 when the lock is
 // obtained, 0 when the wait elapses first, and NULL on error (for example the
-// session was killed); a NULL result is surfaced as an error.
+// session was killed); a NULL result is surfaced as an error. MySQL only
+// supports whole-second waits, so sub-second waits round up to the next
+// second. A negative wait is rejected rather than passed through, because
+// GET_LOCK treats a negative timeout as an infinite wait.
 func (MySQL) Acquire(ctx context.Context, conn *sql.Conn, name string, wait time.Duration) (bool, error) {
+	if wait < 0 {
+		return false, fmt.Errorf("acquire named lock %q: negative wait %s", name, wait)
+	}
+	waitSeconds := int64(math.Ceil(wait.Seconds()))
 	var result sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", name, int(wait.Seconds())).Scan(&result); err != nil {
-		return false, err
+	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", name, waitSeconds).Scan(&result); err != nil {
+		return false, fmt.Errorf("acquire named lock %q: %w", name, err)
 	}
 	if !result.Valid {
 		return false, fmt.Errorf("GET_LOCK(%q) returned NULL", name)
@@ -59,7 +67,7 @@ func (MySQL) Acquire(ctx context.Context, conn *sql.Conn, name string, wait time
 func (MySQL) Release(ctx context.Context, conn *sql.Conn, name string) (bool, error) {
 	var result sql.NullInt64
 	if err := conn.QueryRowContext(ctx, "SELECT RELEASE_LOCK(?)", name).Scan(&result); err != nil {
-		return false, err
+		return false, fmt.Errorf("release named lock %q: %w", name, err)
 	}
 	return result.Valid && result.Int64 == 1, nil
 }

@@ -103,7 +103,8 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		return fmt.Errorf("ping target %s/%s: %w", target.Database, target.Environment, err)
 	}
 
-	// GET_LOCK is session-scoped, so hold one connection for the whole pass.
+	// The advisory lock is session-scoped, so hold one connection for the
+	// whole pass.
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "target_error")
