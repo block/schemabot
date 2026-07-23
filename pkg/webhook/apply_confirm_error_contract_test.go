@@ -1,12 +1,15 @@
 package webhook
 
 import (
+	"encoding/json"
 	"errors"
+	"net/http"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
@@ -64,4 +67,52 @@ func TestApplyConfirmCommandCoreTerminalDispositions(t *testing.T) {
 		body := requireComment(t, comments, "database-not-configured apply-confirm error")
 		assert.Contains(t, body, `database "orders" is not configured on this server`)
 	})
+
+	// Requesting an environment the database does not configure is a targeting
+	// rejection the same command will always reproduce, so it is terminal even
+	// though it surfaces through the generic schema-request error comment.
+	t.Run("environment rejection is terminal", func(t *testing.T) {
+		cfg := nonAggregateConfig()
+		cfg.Databases = map[string]api.DatabaseConfig{
+			"orders": {Environments: map[string]api.EnvironmentConfig{"production": {}}},
+		}
+		h, mux, comments := newFanOutSkipHandler(t, cfg)
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		retry, err := h.applyConfirmCommandCore("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+
+		require.NoError(t, err)
+		assert.False(t, retry, "an unconfigured-environment rejection is the command's answer, not a transient failure")
+		body := requireComment(t, comments, "environment-not-configured apply-confirm error")
+		assert.Contains(t, body, `database "orders" environment "staging" is not configured on this server`)
+	})
+}
+
+// A GitHub read failure during config discovery (here, fetching the changed
+// schemabot.yaml returns a server error) is a transient infrastructure failure:
+// the same delivery could succeed once GitHub recovers, so the core must report
+// it as retryable rather than treating the posted error comment as terminal.
+func TestApplyConfirmCommandCoreTransientConfigReadFailureIsRetryable(t *testing.T) {
+	h, mux, _ := newFanOutSkipHandler(t, nonAggregateConfig())
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"head": map[string]any{"sha": "abc123", "ref": "feature-branch"},
+			"base": map[string]any{"sha": "def456", "ref": "main"},
+			"user": map[string]any{"login": "testuser"},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode([]map[string]string{{
+			"filename": "schemabot.yaml",
+			"status":   "modified",
+		}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schemabot.yaml", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	retry, err := h.applyConfirmCommandCore("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+
+	require.Error(t, err)
+	assert.True(t, retry, "a transient GitHub config read failure must stay retryable for a durable driver")
 }

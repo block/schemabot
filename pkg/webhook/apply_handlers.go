@@ -335,9 +335,8 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 
 // handleApplyConfirmCommand handles the "schemabot apply-confirm -e <env>" PR comment command.
 // It is the synchronous goSafe entry point: it runs applyConfirmCommandCore and
-// discards the durability disposition, so behaviour is identical to before the
-// error-contract rework. The disposition (retry-vs-terminal) is consumed only by
-// the durable issue_comment driver (WH-9b); see decision 0002.
+// discards the durability disposition, which only a durable issue_comment
+// driver consumes.
 func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) {
 	_, _ = h.applyConfirmCommandCore(repo, pr, environment, databaseName, installationID, requestedBy, result)
 }
@@ -349,10 +348,16 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 //   - retry=true, err!=nil — a transient infrastructure failure (command
 //     bootstrap, a GitHub read, or a storage operation) that a durable driver
 //     should re-drive; the same window may succeed on a later attempt.
-//   - retry=false, err=nil — a terminal outcome that is the command's answer,
-//     including every user-facing block or error it already posted (silent
-//     fan-out skip, no pending confirmation, gate blocks, lock conflict,
-//     stale-schema/base/plan rejection, or a dispatched apply).
+//   - retry=false, err=nil — a terminal outcome that is the command's answer
+//     (silent fan-out skip, no pending confirmation, gate blocks, lock conflict,
+//     stale-schema/base/plan rejection, or a dispatched apply). A schema-request
+//     failure is terminal only when handleSchemaRequestError recognizes it as a
+//     user-facing rejection; an unexpected failure there (for example a
+//     transient GitHub config read) stays retryable.
+//
+// A posted PR comment does not imply a terminal disposition: retryable sites
+// post best-effort error comments too, so a durable driver re-driving one may
+// post the same comment again.
 //
 // The core logs each failure at its site, so the synchronous wrapper can discard
 // the result without losing observability.
@@ -380,12 +385,16 @@ func (h *Handler) applyConfirmCommandCore(repo string, pr int, environment, data
 				"repo", repo, "pr", pr, "environment", environment, "error", err)
 			return false, nil
 		}
-		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err)
-		return false, nil
+		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err) {
+			return false, nil
+		}
+		return true, fmt.Errorf("apply-confirm command schema request %s#%d: %w", repo, pr, err)
 	}
 	if err := h.attachServerEnvironments(schemaResult, environment); err != nil {
-		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err)
-		return false, nil
+		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err) {
+			return false, nil
+		}
+		return true, fmt.Errorf("apply-confirm command attach server environments %s#%d: %w", repo, pr, err)
 	}
 
 	if blocked := h.enforceOpenPR(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, requestedBy); blocked {
