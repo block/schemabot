@@ -25,29 +25,23 @@ const applyOperationColumns = `id, apply_id, deployment, operation_key, operatio
 
 // applyOperationStore implements storage.ApplyOperationStore using MySQL.
 type applyOperationStore struct {
-	db      *sql.DB
-	dialect Dialect
+	db       *sql.DB
+	dialect  Dialect
+	identity identityInserter
 }
 
 // Insert stores a new apply_operations row and returns its ID.
 // Translates a unique-key conflict on (apply_id, deployment, operation_key) into
 // storage.ErrApplyOperationExists so callers can branch cleanly.
 func (s *applyOperationStore) Insert(ctx context.Context, ad *storage.ApplyOperation) (int64, error) {
-	return insertApplyOperation(ctx, s.db, ad)
-}
-
-// sqlExecer is the subset of *sql.DB / *sql.Tx used by insertApplyOperation.
-// Defined locally so the helper can run against either the pool or an
-// in-flight transaction (for atomic apply-create dual-writes).
-type sqlExecer interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	return insertApplyOperation(ctx, s.db, s.identity, ad)
 }
 
 // insertApplyOperation inserts one apply_operations row using the supplied
 // executer (pool or transaction). On success the row's ID and State fields
 // are set. A duplicate-key violation on (apply_id, deployment, operation_key)
 // is translated to storage.ErrApplyOperationExists for callers to branch on.
-func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.ApplyOperation) (int64, error) {
+func insertApplyOperation(ctx context.Context, exec queryExecer, identity identityInserter, ad *storage.ApplyOperation) (int64, error) {
 	stateVal := ad.State
 	if stateVal == "" {
 		stateVal = state.ApplyOperation.Pending
@@ -75,7 +69,7 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 		operationKind = storage.ApplyOperationKindWork
 	}
 
-	result, err := exec.ExecContext(ctx, `
+	id, err := identity.InsertID(ctx, exec, `
 		INSERT INTO apply_operations (
 			apply_id, deployment, operation_key, operation_kind, target, external_id, external_operation_id, state, error_message, cutover_policy, on_failure,
 			started_at, completed_at, engine_resume_context, engine_resume_metadata
@@ -89,11 +83,6 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 			return 0, storage.ErrApplyOperationExists
 		}
 		return 0, fmt.Errorf("insert apply_operations (apply=%d, deployment=%s, operation_key=%s): %w", ad.ApplyID, ad.Deployment, ad.OperationKey, err)
-	}
-
-	id, err := result.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("last insert id: %w", err)
 	}
 	ad.ID = id
 	ad.State = stateVal

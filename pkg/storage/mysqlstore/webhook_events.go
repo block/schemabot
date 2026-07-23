@@ -20,8 +20,9 @@ const webhookEventColumns = `id, provider, delivery_id, event, action, repositor
 	received_at, started_at, completed_at, created_at, updated_at`
 
 type webhookEventStore struct {
-	db      *sql.DB
-	dialect Dialect
+	db       *sql.DB
+	dialect  Dialect
+	identity identityInserter
 }
 
 func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
@@ -53,7 +54,7 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 		receivedAt = time.Now()
 	}
 
-	result, err := s.db.ExecContext(ctx, `
+	id, err := s.identity.InsertID(ctx, s.db, `
 		INSERT INTO webhook_events (
 			provider, delivery_id, event, action, repository, pull_request, head_sha, tenant_id,
 			payload, state, attempts, received_at
@@ -65,10 +66,6 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 			return s.reopenTerminalWebhookEvent(ctx, provider, event.DeliveryID, payload, receivedAt)
 		}
 		return false, fmt.Errorf("insert webhook event (provider=%s, delivery_id=%s): %w", provider, event.DeliveryID, err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return false, fmt.Errorf("read webhook event last insert id (delivery_id=%s): %w", event.DeliveryID, err)
 	}
 	event.ID = id
 	event.Provider = provider

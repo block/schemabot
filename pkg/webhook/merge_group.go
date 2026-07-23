@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // mergeGroupPayload is the subset of the GitHub merge_group webhook payload
@@ -42,7 +44,7 @@ type mergeGroupPayload struct {
 // before the PR could enter the queue. The merge group sits strictly downstream
 // of an already-completed, already-gated apply, so there is nothing left to
 // verify on the combined commit.
-func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte) {
+func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte, deliveryID string) {
 	var payload mergeGroupPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid merge_group payload")
@@ -104,6 +106,32 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 		return
 	}
 
+	if h.durableWebhookDispatch {
+		// Enqueue and ACK fast; a leased driver posts the check with retries so
+		// a process restart mid-post cannot drop the delivery. Enqueue failure
+		// is a deliberate 500 with no in-process fallback — it fails loudly (a
+		// red delivery in GitHub's webhook UI) so an operator can Redeliver.
+		inserted, err := h.enqueueDurableMergeGroup(ctx, payload, body, deliveryID, installationID)
+		if err != nil {
+			h.logger.Error("failed to enqueue durable merge_group check",
+				"repo", repo, "head_sha", headSHA, "installation_id", installationID,
+				"delivery_id", deliveryID, "error", err)
+			metrics.RecordWebhookEvent(ctx, metricApp, "merge_group", payload.Action, repo, "durable_enqueue_failed")
+			h.writeError(w, http.StatusInternalServerError, "failed to enqueue webhook delivery")
+			return
+		}
+		if !inserted {
+			h.logger.Info("durable merge_group delivery already queued",
+				"repo", repo, "head_sha", headSHA, "delivery_id", deliveryID)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "merge_group check already queued"})
+			return
+		}
+		h.logger.Info("durable merge_group check queued",
+			"repo", repo, "head_sha", headSHA, "delivery_id", deliveryID)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "merge_group check queued"})
+		return
+	}
+
 	postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 
@@ -115,12 +143,7 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 		return
 	}
 
-	if err := h.postPassingAggregateChecks(postCtx, client, repo, headSHA, passingAggregateCheckContent{
-		operation: "merge_group_check",
-		title:     "Schema changes verified before merge queue",
-		summary: "Schema changes in queued pull requests are applied and verified by SchemaBot before " +
-			"they enter the merge queue, so no additional verification is required for this merge group.",
-	}); err != nil {
+	if err := h.postPassingAggregateChecks(postCtx, client, repo, headSHA, mergeGroupCheckContent()); err != nil {
 		// Return 500 so the delivery is recorded as failed and shows up in the
 		// App's delivery log for redelivery. The merge queue blocks until the
 		// check is posted, so the failure must be visible for retry, not
@@ -137,6 +160,113 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 	}
 
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": "merge_group checks posted"})
+}
+
+// mergeGroupCheckContent is the passing Check Run content published on a
+// merge-queue head. Both the request path and the durable driver use it so a
+// redelivery updates the same check with identical output.
+func mergeGroupCheckContent() passingAggregateCheckContent {
+	return passingAggregateCheckContent{
+		operation: "merge_group_check",
+		title:     "Schema changes verified before merge queue",
+		summary: "Schema changes in queued pull requests are applied and verified by SchemaBot before " +
+			"they enter the merge queue, so no additional verification is required for this merge group.",
+	}
+}
+
+// enqueueDurableMergeGroup persists a merge_group delivery in the inbox. The
+// stored TenantID is the resolved installation ID so the driver, which runs
+// outside any HTTP request, does not have to re-resolve a repo-level install.
+func (h *Handler) enqueueDurableMergeGroup(ctx context.Context, payload mergeGroupPayload, body []byte, deliveryID string, installationID int64) (bool, error) {
+	return h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
+		Provider:   storage.WebhookProviderGitHub,
+		DeliveryID: deliveryID,
+		Event:      "merge_group",
+		Action:     payload.Action,
+		Repository: payload.Repository.FullName,
+		HeadSHA:    payload.MergeGroup.HeadSHA,
+		TenantID:   strconv.FormatInt(installationID, 10),
+		Payload:    body,
+	})
+}
+
+// processDurableMergeGroup posts the passing merge-queue check for a claimed
+// merge_group delivery. It re-validates every enqueue-time guard fail-closed —
+// config can change between enqueue and drive, and rows can arrive via replay —
+// so a now-ignored delivery completes as a no-op rather than posting a check
+// the current config would not. GitHub client and post failures are retryable;
+// posting is idempotent (the check is looked up by name and updated in place),
+// so a retry after a partial post reconciles rather than duplicates.
+func (h *Handler) processDurableMergeGroup(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
+	var payload mergeGroupPayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return false, fmt.Errorf("decode durable merge_group delivery %s: %w", event.DeliveryID, err)
+	}
+
+	if payload.Action != "checks_requested" {
+		h.logger.Info("durable merge_group delivery ignored because action needs no check",
+			"delivery_id", event.DeliveryID, "action", payload.Action, "repo", event.Repository)
+		return false, nil
+	}
+
+	repo := payload.Repository.FullName
+	headSHA := payload.MergeGroup.HeadSHA
+	if repo == "" || headSHA == "" {
+		return false, fmt.Errorf("durable merge_group delivery %s missing repo or head SHA", event.DeliveryID)
+	}
+
+	installationID := h.durableInstallationID(ctx, event, payload.Installation.ID)
+	if installationID == 0 {
+		return false, fmt.Errorf("durable merge_group delivery %s missing installation ID", event.DeliveryID)
+	}
+
+	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
+		h.logger.Warn("durable merge_group delivery from unregistered repository",
+			"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA, "installation_id", installationID)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "merge_group", payload.Action, repo)
+		return false, nil
+	}
+
+	if h.isAggregateParticipant(repo) {
+		h.logger.Info("durable merge_group delivery skipped: aggregate participant stays silent; the leader posts the required checks",
+			"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA, "installation_id", installationID)
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "merge_group_check",
+			Repository: repo,
+			Status:     "skipped",
+		})
+		return false, nil
+	}
+
+	if !h.shouldPublishChecks(ctx, repo, "merge_group_check") {
+		// shouldPublishChecks logs and records the skip.
+		return false, nil
+	}
+
+	// Bound the GitHub work so a stalled API call cannot be kept alive
+	// indefinitely by the lease heartbeat and monopolize a driver. Matches the
+	// request path's post budget and the durable auto-plan bootstrap. The driver
+	// context stays the parent, so shutdown or lease loss still cancels.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	client, err := h.clientForRepo(repo, installationID)
+	if err != nil {
+		return true, fmt.Errorf("create GitHub client for durable merge_group %s@%s: %w", repo, headSHA, err)
+	}
+
+	if err := h.postPassingAggregateChecks(ctx, client, repo, headSHA, mergeGroupCheckContent()); err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "merge_group_check",
+			Repository: repo,
+			Status:     "error",
+		})
+		return true, fmt.Errorf("post durable merge_group checks for %s@%s: %w", repo, headSHA, err)
+	}
+
+	h.logger.Info("durable merge_group checks posted",
+		"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA)
+	return false, nil
 }
 
 // passingAggregateCheckContent carries the operation name and Check Run output

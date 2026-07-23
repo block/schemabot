@@ -58,8 +58,9 @@ var applyTargetLocker namedlock.Locker = namedlock.MySQL{}
 
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
-	db      *sql.DB
-	dialect Dialect
+	db       *sql.DB
+	dialect  Dialect
+	identity identityInserter
 }
 
 type applyWriteTx struct {
@@ -520,7 +521,7 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 		}
 	}
 
-	result, err := writeTx.tx.ExecContext(ctx, `
+	id, err := s.identity.InsertID(ctx, writeTx.tx, `
 		INSERT INTO applies (
 			apply_identifier, lock_id, plan_id, database_name, database_type,
 			repository, pull_request, environment, deployment, caller, installation_id, external_id, idempotency_key, engine,
@@ -536,11 +537,6 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 			return 0, fmt.Errorf("create apply %s: %w", apply.ApplyIdentifier, storage.ErrApplyIDExists)
 		}
 		return 0, fmt.Errorf("insert apply %s: %w", apply.ApplyIdentifier, err)
-	}
-
-	id, err := result.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("read inserted apply id for %s: %w", apply.ApplyIdentifier, err)
 	}
 
 	if err := writeTx.commit(); err != nil {
@@ -569,7 +565,7 @@ func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *st
 		deployments = append(deployments, op.Deployment)
 	}
 	return s.createWithRows(ctx, apply, opName, deployments, func(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64) error {
-		return insertApplyTasksAndOperations(ctx, tx, apply, applyID, tasks, operations)
+		return insertApplyTasksAndOperations(ctx, tx, s.identity, apply, applyID, tasks, operations)
 	})
 }
 
@@ -583,7 +579,7 @@ func (s *applyStore) CreateWithGroupedOperations(ctx context.Context, apply *sto
 		}
 	}
 	return s.createWithRows(ctx, apply, opName, deployments, func(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64) error {
-		return insertApplyGroupedOperations(ctx, tx, apply, applyID, groups)
+		return insertApplyGroupedOperations(ctx, tx, s.identity, apply, applyID, groups)
 	})
 }
 
@@ -619,7 +615,7 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 		}
 	}
 
-	result, err := writeTx.tx.ExecContext(ctx, `
+	id, err := s.identity.InsertID(ctx, writeTx.tx, `
 		INSERT INTO applies (
 			apply_identifier, lock_id, plan_id, database_name, database_type,
 			repository, pull_request, environment, deployment, caller, installation_id, external_id, idempotency_key, engine,
@@ -635,11 +631,6 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 			return 0, fmt.Errorf("create apply %s: %w", apply.ApplyIdentifier, storage.ErrApplyIDExists)
 		}
 		return 0, fmt.Errorf("insert apply %s: %w", apply.ApplyIdentifier, err)
-	}
-
-	id, err := result.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("read inserted apply id for %s: %w", apply.ApplyIdentifier, err)
 	}
 
 	if err := writeRows(ctx, writeTx.tx, apply, id); err != nil {
@@ -686,7 +677,7 @@ func verifyExpectedLockIntent(ctx context.Context, tx *sql.Tx, apply *storage.Ap
 	return nil
 }
 
-func insertApplyTasksAndOperations(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64, tasks []*storage.Task, operations []*storage.ApplyOperation) error {
+func insertApplyTasksAndOperations(ctx context.Context, tx *sql.Tx, identity identityInserter, apply *storage.Apply, applyID int64, tasks []*storage.Task, operations []*storage.ApplyOperation) error {
 	// Operations are inserted BEFORE tasks so each task can be persisted
 	// with the apply_operation_id of the operation it belongs to. Today
 	// the config layer hard-blocks multi-entry deployments so there is
@@ -696,7 +687,7 @@ func insertApplyTasksAndOperations(ctx context.Context, tx *sql.Tx, apply *stora
 	// by the caller (see the multi-op guard below).
 	for _, op := range operations {
 		op.ApplyID = applyID
-		if _, err := insertApplyOperation(ctx, tx, op); err != nil {
+		if _, err := insertApplyOperation(ctx, tx, identity, op); err != nil {
 			return fmt.Errorf("insert apply_operation (deployment=%s) for apply %s: %w", op.Deployment, apply.ApplyIdentifier, err)
 		}
 	}
@@ -753,7 +744,7 @@ func insertApplyTasksAndOperations(ctx context.Context, tx *sql.Tx, apply *stora
 
 	for _, task := range tasks {
 		task.ApplyID = applyID
-		taskID, err := insertTask(ctx, tx, task)
+		taskID, err := insertTask(ctx, tx, identity, task)
 		if err != nil {
 			return fmt.Errorf("insert task %s for apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
 		}
@@ -762,7 +753,7 @@ func insertApplyTasksAndOperations(ctx context.Context, tx *sql.Tx, apply *stora
 	return nil
 }
 
-func insertApplyGroupedOperations(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64, groups []*storage.ApplyOperationWithTasks) error {
+func insertApplyGroupedOperations(ctx context.Context, tx *sql.Tx, identity identityInserter, apply *storage.Apply, applyID int64, groups []*storage.ApplyOperationWithTasks) error {
 	if len(groups) == 0 {
 		return fmt.Errorf("create apply %s: grouped operations are empty", apply.ApplyIdentifier)
 	}
@@ -787,7 +778,7 @@ func insertApplyGroupedOperations(ctx context.Context, tx *sql.Tx, apply *storag
 		}
 
 		group.Operation.ApplyID = applyID
-		if _, err := insertApplyOperation(ctx, tx, group.Operation); err != nil {
+		if _, err := insertApplyOperation(ctx, tx, identity, group.Operation); err != nil {
 			return fmt.Errorf("insert apply_operation (deployment=%s) for apply %s: %w", group.Operation.Deployment, apply.ApplyIdentifier, err)
 		}
 		for _, task := range group.Tasks {
@@ -796,7 +787,7 @@ func insertApplyGroupedOperations(ctx context.Context, tx *sql.Tx, apply *storag
 			}
 			task.ApplyID = applyID
 			task.ApplyOperationID = &group.Operation.ID
-			taskID, err := insertTask(ctx, tx, task)
+			taskID, err := insertTask(ctx, tx, identity, task)
 			if err != nil {
 				return fmt.Errorf("insert task %s for apply %s deployment %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, group.Operation.Deployment, err)
 			}

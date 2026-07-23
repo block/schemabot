@@ -715,10 +715,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handlePullRequest(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
 		recordProcessed()
 	case "merge_group":
-		h.handleMergeGroup(ctx, metricApp, sw, body)
+		h.handleMergeGroup(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
 		recordProcessed()
 	case "push":
-		h.handlePush(ctx, metricApp, sw, body)
+		h.handlePush(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
 		recordProcessed()
 	default:
 		h.logger.Info("webhook ignored",

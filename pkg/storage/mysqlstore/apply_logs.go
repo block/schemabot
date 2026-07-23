@@ -18,7 +18,8 @@ const applyLogColumns = `id, apply_id, task_id, level, event_type, source, messa
 
 // applyLogStore implements storage.ApplyLogStore using MySQL.
 type applyLogStore struct {
-	db *sql.DB
+	db       *sql.DB
+	identity identityInserter
 }
 
 // Append adds a new log entry.
@@ -34,7 +35,7 @@ func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error
 	}
 
 	if hasLease {
-		result, err := s.db.ExecContext(ctx, `
+		id, inserted, err := s.identity.InsertGuardedID(ctx, s.db, `
 			INSERT INTO apply_logs (
 				apply_id, task_id, level, event_type, source, message,
 				old_state, new_state, metadata
@@ -48,27 +49,19 @@ func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error
 			lease.ApplyID, lease.Token,
 		)
 		if err != nil {
-			return err
+			return fmt.Errorf("append apply log for apply %d: %w", log.ApplyID, err)
 		}
-		rows, err := result.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("read apply log append rows affected for apply %d: %w", log.ApplyID, err)
-		}
-		if rows == 0 {
+		if !inserted {
 			if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
 				return err
 			}
 			return fmt.Errorf("append apply log for apply %d matched no rows despite current lease", log.ApplyID)
 		}
-		id, err := result.LastInsertId()
-		if err != nil {
-			return err
-		}
 		log.ID = id
 		return nil
 	}
 
-	result, err := s.db.ExecContext(ctx, `
+	id, err := s.identity.InsertID(ctx, s.db, `
 		INSERT INTO apply_logs (
 			apply_id, task_id, level, event_type, source, message,
 			old_state, new_state, metadata
@@ -77,12 +70,6 @@ func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error
 		log.ApplyID, nullInt64Ptr(log.TaskID), log.Level, log.EventType, source, log.Message,
 		nullString(log.OldState), nullString(log.NewState), nullJSON(log.Metadata),
 	)
-	if err != nil {
-		return err
-	}
-
-	// Set the auto-generated ID
-	id, err := result.LastInsertId()
 	if err != nil {
 		return err
 	}
