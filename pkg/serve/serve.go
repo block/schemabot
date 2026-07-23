@@ -310,6 +310,14 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	db.SetConnMaxLifetime(5 * time.Minute)
 	db.SetConnMaxIdleTime(3 * time.Minute)
 
+	// Size the idle pool to cover the per-pod background concurrency so idle
+	// connections stay pooled instead of being closed and reopened every tick.
+	// Without this, Go's default MaxIdleConns=2 causes constant TCP churn
+	// (CONNECT/DISCONNECT pairs in the MySQL audit log) because the durable
+	// webhook drivers (4 × 1 s poll), operator drivers (4 × 10 s poll), and
+	// background monitors all return connections that exceed the idle limit.
+	db.SetMaxIdleConns(10)
+
 	// Log config summary for debugging
 	logger.Info("config loaded",
 		"databases", len(cfg.Databases),
