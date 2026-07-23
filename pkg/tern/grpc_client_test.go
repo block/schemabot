@@ -532,6 +532,8 @@ type capturingTernServer struct {
 	cutoverAccepted   bool
 	cutoverMessage    string
 	startCalled       bool // tracks whether Start was actually invoked
+	stopCalls         int
+	cancelCalls       int
 }
 
 func (s *capturingTernServer) Apply(_ context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
@@ -568,6 +570,7 @@ func (s *capturingTernServer) Start(_ context.Context, req *ternv1.StartRequest)
 func (s *capturingTernServer) Stop(_ context.Context, req *ternv1.StopRequest) (*ternv1.StopResponse, error) {
 	s.mu.Lock()
 	s.stopApplyID = req.ApplyId
+	s.stopCalls++
 	s.mu.Unlock()
 	return &ternv1.StopResponse{Accepted: true}, nil
 }
@@ -575,6 +578,7 @@ func (s *capturingTernServer) Stop(_ context.Context, req *ternv1.StopRequest) (
 func (s *capturingTernServer) Cancel(_ context.Context, req *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
 	s.mu.Lock()
 	s.cancelApplyID = req.ApplyId
+	s.cancelCalls++
 	err := s.cancelErr
 	s.mu.Unlock()
 	if err != nil {
@@ -657,6 +661,18 @@ func (s *capturingTernServer) getCancelApplyID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.cancelApplyID
+}
+
+func (s *capturingTernServer) getStopCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopCalls
+}
+
+func (s *capturingTernServer) getCancelCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cancelCalls
 }
 
 func (s *capturingTernServer) getSkipRevertApplyID() string {
