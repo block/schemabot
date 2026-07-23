@@ -18,6 +18,7 @@ import (
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -512,9 +513,13 @@ func diagnoseStorageTarget(ctx context.Context, dsn string) (*storageDiagnostic,
 	return &diag, nil
 }
 
-// ensureSchemaLockName is the MySQL advisory lock name used to serialize
+// ensureSchemaLockName is the advisory lock name used to serialize
 // EnsureSchema across concurrent pod startups.
 const ensureSchemaLockName = "schemabot_ensure_schema"
+
+// ensureSchemaLocker serializes EnsureSchema across pods with a session-scoped
+// advisory lock held on the returned connection for the operation's lifetime.
+var ensureSchemaLocker namedlock.Locker = namedlock.MySQL{}
 
 // acquireEnsureSchemaLock acquires a MySQL advisory lock to serialize
 // EnsureSchema across pods. Returns the connection holding the lock — the
@@ -532,18 +537,14 @@ func acquireEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logge
 		return nil, fmt.Errorf("get connection: %w", err)
 	}
 
-	// GET_LOCK returns 1 on success, 0 on timeout, NULL on error.
 	// Wait up to the full timeout for the lock — a trailing pod must outwait the
 	// leader's schema change, after which it re-plans and finds no changes.
-	var result sql.NullInt64
-	err = conn.QueryRowContext(ctx,
-		"SELECT GET_LOCK(?, ?)", ensureSchemaLockName, int(EnsureSchemaTimeout.Seconds()),
-	).Scan(&result)
+	acquired, err := ensureSchemaLocker.Acquire(ctx, conn, ensureSchemaLockName, EnsureSchemaTimeout)
 	if err != nil {
 		utils.CloseAndLog(conn)
-		return nil, fmt.Errorf("GET_LOCK: %w", err)
+		return nil, fmt.Errorf("acquire advisory lock: %w", err)
 	}
-	if !result.Valid || result.Int64 != 1 {
+	if !acquired {
 		utils.CloseAndLog(conn)
 		return nil, fmt.Errorf("timed out waiting for advisory lock %q (another pod may be running EnsureSchema)", ensureSchemaLockName)
 	}
