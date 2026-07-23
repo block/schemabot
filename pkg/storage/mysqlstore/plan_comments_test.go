@@ -67,6 +67,37 @@ func TestPlanCommentStore_InsertAndListUnminimizedForSlot(t *testing.T) {
 	assert.Empty(t, comments)
 }
 
+func TestPlanCommentStore_ListUnminimizedForPR(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	// Two database slots on the target PR, one already-minimized row on the
+	// same PR, and one row on a different PR.
+	first := insertTestPlanComment(t, store, "org/repo", 42, "orders", "mysql", "staging", "sha1", 100)
+	second := insertTestPlanComment(t, store, "org/repo", 42, "billing", "mysql", "staging", "sha1", 200)
+	minimized := insertTestPlanComment(t, store, "org/repo", 42, "orders", "mysql", "staging", "sha2", 300)
+	require.NoError(t, store.PlanComments().MarkMinimized(ctx, minimized.ID))
+	insertTestPlanComment(t, store, "org/repo", 7, "orders", "mysql", "staging", "sha1", 400)
+
+	comments, err := store.PlanComments().ListUnminimizedForPR(ctx, "org/repo", 42)
+	require.NoError(t, err)
+	require.Len(t, comments, 2, "every unminimized slot on the PR is listed, other PRs and minimized rows are not")
+
+	assert.Equal(t, first.ID, comments[0].ID, "ordered by id ascending")
+	assert.Equal(t, "orders", comments[0].DatabaseName)
+	assert.Equal(t, second.ID, comments[1].ID)
+	assert.Equal(t, "billing", comments[1].DatabaseName)
+	assert.Equal(t, "mysql", comments[1].DatabaseType)
+	assert.Equal(t, "sha1", comments[1].HeadSHA)
+	assert.Equal(t, "IC_node200", comments[1].GitHubNodeID)
+
+	// A PR with no rows lists as empty, not an error.
+	comments, err = store.PlanComments().ListUnminimizedForPR(ctx, "org/repo", 999)
+	require.NoError(t, err)
+	assert.Empty(t, comments)
+}
+
 func TestPlanCommentStore_MarkMinimized(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -174,6 +205,16 @@ func TestPlanCommentStore_ListUnminimizedForSlot_DBError(t *testing.T) {
 
 	store := New(db)
 	_, err = store.PlanComments().ListUnminimizedForSlot(t.Context(), "org/repo", 1, "db", "mysql")
+	require.Error(t, err)
+}
+
+func TestPlanCommentStore_ListUnminimizedForPR_DBError(t *testing.T) {
+	db, err := sql.Open("mysql", testDSN)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	store := New(db)
+	_, err = store.PlanComments().ListUnminimizedForPR(t.Context(), "org/repo", 1)
 	require.Error(t, err)
 }
 

@@ -374,6 +374,13 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		h.cleanupStaleChecks(repo, pr, headSHA, installationID, affectedDatabases)
 	})
 
+	// Plan comments for databases no longer in the PR have no plan outcome
+	// left to supersede them, so sweep their slots alongside the stale-check
+	// cleanup.
+	h.goSafe(repo, pr, installationID, func() {
+		h.sweepStalePlanCommentsForRemovedDatabases(repo, pr, headSHA, installationID, affectedDatabases)
+	})
+
 	if len(configs) == 0 {
 		h.logger.Info("no schema files in PR, skipping auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
 		// An aggregate participant does not own the required check for the repo —

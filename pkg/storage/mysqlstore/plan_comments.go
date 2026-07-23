@@ -60,6 +60,31 @@ func (s *planCommentStore) ListUnminimizedForSlot(ctx context.Context, repo stri
 	return comments, rows.Err()
 }
 
+// ListUnminimizedForPR returns the not-yet-minimized comments across every
+// database slot on a pull request, ordered by id ascending.
+func (s *planCommentStore) ListUnminimizedForPR(ctx context.Context, repo string, pr int) ([]*storage.PlanComment, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+planCommentColumns+`
+		FROM plan_comments
+		WHERE repository = ? AND pull_request = ? AND minimized_at IS NULL
+		ORDER BY id
+	`, repo, pr)
+	if err != nil {
+		return nil, fmt.Errorf("query unminimized plan comments for %s#%d: %w", repo, pr, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var comments []*storage.PlanComment
+	for rows.Next() {
+		comment, err := scanPlanComment(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan plan comment for %s#%d: %w", repo, pr, err)
+		}
+		comments = append(comments, comment)
+	}
+	return comments, rows.Err()
+}
+
 // MarkMinimized stamps minimized_at after the GitHub minimize call succeeded.
 // An already-minimized row is not an error.
 func (s *planCommentStore) MarkMinimized(ctx context.Context, id int64) error {
