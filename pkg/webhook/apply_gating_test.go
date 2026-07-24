@@ -522,7 +522,7 @@ func writeCheckRunsResponse(w http.ResponseWriter, nodes []checkStatusNode) {
 }
 
 func TestEnforcePassingChecks(t *testing.T) {
-	t.Run("permission error blocks with actionable message", func(t *testing.T) {
+	t.Run("permission error returns error with actionable message", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := make(chan string, 10)
 
@@ -558,8 +558,9 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
-		assert.True(t, blocked, "should block on permission error")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		require.Error(t, err)
+		assert.False(t, blocked)
 
 		select {
 		case body := <-comments:
@@ -573,7 +574,7 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 	})
 
-	t.Run("API failure blocks apply (fail-closed)", func(t *testing.T) {
+	t.Run("API failure returns error", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := make(chan string, 10)
 
@@ -602,8 +603,9 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
-		assert.True(t, blocked, "should block when API fails")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		require.Error(t, err)
+		assert.False(t, blocked)
 
 		select {
 		case body := <-comments:
@@ -644,7 +646,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		require.NoError(t, err)
 		assert.True(t, blocked, "should block when checks are failing")
 
 		select {
@@ -689,7 +692,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		require.NoError(t, err)
 		assert.True(t, blocked, "should block when a check was cancelled")
 
 		select {
@@ -720,7 +724,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		require.NoError(t, err)
 		assert.False(t, blocked, "should allow when configured checks pass")
 	})
 
@@ -750,7 +755,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		require.NoError(t, err)
 		assert.False(t, blocked, "status-only required gate should pass without reading check runs")
 		assert.False(t, checkRunsCalled, "unrelated check runs should not be fetched once required statuses are found")
 	})
@@ -784,7 +790,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		require.NoError(t, err)
 		assert.True(t, blocked, "should block on all checks when configured checks are absent")
 
 		select {
@@ -829,7 +836,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		require.NoError(t, err)
 		assert.True(t, blocked, "should block when a required check has not reported")
 
 		select {
@@ -878,7 +886,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		require.NoError(t, err)
 		assert.True(t, blocked, "should block when no required check has reported")
 
 		select {
@@ -921,7 +930,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		require.NoError(t, err)
 		assert.True(t, blocked, "should block when a required check has not reported")
 
 		logs := logBuf.String()
@@ -966,7 +976,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		require.NoError(t, err)
 		assert.True(t, blocked, "should block when a required check is running and another has not reported")
 
 		select {
@@ -1005,7 +1016,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		require.NoError(t, err)
 		assert.False(t, blocked, "should allow when all required checks reported and passed")
 	})
 
@@ -1028,7 +1040,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		require.NoError(t, err)
 		assert.False(t, blocked, "should allow when all non-SchemaBot checks pass")
 	})
 
@@ -1061,7 +1074,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		require.NoError(t, err)
 		assert.True(t, blocked, "should block when checks are in-progress")
 
 		select {
@@ -1091,7 +1105,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		require.NoError(t, err)
 		assert.False(t, blocked, "should not block on own failed check with variant slug")
 	})
 
@@ -1107,7 +1122,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		require.NoError(t, err)
 		assert.False(t, blocked, "should not block when disabled")
 	})
 }

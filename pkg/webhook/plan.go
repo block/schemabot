@@ -203,7 +203,11 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 			"repo", repo, "pr", pr, "database", databaseName, "requested_by", requestedBy)
 		return false
 	}
-	return h.enforcePRCommandActorAuthorization(ctx, authzClient, repo, pr, installationID, requestedBy, databaseName, dbConfig.Type, environment, action.Plan)
+	// The plan handler is not a durable core, so an authorization evaluation
+	// failure blocks the plan the same as a merit denial (fail closed); the
+	// gate has already logged and posted the distinction.
+	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, authzClient, repo, pr, installationID, requestedBy, databaseName, dbConfig.Type, environment, action.Plan)
+	return authErr != nil || blocked
 }
 
 // handleMultiEnvPlan runs plan for all configured environments and posts a single combined comment.

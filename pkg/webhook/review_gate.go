@@ -20,13 +20,24 @@ type ReviewGateResult struct {
 }
 
 // enforceReviewGate runs the review gate check and posts the appropriate comment if blocked.
-// Returns true if the apply was blocked (caller should return), false if it may proceed.
-func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, environment, requestedBy, commandName string) bool {
+// Returns blocked=true when the gate blocks on the merits — the PR lacks an
+// approval from a configured review-policy principal (caller should return).
+// A gate evaluation failure (a GitHub read inside checkReviewGate, or a review
+// policy the gate cannot resolve) stops the command (fail closed) and is
+// returned as an error, not a block: the approval state could not be
+// determined, so the outcome is not the command's answer and a durable driver
+// may re-drive it. Policy-shape errors in that class (for example a review
+// policy with no configured reviewers) cannot succeed on a re-drive, but they
+// are bounded by the driver's retry budget, so the gate does not maintain a
+// separate taxonomy for them.
+func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, environment, requestedBy, commandName string) (blocked bool, err error) {
 	gateResult, err := h.checkReviewGate(ctx, client, repo, pr, schemaResult.Database, schemaResult.SchemaPath)
 	if err != nil {
-		h.logger.Error("review gate check failed", "error", err)
+		h.logger.Error("review gate check failed", "repo", repo, "pr", pr,
+			"database", schemaResult.Database, "environment", environment,
+			"command", commandName, "error", err)
 		h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, reviewGateErrorDetail(err))
-		return true
+		return false, fmt.Errorf("review gate check %s#%d: %w", repo, pr, err)
 	}
 	if gateResult != nil && !gateResult.Approved {
 		h.postComment(repo, pr, installationID, templates.RenderReviewRequired(templates.ReviewGateData{
@@ -36,9 +47,9 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 			Reviewers:   gateResult.RequiredReviewers,
 			PRAuthor:    gateResult.PRAuthor,
 		}))
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
 }
 
 func reviewGateErrorDetail(err error) string {
