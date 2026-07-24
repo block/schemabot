@@ -683,11 +683,24 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysq
 func grpcLocalClientFactory(config *api.ServerConfig, wakeOperator func(applyIdentifier, database, environment string), engineFactories map[string]tern.EngineFactory) tern.LocalClientFactory {
 	pendingDropsDisabled := !config.PendingDropsEnabled()
 	return func(cfg tern.LocalConfig, st storage.Storage, logger *slog.Logger) (tern.Client, error) {
-		if pendingDropsDisabled {
+		spiritMetadata, err := config.SpiritMetadata()
+		if err != nil {
+			return nil, fmt.Errorf("resolve spirit config for database %q: %w", cfg.Database, err)
+		}
+		if pendingDropsDisabled || len(spiritMetadata) > 0 {
 			if cfg.Metadata == nil {
 				cfg.Metadata = map[string]string{}
 			}
+		}
+		if pendingDropsDisabled {
 			cfg.Metadata["pending_drops"] = "false"
+		}
+		// Server-level spirit overrides are defaults; a database's own
+		// metadata entry for the same key wins.
+		for key, value := range spiritMetadata {
+			if _, ok := cfg.Metadata[key]; !ok {
+				cfg.Metadata[key] = value
+			}
 		}
 		if cfg.WakeOperator == nil {
 			cfg.WakeOperator = wakeOperator

@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/routing"
@@ -3523,5 +3524,48 @@ func TestKnownEnvironments(t *testing.T) {
 		var cfg *ServerConfig
 		assert.Nil(t, cfg.KnownEnvironments())
 		assert.False(t, cfg.IsEnvironmentKnown("staging"))
+	})
+}
+
+// TestServerConfig_SpiritMetadata verifies that the spirit block translates
+// into engine metadata overrides: an absent block produces no entries (the
+// engine defaults apply), configured values carry through, and a
+// misconfigured duration fails instead of silently running applies with the
+// defaults.
+func TestServerConfig_SpiritMetadata(t *testing.T) {
+	t.Run("absent block produces no overrides", func(t *testing.T) {
+		var cfg ServerConfig
+		metadata, err := cfg.SpiritMetadata()
+		require.NoError(t, err)
+		assert.Empty(t, metadata)
+	})
+
+	t.Run("configured values translate to metadata keys", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte(`
+spirit:
+  enable_experimental_autoscaling: false
+  checkpoint_max_age: 24h
+  checksum_yield_timeout: 6h
+`), &cfg))
+		metadata, err := cfg.SpiritMetadata()
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{
+			spirit.MetadataEnableExperimentalAutoscaling: "false",
+			spirit.MetadataCheckpointMaxAge:              "24h",
+			spirit.MetadataChecksumYieldTimeout:          "6h",
+		}, metadata)
+	})
+
+	t.Run("invalid duration errors", func(t *testing.T) {
+		cfg := ServerConfig{Spirit: SpiritConfig{CheckpointMaxAge: "3 days"}}
+		_, err := cfg.SpiritMetadata()
+		require.ErrorContains(t, err, "checkpoint_max_age")
+	})
+
+	t.Run("non-positive duration errors", func(t *testing.T) {
+		cfg := ServerConfig{Spirit: SpiritConfig{ChecksumYieldTimeout: "-1h"}}
+		_, err := cfg.SpiritMetadata()
+		require.ErrorContains(t, err, "must be positive")
 	})
 }

@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/routing"
@@ -173,6 +174,14 @@ type ServerConfig struct {
 	// background cleaner can be run by this process or disabled so another
 	// deployment owns permanent cleanup after the retention period.
 	PendingDrops PendingDropsConfig `yaml:"pending_drops,omitempty"`
+
+	// Spirit overrides the Spirit engine's default run settings for every
+	// MySQL database this server drives directly. Unset fields keep the
+	// engine defaults (see pkg/engine/spirit), so the block is only needed
+	// to deviate — for example to disable write-thread autoscaling as an
+	// incident kill switch. A database's own metadata entry for the same
+	// key wins over this server-level value.
+	Spirit SpiritConfig `yaml:"spirit,omitempty"`
 }
 
 // PendingDropsConfig configures the pending drops quarantine for MySQL/Spirit
@@ -238,6 +247,66 @@ func (c *ServerConfig) PendingDropsRetention() (time.Duration, error) {
 		return 0, fmt.Errorf("pending_drops.retention must be positive, got %q", c.PendingDrops.Retention)
 	}
 	return d, nil
+}
+
+// SpiritConfig overrides the Spirit engine's default run settings. Each field
+// maps to an engine metadata key (see spirit.SettingsFromMetadata); values set
+// here are merged into every locally driven MySQL database's metadata unless
+// the database sets the same key itself.
+type SpiritConfig struct {
+	// EnableExperimentalAutoscaling controls whether Spirit scales write
+	// threads dynamically from throttler feedback. Defaults to true when not
+	// configured (nil = enabled); set false as the operator kill switch when
+	// autoscaling misbehaves on a target fleet.
+	EnableExperimentalAutoscaling *bool `yaml:"enable_experimental_autoscaling"`
+
+	// CheckpointMaxAge bounds how old a Spirit checkpoint may be and still be
+	// resumed, as a Go duration string (e.g. "72h"). Defaults to 3 days:
+	// a copy stalled that long restarts cleanly instead of replaying days of
+	// old binlogs.
+	CheckpointMaxAge string `yaml:"checkpoint_max_age,omitempty"`
+
+	// ChecksumYieldTimeout bounds each checksum read transaction before it
+	// yields its REPEATABLE READ snapshot, as a Go duration string (e.g.
+	// "12h"). Defaults to 12 hours so a long checksum cannot pin InnoDB purge
+	// on the target.
+	ChecksumYieldTimeout string `yaml:"checksum_yield_timeout,omitempty"`
+}
+
+// SpiritMetadata validates the configured Spirit overrides and returns them as
+// engine metadata entries, containing only the keys the config sets. Duration
+// values must parse and be positive; a misconfigured override fails server
+// construction instead of silently running applies with the defaults.
+func (c *ServerConfig) SpiritMetadata() (map[string]string, error) {
+	metadata := map[string]string{}
+	if c.Spirit.EnableExperimentalAutoscaling != nil {
+		metadata[spirit.MetadataEnableExperimentalAutoscaling] = strconv.FormatBool(*c.Spirit.EnableExperimentalAutoscaling)
+	}
+	if err := setSpiritDuration(metadata, spirit.MetadataCheckpointMaxAge, c.Spirit.CheckpointMaxAge); err != nil {
+		return nil, err
+	}
+	if err := setSpiritDuration(metadata, spirit.MetadataChecksumYieldTimeout, c.Spirit.ChecksumYieldTimeout); err != nil {
+		return nil, err
+	}
+	return metadata, nil
+}
+
+// setSpiritDuration validates an optional spirit duration override and records
+// it under the given metadata key. Empty values are skipped so the engine
+// default applies.
+func setSpiritDuration(metadata map[string]string, key, raw string) error {
+	if raw == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf("parse spirit.%s %q: %w", key, raw, err)
+	}
+	if d <= 0 {
+		return fmt.Errorf("spirit.%s must be positive, got %q", key, raw)
+	}
+	metadata[key] = raw
+	return nil
 }
 
 // GitHubConfig configures the GitHub App used for webhook-driven schema changes.

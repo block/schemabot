@@ -6,14 +6,94 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/go-sql-driver/mysql"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/mysqlconn"
 )
+
+// maxCommitLatency is the commit-latency throttle threshold: the copy backs
+// off when the target's observed average commit latency exceeds it. It must
+// be set explicitly — Spirit treats a zero value as "throttler disabled", and
+// in redo-aware mode this throttler is also the backstop that lets the
+// write-thread autoscaler grow above its starting value.
+const maxCommitLatency = 100 * time.Millisecond
+
+// newMigration builds the Spirit migration for a statement against the
+// target with the engine's copy, durability, and throttling settings.
+// Callers layer statement-specific fields (DeferCutOver, RespectSentinel)
+// onto the result.
+//
+// Write threads start at the target-appropriate automatic size (on Aurora,
+// the instance vCPU count) and, when autoscaling is enabled, scale
+// dynamically from there on throttler feedback, so apply throughput tracks
+// the target instance rather than a fixed constant.
+func (e *Engine) newMigration(ctx context.Context, host, username, password, database, stmt string) *spiritmigration.Migration {
+	threads, chunkTime, lockTimeout := e.copySettings()
+	return &spiritmigration.Migration{
+		Host:                          host,
+		Username:                      username,
+		Password:                      &password,
+		Database:                      database,
+		Statement:                     stmt,
+		TargetChunkTime:               chunkTime,
+		Threads:                       threads,
+		WriteThreads:                  0, // auto-size for the target
+		LockWaitTimeout:               lockTimeout,
+		InterpolateParams:             true,
+		CheckpointMaxAge:              e.checkpointMaxAge,
+		ChecksumYieldTimeout:          e.checksumYieldTimeout,
+		MaxCommitLatency:              maxCommitLatency,
+		EnableExperimentalAutoscaling: e.autoscaling,
+		EnableExperimentalGTID:        e.gtidChangeSourceSupported(ctx, host, username, password, database),
+	}
+}
+
+// gtidChangeSourceSupported reports whether the target can serve Spirit's
+// GTID-based change source, which tracks replication position across binlog
+// rotation and failover more robustly than binlog file+position. Spirit
+// refuses to start when the GTID source is requested on a target without
+// gtid_mode=ON, so the source is chosen per target: GTID-capable targets get
+// the stronger source and every other target keeps the universally supported
+// binlog file+position source.
+func (e *Engine) gtidChangeSourceSupported(ctx context.Context, host, username, password, database string) bool {
+	cfg := mysql.NewConfig()
+	cfg.User = username
+	cfg.Passwd = password
+	cfg.Net = "tcp"
+	cfg.Addr = host
+	cfg.DBName = database
+	db, err := mysqlconn.Open(cfg.FormatDSN())
+	if err != nil {
+		e.logger.Warn("failed to probe target GTID support, using the binlog file+position change source",
+			"host", host, "database", database, "error", err)
+		return false
+	}
+	defer utils.CloseAndLog(db)
+
+	var gtidMode, enforceConsistency string
+	if err := db.QueryRowContext(ctx,
+		`SELECT @@global.gtid_mode, @@global.enforce_gtid_consistency`).Scan(&gtidMode, &enforceConsistency); err != nil {
+		e.logger.Warn("failed to probe target GTID support, using the binlog file+position change source",
+			"host", host, "database", database, "error", err)
+		return false
+	}
+	if gtidMode != "ON" || enforceConsistency != "ON" {
+		e.logger.Info("target does not support GTID, using the binlog file+position change source",
+			"host", host, "database", database,
+			"gtid_mode", gtidMode, "enforce_gtid_consistency", enforceConsistency)
+		return false
+	}
+	e.logger.Info("target supports GTID, using the GTID change source",
+		"host", host, "database", database)
+	return true
+}
 
 // executeSchemaChange runs the Spirit schema change synchronously.
 // All DDL statements (CREATE, DROP, ALTER, RENAME) are passed through Spirit.
@@ -262,18 +342,7 @@ func (e *Engine) executeSingleStatement(ctx context.Context, host, username, pas
 		"type", stmtType,
 	)
 
-	threads, chunkTime, lockTimeout := e.copySettings()
-	migration := &spiritmigration.Migration{
-		Host:              host,
-		Username:          username,
-		Password:          &password,
-		Database:          database,
-		Statement:         stmt,
-		TargetChunkTime:   chunkTime,
-		Threads:           threads,
-		LockWaitTimeout:   lockTimeout,
-		InterpolateParams: true,
-	}
+	migration := e.newMigration(ctx, host, username, password, database, stmt)
 
 	runner, err := spiritmigration.NewRunner(migration)
 	if err != nil {
@@ -307,20 +376,9 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 		ddls = append(ddls, p.Statement)
 	}
 
-	threads, chunkTime, lockTimeout := e.copySettings()
-	migration := &spiritmigration.Migration{
-		Host:              host,
-		Username:          username,
-		Password:          &password,
-		Database:          database,
-		Statement:         combinedStatement,
-		TargetChunkTime:   chunkTime,
-		Threads:           threads,
-		LockWaitTimeout:   lockTimeout,
-		InterpolateParams: true,
-		DeferCutOver:      deferCutover,
-		RespectSentinel:   deferCutover, // Only wait for sentinel when deferring cutover
-	}
+	migration := e.newMigration(ctx, host, username, password, database, combinedStatement)
+	migration.DeferCutOver = deferCutover
+	migration.RespectSentinel = deferCutover // Only wait for sentinel when deferring cutover
 
 	runner, err := spiritmigration.NewRunner(migration)
 	if err != nil {

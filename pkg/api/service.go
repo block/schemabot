@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"strings"
@@ -565,6 +566,11 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 	if !s.config.PendingDropsEnabled() {
 		metadata["pending_drops"] = "false"
 	}
+	spiritMetadata, err := s.config.SpiritMetadata()
+	if err != nil {
+		return nil, fmt.Errorf("resolve spirit config for %s: %w", key, err)
+	}
+	maps.Copy(metadata, spiritMetadata)
 	client, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:        database,
 		Type:            dbType,
