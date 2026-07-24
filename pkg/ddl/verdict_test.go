@@ -1,8 +1,11 @@
 package ddl
 
 import (
+	"log/slog"
 	"testing"
 
+	"github.com/block/spirit/pkg/migration/check"
+	"github.com/block/spirit/pkg/statement"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -93,6 +96,68 @@ func TestEngineRefusalReason(t *testing.T) {
 			} else {
 				assert.Empty(t, reason)
 			}
+		})
+	}
+}
+
+// runEngineStatementChecks runs the engine's own statement-scope preflight
+// checks against a single statement, returning the engine's refusal error
+// (nil when the checks accept the statement).
+func runEngineStatementChecks(t *testing.T, stmt string) error {
+	t.Helper()
+	stmts, err := statement.New(stmt)
+	require.NoError(t, err)
+	require.Len(t, stmts, 1)
+	resources := check.Resources{Statement: stmts[0]}
+	return check.RunChecks(t.Context(), resources, slog.New(slog.DiscardHandler), check.ScopeStatement)
+}
+
+// TestEngineRefusalReasonAgreesWithEngineChecks pins the refusal predicate to
+// the engine: every statement this package refuses must also be refused by
+// the engine's statement-scope preflight checks, with the same reason. If the
+// engine relaxes or rewords one of these checks, this test fails and the
+// predicate must be revisited — a refusal claimed here that the engine no
+// longer enforces would wrongly block an apply that can succeed.
+func TestEngineRefusalReasonAgreesWithEngineChecks(t *testing.T) {
+	refused := []string{
+		"ALTER TABLE `users` DROP PRIMARY KEY",
+		"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+		"ALTER TABLE `users` ADD COLUMN `email` VARCHAR(255), ALGORITHM=INPLACE",
+		"ALTER TABLE `users` ADD COLUMN `email` VARCHAR(255), LOCK=NONE",
+		"ALTER TABLE `orders` ADD CONSTRAINT `fk_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)",
+		"ALTER TABLE `orders` ADD FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)",
+	}
+	for _, stmt := range refused {
+		t.Run(stmt, func(t *testing.T) {
+			reason, isRefused, err := EngineRefusalReason(stmt)
+			require.NoError(t, err)
+			require.True(t, isRefused)
+			checkErr := runEngineStatementChecks(t, stmt)
+			require.Error(t, checkErr, "engine statement-scope checks accept a statement this package refuses")
+			assert.Equal(t, reason, checkErr.Error())
+		})
+	}
+}
+
+// TestEngineRefusalReasonToleratesFastPathStatements documents the deliberate
+// gap between this package's refusals and the engine's statement-scope
+// checks: these statements fail a statement-scope check, but the engine
+// attempts MySQL's native DDL fast path before preflight checks and the fast
+// path can complete them, so the verdict must stay silent rather than claim
+// an apply will fail.
+func TestEngineRefusalReasonToleratesFastPathStatements(t *testing.T) {
+	fastPath := []string{
+		"ALTER TABLE `users` DROP COLUMN `email`, ADD COLUMN `email` VARCHAR(255)",
+		"ALTER TABLE `users` RENAME COLUMN `email` TO `contact_email`, ADD COLUMN `email` VARCHAR(255)",
+	}
+	for _, stmt := range fastPath {
+		t.Run(stmt, func(t *testing.T) {
+			reason, isRefused, err := EngineRefusalReason(stmt)
+			require.NoError(t, err)
+			assert.False(t, isRefused)
+			assert.Empty(t, reason)
+			require.Error(t, runEngineStatementChecks(t, stmt),
+				"engine statement-scope checks accept this statement, so it no longer documents a tolerated gap — remove it from this corpus")
 		})
 	}
 }
