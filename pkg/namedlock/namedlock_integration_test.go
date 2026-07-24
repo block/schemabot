@@ -57,6 +57,28 @@ func TestMain(m *testing.M) {
 	}
 	sharedDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/testdb?parseTime=true", host, port)
 
+	var db *sql.DB
+	for range 30 {
+		db, err = sql.Open("mysql", sharedDSN)
+		if err != nil {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		if err = db.PingContext(ctx); err == nil {
+			if err := db.Close(); err != nil {
+				log.Fatalf("close mysql readiness connection: %v", err)
+			}
+			break
+		}
+		if closeErr := db.Close(); closeErr != nil {
+			log.Printf("close mysql readiness connection: %v", closeErr)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if err != nil {
+		log.Fatalf("connect to mysql: %v", err)
+	}
+
 	code := m.Run()
 
 	if err := container.Terminate(ctx); err != nil {
