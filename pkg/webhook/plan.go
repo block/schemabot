@@ -201,7 +201,10 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 			"repo", repo, "pr", pr, "database", databaseName, "requested_by", requestedBy)
 		return false
 	}
-	return h.enforcePRCommandActorAuthorization(ctx, authzClient, repo, pr, installationID, requestedBy, databaseName, dbConfig.Type, environment, action.Plan)
+	// Evaluation errors are logged in the gate; this synchronous path treats any
+	// block as terminal, so the retryable disposition is not consumed here.
+	blocked, _ = h.enforcePRCommandActorAuthorization(ctx, authzClient, repo, pr, installationID, requestedBy, databaseName, dbConfig.Type, environment, action.Plan)
+	return blocked
 }
 
 // handleMultiEnvPlan runs plan for all configured environments and posts a single combined comment.

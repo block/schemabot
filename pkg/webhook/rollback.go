@@ -94,7 +94,9 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	if blocked {
 		return
 	}
-	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.Rollback); blocked {
+	// Evaluation errors are logged in the gate; this synchronous path treats any
+	// block as terminal, so the retryable disposition is not consumed here.
+	if blocked, _ := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.Rollback); blocked {
 		return
 	}
 
@@ -332,7 +334,9 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 	// must be an authorized admin/operator before any lock is released or acted
 	// on. The database comes from the lock-pinned rollback plan instead of
 	// current PR files so confirmation follows the reviewed rollback artifact.
-	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.RollbackConfirm); blocked {
+	// Evaluation errors are logged in the gate; this synchronous path treats any
+	// block as terminal, so the retryable disposition is not consumed here.
+	if blocked, _ := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.RollbackConfirm); blocked {
 		return
 	}
 

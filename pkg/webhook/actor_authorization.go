@@ -45,6 +45,17 @@ func (h *Handler) actorAuthorizationClient(
 	return client, false
 }
 
+// enforcePRCommandActorAuthorization gates a PR command on the actor's
+// authorization and reports a retryable-vs-terminal disposition:
+//
+//   - (false, nil) — the actor is authorized, or authorization is disabled.
+//   - (true, nil) — a terminal merit block: the actor is not authorized, or the
+//     database is not configured on this instance. Retrying will not change the
+//     outcome, so a durable driver should stop.
+//   - (true, err) — the authorization decision could not be evaluated (a GitHub
+//     team-membership lookup or config read failed). It fails closed and posts
+//     an authorization-unavailable comment, but the returned error marks the
+//     block as an evaluation failure a durable driver should retry.
 func (h *Handler) enforcePRCommandActorAuthorization(
 	ctx context.Context,
 	client *ghclient.InstallationClient,
@@ -56,7 +67,7 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 	databaseType string,
 	environment string,
 	commandName string,
-) bool {
+) (blocked bool, err error) {
 	result, err := h.authorizePRCommandActor(ctx, client, requestedBy, repo, database)
 	status := actorAuthorizationMetricStatus(result, err)
 	metrics.RecordPRCommandActorAuthorization(ctx, metricActionKey(commandName), database, environment, repo, status, result.Reason)
@@ -73,7 +84,7 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 			Database:    database,
 			Environment: environment,
 		}))
-		return true
+		return true, fmt.Errorf("actor authorization %s#%d: %w", repo, pr, err)
 	}
 	if !result.Allowed {
 		// A missing database config is operationally distinct from an actor who
@@ -91,7 +102,7 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 				Database:    database,
 				Environment: environment,
 			}))
-			return true
+			return true, nil
 		}
 		h.logger.Warn("PR command blocked by actor authorization",
 			"repo", repo, "pr", pr, "database", database,
@@ -105,14 +116,14 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 			Environment:          environment,
 			AuthorizedPrincipals: h.service.Config().PRCommandAuthorizedPrincipals(repo, database),
 		}))
-		return true
+		return true, nil
 	}
 	if result.Reason == api.ActorAuthReasonDisabled {
 		h.logger.Debug("skipping PR command actor authorization because it is disabled",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", databaseType, "environment", environment,
 			"command", commandName, "requested_by", requestedBy)
-		return false
+		return false, nil
 	}
 	// Rollback, rollback-confirm, and unlock execute DDL or force-release locks,
 	// so the allow decision is audit-relevant. Log it at Info with the same
@@ -123,7 +134,7 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 		"database_type", databaseType, "environment", environment,
 		"command", commandName, "requested_by", requestedBy,
 		"reason", result.Reason, "matched_principal", result.MatchedPrincipal)
-	return false
+	return false, nil
 }
 
 func (h *Handler) authorizePRCommandActor(

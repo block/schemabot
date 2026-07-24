@@ -100,7 +100,9 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 		return false, nil
 	}
 
-	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.Apply); blocked {
+	if blocked, err := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.Apply); err != nil {
+		return true, fmt.Errorf("apply command actor authorization %s#%d: %w", repo, pr, err)
+	} else if blocked {
 		return false, nil
 	}
 
@@ -434,7 +436,9 @@ func (h *Handler) applyConfirmCommandCore(repo string, pr int, environment, data
 		return false, nil
 	}
 
-	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.ApplyConfirm); blocked {
+	if blocked, err := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.ApplyConfirm); err != nil {
+		return true, fmt.Errorf("apply-confirm command actor authorization %s#%d: %w", repo, pr, err)
+	} else if blocked {
 		return false, nil
 	}
 
@@ -616,7 +620,9 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 		return
 	}
 	for _, lock := range locks {
-		if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, lock.DatabaseName, lock.DatabaseType, "", action.Unlock); blocked {
+		// Evaluation errors are logged in the gate; this synchronous path treats
+		// any block as terminal, so the retryable disposition is not consumed here.
+		if blocked, _ := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, lock.DatabaseName, lock.DatabaseType, "", action.Unlock); blocked {
 			return
 		}
 	}

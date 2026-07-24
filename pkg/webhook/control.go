@@ -150,7 +150,9 @@ func runControlCommand[R any](
 	if blocked {
 		return nil
 	}
-	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, apply.Database, apply.DatabaseType, result.Environment, actionName); blocked {
+	// Evaluation errors are logged in the gate; this synchronous path treats any
+	// block as terminal, so the retryable disposition is not consumed here.
+	if blocked, _ := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, apply.Database, apply.DatabaseType, result.Environment, actionName); blocked {
 		return nil
 	}
 
