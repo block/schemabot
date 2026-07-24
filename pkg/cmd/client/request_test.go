@@ -45,8 +45,9 @@ func sendThroughTransport(t *testing.T, rawURL string, presetAuth string) (*http
 	return httpClient.Do(req)
 }
 
-// controlStatusServer returns a test server that answers every POST with the
-// given status code and JSON body, for exercising the client's status handling.
+// controlStatusServer returns a test server that answers every request with
+// the given status code and JSON body, for exercising the client's status
+// handling.
 func controlStatusServer(t *testing.T, statusCode int, body string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
