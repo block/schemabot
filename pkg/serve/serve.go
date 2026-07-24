@@ -305,18 +305,17 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		}
 	}()
 
-	// Proactively discard idle connections before MySQL's wait_timeout (default 28800s)
-	// to avoid "invalid connection" errors when the pool hands out stale connections.
-	db.SetConnMaxLifetime(5 * time.Minute)
-	db.SetConnMaxIdleTime(3 * time.Minute)
-
-	// Size the idle pool to cover the per-pod background concurrency so idle
-	// connections stay pooled instead of being closed and reopened every tick.
-	// Without this, Go's default MaxIdleConns=2 causes constant TCP churn
-	// (CONNECT/DISCONNECT pairs in the MySQL audit log) because the durable
-	// webhook drivers (4 × 1 s poll), operator drivers (4 × 10 s poll), and
-	// background monitors all return connections that exceed the idle limit.
-	db.SetMaxIdleConns(10)
+	// Apply the storage connection-pool settings. Each knob is configurable via
+	// storage.pool; the *OrDefault helpers supply the defaults (and their
+	// rationale) from the api package. MaxOpenConns is left unset when zero so
+	// the pool stays unbounded, matching database/sql's default.
+	pool := cfg.Storage.Pool
+	db.SetConnMaxLifetime(pool.ConnMaxLifetimeOrDefault())
+	db.SetConnMaxIdleTime(pool.ConnMaxIdleTimeOrDefault())
+	db.SetMaxIdleConns(pool.MaxIdleConnsOrDefault())
+	if pool.MaxOpenConns > 0 {
+		db.SetMaxOpenConns(pool.MaxOpenConns)
+	}
 
 	// Log config summary for debugging
 	logger.Info("config loaded",
@@ -462,7 +461,8 @@ func connectStorage(ctx context.Context, cfg *api.ServerConfig, logger *slog.Log
 	if err := api.EnsureSchema(dsn, logger, api.WithAllowDestructiveSchemaChanges(cfg.Storage.AllowDestructiveSchemaChanges)); err != nil {
 		return nil, fmt.Errorf("ensure storage schema: %w", err)
 	}
-	db, err := mysqlconn.OpenReloadable(dsn, cfg.StorageDSN)
+	db, err := mysqlconn.OpenReloadable(dsn, cfg.StorageDSN,
+		mysqlconn.WithConnectTimeout(cfg.Storage.Pool.ConnectTimeoutOrZero()))
 	if err != nil {
 		return nil, fmt.Errorf("open storage database: %w", err)
 	}

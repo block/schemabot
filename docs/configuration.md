@@ -320,6 +320,37 @@ process has no target DSN and cannot clean that target. Cleanup runs only if the
 remote deployment is also a SchemaBot server with the target configured as
 local-mode MySQL and `cleanup_enabled: true`.
 
+## Storage Connection Pool
+
+SchemaBot tunes the `database/sql` pool for its internal storage database with
+defaults that suit a typical single-pod deployment. Override any of them under
+`storage.pool` when a deployment needs different sizing or timeouts. Every field
+is optional; omit `storage.pool` entirely to keep the defaults.
+
+```yaml
+storage:
+  dsn: "env:SCHEMABOT_DSN"
+  pool:
+    max_idle_conns: 10        # default: 10
+    max_open_conns: 0         # default: 0 (unbounded)
+    conn_max_lifetime: "5m"   # default: 5m
+    conn_max_idle_time: "3m"  # default: 3m
+    connect_timeout: "5s"     # default: unset (driver default)
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `max_idle_conns` | `10` | Idle connections kept warm in the pool. Sized to cover the per-pod background concurrency (durable webhook drivers, operator drivers, and monitors) so idle connections are not closed and reopened every poll tick. |
+| `max_open_conns` | `0` (unbounded) | Maximum total open connections (the max pool size). Set a positive value to cap concurrent connections against the storage database. |
+| `conn_max_lifetime` | `5m` | Maximum age of a pooled connection before it is retired, keeping connections well under MySQL's `wait_timeout`. |
+| `conn_max_idle_time` | `3m` | Maximum time a connection may sit idle before it is retired. |
+| `connect_timeout` | unset | Bounds a single connection attempt (TCP dial plus handshake) via the driver's `timeout` DSN parameter. Does not bound query execution. |
+
+Durations are Go duration strings (for example `30s`, `5m`). When set, each
+duration must be positive, and `max_idle_conns` must not exceed a positive
+`max_open_conns`; SchemaBot rejects violations at config load rather than
+silently reverting to a default.
+
 ## Storage Schema Changes
 
 SchemaBot's internal storage schema is self-bootstrapping: on every startup,
