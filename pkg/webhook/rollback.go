@@ -434,21 +434,19 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 		h.logger.Error("failed to load rollback apply after accepted rollback",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", dbType, "environment", environment,
-			"apply_id", applyID, "error", err)
+			"apply_id", applyResp.ApplyID, "error", err)
 		return
 	}
 	if apply == nil {
 		h.logger.Error("rollback apply missing after accepted apply",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", dbType, "environment", environment,
-			"apply_id", applyID)
+			"apply_id", applyResp.ApplyID)
 		return
 	}
 	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply); err != nil {
 		h.logger.Error("failed to mark check in_progress for rollback",
-			"repo", repo, "pr", pr, "database", database,
-			"database_type", dbType, "environment", environment,
-			"apply_id", applyID, "error", err)
+			append(apply.LogAttrs(), "error", err)...)
 		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, "Rollback was accepted, but SchemaBot could not update the required status check: "+err.Error())
 		return
 	}

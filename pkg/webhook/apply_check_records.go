@@ -23,15 +23,36 @@ func (h *Handler) storeApplyPlanCheckRecord(ctx context.Context, client *ghclien
 // when an apply begins execution. The aggregate check is updated to reflect the
 // state. If the apply is already terminal by the time the claim lands, the
 // stored check state is immediately refreshed to the apply's terminal outcome.
+//
+// The apply parameter is the caller's pre-claim snapshot: only its identifiers
+// (ID, ApplyIdentifier) are read here. Live state is reloaded from storage
+// after the claim lands, so a snapshot that went stale between accept and
+// claim cannot leak outdated state into the check row.
 func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string, apply *storage.Apply) error {
 	// Fail closed on a missing or non-persisted apply before touching check
 	// state: claiming the check row without a real apply row would record
 	// ownership nothing can ever reconcile.
 	if apply == nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "apply_started",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "error",
+		})
 		return fmt.Errorf("update check state for apply start repo %s pr %d environment %s database_type %s database %s: apply is nil",
 			repo, pr, environment, schema.Type, schema.Database)
 	}
 	if apply.ID == 0 {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "apply_started",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "error",
+		})
 		return fmt.Errorf("update check state for apply start repo %s pr %d environment %s database_type %s database %s apply_id %s: apply row ID is unset",
 			repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier)
 	}
