@@ -344,14 +344,6 @@ func (p *planFlowResult) nextHeadSHA() string {
 	return p.HeadSHAs[idx]
 }
 
-type checkRunCapture struct {
-	Name       string                   `json:"name"`
-	HeadSHA    string                   `json:"head_sha"`
-	Status     string                   `json:"status"`
-	Conclusion string                   `json:"conclusion"`
-	Output     *ghclient.CheckRunOutput `json:"output"`
-}
-
 // registerPassingChecks adds mock REST endpoints for PR check statuses that
 // return no checks. This prevents enforcePassingChecks from blocking apply
 // commands in e2e tests.

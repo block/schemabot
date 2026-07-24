@@ -255,9 +255,9 @@ func TestUpdateCheckRecordForApplyStart_RollbackOnConcludedAggregatePublishesFre
 			"user": map[string]any{"login": "testuser"},
 		}))
 	})
-	var created []rewindCheckRunBody
+	var created []checkRunCapture
 	mux.HandleFunc("POST /repos/octocat/rollback-green-gate/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		var body rewindCheckRunBody
+		var body checkRunCapture
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 		created = append(created, body)
 		w.WriteHeader(http.StatusCreated)

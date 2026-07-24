@@ -11,14 +11,6 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// rewindCheckRunBody captures the Check Run payload the fold publishes so the
-// tests can assert on the exact status and conclusion sent to GitHub.
-type rewindCheckRunBody struct {
-	Name       string `json:"name"`
-	Status     string `json:"status"`
-	Conclusion string `json:"conclusion"`
-}
-
 // TestAggregateRewindFromConcludedCreatesFreshCheckRun exercises the merge
 // gate when an apply starts on a PR whose aggregate Check Run already
 // concluded — the rollback-confirm flow, where the original apply completed
@@ -47,9 +39,9 @@ func TestAggregateRewindFromConcludedCreatesFreshCheckRun(t *testing.T) {
 	h, mux, client := newFoldHandler(t, nonAggregateConfig(), store)
 	serveHeadSHA(t, mux, "abc123")
 
-	var created []rewindCheckRunBody
+	var created []checkRunCapture
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		var body rewindCheckRunBody
+		var body checkRunCapture
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 		created = append(created, body)
 		w.WriteHeader(http.StatusCreated)
@@ -104,9 +96,9 @@ func TestAggregateRecomputeOnConcludedRunReusesItWhenStillCompleted(t *testing.T
 		w.WriteHeader(http.StatusCreated)
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 999}))
 	})
-	var patchedBodies []rewindCheckRunBody
+	var patchedBodies []checkRunCapture
 	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/", func(w http.ResponseWriter, r *http.Request) {
-		var body rewindCheckRunBody
+		var body checkRunCapture
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 		patchedBodies = append(patchedBodies, body)
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 555}))
