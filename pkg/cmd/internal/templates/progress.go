@@ -854,18 +854,32 @@ type StatusListData struct {
 	MaxLimit       int
 	HasMore        bool
 	FailuresOnly   bool
+	Last           string
 	ShowExternalID bool
 	Deployment     string
 	Applies        []ActiveApplyData
 }
 
+// statusWindowSuffix renders the --last window as a header suffix, or empty
+// when the list is unbounded.
+func statusWindowSuffix(data StatusListData) string {
+	if data.Last == "" {
+		return ""
+	}
+	return fmt.Sprintf(" %s(updated in the last %s)%s", ANSIDim, data.Last, ANSIReset)
+}
+
 // WriteStatusList writes the status list output.
 func WriteStatusList(data StatusListData) {
 	if len(data.Applies) == 0 {
+		window := ""
+		if data.Last != "" {
+			window = fmt.Sprintf(" updated in the last %s", data.Last)
+		}
 		if data.FailuresOnly {
-			fmt.Printf("%sNo recent failed schema changes%s\n", ANSIDim, ANSIReset)
+			fmt.Printf("%sNo recent failed schema changes%s%s\n", ANSIDim, window, ANSIReset)
 		} else {
-			fmt.Printf("%sNo recent schema changes%s\n", ANSIDim, ANSIReset)
+			fmt.Printf("%sNo recent schema changes%s%s\n", ANSIDim, window, ANSIReset)
 		}
 		return
 	}
@@ -877,12 +891,12 @@ func WriteStatusList(data StatusListData) {
 	// Header
 	if data.ActiveCount > 0 {
 		if data.ActiveCount == 1 {
-			fmt.Printf("%s1 active schema change%s\n", ANSIBold, ANSIReset)
+			fmt.Printf("%s1 active schema change%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
 		} else {
-			fmt.Printf("%s%d active schema changes%s\n", ANSIBold, data.ActiveCount, ANSIReset)
+			fmt.Printf("%s%d active schema changes%s%s\n", ANSIBold, data.ActiveCount, ANSIReset, statusWindowSuffix(data))
 		}
 	} else {
-		fmt.Printf("%sRecent schema changes%s\n", ANSIBold, ANSIReset)
+		fmt.Printf("%sRecent schema changes%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
 	}
 	fmt.Println()
 
@@ -1027,7 +1041,7 @@ func writeStatusListFooter(data StatusListData) {
 }
 
 func writeFailedStatusList(data StatusListData) {
-	fmt.Printf("%sRecent failed schema changes%s\n", ANSIBold, ANSIReset)
+	fmt.Printf("%sRecent failed schema changes%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
 	fmt.Println()
 
 	for i, a := range data.Applies {

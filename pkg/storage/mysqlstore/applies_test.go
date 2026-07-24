@@ -1389,6 +1389,42 @@ func TestApplyStore_GetRecentLimitAndEnvironment(t *testing.T) {
 	assert.Equal(t, "apply_recent_staging_failed", applies[0].ApplyIdentifier)
 }
 
+// TestApplyStore_GetRecentUpdatedSince verifies the status window bound: only
+// applies whose updated_at falls at or after the bound are returned, so an
+// apply that last changed before the window drops out while fresh activity
+// stays visible.
+func TestApplyStore_GetRecentUpdatedSince(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "windowdb", "mysql", "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_window_stale", 220, state.Apply.Completed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_window_fresh", 221, state.Apply.Completed, "staging")
+
+	_, err := testDB.ExecContext(ctx,
+		"UPDATE `applies` SET updated_at = ? WHERE apply_identifier = ?",
+		time.Now().Add(-2*time.Hour), "apply_window_stale")
+	require.NoError(t, err)
+
+	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit:        10,
+		Environment:  "staging",
+		UpdatedSince: time.Now().Add(-time.Hour),
+	})
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, "apply_window_fresh", applies[0].ApplyIdentifier)
+
+	applies, err = store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit:        10,
+		Environment:  "staging",
+		UpdatedSince: time.Now().Add(-3 * time.Hour),
+	})
+	require.NoError(t, err)
+	require.Len(t, applies, 2)
+}
+
 func TestApplyStore_GetRecentDeploymentFilterMatchesParentAndOperation(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

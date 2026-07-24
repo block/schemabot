@@ -3606,6 +3606,64 @@ func TestParseStatusLimit(t *testing.T) {
 	}
 }
 
+func TestParseStatusLast(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		target    string
+		want      time.Duration
+		wantError bool
+	}{
+		{name: "default", target: "/api/status"},
+		{name: "hours", target: "/api/status?last=24h", want: 24 * time.Hour},
+		{name: "minutes", target: "/api/status?last=30m", want: 30 * time.Minute},
+		{name: "zero", target: "/api/status?last=0s", wantError: true},
+		{name: "negative", target: "/api/status?last=-1h", wantError: true},
+		{name: "not a duration", target: "/api/status?last=yesterday", wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tt.target, nil)
+			got, err := parseStatusLast(req)
+			if tt.wantError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestHandleStatusLastWindowBoundsFilter verifies that the `last` query
+// parameter becomes an UpdatedSince bound on the storage filter and is echoed
+// back in the response, and that an invalid window is rejected rather than
+// silently ignored.
+func TestHandleStatusLastWindowBoundsFilter(t *testing.T) {
+	applies := &recentApplyStore{}
+	stor := &mockStorageWithApplyStores{applies: applies}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(stor, testServerConfig(), nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?last=24h", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp apitypes.StatusResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "24h0m0s", resp.Last)
+
+	require.Len(t, applies.filters, 1)
+	assert.WithinDuration(t, time.Now().Add(-24*time.Hour), applies.filters[0].UpdatedSince, time.Minute)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?last=yesterday", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	require.Len(t, applies.filters, 1, "an invalid window must not reach storage")
+}
+
 func TestParseStatusFailuresOnly(t *testing.T) {
 	for _, tt := range []struct {
 		name      string

@@ -566,6 +566,9 @@ type StatusOptions struct {
 	Environment string
 	Deployment  string
 	Failed      bool
+	// Last bounds the list to applies updated within this window; zero means
+	// unbounded.
+	Last time.Duration
 }
 
 // GetStatus fetches recent schema changes.
@@ -585,6 +588,9 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 		}
 		if opts[0].Failed {
 			values.Set("failed", "true")
+		}
+		if opts[0].Last > 0 {
+			values.Set("last", opts[0].Last.String())
 		}
 		if encoded := values.Encode(); encoded != "" {
 			requestPath += "?" + encoded

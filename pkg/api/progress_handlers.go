@@ -753,6 +753,11 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	last, err := parseStatusLast(r)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	filter := storage.RecentAppliesFilter{
 		Limit:       limit + 1,
@@ -761,6 +766,9 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if failuresOnly {
 		filter.States = []string{state.Apply.Failed, state.Apply.FailedRetryable}
+	}
+	if last > 0 {
+		filter.UpdatedSince = time.Now().Add(-last)
 	}
 	applies, err := s.storage.Applies().GetRecent(r.Context(), filter)
 	if err != nil {
@@ -779,6 +787,9 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		HasMore:      hasMore,
 		FailuresOnly: failuresOnly,
 		Applies:      make([]*apitypes.ActiveApplyResponse, 0, len(applies)),
+	}
+	if last > 0 {
+		resp.Last = last.String()
 	}
 	operationsByApply := map[int64][]*storage.ApplyOperation{}
 	if filter.Deployment != "" {
@@ -923,6 +934,20 @@ func parseStatusLimit(r *http.Request) (int, error) {
 		return maxStatusLimit, nil
 	}
 	return limit, nil
+}
+
+// parseStatusLast parses the optional `last` query parameter bounding the
+// status list to applies updated within the window. Zero means unbounded.
+func parseStatusLast(r *http.Request) (time.Duration, error) {
+	raw := r.URL.Query().Get("last")
+	if raw == "" {
+		return 0, nil
+	}
+	last, err := time.ParseDuration(raw)
+	if err != nil || last <= 0 {
+		return 0, fmt.Errorf("last must be a positive duration such as 30m or 24h")
+	}
+	return last, nil
 }
 
 func parseStatusFailuresOnly(r *http.Request) (bool, error) {
