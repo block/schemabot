@@ -268,7 +268,11 @@ func TestUpdateCheckRecordForApplyStart_RollbackOnConcludedAggregatePublishesFre
 		patched = true
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 555}))
 	})
-	installClient := ghclient.NewInstallationClient(ghClient, logger)
+	serveTrustedCheckRuns(t, mux, repo, headSHA, ghclient.CheckRunResult{
+		ID: 555, Name: aggregateCheckName,
+		Status: checkStatusCompleted, Conclusion: checkConclusionSuccess,
+	})
+	installClient := ghclient.NewInstallationClientWithSlug(ghClient, logger, "schemabot")
 	factory := &fakeClientFactory{client: installClient}
 	h := NewHandler(svc, factory, nil, logger)
 
