@@ -144,7 +144,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	}
 	if result.Tenant == "" && commandRequiresTenantTarget(result) && h.service != nil && h.service.Config().Tenant != "" {
 		if h.fansOutUnscopedCommand(repo) && unscopedCommandFansOut(result) {
-			h.logger.Info("aggregate participant fanning out unscoped work command; applying its own databases",
+			h.logger.Info("aggregate participant fanning out unscoped work command; acting on work it owns",
 				"repo", repo, "pr", pr, "tenant", h.service.Config().Tenant, "action", result.Action)
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 				Operation:  "aggregate_participant_fanout",
@@ -262,6 +262,12 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	}
 
 	if result.Found && result.Action == action.Rollback && result.ApplyID == "" {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping rollback missing-apply-id reply for unscoped fan-out; the leader posts it once",
+				"repo", repo, "pr", pr)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
+			return
+		}
 		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.deploymentTenant()))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing apply ID"})
 		return
@@ -286,11 +292,23 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 
 	// Reject -y/--yes on commands that don't support it
 	if result.Action != action.Apply && parser.HasAutoConfirmFlag(payload.Comment.Body) {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping unsupported auto-confirm flag reply for unscoped fan-out; the leader posts it once",
+				"repo", repo, "pr", pr, "action", result.Action)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
+			return
+		}
 		h.postComment(repo, pr, installationID, templates.RenderUnsupportedAutoConfirm(result.Action))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
 		return
 	}
 	if result.Action == action.Rollback && parser.HasDeferCutoverFlag(payload.Comment.Body) {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping misplaced defer-cutover flag reply for unscoped fan-out; the leader posts it once",
+				"repo", repo, "pr", pr)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
+			return
+		}
 		h.postCommandError(repo, pr, installationID, action.Rollback, result.Environment, requestedBy,
 			"`--defer-cutover` belongs on `schemabot rollback-confirm`, after reviewing the rollback plan.")
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
@@ -298,6 +316,12 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	}
 
 	if !commandSupportsDatabaseFlag(result.Action) && parser.HasDatabaseFlag(payload.Comment.Body) {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping unsupported database flag reply for unscoped fan-out; the leader posts it once",
+				"repo", repo, "pr", pr, "action", result.Action)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
+			return
+		}
 		h.postComment(repo, pr, installationID, templates.RenderUnsupportedDatabaseFlag(result.Action))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
 		return
@@ -403,12 +427,14 @@ func commandRequiresTenantTarget(result CommandResult) bool {
 }
 
 // fansOutUnscopedCommand reports whether this deployment should self-serve an
-// unscoped work command (no -t tenant) for repo by applying its own databases,
+// unscoped work command (no -t tenant) for repo by acting on work it owns,
 // rather than ignoring it. An aggregate participant fans out: an unscoped
-// `apply -e <env>` on a shared repo reaches every participant, and each applies
-// only its own databases (its own registry filtered by repo/env/allowed_dirs).
-// A tenanted deployment that is not a participant for repo keeps ignoring
-// unscoped work commands, since per-tenant routing requires an explicit -t.
+// command on a shared repo reaches every participant, and each acts only on
+// what it owns — its own databases for plan/apply/unlock, or the target apply
+// when it is the one holding it in storage (see actionFansOutUnscoped for the
+// per-action discriminators). A tenanted deployment that is not a participant
+// for repo keeps ignoring unscoped work commands, since per-tenant routing
+// requires an explicit -t.
 func (h *Handler) fansOutUnscopedCommand(repo string) bool {
 	if h.service == nil {
 		return false
@@ -417,18 +443,28 @@ func (h *Handler) fansOutUnscopedCommand(repo string) bool {
 }
 
 // actionFansOutUnscoped reports whether an action is one a participant can serve
-// without an explicit -t, by acting on its own databases. plan, apply, and
-// apply-confirm route by environment/database, so each participant handles its
-// own share of a shared PR; unlock releases only the participant's own database
-// locks (locks are keyed by database, not by apply). Commands that target a
-// single apply owned by one tenant — rollback and the lifecycle controls (stop,
-// cancel, start, release, cutover, volume, skip-revert, revert) — are not in
-// this set:
-// an unscoped one would reach every participant and all but the owner would
-// report "apply not found", so they require an explicit -t instead.
+// without an explicit -t, by acting only on work it owns. Every action in the
+// set routes by a discriminator that resolves to exactly one deployment, so a
+// fan-out still yields a single actor per unit of work:
+//   - plan, apply, and apply-confirm route by environment/database — each
+//     participant handles its own share of a shared PR;
+//   - unlock releases only the participant's own database locks (locks are
+//     keyed by database, not by apply);
+//   - rollback and the lifecycle controls (stop, cancel, start, release,
+//     cutover, volume, skip-revert, revert) route by apply identifier, which
+//     lives in exactly one deployment's storage — non-owners silently skip the
+//     lookup miss (see silentOnUnscopedFanOut) and only the owner acts;
+//   - rollback-confirm routes by the pinned pending rollback plan for the
+//     PR/environment, held only by the deployment that posted the plan.
+//
+// An action outside the set requires an explicit -t until a single-owner
+// discriminator is established for it.
 func actionFansOutUnscoped(a string) bool {
 	switch a {
-	case action.Plan, action.Apply, action.ApplyConfirm, action.Unlock:
+	case action.Plan, action.Apply, action.ApplyConfirm, action.Unlock,
+		action.Rollback, action.RollbackConfirm,
+		action.Stop, action.Cancel, action.Start, action.Release,
+		action.Cutover, action.Volume, action.SkipRevert, action.Revert:
 		return true
 	default:
 		return false
@@ -439,10 +475,10 @@ func actionFansOutUnscoped(a string) bool {
 // participant should actually act on when fanning out, as opposed to an error
 // case it should stay silent on. Only fan-out actions qualify (see
 // actionFansOutUnscoped). A complete command (Found) fans out, and a plan
-// without -e fans out as a multi-env plan. A missing-env apply does NOT fan out:
-// otherwise every participant on a shared repo would post its own duplicate
-// "missing environment" comment. The leader (which never hits the tenant gate)
-// posts that error once.
+// without -e fans out as a multi-env plan. A missing-env command other than
+// plan does NOT fan out: otherwise every participant on a shared repo would
+// post its own duplicate "missing environment" comment. The leader (which
+// never hits the tenant gate) posts that error once.
 func unscopedCommandFansOut(result CommandResult) bool {
 	if !actionFansOutUnscoped(result.Action) {
 		return false

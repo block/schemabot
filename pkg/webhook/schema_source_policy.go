@@ -68,6 +68,26 @@ func (h *Handler) silentOnUnscopedFanOut(repo, tenant string) bool {
 	return config.AggregateRoleForRepo(repo) != ""
 }
 
+// silentUsageErrorOnUnscopedFanOut reports whether a usage-error reply (a bad
+// or missing flag or argument) to an unscoped (no -t) command should be a
+// logged silent skip on this deployment. A usage error is decidable by every
+// deployment from the comment text alone, so on an aggregate repo a fan-out
+// would post one copy per participant. Unlike a "nothing to do on this
+// deployment" outcome (silentOnUnscopedFanOut), no owner is going to answer —
+// the command is malformed everywhere — so participants stay silent and the
+// leader posts the error exactly once. A -t-scoped command named this
+// deployment, so its answer always surfaces.
+func (h *Handler) silentUsageErrorOnUnscopedFanOut(repo, tenant string) bool {
+	if tenant != "" {
+		return false
+	}
+	config, ok := h.serverConfig()
+	if !ok {
+		return false
+	}
+	return config.AggregateRoleForRepo(repo) == api.AggregateRoleParticipant
+}
+
 // environmentNotConfiguredError reports that the requested environment has no
 // entry for the database on this server — a targeting rejection the same
 // command will always reproduce, not a transient failure.

@@ -38,6 +38,17 @@ func nonAggregateConfig() *api.ServerConfig {
 	}
 }
 
+// aggregateParticipantConfig returns a server config where the test repo has
+// the aggregate participant role — the shape of a tenant deployment receiving
+// unscoped fan-out commands on a shared repo.
+func aggregateParticipantConfig() *api.ServerConfig {
+	return &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{
+			"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}},
+		},
+	}
+}
+
 // newFanOutSkipHandler builds a handler backed by a fake GitHub server and
 // empty storage, returning the handler, the GitHub mux for extra routes, and a
 // channel capturing posted PR comments. The handlers under test post comments
@@ -211,6 +222,126 @@ func TestUnscopedRollbackConfirmNoLockStaysSilentOnAggregateRepo(t *testing.T) {
 		body := requireComment(t, comments, "no-lock rollback-confirm comment")
 		assert.Contains(t, body, "No Lock Found")
 		assert.Contains(t, body, "`staging`")
+	})
+}
+
+// On an aggregate repo, an unscoped lifecycle control command (stop, cancel,
+// cutover, ...) fans out to every deployment, but the target apply lives in
+// exactly one tenant's storage. A deployment whose storage has no such apply
+// stays silent so only the owning deployment answers — it must not post
+// "Apply not found" for another tenant's apply. A -t-scoped command and a
+// non-aggregate repo still get the comment.
+func TestUnscopedControlUnknownApplyStaysSilentOnAggregateRepo(t *testing.T) {
+	stopResult := func(tenant string) CommandResult {
+		return CommandResult{Action: action.Stop, ApplyID: "apply_a1b2c3", Environment: "staging", Tenant: tenant}
+	}
+
+	t.Run("unscoped stop on aggregate repo stays silent", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", stopResult(""))
+
+		assert.Empty(t, comments, "deployment without the apply must not post Apply not found on an unscoped fan-out control command")
+	})
+
+	t.Run("unscoped stop on participant deployment stays silent", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", stopResult(""))
+
+		assert.Empty(t, comments, "a participant without the apply must not post Apply not found on an unscoped fan-out control command")
+	})
+
+	t.Run("tenant-scoped stop still posts apply not found", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", stopResult("tenant-b"))
+
+		body := requireComment(t, comments, "apply-not-found control comment")
+		assert.Contains(t, body, "Apply not found")
+		assert.Contains(t, body, "apply_a1b2c3")
+	})
+
+	t.Run("non-aggregate repo still posts apply not found", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", stopResult(""))
+
+		body := requireComment(t, comments, "apply-not-found control comment")
+		assert.Contains(t, body, "Apply not found")
+		assert.Contains(t, body, "apply_a1b2c3")
+	})
+}
+
+// A control command without an apply ID is a usage error every deployment can
+// detect from the comment text alone, so on an unscoped fan-out participants
+// defer the reply to the leader, which posts it exactly once. A -t-scoped
+// command and a non-aggregate repo answer directly as the single addressee.
+func TestControlMissingApplyIDDefersToLeader(t *testing.T) {
+	missingID := func(tenant string) CommandResult {
+		return CommandResult{Action: action.Stop, Environment: "staging", Tenant: tenant}
+	}
+
+	t.Run("participant stays silent on the unscoped usage error", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", missingID(""))
+
+		assert.Empty(t, comments, "a participant must defer the missing-apply-id reply to the leader")
+	})
+
+	t.Run("leader posts the usage error once", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", missingID(""))
+
+		body := requireComment(t, comments, "missing-apply-id control comment")
+		assert.Contains(t, body, "Missing Apply ID")
+		assert.Contains(t, body, "schemabot stop <apply-id> -e <environment>")
+	})
+
+	t.Run("tenant-scoped command gets the usage error from the addressee", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", missingID("tenant-b"))
+
+		body := requireComment(t, comments, "missing-apply-id control comment")
+		assert.Contains(t, body, "Missing Apply ID")
+	})
+}
+
+// A volume command with a missing or invalid -v level is a usage error every
+// deployment can detect from the comment text alone, so on an unscoped fan-out
+// participants defer the reply to the leader, which posts it exactly once.
+func TestVolumeInvalidLevelDefersToLeader(t *testing.T) {
+	invalidLevel := func(tenant string) CommandResult {
+		return CommandResult{Action: action.Volume, ApplyID: "apply_a1b2c3", Environment: "staging", VolumeLevelError: true, Tenant: tenant}
+	}
+
+	t.Run("participant stays silent on the unscoped usage error", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleVolumeCommand("octocat/hello-world", 1, 12345, "hubot", invalidLevel(""))
+
+		assert.Empty(t, comments, "a participant must defer the invalid-volume-level reply to the leader")
+	})
+
+	t.Run("leader posts the usage error once", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleVolumeCommand("octocat/hello-world", 1, 12345, "hubot", invalidLevel(""))
+
+		body := requireComment(t, comments, "invalid-volume-level comment")
+		assert.Contains(t, body, "Missing or Invalid Volume Level")
+	})
+
+	t.Run("tenant-scoped command gets the usage error from the addressee", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleVolumeCommand("octocat/hello-world", 1, 12345, "hubot", invalidLevel("tenant-b"))
+
+		body := requireComment(t, comments, "invalid-volume-level comment")
+		assert.Contains(t, body, "Missing or Invalid Volume Level")
 	})
 }
 
