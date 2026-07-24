@@ -512,3 +512,107 @@ func reviewGateTestConfig(opts ...func(*api.ServerConfig)) *api.ServerConfig {
 	}
 	return cfg
 }
+
+// TestEnforceReviewGate pins the review gate's three-way disposition: an
+// internal evaluation failure (a GitHub reviews read here) is not a merit
+// block — the gate returns the error so the command stays retryable — while
+// missing approval blocks on the merits without error. The evaluation-failure
+// comment must stay sanitized: no raw GitHub error text in PR markdown.
+func TestEnforceReviewGate(t *testing.T) {
+	schemaResult := &ghclient.SchemaRequestResult{Database: "orders", SchemaPath: "schema/testdb"}
+
+	registerCommentsCapture := func(mux *http.ServeMux) chan string {
+		comments := make(chan string, 10)
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			comments <- body.Body
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+		})
+		return comments
+	}
+
+	t.Run("evaluation failure returns error without blocking", func(t *testing.T) {
+		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+			db := cfg.Databases["orders"]
+			db.OperatorUsers = []string{"bob"}
+			cfg.Databases["orders"] = db
+		}))
+		registerPREndpoint(mux, "alice")
+		comments := registerCommentsCapture(mux)
+		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/reviews", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": "Resource not accessible by integration"})
+		})
+
+		client, err := h.clientForRepo("octocat/hello-world", 12345)
+		require.NoError(t, err)
+
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply")
+		require.Error(t, err)
+		assert.False(t, blocked, "evaluation failure must not report a merit block")
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Review gate check failed; see server logs")
+			assert.NotContains(t, body, "Resource not accessible", "raw GitHub error text must never render in PR markdown")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for evaluation-failure comment")
+		}
+	})
+
+	t.Run("missing approval blocks on the merits without error", func(t *testing.T) {
+		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+			db := cfg.Databases["orders"]
+			db.OperatorUsers = []string{"bob"}
+			cfg.Databases["orders"] = db
+		}))
+		registerPREndpoint(mux, "alice")
+		registerReviewsEndpoint(mux, []*gh.PullRequestReview{})
+		comments := registerCommentsCapture(mux)
+
+		client, err := h.clientForRepo("octocat/hello-world", 12345)
+		require.NoError(t, err)
+
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply")
+		require.NoError(t, err)
+		assert.True(t, blocked)
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Review Required")
+			assert.Contains(t, body, "@bob")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for review-required comment")
+		}
+	})
+
+	t.Run("approved review passes without comment", func(t *testing.T) {
+		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+			db := cfg.Databases["orders"]
+			db.OperatorUsers = []string{"bob"}
+			cfg.Databases["orders"] = db
+		}))
+		registerPREndpoint(mux, "alice")
+		registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+			{
+				User:        &gh.User{Login: new("bob")},
+				State:       new(ghclient.ReviewApproved),
+				SubmittedAt: &gh.Timestamp{Time: time.Now()},
+			},
+		})
+		comments := registerCommentsCapture(mux)
+
+		client, err := h.clientForRepo("octocat/hello-world", 12345)
+		require.NoError(t, err)
+
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply")
+		require.NoError(t, err)
+		assert.False(t, blocked)
+		assert.Empty(t, comments, "an approved review must not draw a gate comment")
+	})
+}

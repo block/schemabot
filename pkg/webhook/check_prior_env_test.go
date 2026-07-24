@@ -439,8 +439,9 @@ func TestCheckPriorEnvironmentsWithDatabaseOverrideGatesOnOverrideOrder(t *testi
 	// A production apply walks the override's prior environments: qa passes,
 	// sandbox blocks — the server order's green staging check must not
 	// satisfy the gate.
-	blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
+	blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr,
 		"bureau", "mysql", "production", []string{"production"}, 12345)
+	require.NoError(t, err)
 	assert.True(t, blocked, "sandbox action_required must block production despite a green staging check")
 
 	for _, checkName := range []string{"SchemaBot (qa)", "SchemaBot (sandbox)"} {
@@ -462,8 +463,9 @@ func TestCheckPriorEnvironmentsWithDatabaseOverrideGatesOnOverrideOrder(t *testi
 
 	// An apply targeting an environment absent from the override fails closed
 	// with the database's effective order rendered in the comment.
-	blocked = h.checkPriorEnvironments(t.Context(), repo, pr,
+	blocked, err = h.checkPriorEnvironments(t.Context(), repo, pr,
 		"bureau", "mysql", "staging", []string{"production"}, 12345)
+	require.NoError(t, err)
 	assert.True(t, blocked, "environment absent from the database override must fail closed")
 
 	select {
@@ -903,7 +905,8 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			TrustedCheckAppSlugs: []string{"schemabot"},
 		}})
 
-		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		blocked, err := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		require.NoError(t, err)
 		assert.False(t, blocked)
 
 		select {
@@ -925,7 +928,8 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			TrustedCheckAppSlugs: []string{"schemabot"},
 		}})
 
-		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		blocked, err := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		require.NoError(t, err)
 		assert.True(t, blocked, "the gate must query only the overridden check name")
 	})
 
