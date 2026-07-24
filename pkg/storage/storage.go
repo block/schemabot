@@ -133,9 +133,10 @@ type CheckStore interface {
 	// the database it covers is no longer in the PR. It fails closed: the update
 	// is skipped when the row is in_progress or owns an apply ID, so a started
 	// apply that began after stale cleanup read the row keeps blocking the PR.
-	// The change summary is written as given — including empty — so the
-	// superseded plan's summary does not survive onto a head that no longer
-	// touches the database. Returns true when the row was marked successful.
+	// The change summary is overwritten with the caller's value; an empty
+	// summary clears the stored one (persisted as NULL), so the superseded
+	// plan's summary does not survive onto a head that no longer touches the
+	// database. Returns true when the row was marked successful.
 	MarkStalePlanSuccessful(ctx context.Context, check *Check) (bool, error)
 
 	// ClearAggregateBlock clears the blocking reason on stored aggregate check

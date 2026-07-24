@@ -219,8 +219,9 @@ func successfulNoOpPlanResult(check *storage.Check) bool {
 // claimed the row after stale cleanup read it keeps blocking: a row that is
 // in_progress or owns an apply ID is left untouched, because a passing check must
 // never be derived from cleanup alone while an apply may have reached the live
-// database. The change summary is written as given — including empty — because
-// the stored summary describes the superseded plan and must not survive onto a
+// database. The change summary is overwritten with the caller's value;
+// an empty summary clears the stored one (persisted as NULL), because the
+// stored summary describes the superseded plan and must not survive onto a
 // head that no longer touches the database. Returns true when the row is in the
 // plan-only successful state after this call (whether this call wrote it or it
 // already was), and false only when a started apply still owns it.
