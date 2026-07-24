@@ -72,8 +72,14 @@ func isRetryableLockError(err error) bool {
 }
 
 // sleepBackoff waits before the next retry using exponential backoff with full
-// jitter, returning early if the context is cancelled.
+// jitter, returning early if the context is cancelled. An already-cancelled
+// context returns immediately: full jitter can pick a near-zero delay, and a
+// select over two ready channels chooses randomly, so without the pre-check a
+// cancelled caller could slip through to another attempt.
 func sleepBackoff(ctx context.Context, attempt int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	maxDelay := lockRetryBaseBackoff << (attempt - 1)
 	delay := time.Duration(rand.Int64N(int64(maxDelay) + 1))
 	timer := time.NewTimer(delay)
