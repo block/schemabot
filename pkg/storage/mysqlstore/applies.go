@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
@@ -50,6 +51,10 @@ const (
 	applyTargetLockWait           = 10 * time.Second
 	applyTargetLockReleaseTimeout = 5 * time.Second
 )
+
+// applyTargetLocker serializes concurrent applies against the same target with
+// a session-scoped advisory lock held on the pinned apply connection.
+var applyTargetLocker namedlock.Locker = namedlock.MySQL{}
 
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
@@ -220,8 +225,7 @@ func acquireApplyTargetLockConn(ctx context.Context, db *sql.DB, database, dbTyp
 	}
 
 	lockName := applyTargetLockName(database, dbType, environment)
-	var result sql.NullInt64
-	err = conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, int(applyTargetLockWait.Seconds())).Scan(&result)
+	acquired, err := applyTargetLocker.Acquire(ctx, conn, lockName, applyTargetLockWait)
 	if err != nil {
 		slog.WarnContext(ctx, "failed to acquire apply target lock",
 			"database", database,
@@ -233,14 +237,13 @@ func acquireApplyTargetLockConn(ctx context.Context, db *sql.DB, database, dbTyp
 		closeApplyTargetLockConn(ctx, conn, lockName, "acquire apply target lock")
 		return nil, "", fmt.Errorf("acquire apply target lock for %s/%s/%s: %w", database, dbType, environment, err)
 	}
-	if !result.Valid || result.Int64 != 1 {
+	if !acquired {
 		slog.WarnContext(ctx, "timed out waiting for apply target lock",
 			"database", database,
 			"database_type", dbType,
 			"environment", environment,
 			"lock", lockName,
-			"wait", applyTargetLockWait,
-			"result", result)
+			"wait", applyTargetLockWait)
 		closeApplyTargetLockConn(ctx, conn, lockName, "acquire apply target lock")
 		return nil, "", fmt.Errorf("timed out waiting for apply target lock for %s/%s/%s", database, dbType, environment)
 	}
@@ -255,23 +258,34 @@ func releaseApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, o
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), applyTargetLockReleaseTimeout)
 	defer cancel()
 
-	var result sql.NullInt64
-	err := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(?)", lockName).Scan(&result)
-	if err != nil || !result.Valid || result.Int64 != 1 {
+	released, err := applyTargetLocker.Release(releaseCtx, conn, lockName)
+	switch {
+	case err != nil:
 		slog.WarnContext(releaseCtx, "failed to release apply target lock; discarding connection",
 			"operation", operation,
 			"lock", lockName,
-			"result", result,
 			"error", err)
-		if rawErr := conn.Raw(func(any) error { return driver.ErrBadConn }); rawErr != nil && !errors.Is(rawErr, driver.ErrBadConn) {
-			slog.WarnContext(releaseCtx, "failed to discard apply target lock connection",
-				"operation", operation,
-				"lock", lockName,
-				"error", rawErr)
-		}
+		discardApplyTargetLockConn(releaseCtx, conn, lockName, operation)
+	case !released:
+		slog.WarnContext(releaseCtx, "apply target lock was not held by this session; discarding connection",
+			"operation", operation,
+			"lock", lockName)
+		discardApplyTargetLockConn(releaseCtx, conn, lockName, operation)
 	}
 
 	closeApplyTargetLockConn(releaseCtx, conn, lockName, operation)
+}
+
+// discardApplyTargetLockConn marks the pinned connection as bad so the pool
+// destroys it instead of reusing a session whose advisory-lock state is
+// uncertain.
+func discardApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, operation string) {
+	if rawErr := conn.Raw(func(any) error { return driver.ErrBadConn }); rawErr != nil && !errors.Is(rawErr, driver.ErrBadConn) {
+		slog.WarnContext(ctx, "failed to discard apply target lock connection",
+			"operation", operation,
+			"lock", lockName,
+			"error", rawErr)
+	}
 }
 
 func closeApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, operation string) {
