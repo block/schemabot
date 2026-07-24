@@ -258,7 +258,17 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 			Keyspace:     ks,
 		})
 		if fetchErr != nil {
-			return nil, false, "", fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, fetchErr)
+			var psErr *ps.Error
+			if !errors.As(fetchErr, &psErr) || psErr.Code != ps.ErrNotFound {
+				return nil, false, "", fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, fetchErr)
+			}
+			// Keyspace has no VSchema on this branch yet — either it has
+			// never had one, or the API has not converged after a recent
+			// write. Treat as empty so the desired VSchema appears as a
+			// change; validation callers absorb convergence lag through
+			// the VSchema staleness retry.
+			e.logger.Warn("VSchema not found for keyspace, treating as empty",
+				"keyspace", ks, "branch", branch)
 		}
 		if currentVSchema != nil {
 			currentVSchemaRaw = currentVSchema.Raw
