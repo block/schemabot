@@ -790,12 +790,19 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if hasMore {
 		applies = applies[:limit]
 	}
+	stateCounts, err := s.storage.Applies().CountRecentByState(r.Context(), filter)
+	if err != nil {
+		s.logger.Error("count recent applies by state failed", "error", err)
+		s.writeError(w, http.StatusInternalServerError, "failed to count recent applies by state")
+		return
+	}
 
 	resp := &apitypes.StatusResponse{
 		Limit:        limit,
 		MaxLimit:     maxStatusLimit,
 		HasMore:      hasMore,
 		FailuresOnly: failuresOnly,
+		StateCounts:  stateCounts,
 		Applies:      make([]*apitypes.ActiveApplyResponse, 0, len(applies)),
 	}
 	if last > 0 {

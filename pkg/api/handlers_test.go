@@ -257,6 +257,25 @@ func (s *recentApplyStore) GetRecent(_ context.Context, filter storage.RecentApp
 	if s.err != nil {
 		return nil, s.err
 	}
+	applies := s.matching(filter)
+	if filter.Limit > 0 && len(applies) > filter.Limit {
+		return applies[:filter.Limit], nil
+	}
+	return applies, nil
+}
+
+func (s *recentApplyStore) CountRecentByState(_ context.Context, filter storage.RecentAppliesFilter) (map[string]int, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	counts := map[string]int{}
+	for _, apply := range s.matching(filter) {
+		counts[apply.State]++
+	}
+	return counts, nil
+}
+
+func (s *recentApplyStore) matching(filter storage.RecentAppliesFilter) []*storage.Apply {
 	applies := make([]*storage.Apply, 0, len(s.applies))
 	for _, apply := range s.applies {
 		if filter.Environment != "" && apply.Environment != filter.Environment {
@@ -270,10 +289,7 @@ func (s *recentApplyStore) GetRecent(_ context.Context, filter storage.RecentApp
 		}
 		applies = append(applies, apply)
 	}
-	if filter.Limit > 0 && len(applies) > filter.Limit {
-		return applies[:filter.Limit], nil
-	}
-	return applies, nil
+	return applies
 }
 
 type memoryControlRequestStore struct {
@@ -3430,6 +3446,11 @@ func TestHandleStatusLimitAndEnvironment(t *testing.T) {
 	assert.True(t, resp.HasMore)
 	assert.False(t, resp.FailuresOnly)
 	assert.Equal(t, 1, resp.ActiveCount)
+	assert.Equal(t, map[string]int{
+		state.Apply.Completed: 2,
+		state.Apply.Running:   1,
+		state.Apply.Failed:    1,
+	}, resp.StateCounts, "state counts cover every matching apply, not just the truncated page")
 	require.Len(t, resp.Applies, 2)
 	assert.Equal(t, "apply-one", resp.Applies[0].ApplyID)
 	assert.Equal(t, "external-one", resp.Applies[0].ExternalID)

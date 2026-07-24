@@ -396,6 +396,11 @@ type ApplyStore interface {
 	// Used by `schemabot status` (no args) to show recent activity.
 	GetRecent(ctx context.Context, filter RecentAppliesFilter) ([]*Apply, error)
 
+	// CountRecentByState returns how many applies match the filter, grouped by
+	// state. The filter's Limit is ignored: counts cover every matching row, so
+	// a status summary is not truncated by list pagination.
+	CountRecentByState(ctx context.Context, filter RecentAppliesFilter) (map[string]int, error)
+
 	// GetInProgress returns all applies in non-terminal states.
 	// Note: For recovery, use FindNextApply which handles locking.
 	GetInProgress(ctx context.Context) ([]*Apply, error)
