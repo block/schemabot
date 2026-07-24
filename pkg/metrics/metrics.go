@@ -1375,6 +1375,7 @@ var knownStatusCheckStatuses = map[string]bool{
 	"blocked":   true,
 	"scheduled": true,
 	"exhausted": true,
+	"recreated": true,
 }
 
 // StatusCheckOperation describes one status-check storage or GitHub operation.

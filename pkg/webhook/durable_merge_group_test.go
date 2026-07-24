@@ -105,9 +105,9 @@ func TestDurableMergeGroupWebhookDeduplicatesDelivery(t *testing.T) {
 // gated environment, then marks the delivery completed.
 func TestDurableMergeGroupDriverPostsChecks(t *testing.T) {
 	client, mux := setupGitHubServer(t)
-	created := make(chan createdCheckRun, 10)
+	created := make(chan checkRunCapture, 10)
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		var c createdCheckRun
+		var c checkRunCapture
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&c))
 		created <- c
 		w.WriteHeader(http.StatusCreated)

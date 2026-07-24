@@ -302,7 +302,7 @@ Important columns:
 | `head_sha` | Commit SHA the record represents. GitHub only displays checks for the current PR head. |
 | `status` | `in_progress` or `completed`. |
 | `conclusion` | `success`, `failure`, or `action_required` when complete. |
-| `apply_id` | Storage apply ID represented by the row. It is set when an apply or rollback starts, and normal apply completion leaves it set so later cleanup can tell that live work started. |
+| `apply_id` | Internal numeric apply row ID represented by the row (distinct from the user-facing apply identifier that logs report as `apply_id`). It is set when an apply or rollback starts, and normal apply completion leaves it set so later cleanup can tell that live work started. |
 | `blocking_reason` | Stable machine-readable reason for fail-closed states that operators may need to triage. |
 | `check_run_id` | GitHub check run ID for aggregate records. |
 

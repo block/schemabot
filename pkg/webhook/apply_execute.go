@@ -212,14 +212,14 @@ func (h *Handler) executeApply(
 		h.logger.Error("failed to load apply after accepted apply",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", schemaResult.Type, "environment", environment,
-			"apply_id", applyID, "error", err)
+			"apply_id", applyResp.ApplyID, "error", err)
 		return
 	}
 	if apply == nil {
 		h.logger.Error("apply missing after accepted apply",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", schemaResult.Type, "environment", environment,
-			"apply_id", applyID)
+			"apply_id", applyResp.ApplyID)
 		return
 	}
 
@@ -238,11 +238,9 @@ func (h *Handler) executeApply(
 	h.postInitialProgressComment(ctx, repo, pr, installationID, apply, progressBody)
 
 	// Update stored check state to in_progress (transitions action_required to in_progress).
-	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID); err != nil {
+	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply); err != nil {
 		h.logger.Error("failed to mark check in_progress for apply",
-			"repo", repo, "pr", pr, "database", database,
-			"database_type", schemaResult.Type, "environment", environment,
-			"apply_id", applyID, "error", err)
+			append(apply.LogAttrs(), "error", err)...)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot could not update the required status check: "+err.Error())
 		return
 	}
