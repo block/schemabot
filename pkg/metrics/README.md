@@ -47,6 +47,8 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 > **Deprecated aliases:** the `schemabot.scheduler.*` series (`resumed_total`, `resume_failures_total`, `claim_failures_total`, `claim_duration_seconds`) is still emitted alongside the `schemabot.operator.*` series for one release so dashboards and alerts can migrate. The scheduler-named series will be removed afterward.
 
+> **`stuck_pending_applies` is per-pod, not fleet-wide:** every pod running the server runs the stuck-pending monitor (there is no leader election, matching the inbox-depth and health monitors), so each pod reports the same DB-wide count as its own series. Aggregate with `max()`/`avg()`, not `sum()`, and expect the paired WARN log to fire from every pod each scan while anything is stuck.
+
 ### Attribute Values
 
 **status** (plans): `success`, `error`

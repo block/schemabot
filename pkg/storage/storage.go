@@ -401,8 +401,8 @@ type ApplyStore interface {
 	GetInProgress(ctx context.Context) ([]*Apply, error)
 
 	// FindStuckPendingApplies returns pending applies that FindNextApply should
-	// already have claimed — pending with child rows (the same claimable-pending
-	// predicate FindNextApply uses) — but whose created_at is older than
+	// already have claimed — pending with child rows (the child-rows arm of
+	// FindNextApply's pending predicate) — but whose created_at is older than
 	// olderThan, ordered oldest first and capped at limit. It is a read-only
 	// diagnostic: apply creation rejects a second active apply for the same
 	// target rather than queuing it, so a pending apply this old is not waiting
