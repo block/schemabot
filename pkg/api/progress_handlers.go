@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/block/spirit/pkg/statement"
@@ -649,7 +650,8 @@ func (s *Service) handleDatabaseList(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	resp, err := databaseListResponse(s.config, databaseType)
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	resp, err := databaseListResponse(s.config, databaseType, name)
 	if err != nil {
 		s.logger.Error("database list failed", "error", err)
 		s.writeError(w, http.StatusInternalServerError, "failed to list databases: "+err.Error())
@@ -668,13 +670,21 @@ func parseDatabaseListTypeFilter(r *http.Request) (string, error) {
 	}
 }
 
-func databaseListResponse(config *ServerConfig, databaseType string) (*apitypes.DatabaseListResponse, error) {
+// databaseListResponse builds the sanitized database list, keeping only
+// databases matching the optional type and name filters. The name filter is a
+// case-insensitive substring match so one query covers a sharded family
+// (omnibus matches omnibus_001, omnibus_002, ...).
+func databaseListResponse(config *ServerConfig, databaseType, name string) (*apitypes.DatabaseListResponse, error) {
 	if config == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
+	nameFilter := strings.ToLower(name)
 	databaseNames := make([]string, 0, len(config.Databases))
 	for database, dbConfig := range config.Databases {
 		if databaseType != "" && dbConfig.Type != databaseType {
+			continue
+		}
+		if nameFilter != "" && !strings.Contains(strings.ToLower(database), nameFilter) {
 			continue
 		}
 		databaseNames = append(databaseNames, database)
