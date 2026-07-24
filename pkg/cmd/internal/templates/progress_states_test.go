@@ -88,6 +88,54 @@ func TestWriteStatusListHasMoreFooterAtMaxLimit(t *testing.T) {
 	assert.NotContains(t, output, "Use --limit N to show more.")
 }
 
+func TestWriteStatusListStateSummary(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount: 1,
+			Limit:       20,
+			StateCounts: map[string]int{
+				state.Apply.Completed: 12,
+				state.Apply.Failed:    2,
+				state.Apply.Running:   1,
+			},
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-example",
+					Database:    "orders",
+					Environment: "staging",
+					State:       state.Apply.Running,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "15 total: 12 Completed · 2 Failed · 1 Running")
+}
+
+func TestWriteStatusListNoStateSummaryWhenEmpty(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount: 0,
+			Limit:       20,
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-example",
+					Database:    "orders",
+					Environment: "staging",
+					State:       state.Apply.Completed,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					CompletedAt: "2026-05-28T12:00:02Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.NotContains(t, output, "total:")
+}
+
 func TestWriteStatusListExternalID(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteStatusList(StatusListData{

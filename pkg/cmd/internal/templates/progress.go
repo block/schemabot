@@ -855,6 +855,7 @@ type StatusListData struct {
 	HasMore        bool
 	FailuresOnly   bool
 	Last           string
+	StateCounts    map[string]int
 	ShowExternalID bool
 	Deployment     string
 	Applies        []ActiveApplyData
@@ -867,6 +868,34 @@ func statusWindowSuffix(data StatusListData) string {
 		return ""
 	}
 	return fmt.Sprintf(" %s(updated in the last %s)%s", ANSIDim, data.Last, ANSIReset)
+}
+
+// writeStatusStateSummary renders one line tallying every apply matching the
+// request's filters by state. The counts come from the server unbounded by
+// limit, so the line stays truthful when the table below it is a truncated
+// page. Ordered by count descending (ties by state name) so the dominant
+// outcome reads first.
+func writeStatusStateSummary(counts map[string]int) {
+	if len(counts) == 0 {
+		return
+	}
+	states := make([]string, 0, len(counts))
+	total := 0
+	for s, n := range counts {
+		states = append(states, s)
+		total += n
+	}
+	sort.Slice(states, func(i, j int) bool {
+		if counts[states[i]] != counts[states[j]] {
+			return counts[states[i]] > counts[states[j]]
+		}
+		return states[i] < states[j]
+	})
+	parts := make([]string, 0, len(states))
+	for _, s := range states {
+		parts = append(parts, fmt.Sprintf("%d %s", counts[s], state.Label(s)))
+	}
+	fmt.Printf("%s%d total: %s%s\n", ANSIDim, total, strings.Join(parts, " · "), ANSIReset)
 }
 
 // WriteStatusList writes the status list output.
@@ -898,6 +927,7 @@ func WriteStatusList(data StatusListData) {
 	} else {
 		fmt.Printf("%sRecent schema changes%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
 	}
+	writeStatusStateSummary(data.StateCounts)
 	fmt.Println()
 
 	// Calculate column widths from data
@@ -1042,6 +1072,7 @@ func writeStatusListFooter(data StatusListData) {
 
 func writeFailedStatusList(data StatusListData) {
 	fmt.Printf("%sRecent failed schema changes%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
+	writeStatusStateSummary(data.StateCounts)
 	fmt.Println()
 
 	for i, a := range data.Applies {

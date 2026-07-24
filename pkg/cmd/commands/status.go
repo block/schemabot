@@ -82,6 +82,7 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 		HasMore:        result.HasMore,
 		FailuresOnly:   result.FailuresOnly,
 		Last:           cmd.Last,
+		StateCounts:    result.StateCounts,
 		ShowExternalID: cmd.ExternalID,
 		Deployment:     cmd.Deployment,
 		Applies:        applies,

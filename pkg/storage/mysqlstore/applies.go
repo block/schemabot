@@ -1111,14 +1111,12 @@ func (s *applyStore) GetInProgress(ctx context.Context) ([]*storage.Apply, error
 	return scanApplies(rows)
 }
 
-// GetRecent returns the most recent applies across all databases, ordered by creation time desc.
-func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentAppliesFilter) ([]*storage.Apply, error) {
-	query := `
-		SELECT ` + applyColumns + `
-		FROM applies
-	`
-	var args []any
+// recentAppliesWhere builds the WHERE predicates and args shared by the
+// recent-apply list and count queries, so both views agree on which applies a
+// filter selects.
+func recentAppliesWhere(filter storage.RecentAppliesFilter) ([]string, []any) {
 	var where []string
+	var args []any
 	if filter.Environment != "" {
 		where = append(where, "environment = ?")
 		args = append(args, filter.Environment)
@@ -1139,6 +1137,16 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 		where = append(where, "updated_at >= ?")
 		args = append(args, filter.UpdatedSince)
 	}
+	return where, args
+}
+
+// GetRecent returns the most recent applies across all databases, ordered by creation time desc.
+func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentAppliesFilter) ([]*storage.Apply, error) {
+	query := `
+		SELECT ` + applyColumns + `
+		FROM applies
+	`
+	where, args := recentAppliesWhere(filter)
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -1152,6 +1160,38 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 	defer utils.CloseAndLog(rows)
 
 	return scanApplies(rows)
+}
+
+// CountRecentByState returns how many applies match the filter, grouped by
+// state. The filter's Limit is ignored: counts cover every matching row, so a
+// summary over a window is not truncated by list pagination.
+func (s *applyStore) CountRecentByState(ctx context.Context, filter storage.RecentAppliesFilter) (map[string]int, error) {
+	query := "SELECT state, COUNT(*) FROM applies"
+	where, args := recentAppliesWhere(filter)
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY state"
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("count recent applies by state: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	counts := map[string]int{}
+	for rows.Next() {
+		var applyState string
+		var count int
+		if err := rows.Scan(&applyState, &count); err != nil {
+			return nil, fmt.Errorf("scan recent apply state count: %w", err)
+		}
+		counts[applyState] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate recent apply state counts: %w", err)
+	}
+	return counts, nil
 }
 
 // FindNextApply atomically claims the next apply that needs attention.
