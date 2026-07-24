@@ -128,12 +128,20 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		return nil
 	}
 	defer func() {
-		if _, err := cleanupLocker.Release(context.WithoutCancel(ctx), conn, lockName); err != nil {
+		released, err := cleanupLocker.Release(context.WithoutCancel(ctx), conn, lockName)
+		switch {
+		case err != nil:
 			c.logger.Warn("failed to release pending drops cleanup lock; the lock releases when the session closes",
 				"database", target.Database,
 				"environment", target.Environment,
 				"lock_name", lockName,
 				"error", err,
+			)
+		case !released:
+			c.logger.Warn("pending drops cleanup lock was no longer held at release; another instance may have run concurrently against this target",
+				"database", target.Database,
+				"environment", target.Environment,
+				"lock_name", lockName,
 			)
 		}
 	}()

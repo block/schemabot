@@ -521,7 +521,7 @@ const ensureSchemaLockName = "schemabot_ensure_schema"
 // advisory lock held on the returned connection for the operation's lifetime.
 var ensureSchemaLocker namedlock.Locker = namedlock.MySQL{}
 
-// acquireEnsureSchemaLock acquires a MySQL advisory lock to serialize
+// acquireEnsureSchemaLock acquires a session-scoped advisory lock to serialize
 // EnsureSchema across pods. Returns the connection holding the lock — the
 // lock is released when the connection is closed.
 func acquireEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger) (*sql.Conn, error) {

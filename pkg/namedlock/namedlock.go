@@ -18,6 +18,12 @@ import (
 // Locker acquires and releases session-scoped advisory locks on a pinned
 // connection. Implementations are engine-specific: MySQL uses GET_LOCK /
 // RELEASE_LOCK, a future Postgres implementation would use pg_advisory_lock.
+//
+// name identifies the lock within an engine but is not guaranteed to round-trip
+// verbatim: MySQL uses it as the literal lock string, whereas Postgres advisory
+// locks are keyed by int64, so a Postgres implementation would hash name into a
+// key. Callers should treat name as an opaque identity, not a value they can
+// read back.
 type Locker interface {
 	// Acquire attempts to take the named lock on conn, waiting up to wait for
 	// it. acquired reports whether the lock was taken; it is false when the
@@ -34,7 +40,9 @@ type Locker interface {
 
 // MySQL implements Locker with MySQL's GET_LOCK / RELEASE_LOCK. The lock is
 // bound to the connection's session, so callers must pass the same *sql.Conn to
-// Acquire and Release and keep it open for as long as the lock is held.
+// Acquire and Release and keep it open for as long as the lock is held. MySQL 8
+// rejects lock names longer than 64 characters; callers are responsible for
+// keeping name within that bound.
 type MySQL struct{}
 
 var _ Locker = MySQL{}
