@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -624,6 +625,48 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 	return out
 }
 
+// engineBlocked reports whether the planner's execution-mode verdict says the
+// engine will refuse this change at apply time.
+func engineBlocked(t *apitypes.TableChangeResponse) bool {
+	return t != nil && t.ExecutionMode == ddl.ExecutionModeBlocked
+}
+
+// shardedBlockedChanges collects blocked per-shard changes, grouped by (table,
+// reason) so a change present on several shards lists them together rather
+// than repeating. Returns nil when the plan carries no per-shard changes (the
+// non-sharded path uses the namespace-level blocked view instead).
+func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.BlockedChangeData {
+	if len(shards) == 0 {
+		return nil
+	}
+	type key struct{ table, reason string }
+	var order []key
+	byKey := make(map[key]*templates.BlockedChangeData)
+	for _, sp := range shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if !engineBlocked(t) {
+				continue
+			}
+			k := key{table: t.TableName, reason: t.ModeReason}
+			bc := byKey[k]
+			if bc == nil {
+				bc = &templates.BlockedChangeData{Table: t.TableName, Reason: t.ModeReason}
+				byKey[k] = bc
+				order = append(order, k)
+			}
+			bc.Shards = append(bc.Shards, sp.Shard)
+		}
+	}
+	out := make([]templates.BlockedChangeData, 0, len(order))
+	for _, k := range order {
+		out = append(out, *byKey[k])
+	}
+	return out
+}
+
 // buildPlanCommentData converts plan results into template data.
 func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
@@ -704,6 +747,28 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 				Table:  uc.Table,
 				Reason: uc.Reason,
 			})
+		}
+	}
+
+	// Blocked changes — the engine will refuse these at apply time. Like the
+	// unsafe view, a sharded plan derives them per shard so a blocked change
+	// confined to one shard names the shard it applies to.
+	if blocked := shardedBlockedChanges(planResp.Shards); len(blocked) > 0 {
+		data.BlockedChanges = blocked
+	} else {
+		for _, sc := range planResp.Changes {
+			if sc == nil {
+				continue
+			}
+			for _, t := range sc.TableChanges {
+				if !engineBlocked(t) {
+					continue
+				}
+				data.BlockedChanges = append(data.BlockedChanges, templates.BlockedChangeData{
+					Table:  t.TableName,
+					Reason: t.ModeReason,
+				})
+			}
 		}
 	}
 

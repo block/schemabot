@@ -29,6 +29,16 @@ type UnsafeChangeData struct {
 	Shards []string
 }
 
+// BlockedChangeData is a planned change the engine deterministically refuses:
+// an apply will fail on it, so the plan comment discloses it up front.
+type BlockedChangeData struct {
+	Table  string
+	Reason string
+	// Shards names the shards this blocked change applies to, for a sharded
+	// plan where only some shards carry it. Empty for a non-sharded change.
+	Shards []string
+}
+
 // PlanCommentData contains all data needed to render a plan comment.
 type PlanCommentData struct {
 	Database     string
@@ -50,6 +60,9 @@ type PlanCommentData struct {
 	HasUnsafeChanges bool
 	AllowUnsafe      bool
 	UnsafeChanges    []UnsafeChangeData
+
+	// Changes the engine refuses; the apply will fail on them.
+	BlockedChanges []BlockedChangeData
 
 	// Options
 	DeferCutover bool
@@ -127,6 +140,14 @@ func RenderPlanComment(data PlanCommentData) string {
 
 	// Detailed changes
 	writeKeyspaceChanges(&sb, data)
+
+	// Blocked changes — statements the engine refuses. Unlike unsafe changes,
+	// these cannot be acknowledged away: the apply will fail on them. Shown on
+	// the locked apply comment too, so the operator sees the guaranteed
+	// failure before confirming.
+	if len(data.BlockedChanges) > 0 {
+		writeBlockedChanges(&sb, data.BlockedChanges)
+	}
 
 	// Unsafe changes warning — shown on the plan comment for review, omitted on
 	// the locked apply comment: unsafe changes only reach an apply after the
@@ -524,6 +545,26 @@ func planShardList(shards []string) string {
 	return "shards " + strings.Join(quoted, ", ")
 }
 
+// writeBlockedChanges writes the section for statements the engine refuses,
+// naming each table and the engine's reason verbatim. There is no opt-in flag
+// that lets these through — the guidance is to rewrite the change, not retry.
+func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
+	n := len(changes)
+	fmt.Fprintf(sb, "⛔ **Cannot apply**: **%d** %s not supported by the schema-change engine\n", n, pluralize("change", n))
+	for _, c := range changes {
+		table := "`" + c.Table + "`"
+		if len(c.Shards) > 0 {
+			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
+		}
+		if c.Reason != "" {
+			fmt.Fprintf(sb, "- %s: %s\n", table, c.Reason)
+		} else {
+			fmt.Fprintf(sb, "- %s\n", table)
+		}
+	}
+	sb.WriteString("\nAn apply will fail on these statements. Rewrite them as a supported schema change, or contact your SchemaBot operators for help.\n\n")
+}
+
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
 	n := len(changes)
 	fmt.Fprintf(sb, "⚠️ **Issues**: **%d** unsafe %s detected\n", n, pluralize("change", n))
@@ -822,6 +863,12 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 		writeKeyspaceChanges(sb, *plan)
 	} else {
 		writeCollapsibleKeyspaceChanges(sb, *plan, totalStatements)
+	}
+
+	// Blocked changes — statements the engine refuses; the apply will fail on
+	// them, so each environment's section discloses its own.
+	if len(plan.BlockedChanges) > 0 {
+		writeBlockedChanges(sb, plan.BlockedChanges)
 	}
 
 	// Unsafe changes warning
