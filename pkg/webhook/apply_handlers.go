@@ -251,6 +251,18 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 		return false, nil
 	}
 
+	// Engine-blocked changes reject the apply before the unsafe gate: no flag
+	// lets a refused statement through, so the user must never be coached
+	// toward --allow-unsafe for a guaranteed failure. No lock is held yet, so
+	// the rejection needs no release.
+	if planResp.HasBlockedChanges() {
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+		h.logger.Info("apply rejected: plan contains engine-blocked changes",
+			"repo", repo, "pr", pr, "database", database, "environment", environment)
+		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
+		return false, nil
+	}
+
 	// Block unsafe changes unless --allow-unsafe was specified
 	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)

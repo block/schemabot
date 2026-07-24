@@ -496,6 +496,32 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 	return result
 }
 
+// HasBlockedChanges reports whether any planned change carries the blocked
+// execution-mode verdict, across namespace-level and per-shard changes. A
+// blocked change guarantees the apply fails, so gates use this to reject the
+// apply before it starts.
+func (r *PlanResponse) HasBlockedChanges() bool {
+	if r == nil {
+		return false
+	}
+	for _, t := range r.FlatTables() {
+		if t.EngineBlocked() {
+			return true
+		}
+	}
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if t.EngineBlocked() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // LintWarnings returns lint results with warning severity.
 func (r *PlanResponse) LintWarnings() []LintViolationResponse {
 	var result []LintViolationResponse
@@ -584,8 +610,19 @@ type TableChangeResponse struct {
 	ModeReason    string `json:"mode_reason,omitempty"`
 }
 
+// executionModeBlocked is the execution-mode verdict a planner records on a
+// table change the engine refuses. It mirrors the engine-side constant
+// (pkg/ddl); apitypes keeps its own copy so this package stays dependency-free.
+const executionModeBlocked = "blocked"
+
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
 func (t *TableChangeResponse) GetTableName() string { return t.TableName }
+
+// EngineBlocked reports whether the planner's execution-mode verdict says the
+// engine deterministically refuses this change: an apply will fail on it.
+func (t *TableChangeResponse) EngineBlocked() bool {
+	return t != nil && strings.EqualFold(t.ExecutionMode, executionModeBlocked)
+}
 
 // UnsafeChange returns the unsafe-change view for table changes that require
 // explicit operator opt-in. Engines should mark unsafe table changes directly;

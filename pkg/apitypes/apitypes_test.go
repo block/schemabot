@@ -195,3 +195,62 @@ func TestPlanResponse_HasChanges(t *testing.T) {
 		})
 	}
 }
+
+// A blocked verdict anywhere in the plan — namespace-level or per-shard —
+// marks the plan as containing blocked changes, so apply gates reject it
+// before the apply starts.
+func TestPlanResponse_HasBlockedChanges(t *testing.T) {
+	tests := []struct {
+		name string
+		resp *PlanResponse
+		want bool
+	}{
+		{
+			name: "namespace-level blocked change",
+			resp: &PlanResponse{
+				Changes: []*SchemaChangeResponse{{
+					Namespace: "testdb",
+					TableChanges: []*TableChangeResponse{
+						{TableName: "users", ExecutionMode: "blocked", ModeReason: "dropping primary key is not supported"},
+					},
+				}},
+			},
+			want: true,
+		},
+		{
+			name: "per-shard blocked change only",
+			resp: &PlanResponse{
+				Shards: []*ShardPlanResponse{{
+					Shard: "-40",
+					Changes: []*TableChangeResponse{
+						{TableName: "users", ExecutionMode: "blocked"},
+					},
+				}},
+			},
+			want: true,
+		},
+		{
+			name: "direct and default modes are not blocked",
+			resp: &PlanResponse{
+				Changes: []*SchemaChangeResponse{{
+					Namespace: "testdb",
+					TableChanges: []*TableChangeResponse{
+						{TableName: "users", ExecutionMode: "direct"},
+						{TableName: "orders"},
+					},
+				}},
+			},
+			want: false,
+		},
+		{
+			name: "nil plan",
+			resp: nil,
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.resp.HasBlockedChanges())
+		})
+	}
+}
