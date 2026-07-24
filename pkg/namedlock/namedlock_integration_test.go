@@ -109,8 +109,8 @@ func TestMySQLLockExclusiveAcrossSessions(t *testing.T) {
 	assert.True(t, released)
 }
 
-// The same session re-acquiring a lock it already holds succeeds, and releasing
-// a lock this session never held reports released=false without an error.
+// Releasing a lock this session never held reports released=false without an
+// error, so a best-effort release of an unheld lock is a safe no-op.
 func TestMySQLReleaseUnheldLock(t *testing.T) {
 	locker := MySQL{}
 	conn := openConn(t)

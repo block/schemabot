@@ -5,6 +5,13 @@
 // which are bound to a single connection's session, so every caller holds the
 // lock on a pinned *sql.Conn for the lock's whole lifetime and passes that same
 // connection to Release (or closes it) to drop the lock.
+//
+// Engine selection is per-target, not per-process: a single server can serve
+// multiple engines and the pending-drops cleaner iterates heterogeneous targets
+// in one pass. A second implementation should therefore be supplied as an
+// injected dependency chosen per target (a struct field or parameter), not by
+// swapping the package-level Locker bindings the call sites currently default
+// to MySQL.
 package namedlock
 
 import (
