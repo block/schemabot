@@ -653,12 +653,40 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 	return out
 }
 
-// rendersAsBlocked reports whether a planned change belongs in the ⛔ blocked
-// view: the engine refuses it outright, or the plan routes it to direct
-// execution — which the apply commands reject the same way, because running
-// native DDL requires operator consent the PR command flow does not collect.
-func rendersAsBlocked(t *apitypes.TableChangeResponse) bool {
-	return t.EngineBlocked() || t.DirectExecution()
+// shardedDirectChanges collects direct-execution per-shard changes, grouped by
+// (table, reason) so a change present on several shards lists them together
+// rather than repeating. Returns nil when the plan carries no per-shard
+// changes (the non-sharded path uses the namespace-level view instead).
+func shardedDirectChanges(shards []*apitypes.ShardPlanResponse) []templates.DirectChangeData {
+	if len(shards) == 0 {
+		return nil
+	}
+	type key struct{ table, reason string }
+	var order []key
+	byKey := make(map[key]*templates.DirectChangeData)
+	for _, sp := range shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if !t.DirectExecution() {
+				continue
+			}
+			k := key{table: t.TableName, reason: t.ModeReason}
+			dc := byKey[k]
+			if dc == nil {
+				dc = &templates.DirectChangeData{Table: t.TableName, Reason: t.ModeReason}
+				byKey[k] = dc
+				order = append(order, k)
+			}
+			dc.Shards = append(dc.Shards, sp.Shard)
+		}
+	}
+	out := make([]templates.DirectChangeData, 0, len(order))
+	for _, k := range order {
+		out = append(out, *byKey[k])
+	}
+	return out
 }
 
 // shardedBlockedChanges collects blocked per-shard changes, grouped by (table,
@@ -677,7 +705,7 @@ func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.Blo
 			continue
 		}
 		for _, t := range sp.Changes {
-			if !rendersAsBlocked(t) {
+			if !t.EngineBlocked() {
 				continue
 			}
 			k := key{table: t.TableName, reason: t.ModeReason}
@@ -791,10 +819,31 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 				continue
 			}
 			for _, t := range sc.TableChanges {
-				if !rendersAsBlocked(t) {
+				if !t.EngineBlocked() {
 					continue
 				}
 				data.BlockedChanges = append(data.BlockedChanges, templates.BlockedChangeData{
+					Table:  t.TableName,
+					Reason: t.ModeReason,
+				})
+			}
+		}
+	}
+
+	// Direct-execution changes — the policy routes these to native MySQL DDL,
+	// derived the same way as the blocked view.
+	if direct := shardedDirectChanges(planResp.Shards); len(direct) > 0 {
+		data.DirectChanges = direct
+	} else {
+		for _, sc := range planResp.Changes {
+			if sc == nil {
+				continue
+			}
+			for _, t := range sc.TableChanges {
+				if !t.DirectExecution() {
+					continue
+				}
+				data.DirectChanges = append(data.DirectChanges, templates.DirectChangeData{
 					Table:  t.TableName,
 					Reason: t.ModeReason,
 				})

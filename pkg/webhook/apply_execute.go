@@ -122,19 +122,6 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// Direct-verdict changes reject the apply for a different reason: running
-	// native MySQL DDL blocks writes to the table and is not revertible, so
-	// it requires operator consent the apply commands do not collect. Release
-	// the lock — retrying the same command cannot succeed either.
-	if len(planResp.DirectChanges()) > 0 {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
-		h.logger.Info("apply rejected: re-plan routes changes to direct execution",
-			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
-		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
-		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "direct execution changes rejection")
-		return
-	}
-
 	// Automatic apply DDL drift check: if the re-plan DDL differs from the stored auto-plan,
 	// downgrade to manual confirmation so the user reviews the new plan.
 	if storedPlan != nil && !ddlMatchesStoredPlan(planResp, storedPlan) {
@@ -144,6 +131,33 @@ func (h *Handler) executeApply(
 		commentData.IsLocked = true
 		commentData.AutoConfirmDowngradeReason = "Schema changes differ from auto-plan — review and confirm manually"
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		return
+	}
+
+	// Direct-execution changes never run from the automatic apply path: the
+	// operator must confirm the blocking, non-revertible native DDL against
+	// the locked plan comment that discloses it, so downgrade to manual
+	// confirmation.
+	if storedPlan != nil && len(planResp.DirectChanges()) > 0 {
+		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
+			"repo", repo, "pr", pr, "database", database, "environment", environment)
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+		commentData.IsLocked = true
+		commentData.AutoConfirmDowngradeReason = "Plan contains direct-execution changes — review the disclosure and confirm manually"
+		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		return
+	}
+
+	// --defer-cutover only affects engine-driven statements; an all-direct
+	// plan has no cutover to defer, so reject the flag instead of silently
+	// ignoring it. Release the lock so the re-run without the flag does not
+	// require a manual unlock.
+	if result.DeferCutover && planResp.AllChangesDirect() {
+		h.logger.Info("apply rejected: --defer-cutover on an all-direct plan",
+			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
+		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+			"`--defer-cutover` has no effect on this plan: every change runs as native MySQL DDL, which has no cutover to defer. Re-run without the flag.")
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "defer-cutover on all-direct plan rejection")
 		return
 	}
 

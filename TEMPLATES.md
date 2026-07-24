@@ -97,6 +97,50 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-directexecution-change"></a><strong>MySQL Plan (Direct-execution Change)</strong></summary>
+
+
+## Schema Change Apply — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
+
+```sql
+ALTER TABLE `users`
+    DROP PRIMARY KEY,
+    ADD PRIMARY KEY(`id`, `tenant_id`);
+
+ALTER TABLE `orders` ADD COLUMN `notes` text;
+```
+
+⚙️ **Direct execution**: **1** change will run as native MySQL DDL
+- `users`: dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows
+
+These statements run synchronously outside the schema-change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this.
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+⚠️ **Automatic apply paused**: Plan contains direct-execution changes — review the disclosure and confirm manually
+
+Review the plan above, then confirm manually:
+```
+schemabot apply-confirm -e staging
+```
+
+🔓 To discard this plan and unlock, comment:
+```
+schemabot unlock
+```
+
+</details>
+
+<details>
 <summary><a name="apply-rejected-engineblocked-changes"></a><strong>Apply Rejected (Engine-blocked Changes)</strong></summary>
 
 
@@ -119,7 +163,7 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 ---
 
 **⛔ Apply rejected**: **1** planned change not supported by the schema-change engine
-- `users`: dropping primary key is not supported
+- `users`: dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000
 
 Rewrite these statements as a supported schema change, or contact your SchemaBot operators for help.
 

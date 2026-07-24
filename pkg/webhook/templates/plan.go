@@ -39,6 +39,18 @@ type BlockedChangeData struct {
 	Shards []string
 }
 
+// DirectChangeData is a planned change the database's direct execution policy
+// routes to native MySQL DDL instead of the schema-change engine. The plan
+// comment discloses its semantics — blocking, not revertible — so the
+// operator consents to them when confirming the apply.
+type DirectChangeData struct {
+	Table  string
+	Reason string
+	// Shards names the shards this direct change applies to, for a sharded
+	// plan where only some shards carry it. Empty for a non-sharded change.
+	Shards []string
+}
+
 // PlanCommentData contains all data needed to render a plan comment.
 type PlanCommentData struct {
 	Database     string
@@ -63,6 +75,9 @@ type PlanCommentData struct {
 
 	// Changes the engine refuses; the apply will fail on them.
 	BlockedChanges []BlockedChangeData
+
+	// Changes the direct execution policy routes to native MySQL DDL.
+	DirectChanges []DirectChangeData
 
 	// Options
 	DeferCutover bool
@@ -147,6 +162,14 @@ func RenderPlanComment(data PlanCommentData) string {
 	// failure before confirming.
 	if len(data.BlockedChanges) > 0 {
 		writeBlockedChanges(&sb, data.BlockedChanges)
+	}
+
+	// Direct-execution changes — statements the policy routes to native MySQL
+	// DDL. Shown on the locked apply comment too: confirming the apply is the
+	// operator's consent to their blocking, non-revertible semantics, so the
+	// disclosure must sit on the comment the confirmation acts on.
+	if len(data.DirectChanges) > 0 {
+		writeDirectChanges(&sb, data.DirectChanges)
 	}
 
 	// Unsafe changes warning — shown on the plan comment for review, omitted on
@@ -565,6 +588,27 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	sb.WriteString("\nAn apply will fail on these statements. Rewrite them as a supported schema change, or contact your SchemaBot operators for help.\n\n")
 }
 
+// writeDirectChanges writes the section for statements the direct execution
+// policy routes to native MySQL DDL, naming each table and the planner's
+// reason (which carries the row estimate). The fixed footer discloses the
+// semantics the operator consents to by confirming the apply.
+func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData) {
+	n := len(changes)
+	fmt.Fprintf(sb, "⚙️ **Direct execution**: **%d** %s will run as native MySQL DDL\n", n, pluralize("change", n))
+	for _, c := range changes {
+		table := "`" + c.Table + "`"
+		if len(c.Shards) > 0 {
+			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
+		}
+		if c.Reason != "" {
+			fmt.Fprintf(sb, "- %s: %s\n", table, c.Reason)
+		} else {
+			fmt.Fprintf(sb, "- %s\n", table)
+		}
+	}
+	sb.WriteString("\nThese statements run synchronously outside the schema-change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this.\n\n")
+}
+
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
 	n := len(changes)
 	fmt.Fprintf(sb, "⚠️ **Issues**: **%d** unsafe %s detected\n", n, pluralize("change", n))
@@ -869,6 +913,12 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 	// them, so each environment's section discloses its own.
 	if len(plan.BlockedChanges) > 0 {
 		writeBlockedChanges(sb, plan.BlockedChanges)
+	}
+
+	// Direct-execution changes — each environment's section discloses its own,
+	// since the policy is configured per environment.
+	if len(plan.DirectChanges) > 0 {
+		writeDirectChanges(sb, plan.DirectChanges)
 	}
 
 	// Unsafe changes warning
