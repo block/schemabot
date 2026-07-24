@@ -2342,6 +2342,23 @@ func TestApplyStore_FindStuckPendingApplies(t *testing.T) {
 		}
 		return apply
 	}
+	// A VSchema-only apply carries an apply_operations row but no tasks; that
+	// operation row alone makes it claimable, so the stuck scan must surface it.
+	seedPendingVSchemaOnly := func(t *testing.T, applyID string, planID int64) *storage.Apply {
+		t.Helper()
+		lock := createTestLock(t, store, "db_"+applyID, storage.DatabaseTypeVitess, "staging")
+		apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Pending, "staging")
+		now := time.Now()
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID:    apply.ID,
+			Deployment: apply.Database,
+			State:      state.ApplyOperation.Pending,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		})
+		require.NoError(t, err)
+		return apply
+	}
 	backdate := func(t *testing.T, id int64, age time.Duration) {
 		t.Helper()
 		_, err := testDB.ExecContext(ctx,
@@ -2350,9 +2367,12 @@ func TestApplyStore_FindStuckPendingApplies(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Old claimable pending applies (have a task) → stuck, oldest first.
+	// Old claimable pending applies → stuck, oldest first. The tasks arm and the
+	// apply_operations arm are both claimable, so both must be surfaced.
 	oldest := seedPending(t, "apply_oldest_claimable", 9001, true)
 	backdate(t, oldest.ID, 40*time.Minute)
+	vschemaOnly := seedPendingVSchemaOnly(t, "apply_vschema_only", 9006)
+	backdate(t, vschemaOnly.ID, 30*time.Minute)
 	older := seedPending(t, "apply_old_claimable", 9002, true)
 	backdate(t, older.ID, 20*time.Minute)
 
@@ -2373,9 +2393,11 @@ func TestApplyStore_FindStuckPendingApplies(t *testing.T) {
 	t.Run("returns aged claimable pending applies oldest first", func(t *testing.T) {
 		stuck, err := store.Applies().FindStuckPendingApplies(ctx, threshold, 0)
 		require.NoError(t, err)
-		require.Len(t, stuck, 2)
+		require.Len(t, stuck, 3)
 		assert.Equal(t, oldest.ApplyIdentifier, stuck[0].ApplyIdentifier)
-		assert.Equal(t, older.ApplyIdentifier, stuck[1].ApplyIdentifier)
+		assert.Equal(t, vschemaOnly.ApplyIdentifier, stuck[1].ApplyIdentifier,
+			"a task-less pending apply with an apply_operations row must be surfaced")
+		assert.Equal(t, older.ApplyIdentifier, stuck[2].ApplyIdentifier)
 		assert.Equal(t, state.Apply.Pending, stuck[0].State)
 	})
 

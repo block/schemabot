@@ -37,7 +37,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.operator.resume_failures_total` | Counter | database, environment, reason | Operator resume attempts that failed |
 | `schemabot.operator.claim_failures_total` | Counter | environment, reason | Operator claim attempts that failed |
 | `schemabot.operator.claim_duration_seconds` | Histogram | database, environment, previous_state | Operator claim and resume duration |
-| `schemabot.operator.stuck_pending_applies` | Gauge | environment | Pending applies past the stuck threshold that a driver should have claimed |
+| `schemabot.operator.stuck_pending_applies` | Gauge | environment | Pending applies past the stuck threshold that a driver should have claimed (sampled; capped at 500, so a value of 500 means "at least 500") |
 | `schemabot.operator.stuck_pending_scan_failures` | Counter | environment | Failed stuck-pending apply scans (liveness signal for the gauge above) |
 | `schemabot.pending_drops.tables_moved_total` | Counter | database, environment | Dropped tables quarantined into the pending drops database |
 | `schemabot.pending_drops.cleanup_dropped_total` | Counter | database, environment | Expired quarantined tables permanently dropped by the cleaner |

@@ -322,7 +322,7 @@ jobs:
           # test-e2e-grpc-multideploy tears its own stack down, so it captures
           # grpc-multideploy-containers.log itself before teardown; the stack is
           # already gone by the time this step runs.
-          echo "=== tail of container logs (full logs in the uploaded e2e-grpc-md-logs artifact) ==="
+          echo "=== tail of container logs (full logs in the uploaded e2e-grpc-md-logs-shard-${{ matrix.shard }} artifact) ==="
           tail -n 200 e2e-logs/grpc-multideploy-containers.log 2>/dev/null || echo "no container logs captured (stack failed before tests ran; see the job log above)"
       - name: "Upload container logs on failure"
         if: failure()
@@ -413,7 +413,7 @@ jobs:
         run: |
           mkdir -p e2e-logs
           docker compose -f deploy/e2e/docker-compose.yml logs --no-color --timestamps > e2e-logs/containers.log 2>&1 || true
-          echo "=== tail of container logs (full logs in the uploaded e2e-vitess-logs artifact) ==="
+          echo "=== tail of container logs (full logs in the uploaded e2e-vitess-logs-shard-${{ matrix.shard }} artifact) ==="
           tail -n 200 e2e-logs/containers.log || true
       - name: "Upload container logs on failure"
         if: failure()
