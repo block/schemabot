@@ -271,9 +271,9 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 			return true
 		}
 		var prior *storage.PlanComment
-		for i := len(comments) - 1; i >= 0; i-- {
-			if comments[i].EnvironmentScope == expectedScope {
-				prior = comments[i]
+		for _, v := range slices.Backward(comments) {
+			if v.EnvironmentScope == expectedScope {
+				prior = v
 				break
 			}
 		}
