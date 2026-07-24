@@ -71,6 +71,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCLIOutput(previewType)
 	// Comment template types
 	case templates.PreviewCommentPlan, templates.PreviewCommentPlanBlocked,
+		templates.PreviewCommentApplyBlockedRejected,
 		templates.PreviewCommentPlanTenant,
 		templates.PreviewCommentPlanEmpty,
 		templates.PreviewCommentNoManagedSchema,
@@ -245,6 +246,7 @@ Interactive TUI:
 Comment Templates (GitHub PR comments):
   comment_plan                  Plan comment with DDL changes + lint violations
   comment_plan_blocked          Plan with a statement the engine refuses (blocked verdict)
+  comment_apply_blocked_rejected Apply rejected: plan contains engine-blocked statements
   comment_plan_tenant           Tenant-targeted plan comment
   comment_plan_empty            Plan comment with no changes
   comment_no_managed_schema     No managed schema changes in current PR

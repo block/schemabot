@@ -97,6 +97,35 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="apply-rejected-engineblocked-changes"></a><strong>Apply Rejected (Engine-blocked Changes)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `users`
+    DROP PRIMARY KEY,
+    ADD PRIMARY KEY(`id`, `tenant_id`);
+
+ALTER TABLE `orders` ADD COLUMN `notes` text;
+```
+
+📋 **Plan**: **2** tables to alter
+
+---
+
+**⛔ Apply rejected**: **1** planned change not supported by the schema-change engine
+- `users`: dropping primary key is not supported
+
+Rewrite these statements as a supported schema change, or contact your SchemaBot operators for help.
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-tenant-target"></a><strong>MySQL Plan (Tenant Target)</strong></summary>
 
 
