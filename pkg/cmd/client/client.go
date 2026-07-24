@@ -572,7 +572,9 @@ type StatusOptions struct {
 	Limit       int
 	Environment string
 	Deployment  string
-	Failed      bool
+	// State restricts the list to one apply state; empty means all states.
+	State  string
+	Failed bool
 	// Last bounds the list to applies updated within this window; zero means
 	// unbounded.
 	Last time.Duration
@@ -592,6 +594,9 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 		}
 		if opts[0].Deployment != "" {
 			values.Set("deployment", opts[0].Deployment)
+		}
+		if opts[0].State != "" {
+			values.Set("state", opts[0].State)
 		}
 		if opts[0].Failed {
 			values.Set("failed", "true")

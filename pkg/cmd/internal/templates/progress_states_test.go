@@ -114,6 +114,40 @@ func TestWriteStatusListStateSummary(t *testing.T) {
 	assert.Contains(t, output, "15 total: 12 Completed · 2 Failed · 1 Running")
 }
 
+func TestWriteStatusListStateFilterSuffix(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount: 0,
+			Limit:       20,
+			StateFilter: state.Apply.FailedRetryable,
+			Last:        "6h",
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-example",
+					Database:    "orders",
+					Environment: "staging",
+					State:       state.Apply.FailedRetryable,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "(in state Retrying, updated in the last 6h)")
+}
+
+func TestWriteStatusListEmptyWithStateFilter(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			Limit:       20,
+			StateFilter: state.Apply.Running,
+		})
+	})
+
+	assert.Contains(t, output, "No recent schema changes in state Running")
+}
+
 func TestWriteStatusListNoStateSummaryWhenEmpty(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteStatusList(StatusListData{

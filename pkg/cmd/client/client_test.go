@@ -123,12 +123,13 @@ func TestListDatabases(t *testing.T) {
 }
 
 func TestGetStatusWithOptions(t *testing.T) {
-	var gotLimit, gotEnvironment, gotFailed, gotLast string
+	var gotLimit, gotEnvironment, gotFailed, gotLast, gotState string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotLimit = r.URL.Query().Get("limit")
 		gotEnvironment = r.URL.Query().Get("environment")
 		gotFailed = r.URL.Query().Get("failed")
 		gotLast = r.URL.Query().Get("last")
+		gotState = r.URL.Query().Get("state")
 		w.Header().Set("Content-Type", "application/json")
 		_, err := w.Write([]byte(`{"active_count":0,"limit":50,"applies":[]}`))
 		require.NoError(t, err)
@@ -147,7 +148,13 @@ func TestGetStatusWithOptions(t *testing.T) {
 	assert.Equal(t, "staging", gotEnvironment)
 	assert.Equal(t, "true", gotFailed)
 	assert.Equal(t, "24h0m0s", gotLast)
+	assert.Empty(t, gotState)
 	assert.Equal(t, 50, result.Limit)
+
+	_, err = GetStatus(server.URL, StatusOptions{State: "running"})
+	require.NoError(t, err)
+	assert.Equal(t, "running", gotState)
+	assert.Empty(t, gotFailed)
 }
 
 func TestReadSchemaFiles_RegularDirectories(t *testing.T) {
