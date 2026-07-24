@@ -577,6 +577,11 @@ type TableChangeResponse struct {
 	ChangeType   string `json:"change_type"`
 	IsUnsafe     bool   `json:"is_unsafe,omitempty"`
 	UnsafeReason string `json:"unsafe_reason,omitempty"`
+	// ExecutionMode is the planner's execution-mode verdict. Empty means the
+	// engine's default path; "blocked" means the engine deterministically
+	// refuses the statement and the apply will fail.
+	ExecutionMode string `json:"execution_mode,omitempty"`
+	ModeReason    string `json:"mode_reason,omitempty"`
 }
 
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.

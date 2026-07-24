@@ -134,7 +134,7 @@ func (h *Handler) attachServerEnvironments(schemaResult *ghclient.SchemaRequestR
 		return fmt.Errorf("resolve configured environments for database %q: %w", schemaResult.Database, err)
 	}
 	if environment != "" && !slices.Contains(environments, environment) {
-		return fmt.Errorf("database %q environment %q is not configured on this server", schemaResult.Database, environment)
+		return &environmentNotConfiguredError{Database: schemaResult.Database, Environment: environment}
 	}
 	schemaResult.Environments = environments
 	return nil

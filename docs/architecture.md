@@ -663,6 +663,8 @@ In a multi-pod deployment, every SchemaBot pod runs its own operator. Each opera
 
 The storage arrows represent operator coordination. The GitHub arrows represent optional observer notifications; CLI applies simply run without an observer.
 
+**An idle SchemaBot is never query-idle.** Polling is how drivers find work: every pod's drivers scan storage on each poll tick — claim queries with `FOR UPDATE SKIP LOCKED`, plus pending-stop and ordered-cutover precedence checks — whether or not any applies exist. The result is a steady baseline of query traffic against the storage database that scales with pods × drivers, even when no schema change is running. This is expected claim-loop traffic, not a leak or a stuck apply. To check whether a deployment is actually busy, look for non-terminal applies (`schemabot status`) rather than storage query volume. If the idle baseline ever matters, replica count and `drivers` are the knobs.
+
 A **claim** is an atomic storage operation: it selects one apply that needs work,
 refreshes its `updated_at` heartbeat, and rotates an apply lease token in the
 same transaction. The heartbeat timestamp decides when another driver may try to

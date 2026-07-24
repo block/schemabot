@@ -21,6 +21,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/schema"
@@ -279,6 +280,180 @@ func TestEngine_Plan_DropTable(t *testing.T) {
 	assert.True(t, result.HasErrors(), "Spirit unsafe drop lint should remain the blocking gate")
 	_, err = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS `legacy_users`")
 	require.NoError(t, err, "drop table")
+}
+
+// A desired schema that swaps a table's primary key diffs to a DROP PRIMARY
+// KEY, and one that introduces a referential constraint diffs to an ADD
+// FOREIGN KEY — both statements Spirit deterministically refuses at apply
+// time. The plan carries the execution-mode verdict on those changes — mode
+// "blocked" with the engine's reason — so the operator learns at plan time
+// that the apply will fail, while an ordinary change in the same plan stays
+// on the engine's default path.
+func TestEngine_Plan_ExecutionVerdictBlocked(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupCtx := context.WithoutCancel(t.Context())
+	t.Cleanup(func() {
+		for _, table := range []string{"orders", "accounts", "notes"} {
+			_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `"+table+"`")
+			assert.NoError(t, err, "drop table %s", table)
+		}
+	})
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE accounts (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create accounts table")
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE notes (
+		id INT NOT NULL AUTO_INCREMENT,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create notes table")
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE orders (
+		id INT NOT NULL AUTO_INCREMENT,
+		note_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create orders table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"accounts.sql": `CREATE TABLE accounts (
+				id INT NOT NULL AUTO_INCREMENT,
+				tenant_id INT NOT NULL,
+				PRIMARY KEY (id, tenant_id)
+			)`,
+			"notes.sql": `CREATE TABLE notes (
+				id INT NOT NULL AUTO_INCREMENT,
+				body TEXT,
+				PRIMARY KEY (id)
+			)`,
+			"orders.sql": `CREATE TABLE orders (
+				id INT NOT NULL AUTO_INCREMENT,
+				note_id INT NOT NULL,
+				PRIMARY KEY (id),
+				CONSTRAINT fk_orders_note FOREIGN KEY (note_id) REFERENCES notes (id)
+			)`,
+		}),
+		Credentials: &engine.Credentials{
+			DSN: dsn,
+		},
+	})
+	require.NoError(t, err, "Plan()")
+	require.False(t, result.NoChanges, "expected changes, got NoChanges")
+
+	verdicts := make(map[string]engine.TableChange)
+	for _, tc := range result.FlatTableChanges() {
+		t.Logf("table %s: ddl=%s mode=%q reason=%q", tc.Table, tc.DDL, tc.ExecutionMode, tc.ModeReason)
+		verdicts[tc.Table] = tc
+	}
+
+	accounts, ok := verdicts["accounts"]
+	require.True(t, ok, "plan carries the accounts change")
+	assert.Contains(t, accounts.DDL, "DROP PRIMARY KEY")
+	assert.Equal(t, "blocked", accounts.ExecutionMode, "the refused statement carries the blocked verdict")
+	assert.Equal(t, "dropping primary key is not supported", accounts.ModeReason)
+
+	notes, ok := verdicts["notes"]
+	require.True(t, ok, "plan carries the notes change")
+	assert.Empty(t, notes.ExecutionMode, "an ordinary ADD COLUMN stays on the engine's default path")
+	assert.Empty(t, notes.ModeReason)
+
+	orders, ok := verdicts["orders"]
+	require.True(t, ok, "plan carries the orders change")
+	assert.Contains(t, orders.DDL, "FOREIGN KEY")
+	assert.Contains(t, orders.DDL, "fk_orders_note")
+	assert.Equal(t, "blocked", orders.ExecutionMode, "adding a foreign key carries the blocked verdict")
+	assert.Equal(t, "adding foreign key constraints is not supported", orders.ModeReason)
+}
+
+// The execution-mode verdict mirrors refusal checks that live inside the
+// engine, so this test proves the mirror against the engine itself: every
+// statement shape the verdict classifies as blocked is handed to a real
+// Spirit schema change, which must refuse it with the very reason the verdict
+// recorded. An engine upgrade that relaxes one of these checks — or rewords
+// its refusal — fails this test, signaling that ddl.EngineRefusalReason must
+// change in the same bump so the verdict never claims an apply will fail when
+// it can succeed.
+func TestEngine_SpiritRefusesVerdictBlockedStatements(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupCtx := context.WithoutCancel(t.Context())
+	t.Cleanup(func() {
+		for _, table := range []string{"verdict_orders", "verdict_refs"} {
+			_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `"+table+"`")
+			assert.NoError(t, err, "drop table %s", table)
+		}
+	})
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE verdict_refs (
+		id INT NOT NULL AUTO_INCREMENT,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create verdict_refs table")
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE verdict_orders (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		ref_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create verdict_orders table")
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	tests := []struct {
+		name string
+		stmt string
+	}{
+		{
+			name: "drop primary key",
+			stmt: "ALTER TABLE `verdict_orders` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+		},
+		{
+			name: "add foreign key",
+			stmt: "ALTER TABLE `verdict_orders` ADD CONSTRAINT `fk_verdict_ref` FOREIGN KEY (`ref_id`) REFERENCES `verdict_refs` (`id`)",
+		},
+		{
+			name: "explicit algorithm clause",
+			stmt: "ALTER TABLE `verdict_orders` ADD COLUMN `note` VARCHAR(64), ALGORITHM=INPLACE",
+		},
+		{
+			name: "explicit lock clause",
+			stmt: "ALTER TABLE `verdict_orders` ADD COLUMN `note` VARCHAR(64), LOCK=NONE",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reason, refused, err := ddl.EngineRefusalReason(tt.stmt)
+			require.NoError(t, err, "EngineRefusalReason")
+			require.True(t, refused, "the verdict must classify this statement as blocked")
+			require.NotEmpty(t, reason)
+
+			runner, err := spiritmigration.NewRunner(&spiritmigration.Migration{
+				Host:      host,
+				Username:  username,
+				Password:  &password,
+				Database:  database,
+				Statement: tt.stmt,
+			})
+			require.NoError(t, err, "NewRunner")
+			defer utils.CloseAndLog(runner)
+
+			runCtx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			runErr := runner.Run(runCtx)
+			require.Error(t, runErr, "the engine must refuse a statement the verdict marked blocked")
+			assert.Contains(t, runErr.Error(), reason,
+				"the engine's refusal must carry the reason the verdict recorded")
+		})
+	}
 }
 
 func TestEngine_Plan_NoChanges(t *testing.T) {
