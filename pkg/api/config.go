@@ -383,6 +383,148 @@ type StorageConfig struct {
 	// columns, after every running pod is on a binary whose embedded schema no
 	// longer declares them.
 	AllowDestructiveSchemaChanges bool `yaml:"allow_destructive_schema_changes,omitempty"`
+
+	// Pool tunes SchemaBot's internal storage connection pool. Every field is
+	// optional; each falls back to a built-in default that preserves the prior
+	// hardcoded behavior when left unset.
+	Pool StoragePoolConfig `yaml:"pool,omitempty"`
+}
+
+// Storage connection-pool defaults. These reproduce the values that were
+// previously hardcoded in the server build path, so an unset pool config
+// behaves exactly as before.
+const (
+	// DefaultStorageMaxIdleConns sizes the idle pool to cover the per-pod
+	// background concurrency so idle connections stay pooled instead of being
+	// closed and reopened every poll tick. Go's driver default of 2 is smaller
+	// than that concurrency, so idle connections returned by the durable
+	// webhook drivers (4 × 1 s poll), operator drivers (4 × 10 s poll), and
+	// background monitors were closed and reopened on nearly every tick,
+	// producing constant CONNECT/DISCONNECT churn (visible as paired entries in
+	// the MySQL audit log). 10 keeps those connections warm.
+	DefaultStorageMaxIdleConns = 10
+
+	// DefaultStorageConnMaxLifetime proactively retires connections before
+	// MySQL's wait_timeout (default 28800s) to avoid "invalid connection"
+	// errors when the pool hands out a stale connection.
+	DefaultStorageConnMaxLifetime = 5 * time.Minute
+
+	// DefaultStorageConnMaxIdleTime discards connections that have sat idle
+	// this long, complementing the lifetime cap for connections that are
+	// rarely reused.
+	DefaultStorageConnMaxIdleTime = 3 * time.Minute
+)
+
+// StoragePoolConfig tunes the database/sql connection pool and driver dial
+// timeout for SchemaBot's internal storage database. Durations are Go duration
+// strings (e.g. "5m", "30s"). Zero/empty fields fall back to defaults; an
+// unset MaxOpenConns leaves the pool unbounded (the database/sql default) and
+// an unset ConnectTimeout leaves the driver's own dial behavior unchanged.
+type StoragePoolConfig struct {
+	// MaxIdleConns caps the number of idle connections kept in the pool.
+	// Unset (0) uses DefaultStorageMaxIdleConns.
+	MaxIdleConns int `yaml:"max_idle_conns,omitempty"`
+
+	// MaxOpenConns caps the total number of open connections (the max pool
+	// size). Unset (0) leaves the pool unbounded, matching database/sql's
+	// default.
+	MaxOpenConns int `yaml:"max_open_conns,omitempty"`
+
+	// ConnMaxLifetime is the maximum age of a pooled connection before it is
+	// retired. Unset uses DefaultStorageConnMaxLifetime.
+	ConnMaxLifetime string `yaml:"conn_max_lifetime,omitempty"`
+
+	// ConnMaxIdleTime is the maximum time a connection may sit idle before it
+	// is retired. Unset uses DefaultStorageConnMaxIdleTime.
+	ConnMaxIdleTime string `yaml:"conn_max_idle_time,omitempty"`
+
+	// ConnectTimeout bounds how long a single connection attempt (the TCP dial
+	// plus handshake) may take. It maps to the go-sql-driver `timeout` DSN
+	// parameter and does not bound query execution. Unset leaves the driver
+	// default (no explicit dial timeout).
+	ConnectTimeout string `yaml:"connect_timeout,omitempty"`
+}
+
+// MaxIdleConnsOrDefault returns the configured idle-pool cap or the default
+// when unset.
+func (p StoragePoolConfig) MaxIdleConnsOrDefault() int {
+	if p.MaxIdleConns > 0 {
+		return p.MaxIdleConns
+	}
+	return DefaultStorageMaxIdleConns
+}
+
+// ConnMaxLifetimeOrDefault returns the configured connection lifetime or the
+// default when unset. It assumes the value has already passed validation.
+func (p StoragePoolConfig) ConnMaxLifetimeOrDefault() time.Duration {
+	return parseDurationOrDefault(p.ConnMaxLifetime, DefaultStorageConnMaxLifetime)
+}
+
+// ConnMaxIdleTimeOrDefault returns the configured idle timeout or the default
+// when unset. It assumes the value has already passed validation.
+func (p StoragePoolConfig) ConnMaxIdleTimeOrDefault() time.Duration {
+	return parseDurationOrDefault(p.ConnMaxIdleTime, DefaultStorageConnMaxIdleTime)
+}
+
+// ConnectTimeoutOrZero returns the configured dial timeout, or zero when unset,
+// meaning "leave the driver default". It assumes the value has already passed
+// validation.
+func (p StoragePoolConfig) ConnectTimeoutOrZero() time.Duration {
+	return parseDurationOrDefault(p.ConnectTimeout, 0)
+}
+
+// parseDurationOrDefault parses a Go duration string, returning def when the
+// string is empty or unparseable. Callers validate values at config load, so a
+// parse failure here only happens on an already-rejected config.
+func parseDurationOrDefault(s string, def time.Duration) time.Duration {
+	if s == "" {
+		return def
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return def
+	}
+	return d
+}
+
+// Validate rejects out-of-range or malformed pool settings at config load so a
+// typo fails fast instead of silently reverting to a default at runtime.
+func (p StoragePoolConfig) Validate(context string) error {
+	if p.MaxIdleConns < 0 {
+		return fmt.Errorf("%s pool.max_idle_conns %d must not be negative", context, p.MaxIdleConns)
+	}
+	if p.MaxOpenConns < 0 {
+		return fmt.Errorf("%s pool.max_open_conns %d must not be negative", context, p.MaxOpenConns)
+	}
+	if p.MaxOpenConns > 0 && p.MaxIdleConns > 0 && p.MaxIdleConns > p.MaxOpenConns {
+		return fmt.Errorf("%s pool.max_idle_conns %d must not exceed pool.max_open_conns %d", context, p.MaxIdleConns, p.MaxOpenConns)
+	}
+	if err := validatePositiveDuration(context, "pool.conn_max_lifetime", p.ConnMaxLifetime); err != nil {
+		return err
+	}
+	if err := validatePositiveDuration(context, "pool.conn_max_idle_time", p.ConnMaxIdleTime); err != nil {
+		return err
+	}
+	if err := validatePositiveDuration(context, "pool.connect_timeout", p.ConnectTimeout); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validatePositiveDuration accepts an empty value (meaning "use the default")
+// and otherwise requires a parseable, strictly positive Go duration.
+func validatePositiveDuration(context, field, value string) error {
+	if value == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return fmt.Errorf("%s %s %q is not a valid duration: %w", context, field, value, err)
+	}
+	if d <= 0 {
+		return fmt.Errorf("%s %s %q must be positive (omit it to use the default)", context, field, value)
+	}
+	return nil
 }
 
 // DSNFromConfig configures a MySQL DSN assembled from separate secret values.
@@ -1992,9 +2134,11 @@ func (c StorageConfig) validateLocalDSNConfig(context string) error {
 		return fmt.Errorf("%s cannot configure both dsn and dsn_from", context)
 	}
 	if c.DSNFrom != nil {
-		return c.DSNFrom.Validate(context)
+		if err := c.DSNFrom.Validate(context); err != nil {
+			return err
+		}
 	}
-	return nil
+	return c.Pool.Validate(context)
 }
 
 // HasLocalDSN returns true when the environment should use a local database connection.
