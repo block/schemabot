@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
 	"testing"
 	"time"
 
@@ -30,8 +29,7 @@ const pkSwapSchema = "CREATE TABLE `users` (\n" +
 // database so the plan produces the refused primary-key reshape.
 func seedPKSwapTargetTable(t *testing.T, dbName string) {
 	t.Helper()
-	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+dbName, 1)
-	db, err := sql.Open("mysql", appDSN)
+	db, err := sql.Open("mysql", driftDSN(t, dbName))
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 	_, err = db.ExecContext(t.Context(), "CREATE TABLE `users` (\n"+
