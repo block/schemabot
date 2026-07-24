@@ -52,8 +52,12 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 	return false, nil
 }
 
+// reviewGateErrorDetail builds the PR-facing detail for a review gate
+// evaluation failure. The error is used only to classify the failure — its
+// text is never rendered, because raw GitHub errors can carry internal detail
+// that must not land in PR markdown; operators triage from the server logs.
 func reviewGateErrorDetail(err error) string {
-	detail := "Review gate check failed: " + err.Error()
+	detail := "Review gate check failed; see server logs for details"
 	if errors.Is(err, ghclient.ErrTeamMembershipUnreadable) {
 		detail += ". If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership."
 	}

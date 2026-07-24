@@ -25,15 +25,18 @@ func TestReviewGateErrorDetailTeamMembership(t *testing.T) {
 
 	detail := reviewGateErrorDetail(err)
 
-	assert.Contains(t, detail, "Review gate check failed")
-	assert.Contains(t, detail, "team membership cannot be read")
+	assert.Contains(t, detail, "Review gate check failed; see server logs for details")
 	assert.Contains(t, detail, "GitHub App can read organization members")
+	assert.NotContains(t, detail, "expand team @octocat/schema-admins",
+		"raw error text must never render in PR markdown")
 }
 
 func TestReviewGateErrorDetailGeneric(t *testing.T) {
 	detail := reviewGateErrorDetail(assert.AnError)
 
-	assert.Contains(t, detail, "Review gate check failed")
+	assert.Contains(t, detail, "Review gate check failed; see server logs for details")
+	assert.NotContains(t, detail, assert.AnError.Error(),
+		"raw error text must never render in PR markdown")
 	assert.NotContains(t, detail, "GitHub App can read organization members")
 }
 

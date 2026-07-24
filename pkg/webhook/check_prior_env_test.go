@@ -148,7 +148,9 @@ func TestCheckPriorEnvViaLocalReturnsStorageError(t *testing.T) {
 	case body := <-comments:
 		assert.Contains(t, body, "Apply Blocked")
 		assert.Contains(t, body, "Could not verify staging status")
-		assert.Contains(t, body, "storage read failed")
+		assert.Contains(t, body, "_See server logs for details._")
+		assert.NotContains(t, body, "storage read failed",
+			"raw error text must never render in PR markdown")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for fail-closed comment")
 	}

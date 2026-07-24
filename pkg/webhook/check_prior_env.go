@@ -160,7 +160,7 @@ func (h *Handler) checkPriorEnvViaLocal(
 			"environment", environment, "prior_environment", priorEnv,
 			"error", err)
 		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "read SchemaBot storage", err))
+			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "read SchemaBot storage"))
 		return false, fmt.Errorf("prior environment gate read stored check for %s: %w", priorEnv, err)
 	}
 
@@ -279,7 +279,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 		h.logger.Error("failed to create GitHub client for prior env check, stopping apply",
 			"prior_env", priorEnv, "error", err)
 		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "create GitHub client", err))
+			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "create GitHub client"))
 		return false, fmt.Errorf("prior environment gate create GitHub client for %s: %w", priorEnv, err)
 	}
 
@@ -288,7 +288,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 		h.logger.Error("failed to fetch PR for prior env check, stopping apply",
 			"prior_env", priorEnv, "error", err)
 		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "fetch PR details", err))
+			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "fetch PR details"))
 		return false, fmt.Errorf("prior environment gate fetch PR %s#%d for %s: %w", repo, pr, priorEnv, err)
 	}
 
@@ -302,7 +302,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 			"head_sha", prInfo.HeadSHA,
 			"check_name", checkName, "error", err)
 		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "query check runs", err))
+			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "query check runs"))
 		return false, fmt.Errorf("prior environment gate query check run %q for %s: %w", checkName, priorEnv, err)
 	}
 
