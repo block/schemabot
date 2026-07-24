@@ -281,7 +281,18 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 	if participantsRetriable {
 		return aggregateFoldScheduleParticipantRefold, errors.Join(upsertErrs...)
 	}
-	return aggregateFoldClearParticipantRefoldBudget, errors.Join(upsertErrs...)
+	if len(upsertErrs) > 0 {
+		// A failed aggregate publish (the GitHub Check Run write or the storage
+		// write recording it) left at least one environment's gate not
+		// reflecting this fold. Callers that own a durable retry act on the
+		// returned error, but the fire-and-forget entry points (apply and
+		// rollback claims, webhook events) have none — arm the bounded re-fold
+		// so one transient write failure cannot strand the gate on its previous
+		// state, such as a passing aggregate persisting over a just-claimed
+		// rollback.
+		return aggregateFoldScheduleParticipantRefold, errors.Join(upsertErrs...)
+	}
+	return aggregateFoldClearParticipantRefoldBudget, nil
 }
 
 // prFilePaths extracts the changed-file paths from a PR file listing for
