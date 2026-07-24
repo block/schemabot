@@ -41,7 +41,7 @@ func TestMain(m *testing.M) {
 
 	// Start shared MySQL container
 	req := testcontainers.ContainerRequest{
-		Image:        "mysql:8.0",
+		Image:        "mysql:8.4",
 		ExposedPorts: []string{"3306/tcp"},
 		Env: map[string]string{
 			"MYSQL_ROOT_PASSWORD": "testpassword",

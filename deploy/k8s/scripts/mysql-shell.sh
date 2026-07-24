@@ -83,7 +83,7 @@ OVERRIDES=$(jq -n \
         spec: {
             containers: [{
                 name: $name,
-                image: "mysql:8.0",
+                image: "mysql:8.4",
                 stdin: true,
                 tty: true,
                 command: ["sh", "-c", $cmd],
@@ -94,7 +94,7 @@ OVERRIDES=$(jq -n \
     }')
 
 "${KUBECTL[@]}" run "$POD_NAME" --rm -it \
-    --image=mysql:8.0 \
+    --image=mysql:8.4 \
     -n "$NAMESPACE" \
     --restart=Never \
     --overrides="$OVERRIDES"

@@ -200,7 +200,7 @@ func startEnsureSchemaContainer(t *testing.T, ctx context.Context) (testcontaine
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        "mysql:8.0",
+			Image:        "mysql:8.4",
 			ExposedPorts: []string{"3306/tcp"},
 			Env: map[string]string{
 				"MYSQL_ROOT_PASSWORD": "testpassword",

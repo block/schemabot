@@ -46,7 +46,7 @@ func TestMain(m *testing.M) {
 	// Start shared MySQL container
 	var err error
 	sharedContainer, err = mysql.Run(ctx,
-		"mysql:8.0",
+		"mysql:8.4",
 		mysql.WithDatabase("testdb"),
 		mysql.WithUsername("root"),
 		mysql.WithPassword("test"),

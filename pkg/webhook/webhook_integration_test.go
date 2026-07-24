@@ -704,7 +704,7 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 func startE2EMySQLContainer(ctx context.Context, baseName, dbName string, schemaFS *embed.FS) (testcontainers.Container, error) {
 	req := testcontainers.ContainerRequest{
 		Name:         e2eContainerName(baseName),
-		Image:        "mysql:8.0",
+		Image:        "mysql:8.4",
 		ExposedPorts: []string{"3306/tcp"},
 		Env: map[string]string{
 			"MYSQL_ROOT_PASSWORD": "testpassword",

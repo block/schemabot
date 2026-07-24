@@ -23,7 +23,7 @@ func TestNew_Integration(t *testing.T) {
 	ctx := t.Context()
 
 	container, err := mysql.Run(ctx,
-		"mysql:8.0",
+		"mysql:8.4",
 		mysql.WithDatabase("schemabot_test"),
 		mysql.WithUsername("root"),
 		mysql.WithPassword("test"),
