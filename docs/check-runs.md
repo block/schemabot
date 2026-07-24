@@ -656,6 +656,15 @@ on expected participants that have not reported. A missing participant check
 is repaired by running the backfill on that participant's deployment — never
 by the leader.
 
+**The exit code means "nothing needs an operator after this run."** A run
+that leaves work behind exits nonzero with a one-line count summary, after
+printing the full report, so a scheduled sweep can alert on the exit code
+without parsing the output. A `--dry-run` acts on nothing, so any finding —
+missing, held, or stuck — fails the run. Outside `--dry-run`, successfully
+recreated checks are resolved and do not fail the run; held PRs, failed
+recreations, and stuck Check Runs do, because the backfill never acts on
+those and an operator still has to.
+
 [github-create-check-run]: https://docs.github.com/en/rest/checks/runs#create-a-check-run
 [github-check-runs]: https://docs.github.com/en/rest/checks/runs
 [github-protected-branches]: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches
