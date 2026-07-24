@@ -25,7 +25,7 @@ import (
 // write-thread autoscaler grow above its starting value.
 const maxCommitLatency = 100 * time.Millisecond
 
-// newMigration builds the Spirit migration for a statement against the
+// newSpiritMigration builds the Spirit migration for a statement against the
 // target with the engine's copy, durability, and throttling settings.
 // Callers layer statement-specific fields (DeferCutOver, RespectSentinel)
 // onto the result.
@@ -34,7 +34,7 @@ const maxCommitLatency = 100 * time.Millisecond
 // the instance vCPU count) and, when autoscaling is enabled, scale
 // dynamically from there on throttler feedback, so apply throughput tracks
 // the target instance rather than a fixed constant.
-func (e *Engine) newMigration(ctx context.Context, host, username, password, database, stmt string) *spiritmigration.Migration {
+func (e *Engine) newSpiritMigration(ctx context.Context, host, username, password, database, stmt string) *spiritmigration.Migration {
 	threads, chunkTime, lockTimeout := e.copySettings()
 	return &spiritmigration.Migration{
 		Host:                          host,
@@ -76,6 +76,12 @@ func (e *Engine) gtidChangeSourceSupported(ctx context.Context, host, username, 
 		return false
 	}
 	defer utils.CloseAndLog(db)
+
+	if err := db.PingContext(ctx); err != nil {
+		e.logger.Warn("failed to connect to target for GTID support probe, using the binlog file+position change source",
+			"host", host, "database", database, "error", err)
+		return false
+	}
 
 	var gtidMode, enforceConsistency string
 	if err := db.QueryRowContext(ctx,
@@ -342,7 +348,7 @@ func (e *Engine) executeSingleStatement(ctx context.Context, host, username, pas
 		"type", stmtType,
 	)
 
-	migration := e.newMigration(ctx, host, username, password, database, stmt)
+	migration := e.newSpiritMigration(ctx, host, username, password, database, stmt)
 
 	runner, err := spiritmigration.NewRunner(migration)
 	if err != nil {
@@ -376,7 +382,7 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 		ddls = append(ddls, p.Statement)
 	}
 
-	migration := e.newMigration(ctx, host, username, password, database, combinedStatement)
+	migration := e.newSpiritMigration(ctx, host, username, password, database, combinedStatement)
 	migration.DeferCutOver = deferCutover
 	migration.RespectSentinel = deferCutover // Only wait for sentinel when deferring cutover
 

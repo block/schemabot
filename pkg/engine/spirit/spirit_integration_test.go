@@ -2269,20 +2269,20 @@ func TestEngine_StatelessControlAddressesDSNSchema(t *testing.T) {
 	assert.False(t, exists, "signal is reported absent after the sentinel drop")
 }
 
-// TestNewMigrationRunSettings verifies the Spirit run settings applied to
+// TestNewSpiritMigrationRunSettings verifies the Spirit run settings applied to
 // every schema change this engine starts: the fleet defaults resolve when the
 // engine is built without overrides, metadata overrides carry through, and
 // the change source is selected per target capability — the shared test
 // container runs without gtid_mode=ON, so the universally supported binlog
 // file+position source is chosen instead of the GTID source Spirit would
 // refuse to start on this target.
-func TestNewMigrationRunSettings(t *testing.T) {
+func TestNewSpiritMigrationRunSettings(t *testing.T) {
 	dsn, _ := setupTestMySQL(t)
 	host, username, password, database, err := parseDSN(dsn)
 	require.NoError(t, err, "parseDSN")
 
 	eng := New(Config{})
-	m := eng.newMigration(t.Context(), host, username, password, database, "ALTER TABLE t1 ADD COLUMN c1 INT")
+	m := eng.newSpiritMigration(t.Context(), host, username, password, database, "ALTER TABLE t1 ADD COLUMN c1 INT")
 	assert.Equal(t, DefaultCheckpointMaxAge, m.CheckpointMaxAge)
 	assert.Equal(t, DefaultChecksumYieldTimeout, m.ChecksumYieldTimeout)
 	assert.True(t, m.EnableExperimentalAutoscaling, "autoscaling defaults to enabled")
@@ -2299,7 +2299,7 @@ func TestNewMigrationRunSettings(t *testing.T) {
 	})
 	require.NoError(t, err, "SettingsFromMetadata")
 	eng = New(Config{Settings: settings})
-	m = eng.newMigration(t.Context(), host, username, password, database, "ALTER TABLE t1 ADD COLUMN c1 INT")
+	m = eng.newSpiritMigration(t.Context(), host, username, password, database, "ALTER TABLE t1 ADD COLUMN c1 INT")
 	assert.Equal(t, 24*time.Hour, m.CheckpointMaxAge)
 	assert.Equal(t, 6*time.Hour, m.ChecksumYieldTimeout)
 	assert.False(t, m.EnableExperimentalAutoscaling, "autoscaling override disables it")
