@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -120,11 +121,12 @@ func TestListDatabases(t *testing.T) {
 }
 
 func TestGetStatusWithOptions(t *testing.T) {
-	var gotLimit, gotEnvironment, gotFailed string
+	var gotLimit, gotEnvironment, gotFailed, gotLast string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotLimit = r.URL.Query().Get("limit")
 		gotEnvironment = r.URL.Query().Get("environment")
 		gotFailed = r.URL.Query().Get("failed")
+		gotLast = r.URL.Query().Get("last")
 		w.Header().Set("Content-Type", "application/json")
 		_, err := w.Write([]byte(`{"active_count":0,"limit":50,"applies":[]}`))
 		require.NoError(t, err)
@@ -135,12 +137,14 @@ func TestGetStatusWithOptions(t *testing.T) {
 		Limit:       50,
 		Environment: "staging",
 		Failed:      true,
+		Last:        24 * time.Hour,
 	})
 	require.NoError(t, err)
 
 	assert.Equal(t, "50", gotLimit)
 	assert.Equal(t, "staging", gotEnvironment)
 	assert.Equal(t, "true", gotFailed)
+	assert.Equal(t, "24h0m0s", gotLast)
 	assert.Equal(t, 50, result.Limit)
 }
 

@@ -813,10 +813,13 @@ type ActiveApplyResponse struct {
 
 // StatusResponse is the HTTP response for GET /api/status.
 type StatusResponse struct {
-	ActiveCount  int                    `json:"active_count"`
-	Limit        int                    `json:"limit,omitempty"`
-	MaxLimit     int                    `json:"max_limit,omitempty"`
-	HasMore      bool                   `json:"has_more,omitempty"`
-	FailuresOnly bool                   `json:"failures_only,omitempty"`
-	Applies      []*ActiveApplyResponse `json:"applies"`
+	ActiveCount  int  `json:"active_count"`
+	Limit        int  `json:"limit,omitempty"`
+	MaxLimit     int  `json:"max_limit,omitempty"`
+	HasMore      bool `json:"has_more,omitempty"`
+	FailuresOnly bool `json:"failures_only,omitempty"`
+	// Last echoes the window bounding the list to applies updated within it;
+	// empty means the list is bounded by limit alone.
+	Last    string                 `json:"last,omitempty"`
+	Applies []*ActiveApplyResponse `json:"applies"`
 }

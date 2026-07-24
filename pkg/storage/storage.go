@@ -506,6 +506,12 @@ type RecentAppliesFilter struct {
 	Environment string
 	Deployment  string
 	States      []string
+	// UpdatedSince, when set, restricts results to applies whose updated_at
+	// falls at or after this instant. Filtering on updated_at rather than
+	// started_at keeps two kinds of applies visible in a window: those that
+	// reached a terminal state within it, and those started earlier but
+	// still active (progress keeps touching updated_at).
+	UpdatedSince time.Time
 }
 
 // RetryableExpirationReason identifies why operator retry recovery stopped.

@@ -1135,6 +1135,10 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 		where = append(where, fmt.Sprintf("state IN (%s)", placeholders(len(filter.States))))
 		args = append(args, stringArgs(filter.States)...)
 	}
+	if !filter.UpdatedSince.IsZero() {
+		where = append(where, "updated_at >= ?")
+		args = append(args, filter.UpdatedSince)
+	}
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
