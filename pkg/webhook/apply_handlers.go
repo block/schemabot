@@ -350,10 +350,17 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 //     should re-drive; the same window may succeed on a later attempt.
 //   - retry=false, err=nil — a terminal outcome that is the command's answer
 //     (silent fan-out skip, no pending confirmation, gate blocks, lock conflict,
-//     stale-schema/base/plan rejection, or a dispatched apply). A schema-request
-//     failure is terminal only when handleSchemaRequestError recognizes it as a
-//     user-facing rejection; an unexpected failure there (for example a
-//     transient GitHub config read) stays retryable.
+//     stale-schema/base/plan rejection, or a hand-off to executeApply, which
+//     may itself fail before dispatching). A schema-request failure is terminal
+//     only when handleSchemaRequestError recognizes it as a user-facing
+//     rejection; an unexpected failure there (for example a transient GitHub
+//     config read) stays retryable.
+//
+// Gate blocks are terminal even when the gate blocked because it could not
+// evaluate its own inputs (for example a GitHub read inside the gate failed):
+// gates fail closed and post their own retry guidance, so the block is the
+// command's answer and recovery is the user re-issuing the command, not a
+// driver re-driving the delivery.
 //
 // A posted PR comment does not imply a terminal disposition: retryable sites
 // post best-effort error comments too, so a durable driver re-driving one may
