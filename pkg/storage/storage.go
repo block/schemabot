@@ -807,7 +807,8 @@ type ApplyLogStore interface {
 	// caller rendering a tail needs.
 	GetRecentByApply(ctx context.Context, applyID int64, limit int) ([]*ApplyLog, error)
 
-	// List returns logs matching the filter criteria, ordered by created_at.
+	// List returns the newest Limit logs matching the filter criteria,
+	// ordered by created_at ascending so the result reads chronologically.
 	List(ctx context.Context, filter ApplyLogFilter) ([]*ApplyLog, error)
 }
 
