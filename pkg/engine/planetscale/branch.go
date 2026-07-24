@@ -267,7 +267,7 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 			// write. Treat as empty so the desired VSchema appears as a
 			// change; validation callers absorb convergence lag through
 			// the VSchema staleness retry.
-			e.logger.Info("VSchema not found for keyspace, treating as empty",
+			e.logger.Warn("VSchema not found for keyspace, treating as empty",
 				"keyspace", ks, "branch", branch)
 		}
 		if currentVSchema != nil {
