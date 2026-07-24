@@ -24,8 +24,7 @@ import (
 // ordinal order, so tests can assert whether the reshape landed on the target.
 func appPrimaryKeyColumns(t *testing.T, dbName, tableName string) []string {
 	t.Helper()
-	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+dbName, 1)
-	db, err := sql.Open("mysql", appDSN)
+	db, err := sql.Open("mysql", driftDSN(t, dbName))
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 	rows, err := db.QueryContext(t.Context(), `
