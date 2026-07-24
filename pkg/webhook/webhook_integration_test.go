@@ -71,7 +71,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -276,7 +279,7 @@ func seedCheck(t *testing.T, svc *api.Service, dbName, env, conclusion string) {
 func newE2EHandler(t *testing.T, svc *api.Service, client *gh.Client) *Handler {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	installClient := ghclient.NewInstallationClient(client, logger)
+	installClient := ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")
 	factory := &fakeClientFactory{client: installClient}
 	return NewHandler(svc, factory, nil, logger)
 }
@@ -351,14 +354,101 @@ func registerPassingChecks(mux *http.ServeMux) {
 	registerCheckStatusRESTHandlers(mux, nil)
 }
 
-func registerCheckStatusRESTHandlersForAnyRef(mux *http.ServeMux, nodes func() []checkStatusNode) {
+// fakeCheckRunStore records every Check Run a fake GitHub server accepts so
+// the commit check-runs list can serve the same runs the real API would: each
+// run's latest state, attributed to the trusted "schemabot" App. The
+// aggregate fold resolves its reuse/rewind decision from that list, so a
+// harness whose handler can fold the same head more than once must list the
+// runs its own create and update calls produced.
+type fakeCheckRunStore struct {
+	mu   sync.Mutex
+	next int64
+	runs []*fakeCheckRunRecord
+}
+
+type fakeCheckRunRecord struct {
+	id         int64
+	name       string
+	headSHA    string
+	status     string
+	conclusion string
+}
+
+// create records a created Check Run and returns its assigned ID.
+func (s *fakeCheckRunStore) create(body checkRunCapture) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.next++
+	s.runs = append(s.runs, &fakeCheckRunRecord{
+		id:         s.next,
+		name:       body.Name,
+		headSHA:    body.HeadSHA,
+		status:     body.Status,
+		conclusion: body.Conclusion,
+	})
+	return s.next
+}
+
+// update records an update to an existing run. Update payloads carry no head
+// SHA, so an update to an ID the store never saw created (for example a
+// seeded stored CheckRunID) is recorded without one and stays invisible to
+// every commit's list — like a run that lives on some other commit.
+func (s *fakeCheckRunStore) update(id int64, body checkRunCapture) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, run := range s.runs {
+		if run.id != id {
+			continue
+		}
+		run.status = body.Status
+		run.conclusion = body.Conclusion
+		return
+	}
+	s.runs = append(s.runs, &fakeCheckRunRecord{
+		id:         id,
+		name:       body.Name,
+		status:     body.Status,
+		conclusion: body.Conclusion,
+	})
+}
+
+// serveList writes GitHub's list-check-runs response for the recorded runs on
+// headSHA whose name matches checkName, each attributed to the trusted
+// "schemabot" App.
+func (s *fakeCheckRunStore) serveList(w http.ResponseWriter, headSHA, checkName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]map[string]any, 0, len(s.runs))
+	for _, run := range s.runs {
+		if run.headSHA != headSHA || run.name != checkName {
+			continue
+		}
+		out = append(out, map[string]any{
+			"id":         run.id,
+			"name":       run.name,
+			"status":     run.status,
+			"conclusion": run.conclusion,
+			"app":        map[string]any{"slug": "schemabot"},
+		})
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"total_count": len(out), "check_runs": out})
+}
+
+func registerCheckStatusRESTHandlersForAnyRef(mux *http.ServeMux, nodes func() []checkStatusNode, checkRuns *fakeCheckRunStore) {
 	prefix := "/repos/octocat/hello-world/commits/"
 	mux.HandleFunc("GET "+prefix, func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, prefix)
+		reqPath := strings.TrimPrefix(r.URL.Path, prefix)
 		switch {
-		case strings.HasSuffix(path, "/status"):
+		case strings.HasSuffix(reqPath, "/status"):
 			writeCommitStatusResponse(w, nodes())
-		case strings.HasSuffix(path, "/check-runs"):
+		case strings.HasSuffix(reqPath, "/check-runs"):
+			// A name-filtered list is the aggregate fold resolving the newest
+			// run for its check name; the unfiltered list is the apply gate
+			// reading the PR's checks.
+			if name := r.URL.Query().Get("check_name"); name != "" && checkRuns != nil {
+				checkRuns.serveList(w, strings.TrimSuffix(reqPath, "/check-runs"), name)
+				return
+			}
 			writeCheckRunsResponse(w, nodes())
 		default:
 			http.NotFound(w, r)
@@ -558,24 +648,32 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
 	})
 
-	// Capture check run creates (incrementing IDs so aggregate can distinguish create vs update)
-	var checkRunIDCounter atomic.Int64
+	// Capture check run creates and updates. Every write is also recorded in
+	// checkRunState (with incrementing IDs) so the commit's check-runs list
+	// serves the runs this server actually accepted — the aggregate fold
+	// resolves its reuse/rewind decision from that list.
+	checkRunState := &fakeCheckRunStore{}
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		result.checkRuns <- body
-		id := checkRunIDCounter.Add(1)
+		id := checkRunState.create(body)
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
 
-	// Capture check run updates (PATCH)
 	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		result.checkRuns <- body
+		id, err := strconv.ParseInt(path.Base(r.URL.Path), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid check run id", http.StatusBadRequest)
+			return
+		}
+		checkRunState.update(id, body)
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
 
 	// PR check statuses for enforcePassingChecks. Defaults to all passing
@@ -587,7 +685,7 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 			return (*provider)()
 		}
 		return nil
-	})
+	}, checkRunState)
 
 	return result
 }

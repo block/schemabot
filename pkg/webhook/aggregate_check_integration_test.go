@@ -12,6 +12,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -450,19 +452,28 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 	})
 
 	checkRuns := make(chan checkRunCapture, 10)
+	checkRunState := &fakeCheckRunStore{}
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		checkRuns <- body
+		id := checkRunState.create(body)
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 300})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
 	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		checkRuns <- body
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 300})
+		id, err := strconv.ParseInt(path.Base(r.URL.Path), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid check run id", http.StatusBadRequest)
+			return
+		}
+		checkRunState.update(id, body)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
+	registerCheckStatusRESTHandlersForAnyRef(mux, func() []checkStatusNode { return nil }, checkRunState)
 
 	h := newE2EHandler(t, svc, client)
 
@@ -484,7 +495,7 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 		t.Fatal("timed out waiting for in-progress aggregate check run")
 	}
 
-	installClient := ghclient.NewInstallationClient(client, h.logger)
+	installClient := ghclient.NewInstallationClientWithSlug(client, h.logger, "schemabot")
 	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "newsha222")
 	select {
 	case cr := <-checkRuns:
