@@ -16,7 +16,6 @@ import (
 // checkPriorEnvironments enforces server-owned environment ordering: all enabled
 // environments before the current one in the server promotion order must have a
 // successful SchemaBot check.
-// Returns true if the apply is blocked (caller should return).
 //
 // For environments: [sandbox, staging, production]
 //   - applying to sandbox: no prior envs, always allowed
@@ -28,12 +27,22 @@ import (
 // environments. For prior environments owned by this instance, local storage is
 // checked. For prior environments owned by another instance, the GitHub Checks
 // API is queried for the per-environment aggregate check run.
+//
+// Returns follow the apply-gate disposition contract (see applyCommandCore):
+//   - (true, err) — a prior-environment check could not be evaluated (a storage
+//     or GitHub read failed). It fails closed and posts an error comment, but
+//     the returned error marks the block as an evaluation failure a durable
+//     driver should re-drive.
+//   - (true, nil) — blocked on merits (a prior environment is not applied, is
+//     still in progress, failed, or its check is missing/untrusted; or the
+//     target is absent from the configured promotion order). Terminal.
+//   - (false, nil) — all prior environments are clean; the apply may proceed.
 func (h *Handler) checkPriorEnvironments(
 	ctx context.Context, repo string, pr int,
 	database, dbType, environment string,
 	environments []string,
 	installationID int64,
-) bool {
+) (blocked bool, err error) {
 	config := h.service.Config()
 
 	// On a scoped instance the server-configured promotion order is the only
@@ -52,7 +61,7 @@ func (h *Handler) checkPriorEnvironments(
 		metrics.RecordPromotionConfigErrorBlock(ctx, repo, database, environment)
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByUnlistedEnvironment(environment, order))
-		return true
+		return true, nil
 	}
 
 	environments = promotionGateEnvironments(config, environment, environments)
@@ -68,7 +77,7 @@ func (h *Handler) checkPriorEnvironments(
 
 	// First environment or not in list — no prior environments to check
 	if currentIdx <= 0 {
-		return false
+		return false, nil
 	}
 
 	// Check all prior environments
@@ -77,18 +86,22 @@ func (h *Handler) checkPriorEnvironments(
 
 		if config.IsEnvironmentAllowed(priorEnv) {
 			// This instance owns the prior environment — check local database
-			if blocked := h.checkPriorEnvViaLocal(ctx, repo, pr, database, dbType, environment, priorEnv, installationID); blocked {
-				return true
+			if blocked, err := h.checkPriorEnvViaLocal(ctx, repo, pr, database, dbType, environment, priorEnv, installationID); err != nil {
+				return true, err
+			} else if blocked {
+				return true, nil
 			}
 		} else {
 			// Another instance owns this environment — check GitHub Checks API
-			if blocked := h.checkPriorEnvViaGitHub(ctx, repo, pr, database, environment, priorEnv, installationID); blocked {
-				return true
+			if blocked, err := h.checkPriorEnvViaGitHub(ctx, repo, pr, database, environment, priorEnv, installationID); err != nil {
+				return true, err
+			} else if blocked {
+				return true, nil
 			}
 		}
 	}
 
-	return false
+	return false, nil
 }
 
 // scopedTargetMissingFromPromotionOrder reports whether this instance is scoped
@@ -116,12 +129,16 @@ func promotionGateEnvironments(config *api.ServerConfig, environment string, env
 	return config.OrderedEnvironments(environments)
 }
 
-// checkPriorEnvViaLocal checks the prior environment status using the local database.
+// checkPriorEnvViaLocal checks the prior environment status using the local
+// database. Returns follow the same disposition contract as
+// checkPriorEnvironments: (true, err) on a storage read failure (retryable),
+// (true, nil) on a merit block, and (false, nil) when the prior environment
+// is clean.
 func (h *Handler) checkPriorEnvViaLocal(
 	ctx context.Context, repo string, pr int,
 	database, dbType, environment, priorEnv string,
 	installationID int64,
-) bool {
+) (blocked bool, err error) {
 	check, err := h.waitForLocalPriorEnvCheck(ctx, repo, pr, database, dbType, environment, priorEnv)
 	if err != nil {
 		h.logger.Error("failed to look up prior environment check",
@@ -131,7 +148,7 @@ func (h *Handler) checkPriorEnvViaLocal(
 			"error", err)
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "read SchemaBot storage", err))
-		return true
+		return true, fmt.Errorf("read prior-environment check %s#%d prior=%s: %w", repo, pr, priorEnv, err)
 	}
 
 	if check == nil {
@@ -142,7 +159,7 @@ func (h *Handler) checkPriorEnvViaLocal(
 			"attempts", h.priorEnvCheckMaxAttemptCount())
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByMissingPriorEnvCheck(priorEnv))
-		return true
+		return true, nil
 	}
 
 	switch {
@@ -152,7 +169,7 @@ func (h *Handler) checkPriorEnvViaLocal(
 			"database", database, "database_type", dbType,
 			"environment", environment, "prior_environment", priorEnv,
 			"check_status", check.Status, "check_conclusion", check.Conclusion)
-		return false
+		return false, nil
 	case check.Status == checkStatusInProgress:
 		h.logger.Warn("prior environment check is still in progress after retries, blocking apply",
 			"repo", repo, "pr", pr,
@@ -162,7 +179,7 @@ func (h *Handler) checkPriorEnvViaLocal(
 			"attempts", h.priorEnvCheckMaxAttemptCount())
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv))
-		return true
+		return true, nil
 	default:
 		status := "has pending changes"
 		action := fmt.Sprintf("Apply %s first", priorEnv)
@@ -172,7 +189,7 @@ func (h *Handler) checkPriorEnvViaLocal(
 		}
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, action))
-		return true
+		return true, nil
 	}
 }
 
@@ -235,18 +252,21 @@ func storedPriorEnvCheckStatus(check *storage.Check) string {
 // (github.trusted-check-app-slugs). A same-named check run from any other app
 // (e.g. a GitHub Actions job) cannot satisfy the gate, and when ownership
 // cannot be verified the gate blocks the apply.
+// Returns follow the same disposition contract as checkPriorEnvironments:
+// (true, err) on a GitHub read failure (retryable), (true, nil) on a merit
+// block, and (false, nil) when the prior environment is verified clean.
 func (h *Handler) checkPriorEnvViaGitHub(
 	ctx context.Context, repo string, pr int,
 	database, environment, priorEnv string,
 	installationID int64,
-) bool {
+) (blocked bool, err error) {
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
 		h.logger.Error("failed to create GitHub client for prior env check, blocking apply",
 			"prior_env", priorEnv, "error", err)
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "create GitHub client", err))
-		return true
+		return true, fmt.Errorf("create GitHub client for prior-environment check %s#%d prior=%s: %w", repo, pr, priorEnv, err)
 	}
 
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
@@ -255,7 +275,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 			"prior_env", priorEnv, "error", err)
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "fetch PR details", err))
-		return true
+		return true, fmt.Errorf("fetch PR for prior-environment check %s#%d prior=%s: %w", repo, pr, priorEnv, err)
 	}
 
 	checkName := aggregateCheckNameForEnv(h.aggregateCheckNameForRepo(repo), priorEnv)
@@ -269,7 +289,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 			"check_name", checkName, "error", err)
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "query check runs", err))
-		return true
+		return true, fmt.Errorf("query GitHub check for prior-environment %s#%d prior=%s: %w", repo, pr, priorEnv, err)
 	}
 
 	if checkResult == nil && len(untrustedApps) > 0 {
@@ -289,7 +309,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 		}
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByUntrustedPriorEnvCheck(priorEnv, checkName, untrustedApps))
-		return true
+		return true, nil
 	}
 
 	if checkResult == nil {
@@ -301,7 +321,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 			"attempts", h.priorEnvCheckMaxAttemptCount())
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByMissingPriorEnvCheck(priorEnv))
-		return true
+		return true, nil
 	}
 
 	switch {
@@ -311,7 +331,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 			"database", database,
 			"environment", environment, "prior_environment", priorEnv,
 			"check_name", checkName, "conclusion", checkResult.Conclusion)
-		return false
+		return false, nil
 	case checkResult.Status == checkStatusInProgress || checkResult.Status == checkStatusQueued:
 		h.logger.Warn("prior environment GitHub check is still non-terminal after retries, blocking apply",
 			"repo", repo, "pr", pr,
@@ -322,7 +342,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 			"attempts", h.priorEnvCheckMaxAttemptCount())
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv))
-		return true
+		return true, nil
 	default:
 		status := "has pending changes"
 		action := fmt.Sprintf("Apply %s first", priorEnv)
@@ -332,7 +352,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 		}
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, action))
-		return true
+		return true, nil
 	}
 }
 

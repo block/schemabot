@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -83,6 +84,15 @@ func metricActionKey(action string) string {
 // base commits), so unrelated commits elsewhere in a monorepo never block an
 // apply. GitHub read uncertainty rejects the apply rather than silently
 // bypassing the guard.
+//
+// Returns follow the apply-gate disposition contract (see applyCommandCore):
+//   - (true, err) — the base schema freshness could not be verified (a GitHub
+//     read failed). It fails closed and posts a rejection comment, but the
+//     returned error marks the rejection as an evaluation failure a durable
+//     driver should re-drive.
+//   - (true, nil) — rejected on merits (the schema path changed on the base
+//     branch after the PR diverged). Terminal.
+//   - (false, nil) — the base schema is unchanged under the PR; apply may proceed.
 func (h *Handler) assertBaseSchemaStillCurrent(
 	ctx context.Context,
 	client *ghclient.InstallationClient,
@@ -94,7 +104,7 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 	environment string,
 	requestedBy string,
 	action string,
-) bool {
+) (rejected bool, err error) {
 	schemaPaths := []string{schema.SchemaPath}
 	if schema.SchemaLinkPath != "" {
 		schemaPaths = append(schemaPaths, schema.SchemaLinkPath)
@@ -122,10 +132,10 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 			SchemaPath:        schema.SchemaPath,
 			VerificationError: true,
 		}))
-		return true
+		return true, fmt.Errorf("verify base schema freshness %s#%d: %w", repo, pr, err)
 	}
 	if !changed {
-		return false
+		return false, nil
 	}
 
 	h.logger.Warn("apply rejected: schema path changed on base branch after PR divergence",
@@ -148,5 +158,5 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 		Environment: environment,
 		SchemaPath:  schema.SchemaPath,
 	}))
-	return true
+	return true, nil
 }

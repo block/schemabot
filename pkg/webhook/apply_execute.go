@@ -74,7 +74,10 @@ func (h *Handler) executeApply(
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final stale-schema rejection")
 		return
 	}
-	if rejected := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, freshPRInfo, environment, requestedBy, actionName); rejected {
+	// executeApply is void; a base-schema evaluation failure only matters to a
+	// durable driver, so the error is discarded here (the gate has already
+	// logged it and posted user guidance) and any rejection releases the lock.
+	if rejected, _ := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, freshPRInfo, environment, requestedBy, actionName); rejected {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final base-schema freshness rejection")
 		return
 	}

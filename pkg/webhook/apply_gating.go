@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
@@ -25,24 +26,32 @@ import (
 // This is a safety re-check, so it bypasses the request-scoped PR-info cache:
 // discovery earlier in the same delivery may have cached the PR as open, and a
 // close landing between discovery and this gate must still block the apply.
-func (h *Handler) enforceOpenPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, commandName, environment, requestedBy string) (blocked bool) {
-	prInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
-	if err != nil {
+//
+// Returns follow the apply-gate disposition contract (see applyCommandCore):
+//   - (true, err) — the gate could not evaluate its inputs (a GitHub read
+//     failed). It fails closed and posts retry guidance, but the returned
+//     error marks the block as an evaluation failure a durable driver should
+//     re-drive.
+//   - (true, nil) — blocked on merits (the PR is closed). Terminal.
+//   - (false, nil) — the PR is open; the command may proceed.
+func (h *Handler) enforceOpenPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, commandName, environment, requestedBy string) (blocked bool, err error) {
+	prInfo, fetchErr := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if fetchErr != nil {
 		h.logger.Error("failed to fetch PR state for the closed-PR apply gate; blocking the command",
-			"repo", repo, "pr", pr, "environment", environment, "command", commandName, "error", err)
+			"repo", repo, "pr", pr, "environment", environment, "command", commandName, "error", fetchErr)
 		// The raw error can carry internal detail (hosts, headers, newlines)
 		// that must not render in PR markdown; operators triage from the log
 		// line above.
 		h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, "Could not verify the pull request state, so the command was blocked. Retry, and see server logs if it persists.")
-		return true
+		return true, fmt.Errorf("fetch PR state for closed-PR gate %s#%d: %w", repo, pr, fetchErr)
 	}
 	if !prInfo.IsClosed() {
-		return false
+		return false, nil
 	}
 	h.logger.Info("apply command rejected: PR is closed",
 		"repo", repo, "pr", pr, "environment", environment, "command", commandName, "requested_by", requestedBy, "merged", prInfo.Merged)
 	h.postComment(repo, pr, installationID, templates.RenderApplyBlockedClosedPR(environment, requestedBy, prInfo.Merged))
-	return true
+	return true, nil
 }
 
 // isAggregateCheckName reports whether a check name matches this deployment's
@@ -100,14 +109,21 @@ func isPassingCheckConclusion(conclusion string) bool {
 }
 
 // enforcePassingChecks verifies that all non-SchemaBot PR checks are passing.
-// Returns true if apply was blocked (caller should return), false if it may proceed.
 // Blocks on both non-passing completed checks and in-progress checks with
 // distinct messages.
-func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, headSHA, environment string) bool {
+//
+// Returns follow the apply-gate disposition contract (see applyCommandCore):
+//   - (true, err) — the check statuses could not be read from GitHub. It fails
+//     closed and posts an error comment, but the returned error marks the block
+//     as an evaluation failure a durable driver should re-drive.
+//   - (true, nil) — blocked on merits (a required check is failing, in
+//     progress, or not yet reported). Terminal.
+//   - (false, nil) — all required checks pass; the command may proceed.
+func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, headSHA, environment string) (blocked bool, err error) {
 	config := h.service.Config()
 	if !config.ShouldRequirePassingChecks() {
 		h.logger.Debug("passing checks gate disabled", "repo", repo, "pr", pr)
-		return false
+		return false, nil
 	}
 
 	statuses, err := client.GetPRCheckStatuses(ctx, repo, headSHA, config.RequiredChecks)
@@ -140,7 +156,7 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 			"error", err)
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByCheckStatusError(environment, err, details))
-		return true
+		return true, fmt.Errorf("read PR check statuses %s#%d: %w", repo, pr, err)
 	}
 
 	notPassing := filterNonPassingNonSchemaBotChecks(statuses, config)
@@ -154,7 +170,7 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 			"not_passing_count", len(notPassing))
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByNonPassingChecks(environment, notPassing))
-		return true
+		return true, nil
 	}
 
 	if len(inProgress) > 0 || len(notReported) > 0 {
@@ -165,10 +181,10 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 			"missing_required_checks", blockingCheckNames(notReported))
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByInProgressChecks(environment, inProgress, notReported))
-		return true
+		return true, nil
 	}
 
-	return false
+	return false, nil
 }
 
 // blockingCheckNames extracts the check names from a slice of blocking checks

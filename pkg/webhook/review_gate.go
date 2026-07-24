@@ -20,13 +20,20 @@ type ReviewGateResult struct {
 }
 
 // enforceReviewGate runs the review gate check and posts the appropriate comment if blocked.
-// Returns true if the apply was blocked (caller should return), false if it may proceed.
-func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, environment, requestedBy, commandName string) bool {
+//
+// Returns follow the apply-gate disposition contract (see applyCommandCore):
+//   - (true, err) — the review gate could not be evaluated (a GitHub or config
+//     read failed). It fails closed and posts an error comment, but the
+//     returned error marks the block as an evaluation failure a durable driver
+//     should re-drive.
+//   - (true, nil) — blocked on merits (required approval is missing). Terminal.
+//   - (false, nil) — the gate is disabled or satisfied; the command may proceed.
+func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, environment, requestedBy, commandName string) (blocked bool, err error) {
 	gateResult, err := h.checkReviewGate(ctx, client, repo, pr, schemaResult.Database, schemaResult.SchemaPath)
 	if err != nil {
 		h.logger.Error("review gate check failed", "error", err)
 		h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, reviewGateErrorDetail(err))
-		return true
+		return true, fmt.Errorf("review gate %s#%d: %w", repo, pr, err)
 	}
 	if gateResult != nil && !gateResult.Approved {
 		h.postComment(repo, pr, installationID, templates.RenderReviewRequired(templates.ReviewGateData{
@@ -36,9 +43,9 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 			Reviewers:   gateResult.RequiredReviewers,
 			PRAuthor:    gateResult.PRAuthor,
 		}))
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
 }
 
 func reviewGateErrorDetail(err error) string {
