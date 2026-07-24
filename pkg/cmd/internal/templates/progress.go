@@ -855,19 +855,34 @@ type StatusListData struct {
 	HasMore        bool
 	FailuresOnly   bool
 	Last           string
+	StateFilter    string
 	StateCounts    map[string]int
 	ShowExternalID bool
 	Deployment     string
 	Applies        []ActiveApplyData
 }
 
-// statusWindowSuffix renders the --last window as a header suffix, or empty
-// when the list is unbounded.
+// statusWindowSuffix renders the active list filters (--state, --last) as a
+// header suffix, or empty when the list is unfiltered.
 func statusWindowSuffix(data StatusListData) string {
-	if data.Last == "" {
+	parts := statusFilterPhrases(data)
+	if len(parts) == 0 {
 		return ""
 	}
-	return fmt.Sprintf(" %s(updated in the last %s)%s", ANSIDim, data.Last, ANSIReset)
+	return fmt.Sprintf(" %s(%s)%s", ANSIDim, strings.Join(parts, ", "), ANSIReset)
+}
+
+// statusFilterPhrases returns one human-readable phrase per active list
+// filter, shared by the header suffix and the empty-state message.
+func statusFilterPhrases(data StatusListData) []string {
+	var parts []string
+	if data.StateFilter != "" {
+		parts = append(parts, fmt.Sprintf("in state %s", state.Label(data.StateFilter)))
+	}
+	if data.Last != "" {
+		parts = append(parts, fmt.Sprintf("updated in the last %s", data.Last))
+	}
+	return parts
 }
 
 // writeStatusStateSummary renders one line tallying every apply matching the
@@ -901,14 +916,14 @@ func writeStatusStateSummary(counts map[string]int) {
 // WriteStatusList writes the status list output.
 func WriteStatusList(data StatusListData) {
 	if len(data.Applies) == 0 {
-		window := ""
-		if data.Last != "" {
-			window = fmt.Sprintf(" updated in the last %s", data.Last)
+		filters := ""
+		if parts := statusFilterPhrases(data); len(parts) > 0 {
+			filters = " " + strings.Join(parts, ", ")
 		}
 		if data.FailuresOnly {
-			fmt.Printf("%sNo recent failed schema changes%s%s\n", ANSIDim, window, ANSIReset)
+			fmt.Printf("%sNo recent failed schema changes%s%s\n", ANSIDim, filters, ANSIReset)
 		} else {
-			fmt.Printf("%sNo recent schema changes%s%s\n", ANSIDim, window, ANSIReset)
+			fmt.Printf("%sNo recent schema changes%s%s\n", ANSIDim, filters, ANSIReset)
 		}
 		return
 	}

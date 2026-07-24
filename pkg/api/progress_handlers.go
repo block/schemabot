@@ -768,6 +768,11 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	stateFilter, err := parseStatusState(r, failuresOnly)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	filter := storage.RecentAppliesFilter{
 		Limit:       limit + 1,
@@ -776,6 +781,9 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if failuresOnly {
 		filter.States = []string{state.Apply.Failed, state.Apply.FailedRetryable}
+	}
+	if stateFilter != "" {
+		filter.States = []string{stateFilter}
 	}
 	if last > 0 {
 		filter.UpdatedSince = time.Now().Add(-last)
@@ -808,6 +816,7 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if last > 0 {
 		resp.Last = last.String()
 	}
+	resp.State = stateFilter
 	operationsByApply := map[int64][]*storage.ApplyOperation{}
 	if filter.Deployment != "" {
 		applyIDs := make([]int64, 0, len(applies))
@@ -977,6 +986,26 @@ func parseStatusFailuresOnly(r *http.Request) (bool, error) {
 		return false, fmt.Errorf("failed must be a boolean")
 	}
 	return failed, nil
+}
+
+// parseStatusState parses the optional `state` query parameter restricting the
+// status list to one apply state. The value is normalized to canonical
+// lowercase and must name a known apply state, so a typo returns an error
+// instead of a silently empty list. It cannot be combined with `failed`, which
+// is its own state filter.
+func parseStatusState(r *http.Request, failuresOnly bool) (string, error) {
+	raw := r.URL.Query().Get("state")
+	if raw == "" {
+		return "", nil
+	}
+	if failuresOnly {
+		return "", fmt.Errorf("state cannot be combined with failed")
+	}
+	normalized := state.NormalizeState(raw)
+	if _, ok := state.LookupApply(normalized); !ok {
+		return "", fmt.Errorf("unknown state %q", raw)
+	}
+	return normalized, nil
 }
 
 // progressFromLocalStorage builds a ProgressResponse from local apply + task
