@@ -15,7 +15,7 @@ import (
 
 // DatabasesCmd lists databases configured on the SchemaBot server.
 type DatabasesCmd struct {
-	Type string `help:"Database type filter (mysql, vitess, or strata)"`
+	Type string `help:"Database type filter (mysql, vitess, strata, or postgres)"`
 	Name string `help:"Only show databases whose name contains this string, case-insensitively; a family prefix like omnibus matches every shard"`
 	JSON bool   `help:"Output as JSON"`
 }
@@ -29,11 +29,15 @@ func (cmd *DatabasesCmd) Run(g *Globals) error {
 	if err := validateDatabaseListType(cmd.Type); err != nil {
 		return err
 	}
+	// The server treats a whitespace-only name filter as absent; trim here so
+	// the rendered headers and empty-state message agree with what the server
+	// actually filtered on.
+	name := strings.TrimSpace(cmd.Name)
 
 	var resp *apitypes.DatabaseListResponse
 	err = withLoading("Loading databases...", !cmd.JSON, func() error {
 		var loadErr error
-		resp, loadErr = client.ListDatabases(ep, client.ListDatabasesOptions{Type: cmd.Type, Name: cmd.Name})
+		resp, loadErr = client.ListDatabases(ep, client.ListDatabasesOptions{Type: cmd.Type, Name: name})
 		return loadErr
 	})
 	if err != nil {
@@ -42,7 +46,7 @@ func (cmd *DatabasesCmd) Run(g *Globals) error {
 	if cmd.JSON {
 		return writeJSON(resp)
 	}
-	return writeDatabaseList(os.Stdout, resp, cmd.Name)
+	return writeDatabaseList(os.Stdout, resp, name)
 }
 
 func validateDatabaseListType(databaseType string) error {

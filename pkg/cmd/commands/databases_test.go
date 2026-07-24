@@ -72,7 +72,7 @@ func TestDatabasesCommandRunFetchesAndRendersDatabases(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	cmd := &DatabasesCmd{Type: "mysql", Name: "ord"}
+	cmd := &DatabasesCmd{Type: "mysql", Name: " ord "}
 	var runErr error
 	output := captureStdout(func() {
 		runErr = cmd.Run(&Globals{Endpoint: server.URL})
@@ -80,7 +80,7 @@ func TestDatabasesCommandRunFetchesAndRendersDatabases(t *testing.T) {
 
 	require.NoError(t, runErr)
 	assert.Equal(t, "mysql", gotType)
-	assert.Equal(t, "ord", gotName)
+	assert.Equal(t, "ord", gotName, "the name filter is trimmed before it reaches the server")
 	assert.Contains(t, output, "DATABASE")
 	assert.Contains(t, output, "orders")
 	assert.Contains(t, output, "mysql")
