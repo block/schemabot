@@ -43,6 +43,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewLockConflictByCLIOutput()
 	case PreviewNoLockFound:
 		previewNoLockFoundOutput()
+	case PreviewLockOtherType:
+		previewLockExistsUnderOtherTypeOutput()
 	case PreviewUnlockNotOwned:
 		previewUnlockNotOwnedOutput()
 	case PreviewLockReleased:

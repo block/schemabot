@@ -103,6 +103,23 @@ func WriteNoLockFound(database, dbType string) {
 	fmt.Printf("No lock found for %s (%s)\n", database, dbType)
 }
 
+// WriteLockExistsUnderOtherType writes the message when the database is not
+// locked under the requested type but does hold a lock under another database
+// type. Lock lookups are keyed by (database, type) and the type flag defaults
+// to mysql, so an operator targeting a vitess database without -t searches
+// the wrong namespace — point them at the lock that actually exists.
+func WriteLockExistsUnderOtherType(database, requestedType, foundType string) {
+	fmt.Printf("No lock found for %s (%s), but a %s lock exists for this database.\n", database, requestedType, foundType)
+	fmt.Printf("Release it with: schemabot unlock -d %s -t %s\n", database, foundType)
+}
+
+// WriteLockTypeScanFailed writes the message when the check for locks under
+// other database types could not run, so a "no lock found" answer is only
+// authoritative for the requested type.
+func WriteLockTypeScanFailed(err error) {
+	fmt.Printf("Could not check for locks under other database types: %v\n", err)
+}
+
 // WriteUnlockNotOwned writes the message when trying to unlock without ownership.
 func WriteUnlockNotOwned(database, dbType, currentOwner string) {
 	fmt.Println()

@@ -1463,6 +1463,17 @@ No lock found for testapp (mysql)
 </details>
 
 <details>
+<summary><a name="lock-exists-under-other-type"></a><strong>Lock Exists Under Other Type</strong></summary>
+
+```
+
+No lock found for testapp (mysql), but a vitess lock exists for this database.
+Release it with: schemabot unlock -d testapp -t vitess
+
+```
+</details>
+
+<details>
 <summary><a name="unlock-not-owned"></a><strong>Unlock Not Owned</strong></summary>
 
 ```
