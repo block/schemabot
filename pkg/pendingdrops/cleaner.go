@@ -13,12 +13,17 @@ import (
 
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
+	"github.com/block/schemabot/pkg/namedlock"
 )
 
 const (
 	lockNamePrefix = "schemabot_pending_drops_"
 	lockHashLen    = 16
 )
+
+// cleanupLocker serializes pending-drops cleanup across SchemaBot instances
+// with a session-scoped advisory lock held on the pinned target connection.
+var cleanupLocker namedlock.Locker = namedlock.MySQL{}
 
 // Target is one database the cleaner inspects. The DSN must be resolved
 // (no secret references) and reachable from this process.
@@ -98,7 +103,8 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		return fmt.Errorf("ping target %s/%s: %w", target.Database, target.Environment, err)
 	}
 
-	// GET_LOCK is session-scoped, so hold one connection for the whole pass.
+	// The advisory lock is session-scoped, so hold one connection for the
+	// whole pass.
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "target_error")
@@ -107,12 +113,12 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 	defer utils.CloseAndLog(conn)
 
 	lockName := targetLockName(target)
-	var locked int
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, 0)", lockName).Scan(&locked); err != nil {
+	acquired, err := cleanupLocker.Acquire(ctx, conn, lockName, 0)
+	if err != nil {
 		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "target_error")
 		return fmt.Errorf("acquire advisory lock on %s/%s: %w", target.Database, target.Environment, err)
 	}
-	if locked != 1 {
+	if !acquired {
 		c.logger.Info("pending drops cleanup skipped: another instance holds the cleanup lock",
 			"database", target.Database,
 			"environment", target.Environment,
@@ -122,12 +128,20 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		return nil
 	}
 	defer func() {
-		if _, err := conn.ExecContext(context.WithoutCancel(ctx), "SELECT RELEASE_LOCK(?)", lockName); err != nil {
+		released, err := cleanupLocker.Release(context.WithoutCancel(ctx), conn, lockName)
+		switch {
+		case err != nil:
 			c.logger.Warn("failed to release pending drops cleanup lock; the lock releases when the session closes",
 				"database", target.Database,
 				"environment", target.Environment,
 				"lock_name", lockName,
 				"error", err,
+			)
+		case !released:
+			c.logger.Warn("pending drops cleanup lock was no longer held at release; another instance may have run concurrently against this target",
+				"database", target.Database,
+				"environment", target.Environment,
+				"lock_name", lockName,
 			)
 		}
 	}()
