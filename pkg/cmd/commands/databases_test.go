@@ -33,7 +33,7 @@ func TestWriteDatabaseList(t *testing.T) {
 				},
 			},
 		},
-	})
+	}, "")
 
 	require.NoError(t, err)
 	output := out.String()
@@ -51,11 +51,12 @@ func TestWriteDatabaseList(t *testing.T) {
 }
 
 func TestDatabasesCommandRunFetchesAndRendersDatabases(t *testing.T) {
-	var gotType string
+	var gotType, gotName string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, http.MethodGet, r.Method)
 		assert.Equal(t, "/api/databases", r.URL.Path)
 		gotType = r.URL.Query().Get("type")
+		gotName = r.URL.Query().Get("name")
 		w.Header().Set("Content-Type", "application/json")
 		require.NoError(t, json.NewEncoder(w).Encode(apitypes.DatabaseListResponse{
 			Databases: []*apitypes.DatabaseResponse{
@@ -71,7 +72,7 @@ func TestDatabasesCommandRunFetchesAndRendersDatabases(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	cmd := &DatabasesCmd{Type: "mysql"}
+	cmd := &DatabasesCmd{Type: "mysql", Name: "ord"}
 	var runErr error
 	output := captureStdout(func() {
 		runErr = cmd.Run(&Globals{Endpoint: server.URL})
@@ -79,6 +80,7 @@ func TestDatabasesCommandRunFetchesAndRendersDatabases(t *testing.T) {
 
 	require.NoError(t, runErr)
 	assert.Equal(t, "mysql", gotType)
+	assert.Equal(t, "ord", gotName)
 	assert.Contains(t, output, "DATABASE")
 	assert.Contains(t, output, "orders")
 	assert.Contains(t, output, "mysql")
@@ -88,10 +90,18 @@ func TestDatabasesCommandRunFetchesAndRendersDatabases(t *testing.T) {
 
 func TestWriteDatabaseListEmpty(t *testing.T) {
 	var out bytes.Buffer
-	err := writeDatabaseList(&out, &apitypes.DatabaseListResponse{})
+	err := writeDatabaseList(&out, &apitypes.DatabaseListResponse{}, "")
 
 	require.NoError(t, err)
 	assert.Equal(t, "No databases configured.\n", out.String())
+}
+
+func TestWriteDatabaseListEmptyWithNameFilter(t *testing.T) {
+	var out bytes.Buffer
+	err := writeDatabaseList(&out, &apitypes.DatabaseListResponse{}, "omnibus")
+
+	require.NoError(t, err)
+	assert.Equal(t, "No databases match --name \"omnibus\".\n", out.String())
 }
 
 func TestValidateDatabaseListType(t *testing.T) {
