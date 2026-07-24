@@ -70,7 +70,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewUnsafeAllowed, templates.PreviewLintAll:
 		templates.PreviewCLIOutput(previewType)
 	// Comment template types
-	case templates.PreviewCommentPlan, templates.PreviewCommentPlanTenant,
+	case templates.PreviewCommentPlan, templates.PreviewCommentPlanBlocked,
+		templates.PreviewCommentPlanTenant,
 		templates.PreviewCommentPlanEmpty,
 		templates.PreviewCommentNoManagedSchema,
 		templates.PreviewCommentReconcileInProgress,
@@ -87,7 +88,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyPlanUnsafe,
 		templates.PreviewCommentApplyProgress, templates.PreviewCommentApplyCompleted,
 		templates.PreviewCommentApplyEstimateExceeded,
-		templates.PreviewCommentApplyFailed, templates.PreviewCommentApplyRetrying,
+		templates.PreviewCommentApplyFailed,
+		templates.PreviewCommentApplyRetrying,
 		templates.PreviewCommentApplyStopped,
 		templates.PreviewCommentApplyWaitingCutover, templates.PreviewCommentApplyCuttingOver,
 		templates.PreviewCommentMultiDeployInProgress, templates.PreviewCommentMultiDeployFailed,
@@ -242,6 +244,7 @@ Interactive TUI:
 
 Comment Templates (GitHub PR comments):
   comment_plan                  Plan comment with DDL changes + lint violations
+  comment_plan_blocked          Plan with a statement the engine refuses (blocked verdict)
   comment_plan_tenant           Tenant-targeted plan comment
   comment_plan_empty            Plan comment with no changes
   comment_no_managed_schema     No managed schema changes in current PR

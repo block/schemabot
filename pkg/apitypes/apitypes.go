@@ -820,6 +820,13 @@ type StatusResponse struct {
 	FailuresOnly bool `json:"failures_only,omitempty"`
 	// Last echoes the window bounding the list to applies updated within it;
 	// empty means the list is bounded by limit alone.
-	Last    string                 `json:"last,omitempty"`
-	Applies []*ActiveApplyResponse `json:"applies"`
+	Last string `json:"last,omitempty"`
+	// State echoes the canonical form of the state filter restricting the
+	// list; empty means no state filter.
+	State string `json:"state,omitempty"`
+	// StateCounts tallies every apply matching the request's filters by state,
+	// unbounded by limit — the applies list may be a truncated page, but these
+	// counts never are.
+	StateCounts map[string]int         `json:"state_counts,omitempty"`
+	Applies     []*ActiveApplyResponse `json:"applies"`
 }

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docker/go-connections/nat"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -26,17 +27,21 @@ var sharedDSN string
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
+	// The MySQL entrypoint runs a throwaway init server that also logs
+	// "ready for connections" and binds nothing on TCP, so log- and
+	// port-based waits can be satisfied before the final server accepts
+	// clients. Gate readiness on a real query through the mapped port
+	// instead — the same handshake the tests themselves perform.
 	req := testcontainers.ContainerRequest{
-		Image:        "mysql:8.0",
+		Image:        "mysql:8.4",
 		ExposedPorts: []string{"3306/tcp"},
 		Env: map[string]string{
 			"MYSQL_ROOT_PASSWORD": "testpassword",
 			"MYSQL_DATABASE":      "testdb",
 		},
-		WaitingFor: wait.ForAll(
-			wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(30*time.Second),
-			wait.ForListeningPort("3306/tcp"),
-		),
+		WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port nat.Port) string {
+			return fmt.Sprintf("root:testpassword@tcp(%s:%s)/testdb", host, port.Port())
+		}).WithStartupTimeout(30 * time.Second),
 	}
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{

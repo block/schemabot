@@ -59,6 +59,44 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-engineblocked-change"></a><strong>MySQL Plan (Engine-blocked Change)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `users`
+    DROP PRIMARY KEY,
+    ADD PRIMARY KEY(`id`, `tenant_id`);
+
+ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`);
+
+ALTER TABLE `orders` ADD COLUMN `notes` text;
+```
+
+⛔ **Cannot apply**: **2** changes not supported by the schema-change engine
+- `users`: dropping primary key is not supported
+- `orders`: adding foreign key constraints is not supported
+
+An apply will fail on these statements. Rewrite them as a supported schema change, or contact your SchemaBot operators for help.
+
+📋 **Plan**: **3** tables to alter
+
+
+---
+
+💡 **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-tenant-target"></a><strong>MySQL Plan (Tenant Target)</strong></summary>
 
 

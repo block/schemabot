@@ -52,6 +52,34 @@ func PreviewCommentPlan() string {
 	})
 }
 
+// PreviewCommentPlanBlocked renders a sample plan containing a statement the
+// engine deterministically refuses (execution-mode verdict "blocked").
+func PreviewCommentPlanBlocked() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+					"ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)",
+					"ALTER TABLE `orders` ADD COLUMN `notes` TEXT",
+				},
+			},
+		},
+		BlockedChanges: []BlockedChangeData{
+			{Table: "users", Reason: "dropping primary key is not supported"},
+			{Table: "orders", Reason: "adding foreign key constraints is not supported"},
+		},
+	})
+}
+
 // PreviewCommentPlanTenant renders a tenant-targeted plan comment.
 func PreviewCommentPlanTenant() string {
 	return RenderPlanComment(PlanCommentData{

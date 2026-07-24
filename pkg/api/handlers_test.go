@@ -257,6 +257,25 @@ func (s *recentApplyStore) GetRecent(_ context.Context, filter storage.RecentApp
 	if s.err != nil {
 		return nil, s.err
 	}
+	applies := s.matching(filter)
+	if filter.Limit > 0 && len(applies) > filter.Limit {
+		return applies[:filter.Limit], nil
+	}
+	return applies, nil
+}
+
+func (s *recentApplyStore) CountRecentByState(_ context.Context, filter storage.RecentAppliesFilter) (map[string]int, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	counts := map[string]int{}
+	for _, apply := range s.matching(filter) {
+		counts[apply.State]++
+	}
+	return counts, nil
+}
+
+func (s *recentApplyStore) matching(filter storage.RecentAppliesFilter) []*storage.Apply {
 	applies := make([]*storage.Apply, 0, len(s.applies))
 	for _, apply := range s.applies {
 		if filter.Environment != "" && apply.Environment != filter.Environment {
@@ -270,10 +289,7 @@ func (s *recentApplyStore) GetRecent(_ context.Context, filter storage.RecentApp
 		}
 		applies = append(applies, apply)
 	}
-	if filter.Limit > 0 && len(applies) > filter.Limit {
-		return applies[:filter.Limit], nil
-	}
-	return applies, nil
+	return applies
 }
 
 type memoryControlRequestStore struct {
@@ -3430,6 +3446,11 @@ func TestHandleStatusLimitAndEnvironment(t *testing.T) {
 	assert.True(t, resp.HasMore)
 	assert.False(t, resp.FailuresOnly)
 	assert.Equal(t, 1, resp.ActiveCount)
+	assert.Equal(t, map[string]int{
+		state.Apply.Completed: 2,
+		state.Apply.Running:   1,
+		state.Apply.Failed:    1,
+	}, resp.StateCounts, "state counts cover every matching apply, not just the truncated page")
 	require.Len(t, resp.Applies, 2)
 	assert.Equal(t, "apply-one", resp.Applies[0].ApplyID)
 	assert.Equal(t, "external-one", resp.Applies[0].ExternalID)
@@ -3702,6 +3723,71 @@ func TestHandleStatusLastWindowBoundsFilter(t *testing.T) {
 	mux.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	require.Len(t, applies.filters, 1, "an invalid window must not reach storage")
+}
+
+// TestHandleStatusStateFilter verifies that the `state` query parameter
+// normalizes to the canonical apply state and restricts the storage filter,
+// that a typo'd state is rejected rather than returning a silently empty
+// list, and that `state` cannot be combined with `failed`.
+func TestHandleStatusStateFilter(t *testing.T) {
+	now := time.Now().UTC()
+	applies := &recentApplyStore{
+		applies: []*storage.Apply{
+			{
+				ApplyIdentifier: "apply-running",
+				Database:        "orders",
+				Environment:     "staging",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Running,
+				Caller:          "cli",
+				CreatedAt:       now,
+				UpdatedAt:       now,
+			},
+			{
+				ApplyIdentifier: "apply-completed",
+				Database:        "payments",
+				Environment:     "staging",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Completed,
+				Caller:          "cli",
+				CreatedAt:       now.Add(-time.Minute),
+				UpdatedAt:       now.Add(-time.Minute),
+			},
+		},
+	}
+	stor := &mockStorageWithApplyStores{applies: applies}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(stor, testServerConfig(), nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?state=RUNNING", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.StatusResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, state.Apply.Running, resp.State, "the state filter echoes in canonical form")
+	require.Len(t, resp.Applies, 1)
+	assert.Equal(t, "apply-running", resp.Applies[0].ApplyID)
+	assert.Equal(t, map[string]int{state.Apply.Running: 1}, resp.StateCounts)
+	require.Len(t, applies.filters, 1)
+	assert.Equal(t, []string{state.Apply.Running}, applies.filters[0].States)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?state=comleted", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "unknown state")
+	require.Len(t, applies.filters, 1, "an unknown state must not reach storage")
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?state=running&failed=true", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "state cannot be combined with failed")
+	require.Len(t, applies.filters, 1, "conflicting filters must not reach storage")
 }
 
 func TestParseStatusFailuresOnly(t *testing.T) {

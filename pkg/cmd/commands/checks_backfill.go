@@ -14,6 +14,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	cmdclient "github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // ChecksCmd groups SchemaBot Check Run operator commands.
@@ -286,7 +287,61 @@ scanning:
 		}
 	}
 	stopProgress()
-	return cmd.write(report)
+	if err := cmd.write(report); err != nil {
+		return err
+	}
+	return attentionExitError(report)
+}
+
+// attentionExitError makes the exit code mean "nothing needs an operator
+// after this run": it converts anything the run left unresolved into a
+// nonzero exit, so scheduled sweeps can alert on the exit code instead of
+// parsing the output. In a dry-run nothing was acted on, so every finding
+// remains. After an act phase, successfully recreated checks are resolved;
+// held PRs, failed recreations, and stuck Check Runs remain — the backfill
+// never acts on those. It fires only after the full report has been printed;
+// the report itself is unchanged. A run that leaves nothing behind returns
+// nil.
+func attentionExitError(report *checksBackfillReport) error {
+	var parts []string
+	if report.DryRun {
+		if n := len(report.Actions); n > 0 {
+			part := fmt.Sprintf("%d %s with missing Check Runs", n, ui.Pluralize("PR", n))
+			held := 0
+			for _, action := range report.Actions {
+				if action.Held {
+					held++
+				}
+			}
+			if held > 0 {
+				part += fmt.Sprintf(" (%d held)", held)
+			}
+			parts = append(parts, part)
+		}
+	} else {
+		held, failed := 0, 0
+		for _, action := range report.Actions {
+			switch {
+			case action.Held:
+				held++
+			case action.Error != "":
+				failed++
+			}
+		}
+		if held > 0 {
+			parts = append(parts, fmt.Sprintf("%d held %s", held, ui.Pluralize("PR", held)))
+		}
+		if failed > 0 {
+			parts = append(parts, fmt.Sprintf("%d failed Check Run %s", failed, ui.Pluralize("recreation", failed)))
+		}
+	}
+	if n := len(report.Stuck); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d stuck %s", n, ui.Pluralize("Check Run", n)))
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	return fmt.Errorf("checks backfill left %s needing attention", strings.Join(parts, " and "))
 }
 
 // checksScanProgressLine renders one scan progress update. The denominator is

@@ -1425,6 +1425,47 @@ func TestApplyStore_GetRecentUpdatedSince(t *testing.T) {
 	require.Len(t, applies, 2)
 }
 
+// A status summary must tally every apply matching the filters — unbounded by
+// the list limit, scoped by environment, and windowed by UpdatedSince — so an
+// operator reading a truncated status page still sees truthful totals.
+func TestApplyStore_CountRecentByState(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "countdb", "mysql", "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_completed_one", 230, state.Apply.Completed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_completed_two", 231, state.Apply.Completed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_failed", 232, state.Apply.Failed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_other_env", 233, state.Apply.Completed, "production")
+
+	counts, err := store.Applies().CountRecentByState(ctx, storage.RecentAppliesFilter{
+		Limit:       1,
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{
+		state.Apply.Completed: 2,
+		state.Apply.Failed:    1,
+	}, counts, "counts cover every matching row even when the list limit is 1")
+
+	_, err = testDB.ExecContext(ctx,
+		"UPDATE `applies` SET updated_at = ? WHERE apply_identifier = ?",
+		time.Now().Add(-2*time.Hour), "apply_count_completed_one")
+	require.NoError(t, err)
+
+	counts, err = store.Applies().CountRecentByState(ctx, storage.RecentAppliesFilter{
+		Limit:        10,
+		Environment:  "staging",
+		UpdatedSince: time.Now().Add(-time.Hour),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{
+		state.Apply.Completed: 1,
+		state.Apply.Failed:    1,
+	}, counts)
+}
+
 func TestApplyStore_GetRecentDeploymentFilterMatchesParentAndOperation(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
