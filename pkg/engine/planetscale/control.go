@@ -39,9 +39,12 @@ func (e *Engine) cancelDeployRequest(ctx context.Context, operation engine.Contr
 		// request that is already closed, and a prior cancel attempt (this
 		// driver's or another's) may have closed it. Read the deploy request's
 		// live state to distinguish "already cancelled" — the goal state, report
-		// success — from a deploy request that closed by completing or failing,
-		// where reporting a successful cancel would misrepresent a schema change
-		// that actually landed.
+		// success — from a deploy request that closed by completing, where the
+		// schema change landed before the cancel arrived and the caller must
+		// reconcile to the completed outcome rather than retry a rejection that
+		// can never succeed. Any other closed state stays a plain error naming
+		// the live state: reporting a successful cancel there would
+		// misrepresent what happened on the target.
 		dr, getErr := client.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
 			Organization: credOrg(req.Credentials),
 			Database:     req.Database,
@@ -57,6 +60,13 @@ func (e *Engine) cancelDeployRequest(ctx context.Context, operation engine.Contr
 				Message:     fmt.Sprintf("Deploy request #%d already cancelled", meta.DeployRequestID),
 				ResumeState: req.ResumeState,
 			}, nil
+		case deployState.Complete, deployState.NoChanges:
+			// complete_pending_revert is deliberately not treated as completed
+			// here: the change is still in its revert window, where the revert
+			// and skip-revert paths own the outcome. Once the window closes the
+			// deploy request settles to complete and a still-pending cancel
+			// reconciles then.
+			return nil, engine.NewAlreadyCompletedError("cancel deploy request #%d rejected: the deploy request completed before the cancel arrived (deployment state %q): %w", meta.DeployRequestID, dr.DeploymentState, err)
 		}
 		return nil, fmt.Errorf("cancel deploy request #%d rejected in deployment state %q: %w", meta.DeployRequestID, dr.DeploymentState, err)
 	}

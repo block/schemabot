@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -534,6 +535,17 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 	// returns the progress data reflects the true final state of each table.
 	stopCreds, err := c.stopEngineForTasks(ctx, eng, tasks, targetApplyID)
 	if err != nil {
+		if engine.IsAlreadyCompleted(err) {
+			skippedCount, settleErr := c.settleControlForCompletedEngineChange(ctx, "stop", tasks, targetApplyID, targetApply, caller, err)
+			if settleErr != nil {
+				return nil, settleErr
+			}
+			return &ternv1.StopResponse{
+				Accepted:     true,
+				SkippedCount: skippedCount,
+				ErrorMessage: "Schema change already completed before the stop; apply recorded as completed",
+			}, nil
+		}
 		return nil, fmt.Errorf("engine stop failed: %w", err)
 	}
 
@@ -657,6 +669,17 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 	eng := c.getEngine()
 	applyCancel := c.currentApplyCancel()
 	if err := c.cancelEngineForTasks(ctx, eng, tasks, targetApplyID); err != nil {
+		if engine.IsAlreadyCompleted(err) {
+			skippedCount, settleErr := c.settleControlForCompletedEngineChange(ctx, "cancel", tasks, targetApplyID, targetApply, caller, err)
+			if settleErr != nil {
+				return nil, settleErr
+			}
+			return &ternv1.CancelResponse{
+				Accepted:     true,
+				SkippedCount: skippedCount,
+				ErrorMessage: "Schema change already completed before the cancel; apply recorded as completed",
+			}, nil
+		}
 		return nil, fmt.Errorf("engine cancel failed: %w", err)
 	}
 	c.cancelApplyHandle(applyCancel)
@@ -1458,6 +1481,83 @@ func (c *LocalClient) markApplyCancelled(ctx context.Context, applyID int64) err
 		return fmt.Errorf("mark apply %s cancelled: %w", apply.ApplyIdentifier, err)
 	}
 	return nil
+}
+
+// settleControlForCompletedEngineChange terminalizes a stop or cancel that the
+// engine rejected because the schema change had already completed on its
+// backend before the operation arrived. The backend's terminal outcome is
+// authoritative: the change is live on the target, so the stored apply and its
+// still-active tasks settle to completed — recording them stopped or cancelled
+// would misrepresent a schema change that actually landed — and the accepted
+// settle lets the durable control request resolve, so the operator's claim
+// loop stops re-running an operation the engine will reject forever. Returns
+// the number of targeted tasks that were already terminal. An apply already in
+// a non-resumable terminal state keeps its outcome. operation names the
+// rejected verb ("stop" or "cancel") for logs and the apply event.
+func (c *LocalClient) settleControlForCompletedEngineChange(ctx context.Context, operation string, tasks []*storage.Task, targetApplyID int64, targetApply *storage.Apply, caller string, rejection error) (int64, error) {
+	now := time.Now()
+	var completedCount, skippedCount, applyID int64
+	if targetApply != nil {
+		applyID = targetApply.ID
+	}
+	for _, task := range tasks {
+		if targetApplyID > 0 && task.ApplyID != targetApplyID {
+			continue
+		}
+		if applyID == 0 && task.ApplyID > 0 {
+			applyID = task.ApplyID
+		}
+		if state.IsTerminalTaskState(task.State) {
+			skippedCount++
+			continue
+		}
+		task.CompletedAt = &now
+		c.transitionTaskState(ctx, task, task.ApplyID, state.Task.Completed,
+			fmt.Sprintf("Task %s completed on the engine before the %s took effect", task.TaskIdentifier, operation))
+		completedCount++
+	}
+	if applyID == 0 {
+		return 0, fmt.Errorf("%s found the schema change already completed on the engine, but resolved no apply to settle: %w", operation, rejection)
+	}
+	apply, err := c.storage.Applies().Get(ctx, applyID)
+	if err != nil {
+		return 0, fmt.Errorf("load apply %d to settle %s for a completed schema change: %w", applyID, operation, err)
+	}
+	if apply == nil {
+		return 0, fmt.Errorf("load apply %d to settle %s for a completed schema change: %w", applyID, operation, storage.ErrApplyNotFound)
+	}
+	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
+		c.logger.Info(operation+" found the schema change already completed on the engine and the apply already terminal; accepting without a state change",
+			append(apply.LogAttrs(), "requested_by", caller)...)
+		return skippedCount, nil
+	}
+	previousState := apply.State
+	apply.State = state.Apply.Completed
+	apply.CompletedAt = &now
+	apply.UpdatedAt = now
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		return 0, fmt.Errorf("mark apply %s completed after %s found the schema change already completed on the engine: %w", apply.ApplyIdentifier, operation, err)
+	}
+	c.logger.Warn("engine rejected "+operation+" because the schema change already completed; apply settled as completed",
+		append(apply.LogAttrs(), "requested_by", caller, "previous_state", previousState, "error", rejection)...)
+	eventMsg := fmt.Sprintf("%s arrived after the schema change completed on the engine; apply recorded as completed (%d tasks completed, %d already terminal)",
+		capitalizeControlVerb(operation), completedCount, skippedCount)
+	if caller != "" {
+		eventMsg += callerApplyLogSuffix(caller)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+		eventMsg, previousState, state.Apply.Completed)
+	c.notifyTerminalObserver(apply, tasks)
+	return skippedCount, nil
+}
+
+// capitalizeControlVerb upper-cases the first letter of a control verb for use
+// at the start of an operator-facing apply event message.
+func capitalizeControlVerb(operation string) string {
+	if operation == "" {
+		return operation
+	}
+	return strings.ToUpper(operation[:1]) + operation[1:]
 }
 
 // controlSetup resolves the active task, credentials, and engine for a control operation.

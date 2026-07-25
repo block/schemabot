@@ -3,6 +3,7 @@ package planetscale
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"testing"
@@ -88,9 +89,12 @@ func (c *cancelDeployRequestClient) GetDeployRequest(context.Context, *ps.GetDep
 // PlanetScale rejects a cancel of a deploy request that is already closed, and
 // a prior cancel attempt may be what closed it — cancel is retried across
 // drives and pods, so a rejection of an already-cancelled deploy request must
-// read as success. A deploy request that closed any other way (completed,
-// errored) must stay an error naming its live state: reporting a successful
-// cancel there would misrepresent a schema change that actually landed.
+// read as success. A deploy request that closed by completing is typed as
+// already-completed so the caller reconciles to the completed outcome instead
+// of retrying a rejection that can never succeed. A deploy request closed any
+// other way (errored, or still in its revert window) must stay a plain error
+// naming its live state: reporting a successful cancel or a completed change
+// there would misrepresent what happened on the target.
 func TestCancel_AlreadyClosedDeployRequest(t *testing.T) {
 	meta, err := encodePSMetadata(&psMetadata{
 		BranchName:       "schemabot-mydb-abc",
@@ -134,18 +138,38 @@ func TestCancel_AlreadyClosedDeployRequest(t *testing.T) {
 		})
 	}
 
-	t.Run("deploy request closed by completing stays an error naming its state", func(t *testing.T) {
-		e := newEngine(&cancelDeployRequestClient{
-			cancelErr: closedErr,
-			dr:        &ps.DeployRequest{Number: 121, DeploymentState: deployState.Complete},
+	for _, completedState := range []string{deployState.Complete, deployState.NoChanges} {
+		t.Run("deploy request closed by completing in state "+completedState+" reads as already completed", func(t *testing.T) {
+			e := newEngine(&cancelDeployRequestClient{
+				cancelErr: closedErr,
+				dr:        &ps.DeployRequest{Number: 121, DeploymentState: completedState},
+			})
+
+			_, err := e.Cancel(t.Context(), controlReq())
+
+			require.Error(t, err)
+			assert.True(t, engine.IsAlreadyCompleted(err), "a completed deploy request must type the rejection so the caller reconciles instead of retrying")
+			assert.Contains(t, err.Error(), "cancel deploy request #121 rejected: the deploy request completed before the cancel arrived")
+			assert.Contains(t, err.Error(), completedState)
+			assert.Contains(t, err.Error(), "The deploy request is closed.")
 		})
+	}
 
-		_, err := e.Cancel(t.Context(), controlReq())
+	for _, otherState := range []string{deployState.CompletePendingRevert, deployState.CompleteError} {
+		t.Run("deploy request in state "+otherState+" stays an error naming its state", func(t *testing.T) {
+			e := newEngine(&cancelDeployRequestClient{
+				cancelErr: closedErr,
+				dr:        &ps.DeployRequest{Number: 121, DeploymentState: otherState},
+			})
 
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), `cancel deploy request #121 rejected in deployment state "complete"`)
-		assert.Contains(t, err.Error(), "The deploy request is closed.")
-	})
+			_, err := e.Cancel(t.Context(), controlReq())
+
+			require.Error(t, err)
+			assert.False(t, engine.IsAlreadyCompleted(err), "only a fully completed deploy request may read as already completed")
+			assert.Contains(t, err.Error(), fmt.Sprintf("cancel deploy request #121 rejected in deployment state %q", otherState))
+			assert.Contains(t, err.Error(), "The deploy request is closed.")
+		})
+	}
 
 	t.Run("failed state read keeps both errors", func(t *testing.T) {
 		e := newEngine(&cancelDeployRequestClient{

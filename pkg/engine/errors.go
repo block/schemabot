@@ -46,6 +46,36 @@ func IsNotReady(err error) bool {
 	return errors.As(err, &notReady)
 }
 
+// AlreadyCompletedError wraps an error to indicate the engine's backend
+// rejected a control operation because the schema change had already completed
+// before the operation arrived. The backend's terminal outcome is
+// authoritative and retrying can never succeed, so callers should reconcile
+// stored state to the completed outcome instead of retrying — leaving the
+// operation pending would re-run a rejection forever against a change that has
+// already landed.
+type AlreadyCompletedError struct {
+	Err error
+}
+
+func (e *AlreadyCompletedError) Error() string { return e.Err.Error() }
+func (e *AlreadyCompletedError) Unwrap() error { return e.Err }
+
+// NewAlreadyCompletedError wraps err as an already-completed error.
+func NewAlreadyCompletedError(msg string, args ...any) error {
+	return &AlreadyCompletedError{Err: fmt.Errorf(msg, args...)}
+}
+
+// IsAlreadyCompleted reports whether err indicates the engine's backend
+// rejected a control operation because the schema change had already
+// completed.
+func IsAlreadyCompleted(err error) bool {
+	if err == nil {
+		return false
+	}
+	var alreadyCompleted *AlreadyCompletedError
+	return errors.As(err, &alreadyCompleted)
+}
+
 // IsRetryable returns true if the error should be retried by the operator.
 // All errors are retryable by default, and engines explicitly wrap only
 // permanent errors with PermanentError.
