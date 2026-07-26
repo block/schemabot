@@ -2272,10 +2272,10 @@ func TestEngine_StatelessControlAddressesDSNSchema(t *testing.T) {
 // TestNewSpiritMigrationRunSettings verifies the Spirit run settings applied to
 // every schema change this engine starts: the fleet defaults resolve when the
 // engine is built without overrides, metadata overrides carry through, and the
-// GTID-based change source stays off by default. The shared test container
-// runs without gtid_mode=ON, so even with the GTID opt-in enabled the
-// per-target probe keeps the universally supported binlog file+position source
-// that Spirit can start on this target.
+// change source is selected per target capability — the shared test container
+// runs without gtid_mode=ON, so the universally supported binlog file+position
+// source is chosen instead of the GTID source Spirit would refuse to start on
+// this target.
 func TestNewSpiritMigrationRunSettings(t *testing.T) {
 	dsn, _ := setupTestMySQL(t)
 	host, username, password, database, err := parseDSN(dsn)
@@ -2290,12 +2290,11 @@ func TestNewSpiritMigrationRunSettings(t *testing.T) {
 	assert.Zero(t, m.WriteThreads, "write threads auto-size for the target")
 	assert.Equal(t, maxCommitLatency, m.MaxCommitLatency,
 		"commit-latency throttle must be set explicitly; Spirit disables the throttler on zero")
-	assert.False(t, m.EnableExperimentalGTID,
-		"GTID change source is opt-in; the default keeps the binlog file+position change source")
+	assert.False(t, m.EnableExperimentalGTID, "GTID-off target keeps the binlog file+position change source")
 
 	settings, err := SettingsFromMetadata(map[string]string{
 		MetadataEnableExperimentalAutoscaling: "false",
-		MetadataEnableExperimentalGTID:        "true",
+		MetadataEnableExperimentalGTID:        "false",
 		MetadataCheckpointMaxAge:              "24h",
 		MetadataChecksumYieldTimeout:          "6h",
 	})
@@ -2306,16 +2305,15 @@ func TestNewSpiritMigrationRunSettings(t *testing.T) {
 	assert.Equal(t, 6*time.Hour, m.ChecksumYieldTimeout)
 	assert.False(t, m.EnableExperimentalAutoscaling, "autoscaling override disables it")
 	assert.False(t, m.EnableExperimentalGTID,
-		"GTID opt-in on a GTID-off target keeps the binlog file+position change source")
+		"GTID kill switch keeps the binlog file+position change source")
 }
 
 // TestNewSpiritMigrationGTIDChangeSource verifies per-target change-source
 // selection against a target that actually runs with gtid_mode=ON and
-// enforce_gtid_consistency=ON: the GTID-based change source is used only when
-// the operator opts in, and the opt-in alone never forces it onto the target —
-// the same engine keeps the binlog file+position source with the opt-in off.
-// Uses a dedicated GTID-enabled MySQL container because the shared container
-// runs without GTIDs.
+// enforce_gtid_consistency=ON: the GTID-based change source is used by
+// default on such a target, and the operator kill switch keeps the binlog
+// file+position source on the same target. Uses a dedicated GTID-enabled
+// MySQL container because the shared container runs without GTIDs.
 func TestNewSpiritMigrationGTIDChangeSource(t *testing.T) {
 	req := testcontainers.ContainerRequest{
 		Image:        "mysql:8.0",
@@ -2347,13 +2345,14 @@ func TestNewSpiritMigrationGTIDChangeSource(t *testing.T) {
 	require.NoError(t, err, "container port")
 	addr := fmt.Sprintf("%s:%d", host, port)
 
-	eng := New(Config{Settings: Settings{EnableExperimentalGTID: true}})
+	eng := New(Config{})
 	m := eng.newSpiritMigration(t.Context(), addr, "root", "testpassword", "testdb", "ALTER TABLE t1 ADD COLUMN c1 INT")
 	assert.True(t, m.EnableExperimentalGTID,
-		"GTID-capable target gets the GTID change source when the opt-in is enabled")
+		"GTID-capable target gets the GTID change source by default")
 
-	eng = New(Config{})
+	disabled := false
+	eng = New(Config{Settings: Settings{EnableExperimentalGTID: &disabled}})
 	m = eng.newSpiritMigration(t.Context(), addr, "root", "testpassword", "testdb", "ALTER TABLE t1 ADD COLUMN c1 INT")
 	assert.False(t, m.EnableExperimentalGTID,
-		"opt-in off keeps the binlog file+position change source even on a GTID-capable target")
+		"kill switch keeps the binlog file+position change source even on a GTID-capable target")
 }

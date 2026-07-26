@@ -64,7 +64,7 @@ type Engine struct {
 	checkpointMaxAge     time.Duration
 	checksumYieldTimeout time.Duration
 	autoscaling          bool
-	gtid                 bool // opt-in to the GTID-based change source on capable targets
+	gtid                 bool // use the GTID-based change source on capable targets; false = operator kill switch
 
 	cpuHint int // Inferred CPU count from innodb_buffer_pool_instances (0 = unknown); guarded by mu
 
@@ -168,6 +168,7 @@ func New(cfg Config) *Engine {
 	}
 
 	autoscaling := cfg.Settings.EnableExperimentalAutoscaling == nil || *cfg.Settings.EnableExperimentalAutoscaling
+	gtid := cfg.Settings.EnableExperimentalGTID == nil || *cfg.Settings.EnableExperimentalGTID
 
 	eng := &Engine{
 		logger:               logger,
@@ -180,7 +181,7 @@ func New(cfg Config) *Engine {
 		checkpointMaxAge:     checkpointMaxAge,
 		checksumYieldTimeout: checksumYieldTimeout,
 		autoscaling:          autoscaling,
-		gtid:                 cfg.Settings.EnableExperimentalGTID,
+		gtid:                 gtid,
 	}
 
 	// Create Spirit logger with filter that checks debugLogs at runtime

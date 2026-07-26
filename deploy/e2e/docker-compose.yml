@@ -33,8 +33,7 @@ services:
       retries: 10
 
   # Staging MySQL instance. Runs with GTIDs enabled so applies exercise
-  # Spirit's GTID-based change source (enable_experimental_gtid in
-  # config/local.yaml) end-to-end.
+  # Spirit's GTID-based change source end-to-end.
   mysql-staging:
     image: mysql:8.0
     command:

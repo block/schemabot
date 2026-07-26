@@ -3545,7 +3545,7 @@ func TestServerConfig_SpiritMetadata(t *testing.T) {
 		require.NoError(t, yaml.Unmarshal([]byte(`
 spirit:
   enable_experimental_autoscaling: false
-  enable_experimental_gtid: true
+  enable_experimental_gtid: false
   checkpoint_max_age: 24h
   checksum_yield_timeout: 6h
 `), &cfg))
@@ -3553,7 +3553,7 @@ spirit:
 		require.NoError(t, err)
 		assert.Equal(t, map[string]string{
 			spirit.MetadataEnableExperimentalAutoscaling: "false",
-			spirit.MetadataEnableExperimentalGTID:        "true",
+			spirit.MetadataEnableExperimentalGTID:        "false",
 			spirit.MetadataCheckpointMaxAge:              "24h",
 			spirit.MetadataChecksumYieldTimeout:          "6h",
 		}, metadata)

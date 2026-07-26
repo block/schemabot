@@ -361,7 +361,7 @@ defaults below.
 ```yaml
 spirit:
   enable_experimental_autoscaling: true  # default: true
-  enable_experimental_gtid: false        # default: false
+  enable_experimental_gtid: true         # default: true
   checkpoint_max_age: 72h                # default: 72h (3 days)
   checksum_yield_timeout: 12h            # default: 12h
 ```
@@ -383,10 +383,12 @@ The defaults, and why they were chosen:
 - **`checksum_yield_timeout: 12h`** — each checksum read transaction yields its
   `REPEATABLE READ` snapshot within this bound so a long checksum cannot pin
   InnoDB purge and degrade the whole target instance.
-- **`enable_experimental_gtid: false`** — opt-in to Spirit's GTID-based change
-  source instead of the default binlog file+position source. See
+- **`enable_experimental_gtid: true`** — Spirit's GTID-based change source is
+  used on targets that support it; every other target keeps the binlog
+  file+position source, so the default is safe whether or not your targets
+  use GTIDs. See
   [GTID change source](#gtid-change-source-enable_experimental_gtid) below for
-  what the mode does and the implications of turning it on.
+  what the mode does and when to use the kill switch.
 
 A database can override the server-level value by setting the same key
 (`enable_experimental_autoscaling`, `enable_experimental_gtid`,
@@ -402,43 +404,52 @@ over gRPC run with that deployment's engine settings.
 While a schema change copies a table, Spirit simultaneously follows the
 target's replication stream so writes that land during the copy are applied to
 the new table too. The *change source* is Spirit's bookmark into that stream,
-and this flag selects which kind of bookmark is used:
+and it comes in two kinds:
 
-- **Off (the default):** the bookmark is a binlog file name plus an offset
+- **Binlog file+position:** the bookmark is a binlog file name plus an offset
   within it. This works on every MySQL target, but it is tied to one server's
   binlog files. If the binlogs the bookmark points at are purged before a
   stalled schema change resumes, or the target fails over to a replica (whose
   binlog files are numbered differently), the saved position no longer exists
   and the schema change restarts its copy from the beginning instead of
   resuming.
-- **On:** the bookmark is a GTID set. GTIDs (global transaction identifiers)
-  name each transaction globally rather than by its offset in a specific
-  file, so the bookmark stays valid across binlog rotation and failover, and
-  an interrupted schema change can resume where it left off in situations
-  where the file+position source would have to start over. The GTID source
-  requires `gtid_mode=ON` and `enforce_gtid_consistency=ON` on the target
-  MySQL server — Spirit refuses to start it anywhere else.
+- **GTID set:** GTIDs (global transaction identifiers) name each transaction
+  globally rather than by its offset in a specific file, so the bookmark
+  stays valid across binlog rotation and failover, and an interrupted schema
+  change can resume where it left off in situations where the file+position
+  source would have to start over. The GTID source requires `gtid_mode=ON`
+  and `enforce_gtid_consistency=ON` on the target MySQL server — Spirit
+  refuses to start it anywhere else.
 
-Implications of turning it on:
+With `enable_experimental_gtid: true` (the default), SchemaBot chooses the
+source per target: before every run it probes the target and uses the GTID
+source only where `gtid_mode=ON` and `enforce_gtid_consistency=ON`; every
+other target keeps the file+position source. Three properties make this the
+safe default:
 
-- **It only takes effect where the target has GTIDs enabled.** With the flag
-  on, SchemaBot probes each target before every run and uses the GTID source
-  only where `gtid_mode=ON` and `enforce_gtid_consistency=ON`; every other
-  target keeps the file+position source. That per-target selection makes the
-  flag safe to enable on a mixed fleet, but it does nothing for a target until
-  GTIDs are enabled on the MySQL server itself. If the probe cannot reach the
-  target it logs a warning and falls back to the file+position source rather
-  than failing the apply.
-- **Checkpoints do not carry across a source switch.** A schema change's
-  resume checkpoint records its bookmark in the format of the change source
-  that wrote it. If the effective source changes between a stop and a resume —
-  the flag is toggled, or GTIDs are enabled on the target mid-flight — the old
-  checkpoint cannot be read and the schema change restarts its copy from the
-  beginning. That is safe but loses copy progress, so avoid flipping the flag
-  while applies are in flight.
-- **The mode is experimental.** This maps to Spirit's `EnableExperimentalGTID`
-  setting — a newer code path than the long-standing file+position source,
-  which is why it is off by default and opt-in per deployment.
+- **Targets without GTIDs are completely unaffected.** The GTID source is
+  never forced onto a target that cannot serve it — a target running without
+  GTIDs behaves exactly as if the setting were off. If the probe cannot reach
+  the target, SchemaBot logs a warning and falls back to file+position rather
+  than failing the apply. Nothing breaks for deployments that do not use
+  GTIDs.
+- **It is forward compatible with a GTID migration.** When a target enables
+  GTIDs later, subsequent schema changes automatically pick up the GTID
+  source with no configuration change. One transition note: a schema change's
+  resume checkpoint records its bookmark in the format of the source that
+  wrote it, so a schema change that is stopped when the target's source
+  changes restarts its copy from the beginning instead of resuming — safe,
+  but copy progress is lost. Prefer enabling GTIDs on a target while no
+  schema change is in flight on it.
+- **A missed write cannot survive to cutover.** Whichever source is used,
+  Spirit checksums the old and new tables before cutover, so a change-source
+  problem surfaces as a failed apply — never as silent data divergence.
+
+Set `enable_experimental_gtid: false` as the operator kill switch to keep
+every target on binlog file+position — for example if the GTID source
+misbehaves on a target fleet. The same checkpoint transition note applies when
+flipping the switch while applies are in flight. The setting maps to Spirit's
+`EnableExperimentalGTID` option.
 
 ## Storage Schema Changes
 

@@ -260,14 +260,15 @@ type SpiritConfig struct {
 	// autoscaling misbehaves on a target fleet.
 	EnableExperimentalAutoscaling *bool `yaml:"enable_experimental_autoscaling"`
 
-	// EnableExperimentalGTID opts in to Spirit's GTID-based change source,
-	// which tracks replication position across binlog rotation and failover
-	// more robustly than binlog file+position. Defaults to false: every
-	// target uses the universally supported binlog file+position source.
-	// Enabling it only takes effect on targets running with gtid_mode=ON and
-	// enforce_gtid_consistency=ON — the engine probes each target and any
-	// target without GTIDs keeps the binlog file+position source, so the flag
-	// is safe to enable on a mixed fleet.
+	// EnableExperimentalGTID controls whether Spirit may use its GTID-based
+	// change source, which tracks replication position across binlog rotation
+	// and failover more robustly than binlog file+position. Defaults to true
+	// when not configured (nil = enabled), which is safe on any fleet: the
+	// engine probes each target and only targets running gtid_mode=ON and
+	// enforce_gtid_consistency=ON get the GTID source. A target without GTIDs
+	// keeps the binlog file+position source and picks up the GTID source
+	// automatically once GTIDs are enabled on it. Set false as the operator
+	// kill switch to keep every target on binlog file+position.
 	EnableExperimentalGTID *bool `yaml:"enable_experimental_gtid"`
 
 	// CheckpointMaxAge bounds how old a Spirit checkpoint may be and still be

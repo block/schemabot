@@ -57,15 +57,16 @@ func (e *Engine) newSpiritMigration(ctx context.Context, host, username, passwor
 
 // useGTIDChangeSource reports whether this run should use Spirit's GTID-based
 // change source, which tracks replication position across binlog rotation and
-// failover more robustly than binlog file+position. The source is opt-in via
-// Settings.EnableExperimentalGTID and, even when enabled, is still chosen per
+// failover more robustly than binlog file+position. The source is chosen per
 // target: Spirit refuses to start when the GTID source is requested on a
 // target without gtid_mode=ON, so only targets with gtid_mode=ON and
 // enforce_gtid_consistency=ON get the stronger source and every other target
 // keeps the universally supported binlog file+position source.
+// Settings.EnableExperimentalGTID set to false is the operator kill switch
+// that skips the probe and keeps every target on binlog file+position.
 func (e *Engine) useGTIDChangeSource(ctx context.Context, host, username, password, database string) bool {
 	if !e.gtid {
-		e.logger.Debug("GTID change source not enabled in settings, using the binlog file+position change source",
+		e.logger.Debug("GTID change source disabled in settings, using the binlog file+position change source",
 			"host", host, "database", database)
 		return false
 	}

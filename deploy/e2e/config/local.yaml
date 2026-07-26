@@ -10,11 +10,6 @@
 storage:
   dsn: "env:MYSQL_DSN"
 
-# Opt in to Spirit's GTID-based change source. The e2e MySQL targets run with
-# gtid_mode=ON, so applies exercise the GTID source end-to-end.
-spirit:
-  enable_experimental_gtid: true
-
 # Database configurations (source of truth)
 # In local mode, SchemaBot uses embedded Tern to manage these databases.
 # Staging and production use separate MySQL instances (different hosts),
