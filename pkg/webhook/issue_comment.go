@@ -123,6 +123,14 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
+	// Every command response below — acknowledgment reactions, usage-error
+	// comments, and dispatched work alike — needs the installation ID, so a
+	// delivery without one is rejected before any command handling.
+	if installationID == 0 {
+		h.writeError(w, http.StatusBadRequest, "missing installation ID in webhook payload")
+		return
+	}
+
 	if result.TenantError {
 		h.logger.Info("ignoring command with invalid tenant flag",
 			"repo", repo, "pr", pr, "action", result.Action)
@@ -297,11 +305,6 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		}
 		h.postComment(repo, pr, installationID, templates.RenderInvalidCommand())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "invalid command"})
-		return
-	}
-
-	if installationID == 0 {
-		h.writeError(w, http.StatusBadRequest, "missing installation ID in webhook payload")
 		return
 	}
 
