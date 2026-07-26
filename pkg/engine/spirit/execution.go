@@ -362,6 +362,9 @@ func (e *Engine) executeSingleStatement(ctx context.Context, host, username, pas
 	if err != nil {
 		return fmt.Errorf("create runner: %w", err)
 	}
+	// Use spiritLogger so Spirit's log lines reach the apply log stream and
+	// respect the runtime debug-log filter, same as the ALTER path.
+	runner.SetLogger(e.spiritLogger.With("database", database))
 	// Run opens the runner's connection pool and background routines; they are
 	// only released by Close. Close on every return path so each single DDL
 	// statement leaves no leaked connections or goroutines behind.
