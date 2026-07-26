@@ -240,12 +240,11 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		"dry_run", c.dryRun,
 		"kept", kept,
 		"skipped_unparseable", skipped,
-		"pruned_intents", prunedIntents,
 	}
 	if c.dryRun {
-		attrs = append(attrs, "would_drop", wouldDrop)
+		attrs = append(attrs, "would_drop", wouldDrop, "would_prune_intents", prunedIntents)
 	} else {
-		attrs = append(attrs, "dropped", dropped)
+		attrs = append(attrs, "dropped", dropped, "pruned_intents", prunedIntents)
 	}
 	c.logger.Info("pending drops cleanup pass complete", attrs...)
 	if dropErr != nil {

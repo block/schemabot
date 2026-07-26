@@ -129,7 +129,8 @@ func ensureQuarantineSchema(ctx context.Context, db *sql.DB) error {
   `+"`quarantine_table`"+` varchar(64) NOT NULL,
   `+"`created_at`"+` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`+"`id`"+`),
-  KEY `+"`idx_source`"+` (`+"`source_schema`"+`,`+"`source_table`"+`)
+  KEY `+"`idx_source`"+` (`+"`source_schema`"+`,`+"`source_table`"+`),
+  KEY `+"`idx_created_at`"+` (`+"`created_at`"+`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 		quoteIdentifier(Database), quoteIdentifier(IntentsTable))
 	if _, err := db.ExecContext(ctx, createIntents); err != nil {
