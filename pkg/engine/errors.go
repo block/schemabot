@@ -79,6 +79,14 @@ func IsAlreadyCompleted(err error) bool {
 // IsRetryable returns true if the error should be retried by the operator.
 // All errors are retryable by default, and engines explicitly wrap only
 // permanent errors with PermanentError.
+//
+// AlreadyCompletedError deliberately stays retryable here even though the
+// rejected operation can never succeed: callers treat a non-retryable error as
+// a permanent failure, and recording a failure for a schema change that
+// already landed would misrepresent the target. Paths that can receive an
+// already-completed rejection must reconcile to the completed outcome via
+// IsAlreadyCompleted instead; anywhere that doesn't, retrying keeps the stored
+// state honest until a drive that reconciles picks it up.
 func IsRetryable(err error) bool {
 	if err == nil {
 		return false

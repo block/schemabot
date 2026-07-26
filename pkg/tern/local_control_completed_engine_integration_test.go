@@ -75,6 +75,7 @@ func TestLocalClient_CancelAfterEngineChangeCompletedSettlesCompleted(t *testing
 	require.Len(t, settledTasks, 1)
 	assert.Equal(t, state.Task.Completed, settledTasks[0].State,
 		"the task must adopt the engine's completed outcome, not cancelled")
+	assert.Equal(t, 100, settledTasks[0].ProgressPercent, "a completed task reports full progress")
 	assert.NotNil(t, settledTasks[0].CompletedAt, "a completed task must carry its completion time")
 
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestCompleted)

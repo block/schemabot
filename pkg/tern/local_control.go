@@ -1511,6 +1511,7 @@ func (c *LocalClient) settleControlForCompletedEngineChange(ctx context.Context,
 			skippedCount++
 			continue
 		}
+		task.ProgressPercent = 100
 		task.CompletedAt = &now
 		c.transitionTaskState(ctx, task, task.ApplyID, state.Task.Completed,
 			fmt.Sprintf("Task %s completed on the engine before the %s took effect", task.TaskIdentifier, operation))
