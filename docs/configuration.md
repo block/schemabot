@@ -351,6 +351,51 @@ duration must be positive, and `max_idle_conns` must not exceed a positive
 `max_open_conns`; SchemaBot rejects violations at config load rather than
 silently reverting to a default.
 
+## Spirit Run Settings
+
+For MySQL databases this server drives directly, the Spirit engine runs every
+schema change with a set of production-proven defaults. The `spirit:` block
+exists only to *deviate* from them — leave it out entirely to run with the
+defaults below.
+
+```yaml
+spirit:
+  enable_experimental_autoscaling: true  # default: true
+  checkpoint_max_age: 72h                # default: 72h (3 days)
+  checksum_yield_timeout: 12h            # default: 12h
+```
+
+The defaults, and why they were chosen:
+
+- **Write threads are auto-sized and autoscaled** (not configurable as a fixed
+  count). Spirit starts write threads at a size appropriate for the target
+  instance and, with `enable_experimental_autoscaling` on, scales them
+  dynamically from throttler feedback. A fixed thread count is the classic
+  failure mode on large targets — throughput that made sense on one instance
+  class silently starves or overloads another. The operator control for copy
+  aggressiveness is the apply's `volume`, not a thread count. Set
+  `enable_experimental_autoscaling: false` only as an incident kill switch when
+  autoscaling misbehaves on a target fleet.
+- **`checkpoint_max_age: 72h`** — a checkpoint older than this is not resumed;
+  the copy restarts cleanly instead of replaying days of old binlogs, which on
+  a busy target is slower and riskier than starting over.
+- **`checksum_yield_timeout: 12h`** — each checksum read transaction yields its
+  `REPEATABLE READ` snapshot within this bound so a long checksum cannot pin
+  InnoDB purge and degrade the whole target instance.
+- **GTID change source is auto-detected** (no knob). Targets running with
+  `gtid_mode=ON` and `enforce_gtid_consistency=ON` get Spirit's GTID-based
+  change source, which tracks replication position across binlog rotation and
+  failover more robustly than binlog file+position; every other target keeps
+  the universally supported file+position source.
+
+A database can override the server-level value by setting the same key
+(`enable_experimental_autoscaling`, `checkpoint_max_age`,
+`checksum_yield_timeout`) in its own metadata; the database's entry wins.
+
+These settings only apply where this server constructs the Spirit engine
+itself — local-mode MySQL databases. Databases routed to a remote deployment
+over gRPC run with that deployment's engine settings.
+
 ## Storage Schema Changes
 
 SchemaBot's internal storage schema is self-bootstrapping: on every startup,

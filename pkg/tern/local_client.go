@@ -147,7 +147,10 @@ type LocalConfig struct {
 	// Keys used by PlanetScale: organization, token_name, token_value,
 	// tls_name, revert_window_duration, main_branch.
 	// Keys used by Spirit: pending_drops ("false" disables the pending drops
-	// quarantine so DROP TABLE executes directly).
+	// quarantine so DROP TABLE executes directly), plus the run-settings
+	// overrides parsed by spirit.SettingsFromMetadata
+	// (enable_experimental_autoscaling, checkpoint_max_age,
+	// checksum_yield_timeout).
 	Metadata map[string]string
 
 	// SchemaOverrides maps a requested (canonical) MySQL namespace to the
@@ -282,6 +285,11 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 		customEngine = eng
 	}
 
+	spiritSettings, err := spirit.SettingsFromMetadata(cfg.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("parse Spirit settings for database %q: %w", cfg.Database, err)
+	}
+
 	return &LocalClient{
 		config:  cfg,
 		storage: stor,
@@ -290,6 +298,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 			// Pending drops quarantine is on by default; deployments opt out
 			// via the pending_drops metadata key.
 			DisablePendingDrops: cfg.Metadata["pending_drops"] == "false",
+			Settings:            spiritSettings,
 		}),
 		planetscaleEngine: psEngine,
 		customEngine:      customEngine,

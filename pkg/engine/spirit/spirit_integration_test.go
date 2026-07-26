@@ -2268,3 +2268,81 @@ func TestEngine_StatelessControlAddressesDSNSchema(t *testing.T) {
 	require.NoError(t, err, "deferred cutover signal lookup after cutover")
 	assert.False(t, exists, "signal is reported absent after the sentinel drop")
 }
+
+// TestNewSpiritMigrationRunSettings verifies the Spirit run settings applied to
+// every schema change this engine starts: the fleet defaults resolve when the
+// engine is built without overrides, metadata overrides carry through, and the
+// change source is selected per target capability — the shared test container
+// runs without gtid_mode=ON, so the universally supported binlog file+position
+// source is chosen instead of the GTID source Spirit would refuse to start on
+// this target.
+func TestNewSpiritMigrationRunSettings(t *testing.T) {
+	dsn, _ := setupTestMySQL(t)
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	eng := New(Config{})
+	m := eng.newSpiritMigration(t.Context(), host, username, password, database, "ALTER TABLE t1 ADD COLUMN c1 INT")
+	assert.Equal(t, DefaultCheckpointMaxAge, m.CheckpointMaxAge)
+	assert.Equal(t, DefaultChecksumYieldTimeout, m.ChecksumYieldTimeout)
+	assert.True(t, m.EnableExperimentalAutoscaling, "autoscaling defaults to enabled")
+	assert.True(t, m.InterpolateParams)
+	assert.Zero(t, m.WriteThreads, "write threads auto-size for the target")
+	assert.Equal(t, maxCommitLatency, m.MaxCommitLatency,
+		"commit-latency throttle must be set explicitly; Spirit disables the throttler on zero")
+	assert.False(t, m.EnableExperimentalGTID, "GTID-off target keeps the binlog file+position change source")
+
+	settings, err := SettingsFromMetadata(map[string]string{
+		MetadataEnableExperimentalAutoscaling: "false",
+		MetadataCheckpointMaxAge:              "24h",
+		MetadataChecksumYieldTimeout:          "6h",
+	})
+	require.NoError(t, err, "SettingsFromMetadata")
+	eng = New(Config{Settings: settings})
+	m = eng.newSpiritMigration(t.Context(), host, username, password, database, "ALTER TABLE t1 ADD COLUMN c1 INT")
+	assert.Equal(t, 24*time.Hour, m.CheckpointMaxAge)
+	assert.Equal(t, 6*time.Hour, m.ChecksumYieldTimeout)
+	assert.False(t, m.EnableExperimentalAutoscaling, "autoscaling override disables it")
+}
+
+// TestNewSpiritMigrationGTIDChangeSource verifies per-target change-source
+// selection against a target that actually runs with gtid_mode=ON and
+// enforce_gtid_consistency=ON: such a target gets the GTID-based change
+// source. Uses a dedicated GTID-enabled MySQL container because the shared
+// container runs without GTIDs.
+func TestNewSpiritMigrationGTIDChangeSource(t *testing.T) {
+	req := testcontainers.ContainerRequest{
+		Image:        "mysql:8.0",
+		ExposedPorts: []string{"3306/tcp"},
+		Cmd:          []string{"--gtid-mode=ON", "--enforce-gtid-consistency=ON"},
+		Env: map[string]string{
+			"MYSQL_ROOT_PASSWORD": "testpassword",
+			"MYSQL_DATABASE":      "testdb",
+		},
+		WaitingFor: wait.ForAll(
+			wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(30*time.Second),
+			wait.ForListeningPort("3306/tcp"),
+		),
+	}
+	container, err := testcontainers.GenericContainer(t.Context(), testcontainers.GenericContainerRequest{
+		ContainerRequest: req,
+		Started:          true,
+	})
+	require.NoError(t, err, "start GTID-enabled mysql container")
+	t.Cleanup(func() {
+		if err := container.Terminate(t.Context()); err != nil {
+			t.Logf("warning: terminate GTID-enabled mysql container: %v", err)
+		}
+	})
+
+	host, err := testutil.ContainerHost(t.Context(), container)
+	require.NoError(t, err, "container host")
+	port, err := testutil.ContainerPort(t.Context(), container, "3306")
+	require.NoError(t, err, "container port")
+	addr := fmt.Sprintf("%s:%d", host, port)
+
+	eng := New(Config{})
+	m := eng.newSpiritMigration(t.Context(), addr, "root", "testpassword", "testdb", "ALTER TABLE t1 ADD COLUMN c1 INT")
+	assert.True(t, m.EnableExperimentalGTID,
+		"GTID-capable target gets the GTID change source")
+}

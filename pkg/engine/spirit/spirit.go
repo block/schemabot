@@ -59,7 +59,13 @@ type Engine struct {
 	lockWaitTimeout     time.Duration
 	debugLogs           bool
 	disablePendingDrops bool
-	cpuHint             int // Inferred CPU count from innodb_buffer_pool_instances (0 = unknown); guarded by mu
+
+	// Resolved Settings applied to every Spirit run; immutable after New.
+	checkpointMaxAge     time.Duration
+	checksumYieldTimeout time.Duration
+	autoscaling          bool
+
+	cpuHint int // Inferred CPU count from innodb_buffer_pool_instances (0 = unknown); guarded by mu
 
 	// Log callback for routing Spirit logs to ApplyLogStore (with table context)
 	onLog func(level slog.Level, table, msg string)
@@ -122,6 +128,10 @@ type Config struct {
 	// default because it keeps dropped table data recoverable until the
 	// retention period expires.
 	DisablePendingDrops bool
+
+	// Settings tunes the Spirit runs the engine starts; zero-value fields
+	// resolve to the fleet defaults (see settings.go).
+	Settings Settings
 }
 
 // New creates a new Spirit engine.
@@ -146,14 +156,29 @@ func New(cfg Config) *Engine {
 		lockWaitTimeout = DefaultLockWaitTimeout
 	}
 
+	checkpointMaxAge := cfg.Settings.CheckpointMaxAge
+	if checkpointMaxAge == 0 {
+		checkpointMaxAge = DefaultCheckpointMaxAge
+	}
+
+	checksumYieldTimeout := cfg.Settings.ChecksumYieldTimeout
+	if checksumYieldTimeout == 0 {
+		checksumYieldTimeout = DefaultChecksumYieldTimeout
+	}
+
+	autoscaling := cfg.Settings.EnableExperimentalAutoscaling == nil || *cfg.Settings.EnableExperimentalAutoscaling
+
 	eng := &Engine{
-		logger:              logger,
-		linter:              lint.New(),
-		targetChunkTime:     targetChunkTime,
-		threads:             threads,
-		lockWaitTimeout:     lockWaitTimeout,
-		debugLogs:           cfg.DebugLogs,
-		disablePendingDrops: cfg.DisablePendingDrops,
+		logger:               logger,
+		linter:               lint.New(),
+		targetChunkTime:      targetChunkTime,
+		threads:              threads,
+		lockWaitTimeout:      lockWaitTimeout,
+		debugLogs:            cfg.DebugLogs,
+		disablePendingDrops:  cfg.DisablePendingDrops,
+		checkpointMaxAge:     checkpointMaxAge,
+		checksumYieldTimeout: checksumYieldTimeout,
+		autoscaling:          autoscaling,
 	}
 
 	// Create Spirit logger with filter that checks debugLogs at runtime
