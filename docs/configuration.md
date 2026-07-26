@@ -383,9 +383,10 @@ The defaults, and why they were chosen:
   `REPEATABLE READ` snapshot within this bound so a long checksum cannot pin
   InnoDB purge and degrade the whole target instance.
 - **GTID change source is auto-detected** (no knob). Targets running with
-  GTIDs enabled get Spirit's GTID-based change source; every other target
-  keeps the universally supported binlog file+position source. See
-  [GTID change source](#gtid-change-source) below.
+  `gtid_mode=ON` and `enforce_gtid_consistency=ON` get Spirit's GTID-based
+  change source, which tracks replication position across binlog rotation and
+  failover more robustly than binlog file+position; every other target keeps
+  the universally supported file+position source.
 
 A database can override the server-level value by setting the same key
 (`enable_experimental_autoscaling`, `checkpoint_max_age`,
@@ -394,53 +395,6 @@ A database can override the server-level value by setting the same key
 These settings only apply where this server constructs the Spirit engine
 itself — local-mode MySQL databases. Databases routed to a remote deployment
 over gRPC run with that deployment's engine settings.
-
-### GTID change source
-
-While a schema change copies a table, Spirit simultaneously follows the
-target's replication stream so writes that land during the copy are applied to
-the new table too. The *change source* is Spirit's bookmark into that stream,
-and it comes in two kinds:
-
-- **Binlog file+position:** the bookmark is a binlog file name plus an offset
-  within it. This works on every MySQL target, but it is tied to one server's
-  binlog files. If the binlogs the bookmark points at are purged before a
-  stalled schema change resumes, or the target fails over to a replica (whose
-  binlog files are numbered differently), the saved position no longer exists
-  and the schema change restarts its copy from the beginning instead of
-  resuming.
-- **GTID set:** GTIDs (global transaction identifiers) name each transaction
-  globally rather than by its offset in a specific file, so the bookmark
-  stays valid across binlog rotation and failover, and an interrupted schema
-  change can resume where it left off in situations where the file+position
-  source would have to start over. The GTID source requires `gtid_mode=ON`
-  and `enforce_gtid_consistency=ON` on the target MySQL server — Spirit
-  refuses to start it anywhere else.
-
-SchemaBot chooses the source per target automatically — there is nothing to
-configure. Before every run it probes the target and uses the GTID source only
-where `gtid_mode=ON` and `enforce_gtid_consistency=ON`; every other target
-keeps the file+position source. Three properties make this safe:
-
-- **Targets without GTIDs are completely unaffected.** The GTID source is
-  never forced onto a target that cannot serve it. If the probe cannot reach
-  the target, SchemaBot logs a warning and falls back to file+position rather
-  than failing the apply. Nothing breaks for deployments that do not use
-  GTIDs.
-- **It is forward compatible with a GTID migration.** When a target enables
-  GTIDs later, subsequent schema changes automatically pick up the GTID
-  source with no configuration change. One transition note: a schema change's
-  resume checkpoint records its bookmark in the format of the source that
-  wrote it, so a schema change that is stopped when the target's source
-  changes restarts its copy from the beginning instead of resuming — safe,
-  but copy progress is lost. Prefer enabling GTIDs on a target while no
-  schema change is in flight on it.
-- **A missed write cannot survive to cutover.** Whichever source is used,
-  Spirit checksums the old and new tables before cutover, so a change-source
-  problem surfaces as a failed apply — never as silent data divergence.
-
-Under the hood this enables Spirit's `EnableExperimentalGTID` option on
-GTID-capable targets.
 
 ## Storage Schema Changes
 
