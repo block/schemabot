@@ -383,6 +383,7 @@ type fakeControlEngine struct {
 	cancelCount             int
 	startCount              int
 	cutoverCount            int
+	volumeCount             int
 	cutoverResult           *engine.ControlResult
 	cutoverErr              error
 	progressReq             *engine.ProgressRequest
@@ -457,6 +458,7 @@ func (e *fakeControlEngine) SkipRevert(context.Context, *engine.ControlRequest) 
 }
 
 func (e *fakeControlEngine) Volume(context.Context, *engine.VolumeRequest) (*engine.VolumeResult, error) {
+	e.volumeCount++
 	return &engine.VolumeResult{Accepted: true}, nil
 }
 
