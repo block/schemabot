@@ -19,7 +19,7 @@ import (
 // All DDL statements (CREATE, DROP, ALTER, RENAME) are passed through Spirit.
 // Spirit requires non-ALTER statements to be executed individually (not combined).
 // ALTER statements can be combined for atomic multi-table schema changes.
-func (e *Engine) executeSchemaChange(ctx context.Context, host, username, password, database string, ddlStatements []string, deferCutover bool) {
+func (e *Engine) executeSchemaChange(ctx context.Context, host, username, password, database string, ddlStatements []string, deferCutover bool, runIdentifier string) {
 	phases, err := classifyDDLPhases(ddlStatements)
 	if err != nil {
 		e.logger.Error("failed to classify statement", "error", err)
@@ -42,7 +42,7 @@ func (e *Engine) executeSchemaChange(ctx context.Context, host, username, passwo
 	// Execute DROP TABLE statements last. By default each table is quarantined
 	// in the pending drops database instead of dropped; when pending drops is
 	// disabled the DROP runs directly through Spirit.
-	if !e.executeDropStatements(ctx, host, username, password, database, phases.drops) {
+	if !e.executeDropStatements(ctx, host, username, password, database, phases.drops, runIdentifier) {
 		return
 	}
 
@@ -71,9 +71,9 @@ func (e *Engine) executeSchemaChange(ctx context.Context, host, username, passwo
 // phase, so once an ALTER has started they are already applied; only the DROP
 // phase remains and must run after the resumed ALTER completes. When no ALTER was
 // in flight, the whole plan is run from the start.
-func (e *Engine) resumeSchemaChange(ctx context.Context, host, username, password, database string, originalDDLs []string, combinedStatement string, deferCutover bool) {
+func (e *Engine) resumeSchemaChange(ctx context.Context, host, username, password, database string, originalDDLs []string, combinedStatement string, deferCutover bool, runIdentifier string) {
 	if combinedStatement == "" {
-		e.executeSchemaChange(ctx, host, username, password, database, originalDDLs, deferCutover)
+		e.executeSchemaChange(ctx, host, username, password, database, originalDDLs, deferCutover, runIdentifier)
 		return
 	}
 
@@ -98,7 +98,7 @@ func (e *Engine) resumeSchemaChange(ctx context.Context, host, username, passwor
 		return
 	}
 
-	if !e.executeDropStatements(ctx, host, username, password, database, phases.drops) {
+	if !e.executeDropStatements(ctx, host, username, password, database, phases.drops, runIdentifier) {
 		return
 	}
 
@@ -215,22 +215,22 @@ func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password
 // phase call this helper, so a resumed DROP quarantines exactly like an initial
 // one. It returns false when execution should stop: a cancelled context leaves
 // the state Stopped, a genuine failure transitions to StateFailed.
-func (e *Engine) executeDropStatements(ctx context.Context, host, username, password, database string, drops []string) bool {
+func (e *Engine) executeDropStatements(ctx context.Context, host, username, password, database string, drops []string, runIdentifier string) bool {
 	return e.runStatementPhase(ctx, database, "DROP TABLE", "DROP TABLE phase", drops, func(ctx context.Context, stmt string) error {
-		return e.executeDropStatement(ctx, host, username, password, database, stmt)
+		return e.executeDropStatement(ctx, host, username, password, database, stmt, runIdentifier)
 	})
 }
 
 // executeDropStatement runs a single DROP TABLE statement, quarantining the
 // table by default and dropping it directly only when pending drops is disabled.
-func (e *Engine) executeDropStatement(ctx context.Context, host, username, password, database, stmt string) error {
+func (e *Engine) executeDropStatement(ctx context.Context, host, username, password, database, stmt, runIdentifier string) error {
 	if e.disablePendingDrops {
 		if err := e.executeSingleStatement(ctx, host, username, password, database, stmt); err != nil {
 			return fmt.Errorf("drop table directly: %w", err)
 		}
 		return nil
 	}
-	if err := e.quarantineDroppedTables(ctx, host, username, password, database, stmt); err != nil {
+	if err := e.quarantineDroppedTables(ctx, host, username, password, database, stmt, runIdentifier); err != nil {
 		return fmt.Errorf("quarantine dropped table: %w", err)
 	}
 	return nil

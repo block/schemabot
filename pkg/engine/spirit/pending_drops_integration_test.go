@@ -49,7 +49,7 @@ func listQuarantinedTables(t *testing.T, db *sql.DB) []string {
 
 // runDDLApply runs DDL statements through the engine and returns the final
 // engine state.
-func runDDLApply(t *testing.T, eng *Engine, dsn string, ddlStatements []string) engine.State {
+func runDDLApply(t *testing.T, eng *Engine, dsn string, ddlStatements []string, runIdentifier string) engine.State {
 	t.Helper()
 
 	host, username, password, database, err := parseDSN(dsn)
@@ -57,13 +57,14 @@ func runDDLApply(t *testing.T, eng *Engine, dsn string, ddlStatements []string) 
 
 	eng.mu.Lock()
 	eng.runningSchemaChange = &runningSchemaChange{
-		database: database,
-		state:    engine.StateRunning,
-		started:  time.Now(),
+		database:      database,
+		state:         engine.StateRunning,
+		started:       time.Now(),
+		runIdentifier: runIdentifier,
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, runIdentifier)
 
 	eng.mu.Lock()
 	defer eng.mu.Unlock()
@@ -91,7 +92,7 @@ func TestEngine_ExecuteSchemaChange_DropTableQuarantines(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{Logger: logger})
 
-	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE `drop_me`"})
+	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE `drop_me`"}, "apply-quarantine-run")
 	assert.Equal(t, engine.StateCompleted, state)
 
 	// The table is gone from the target database.
@@ -140,12 +141,12 @@ func TestEngine_ExecuteSchemaChange_DropTableRerunAfterQuarantineConverges(t *te
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{Logger: logger})
 
-	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE `drop_rerun`"})
+	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE `drop_rerun`"}, "apply-rerun")
 	require.Equal(t, engine.StateCompleted, state, "the first run quarantines the table")
 	firstQuarantined := listQuarantinedTables(t, db)
 	require.Len(t, firstQuarantined, 1)
 
-	state = runDDLApply(t, eng, dsn, []string{"DROP TABLE `drop_rerun`"})
+	state = runDDLApply(t, eng, dsn, []string{"DROP TABLE `drop_rerun`"}, "apply-rerun")
 	assert.Equal(t, engine.StateCompleted, state, "the re-run converges on the recorded quarantine")
 
 	quarantined := listQuarantinedTables(t, db)
@@ -159,6 +160,36 @@ func TestEngine_ExecuteSchemaChange_DropTableRerunAfterQuarantineConverges(t *te
 	assert.Equal(t, 10, rowCount, "the quarantined table keeps its data across the re-run")
 }
 
+// A quarantine recorded by one apply proves nothing to another: when a
+// different run re-executes the same DROP against a missing source, the
+// same-named quarantined copy holds the earlier apply's data, so the run
+// fails closed instead of claiming that copy as its own executed drop.
+func TestEngine_ExecuteSchemaChange_DropTableForeignRunQuarantineFailsClosed(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE drop_foreign (
+		id INT PRIMARY KEY AUTO_INCREMENT
+	)`)
+	require.NoError(t, err, "create table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE `drop_foreign`"}, "apply-earlier-run")
+	require.Equal(t, engine.StateCompleted, state, "the earlier run quarantines the table")
+	quarantined := listQuarantinedTables(t, db)
+	require.Len(t, quarantined, 1)
+
+	state = runDDLApply(t, eng, dsn, []string{"DROP TABLE `drop_foreign`"}, "apply-later-run")
+	assert.Equal(t, engine.StateFailed, state, "a different run must not claim the earlier run's quarantine as proof")
+
+	afterQuarantined := listQuarantinedTables(t, db)
+	require.Len(t, afterQuarantined, 1, "the failed run must not touch the earlier quarantine")
+	assert.Equal(t, quarantined[0], afterQuarantined[0], "the earlier run's quarantined copy is untouched")
+}
+
 // A DROP TABLE target that is missing with no recorded quarantine is drift
 // from outside SchemaBot: the statement fails closed instead of reporting the
 // drop as executed with no preserved copy to point at.
@@ -170,7 +201,7 @@ func TestEngine_ExecuteSchemaChange_DropTableMissingWithoutRecordFails(t *testin
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{Logger: logger})
 
-	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE `never_there`"})
+	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE `never_there`"}, "apply-missing-run")
 	assert.Equal(t, engine.StateFailed, state, "an unexplained missing target must fail closed")
 
 	quarantined := listQuarantinedTables(t, db)
@@ -192,7 +223,7 @@ func TestEngine_ExecuteSchemaChange_DropTableDisabled(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{Logger: logger, DisablePendingDrops: true})
 
-	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE `drop_me_direct`"})
+	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE `drop_me_direct`"}, "apply-direct-run")
 	assert.Equal(t, engine.StateCompleted, state)
 
 	var count int
@@ -219,7 +250,7 @@ func TestEngine_ExecuteSchemaChange_DropTableIfExistsMissing(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{Logger: logger})
 
-	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE IF EXISTS `never_existed`"})
+	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE IF EXISTS `never_existed`"}, "apply-ifexists-run")
 	assert.Equal(t, engine.StateCompleted, state)
 
 	quarantined := listQuarantinedTables(t, db)
@@ -249,7 +280,7 @@ func TestEngine_ExecuteSchemaChange_DropTableMultiTableFailureIsAtomic(t *testin
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{Logger: logger})
 
-	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE `keep_on_failure`, `missing_table`"})
+	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE `keep_on_failure`, `missing_table`"}, "apply-partial-run")
 	assert.Equal(t, engine.StateFailed, state)
 
 	var count int
@@ -287,7 +318,7 @@ func TestEngine_ExecuteSchemaChange_DropViewExecutesDirectly(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{Logger: logger})
 
-	state := runDDLApply(t, eng, dsn, []string{"DROP VIEW `drop_view_target`"})
+	state := runDDLApply(t, eng, dsn, []string{"DROP VIEW `drop_view_target`"}, "apply-view-run")
 	assert.Equal(t, engine.StateCompleted, state)
 
 	var count int
@@ -311,7 +342,7 @@ func TestEngine_ExecuteSchemaChange_DropTemporaryTableExecutesDirectly(t *testin
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{Logger: logger})
 
-	state := runDDLApply(t, eng, dsn, []string{"DROP TEMPORARY TABLE IF EXISTS `drop_temp_target`"})
+	state := runDDLApply(t, eng, dsn, []string{"DROP TEMPORARY TABLE IF EXISTS `drop_temp_target`"}, "apply-temp-run")
 	assert.Equal(t, engine.StateCompleted, state)
 
 	quarantined := listQuarantinedTables(t, db)

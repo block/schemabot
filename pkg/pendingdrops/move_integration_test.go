@@ -34,11 +34,11 @@ func TestMoveTables_RecordsIntentAndAlreadyQuarantinedFindsIt(t *testing.T) {
 	createSourceTable(t, db, "move_ledger_source")
 
 	moved, err := MoveTables(t.Context(), db,
-		[]TableMove{{SchemaName: "testdb", TableName: "move_ledger_source"}}, time.Now())
+		[]TableMove{{SchemaName: "testdb", TableName: "move_ledger_source"}}, "apply-ledger-run", time.Now())
 	require.NoError(t, err)
 	require.Len(t, moved, 1)
 
-	quarantineTable, quarantined, err := AlreadyQuarantined(t.Context(), db, "testdb", "move_ledger_source")
+	quarantineTable, quarantined, err := AlreadyQuarantined(t.Context(), db, "testdb", "move_ledger_source", "apply-ledger-run")
 	require.NoError(t, err)
 	assert.True(t, quarantined, "a moved table must be provable as quarantined")
 	assert.Equal(t, moved[0].QuarantineTable, quarantineTable,
@@ -50,7 +50,7 @@ func TestMoveTables_RecordsIntentAndAlreadyQuarantinedFindsIt(t *testing.T) {
 func TestAlreadyQuarantined_NoLedgerReportsNotQuarantined(t *testing.T) {
 	db := setupCleanerTest(t)
 
-	quarantineTable, quarantined, err := AlreadyQuarantined(t.Context(), db, "testdb", "never_moved")
+	quarantineTable, quarantined, err := AlreadyQuarantined(t.Context(), db, "testdb", "never_moved", "apply-ledger-run")
 	require.NoError(t, err)
 	assert.False(t, quarantined)
 	assert.Empty(t, quarantineTable)
@@ -62,10 +62,10 @@ func TestAlreadyQuarantined_NoIntentRowReportsNotQuarantined(t *testing.T) {
 	db := setupCleanerTest(t)
 	createSourceTable(t, db, "move_other_source")
 	_, err := MoveTables(t.Context(), db,
-		[]TableMove{{SchemaName: "testdb", TableName: "move_other_source"}}, time.Now())
+		[]TableMove{{SchemaName: "testdb", TableName: "move_other_source"}}, "apply-ledger-run", time.Now())
 	require.NoError(t, err)
 
-	quarantineTable, quarantined, err := AlreadyQuarantined(t.Context(), db, "testdb", "never_moved")
+	quarantineTable, quarantined, err := AlreadyQuarantined(t.Context(), db, "testdb", "never_moved", "apply-ledger-run")
 	require.NoError(t, err)
 	assert.False(t, quarantined, "another table's quarantine must not count as this table's")
 	assert.Empty(t, quarantineTable)
@@ -78,7 +78,7 @@ func TestAlreadyQuarantined_MissingDestinationReportsNotQuarantined(t *testing.T
 	db := setupCleanerTest(t)
 	createSourceTable(t, db, "move_reclaimed_source")
 	moved, err := MoveTables(t.Context(), db,
-		[]TableMove{{SchemaName: "testdb", TableName: "move_reclaimed_source"}}, time.Now())
+		[]TableMove{{SchemaName: "testdb", TableName: "move_reclaimed_source"}}, "apply-ledger-run", time.Now())
 	require.NoError(t, err)
 	require.Len(t, moved, 1)
 
@@ -86,7 +86,7 @@ func TestAlreadyQuarantined_MissingDestinationReportsNotQuarantined(t *testing.T
 		fmt.Sprintf("DROP TABLE `%s`.`%s`", Database, moved[0].QuarantineTable))
 	require.NoError(t, err, "reclaim the quarantined copy")
 
-	quarantineTable, quarantined, err := AlreadyQuarantined(t.Context(), db, "testdb", "move_reclaimed_source")
+	quarantineTable, quarantined, err := AlreadyQuarantined(t.Context(), db, "testdb", "move_reclaimed_source", "apply-ledger-run")
 	require.NoError(t, err)
 	assert.False(t, quarantined, "a reclaimed destination must not count as quarantined")
 	assert.Empty(t, quarantineTable)
@@ -99,22 +99,69 @@ func TestAlreadyQuarantined_LatestIntentWins(t *testing.T) {
 
 	createSourceTable(t, db, "move_repeat_source")
 	first, err := MoveTables(t.Context(), db,
-		[]TableMove{{SchemaName: "testdb", TableName: "move_repeat_source"}}, time.Now().Add(-time.Hour))
+		[]TableMove{{SchemaName: "testdb", TableName: "move_repeat_source"}}, "apply-ledger-run", time.Now().Add(-time.Hour))
 	require.NoError(t, err)
 	require.Len(t, first, 1)
 
 	_, err = db.ExecContext(t.Context(), "CREATE TABLE `testdb`.`move_repeat_source` (id INT PRIMARY KEY)")
 	require.NoError(t, err, "recreate source table")
 	second, err := MoveTables(t.Context(), db,
-		[]TableMove{{SchemaName: "testdb", TableName: "move_repeat_source"}}, time.Now())
+		[]TableMove{{SchemaName: "testdb", TableName: "move_repeat_source"}}, "apply-ledger-run", time.Now())
 	require.NoError(t, err)
 	require.Len(t, second, 1)
 
-	quarantineTable, quarantined, err := AlreadyQuarantined(t.Context(), db, "testdb", "move_repeat_source")
+	quarantineTable, quarantined, err := AlreadyQuarantined(t.Context(), db, "testdb", "move_repeat_source", "apply-ledger-run")
 	require.NoError(t, err)
 	assert.True(t, quarantined)
 	assert.Equal(t, second[0].QuarantineTable, quarantineTable,
 		"the latest quarantine of the source must win")
+}
+
+// A quarantine recorded by one run proves nothing to another run: a same-named
+// table quarantined by an earlier apply holds that apply's data, so a later
+// apply that finds its source missing must not claim the copy as its own.
+func TestAlreadyQuarantined_ForeignRunIntentDoesNotCount(t *testing.T) {
+	db := setupCleanerTest(t)
+
+	createSourceTable(t, db, "move_foreign_source")
+	moved, err := MoveTables(t.Context(), db,
+		[]TableMove{{SchemaName: "testdb", TableName: "move_foreign_source"}}, "apply-earlier-run", time.Now())
+	require.NoError(t, err)
+	require.Len(t, moved, 1)
+
+	quarantineTable, quarantined, err := AlreadyQuarantined(t.Context(), db, "testdb", "move_foreign_source", "apply-later-run")
+	require.NoError(t, err)
+	assert.False(t, quarantined, "another run's quarantine must not count as this run's")
+	assert.Empty(t, quarantineTable)
+
+	record, found, err := LatestIntent(t.Context(), db, "testdb", "move_foreign_source")
+	require.NoError(t, err)
+	require.True(t, found, "the foreign intent is still visible for diagnostics")
+	assert.Equal(t, "apply-earlier-run", record.RunIdentifier)
+	assert.Equal(t, moved[0].QuarantineTable, record.QuarantineTable)
+	assert.True(t, record.DestinationExists, "the foreign copy still exists and is reported as such")
+}
+
+// LatestIntent reports the reclaimed state of a recorded destination so a
+// fail-closed error can distinguish a surviving copy from a reclaimed one.
+func TestLatestIntent_ReportsReclaimedDestination(t *testing.T) {
+	db := setupCleanerTest(t)
+
+	createSourceTable(t, db, "latest_reclaimed_source")
+	moved, err := MoveTables(t.Context(), db,
+		[]TableMove{{SchemaName: "testdb", TableName: "latest_reclaimed_source"}}, "apply-ledger-run", time.Now())
+	require.NoError(t, err)
+	require.Len(t, moved, 1)
+
+	_, err = db.ExecContext(t.Context(),
+		fmt.Sprintf("DROP TABLE `%s`.`%s`", Database, moved[0].QuarantineTable))
+	require.NoError(t, err, "reclaim the quarantined copy")
+
+	record, found, err := LatestIntent(t.Context(), db, "testdb", "latest_reclaimed_source")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, moved[0].QuarantineTable, record.QuarantineTable)
+	assert.False(t, record.DestinationExists)
 }
 
 // The cleaner prunes intent rows on the same retention schedule as the
@@ -125,13 +172,13 @@ func TestCleaner_PrunesExpiredIntentsKeepsFresh(t *testing.T) {
 
 	createSourceTable(t, db, "prune_expired_source")
 	expired, err := MoveTables(t.Context(), db,
-		[]TableMove{{SchemaName: "testdb", TableName: "prune_expired_source"}}, time.Now().Add(-8*24*time.Hour))
+		[]TableMove{{SchemaName: "testdb", TableName: "prune_expired_source"}}, "apply-ledger-run", time.Now().Add(-8*24*time.Hour))
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
 
 	createSourceTable(t, db, "prune_fresh_source")
 	fresh, err := MoveTables(t.Context(), db,
-		[]TableMove{{SchemaName: "testdb", TableName: "prune_fresh_source"}}, time.Now())
+		[]TableMove{{SchemaName: "testdb", TableName: "prune_fresh_source"}}, "apply-ledger-run", time.Now())
 	require.NoError(t, err)
 	require.Len(t, fresh, 1)
 
@@ -162,7 +209,7 @@ func TestCleaner_DryRunKeepsIntents(t *testing.T) {
 
 	createSourceTable(t, db, "dryrun_intent_source")
 	expired, err := MoveTables(t.Context(), db,
-		[]TableMove{{SchemaName: "testdb", TableName: "dryrun_intent_source"}}, time.Now().Add(-8*24*time.Hour))
+		[]TableMove{{SchemaName: "testdb", TableName: "dryrun_intent_source"}}, "apply-ledger-run", time.Now().Add(-8*24*time.Hour))
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
 

@@ -23,8 +23,11 @@ import (
 // quarantineDroppedTables executes a DROP TABLE statement as a quarantine:
 // every table named in the statement is renamed into the pending drops
 // database instead of being dropped. IF EXISTS semantics are preserved —
-// missing tables are skipped when the statement allows it.
-func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, password, database, stmt string) error {
+// missing tables are skipped when the statement allows it. runIdentifier
+// scopes the quarantine intent ledger to this engine run, so a re-run of the
+// same apply can prove its own rename landed without accepting a same-named
+// quarantine from an unrelated apply as proof.
+func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, password, database, stmt, runIdentifier string) error {
 	parsed, err := statement.New(stmt)
 	if err != nil {
 		return fmt.Errorf("parse DROP TABLE statement: %w", err)
@@ -95,18 +98,19 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 
 		// The DROP phase re-runs in full after a mid-phase interruption (pod
 		// loss, lease handover, a stop landing between the quarantine rename
-		// and completion being recorded). A missing source whose recorded
-		// quarantine destination still exists means this statement already
-		// executed: the table is gone from the source schema and its data is
-		// preserved. A missing source without that proof is drift from
-		// outside SchemaBot and fails closed.
-		quarantineTable, quarantined, err := pendingdrops.AlreadyQuarantined(ctx, db, schemaName, tableName)
+		// and completion being recorded). A missing source whose quarantine
+		// destination was recorded by this same run and still exists means
+		// this statement already executed: the table is gone from the source
+		// schema and its data is preserved. A missing source without that
+		// proof is drift from outside this apply and fails closed — including
+		// when a same-named table was quarantined by a different apply, whose
+		// copy holds that apply's data, not this one's.
+		quarantineTable, quarantined, err := pendingdrops.AlreadyQuarantined(ctx, db, schemaName, tableName, runIdentifier)
 		if err != nil {
 			return fmt.Errorf("look up quarantine record for `%s`.`%s`: %w", schemaName, tableName, err)
 		}
 		if !quarantined {
-			return fmt.Errorf("DROP TABLE target `%s`.`%s` does not exist and has no quarantined copy recorded in `%s`",
-				schemaName, tableName, pendingdrops.Database)
+			return e.missingDropTargetError(ctx, db, schemaName, tableName, runIdentifier)
 		}
 		e.logger.Info("DROP TABLE target already quarantined in pending drops, treating the statement as executed",
 			"database", schemaName,
@@ -117,7 +121,7 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 		e.notifyQuarantineLocation(tableName, pendingdrops.Database, quarantineTable)
 	}
 
-	moved, err := pendingdrops.MoveTables(ctx, db, tables, time.Now())
+	moved, err := pendingdrops.MoveTables(ctx, db, tables, runIdentifier, time.Now())
 	if err != nil {
 		return fmt.Errorf("quarantine DROP TABLE targets: %w", err)
 	}
@@ -132,6 +136,31 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 		metrics.RecordPendingDropMoved(ctx, table.SchemaName)
 	}
 	return nil
+}
+
+// missingDropTargetError builds the fail-closed error for a DROP TABLE target
+// that is missing without proof that this run quarantined it. The causes are
+// distinguished so an operator can act on the message alone: no record at all
+// means the table was removed outside SchemaBot; a record from a different
+// run points at another apply's quarantined copy to reconcile against; a
+// record from this run whose destination is gone means the quarantined copy
+// itself was removed.
+func (e *Engine) missingDropTargetError(ctx context.Context, db *sql.DB, schemaName, tableName, runIdentifier string) error {
+	record, found, err := pendingdrops.LatestIntent(ctx, db, schemaName, tableName)
+	if err != nil {
+		return fmt.Errorf("look up latest quarantine intent for `%s`.`%s`: %w", schemaName, tableName, err)
+	}
+	switch {
+	case !found:
+		return fmt.Errorf("DROP TABLE target `%s`.`%s` does not exist and has no quarantined copy recorded in `%s`",
+			schemaName, tableName, pendingdrops.Database)
+	case record.RunIdentifier != runIdentifier:
+		return fmt.Errorf("DROP TABLE target `%s`.`%s` does not exist; the latest quarantine record in `%s` belongs to a different run (%q, destination `%s` exists: %t), so this run cannot claim it — reconcile the target schema manually",
+			schemaName, tableName, pendingdrops.Database, record.RunIdentifier, record.QuarantineTable, record.DestinationExists)
+	default:
+		return fmt.Errorf("DROP TABLE target `%s`.`%s` does not exist and its recorded quarantine destination `%s`.`%s` is gone — the quarantined copy was removed outside this apply",
+			schemaName, tableName, pendingdrops.Database, record.QuarantineTable)
+	}
 }
 
 // notifyQuarantineLocation routes the quarantine location to the apply log so

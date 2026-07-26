@@ -85,6 +85,12 @@ type runningSchemaChange struct {
 	deferCutover            bool // Whether to defer cutover until manual trigger
 	volumeRestartInProgress bool // Set while stored stopped state should still be exposed as running progress.
 
+	// runIdentifier is the durable identifier of the apply or task run driving
+	// this schema change, carried in on the apply request's resume state. It
+	// scopes the quarantine intent ledger so a DROP-phase re-run only accepts
+	// its own recorded renames as proof.
+	runIdentifier string
+
 	// Spirit copy settings for this schema change. Initialized from the
 	// engine's configured defaults and retuned by Volume for this change only;
 	// they end with the change, so the next schema change starts from the
@@ -455,6 +461,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		}
 	}
 
+	runIdentifier := ""
+	if req.ResumeState != nil {
+		runIdentifier = req.ResumeState.MigrationContext
+	}
+
 	rm := &runningSchemaChange{
 		database:        database,
 		tableNamespace:  tableNamespace,
@@ -463,6 +474,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		state:           engine.StateRunning,
 		started:         time.Now(),
 		deferCutover:    deferCutover,
+		runIdentifier:   runIdentifier,
 		host:            host,
 		username:        username,
 		password:        password,
@@ -485,7 +497,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			e.runningSchemaChange.cancelFunc = cancel
 		}
 		e.mu.Unlock()
-		e.executeSchemaChange(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover)
+		e.executeSchemaChange(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover, runIdentifier)
 	})
 
 	return &engine.ApplyResult{
