@@ -37,7 +37,7 @@ services:
       timeout: 5s
       retries: 10
 
-  # Staging MySQL instance (migration target)
+  # Staging MySQL instance (schema change target)
   # Demonstrates separate MySQL instances for staging/production
   mysql-staging:
     image: mysql:8.4
@@ -56,7 +56,7 @@ services:
       timeout: 5s
       retries: 10
 
-  # Production MySQL instance (migration target)
+  # Production MySQL instance (schema change target)
   mysql-production:
     image: mysql:8.4
     environment:
