@@ -46,9 +46,47 @@ func IsNotReady(err error) bool {
 	return errors.As(err, &notReady)
 }
 
+// AlreadyCompletedError wraps an error to indicate the engine's backend
+// rejected a control operation because the schema change had already completed
+// before the operation arrived. The backend's terminal outcome is
+// authoritative and retrying can never succeed, so callers should reconcile
+// stored state to the completed outcome instead of retrying — leaving the
+// operation pending would re-run a rejection forever against a change that has
+// already landed.
+type AlreadyCompletedError struct {
+	Err error
+}
+
+func (e *AlreadyCompletedError) Error() string { return e.Err.Error() }
+func (e *AlreadyCompletedError) Unwrap() error { return e.Err }
+
+// NewAlreadyCompletedError wraps err as an already-completed error.
+func NewAlreadyCompletedError(msg string, args ...any) error {
+	return &AlreadyCompletedError{Err: fmt.Errorf(msg, args...)}
+}
+
+// IsAlreadyCompleted reports whether err indicates the engine's backend
+// rejected a control operation because the schema change had already
+// completed.
+func IsAlreadyCompleted(err error) bool {
+	if err == nil {
+		return false
+	}
+	var alreadyCompleted *AlreadyCompletedError
+	return errors.As(err, &alreadyCompleted)
+}
+
 // IsRetryable returns true if the error should be retried by the operator.
 // All errors are retryable by default, and engines explicitly wrap only
 // permanent errors with PermanentError.
+//
+// AlreadyCompletedError deliberately stays retryable here even though the
+// rejected operation can never succeed: callers treat a non-retryable error as
+// a permanent failure, and recording a failure for a schema change that
+// already landed would misrepresent the target. Paths that can receive an
+// already-completed rejection must reconcile to the completed outcome via
+// IsAlreadyCompleted instead; anywhere that doesn't, retrying keeps the stored
+// state honest until a drive that reconciles picks it up.
 func IsRetryable(err error) bool {
 	if err == nil {
 		return false

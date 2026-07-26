@@ -380,7 +380,9 @@ func (s *exactProgressTaskStore) GetShardProgressByApplyOperationID(_ context.Co
 type fakeControlEngine struct {
 	engine.Engine
 	stopCount               int
+	stopErr                 error
 	cancelCount             int
+	cancelErr               error
 	startCount              int
 	cutoverCount            int
 	volumeCount             int
@@ -428,11 +430,17 @@ func (e *fakeControlEngine) Progress(_ context.Context, req *engine.ProgressRequ
 
 func (e *fakeControlEngine) Stop(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.stopCount++
+	if e.stopErr != nil {
+		return nil, e.stopErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
 func (e *fakeControlEngine) Cancel(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.cancelCount++
+	if e.cancelErr != nil {
+		return nil, e.cancelErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
@@ -1240,6 +1248,135 @@ func TestLocalClient_ProcessPendingCancelControlRequest(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Cancel requested: 1 tasks cancelled, 0 skipped (caller: cli:alice)"))
+}
+
+// A pending cancel can be consumed after the engine's schema change has
+// already reached its completed terminal state — the change landed before the
+// cancel arrived. The engine rejects the cancel as already-completed, and the
+// drive must settle the apply and its tasks to completed (the authoritative
+// engine outcome) and complete the durable cancel request. Leaving the request
+// pending would have the operator re-claim the apply and re-run the doomed
+// cancel on every poll forever.
+func TestLocalClient_ProcessPendingCancelSettlesCompletedEngineChange(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              321,
+		ApplyIdentifier: "apply-cancel-completed",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.ValidatingDeployRequest,
+	}
+	task := &storage.Task{
+		ID:             654,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cancel-completed",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForDeploy,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "github:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{
+		cancelErr: engine.NewAlreadyCompletedError("cancel deploy request #121 rejected: the deploy request completed before the cancel arrived"),
+	}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, 1, fakeEngine.cancelCount)
+	assert.Equal(t, state.Task.Completed, task.State, "the task must adopt the engine's completed outcome, not cancelled")
+	assert.Equal(t, 100, task.ProgressPercent, "a completed task reports full progress")
+	require.NotNil(t, task.CompletedAt)
+	assert.Equal(t, state.Apply.Completed, apply.State, "the apply must adopt the engine's completed outcome, not cancelled")
+	require.NotNil(t, apply.CompletedAt)
+	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq, "the durable cancel request must complete so the operator stops re-running the cancel")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Cancel arrived after the schema change completed on the engine; apply recorded as completed (1 tasks completed, 0 already terminal) (caller: github:alice)"))
+}
+
+// The stop counterpart: a pending stop consumed after the engine's schema
+// change already completed settles the apply and its tasks to completed and
+// completes the durable stop request, instead of recording a landed change as
+// stopped or retrying a rejection that can never succeed.
+func TestLocalClient_ProcessPendingStopSettlesCompletedEngineChange(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              322,
+		ApplyIdentifier: "apply-stop-completed",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.ValidatingDeployRequest,
+	}
+	task := &storage.Task{
+		ID:             655,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-stop-completed",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForDeploy,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "github:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{
+		stopErr: engine.NewAlreadyCompletedError("cancel deploy request #121 rejected: the deploy request completed before the cancel arrived"),
+	}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, 1, fakeEngine.stopCount)
+	assert.Equal(t, state.Task.Completed, task.State, "the task must adopt the engine's completed outcome, not stopped")
+	assert.Equal(t, 100, task.ProgressPercent, "a completed task reports full progress")
+	require.NotNil(t, task.CompletedAt)
+	assert.Equal(t, state.Apply.Completed, apply.State, "the apply must adopt the engine's completed outcome, not stopped")
+	require.NotNil(t, apply.CompletedAt)
+	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq, "the durable stop request must complete so the operator stops re-running the stop")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Stop arrived after the schema change completed on the engine; apply recorded as completed (1 tasks completed, 0 already terminal) (caller: github:alice)"))
 }
 
 func TestLocalClient_ProcessPendingStopControlRequestContinuesToQueuedStart(t *testing.T) {
