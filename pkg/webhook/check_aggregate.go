@@ -276,17 +276,17 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 	case checkConclusionActionRequired:
 		pending := 0
 		unresolved := 0
-		tenantPending := 0
+		tenantApplies := 0
 		for _, c := range checks {
 			if c.Conclusion != checkConclusionActionRequired {
 				continue
 			}
 			pending++
-			if isUnresolvedParticipantCheck(c) {
+			switch {
+			case isUnresolvedParticipantCheck(c):
 				unresolved++
-			}
-			if isParticipantCheck(c) {
-				tenantPending++
+			case isParticipantCheck(c):
+				tenantApplies++
 			}
 		}
 		switch {
@@ -298,7 +298,22 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 			} else {
 				title = fmt.Sprintf("%d participant deployments have not reported", pending)
 			}
-		case pending > 0 && tenantPending == pending:
+		case unresolved > 0:
+			// Real pending applies alongside participants whose Check Runs
+			// could not be read. Surface both: an unread participant is not a
+			// pending apply, and folding it into the apply count would hide
+			// the reporting gap an operator needs to investigate.
+			applies := pending - unresolved
+			appliesPart := fmt.Sprintf("%d applies pending", applies)
+			if applies == 1 {
+				appliesPart = "1 apply pending"
+			}
+			unresolvedPart := fmt.Sprintf("%d participants have not reported", unresolved)
+			if unresolved == 1 {
+				unresolvedPart = "1 participant has not reported"
+			}
+			title = appliesPart + ", " + unresolvedPart
+		case pending > 0 && tenantApplies == pending:
 			// Every blocking row is a tenant deployment's folded check — say
 			// so, since "apply pending" alone reads as this deployment's own
 			// work when the pending applies belong to the tenants.
@@ -307,8 +322,8 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 			} else {
 				title = fmt.Sprintf("%d tenant applies pending", pending)
 			}
-		case tenantPending > 0:
-			title = fmt.Sprintf("%d applies pending (%d tenant)", pending, tenantPending)
+		case tenantApplies > 0:
+			title = fmt.Sprintf("%d applies pending (%d tenant)", pending, tenantApplies)
 		case pending == 1:
 			title = "1 apply pending"
 		default:

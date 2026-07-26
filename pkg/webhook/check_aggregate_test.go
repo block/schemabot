@@ -260,6 +260,35 @@ func TestAggregateSummary_TenantApplyTitles(t *testing.T) {
 		title, _ := aggregateSummary(checks, checkConclusionActionRequired)
 		assert.Equal(t, "2 applies pending (1 tenant)", title)
 	})
+
+	// A participant whose Check Run could not be read blocks the aggregate,
+	// but it is a reporting gap, not a pending apply — the title must surface
+	// it separately instead of folding it into the tenant-apply count.
+	t.Run("unresolved participant is not counted as a pending apply", func(t *testing.T) {
+		unresolvedRow := tenantPending("tenant-b")
+		unresolvedRow.BlockingReason = participantUnresolvedBlockingReason
+		checks := []*storage.Check{
+			tenantPending("tenant-a"),
+			unresolvedRow,
+		}
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired)
+		assert.Equal(t, "1 apply pending, 1 participant has not reported", title)
+	})
+
+	t.Run("own applies and unresolved participants surface both counts", func(t *testing.T) {
+		unresolvedB := tenantPending("tenant-b")
+		unresolvedB.BlockingReason = participantUnresolvedBlockingReason
+		unresolvedC := tenantPending("tenant-c")
+		unresolvedC.BlockingReason = participantUnresolvedBlockingReason
+		checks := []*storage.Check{
+			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, ChangeSummary: "1 alter"},
+			tenantPending("tenant-a"),
+			unresolvedB,
+			unresolvedC,
+		}
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired)
+		assert.Equal(t, "2 applies pending, 2 participants have not reported", title)
+	})
 }
 
 // Participant gating is the key information, so the Tenant deployments section
