@@ -276,6 +276,7 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 	case checkConclusionActionRequired:
 		pending := 0
 		unresolved := 0
+		tenantPending := 0
 		for _, c := range checks {
 			if c.Conclusion != checkConclusionActionRequired {
 				continue
@@ -283,6 +284,9 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 			pending++
 			if isUnresolvedParticipantCheck(c) {
 				unresolved++
+			}
+			if isParticipantCheck(c) {
+				tenantPending++
 			}
 		}
 		switch {
@@ -294,6 +298,17 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 			} else {
 				title = fmt.Sprintf("%d participant deployments have not reported", pending)
 			}
+		case pending > 0 && tenantPending == pending:
+			// Every blocking row is a tenant deployment's folded check — say
+			// so, since "apply pending" alone reads as this deployment's own
+			// work when the pending applies belong to the tenants.
+			if pending == 1 {
+				title = "1 tenant apply pending"
+			} else {
+				title = fmt.Sprintf("%d tenant applies pending", pending)
+			}
+		case tenantPending > 0:
+			title = fmt.Sprintf("%d applies pending (%d tenant)", pending, tenantPending)
 		case pending == 1:
 			title = "1 apply pending"
 		default:
