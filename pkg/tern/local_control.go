@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -1779,6 +1780,11 @@ func (c *LocalClient) convergeTaskVolumeToStoredLevel(ctx context.Context, apply
 			"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier)
 		return
 	}
+	if !taskHasTunableRowCopy(task) {
+		c.logger.Debug("task has no row-copy work for volume to tune; volume convergence skipped",
+			append(task.LogAttrs(), "ddl_action", task.DDLAction, "volume", volume)...)
+		return
+	}
 	if volume < storage.MinVolume || volume > storage.MaxVolume {
 		c.logger.Warn("stored volume level is out of range; task starts at the engine default",
 			append(task.LogAttrs(), "volume", volume)...)
@@ -1806,6 +1812,14 @@ func (c *LocalClient) convergeTaskVolumeToStoredLevel(ctx context.Context, apply
 	}
 	c.logger.Info("task volume converged to the apply's stored level",
 		append(task.LogAttrs(), "volume", volume)...)
+}
+
+// taskHasTunableRowCopy reports whether a task carries row-copy work that
+// engine volume levels tune. Volume maps to copy throughput, which only exists
+// for an ALTER's row copy; create and drop tasks run statement phases where an
+// engine volume retune restarts the schema change for no benefit.
+func taskHasTunableRowCopy(task *storage.Task) bool {
+	return strings.EqualFold(task.DDLAction, "alter")
 }
 
 // Revert reverts a completed schema change during the revert window.
