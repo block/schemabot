@@ -678,6 +678,28 @@ func RecordRemoteControlRequestStale(ctx context.Context, operation, database, d
 	)
 }
 
+// RecordControlRequestStalePending counts driver consumptions of a durable
+// control request still pending past the stale threshold. A pending request
+// retries indefinitely by design — giving up would silently drop a safety
+// command such as cancel — so a sustained non-zero rate means the driver keeps
+// re-running the operation without the engine resolving it to a terminal
+// outcome. The request will spin forever until an operator investigates why
+// the engine cannot resolve it; the paired warn log carries the apply
+// identifiers and the request age.
+func RecordControlRequestStalePending(ctx context.Context, operation, database, databaseType, deployment, environment string) {
+	if !knownControlOperations[operation] {
+		operation = "unknown"
+	}
+	addCounter(ctx, "schemabot.control_requests.stale_pending_total",
+		"Total driver consumptions of pending control requests older than the stale threshold", "{consumption}",
+		attribute.String("operation", operation),
+		attribute.String("database", database),
+		attribute.String("database_type", databaseType),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+	)
+}
+
 // RecordLockOperation increments the lock operations counter.
 // Operation should be "acquire" or "release".
 // Status should be "success", "conflict", "not_found", "not_owned", or "error".

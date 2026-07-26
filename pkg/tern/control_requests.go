@@ -3,14 +3,31 @@ package tern
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
+// pendingControlStaleThreshold is how long a durable control request may
+// remain pending (measured from the request's creation) before each driver
+// consumption warns and counts it as stalled. A pending request retries
+// indefinitely by design — giving up would silently drop a safety command
+// such as cancel — so past this threshold the driver is repeatedly failing to
+// resolve the operation to a terminal outcome and an operator must
+// investigate why the engine keeps rejecting it. The threshold sits above the
+// longest healthy pending window (a request waiting out the operator claim
+// cadence, or a stop draining a copy to its next checkpoint) so the signal
+// only fires on requests that are genuinely not resolving.
+const pendingControlStaleThreshold = 5 * time.Minute
+
 // pendingControlRequest loads the pending control request of the given operation
-// for an apply, returning nil when none is pending.
+// for an apply, returning nil when none is pending. A loaded request that has
+// been pending past the stale threshold emits the stalled-request signal so an
+// operator can investigate the retry loop; the retry semantics themselves are
+// unchanged.
 func pendingControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
 	if store == nil {
 		return nil, fmt.Errorf("storage is not available")
@@ -23,7 +40,29 @@ func pendingControlRequest(ctx context.Context, store storage.Storage, apply *st
 	if err != nil {
 		return nil, fmt.Errorf("load pending %s control request for apply %s: %w", operation, apply.ApplyIdentifier, err)
 	}
+	if controlReq != nil {
+		observeStalePendingControlRequest(ctx, apply, controlReq, time.Now())
+	}
 	return controlReq, nil
+}
+
+// observeStalePendingControlRequest emits the stalled-request signal for a
+// pending control request the driver just consumed: the stale-pending counter
+// plus a warn built from the apply's triage attributes, the operation, and how
+// long the request has been pending. A request younger than the threshold is
+// the normal case and stays quiet.
+func observeStalePendingControlRequest(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, now time.Time) {
+	pendingFor := now.Sub(controlReq.CreatedAt)
+	if pendingFor < pendingControlStaleThreshold {
+		return
+	}
+	metrics.RecordControlRequestStalePending(ctx, string(controlReq.Operation), apply.Database, apply.DatabaseType, apply.Deployment, apply.Environment)
+	slog.Warn("pending control request is stalled past the stale threshold; the driver will keep retrying it and the command will not take effect until the engine resolves it — investigate why the engine cannot resolve the operation",
+		append(apply.LogAttrs(),
+			"operation", string(controlReq.Operation),
+			"requested_by", controlReq.RequestedBy,
+			"pending_for", pendingFor.Round(time.Second),
+		)...)
 }
 
 // completePendingControlRequests marks the pending control request of the given
