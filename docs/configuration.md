@@ -361,6 +361,7 @@ defaults below.
 ```yaml
 spirit:
   enable_experimental_autoscaling: true  # default: true
+  enable_experimental_gtid: false        # default: false
   checkpoint_max_age: 72h                # default: 72h (3 days)
   checksum_yield_timeout: 12h            # default: 12h
 ```
@@ -382,19 +383,62 @@ The defaults, and why they were chosen:
 - **`checksum_yield_timeout: 12h`** — each checksum read transaction yields its
   `REPEATABLE READ` snapshot within this bound so a long checksum cannot pin
   InnoDB purge and degrade the whole target instance.
-- **GTID change source is auto-detected** (no knob). Targets with
-  `gtid_mode=ON` and `enforce_gtid_consistency=ON` get Spirit's GTID-based
-  change source, which tracks replication position across binlog rotation and
-  failover more robustly than binlog file+position; every other target keeps
-  the universally supported file+position source.
+- **`enable_experimental_gtid: false`** — opt-in to Spirit's GTID-based change
+  source instead of the default binlog file+position source. See
+  [GTID change source](#gtid-change-source-enable_experimental_gtid) below for
+  what the mode does and the implications of turning it on.
 
 A database can override the server-level value by setting the same key
-(`enable_experimental_autoscaling`, `checkpoint_max_age`,
-`checksum_yield_timeout`) in its own metadata; the database's entry wins.
+(`enable_experimental_autoscaling`, `enable_experimental_gtid`,
+`checkpoint_max_age`, `checksum_yield_timeout`) in its own metadata; the
+database's entry wins.
 
 These settings only apply where this server constructs the Spirit engine
 itself — local-mode MySQL databases. Databases routed to a remote deployment
 over gRPC run with that deployment's engine settings.
+
+### GTID change source (`enable_experimental_gtid`)
+
+While a schema change copies a table, Spirit simultaneously follows the
+target's replication stream so writes that land during the copy are applied to
+the new table too. The *change source* is Spirit's bookmark into that stream,
+and this flag selects which kind of bookmark is used:
+
+- **Off (the default):** the bookmark is a binlog file name plus an offset
+  within it. This works on every MySQL target, but it is tied to one server's
+  binlog files. If the binlogs the bookmark points at are purged before a
+  stalled schema change resumes, or the target fails over to a replica (whose
+  binlog files are numbered differently), the saved position no longer exists
+  and the schema change restarts its copy from the beginning instead of
+  resuming.
+- **On:** the bookmark is a GTID set. GTIDs (global transaction identifiers)
+  name each transaction globally rather than by its offset in a specific
+  file, so the bookmark stays valid across binlog rotation and failover, and
+  an interrupted schema change can resume where it left off in situations
+  where the file+position source would have to start over. The GTID source
+  requires `gtid_mode=ON` and `enforce_gtid_consistency=ON` on the target
+  MySQL server — Spirit refuses to start it anywhere else.
+
+Implications of turning it on:
+
+- **It only takes effect where the target has GTIDs enabled.** With the flag
+  on, SchemaBot probes each target before every run and uses the GTID source
+  only where `gtid_mode=ON` and `enforce_gtid_consistency=ON`; every other
+  target keeps the file+position source. That per-target selection makes the
+  flag safe to enable on a mixed fleet, but it does nothing for a target until
+  GTIDs are enabled on the MySQL server itself. If the probe cannot reach the
+  target it logs a warning and falls back to the file+position source rather
+  than failing the apply.
+- **Checkpoints do not carry across a source switch.** A schema change's
+  resume checkpoint records its bookmark in the format of the change source
+  that wrote it. If the effective source changes between a stop and a resume —
+  the flag is toggled, or GTIDs are enabled on the target mid-flight — the old
+  checkpoint cannot be read and the schema change restarts its copy from the
+  beginning. That is safe but loses copy progress, so avoid flipping the flag
+  while applies are in flight.
+- **The mode is experimental.** This maps to Spirit's `EnableExperimentalGTID`
+  setting — a newer code path than the long-standing file+position source,
+  which is why it is off by default and opt-in per deployment.
 
 ## Storage Schema Changes
 

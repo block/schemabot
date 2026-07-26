@@ -64,6 +64,7 @@ type Engine struct {
 	checkpointMaxAge     time.Duration
 	checksumYieldTimeout time.Duration
 	autoscaling          bool
+	gtid                 bool // opt-in to the GTID-based change source on capable targets
 
 	cpuHint int // Inferred CPU count from innodb_buffer_pool_instances (0 = unknown); guarded by mu
 
@@ -179,6 +180,7 @@ func New(cfg Config) *Engine {
 		checkpointMaxAge:     checkpointMaxAge,
 		checksumYieldTimeout: checksumYieldTimeout,
 		autoscaling:          autoscaling,
+		gtid:                 cfg.Settings.EnableExperimentalGTID,
 	}
 
 	// Create Spirit logger with filter that checks debugLogs at runtime

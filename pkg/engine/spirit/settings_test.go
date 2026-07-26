@@ -34,11 +34,13 @@ func TestSettingsFromMetadata(t *testing.T) {
 			name: "all overrides parse",
 			metadata: map[string]string{
 				MetadataEnableExperimentalAutoscaling: "false",
+				MetadataEnableExperimentalGTID:        "true",
 				MetadataCheckpointMaxAge:              "24h",
 				MetadataChecksumYieldTimeout:          "6h",
 			},
 			want: Settings{
 				EnableExperimentalAutoscaling: boolPtr(false),
+				EnableExperimentalGTID:        true,
 				CheckpointMaxAge:              24 * time.Hour,
 				ChecksumYieldTimeout:          6 * time.Hour,
 			},
@@ -49,6 +51,13 @@ func TestSettingsFromMetadata(t *testing.T) {
 				MetadataEnableExperimentalAutoscaling: "true",
 			},
 			want: Settings{EnableExperimentalAutoscaling: boolPtr(true)},
+		},
+		{
+			name: "invalid gtid value errors",
+			metadata: map[string]string{
+				MetadataEnableExperimentalGTID: "yep",
+			},
+			wantErr: MetadataEnableExperimentalGTID,
 		},
 		{
 			name: "invalid autoscaling value errors",
@@ -95,17 +104,20 @@ func TestNewResolvesSettings(t *testing.T) {
 		assert.Equal(t, DefaultCheckpointMaxAge, eng.checkpointMaxAge)
 		assert.Equal(t, DefaultChecksumYieldTimeout, eng.checksumYieldTimeout)
 		assert.True(t, eng.autoscaling)
+		assert.False(t, eng.gtid, "GTID change source is opt-in")
 	})
 
 	t.Run("overrides", func(t *testing.T) {
 		autoscaling := false
 		eng := New(Config{Settings: Settings{
 			EnableExperimentalAutoscaling: &autoscaling,
+			EnableExperimentalGTID:        true,
 			CheckpointMaxAge:              24 * time.Hour,
 			ChecksumYieldTimeout:          6 * time.Hour,
 		}})
 		assert.Equal(t, 24*time.Hour, eng.checkpointMaxAge)
 		assert.Equal(t, 6*time.Hour, eng.checksumYieldTimeout)
 		assert.False(t, eng.autoscaling)
+		assert.True(t, eng.gtid)
 	})
 }

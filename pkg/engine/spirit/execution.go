@@ -51,18 +51,24 @@ func (e *Engine) newSpiritMigration(ctx context.Context, host, username, passwor
 		ChecksumYieldTimeout:          e.checksumYieldTimeout,
 		MaxCommitLatency:              maxCommitLatency,
 		EnableExperimentalAutoscaling: e.autoscaling,
-		EnableExperimentalGTID:        e.gtidChangeSourceSupported(ctx, host, username, password, database),
+		EnableExperimentalGTID:        e.useGTIDChangeSource(ctx, host, username, password, database),
 	}
 }
 
-// gtidChangeSourceSupported reports whether the target can serve Spirit's
-// GTID-based change source, which tracks replication position across binlog
-// rotation and failover more robustly than binlog file+position. Spirit
-// refuses to start when the GTID source is requested on a target without
-// gtid_mode=ON, so the source is chosen per target: GTID-capable targets get
-// the stronger source and every other target keeps the universally supported
-// binlog file+position source.
-func (e *Engine) gtidChangeSourceSupported(ctx context.Context, host, username, password, database string) bool {
+// useGTIDChangeSource reports whether this run should use Spirit's GTID-based
+// change source, which tracks replication position across binlog rotation and
+// failover more robustly than binlog file+position. The source is opt-in via
+// Settings.EnableExperimentalGTID and, even when enabled, is still chosen per
+// target: Spirit refuses to start when the GTID source is requested on a
+// target without gtid_mode=ON, so only targets with gtid_mode=ON and
+// enforce_gtid_consistency=ON get the stronger source and every other target
+// keeps the universally supported binlog file+position source.
+func (e *Engine) useGTIDChangeSource(ctx context.Context, host, username, password, database string) bool {
+	if !e.gtid {
+		e.logger.Debug("GTID change source not enabled in settings, using the binlog file+position change source",
+			"host", host, "database", database)
+		return false
+	}
 	cfg := mysql.NewConfig()
 	cfg.User = username
 	cfg.Passwd = password

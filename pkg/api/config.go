@@ -260,6 +260,16 @@ type SpiritConfig struct {
 	// autoscaling misbehaves on a target fleet.
 	EnableExperimentalAutoscaling *bool `yaml:"enable_experimental_autoscaling"`
 
+	// EnableExperimentalGTID opts in to Spirit's GTID-based change source,
+	// which tracks replication position across binlog rotation and failover
+	// more robustly than binlog file+position. Defaults to false: every
+	// target uses the universally supported binlog file+position source.
+	// Enabling it only takes effect on targets running with gtid_mode=ON and
+	// enforce_gtid_consistency=ON — the engine probes each target and any
+	// target without GTIDs keeps the binlog file+position source, so the flag
+	// is safe to enable on a mixed fleet.
+	EnableExperimentalGTID *bool `yaml:"enable_experimental_gtid"`
+
 	// CheckpointMaxAge bounds how old a Spirit checkpoint may be and still be
 	// resumed, as a Go duration string (e.g. "72h"). Defaults to 3 days:
 	// a copy stalled that long restarts cleanly instead of replaying days of
@@ -281,6 +291,9 @@ func (c *ServerConfig) SpiritMetadata() (map[string]string, error) {
 	metadata := map[string]string{}
 	if c.Spirit.EnableExperimentalAutoscaling != nil {
 		metadata[spirit.MetadataEnableExperimentalAutoscaling] = strconv.FormatBool(*c.Spirit.EnableExperimentalAutoscaling)
+	}
+	if c.Spirit.EnableExperimentalGTID != nil {
+		metadata[spirit.MetadataEnableExperimentalGTID] = strconv.FormatBool(*c.Spirit.EnableExperimentalGTID)
 	}
 	if err := setSpiritDuration(metadata, spirit.MetadataCheckpointMaxAge, c.Spirit.CheckpointMaxAge); err != nil {
 		return nil, err

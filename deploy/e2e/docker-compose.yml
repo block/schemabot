@@ -32,9 +32,14 @@ services:
       timeout: 5s
       retries: 10
 
-  # Staging MySQL instance
+  # Staging MySQL instance. Runs with GTIDs enabled so applies exercise
+  # Spirit's GTID-based change source (enable_experimental_gtid in
+  # config/local.yaml) end-to-end.
   mysql-staging:
     image: mysql:8.0
+    command:
+      - --gtid_mode=ON
+      - --enforce_gtid_consistency=ON
     environment:
       MYSQL_ROOT_PASSWORD: testpassword
       MYSQL_INITDB_SKIP_TZINFO: "1"
@@ -50,9 +55,12 @@ services:
       timeout: 5s
       retries: 10
 
-  # Production MySQL instance
+  # Production MySQL instance. GTIDs enabled for the same reason as staging.
   mysql-production:
     image: mysql:8.0
+    command:
+      - --gtid_mode=ON
+      - --enforce_gtid_consistency=ON
     environment:
       MYSQL_ROOT_PASSWORD: testpassword
       MYSQL_INITDB_SKIP_TZINFO: "1"
