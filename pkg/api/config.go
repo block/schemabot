@@ -286,6 +286,19 @@ type GitHubConfig struct {
 	// this deployment's applies. Check Runs from Apps not in this list (and
 	// not this deployment's own App) never satisfy SchemaBot gates.
 	TrustedCheckAppSlugs []string `yaml:"trusted-check-app-slugs,omitempty"`
+
+	// PromotionCheckName overrides the aggregate Check Run base name the
+	// promotion gate looks for when verifying a prior environment owned by
+	// another deployment. By default the gate queries its own check-name base
+	// scoped to the prior environment (for example "SchemaBot (staging)").
+	// When several scoped deployments promote from one shared
+	// prior-environment deployment that publishes under a different base name,
+	// set this to that deployment's check-name so the gate queries the Check
+	// Run that actually exists on the commit. The prior environment is still
+	// appended in parentheses. The owning deployment's App slug must also be
+	// listed in trusted-check-app-slugs, or the gate rejects its Check Run and
+	// blocks every apply.
+	PromotionCheckName string `yaml:"promotion-check-name,omitempty"`
 }
 
 // CheckRunNameBase returns the configured aggregate GitHub Check Run base name.
@@ -293,6 +306,18 @@ func (g GitHubConfig) CheckRunNameBase() string {
 	name := strings.TrimSpace(g.CheckName)
 	if name == "" {
 		return DefaultGitHubCheckName
+	}
+	return name
+}
+
+// PromotionCheckRunNameBase returns the aggregate Check Run base name the
+// promotion gate queries when a prior environment is owned by another
+// deployment: promotion-check-name when configured, otherwise this
+// deployment's own check-name base.
+func (g GitHubConfig) PromotionCheckRunNameBase() string {
+	name := strings.TrimSpace(g.PromotionCheckName)
+	if name == "" {
+		return g.CheckRunNameBase()
 	}
 	return name
 }
@@ -1418,7 +1443,7 @@ func (c *ServerConfig) validateNoLocalRemoteRouteCollision() error {
 //   - If apps: is NOT set, repos must not declare github_app (it would be a
 //     silently ignored field, which we want to fail closed on).
 func (c *ServerConfig) validateGitHubAppsConfig() error {
-	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != "" || c.GitHub.CheckName != "" || len(c.GitHub.TrustedCheckAppSlugs) > 0
+	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != "" || c.GitHub.CheckName != "" || len(c.GitHub.TrustedCheckAppSlugs) > 0 || c.GitHub.PromotionCheckName != ""
 	hasApps := c.Apps != nil
 
 	if hasGitHub && hasApps {
@@ -1427,6 +1452,9 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 
 	if hasGitHub {
 		if err := validateUniqueNames("github.trusted-check-app-slugs", c.GitHub.TrustedCheckAppSlugs); err != nil {
+			return err
+		}
+		if err := c.GitHub.validatePromotionCheckName("github"); err != nil {
 			return err
 		}
 	}
@@ -1451,6 +1479,9 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 			if err := validateUniqueNames(fmt.Sprintf("app %q trusted-check-app-slugs", name), app.TrustedCheckAppSlugs); err != nil {
 				return err
 			}
+			if err := app.validatePromotionCheckName(fmt.Sprintf("app %q", name)); err != nil {
+				return err
+			}
 		}
 		for repo, repoConfig := range c.Repos {
 			if repoConfig.GitHubApp == "" {
@@ -1469,6 +1500,22 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 		if repoConfig.GitHubApp != "" {
 			return fmt.Errorf("repository %q sets github_app %q but apps: is not configured", repo, repoConfig.GitHubApp)
 		}
+	}
+	return nil
+}
+
+// validatePromotionCheckName rejects a promotion-check-name override that no
+// deployment this App trusts could satisfy. A base name different from this
+// App's own check-name can only be published by another deployment's App, so
+// with trusted-check-app-slugs empty the promotion gate would reject every
+// Check Run under that name and block every apply.
+func (g GitHubConfig) validatePromotionCheckName(context string) error {
+	name := strings.TrimSpace(g.PromotionCheckName)
+	if name == "" || name == g.CheckRunNameBase() {
+		return nil
+	}
+	if len(g.TrustedCheckAppSlugs) == 0 {
+		return fmt.Errorf("%s sets promotion-check-name %q, which differs from its own check-name base %q, but trusted-check-app-slugs is empty; the promotion gate only accepts that Check Run from a trusted sibling App, so every apply would be blocked", context, name, g.CheckRunNameBase())
 	}
 	return nil
 }
@@ -2116,6 +2163,28 @@ func (c *ServerConfig) GitHubCheckNameBaseForRepo(repo string) string {
 		return appConfig.CheckRunNameBase()
 	}
 	return c.GitHub.CheckRunNameBase()
+}
+
+// PromotionCheckNameBaseForRepo returns the aggregate Check Run base name the
+// promotion gate queries when a prior environment of repo is owned by another
+// deployment: the owning App's promotion-check-name when configured, otherwise
+// that App's own check-name base.
+func (c *ServerConfig) PromotionCheckNameBaseForRepo(repo string) string {
+	if c == nil {
+		return DefaultGitHubCheckName
+	}
+	if len(c.Apps) > 0 {
+		repoConfig, ok := c.Repos[repo]
+		if !ok {
+			return DefaultGitHubCheckName
+		}
+		appConfig, ok := c.Apps[repoConfig.GitHubApp]
+		if !ok {
+			return DefaultGitHubCheckName
+		}
+		return appConfig.PromotionCheckRunNameBase()
+	}
+	return c.GitHub.PromotionCheckRunNameBase()
 }
 
 // StorageDSN returns the resolved storage DSN.

@@ -596,9 +596,20 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 		})
 
 		mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, r *http.Request) {
+			// GitHub applies the check_name query parameter server-side; the
+			// gate depends on that filter, so the mock must honor it too.
+			matched := checkRuns
+			if name := r.URL.Query().Get("check_name"); name != "" {
+				matched = nil
+				for _, run := range checkRuns {
+					if run["name"] == name {
+						matched = append(matched, run)
+					}
+				}
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"total_count": len(checkRuns),
-				"check_runs":  checkRuns,
+				"total_count": len(matched),
+				"check_runs":  matched,
 			})
 		})
 
@@ -650,6 +661,46 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			t.Fatalf("unexpected comment posted: %s", body)
 		default:
 		}
+	})
+
+	// Several scoped deployments can promote from one shared prior-environment
+	// deployment that publishes its aggregate Check Run under a different base
+	// name. The promotion-check-name override points the gate at that
+	// deployment's Check Run instead of this deployment's own base, so the
+	// shared prior environment's passing check unblocks the apply.
+	t.Run("promotion check name override queries the shared deployment's check", func(t *testing.T) {
+		h, comments := setupCheckRunServer(t, []map[string]any{
+			{"id": 1, "name": "SchemaBot Shared (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
+		}, &api.ServerConfig{GitHub: api.GitHubConfig{
+			CheckName:            "SchemaBot X",
+			PromotionCheckName:   "SchemaBot Shared",
+			TrustedCheckAppSlugs: []string{"schemabot"},
+		}})
+
+		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		assert.False(t, blocked)
+
+		select {
+		case body := <-comments:
+			t.Fatalf("unexpected comment posted: %s", body)
+		default:
+		}
+	})
+
+	// With the override configured the gate queries only the overridden name:
+	// a passing check under this deployment's own base is not the shared prior
+	// environment's aggregate and must not satisfy the gate.
+	t.Run("override redirects the gate away from the deployment's own check name", func(t *testing.T) {
+		h, _ := setupCheckRunServer(t, []map[string]any{
+			{"id": 1, "name": "SchemaBot X (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
+		}, &api.ServerConfig{GitHub: api.GitHubConfig{
+			CheckName:            "SchemaBot X",
+			PromotionCheckName:   "SchemaBot Shared",
+			TrustedCheckAppSlugs: []string{"schemabot"},
+		}})
+
+		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		assert.True(t, blocked, "the gate must query only the overridden check name")
 	})
 
 	t.Run("staging check pending blocks apply", func(t *testing.T) {

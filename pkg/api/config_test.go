@@ -3062,6 +3062,92 @@ func TestServerConfig_GitHubCheckNameBaseForRepo(t *testing.T) {
 	})
 }
 
+func TestServerConfig_PromotionCheckNameBaseForRepo(t *testing.T) {
+	t.Run("defaults to the app's own check-name base", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{CheckName: "SchemaBot X"}}
+		assert.Equal(t, "SchemaBot X", cfg.PromotionCheckNameBaseForRepo("any/repo"))
+	})
+
+	t.Run("legacy single-app override trims configured name", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{
+			CheckName:          "SchemaBot X",
+			PromotionCheckName: "  SchemaBot Shared  ",
+		}}
+		assert.Equal(t, "SchemaBot Shared", cfg.PromotionCheckNameBaseForRepo("any/repo"))
+	})
+
+	t.Run("multi-app uses the owning app's override", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {CheckName: "SchemaBot X", PromotionCheckName: "SchemaBot Shared"},
+				"app-b": {CheckName: "SchemaBot Y"},
+			},
+			Repos: map[string]RepoConfig{
+				"org-a/repo-x": {GitHubApp: "app-a"},
+				"org-b/repo-y": {GitHubApp: "app-b"},
+			},
+		}
+
+		assert.Equal(t, "SchemaBot Shared", cfg.PromotionCheckNameBaseForRepo("org-a/repo-x"))
+		assert.Equal(t, "SchemaBot Y", cfg.PromotionCheckNameBaseForRepo("org-b/repo-y"))
+	})
+
+	t.Run("multi-app falls back for unknown repository", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps:  map[string]GitHubAppConfig{"app-a": {PromotionCheckName: "SchemaBot Shared"}},
+			Repos: map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+		}
+		assert.Equal(t, DefaultGitHubCheckName, cfg.PromotionCheckNameBaseForRepo("org/unknown"))
+	})
+}
+
+// A promotion-check-name that differs from the App's own check-name can only
+// be satisfied by another deployment's Check Run, so configuring it without
+// trusting any sibling App would block every apply. Config load must reject
+// that combination instead of shipping a gate that always fails closed.
+func TestValidatePromotionCheckName(t *testing.T) {
+	t.Run("override without trusted slugs is rejected", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{
+			CheckName:          "SchemaBot X",
+			PromotionCheckName: "SchemaBot Shared",
+		}}
+		err := cfg.validateGitHubAppsConfig()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "promotion-check-name")
+		assert.Contains(t, err.Error(), "trusted-check-app-slugs")
+	})
+
+	t.Run("override with trusted slugs is accepted", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{
+			CheckName:            "SchemaBot X",
+			PromotionCheckName:   "SchemaBot Shared",
+			TrustedCheckAppSlugs: []string{"schemabot-shared-staging"},
+		}}
+		require.NoError(t, cfg.validateGitHubAppsConfig())
+	})
+
+	t.Run("override equal to own base needs no trusted slugs", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{
+			CheckName:          "SchemaBot X",
+			PromotionCheckName: "SchemaBot X",
+		}}
+		require.NoError(t, cfg.validateGitHubAppsConfig())
+	})
+
+	t.Run("multi-app override without trusted slugs is rejected", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {AppID: "1001", PrivateKey: "x", WebhookSecret: "y", PromotionCheckName: "SchemaBot Shared"},
+			},
+			Repos: map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+		}
+		err := cfg.validateGitHubAppsConfig()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `app "app-a"`)
+		assert.Contains(t, err.Error(), "promotion-check-name")
+	})
+}
+
 func TestServerConfig_ResolveGitHubAppsByID(t *testing.T) {
 	t.Run("multi-app config resolves each entry's app-id", func(t *testing.T) {
 		cfg := &ServerConfig{
