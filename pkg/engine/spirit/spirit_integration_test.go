@@ -2294,7 +2294,6 @@ func TestNewSpiritMigrationRunSettings(t *testing.T) {
 
 	settings, err := SettingsFromMetadata(map[string]string{
 		MetadataEnableExperimentalAutoscaling: "false",
-		MetadataEnableExperimentalGTID:        "false",
 		MetadataCheckpointMaxAge:              "24h",
 		MetadataChecksumYieldTimeout:          "6h",
 	})
@@ -2304,16 +2303,13 @@ func TestNewSpiritMigrationRunSettings(t *testing.T) {
 	assert.Equal(t, 24*time.Hour, m.CheckpointMaxAge)
 	assert.Equal(t, 6*time.Hour, m.ChecksumYieldTimeout)
 	assert.False(t, m.EnableExperimentalAutoscaling, "autoscaling override disables it")
-	assert.False(t, m.EnableExperimentalGTID,
-		"GTID kill switch keeps the binlog file+position change source")
 }
 
 // TestNewSpiritMigrationGTIDChangeSource verifies per-target change-source
 // selection against a target that actually runs with gtid_mode=ON and
-// enforce_gtid_consistency=ON: the GTID-based change source is used by
-// default on such a target, and the operator kill switch keeps the binlog
-// file+position source on the same target. Uses a dedicated GTID-enabled
-// MySQL container because the shared container runs without GTIDs.
+// enforce_gtid_consistency=ON: such a target gets the GTID-based change
+// source. Uses a dedicated GTID-enabled MySQL container because the shared
+// container runs without GTIDs.
 func TestNewSpiritMigrationGTIDChangeSource(t *testing.T) {
 	req := testcontainers.ContainerRequest{
 		Image:        "mysql:8.0",
@@ -2348,11 +2344,5 @@ func TestNewSpiritMigrationGTIDChangeSource(t *testing.T) {
 	eng := New(Config{})
 	m := eng.newSpiritMigration(t.Context(), addr, "root", "testpassword", "testdb", "ALTER TABLE t1 ADD COLUMN c1 INT")
 	assert.True(t, m.EnableExperimentalGTID,
-		"GTID-capable target gets the GTID change source by default")
-
-	disabled := false
-	eng = New(Config{Settings: Settings{EnableExperimentalGTID: &disabled}})
-	m = eng.newSpiritMigration(t.Context(), addr, "root", "testpassword", "testdb", "ALTER TABLE t1 ADD COLUMN c1 INT")
-	assert.False(t, m.EnableExperimentalGTID,
-		"kill switch keeps the binlog file+position change source even on a GTID-capable target")
+		"GTID-capable target gets the GTID change source")
 }

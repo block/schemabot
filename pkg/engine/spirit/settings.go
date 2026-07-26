@@ -33,17 +33,6 @@ type Settings struct {
 	// the operator kill switch when autoscaling misbehaves on a target fleet.
 	EnableExperimentalAutoscaling *bool
 
-	// EnableExperimentalGTID selects Spirit's GTID-based change source, which
-	// tracks replication position across binlog rotation and failover more
-	// robustly than binlog file+position. nil defaults to enabled, which is
-	// safe on any fleet: the engine probes each target and uses the GTID
-	// source only where gtid_mode=ON and enforce_gtid_consistency=ON, so a
-	// target without GTIDs always keeps the universally supported binlog
-	// file+position source and picks up the GTID source automatically once
-	// GTIDs are enabled on it. false is the operator kill switch that keeps
-	// every target on binlog file+position.
-	EnableExperimentalGTID *bool
-
 	// CheckpointMaxAge bounds how old a checkpoint may be and still be
 	// resumed. Zero defaults to DefaultCheckpointMaxAge.
 	CheckpointMaxAge time.Duration
@@ -59,7 +48,6 @@ type Settings struct {
 // the server-level value.
 const (
 	MetadataEnableExperimentalAutoscaling = "enable_experimental_autoscaling"
-	MetadataEnableExperimentalGTID        = "enable_experimental_gtid"
 	MetadataCheckpointMaxAge              = "checkpoint_max_age"
 	MetadataChecksumYieldTimeout          = "checksum_yield_timeout"
 )
@@ -77,13 +65,6 @@ func SettingsFromMetadata(metadata map[string]string) (Settings, error) {
 			return Settings{}, fmt.Errorf("parse %s %q: %w", MetadataEnableExperimentalAutoscaling, raw, err)
 		}
 		settings.EnableExperimentalAutoscaling = &enabled
-	}
-	if raw, ok := metadata[MetadataEnableExperimentalGTID]; ok {
-		enabled, err := strconv.ParseBool(raw)
-		if err != nil {
-			return Settings{}, fmt.Errorf("parse %s %q: %w", MetadataEnableExperimentalGTID, raw, err)
-		}
-		settings.EnableExperimentalGTID = &enabled
 	}
 	var err error
 	if settings.CheckpointMaxAge, err = parsePositiveDuration(metadata, MetadataCheckpointMaxAge); err != nil {

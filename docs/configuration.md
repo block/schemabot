@@ -361,7 +361,6 @@ defaults below.
 ```yaml
 spirit:
   enable_experimental_autoscaling: true  # default: true
-  enable_experimental_gtid: true         # default: true
   checkpoint_max_age: 72h                # default: 72h (3 days)
   checksum_yield_timeout: 12h            # default: 12h
 ```
@@ -383,23 +382,20 @@ The defaults, and why they were chosen:
 - **`checksum_yield_timeout: 12h`** — each checksum read transaction yields its
   `REPEATABLE READ` snapshot within this bound so a long checksum cannot pin
   InnoDB purge and degrade the whole target instance.
-- **`enable_experimental_gtid: true`** — Spirit's GTID-based change source is
-  used on targets that support it; every other target keeps the binlog
-  file+position source, so the default is safe whether or not your targets
-  use GTIDs. See
-  [GTID change source](#gtid-change-source-enable_experimental_gtid) below for
-  what the mode does and when to use the kill switch.
+- **GTID change source is auto-detected** (no knob). Targets running with
+  GTIDs enabled get Spirit's GTID-based change source; every other target
+  keeps the universally supported binlog file+position source. See
+  [GTID change source](#gtid-change-source) below.
 
 A database can override the server-level value by setting the same key
-(`enable_experimental_autoscaling`, `enable_experimental_gtid`,
-`checkpoint_max_age`, `checksum_yield_timeout`) in its own metadata; the
-database's entry wins.
+(`enable_experimental_autoscaling`, `checkpoint_max_age`,
+`checksum_yield_timeout`) in its own metadata; the database's entry wins.
 
 These settings only apply where this server constructs the Spirit engine
 itself — local-mode MySQL databases. Databases routed to a remote deployment
 over gRPC run with that deployment's engine settings.
 
-### GTID change source (`enable_experimental_gtid`)
+### GTID change source
 
 While a schema change copies a table, Spirit simultaneously follows the
 target's replication stream so writes that land during the copy are applied to
@@ -421,15 +417,13 @@ and it comes in two kinds:
   and `enforce_gtid_consistency=ON` on the target MySQL server — Spirit
   refuses to start it anywhere else.
 
-With `enable_experimental_gtid: true` (the default), SchemaBot chooses the
-source per target: before every run it probes the target and uses the GTID
-source only where `gtid_mode=ON` and `enforce_gtid_consistency=ON`; every
-other target keeps the file+position source. Three properties make this the
-safe default:
+SchemaBot chooses the source per target automatically — there is nothing to
+configure. Before every run it probes the target and uses the GTID source only
+where `gtid_mode=ON` and `enforce_gtid_consistency=ON`; every other target
+keeps the file+position source. Three properties make this safe:
 
 - **Targets without GTIDs are completely unaffected.** The GTID source is
-  never forced onto a target that cannot serve it — a target running without
-  GTIDs behaves exactly as if the setting were off. If the probe cannot reach
+  never forced onto a target that cannot serve it. If the probe cannot reach
   the target, SchemaBot logs a warning and falls back to file+position rather
   than failing the apply. Nothing breaks for deployments that do not use
   GTIDs.
@@ -445,11 +439,8 @@ safe default:
   Spirit checksums the old and new tables before cutover, so a change-source
   problem surfaces as a failed apply — never as silent data divergence.
 
-Set `enable_experimental_gtid: false` as the operator kill switch to keep
-every target on binlog file+position — for example if the GTID source
-misbehaves on a target fleet. The same checkpoint transition note applies when
-flipping the switch while applies are in flight. The setting maps to Spirit's
-`EnableExperimentalGTID` option.
+Under the hood this enables Spirit's `EnableExperimentalGTID` option on
+GTID-capable targets.
 
 ## Storage Schema Changes
 

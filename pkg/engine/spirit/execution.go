@@ -51,25 +51,26 @@ func (e *Engine) newSpiritMigration(ctx context.Context, host, username, passwor
 		ChecksumYieldTimeout:          e.checksumYieldTimeout,
 		MaxCommitLatency:              maxCommitLatency,
 		EnableExperimentalAutoscaling: e.autoscaling,
-		EnableExperimentalGTID:        e.useGTIDChangeSource(ctx, host, username, password, database),
+		EnableExperimentalGTID:        e.gtidChangeSourceSupported(ctx, host, username, password, database),
 	}
 }
 
-// useGTIDChangeSource reports whether this run should use Spirit's GTID-based
-// change source, which tracks replication position across binlog rotation and
-// failover more robustly than binlog file+position. The source is chosen per
-// target: Spirit refuses to start when the GTID source is requested on a
-// target without gtid_mode=ON, so only targets with gtid_mode=ON and
-// enforce_gtid_consistency=ON get the stronger source and every other target
-// keeps the universally supported binlog file+position source.
-// Settings.EnableExperimentalGTID set to false is the operator kill switch
-// that skips the probe and keeps every target on binlog file+position.
-func (e *Engine) useGTIDChangeSource(ctx context.Context, host, username, password, database string) bool {
-	if !e.gtid {
-		e.logger.Debug("GTID change source disabled in settings, using the binlog file+position change source",
-			"host", host, "database", database)
-		return false
-	}
+// gtidChangeSourceSupported reports whether the target can serve Spirit's
+// GTID-based change source. The change source is Spirit's bookmark into the
+// target's replication stream while a schema change copies a table: binlog
+// file+position works on every target but is tied to one server's binlog
+// files, while a GTID set stays valid across binlog rotation and failover,
+// letting an interrupted schema change resume where file+position would have
+// to restart the copy. Spirit refuses to start the GTID source on a target
+// without gtid_mode=ON, so the source is chosen per target: GTID-capable
+// targets get the stronger source, every other target keeps binlog
+// file+position, and a target that enables GTIDs later picks up the GTID
+// source automatically on its next schema change. A checkpoint written under
+// one source cannot be resumed under the other — the copy restarts from the
+// beginning, which is safe but loses progress. Whichever source is chosen,
+// Spirit's pre-cutover checksum turns a missed change into a failed apply,
+// never silent divergence.
+func (e *Engine) gtidChangeSourceSupported(ctx context.Context, host, username, password, database string) bool {
 	cfg := mysql.NewConfig()
 	cfg.User = username
 	cfg.Passwd = password
