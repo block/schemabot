@@ -678,6 +678,22 @@ func RecordRemoteControlRequestStale(ctx context.Context, operation, database, d
 	)
 }
 
+// RecordPlanetScaleUnclassifiedCancelRejection counts PlanetScale cancel
+// rejections whose live deployment state has no explicit classification. Every
+// known deployment state is classified explicitly; a hit here means PlanetScale
+// introduced a new deployment state (or returned one SchemaBot has never
+// mapped), and the rejection fell back to a plain retryable error. Add an
+// explicit classification for the state — until then the durable stop/cancel
+// request may be retried against a rejection that can never succeed, and only
+// the drive's terminal-truth reconcile can converge it.
+func RecordPlanetScaleUnclassifiedCancelRejection(ctx context.Context, database, deploymentState string) {
+	addCounter(ctx, "schemabot.engine.planetscale.unclassified_cancel_rejections_total",
+		"Total PlanetScale cancel rejections observed in a deployment state with no explicit classification", "{rejection}",
+		attribute.String("database", database),
+		attribute.String("deployment_state", deploymentState),
+	)
+}
+
 // RecordLockOperation increments the lock operations counter.
 // Operation should be "acquire" or "release".
 // Status should be "success", "conflict", "not_found", "not_owned", or "error".

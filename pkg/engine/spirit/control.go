@@ -31,8 +31,11 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	e.mu.Lock()
 	rm := e.runningSchemaChange
 	if rm == nil {
+		// Spirit tracks the change in-process, so with nothing tracked there is
+		// no change this instance could ever stop — retrying cannot make one
+		// appear.
 		e.mu.Unlock()
-		return nil, fmt.Errorf("no active schema change to stop")
+		return nil, engine.NewPermanentError("no active schema change to stop")
 	}
 	state := rm.state
 	runners := rm.runners
@@ -45,6 +48,12 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 			Accepted: true,
 			Message:  "Already stopped",
 		}, nil
+	}
+	if state == engine.StateCompleted {
+		// The change landed before the stop arrived. Recording it as stopped
+		// would misrepresent the target; the typed rejection has the caller
+		// reconcile to the completed outcome instead.
+		return nil, engine.NewAlreadyCompletedError("stop rejected: the schema change on database %s completed before the stop arrived", database)
 	}
 
 	// Force a checkpoint BEFORE canceling the context.
@@ -95,8 +104,19 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 	e.mu.Lock()
 	rm := e.runningSchemaChange
 	if rm == nil {
+		// Spirit tracks the change in-process, so with nothing tracked there is
+		// no change this instance could ever cancel — retrying cannot make one
+		// appear.
 		e.mu.Unlock()
-		return nil, fmt.Errorf("no active schema change to cancel")
+		return nil, engine.NewPermanentError("no active schema change to cancel")
+	}
+	if rm.state == engine.StateCompleted {
+		// The change landed before the cancel arrived. Marking it cancelled and
+		// dropping its artifacts would misrepresent the target; the typed
+		// rejection has the caller reconcile to the completed outcome instead.
+		database := rm.database
+		e.mu.Unlock()
+		return nil, engine.NewAlreadyCompletedError("cancel rejected: the schema change on database %s completed before the cancel arrived", database)
 	}
 	database := rm.database
 	tables := rm.tables
