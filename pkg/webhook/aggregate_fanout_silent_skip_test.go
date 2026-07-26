@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -342,6 +343,111 @@ func TestVolumeInvalidLevelDefersToLeader(t *testing.T) {
 
 		body := requireComment(t, comments, "invalid-volume-level comment")
 		assert.Contains(t, body, "Missing or Invalid Volume Level")
+	})
+}
+
+// On an aggregate repo, an -e value this deployment does not recognize may be
+// a perfectly valid environment served by a sibling deployment — a
+// participant's config holds only its own slice of the fleet's environments.
+// A participant therefore defers silently instead of posting "Invalid
+// Environment", even when the command names its own tenant, since the same
+// tenant name can be served in other environments by sibling deployments. The
+// leader, whose environment order spans the fleet, still rejects a genuinely
+// unknown value exactly once, and a non-aggregate deployment keeps rejecting
+// directly.
+func TestUnknownEnvironmentDefersOnAggregateParticipant(t *testing.T) {
+	serveUnknownEnvCommand := func(t *testing.T, cfg *api.ServerConfig, comment string) (*httptest.ResponseRecorder, chan string) {
+		t.Helper()
+		cfg.AllowedEnvironments = []string{"production"}
+		h, _, comments := newFanOutSkipHandler(t, cfg)
+
+		req := buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil)
+		rr := httpResponseRecorder()
+		h.ServeHTTP(rr, req)
+		require.Equal(t, http.StatusOK, rr.Code)
+		return rr, comments
+	}
+
+	// The participant declares only its own slice of the fleet's environments,
+	// so the sibling's environment is neither allowed nor known here.
+	participantConfig := func() *api.ServerConfig {
+		cfg := aggregateParticipantConfig()
+		cfg.Tenant = "alpha"
+		cfg.EnvironmentOrder = []string{"production"}
+		return cfg
+	}
+
+	t.Run("tenant-scoped command for a sibling environment defers silently", func(t *testing.T) {
+		rr, comments := serveUnknownEnvCommand(t, participantConfig(), "schemabot apply -e staging --tenant alpha")
+
+		assert.Contains(t, rr.Body.String(), "environment deferred to sibling deployments")
+		assert.Empty(t, comments, "a participant must not reject an environment a sibling deployment may serve")
+	})
+
+	t.Run("unscoped command with an unrecognized environment defers silently", func(t *testing.T) {
+		rr, comments := serveUnknownEnvCommand(t, participantConfig(), "schemabot apply -e staging")
+
+		assert.Contains(t, rr.Body.String(), "environment deferred to sibling deployments")
+		assert.Empty(t, comments, "a participant must not reject an environment a sibling deployment may serve")
+	})
+
+	t.Run("leader still rejects an unknown environment once", func(t *testing.T) {
+		rr, comments := serveUnknownEnvCommand(t, aggregateLeaderConfig(), "schemabot apply -e prodction")
+
+		assert.Contains(t, rr.Body.String(), "unknown environment")
+		body := requireComment(t, comments, "invalid environment comment")
+		assert.Contains(t, body, "Invalid Environment")
+		assert.Contains(t, body, "`production`")
+	})
+
+	t.Run("non-aggregate deployment still rejects an unknown environment", func(t *testing.T) {
+		rr, comments := serveUnknownEnvCommand(t, nonAggregateConfig(), "schemabot apply -e prodction")
+
+		assert.Contains(t, rr.Body.String(), "unknown environment")
+		body := requireComment(t, comments, "invalid environment comment")
+		assert.Contains(t, body, "Invalid Environment")
+	})
+}
+
+// A malformed -e value (for example a flag glued onto the value) is a usage
+// error every deployment can detect from the comment text alone, so on an
+// aggregate repo participants defer the reply to the leader, which posts it
+// exactly once. A -t-scoped command answers directly as the single addressee.
+func TestMalformedEnvironmentDefersToLeader(t *testing.T) {
+	serveMalformedEnvCommand := func(t *testing.T, cfg *api.ServerConfig, comment string) (*httptest.ResponseRecorder, chan string) {
+		t.Helper()
+		h, _, comments := newFanOutSkipHandler(t, cfg)
+
+		req := buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil)
+		rr := httpResponseRecorder()
+		h.ServeHTTP(rr, req)
+		require.Equal(t, http.StatusOK, rr.Code)
+		return rr, comments
+	}
+
+	t.Run("participant stays silent on the unscoped usage error", func(t *testing.T) {
+		rr, comments := serveMalformedEnvCommand(t, aggregateParticipantConfig(), "schemabot apply -e production--allow-unsafe")
+
+		assert.Contains(t, rr.Body.String(), "usage error deferred to leader")
+		assert.Empty(t, comments, "a participant must defer the malformed-environment reply to the leader")
+	})
+
+	t.Run("leader posts the usage error once", func(t *testing.T) {
+		rr, comments := serveMalformedEnvCommand(t, aggregateLeaderConfig(), "schemabot apply -e production--allow-unsafe")
+
+		assert.Contains(t, rr.Body.String(), "invalid environment value")
+		body := requireComment(t, comments, "invalid environment comment")
+		assert.Contains(t, body, "Invalid Environment")
+	})
+
+	t.Run("tenant-scoped command gets the usage error from the addressee", func(t *testing.T) {
+		cfg := aggregateParticipantConfig()
+		cfg.Tenant = "alpha"
+		rr, comments := serveMalformedEnvCommand(t, cfg, "schemabot apply -e production--allow-unsafe --tenant alpha")
+
+		assert.Contains(t, rr.Body.String(), "invalid environment value")
+		body := requireComment(t, comments, "invalid environment comment")
+		assert.Contains(t, body, "Invalid Environment")
 	})
 }
 

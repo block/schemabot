@@ -88,6 +88,24 @@ func (h *Handler) silentUsageErrorOnUnscopedFanOut(repo, tenant string) bool {
 	return config.AggregateRoleForRepo(repo) == api.AggregateRoleParticipant
 }
 
+// silentUnknownEnvOnAggregateFanOut reports whether an unknown-environment
+// rejection should be a logged silent skip on this deployment. An aggregate
+// participant's config holds only its own slice of the fleet's environments,
+// so an -e value it does not recognize may be a perfectly valid environment
+// served by a sibling deployment — rejecting it from that partial worldview
+// posts a spurious "Invalid Environment" next to the sibling's real work.
+// Participants therefore defer silently even when the command names their own
+// tenant, since the same tenant name can be served in other environments by
+// sibling deployments. On unscoped commands the leader, whose environment
+// order spans the fleet, still rejects a genuinely unknown value exactly once.
+func (h *Handler) silentUnknownEnvOnAggregateFanOut(repo string) bool {
+	config, ok := h.serverConfig()
+	if !ok {
+		return false
+	}
+	return config.AggregateRoleForRepo(repo) == api.AggregateRoleParticipant
+}
+
 // environmentNotConfiguredError reports that the requested environment has no
 // entry for the database on this server — a targeting rejection the same
 // command will always reproduce, not a transient failure.

@@ -174,10 +174,17 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
-	// Reject an invalid -e value. It can never match any instance's
-	// allowed_environments, so no instance would act on it; answer under the
-	// respond_to_unscoped policy so exactly one instance corrects the caller.
+	// Reject a malformed -e value. It can never match any instance's
+	// allowed_environments, so no instance would act on it. On an aggregate
+	// repo participants defer the reply to the leader, which posts it exactly
+	// once; otherwise the respond_to_unscoped policy picks one responder.
 	if result.EnvironmentError {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping malformed environment reply for unscoped fan-out; the leader posts it once",
+				"repo", repo, "pr", pr, "action", result.Action)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
+			return
+		}
 		if result.Tenant == "" && h.service != nil && !h.service.Config().ShouldRespondToUnscoped() {
 			h.logger.Debug("skipping invalid environment response (respond_to_unscoped is false)",
 				"repo", repo, "pr", pr, "action", result.Action)
@@ -233,12 +240,20 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 
 	// When allowed_environments is configured, commands targeting environments
 	// handled by another instance are silently ignored — that instance will
-	// process the command from its own webhook delivery. An environment that
-	// appears nowhere in the configuration belongs to no instance, so deferring
-	// would leave the command unanswered everywhere; reject it under the
-	// respond_to_unscoped policy so exactly one instance corrects the caller.
+	// process the command from its own webhook delivery. An environment absent
+	// from this instance's configuration entirely is rejected under the
+	// respond_to_unscoped policy so exactly one instance corrects the caller —
+	// except on an aggregate repo, where a participant's configuration covers
+	// only its own slice of the fleet's environments and a sibling deployment
+	// may serve the value, so participants defer silently instead.
 	if result.Found && result.Environment != "" && h.service != nil && !h.service.Config().IsEnvironmentAllowed(result.Environment) {
 		if !h.service.Config().IsEnvironmentKnown(result.Environment) {
+			if h.silentUnknownEnvOnAggregateFanOut(repo) {
+				h.logger.Info("deferring unknown environment on aggregate participant; a sibling deployment may serve it",
+					"repo", repo, "pr", pr, "environment", result.Environment, "tenant", result.Tenant, "action", result.Action)
+				h.writeJSON(w, http.StatusOK, map[string]string{"message": "environment deferred to sibling deployments"})
+				return
+			}
 			if result.Tenant == "" && !h.service.Config().ShouldRespondToUnscoped() {
 				h.logger.Debug("skipping unknown environment response (respond_to_unscoped is false)",
 					"repo", repo, "pr", pr, "environment", result.Environment, "action", result.Action)
