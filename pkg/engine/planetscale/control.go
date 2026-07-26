@@ -57,7 +57,7 @@ func (e *Engine) cancelDeployRequest(ctx context.Context, operation engine.Contr
 			// cancel — retrying cannot make it appear.
 			var psErr *ps.Error
 			if errors.As(getErr, &psErr) && psErr.Code == ps.ErrNotFound {
-				return nil, engine.NewPermanentError("cancel deploy request #%d: deploy request not found: %w", meta.DeployRequestID, err)
+				return nil, engine.NewPermanentError("cancel deploy request #%d rejected (%w); deploy request not found: %w", meta.DeployRequestID, err, getErr)
 			}
 			return nil, fmt.Errorf("cancel deploy request #%d (may have been deleted; state read also failed: %w): %w", meta.DeployRequestID, getErr, err)
 		}
