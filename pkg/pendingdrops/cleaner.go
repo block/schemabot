@@ -221,12 +221,26 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		dropped++
 	}
 
+	prunedIntents, err := c.pruneExpiredIntents(ctx, conn, cutoff)
+	if err != nil {
+		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "intent_prune_error")
+		c.logger.Error("pending drops cleanup: pruning expired quarantine intents failed, rows remain until the next pass",
+			"database", target.Database,
+			"environment", target.Environment,
+			"error", err,
+		)
+		if dropErr == nil {
+			dropErr = err
+		}
+	}
+
 	attrs := []any{
 		"database", target.Database,
 		"environment", target.Environment,
 		"dry_run", c.dryRun,
 		"kept", kept,
 		"skipped_unparseable", skipped,
+		"pruned_intents", prunedIntents,
 	}
 	if c.dryRun {
 		attrs = append(attrs, "would_drop", wouldDrop)
@@ -238,6 +252,55 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		return fmt.Errorf("drop expired pending drops tables on %s/%s: %w", target.Database, target.Environment, dropErr)
 	}
 	return nil
+}
+
+// pruneExpiredIntents deletes quarantine intent rows older than the retention
+// cutoff. An intent's usefulness ends with its quarantined table: once the
+// table's retention expires the rename can no longer be proven or recovered,
+// so the ledger row expires on the same schedule. In dry-run mode nothing is
+// deleted and the count of rows that would be pruned is returned.
+func (c *Cleaner) pruneExpiredIntents(ctx context.Context, conn *sql.Conn, cutoff time.Time) (int64, error) {
+	exists, err := tableExistsOnConn(ctx, conn, Database, IntentsTable)
+	if err != nil {
+		return 0, fmt.Errorf("check %s.%s ledger exists: %w", Database, IntentsTable, err)
+	}
+	if !exists {
+		return 0, nil
+	}
+
+	if c.dryRun {
+		var count int64
+		err := conn.QueryRowContext(ctx, fmt.Sprintf(
+			"SELECT COUNT(*) FROM %s.%s WHERE created_at < ?",
+			quoteIdentifier(Database), quoteIdentifier(IntentsTable)), cutoff.UTC()).Scan(&count)
+		if err != nil {
+			return 0, fmt.Errorf("count expired quarantine intents: %w", err)
+		}
+		return count, nil
+	}
+
+	result, err := conn.ExecContext(ctx, fmt.Sprintf(
+		"DELETE FROM %s.%s WHERE created_at < ?",
+		quoteIdentifier(Database), quoteIdentifier(IntentsTable)), cutoff.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("delete expired quarantine intents: %w", err)
+	}
+	pruned, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count pruned quarantine intents: %w", err)
+	}
+	return pruned, nil
+}
+
+func tableExistsOnConn(ctx context.Context, conn *sql.Conn, schemaName, tableName string) (bool, error) {
+	var count int
+	err := conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+		schemaName, tableName).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("query information_schema.tables for `%s`.`%s`: %w", schemaName, tableName, err)
+	}
+	return count > 0, nil
 }
 
 func targetLockName(target Target) string {
@@ -256,10 +319,13 @@ func pendingDropsDatabaseExists(ctx context.Context, conn *sql.Conn) (bool, erro
 	return count > 0, nil
 }
 
+// listPendingDropTables returns the quarantined tables in the pending drops
+// database. The quarantine intents ledger lives alongside them but is not a
+// quarantined table; its rows are pruned by pruneExpiredIntents instead.
 func listPendingDropTables(ctx context.Context, conn *sql.Conn) ([]string, error) {
 	rows, err := conn.QueryContext(ctx,
-		"SELECT table_name FROM information_schema.tables WHERE table_schema = ?",
-		Database)
+		"SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name <> ?",
+		Database, IntentsTable)
 	if err != nil {
 		return nil, fmt.Errorf("query information_schema.tables: %w", err)
 	}

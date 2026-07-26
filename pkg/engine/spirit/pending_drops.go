@@ -76,20 +76,45 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 			schemaName = database
 		}
 
-		if dropStmt.IfExists {
-			exists, err := tableExistsInSchema(ctx, db, schemaName, tableName)
-			if err != nil {
-				return fmt.Errorf("check table `%s`.`%s` exists: %w", schemaName, tableName, err)
-			}
-			if !exists {
-				e.logger.Info("DROP TABLE IF EXISTS target does not exist, skipping quarantine",
-					"database", schemaName,
-					"table", tableName,
-				)
-				continue
-			}
+		exists, err := tableExistsInSchema(ctx, db, schemaName, tableName)
+		if err != nil {
+			return fmt.Errorf("check table `%s`.`%s` exists: %w", schemaName, tableName, err)
 		}
-		tables = append(tables, pendingdrops.TableMove{SchemaName: schemaName, TableName: tableName})
+		if exists {
+			tables = append(tables, pendingdrops.TableMove{SchemaName: schemaName, TableName: tableName})
+			continue
+		}
+
+		if dropStmt.IfExists {
+			e.logger.Info("DROP TABLE IF EXISTS target does not exist, skipping quarantine",
+				"database", schemaName,
+				"table", tableName,
+			)
+			continue
+		}
+
+		// The DROP phase re-runs in full after a mid-phase interruption (pod
+		// loss, lease handover, a stop landing between the quarantine rename
+		// and completion being recorded). A missing source whose recorded
+		// quarantine destination still exists means this statement already
+		// executed: the table is gone from the source schema and its data is
+		// preserved. A missing source without that proof is drift from
+		// outside SchemaBot and fails closed.
+		quarantineTable, quarantined, err := pendingdrops.AlreadyQuarantined(ctx, db, schemaName, tableName)
+		if err != nil {
+			return fmt.Errorf("look up quarantine record for `%s`.`%s`: %w", schemaName, tableName, err)
+		}
+		if !quarantined {
+			return fmt.Errorf("DROP TABLE target `%s`.`%s` does not exist and has no quarantined copy recorded in `%s`",
+				schemaName, tableName, pendingdrops.Database)
+		}
+		e.logger.Info("DROP TABLE target already quarantined in pending drops, treating the statement as executed",
+			"database", schemaName,
+			"table", tableName,
+			"quarantine_database", pendingdrops.Database,
+			"quarantine_table", quarantineTable,
+		)
+		e.notifyQuarantineLocation(tableName, pendingdrops.Database, quarantineTable)
 	}
 
 	moved, err := pendingdrops.MoveTables(ctx, db, tables, time.Now())
@@ -103,19 +128,25 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 			"quarantine_database", table.QuarantineSchema,
 			"quarantine_table", table.QuarantineTable,
 		)
-		// Route the quarantine location to the apply log so operators can find
-		// the table for recovery without querying information_schema.
-		e.mu.Lock()
-		onLog := e.onLog
-		e.mu.Unlock()
-		if onLog != nil {
-			onLog(slog.LevelInfo, table.TableName,
-				fmt.Sprintf("table quarantined as `%s`.`%s`; recoverable until the pending drops retention period expires",
-					table.QuarantineSchema, table.QuarantineTable))
-		}
+		e.notifyQuarantineLocation(table.TableName, table.QuarantineSchema, table.QuarantineTable)
 		metrics.RecordPendingDropMoved(ctx, table.SchemaName)
 	}
 	return nil
+}
+
+// notifyQuarantineLocation routes the quarantine location to the apply log so
+// operators can find the table for recovery without querying
+// information_schema.
+func (e *Engine) notifyQuarantineLocation(tableName, quarantineSchema, quarantineTable string) {
+	e.mu.Lock()
+	onLog := e.onLog
+	e.mu.Unlock()
+	if onLog == nil {
+		return
+	}
+	onLog(slog.LevelInfo, tableName,
+		fmt.Sprintf("table quarantined as `%s`.`%s`; recoverable until the pending drops retention period expires",
+			quarantineSchema, quarantineTable))
 }
 
 // tableExistsInSchema checks if a table exists in the given schema.

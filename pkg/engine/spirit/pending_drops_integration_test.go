@@ -27,12 +27,13 @@ func cleanupPendingDropsDB(t *testing.T, db *sql.DB) {
 	require.NoError(t, err, "drop pending drops database")
 }
 
-// listQuarantinedTables returns the table names currently in the quarantine database.
+// listQuarantinedTables returns the table names currently in the quarantine
+// database, excluding the quarantine intents ledger that lives alongside them.
 func listQuarantinedTables(t *testing.T, db *sql.DB) []string {
 	t.Helper()
 	rows, err := db.QueryContext(t.Context(),
-		"SELECT table_name FROM information_schema.tables WHERE table_schema = ? ORDER BY table_name",
-		pendingdrops.Database)
+		"SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name <> ? ORDER BY table_name",
+		pendingdrops.Database, pendingdrops.IntentsTable)
 	require.NoError(t, err, "query quarantined tables")
 	defer utils.CloseAndLog(rows)
 
@@ -113,6 +114,67 @@ func TestEngine_ExecuteSchemaChange_DropTableQuarantines(t *testing.T) {
 		fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", pendingdrops.Database, quarantined[0])).Scan(&rowCount)
 	require.NoError(t, err)
 	assert.Equal(t, 10, rowCount, "quarantined table keeps its data")
+}
+
+// A DROP phase re-runs in full after a mid-phase interruption (pod loss, lease
+// handover, a stop landing between the quarantine rename and completion being
+// recorded). When the rename already landed, the re-run proves it through the
+// quarantine intents ledger and completes without erroring or moving anything
+// twice, so the apply converges instead of failing on a table that is already
+// safely quarantined.
+func TestEngine_ExecuteSchemaChange_DropTableRerunAfterQuarantineConverges(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE drop_rerun (
+		id INT PRIMARY KEY AUTO_INCREMENT,
+		name VARCHAR(100) NOT NULL
+	)`)
+	require.NoError(t, err, "create table")
+	for i := range 10 {
+		_, err := db.ExecContext(t.Context(), `INSERT INTO drop_rerun (name) VALUES (?)`, fmt.Sprintf("row-%d", i))
+		require.NoError(t, err, "insert data")
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE `drop_rerun`"})
+	require.Equal(t, engine.StateCompleted, state, "the first run quarantines the table")
+	firstQuarantined := listQuarantinedTables(t, db)
+	require.Len(t, firstQuarantined, 1)
+
+	state = runDDLApply(t, eng, dsn, []string{"DROP TABLE `drop_rerun`"})
+	assert.Equal(t, engine.StateCompleted, state, "the re-run converges on the recorded quarantine")
+
+	quarantined := listQuarantinedTables(t, db)
+	require.Len(t, quarantined, 1, "the re-run must not quarantine a second copy")
+	assert.Equal(t, firstQuarantined[0], quarantined[0], "the original quarantined copy is untouched")
+
+	var rowCount int
+	err = db.QueryRowContext(t.Context(),
+		fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", pendingdrops.Database, quarantined[0])).Scan(&rowCount)
+	require.NoError(t, err)
+	assert.Equal(t, 10, rowCount, "the quarantined table keeps its data across the re-run")
+}
+
+// A DROP TABLE target that is missing with no recorded quarantine is drift
+// from outside SchemaBot: the statement fails closed instead of reporting the
+// drop as executed with no preserved copy to point at.
+func TestEngine_ExecuteSchemaChange_DropTableMissingWithoutRecordFails(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE `never_there`"})
+	assert.Equal(t, engine.StateFailed, state, "an unexplained missing target must fail closed")
+
+	quarantined := listQuarantinedTables(t, db)
+	assert.Empty(t, quarantined, "a failed drop must not record a quarantine")
 }
 
 // When pending drops is disabled, DROP TABLE executes directly and no
