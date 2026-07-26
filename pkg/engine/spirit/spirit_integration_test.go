@@ -2341,6 +2341,26 @@ func TestNewSpiritMigrationGTIDChangeSource(t *testing.T) {
 	require.NoError(t, err, "container port")
 	addr := fmt.Sprintf("%s:%d", host, port)
 
+	// The wait strategy confirms mysqld logged readiness, but a freshly
+	// started server can still drop its first connections under load. The
+	// probe under test is fail-open by design, so reaching it before the
+	// target reliably serves authenticated connections would silently select
+	// the fallback change source instead of exercising the GTID path.
+	cfg := drivermysql.NewConfig()
+	cfg.User = "root"
+	cfg.Passwd = "testpassword"
+	cfg.Net = "tcp"
+	cfg.Addr = addr
+	cfg.DBName = "testdb"
+	db, err := sql.Open("mysql", cfg.FormatDSN())
+	require.NoError(t, err, "open GTID-enabled mysql target")
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	require.Eventually(t, func() bool {
+		pingCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+		return db.PingContext(pingCtx) == nil
+	}, 30*time.Second, 500*time.Millisecond, "GTID-enabled mysql target never became connectable")
+
 	eng := New(Config{})
 	m := eng.newSpiritMigration(t.Context(), addr, "root", "testpassword", "testdb", "ALTER TABLE t1 ADD COLUMN c1 INT")
 	assert.True(t, m.EnableExperimentalGTID,
