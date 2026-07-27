@@ -78,25 +78,6 @@ func TestMain(m *testing.M) {
 	}
 	sharedDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/testdb?parseTime=true&multiStatements=true", host, port)
 
-	// Wait for MySQL to be ready
-	var db *sql.DB
-	for range 30 {
-		db, err = sql.Open("mysql", sharedDSN)
-		if err != nil {
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-		if err = db.PingContext(ctx); err == nil {
-			_ = db.Close()
-			break
-		}
-		_ = db.Close()
-		time.Sleep(500 * time.Millisecond)
-	}
-	if err != nil {
-		log.Fatalf("connect to mysql: %v", err)
-	}
-
 	code := m.Run()
 
 	// Cleanup
