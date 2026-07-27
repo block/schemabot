@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1634,6 +1635,57 @@ func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T
 	assert.LessOrEqual(t, settled, baseline+5,
 		"server connections grew far beyond baseline after %d single-statement applies (baseline=%d, settled=%d)",
 		iterations*2, baseline, settled)
+}
+
+// TestEngine_ExecuteSchemaChange_SingleStatementRoutesSpiritLogs runs a CREATE
+// TABLE through Spirit's single-statement path with the engine's log callback
+// registered. Spirit's INFO log lines for the run are routed through the
+// callback — the same path that feeds operator-visible apply logs — so
+// single-statement applies (CREATE/DROP/RENAME) are traceable in the apply
+// log stream just like ALTERs.
+func TestEngine_ExecuteSchemaChange_SingleStatementRoutesSpiritLogs(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger, DisablePendingDrops: true})
+
+	var mu sync.Mutex
+	var captured []string
+	eng.SetLogCallback(func(level slog.Level, table, msg string) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, msg)
+	})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	createDDL := "CREATE TABLE `log_routed` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `name` varchar(100) NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{
+		database: database,
+		tables:   []string{"log_routed"},
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	}
+	eng.mu.Unlock()
+
+	eng.executeSchemaChange(t.Context(), host, username, password, database, []string{createDDL}, false)
+
+	eng.mu.Lock()
+	finalState := eng.runningSchemaChange.state
+	eng.mu.Unlock()
+	require.Equal(t, engine.StateCompleted, finalState, "CREATE TABLE did not complete")
+	require.True(t, tableExists(t, db, "log_routed"), "expected log_routed to exist after CREATE")
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Contains(t, captured, "Starting spirit migration",
+		"Spirit's run-start log line was not routed through the engine log callback")
+	assert.Contains(t, captured, "apply complete",
+		"Spirit's completion log line was not routed through the engine log callback")
 }
 
 // TestEngine_Apply_StartsGoroutine tests that Apply starts a schema change goroutine
