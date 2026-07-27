@@ -10,6 +10,7 @@
   - [MySQL — Different databases entirely](#mysql-different-databases-entirely)
   - [Vitess — Multiple keyspaces](#vitess-multiple-keyspaces)
   - [Vitess — VSchema changes](#vitess-vschema-changes)
+- [Where to Put the Schema Directory](#where-to-put-the-schema-directory)
 - [`$ENV` Substitution in Namespace Names](#env-substitution-in-namespace-names)
   - [Example](#example)
   - [Rules](#rules)
@@ -128,6 +129,51 @@ SchemaBot plans all keyspaces together — a single plan can contain changes acr
 3. The PlanetScale engine applies both DDL and VSchema atomically
 
 A plan can have DDL-only changes, VSchema-only changes, or both.
+
+## Where to Put the Schema Directory
+
+SchemaBot is location-agnostic: config discovery finds `schemabot.yaml` anywhere
+in the repository — the directory containing it *is* the schema directory, and
+its subdirectory (or directory) basenames are the namespaces. Nothing in
+SchemaBot forces a particular path, so placement is a repository-semantics
+choice. That said, a repository-root `schema/` directory is the recommended
+layout:
+
+```
+myapp/
+├── schema/
+│   ├── schemabot.yaml
+│   └── myapp/
+│       ├── users.sql
+│       └── orders.sql
+├── service-a/
+└── service-b/
+```
+
+- **Don't put schema files in build-tool resource directories** (Maven/Gradle
+  `src/main/resources`, embedded asset dirs). Those paths mean "packaged into
+  the application artifact" — but the application never reads these files.
+  Only SchemaBot does, from GitHub, at PR time. Placing them there ships dead
+  weight in every build and implies runtime semantics the files don't have.
+- **Keep visible distance from imperative tools during coexistence.** If the
+  repository still carries Flyway or Liquibase versioned change scripts while
+  SchemaBot takes over, keep the two mechanisms in visibly different places.
+  Those scripts live in `resources/` because the app executes them from the
+  classpath at startup; SchemaBot is the opposite model — declarative desired
+  state, applied out-of-band. Side by side in one resources tree, "which file
+  do I edit?" becomes a coin flip.
+- **The schema is a repository-level concern.** The database usually spans
+  application modules (domain tables, framework tables such as Spring Batch's
+  `BATCH_*`, history tables), so its desired state belongs at the top level,
+  not nested inside one module.
+- **Short stable paths keep operations simple.** A server-side
+  `allowed_dirs: [schema/myapp]` allowlist, CODEOWNERS scoping, and PR review
+  path filters all stay trivial with a root path, and the
+  directory-basename-is-the-namespace contract stays visible at a glance.
+
+A module-root directory outside `src/` (e.g. `my-data-module/schema/`) also
+works and avoids the packaging problem — reasonable when one module clearly
+owns the database, but most schemas span modules.
 
 ## `$ENV` Substitution in Namespace Names
 
