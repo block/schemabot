@@ -226,6 +226,51 @@ func TestUnscopedRollbackConfirmNoLockStaysSilentOnAggregateRepo(t *testing.T) {
 	})
 }
 
+// On an aggregate repo, an unscoped `unlock` fans out to every deployment, but
+// locks live in each tenant's own storage. A deployment holding no locks for
+// the PR stays silent so only the deployment with locks to release answers —
+// it must not post "No Locks Found" next to another tenant's real release. A
+// -t-scoped unlock and a non-aggregate repo still get the comment.
+func TestUnscopedUnlockNoLocksStaysSilentOnAggregateRepo(t *testing.T) {
+	unlockResult := func(tenant string) CommandResult {
+		return CommandResult{Action: action.Unlock, Tenant: tenant}
+	}
+
+	t.Run("unscoped unlock on aggregate repo stays silent", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleUnlockCommand("octocat/hello-world", 1, 12345, "hubot", unlockResult(""))
+
+		assert.Empty(t, comments, "deployment without locks must not post No Locks Found on an unscoped fan-out unlock")
+	})
+
+	t.Run("unscoped unlock on participant deployment stays silent", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleUnlockCommand("octocat/hello-world", 1, 12345, "hubot", unlockResult(""))
+
+		assert.Empty(t, comments, "a participant without locks must not post No Locks Found on an unscoped fan-out unlock")
+	})
+
+	t.Run("tenant-scoped unlock still posts no locks found", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleUnlockCommand("octocat/hello-world", 1, 12345, "hubot", unlockResult("tenant-b"))
+
+		body := requireComment(t, comments, "no-locks unlock comment")
+		assert.Contains(t, body, "No Locks Found")
+	})
+
+	t.Run("non-aggregate repo still posts no locks found", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+
+		h.handleUnlockCommand("octocat/hello-world", 1, 12345, "hubot", unlockResult(""))
+
+		body := requireComment(t, comments, "no-locks unlock comment")
+		assert.Contains(t, body, "No Locks Found")
+	})
+}
+
 // On an aggregate repo, an unscoped lifecycle control command (stop, cancel,
 // cutover, ...) fans out to every deployment, but the target apply lives in
 // exactly one tenant's storage. A deployment whose storage has no such apply
