@@ -350,6 +350,129 @@ func TestCheckPriorEnvironmentsWithProductionOnlyServerConfigChecksStaging(t *te
 	}
 }
 
+// TestCheckPriorEnvironmentsWithDatabaseOverrideGatesOnOverrideOrder covers a
+// production-owning scoped deployment whose database overrides the server-wide
+// promotion order (qa → sandbox → production instead of qa → staging →
+// production): a production apply must verify the override's prior
+// environments through peer aggregate Check Runs — blocking on sandbox even
+// while the server order's staging check is green — and an apply targeting an
+// environment absent from the override must fail closed with the override
+// order in the comment so the operator sees which list gated the apply.
+func TestCheckPriorEnvironmentsWithDatabaseOverrideGatesOnOverrideOrder(t *testing.T) {
+	const (
+		repo    = "octocat/hello-world"
+		pr      = 1
+		headSHA = "abc123"
+	)
+
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"head": map[string]any{"sha": headSHA, "ref": "feature"},
+			"base": map[string]any{"sha": "base123", "ref": "main"},
+			"user": map[string]any{"login": "testuser"},
+		})
+	})
+	// Real GitHub filters check runs server-side by the check_name query
+	// param; the gate depends on that filter, so the mock must honor it.
+	checkRunsByName := map[string]map[string]any{
+		"SchemaBot (qa)":      {"id": 1, "name": "SchemaBot (qa)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
+		"SchemaBot (staging)": {"id": 2, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
+		"SchemaBot (sandbox)": {"id": 3, "name": "SchemaBot (sandbox)", "status": "completed", "conclusion": "action_required", "app": map[string]any{"slug": "schemabot"}},
+	}
+	checkRunLookups := make(chan string, 10)
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Query().Get("check_name")
+		checkRunLookups <- name
+		runs := []map[string]any{}
+		if run, ok := checkRunsByName[name]; ok {
+			runs = append(runs, run)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"total_count": len(runs),
+			"check_runs":  runs,
+		})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+
+	installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
+	service := api.New(&emptyStorage{}, &api.ServerConfig{
+		AllowedEnvironments: []string{"production"},
+		EnvironmentOrder:    []string{"qa", "staging", "production"},
+		Databases: map[string]api.DatabaseConfig{
+			"bureau": {
+				Type:             "mysql",
+				EnvironmentOrder: []string{"qa", "sandbox", "production"},
+				Environments: map[string]api.EnvironmentConfig{
+					"production": {Deployment: "default", Target: "bureau"},
+				},
+			},
+		},
+	}, nil, testLogger())
+	t.Cleanup(func() { utils.CloseAndLog(service) })
+
+	h := &Handler{
+		service:                    service,
+		ghClients:                  ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:                     testLogger(),
+		priorEnvCheckMaxAttempts:   1,
+		priorEnvCheckRetryInterval: time.Nanosecond,
+	}
+
+	// A production apply walks the override's prior environments: qa passes,
+	// sandbox blocks — the server order's green staging check must not
+	// satisfy the gate.
+	blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
+		"bureau", "mysql", "production", []string{"production"}, 12345)
+	assert.True(t, blocked, "sandbox action_required must block production despite a green staging check")
+
+	for _, checkName := range []string{"SchemaBot (qa)", "SchemaBot (sandbox)"} {
+		select {
+		case name := <-checkRunLookups:
+			assert.Equal(t, checkName, name, "gate must look up the override's prior environment check")
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected GitHub check lookup for %s", checkName)
+		}
+	}
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "sandbox")
+		assert.Contains(t, body, "Apply sandbox first")
+		assert.NotContains(t, body, "staging")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for sandbox block comment")
+	}
+
+	// An apply targeting an environment absent from the override fails closed
+	// with the database's effective order rendered in the comment.
+	blocked = h.checkPriorEnvironments(t.Context(), repo, pr,
+		"bureau", "mysql", "staging", []string{"production"}, 12345)
+	assert.True(t, blocked, "environment absent from the database override must fail closed")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "`staging` is not in the configured promotion order")
+		assert.Contains(t, body, "Configured promotion order: `qa` → `sandbox` → `production`")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for unlisted-environment block comment")
+	}
+	select {
+	case name := <-checkRunLookups:
+		t.Fatalf("unlisted-environment guard must fail closed before any GitHub check lookup, got lookup for %s", name)
+	default:
+	}
+}
+
 // TestCheckPriorEnvironmentsCrossDeploymentAppTrust covers the split-deployment
 // topology where each environment is owned by a separate SchemaBot deployment
 // with its own GitHub App: the production deployment verifies staging through

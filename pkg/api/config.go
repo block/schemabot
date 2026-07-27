@@ -2112,9 +2112,10 @@ func isValidTenantName(tenant string) bool {
 // KnownEnvironments returns every environment name visible in this instance's
 // configuration: its own allowed environments, the server-owned promotion
 // order (which lists peer-owned environments in environment-isolated
-// deployments), and each database's routing environments. The result is
-// sorted and deduplicated. A command environment outside this set belongs to
-// no SchemaBot instance and can be rejected instead of deferred to a peer.
+// deployments), each database's environment_order override, and each
+// database's routing environments. The result is sorted and deduplicated. A
+// command environment outside this set belongs to no SchemaBot instance and
+// can be rejected instead of deferred to a peer.
 func (c *ServerConfig) KnownEnvironments() []string {
 	if c == nil {
 		return nil

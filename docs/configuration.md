@@ -238,9 +238,13 @@ The production deployment does not need a staging target. It verifies staging by
 
 ### Per-Database Environment Order
 
-Databases promote through different environment sequences — one database may run `qa → sandbox → production` while another runs `qa → staging → production` — and a single server-wide order cannot express both. A database entry may override the promotion order with its own `environment_order`:
+Databases promote through different environment sequences — one database may run `qa → sandbox → production` while another runs `qa → staging → production` — and a single server-wide order cannot express both. A database entry may override the promotion order with its own `environment_order`. In this example a qa/sandbox-scoped instance promotes `payments` through `qa → sandbox` locally, with `production` owned by a peer instance:
 
 ```yaml
+allowed_environments:
+  - qa
+  - sandbox
+
 environment_order:
   - qa
   - staging

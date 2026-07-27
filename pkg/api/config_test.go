@@ -2073,7 +2073,7 @@ func TestValidateDatabaseEnvironmentOrder(t *testing.T) {
 		err := cfg.Validate()
 
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "duplicate")
+		assert.Contains(t, err.Error(), `database "payments" environment_order contains duplicate value "qa"`)
 	})
 
 	t.Run("rejects a configured environment missing from the override", func(t *testing.T) {
@@ -2085,7 +2085,7 @@ func TestValidateDatabaseEnvironmentOrder(t *testing.T) {
 		err := cfg.Validate()
 
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "missing from the database environment_order")
+		assert.Contains(t, err.Error(), `database "payments" environment "sandbox" is configured but missing from the database environment_order`)
 	})
 
 	t.Run("rejects a locally-owned override environment that is not configured", func(t *testing.T) {
@@ -2097,7 +2097,7 @@ func TestValidateDatabaseEnvironmentOrder(t *testing.T) {
 		err := cfg.Validate()
 
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "does not configure it")
+		assert.Contains(t, err.Error(), `database "payments" environment_order lists "sandbox" but the database does not configure it`)
 	})
 
 	t.Run("unscoped instance must configure every override environment", func(t *testing.T) {
@@ -2107,7 +2107,7 @@ func TestValidateDatabaseEnvironmentOrder(t *testing.T) {
 		err := cfg.Validate()
 
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), `lists "production"`)
+		assert.Contains(t, err.Error(), `database "payments" environment_order lists "production" but the database does not configure it`)
 	})
 }
 
