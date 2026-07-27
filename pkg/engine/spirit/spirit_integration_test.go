@@ -1637,13 +1637,13 @@ func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T
 		iterations*2, baseline, settled)
 }
 
-// TestEngine_ExecuteMigration_SingleStatementRoutesSpiritLogs runs a CREATE
+// TestEngine_ExecuteSchemaChange_SingleStatementRoutesSpiritLogs runs a CREATE
 // TABLE through Spirit's single-statement path with the engine's log callback
 // registered. Spirit's INFO log lines for the run are routed through the
 // callback — the same path that feeds operator-visible apply logs — so
 // single-statement applies (CREATE/DROP/RENAME) are traceable in the apply
 // log stream just like ALTERs.
-func TestEngine_ExecuteMigration_SingleStatementRoutesSpiritLogs(t *testing.T) {
+func TestEngine_ExecuteSchemaChange_SingleStatementRoutesSpiritLogs(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
 
