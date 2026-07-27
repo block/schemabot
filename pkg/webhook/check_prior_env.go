@@ -14,8 +14,8 @@ import (
 )
 
 // checkPriorEnvironments enforces server-owned environment ordering: all enabled
-// environments before the current one in the server promotion order must have a
-// successful SchemaBot check.
+// environments before the current one in the database's effective promotion
+// order must have a successful SchemaBot check.
 // Returns true if the apply is blocked (caller should return).
 //
 // For environments: [sandbox, staging, production]
@@ -24,10 +24,13 @@ import (
 //   - applying to production: both sandbox and staging must be success
 //
 // Server config owns the configured environments and their promotion order.
-// When allowed_environments is configured, this instance only owns a subset of
-// environments. For prior environments owned by this instance, local storage is
-// checked. For prior environments owned by another instance, the GitHub Checks
-// API is queried for the per-environment aggregate check run.
+// The effective order is the database's environment_order override when
+// configured, otherwise the server-wide environment_order — databases promote
+// through different environment sequences, so the gate resolves the order per
+// database. When allowed_environments is configured, this instance only owns a
+// subset of environments. For prior environments owned by this instance, local
+// storage is checked. For prior environments owned by another instance, the
+// GitHub Checks API is queried for the per-environment aggregate check run.
 func (h *Handler) checkPriorEnvironments(
 	ctx context.Context, repo string, pr int,
 	database, dbType, environment string,
@@ -42,8 +45,8 @@ func (h *Handler) checkPriorEnvironments(
 	// environments, so staging-first ordering cannot be enforced. Fail closed:
 	// block the apply with a config error rather than fall back to a local-only
 	// ordering that omits prior environments owned by other instances.
-	if scopedTargetMissingFromPromotionOrder(config, environment) {
-		order := config.PromotionEnvironmentOrder()
+	if scopedTargetMissingFromPromotionOrder(config, database, environment) {
+		order := config.PromotionOrderForDatabase(database)
 		h.logger.Warn("target environment is absent from the configured promotion order, blocking apply",
 			"repo", repo, "pr", pr,
 			"database", database, "database_type", dbType,
@@ -55,7 +58,7 @@ func (h *Handler) checkPriorEnvironments(
 		return true
 	}
 
-	environments = promotionGateEnvironments(config, environment, environments)
+	environments = promotionGateEnvironments(config, database, environment, environments)
 
 	// Find the index of the current environment
 	currentIdx := -1
@@ -93,27 +96,27 @@ func (h *Handler) checkPriorEnvironments(
 
 // scopedTargetMissingFromPromotionOrder reports whether this instance is scoped
 // to a subset of environments (allowed_environments is configured) while the
-// target environment is absent from the server promotion order. In that state
-// the prior environments cannot be derived from the order, and the staging-first
-// gate cannot be enforced — the caller must fail closed.
-func scopedTargetMissingFromPromotionOrder(config *api.ServerConfig, environment string) bool {
+// target environment is absent from the database's effective promotion order.
+// In that state the prior environments cannot be derived from the order, and
+// the staging-first gate cannot be enforced — the caller must fail closed.
+func scopedTargetMissingFromPromotionOrder(config *api.ServerConfig, database, environment string) bool {
 	if config == nil || len(config.AllowedEnvironments) == 0 {
 		return false
 	}
-	return !slices.Contains(config.PromotionEnvironmentOrder(), environment)
+	return !slices.Contains(config.PromotionOrderForDatabase(database), environment)
 }
 
-func promotionGateEnvironments(config *api.ServerConfig, environment string, environments []string) []string {
+func promotionGateEnvironments(config *api.ServerConfig, database, environment string, environments []string) []string {
 	if config == nil {
 		return environments
 	}
 	if len(config.AllowedEnvironments) > 0 {
-		order := config.PromotionEnvironmentOrder()
+		order := config.PromotionOrderForDatabase(database)
 		if slices.Contains(order, environment) {
 			return order
 		}
 	}
-	return config.OrderedEnvironments(environments)
+	return config.OrderedEnvironmentsForDatabase(database, environments)
 }
 
 // promotionCheckNameForRepo returns the aggregate Check Run base name the

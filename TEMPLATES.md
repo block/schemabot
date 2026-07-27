@@ -2097,7 +2097,7 @@ Re-running `schemabot plan -e staging` will not resolve this.
 
 Configured promotion order: `staging` → `production`
 
-Add `development` to `environment_order` so SchemaBot knows where it sits in the promotion sequence, then retry the apply.
+Add `development` to `environment_order` (the server-wide list, or this database's override when it has one) so SchemaBot knows where it sits in the promotion sequence, then retry the apply.
 
 </details>
 

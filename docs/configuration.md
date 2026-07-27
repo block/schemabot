@@ -236,6 +236,41 @@ tern_deployments:
 
 The production deployment does not need a staging target. It verifies staging by reading the staging deployment's GitHub aggregate check, then resolves only the production target from its own config.
 
+### Per-Database Environment Order
+
+Databases promote through different environment sequences — one database may run `qa → sandbox → production` while another runs `qa → staging → production` — and a single server-wide order cannot express both. A database entry may override the promotion order with its own `environment_order`:
+
+```yaml
+environment_order:
+  - qa
+  - staging
+  - production
+
+databases:
+  payments:
+    type: mysql
+    environment_order:
+      - qa
+      - sandbox
+      - production
+    environments:
+      qa:
+        target: "payments-qa"
+        deployment: primary
+      sandbox:
+        target: "payments-sandbox"
+        deployment: primary
+```
+
+When set, the database's `environment_order` replaces the server-wide order entirely for that database's promotion gating: an apply to an environment in the list requires a successful SchemaBot check for every earlier entry, and environments the database does not promote through simply do not appear. Databases without an override keep using the server-wide `environment_order` unchanged.
+
+The override is validated at startup, fail-fast in both directions:
+
+- Every environment configured under the database's `environments` must appear in its `environment_order` — otherwise applies to it would be blocked as unlisted.
+- Every `environment_order` entry owned by this instance (per `allowed_environments`; all entries when the instance is unscoped) must be configured under the database's `environments` — otherwise a later environment's apply would wait on a prior check that can never exist.
+
+Entries owned by another instance in the promotion chain (outside this instance's `allowed_environments`) may be absent from the database's local `environments`: the promotion gate verifies them through the peer's GitHub aggregate check, exactly as with the server-wide order. Instances sharing a database must declare the same effective order for it — render all instances' config from a single source.
+
 ## Hybrid Mode
 
 Both modes can be used simultaneously. Each database environment in the `databases` section chooses one route: local mode with `dsn`, or gRPC mode with `target` and `deployment`. This is useful when some databases are co-located with SchemaBot and others are in remote environments.

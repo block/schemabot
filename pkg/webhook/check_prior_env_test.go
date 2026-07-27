@@ -20,6 +20,96 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
+// TestPromotionGateEnvironments covers per-database promotion order
+// resolution in the apply gate: on a scoped instance each database's
+// environment_order override determines which prior environments gate an
+// apply, so databases with disjoint promotion sequences coexist on one
+// instance without gating each other on environments they do not have.
+func TestPromotionGateEnvironments(t *testing.T) {
+	scoped := &api.ServerConfig{
+		AllowedEnvironments: []string{"qa", "staging", "load", "sandbox"},
+		EnvironmentOrder:    []string{"qa", "staging", "load", "production"},
+		Databases: map[string]api.DatabaseConfig{
+			"bureau": {
+				EnvironmentOrder: []string{"qa", "sandbox", "production"},
+				Environments:     map[string]api.EnvironmentConfig{"qa": {}, "sandbox": {}},
+			},
+			"orders": {
+				Environments: map[string]api.EnvironmentConfig{"qa": {}, "staging": {}, "load": {}},
+			},
+		},
+	}
+
+	t.Run("override gates a sandbox apply on qa only", func(t *testing.T) {
+		got := promotionGateEnvironments(scoped, "bureau", "sandbox", []string{"qa", "sandbox"})
+
+		assert.Equal(t, []string{"qa", "sandbox", "production"}, got)
+	})
+
+	t.Run("database without an override keeps the server order", func(t *testing.T) {
+		got := promotionGateEnvironments(scoped, "orders", "staging", []string{"qa", "staging", "load"})
+
+		assert.Equal(t, []string{"qa", "staging", "load", "production"}, got)
+	})
+
+	t.Run("unscoped instance orders enabled environments by the override", func(t *testing.T) {
+		unscoped := &api.ServerConfig{
+			EnvironmentOrder: []string{"qa", "staging", "production"},
+			Databases: map[string]api.DatabaseConfig{
+				"bureau": {
+					EnvironmentOrder: []string{"qa", "sandbox", "production"},
+					Environments:     map[string]api.EnvironmentConfig{"qa": {}, "sandbox": {}},
+				},
+			},
+		}
+
+		got := promotionGateEnvironments(unscoped, "bureau", "sandbox", []string{"sandbox", "qa"})
+
+		assert.Equal(t, []string{"qa", "sandbox"}, got)
+	})
+
+	t.Run("nil config passes environments through", func(t *testing.T) {
+		got := promotionGateEnvironments(nil, "bureau", "staging", []string{"staging", "qa"})
+
+		assert.Equal(t, []string{"staging", "qa"}, got)
+	})
+}
+
+// TestScopedTargetMissingFromPromotionOrder verifies the fail-closed guard
+// resolves the promotion order per database: an environment in one database's
+// override is a valid target for that database, while a database whose
+// effective order omits the target environment stays blocked.
+func TestScopedTargetMissingFromPromotionOrder(t *testing.T) {
+	cfg := &api.ServerConfig{
+		AllowedEnvironments: []string{"qa", "staging", "sandbox"},
+		EnvironmentOrder:    []string{"qa", "staging", "production"},
+		Databases: map[string]api.DatabaseConfig{
+			"bureau": {
+				EnvironmentOrder: []string{"qa", "sandbox", "production"},
+				Environments:     map[string]api.EnvironmentConfig{"qa": {}, "sandbox": {}},
+			},
+		},
+	}
+
+	t.Run("override target is listed for its database", func(t *testing.T) {
+		assert.False(t, scopedTargetMissingFromPromotionOrder(cfg, "bureau", "sandbox"))
+	})
+
+	t.Run("same target fails closed for a database without it", func(t *testing.T) {
+		assert.True(t, scopedTargetMissingFromPromotionOrder(cfg, "orders", "sandbox"))
+	})
+
+	t.Run("override omitting a server-order environment fails closed", func(t *testing.T) {
+		assert.True(t, scopedTargetMissingFromPromotionOrder(cfg, "bureau", "staging"))
+	})
+
+	t.Run("unscoped instance never fails closed here", func(t *testing.T) {
+		unscoped := &api.ServerConfig{EnvironmentOrder: []string{"qa", "production"}}
+
+		assert.False(t, scopedTargetMissingFromPromotionOrder(unscoped, "bureau", "sandbox"))
+	})
+}
+
 func TestCheckPriorEnvViaLocalFailsClosedOnStorageError(t *testing.T) {
 	const (
 		repo = "octocat/hello-world"

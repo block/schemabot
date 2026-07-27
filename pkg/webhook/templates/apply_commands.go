@@ -711,7 +711,7 @@ func RenderApplyBlockedByUnlistedEnvironment(environment string, promotionOrder 
 	if len(promotionOrder) > 0 {
 		fmt.Fprintf(&sb, "Configured promotion order: `%s`\n\n", strings.Join(promotionOrder, "` → `"))
 	}
-	fmt.Fprintf(&sb, "Add `%s` to `environment_order` so SchemaBot knows where it sits in the promotion sequence, then retry the apply.\n", environment)
+	fmt.Fprintf(&sb, "Add `%s` to `environment_order` (the server-wide list, or this database's override when it has one) so SchemaBot knows where it sits in the promotion sequence, then retry the apply.\n", environment)
 
 	return sb.String()
 }

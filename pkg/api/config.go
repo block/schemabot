@@ -797,6 +797,17 @@ type DatabaseConfig struct {
 	// Environments contains per-environment configuration.
 	Environments map[string]EnvironmentConfig `yaml:"environments"`
 
+	// EnvironmentOrder optionally overrides the server-wide environment_order
+	// for this database's promotion gating. Databases promote through different
+	// environment sequences (one may run qa → sandbox → production while
+	// another runs qa → staging → production), and a single server-wide order
+	// cannot express both. When set it replaces the server order entirely for
+	// this database: a PR apply to an environment in this list requires a
+	// successful SchemaBot check for every earlier entry, and environments the
+	// database does not promote through simply do not appear. When empty, the
+	// server-wide environment_order applies.
+	EnvironmentOrder []string `yaml:"environment_order,omitempty"`
+
 	// AllowedRepos restricts which trusted GitHub PR repositories may manage
 	// this database. Values are exact owner/repo names. A literal "*" allows
 	// any trusted repo.
@@ -1188,6 +1199,9 @@ func (c *ServerConfig) Validate() error {
 		}
 		if len(dbConfig.Environments) == 0 {
 			return fmt.Errorf("database %q has no environments configured", name)
+		}
+		if err := c.validateDatabaseEnvironmentOrder(name, dbConfig); err != nil {
+			return err
 		}
 		for env, envConfig := range dbConfig.Environments {
 			if err := envConfig.validateRevertWindowDuration(fmt.Sprintf("database %q environment %q", name, env)); err != nil {
@@ -1589,6 +1603,38 @@ func (g GitHubConfig) validatePromotionCheckName(context string) error {
 	return nil
 }
 
+// validateDatabaseEnvironmentOrder checks a database's environment_order
+// override against the database's configured environments and this instance's
+// environment scope. Both directions fail fast at startup because each
+// mismatch would silently block applies at runtime: a configured environment
+// absent from the override is rejected as an unlisted apply target, and a
+// locally-owned override entry with no configuration makes every later
+// environment wait on a prior check that can never exist. Entries owned by a
+// peer instance (outside allowed_environments) may legitimately be absent
+// locally — the promotion gate resolves them through the GitHub Checks API.
+func (c *ServerConfig) validateDatabaseEnvironmentOrder(name string, db DatabaseConfig) error {
+	if len(db.EnvironmentOrder) == 0 {
+		return nil
+	}
+	if err := validateUniqueNames(fmt.Sprintf("database %q environment_order", name), db.EnvironmentOrder); err != nil {
+		return err
+	}
+	for env := range db.Environments {
+		if !slices.Contains(db.EnvironmentOrder, env) {
+			return fmt.Errorf("database %q environment %q is configured but missing from the database environment_order; applies to it will be blocked as unlisted", name, env)
+		}
+	}
+	for _, env := range db.EnvironmentOrder {
+		if !c.IsEnvironmentAllowed(env) {
+			continue
+		}
+		if _, ok := db.Environments[env]; !ok {
+			return fmt.Errorf("database %q environment_order lists %q but the database does not configure it; applies to later environments will wait on a prior check that can never exist", name, env)
+		}
+	}
+	return nil
+}
+
 func validateUniqueNames(field string, names []string) error {
 	seen := make(map[string]struct{}, len(names))
 	for _, name := range names {
@@ -1724,7 +1770,7 @@ func (e *DatabaseNotConfiguredError) Error() string {
 }
 
 // DatabaseEnvironments returns the environments configured server-side for a
-// database, ordered by the server-owned promotion order. Returns
+// database, ordered by the database's effective promotion order. Returns
 // *DatabaseNotConfiguredError when the database has no registry entry.
 func (c *ServerConfig) DatabaseEnvironments(database string) ([]string, error) {
 	if c == nil {
@@ -1738,7 +1784,7 @@ func (c *ServerConfig) DatabaseEnvironments(database string) ([]string, error) {
 	for environment := range db.Environments {
 		environments = append(environments, environment)
 	}
-	return c.OrderedEnvironments(environments), nil
+	return c.OrderedEnvironmentsForDatabase(database, environments), nil
 }
 
 // ResolveDatabaseTarget returns the complete routing metadata for a configured
@@ -2084,6 +2130,7 @@ func (c *ServerConfig) KnownEnvironments() []string {
 	add(c.AllowedEnvironments...)
 	add(c.PromotionEnvironmentOrder()...)
 	for _, db := range c.Databases {
+		add(db.EnvironmentOrder...)
 		for env := range db.Environments {
 			add(env)
 		}
@@ -2115,6 +2162,9 @@ func (c *ServerConfig) IsEnvironmentKnown(env string) bool {
 		if _, ok := db.Environments[env]; ok {
 			return true
 		}
+		if slices.Contains(db.EnvironmentOrder, env) {
+			return true
+		}
 	}
 	return false
 }
@@ -2128,10 +2178,38 @@ func (c *ServerConfig) PromotionEnvironmentOrder() []string {
 	return slices.Clone(c.EnvironmentOrder)
 }
 
+// PromotionOrderForDatabase returns the environment promotion order used by PR
+// apply gating for a database: the database's environment_order override when
+// configured, otherwise the server-owned order. Databases without an override
+// behave exactly as before the override existed.
+func (c *ServerConfig) PromotionOrderForDatabase(database string) []string {
+	if c == nil {
+		return slices.Clone(defaultEnvironmentOrder)
+	}
+	if db := c.Database(database); db != nil && len(db.EnvironmentOrder) > 0 {
+		return slices.Clone(db.EnvironmentOrder)
+	}
+	return c.PromotionEnvironmentOrder()
+}
+
 // OrderedEnvironments returns the enabled environments sorted by the server-owned
 // promotion order. Unknown environments are appended alphabetically so callers
 // get deterministic behavior even before a custom environment_order is added.
 func (c *ServerConfig) OrderedEnvironments(enabled []string) []string {
+	return orderEnvironments(c.PromotionEnvironmentOrder(), enabled)
+}
+
+// OrderedEnvironmentsForDatabase returns the enabled environments sorted by the
+// database's effective promotion order: its environment_order override when
+// configured, otherwise the server-owned order. Unknown environments are
+// appended alphabetically so callers get deterministic behavior.
+func (c *ServerConfig) OrderedEnvironmentsForDatabase(database string, enabled []string) []string {
+	return orderEnvironments(c.PromotionOrderForDatabase(database), enabled)
+}
+
+// orderEnvironments sorts the enabled environments by the given promotion
+// order, appending environments absent from the order alphabetically.
+func orderEnvironments(order, enabled []string) []string {
 	enabledSet := make(map[string]struct{}, len(enabled))
 	for _, env := range enabled {
 		if env == "" {
@@ -2141,7 +2219,7 @@ func (c *ServerConfig) OrderedEnvironments(enabled []string) []string {
 	}
 
 	ordered := make([]string, 0, len(enabledSet))
-	for _, env := range c.PromotionEnvironmentOrder() {
+	for _, env := range order {
 		if _, ok := enabledSet[env]; ok {
 			ordered = append(ordered, env)
 			delete(enabledSet, env)
