@@ -11,6 +11,7 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -571,6 +572,10 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		return nil, fmt.Errorf("resolve spirit config for %s: %w", key, err)
 	}
 	maps.Copy(metadata, spiritMetadata)
+	if envConfig.DirectExecution != nil && envConfig.DirectExecution.Enabled {
+		metadata["direct_execution"] = "true"
+		metadata["direct_execution_max_table_rows"] = strconv.FormatInt(envConfig.DirectExecution.MaxTableRows, 10)
+	}
 	client, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:        database,
 		Type:            dbType,

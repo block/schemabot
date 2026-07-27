@@ -147,8 +147,11 @@ type LocalConfig struct {
 	// Keys used by PlanetScale: organization, token_name, token_value,
 	// tls_name, revert_window_duration, main_branch.
 	// Keys used by Spirit: pending_drops ("false" disables the pending drops
-	// quarantine so DROP TABLE executes directly), plus the run-settings
-	// overrides parsed by spirit.SettingsFromMetadata
+	// quarantine so DROP TABLE executes directly); direct_execution ("true"
+	// lets engine-refused ALTER statements run verbatim as native MySQL DDL)
+	// with its required companion direct_execution_max_table_rows (positive
+	// estimated-row-count bound above which direct execution is blocked);
+	// plus the run-settings overrides parsed by spirit.SettingsFromMetadata
 	// (enable_experimental_autoscaling, checkpoint_max_age,
 	// checksum_yield_timeout).
 	Metadata map[string]string

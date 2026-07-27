@@ -822,6 +822,82 @@ func TestServerConfig_ValidateRejectsNonPositiveRevertWindowDuration(t *testing.
 	}
 }
 
+// Enabling direct_execution without a positive max_table_rows bound is a
+// startup config error: the size gate must never be accidentally unbounded.
+func TestServerConfig_ValidateRejectsDirectExecutionWithoutBound(t *testing.T) {
+	for name, direct := range map[string]*DirectExecutionConfig{
+		"missing bound":  {Enabled: true},
+		"zero bound":     {Enabled: true, MaxTableRows: 0},
+		"negative bound": {Enabled: true, MaxTableRows: -1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" enables direct_execution`)
+			assert.Contains(t, err.Error(), "a positive bound is required")
+		})
+	}
+}
+
+// direct_execution on a non-MySQL database is a startup config error rather
+// than a silently ignored grant: config that looks like it permits direct
+// execution must either take effect or fail loudly.
+func TestServerConfig_ValidateRejectsDirectExecutionOnNonMySQL(t *testing.T) {
+	cfg := ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: "vitess",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {
+						DSN:             "root@tcp(localhost)/mydb",
+						DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 1000},
+					},
+				},
+			},
+		},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `database "mydb" environment "staging" sets direct_execution`)
+	assert.Contains(t, err.Error(), "only supported for mysql databases")
+}
+
+// A well-formed direct_execution policy on a MySQL database validates, and a
+// disabled block (even without a bound) is accepted as the fail-closed default.
+func TestServerConfig_ValidateAcceptsDirectExecution(t *testing.T) {
+	for name, direct := range map[string]*DirectExecutionConfig{
+		"enabled with bound": {Enabled: true, MaxTableRows: 500000},
+		"disabled":           {Enabled: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			require.NoError(t, cfg.Validate())
+		})
+	}
+}
+
 // A well-formed revert_window_duration parses to the configured window.
 func TestServerConfig_ValidateAcceptsValidRevertWindowDuration(t *testing.T) {
 	cfg := ServerConfig{

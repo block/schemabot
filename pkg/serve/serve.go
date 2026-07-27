@@ -660,14 +660,23 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysq
 
 	dbName := matches[0]
 	dbConfig := config.Databases[dbName]
-	targetDSN, err := dbConfig.Environments[env].ResolveDSN()
+	envConfig := dbConfig.Environments[env]
+	targetDSN, err := envConfig.ResolveDSN()
 	if err != nil {
 		return nil, fmt.Errorf("resolve DSN for %s/%s: %w", dbName, env, err)
+	}
+	var metadata map[string]string
+	if envConfig.DirectExecution != nil && envConfig.DirectExecution.Enabled {
+		metadata = map[string]string{
+			"direct_execution":                "true",
+			"direct_execution_max_table_rows": strconv.FormatInt(envConfig.DirectExecution.MaxTableRows, 10),
+		}
 	}
 	client, err := grpcLocalClientFactory(config, wake, engineFactories)(tern.LocalConfig{
 		Database:  dbName,
 		Type:      dbConfig.Type,
 		TargetDSN: targetDSN,
+		Metadata:  metadata,
 	}, st, logger)
 	if err != nil {
 		return nil, fmt.Errorf("create local client for %s: %w", dbName, err)

@@ -1465,6 +1465,39 @@ func RecordPendingDropMoved(ctx context.Context, database string) {
 	)
 }
 
+// knownDirectExecutionOutcomes limits metric cardinality to the outcomes the
+// direct execution path can produce. Executed statements terminate as
+// completed, failed, or stopped; refused statements the policy does not route
+// directly are blocked with the reason encoded in the outcome.
+var knownDirectExecutionOutcomes = map[string]bool{
+	"completed":               true,
+	"failed":                  true,
+	"stopped":                 true,
+	"blocked_policy_disabled": true,
+	"blocked_size_limit":      true,
+	"blocked_size_unknown":    true,
+}
+
+// RecordDirectExecution increments the counter for a statement the
+// schema-change engine refused and the direct execution policy resolved — to a
+// native MySQL DDL execution (completed/failed/stopped) or to a block
+// (blocked_*). Direct executions are rare, operator-consented events: a spike
+// in failed means native DDL is erroring on the target (check the apply logs
+// for the statement and MySQL error), and a spike in blocked_size_unknown
+// means row estimates are unavailable (check target connectivity and
+// information_schema access).
+func RecordDirectExecution(ctx context.Context, database, outcome string) {
+	if !knownDirectExecutionOutcomes[outcome] {
+		outcome = "unknown"
+	}
+	addCounter(ctx, "schemabot.direct_execution.statements_total",
+		"Total number of engine-refused statements resolved by the direct execution policy", "{statement}",
+		attribute.String("database", database),
+		attribute.String("outcome", outcome),
+		EnvironmentAttribute(""),
+	)
+}
+
 // RecordPendingDropsCleanupDropped increments the counter for expired
 // quarantined tables permanently dropped by the pending drops cleaner.
 func RecordPendingDropsCleanupDropped(ctx context.Context, database, environment string) {
