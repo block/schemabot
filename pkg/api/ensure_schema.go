@@ -56,6 +56,11 @@ func WithAllowDestructiveSchemaChanges(allow bool) EnsureSchemaOption {
 // schema.DialectMySQL, which preserves the behavior of every existing call
 // site. A dialect without a bootstrapper fails closed rather than falling back
 // to the MySQL flow.
+//
+// The dispatch matches the schema.Dialect constants exactly and deliberately
+// does not normalize case: schema.DialectForDatabaseType owns the conversion
+// from raw config text (including lowercasing), so callers wiring config
+// values must go through it. Any other value fails closed at startup.
 func WithDialect(dialect schema.Dialect) EnsureSchemaOption {
 	return func(o *ensureSchemaOptions) { o.dialect = dialect }
 }
