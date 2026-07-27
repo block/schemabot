@@ -678,6 +678,29 @@ func RecordRemoteControlRequestStale(ctx context.Context, operation, database, d
 	)
 }
 
+// RecordEngineTerminalTruthReconcile counts drive claims that read the
+// engine's authoritative state before consuming a pending stop/cancel control
+// request. Outcomes:
+//   - "adopted_completed" / "adopted_failed" / "adopted_cancelled" /
+//     "adopted_reverted": the engine's change was already terminal, so the
+//     drive settled stored state to that outcome and mooted the pending
+//     command instead of running it. A sustained rate means operator commands
+//     are routinely losing the race with the engine — check why commands are
+//     queued so late (e.g. webhook delivery lag, slow claim turnaround).
+//   - "progress_error": the authoritative read failed and the drive fell back
+//     to consuming the pending command as before. A sustained rate means the
+//     drive cannot see the engine's backend — check engine API connectivity
+//     and the persisted engine resume state for the apply in the drive logs.
+func RecordEngineTerminalTruthReconcile(ctx context.Context, database, deployment, environment, outcome string) {
+	addCounter(ctx, "schemabot.operator.engine_terminal_truth_reconciles_total",
+		"Total drive claims that read the engine's authoritative state before consuming a pending stop/cancel command", "{reconcile}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
 // RecordPlanetScaleUnclassifiedCancelRejection counts PlanetScale cancel
 // rejections whose live deployment state has no explicit classification. Every
 // known deployment state is classified explicitly; a hit here means PlanetScale
