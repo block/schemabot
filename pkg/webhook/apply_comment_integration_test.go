@@ -3579,3 +3579,162 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		}
 	})
 }
+
+// A stagnant apply must not keep re-editing its progress comment forever, but
+// the requester actively watching a young comment must never see it freeze.
+// Renders of an unchanged status differ only in their stamped timestamps
+// ("Last updated" footer, attribution line), so once the comment ages past its
+// grace window, re-PATCHing spends GitHub write budget without showing the
+// reader anything new — a long-running apply parked at a barrier would
+// otherwise re-edit an identical comment forever. Inside the grace window the
+// observer keeps refreshing the footer even when nothing changed (an early
+// stall must not read as SchemaBot going silent); past it, unchanged renders
+// skip GitHub entirely and editing resumes the moment real progress changes
+// the render.
+func TestE2EStagnantApplySkipsIdenticalProgressEdits(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-dedupe",
+		pr:         143,
+		database:   "e2e_dedupe_db",
+		applyState: state.Apply.Running,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	// The handler posts the initial progress comment; the observer edits it
+	// from then on.
+	h.postAndTrackComment(ctx, "org/repo-dedupe", 143, 12345, apply, state.Comment.Progress, "initial progress")
+	progressID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The first tick edits: the observer has never written this comment, so it
+	// cannot know the content is already current.
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, progressID, edited.CommentID)
+		assert.Contains(t, edited.Body, "50%")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the first tick to edit the progress comment")
+	}
+
+	// A stagnant tick while the comment is young still refreshes it: the
+	// requester is watching, and the footer must keep proving liveness.
+	fake.Advance(stagnantInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, progressID, edited.CommentID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an unchanged tick inside the grace window to refresh the comment")
+	}
+
+	// Age the comment past its grace window. This crossing tick also exceeds
+	// the heartbeat since the last write, so it refreshes once more and
+	// re-anchors the heartbeat.
+	fake.Advance(unchangedCommentGraceWindow + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, progressID, edited.CommentID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the grace-crossing tick to refresh the comment")
+	}
+
+	// Ticks past every cadence window with unchanged tasks render identical
+	// content; now that the comment is aged, none of them reaches GitHub.
+	for range 4 {
+		fake.Advance(stagnantInterval + time.Second)
+		obs.OnProgress(apply, []*storage.Task{task})
+	}
+	select {
+	case edited := <-capture.edits:
+		t.Fatalf("aged stagnant ticks with unchanged content must not edit; got edit on comment %d: %q", edited.CommentID, edited.Body)
+	default:
+		// expected: identical renders are skipped once the grace window passed
+	}
+
+	// Real row-copy progress changes the content, so the next tick edits again.
+	task.RowsCopied = 700
+	task.ProgressPercent = 70
+	fake.Advance(stagnantInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, progressID, edited.CommentID)
+		assert.Contains(t, edited.Body, "70%")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the tick after real progress to edit the comment")
+	}
+
+	// Four edits reached GitHub: the first render, the young refresh, the
+	// grace-crossing refresh, and the progress change. Skipped ticks do not
+	// count as edits.
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, 4, prog.EditCount)
+}
+
+// The "Last updated" footer doubles as a liveness signal, so skipping
+// content-identical edits must not freeze a stalled apply's comment forever:
+// once the heartbeat interval elapses without a write, the next tick refreshes
+// the comment even though nothing visible changed, and skipping resumes from
+// that fresh write.
+func TestE2EStagnantApplyHeartbeatRefreshesComment(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-heartbeat",
+		pr:         144,
+		database:   "e2e_heartbeat_db",
+		applyState: state.Apply.Running,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-heartbeat", 144, 12345, apply, state.Comment.Progress, "initial progress")
+	progressID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The first tick edits and anchors the heartbeat.
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, progressID, edited.CommentID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the first tick to edit the progress comment")
+	}
+
+	// Once the heartbeat elapses, an unchanged render is written anyway so the
+	// "Last updated" footer proves the observer is still watching.
+	fake.Advance(unchangedCommentHeartbeat + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, progressID, edited.CommentID)
+		assert.Contains(t, edited.Body, "50%")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an unchanged render to refresh the comment after the heartbeat elapsed")
+	}
+
+	// The refresh re-anchors the heartbeat: the next unchanged tick is skipped
+	// again.
+	fake.Advance(stagnantInterval + time.Second)
+	obs.OnProgress(apply, []*storage.Task{task})
+	select {
+	case edited := <-capture.edits:
+		t.Fatalf("unchanged tick inside the heartbeat window must not edit; got %q", edited.Body)
+	default:
+		// expected: skipping resumes from the refreshed write
+	}
+
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, 2, prog.EditCount)
+}
