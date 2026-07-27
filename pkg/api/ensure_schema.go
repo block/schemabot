@@ -187,7 +187,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 
 	// Changes or stale Spirit tables detected — acquire advisory lock to
 	// serialize cleanup and Spirit execution across pods.
-	lockConn, err := acquireEnsureSchemaLock(ctx, dsn, logger, locker)
+	lockConn, err := acquireMySQLEnsureSchemaLock(ctx, dsn, logger, locker)
 	if err != nil {
 		return fmt.Errorf("acquire schema lock: %w", err)
 	}
@@ -548,11 +548,13 @@ func diagnoseStorageTarget(ctx context.Context, dsn string) (*storageDiagnostic,
 // EnsureSchema across concurrent pod startups.
 const ensureSchemaLockName = "schemabot_ensure_schema"
 
-// acquireEnsureSchemaLock acquires a session-scoped advisory lock to serialize
-// EnsureSchema across pods. locker is the dialect's advisory-lock
-// implementation, supplied by the EnsureSchema dispatch. Returns the connection
-// holding the lock — the lock is released when the connection is closed.
-func acquireEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker) (*sql.Conn, error) {
+// acquireMySQLEnsureSchemaLock acquires a session-scoped advisory lock to
+// serialize EnsureSchema across pods. It serves the MySQL bootstrap flow only:
+// the connection is opened with the Go MySQL driver via mysqlconn, so another
+// dialect's bootstrapper needs its own lock helper alongside its
+// namedlock.Locker. Returns the connection holding the lock — the lock is
+// released when the connection is closed.
+func acquireMySQLEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker) (*sql.Conn, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
