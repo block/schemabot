@@ -208,7 +208,10 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
-	// Handle missing -e flag
+	// Handle missing -e flag. Plan without -e is a valid multi-env request;
+	// for every other command a missing -e is a usage error, answered by
+	// exactly one deployment: participants defer to the leader on an aggregate
+	// repo, and the respond_to_unscoped policy picks one responder otherwise.
 	if result.MissingEnv {
 		if result.Action == action.Plan {
 			// Plan without -e: run for all configured environments. The same
@@ -224,6 +227,18 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, true, result.CommentID)
 			})
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "multi-env plan started"})
+			return
+		}
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping missing environment reply for unscoped fan-out; the leader posts it once",
+				"repo", repo, "pr", pr, "action", result.Action)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
+			return
+		}
+		if result.Tenant == "" && h.service != nil && !h.service.Config().ShouldRespondToUnscoped() {
+			h.logger.Debug("skipping missing environment response (respond_to_unscoped is false)",
+				"repo", repo, "pr", pr, "action", result.Action)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
 			return
 		}
 		if result.Action == action.Rollback {

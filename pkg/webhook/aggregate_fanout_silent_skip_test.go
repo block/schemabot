@@ -488,6 +488,56 @@ func TestMalformedEnvironmentDefersToLeader(t *testing.T) {
 	})
 }
 
+// A command that requires -e but omits it is a usage error every deployment
+// can detect from the comment text alone, so on an aggregate repo participants
+// defer the reply to the leader, which posts it exactly once. A -t-scoped
+// command answers directly as the single addressee.
+func TestMissingEnvironmentDefersToLeader(t *testing.T) {
+	serveMissingEnvCommand := func(t *testing.T, cfg *api.ServerConfig, comment string) (*httptest.ResponseRecorder, chan string) {
+		t.Helper()
+		h, _, comments := newFanOutSkipHandler(t, cfg)
+
+		req := buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil)
+		rr := httpResponseRecorder()
+		h.ServeHTTP(rr, req)
+		require.Equal(t, http.StatusOK, rr.Code)
+		return rr, comments
+	}
+
+	t.Run("participant stays silent on the unscoped usage error", func(t *testing.T) {
+		rr, comments := serveMissingEnvCommand(t, aggregateParticipantConfig(), "schemabot rollback apply-123")
+
+		assert.Contains(t, rr.Body.String(), "usage error deferred to leader")
+		assert.Empty(t, comments, "a participant must defer the missing-environment reply to the leader")
+	})
+
+	t.Run("leader posts the usage error once", func(t *testing.T) {
+		rr, comments := serveMissingEnvCommand(t, aggregateLeaderConfig(), "schemabot rollback apply-123")
+
+		assert.Contains(t, rr.Body.String(), "missing environment flag")
+		body := requireComment(t, comments, "missing environment comment")
+		assert.Contains(t, body, "Missing Environment")
+	})
+
+	t.Run("tenant-scoped command gets the usage error from the addressee", func(t *testing.T) {
+		cfg := aggregateParticipantConfig()
+		cfg.Tenant = "alpha"
+		rr, comments := serveMissingEnvCommand(t, cfg, "schemabot rollback apply-123 --tenant alpha")
+
+		assert.Contains(t, rr.Body.String(), "missing environment flag")
+		body := requireComment(t, comments, "missing environment comment")
+		assert.Contains(t, body, "Missing Environment")
+	})
+
+	t.Run("non-aggregate repo still posts the usage error", func(t *testing.T) {
+		rr, comments := serveMissingEnvCommand(t, nonAggregateConfig(), "schemabot rollback")
+
+		assert.Contains(t, rr.Body.String(), "missing rollback arguments")
+		body := requireComment(t, comments, "missing arguments comment")
+		assert.Contains(t, body, "Missing Arguments")
+	})
+}
+
 // registerReactionRecorder captures acknowledgment reactions posted to the
 // command comment.
 func registerReactionRecorder(t *testing.T, mux *http.ServeMux) chan string {
