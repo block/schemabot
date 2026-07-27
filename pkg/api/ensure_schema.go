@@ -38,6 +38,7 @@ type EnsureSchemaOption func(*ensureSchemaOptions)
 
 type ensureSchemaOptions struct {
 	allowDestructive bool
+	dialect          schema.Dialect
 }
 
 // WithAllowDestructiveSchemaChanges controls whether EnsureSchema may execute
@@ -50,9 +51,43 @@ func WithAllowDestructiveSchemaChanges(allow bool) EnsureSchemaOption {
 	return func(o *ensureSchemaOptions) { o.allowDestructive = allow }
 }
 
-// EnsureSchema applies all embedded MySQL schema files to the database using Spirit.
-// It is idempotent - no changes are made if the schema is already up-to-date.
-// Uses the same differ/Spirit mechanism as LocalClient for consistency.
+// WithDialect selects the database family of the storage database so
+// EnsureSchema routes to the matching schema bootstrapper. It defaults to
+// schema.DialectMySQL, which preserves the behavior of every existing call
+// site. A dialect without a bootstrapper fails closed rather than falling back
+// to the MySQL flow.
+func WithDialect(dialect schema.Dialect) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) { o.dialect = dialect }
+}
+
+// EnsureSchema converges SchemaBot's own storage schema at startup, routing to
+// the bootstrapper for the storage database's dialect (MySQL unless overridden
+// with WithDialect). It is idempotent — no changes are made if the schema is
+// already up-to-date.
+//
+// The dispatch fails closed: a dialect without a bootstrapper returns an error
+// instead of running another family's DDL against the storage database. Each
+// bootstrapper owns its dialect end to end — embedded schema files, diff/apply
+// mechanism, and the advisory locker that serializes startup across pods — so
+// adding a dialect means adding a bootstrapper here, not threading
+// dialect-conditionals through the MySQL flow.
+func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) error {
+	o := ensureSchemaOptions{dialect: schema.DialectMySQL}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	switch o.dialect {
+	case schema.DialectMySQL:
+		return ensureMySQLSchema(dsn, logger, o, namedlock.MySQL{})
+	default:
+		return fmt.Errorf("no schema bootstrapper for storage dialect %q (supported: %q)", o.dialect, schema.DialectMySQL)
+	}
+}
+
+// ensureMySQLSchema applies all embedded MySQL schema files to the database
+// using Spirit — the same differ/Spirit mechanism as LocalClient, for
+// consistency. locker serializes the bootstrap across pods; MySQL dispatch
+// supplies the GET_LOCK/RELEASE_LOCK implementation.
 //
 // Concurrency-safe across pods: plans first without a lock (read-only diff),
 // and returns immediately if no changes are needed and no stale Spirit tables
@@ -71,11 +106,7 @@ func WithAllowDestructiveSchemaChanges(allow bool) EnsureSchemaOption {
 // rolling deploy or rollback where a storage table or column was legitimately
 // removed. The invariant is that an old binary can never destroy newer schema
 // state: the surplus table or column stays in place until an operator opts in.
-func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) error {
-	var o ensureSchemaOptions
-	for _, opt := range opts {
-		opt(&o)
-	}
+func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
 	ctx, cancel := context.WithTimeout(context.Background(), EnsureSchemaTimeout)
 	defer cancel()
 
@@ -156,7 +187,7 @@ func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) e
 
 	// Changes or stale Spirit tables detected — acquire advisory lock to
 	// serialize cleanup and Spirit execution across pods.
-	lockConn, err := acquireEnsureSchemaLock(ctx, dsn, logger)
+	lockConn, err := acquireEnsureSchemaLock(ctx, dsn, logger, locker)
 	if err != nil {
 		return fmt.Errorf("acquire schema lock: %w", err)
 	}
@@ -517,14 +548,11 @@ func diagnoseStorageTarget(ctx context.Context, dsn string) (*storageDiagnostic,
 // EnsureSchema across concurrent pod startups.
 const ensureSchemaLockName = "schemabot_ensure_schema"
 
-// ensureSchemaLocker serializes EnsureSchema across pods with a session-scoped
-// advisory lock held on the returned connection for the operation's lifetime.
-var ensureSchemaLocker namedlock.Locker = namedlock.MySQL{}
-
 // acquireEnsureSchemaLock acquires a session-scoped advisory lock to serialize
-// EnsureSchema across pods. Returns the connection holding the lock — the
-// lock is released when the connection is closed.
-func acquireEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger) (*sql.Conn, error) {
+// EnsureSchema across pods. locker is the dialect's advisory-lock
+// implementation, supplied by the EnsureSchema dispatch. Returns the connection
+// holding the lock — the lock is released when the connection is closed.
+func acquireEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker) (*sql.Conn, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
@@ -539,7 +567,7 @@ func acquireEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logge
 
 	// Wait up to the full timeout for the lock — a trailing pod must outwait the
 	// leader's schema change, after which it re-plans and finds no changes.
-	acquired, err := ensureSchemaLocker.Acquire(ctx, conn, ensureSchemaLockName, EnsureSchemaTimeout)
+	acquired, err := locker.Acquire(ctx, conn, ensureSchemaLockName, EnsureSchemaTimeout)
 	if err != nil {
 		utils.CloseAndLog(conn)
 		return nil, fmt.Errorf("acquire advisory lock: %w", err)
