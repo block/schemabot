@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -417,6 +418,19 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy)
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 		multiEnvData.Plans[env] = &commentData
+	}
+
+	// When every environment fails before a schema request resolves, no
+	// successful result seeded the comment's database identity. Fall back to
+	// the config-resolved database and this deployment's registry type so the
+	// failure comment names what failed to plan instead of rendering an empty
+	// database and a defaulted type.
+	if multiEnvData.Database == "" {
+		multiEnvData.Database = schemaDatabase
+		if db := h.service.Config().Database(schemaDatabase); db != nil {
+			multiEnvData.DatabaseType = db.Type
+			multiEnvData.IsMySQL = db.Type == storage.DatabaseTypeMySQL
+		}
 	}
 
 	// Update aggregate check once after all environments are planned.
