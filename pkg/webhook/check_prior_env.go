@@ -13,8 +13,8 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
-// checkPriorEnvironments enforces server-owned environment ordering: all enabled
-// environments before the current one in the database's effective promotion
+// checkPriorEnvironments enforces the database's effective environment
+// promotion order: all enabled environments before the current one in that
 // order must have a successful SchemaBot check.
 // Returns true if the apply is blocked (caller should return).
 //
@@ -39,7 +39,7 @@ func (h *Handler) checkPriorEnvironments(
 ) bool {
 	config := h.service.Config()
 
-	// On a scoped instance the server-configured promotion order is the only
+	// On a scoped instance the database's effective promotion order is the only
 	// authoritative source for which environments precede the target. If the
 	// target is absent from that order we cannot identify its prior
 	// environments, so staging-first ordering cannot be enforced. Fail closed:
