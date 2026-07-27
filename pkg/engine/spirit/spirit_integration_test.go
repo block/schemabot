@@ -16,6 +16,7 @@ import (
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/docker/go-connections/nat"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -39,7 +40,12 @@ var (
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
-	// Start shared MySQL container
+	// Start shared MySQL container. The MySQL entrypoint runs a throwaway
+	// init server that also logs "ready for connections" and binds nothing
+	// on TCP, so log- and port-based waits can be satisfied before the
+	// final server accepts clients. Gate readiness on a real query through
+	// the mapped port instead — the same handshake the tests themselves
+	// perform.
 	req := testcontainers.ContainerRequest{
 		Image:        "mysql:8.0",
 		ExposedPorts: []string{"3306/tcp"},
@@ -47,10 +53,9 @@ func TestMain(m *testing.M) {
 			"MYSQL_ROOT_PASSWORD": "testpassword",
 			"MYSQL_DATABASE":      "testdb",
 		},
-		WaitingFor: wait.ForAll(
-			wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(30*time.Second),
-			wait.ForListeningPort("3306/tcp"),
-		),
+		WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port nat.Port) string {
+			return fmt.Sprintf("root:testpassword@tcp(%s:%s)/testdb", host, port.Port())
+		}).WithStartupTimeout(30 * time.Second),
 	}
 
 	var err error
@@ -72,25 +77,6 @@ func TestMain(m *testing.M) {
 		log.Fatalf("get container port: %v", err)
 	}
 	sharedDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/testdb?parseTime=true&multiStatements=true", host, port)
-
-	// Wait for MySQL to be ready
-	var db *sql.DB
-	for range 30 {
-		db, err = sql.Open("mysql", sharedDSN)
-		if err != nil {
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-		if err = db.PingContext(ctx); err == nil {
-			_ = db.Close()
-			break
-		}
-		_ = db.Close()
-		time.Sleep(500 * time.Millisecond)
-	}
-	if err != nil {
-		log.Fatalf("connect to mysql: %v", err)
-	}
 
 	code := m.Run()
 
@@ -2319,10 +2305,14 @@ func TestNewSpiritMigrationGTIDChangeSource(t *testing.T) {
 			"MYSQL_ROOT_PASSWORD": "testpassword",
 			"MYSQL_DATABASE":      "testdb",
 		},
-		WaitingFor: wait.ForAll(
-			wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(30*time.Second),
-			wait.ForListeningPort("3306/tcp"),
-		),
+		// Gate readiness on a real query through the mapped port: the
+		// MySQL entrypoint's throwaway init server also logs "ready for
+		// connections", so log- and port-based waits can be satisfied
+		// before the final server accepts clients — and the GTID probe
+		// treats any connection failure as "no GTID support".
+		WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port nat.Port) string {
+			return fmt.Sprintf("root:testpassword@tcp(%s:%s)/testdb", host, port.Port())
+		}).WithStartupTimeout(30 * time.Second),
 	}
 	container, err := testcontainers.GenericContainer(t.Context(), testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
