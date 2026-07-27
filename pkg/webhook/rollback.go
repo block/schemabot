@@ -28,6 +28,14 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 
 	applyID := result.ApplyID
 	if applyID == "" {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping missing-apply-id reply for unscoped fan-out rollback; the leader posts it once",
+				"repo", repo,
+				"pr", pr,
+				"environment", result.Environment,
+				"requested_by", requestedBy)
+			return
+		}
 		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.deploymentTenant()))
 		return
 	}

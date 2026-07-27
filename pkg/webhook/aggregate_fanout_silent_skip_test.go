@@ -311,6 +311,43 @@ func TestControlMissingApplyIDDefersToLeader(t *testing.T) {
 	})
 }
 
+// A rollback command without an apply ID is a usage error every deployment can
+// detect from the comment text alone, so on an unscoped fan-out participants
+// defer the reply to the leader, which posts it exactly once. A -t-scoped
+// command answers directly as the single addressee.
+func TestRollbackMissingApplyIDDefersToLeader(t *testing.T) {
+	missingID := func(tenant string) CommandResult {
+		return CommandResult{Action: action.Rollback, Environment: "staging", Tenant: tenant}
+	}
+
+	t.Run("participant stays silent on the unscoped usage error", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleRollbackCommand("octocat/hello-world", 1, 12345, "hubot", missingID(""))
+
+		assert.Empty(t, comments, "a participant must defer the missing-apply-id reply to the leader")
+	})
+
+	t.Run("leader posts the usage error once", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleRollbackCommand("octocat/hello-world", 1, 12345, "hubot", missingID(""))
+
+		body := requireComment(t, comments, "missing-apply-id rollback comment")
+		assert.Contains(t, body, "Missing Apply ID")
+		assert.Contains(t, body, "schemabot rollback <apply-id> -e <environment>")
+	})
+
+	t.Run("tenant-scoped command gets the usage error from the addressee", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleRollbackCommand("octocat/hello-world", 1, 12345, "hubot", missingID("tenant-b"))
+
+		body := requireComment(t, comments, "missing-apply-id rollback comment")
+		assert.Contains(t, body, "Missing Apply ID")
+	})
+}
+
 // A volume command with a missing or invalid -v level is a usage error every
 // deployment can detect from the comment text alone, so on an unscoped fan-out
 // participants defer the reply to the leader, which posts it exactly once.
