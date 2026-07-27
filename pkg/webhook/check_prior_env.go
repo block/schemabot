@@ -116,6 +116,18 @@ func promotionGateEnvironments(config *api.ServerConfig, environment string, env
 	return config.OrderedEnvironments(environments)
 }
 
+// promotionCheckNameForRepo returns the aggregate Check Run base name the
+// promotion gate queries when a prior environment is owned by another
+// deployment: the owning App's promotion-check-name override when configured,
+// otherwise this deployment's own aggregate base.
+func (h *Handler) promotionCheckNameForRepo(repo string) string {
+	config, ok := h.serverConfig()
+	if !ok {
+		return aggregateCheckName
+	}
+	return config.PromotionCheckNameBaseForRepo(repo)
+}
+
 // checkPriorEnvViaLocal checks the prior environment status using the local database.
 func (h *Handler) checkPriorEnvViaLocal(
 	ctx context.Context, repo string, pr int,
@@ -258,7 +270,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 		return true
 	}
 
-	checkName := aggregateCheckNameForEnv(h.aggregateCheckNameForRepo(repo), priorEnv)
+	checkName := aggregateCheckNameForEnv(h.promotionCheckNameForRepo(repo), priorEnv)
 	checkResult, untrustedApps, err := h.waitForGitHubPriorEnvCheck(ctx, client, repo, pr, database, environment, priorEnv, prInfo.HeadSHA, checkName)
 	if err != nil {
 		h.logger.Error("failed to query GitHub check for prior environment, blocking apply",

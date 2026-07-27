@@ -729,6 +729,40 @@ gate sees an aggregate-named check from an untrusted app, it blocks as usual
 and emits a warning log and metric so operators can distinguish a check-name
 spoof from a chain member missing from the list.
 
+### Shared prior environment: `promotion-check-name`
+
+By default, the promotion gate looks for the prior environment's aggregate
+check run under this instance's own `check-name` base — for example, a
+production instance with `check-name: "SchemaBot X"` looks for
+`SchemaBot X (staging)`. That works when each promotion chain is a matched
+pair of instances publishing under the same base name.
+
+Some fleets instead share one staging instance across several production
+instances, each with its own distinct `check-name`. The shared staging
+instance publishes its aggregate under *its* base name, so a production
+instance's default lookup targets a check run that is never created and every
+apply fails closed. Set `promotion-check-name` to the shared prior
+deployment's `check-name` base to point the gate at the check run that
+actually exists:
+
+```yaml
+github:
+  check-name: "SchemaBot Y"            # this instance's own aggregate base
+  promotion-check-name: "SchemaBot X"  # the shared staging instance's base
+  trusted-check-app-slugs:
+    - schemabot-x-staging              # the shared staging instance's App slug
+```
+
+The prior environment is still appended in parentheses: with the config above,
+a production apply requires `SchemaBot X (staging)` to be successful. The
+shared prior deployment's App slug must be listed in
+`trusted-check-app-slugs` — the overridden name is published by a different
+App, and the gate only accepts check runs from trusted Apps. Config load
+rejects an override that differs from the instance's own base while
+`trusted-check-app-slugs` is empty, since no check run could ever satisfy that
+gate. `promotion-check-name` only redirects the promotion gate's prior-env
+lookup; the instance's own aggregate check runs keep using `check-name`.
+
 **Command routing across instances.** Every instance receives every PR comment
 through its own App's webhook. A command whose `-e` value is in the instance's
 `allowed_environments` is handled; one owned by a peer instance is silently
