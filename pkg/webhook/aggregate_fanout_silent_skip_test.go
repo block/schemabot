@@ -226,6 +226,51 @@ func TestUnscopedRollbackConfirmNoLockStaysSilentOnAggregateRepo(t *testing.T) {
 	})
 }
 
+// On an aggregate repo, an unscoped `unlock` fans out to every deployment, but
+// locks live in each tenant's own storage. A deployment holding no locks for
+// the PR stays silent so only the deployment with locks to release answers —
+// it must not post "No Locks Found" next to another tenant's real release. A
+// -t-scoped unlock and a non-aggregate repo still get the comment.
+func TestUnscopedUnlockNoLocksStaysSilentOnAggregateRepo(t *testing.T) {
+	unlockResult := func(tenant string) CommandResult {
+		return CommandResult{Action: action.Unlock, Tenant: tenant}
+	}
+
+	t.Run("unscoped unlock on aggregate repo stays silent", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleUnlockCommand("octocat/hello-world", 1, 12345, "hubot", unlockResult(""))
+
+		assert.Empty(t, comments, "deployment without locks must not post No Locks Found on an unscoped fan-out unlock")
+	})
+
+	t.Run("unscoped unlock on participant deployment stays silent", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleUnlockCommand("octocat/hello-world", 1, 12345, "hubot", unlockResult(""))
+
+		assert.Empty(t, comments, "a participant without locks must not post No Locks Found on an unscoped fan-out unlock")
+	})
+
+	t.Run("tenant-scoped unlock still posts no locks found", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleUnlockCommand("octocat/hello-world", 1, 12345, "hubot", unlockResult("tenant-b"))
+
+		body := requireComment(t, comments, "no-locks unlock comment")
+		assert.Contains(t, body, "No Locks Found")
+	})
+
+	t.Run("non-aggregate repo still posts no locks found", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+
+		h.handleUnlockCommand("octocat/hello-world", 1, 12345, "hubot", unlockResult(""))
+
+		body := requireComment(t, comments, "no-locks unlock comment")
+		assert.Contains(t, body, "No Locks Found")
+	})
+}
+
 // On an aggregate repo, an unscoped lifecycle control command (stop, cancel,
 // cutover, ...) fans out to every deployment, but the target apply lives in
 // exactly one tenant's storage. A deployment whose storage has no such apply
@@ -485,6 +530,56 @@ func TestMalformedEnvironmentDefersToLeader(t *testing.T) {
 		assert.Contains(t, rr.Body.String(), "invalid environment value")
 		body := requireComment(t, comments, "invalid environment comment")
 		assert.Contains(t, body, "Invalid Environment")
+	})
+}
+
+// A command that requires -e but omits it is a usage error every deployment
+// can detect from the comment text alone, so on an aggregate repo participants
+// defer the reply to the leader, which posts it exactly once. A -t-scoped
+// command answers directly as the single addressee.
+func TestMissingEnvironmentDefersToLeader(t *testing.T) {
+	serveMissingEnvCommand := func(t *testing.T, cfg *api.ServerConfig, comment string) (*httptest.ResponseRecorder, chan string) {
+		t.Helper()
+		h, _, comments := newFanOutSkipHandler(t, cfg)
+
+		req := buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil)
+		rr := httpResponseRecorder()
+		h.ServeHTTP(rr, req)
+		require.Equal(t, http.StatusOK, rr.Code)
+		return rr, comments
+	}
+
+	t.Run("participant stays silent on the unscoped usage error", func(t *testing.T) {
+		rr, comments := serveMissingEnvCommand(t, aggregateParticipantConfig(), "schemabot rollback apply-123")
+
+		assert.Contains(t, rr.Body.String(), "usage error deferred to leader")
+		assert.Empty(t, comments, "a participant must defer the missing-environment reply to the leader")
+	})
+
+	t.Run("leader posts the usage error once", func(t *testing.T) {
+		rr, comments := serveMissingEnvCommand(t, aggregateLeaderConfig(), "schemabot rollback apply-123")
+
+		assert.Contains(t, rr.Body.String(), "missing environment flag")
+		body := requireComment(t, comments, "missing environment comment")
+		assert.Contains(t, body, "Missing Environment")
+	})
+
+	t.Run("tenant-scoped command gets the usage error from the addressee", func(t *testing.T) {
+		cfg := aggregateParticipantConfig()
+		cfg.Tenant = "alpha"
+		rr, comments := serveMissingEnvCommand(t, cfg, "schemabot rollback apply-123 --tenant alpha")
+
+		assert.Contains(t, rr.Body.String(), "missing environment flag")
+		body := requireComment(t, comments, "missing environment comment")
+		assert.Contains(t, body, "Missing Environment")
+	})
+
+	t.Run("non-aggregate repo still posts the usage error", func(t *testing.T) {
+		rr, comments := serveMissingEnvCommand(t, nonAggregateConfig(), "schemabot rollback")
+
+		assert.Contains(t, rr.Body.String(), "missing rollback arguments")
+		body := requireComment(t, comments, "missing arguments comment")
+		assert.Contains(t, body, "Missing Arguments")
 	})
 }
 
