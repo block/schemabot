@@ -133,11 +133,13 @@ A plan can have DDL-only changes, VSchema-only changes, or both.
 ## Where to Put the Schema Directory
 
 SchemaBot is location-agnostic: config discovery finds `schemabot.yaml` anywhere
-in the repository — the directory containing it *is* the schema directory, and
-its subdirectory (or directory) basenames are the namespaces. Nothing in
-SchemaBot forces a particular path, so placement is a repository-semantics
-choice. That said, a repository-root `schema/` directory is the recommended
-layout:
+in the repository — the directory containing it *is* the schema directory.
+Namespaces come from directory names in either layout: with the config at the
+schema root, each subdirectory is a namespace (as below); with the config
+inside a single namespace directory next to its `.sql` files (flat layout),
+that directory's basename is the namespace. Nothing in SchemaBot forces a
+particular path, so placement is a repository-semantics choice. That said, a
+repository-root `schema/` directory is the recommended layout:
 
 ```
 myapp/
@@ -167,9 +169,10 @@ myapp/
   `BATCH_*`, history tables), so its desired state belongs at the top level,
   not nested inside one module.
 - **Short stable paths keep operations simple.** A server-side
-  `allowed_dirs: [schema/myapp]` allowlist, CODEOWNERS scoping, and PR review
+  `allowed_dirs: [schema]` allowlist (matched against the directory containing
+  `schemabot.yaml` and its descendants), CODEOWNERS scoping, and PR review
   path filters all stay trivial with a root path, and the
-  directory-basename-is-the-namespace contract stays visible at a glance.
+  directory-name-is-the-namespace contract stays visible at a glance.
 
 A module-root directory outside `src/` (e.g. `my-data-module/schema/`) also
 works and avoids the packaging problem — reasonable when one module clearly
