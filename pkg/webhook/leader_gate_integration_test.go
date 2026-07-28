@@ -732,7 +732,9 @@ func TestE2ELeaderParticipantSchemaWithDiscoverableConfigFoldsInsteadOfPlanning(
 	mockLeaderEmptyTree(mux, headSHA)
 	// The participant's schema root carries a discoverable schemabot.yaml for a
 	// database only tenant-b's deployment registers.
+	var configFetches atomic.Int64
 	mux.HandleFunc("GET /repos/octocat/hello-world/contents/"+tenantBSchemaDir+"/schemabot.yaml", func(w http.ResponseWriter, _ *http.Request) {
+		configFetches.Add(1)
 		content := base64.StdEncoding.EncodeToString([]byte("database: tenant-b-db\ntype: mysql\n"))
 		_ = json.NewEncoder(w).Encode(gh.RepositoryContent{
 			Type:     new("file"),
@@ -765,6 +767,10 @@ func TestE2ELeaderParticipantSchemaWithDiscoverableConfigFoldsInsteadOfPlanning(
 			"aggregate for %s must block on the unreported participant, not fail on a database the leader cannot plan", env)
 		assert.Empty(t, cr.Conclusion)
 	}
+
+	// The silence must come from the leader dropping the discovered config,
+	// not from discovery never running at all.
+	require.Positive(t, configFetches.Load(), "the participant's schemabot.yaml was never fetched, so config discovery did not run")
 
 	select {
 	case body := <-comments:
