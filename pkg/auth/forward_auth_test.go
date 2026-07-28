@@ -89,10 +89,11 @@ func newForwardAuthWithLogs(t *testing.T, cfg auth.ForwardAuthConfig) (http.Hand
 }
 
 func TestForwardAuth_UntrustedProxyDenialLogsArrivingXFCCIdentities(t *testing.T) {
-	// An operator triaging an untrusted-proxy denial needs to see which
-	// certificate identities actually arrived, so they can tell a missing trust
-	// anchor apart from a caller that presented no certificate. The log carries
-	// the parsed URI SVIDs — never the raw header, which is untrusted input.
+	// An operator triaging an untrusted-proxy denial needs to see which URI
+	// identities were present in the XFCC header, so they can tell a missing
+	// trust anchor apart from a caller that forwarded no identity. The log
+	// carries the parsed URI values — never the raw header, which is untrusted
+	// input on this path.
 	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
 		TrustedProxyCIDRs:  []string{trustedCIDR},
 		TrustedProxySPIFFE: []string{ingressSVID},
@@ -117,8 +118,8 @@ func TestForwardAuth_UntrustedProxyDenialLogsArrivingXFCCIdentities(t *testing.T
 
 func TestForwardAuth_UntrustedProxyDenialLogsZeroXFCCIdentities(t *testing.T) {
 	// A denial with no XFCC header logs a zero identity count, telling the
-	// operator the request never carried a client certificate — a routing or
-	// mesh problem, not a trust-anchor mismatch.
+	// operator no URI identity was forwarded at all — a routing or mesh
+	// problem, not a trust-anchor mismatch.
 	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
 		TrustedProxyCIDRs: []string{trustedCIDR},
 		WriteGroups:       []string{"ops"},

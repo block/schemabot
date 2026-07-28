@@ -155,9 +155,10 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 
 		trusted, proxyID := a.isTrustedProxy(r)
 		if !trusted {
-			// Log the certificate identities that DID arrive so an operator can
-			// tell a missing trust-anchor entry apart from a request that never
-			// carried a client certificate at all.
+			// Log the URI identities present in the XFCC header so an operator
+			// can tell a missing trust-anchor entry apart from a request whose
+			// header carried no identity at all. On this path the values are
+			// unverified caller input — triage signal, never a trust decision.
 			uris, uriCount := deniedRequestXFCCURIs(r)
 			a.logger.Warn("forward-auth request did not arrive through the trusted proxy; refusing to honor identity headers",
 				"path", r.URL.Path, "remote_addr", r.RemoteAddr,
@@ -278,11 +279,12 @@ func (a *ForwardAuthAuthorizer) isTrustedProxy(r *http.Request) (bool, string) {
 // chains carry one URI per hop and stay far below this.
 const maxLoggedXFCCURIs = 8
 
-// deniedRequestXFCCURIs returns the URI (SPIFFE SVID) values from the
+// deniedRequestXFCCURIs returns the URI (SPIFFE SVID) values present in the
 // request's XFCC header for denial logging, clamped to maxLoggedXFCCURIs, plus
 // the unclamped total. Only parsed URI values are returned — never the raw
-// header, which is untrusted caller input. A zero count means no client
-// certificate was recorded at any hop.
+// header — and on a denied request they are unverified caller input: a triage
+// signal, not verified certificate identities. A zero count means the header
+// carried no URI identity at all.
 func deniedRequestXFCCURIs(r *http.Request) ([]string, int) {
 	uris := parseXFCCURIs(r.Header.Get("X-Forwarded-Client-Cert"))
 	total := len(uris)
