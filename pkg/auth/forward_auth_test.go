@@ -232,6 +232,71 @@ func TestForwardAuth_TrustedProxyWithoutUserDenied(t *testing.T) {
 	assert.Nil(t, captured.user)
 }
 
+func TestForwardAuth_ServiceReadAllowsTrustedCallerWithoutUser(t *testing.T) {
+	serviceIngressSVID := "spiffe://example.org/ns/square-ingress/sa/proxy"
+	handler, captured := newForwardAuth(t, auth.ForwardAuthConfig{
+		TrustedProxySPIFFE: []string{ingressSVID},
+		ReadGroups:         []string{"users"},
+		WriteGroups:        []string{"ops"},
+		ServiceReadAuth: &auth.ServiceReadAuthConfig{
+			TrustedProxySPIFFE: []string{serviceIngressSVID},
+			AllowedCallers:     []string{"metanexus"},
+		},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	req.Header.Set("X-Forwarded-Client-Cert", `URI=`+serviceIngressSVID)
+	req.Header.Set("X-Sq-Caller-App-Name", "metanexus")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, captured.user)
+	assert.Equal(t, "service:metanexus", captured.user.Subject)
+}
+
+func TestForwardAuth_ServiceReadDeniesUnconfiguredCaller(t *testing.T) {
+	serviceIngressSVID := "spiffe://example.org/ns/square-ingress/sa/proxy"
+	handler, captured := newForwardAuth(t, auth.ForwardAuthConfig{
+		TrustedProxySPIFFE: []string{ingressSVID},
+		WriteGroups:        []string{"ops"},
+		ServiceReadAuth: &auth.ServiceReadAuthConfig{
+			TrustedProxySPIFFE: []string{serviceIngressSVID},
+			AllowedCallers:     []string{"metanexus"},
+		},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	req.Header.Set("X-Forwarded-Client-Cert", `URI=`+serviceIngressSVID)
+	req.Header.Set("X-Sq-Caller-App-Name", "other-service")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Nil(t, captured.user)
+}
+
+func TestForwardAuth_ServiceReadDoesNotAuthorizeWrites(t *testing.T) {
+	serviceIngressSVID := "spiffe://example.org/ns/square-ingress/sa/proxy"
+	handler, captured := newForwardAuth(t, auth.ForwardAuthConfig{
+		TrustedProxySPIFFE: []string{ingressSVID},
+		WriteGroups:        []string{"ops"},
+		ServiceReadAuth: &auth.ServiceReadAuthConfig{
+			TrustedProxySPIFFE: []string{serviceIngressSVID},
+			AllowedCallers:     []string{"metanexus"},
+		},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", nil)
+	req.Header.Set("X-Forwarded-Client-Cert", `URI=`+serviceIngressSVID)
+	req.Header.Set("X-Sq-Caller-App-Name", "metanexus")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Nil(t, captured.user)
+}
+
 func TestForwardAuth_UnderscoreHeaderNotHonored(t *testing.T) {
 	// A smuggled underscore variant (X_Forwarded_User) must not be read as the
 	// identity: net/http does not fold it into the canonical dashed header.

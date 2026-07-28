@@ -641,12 +641,19 @@ auth:
       - 127.0.0.1/32
     read_groups: [readers]                # groups granted read (empty = any authenticated caller)
     write_groups: [operators]             # groups granted write (empty = no writes)
+  service_read_auth:                      # optional: read-only service callers
+    caller_header: X-Sq-Caller-App-Name   # optional (default)
+    trusted_proxy_spiffe:
+      - spiffe://example.org/ns/square-ingress/sa/proxy
+    allowed_callers:
+      - metanexus
 ```
 
 The authorizer proves the request came from the trusted proxy, then reads the forwarded identity:
 
 - **Trust anchor (required, fail-closed).** With neither `trusted_proxy_cidrs` nor `trusted_proxy_spiffe` set, the server refuses to start. There are three modes: **CIDR only** (trust any request whose source IP is in a trusted network), **SPIFFE only** (trust any request whose XFCC carries a trusted SPIFFE ID), or **both** (require the source CIDR *and* a matching XFCC SPIFFE ID — defense in depth). `X-Forwarded-Client-Cert` (XFCC) is a spoofable HTTP header, so SPIFFE-only is safe only when the proxy sanitizes inbound XFCC and the server is not directly reachable (a service mesh) — the server logs a startup warning in that mode.
 - **Tiers.** Reads are open to any authenticated caller unless `read_groups` is set; writes require membership in `write_groups`. Only the canonical header is read, so a smuggled underscore variant (`X_Forwarded_User`) is ignored.
+- **Service read auth.** `service_read_auth` is optional and only works with `auth.type: forward_auth`. It grants read-tier access to named service callers after SchemaBot verifies the separately configured service-ingress trust anchor. It never authorizes write-tier requests; writes still require `forward_auth.write_groups`.
 
 ## Multi-Environment Deployment
 

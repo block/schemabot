@@ -1309,6 +1309,12 @@ type AuthConfig struct {
 	// SchemaBot runs behind an authenticating reverse proxy that forwards the
 	// verified identity as HTTP headers.
 	ForwardAuth ForwardAuthSettings `yaml:"forward_auth,omitempty"`
+
+	// ServiceReadAuth allows trusted service callers to use read-tier API
+	// endpoints without employee forward-auth identity headers. It is only
+	// honored with Type "forward_auth"; write-tier endpoints still require the
+	// normal ForwardAuth write groups.
+	ServiceReadAuth ServiceReadAuthSettings `yaml:"service_read_auth,omitempty"`
 }
 
 // ForwardAuthSettings configures the forward-auth authenticator. The proxy's
@@ -1344,13 +1350,39 @@ type ForwardAuthSettings struct {
 	WriteGroups []string `yaml:"write_groups,omitempty"`
 }
 
+// ServiceReadAuthSettings configures read-only service access for callers that
+// arrive through a trusted service ingress. The caller identity is read from a
+// proxy-provided header after the proxy trust anchor is verified.
+type ServiceReadAuthSettings struct {
+	// CallerHeader carries the authenticated service caller identity (default
+	// "X-Sq-Caller-App-Name").
+	CallerHeader string `yaml:"caller_header,omitempty"`
+
+	// TrustedProxySPIFFE lists SPIFFE IDs allowed to act as the service ingress
+	// proxy, read from the XFCC header.
+	TrustedProxySPIFFE []string `yaml:"trusted_proxy_spiffe,omitempty"`
+
+	// TrustedProxyCIDRs lists source networks allowed to act as the service
+	// ingress proxy.
+	TrustedProxyCIDRs []string `yaml:"trusted_proxy_cidrs,omitempty"`
+
+	// AllowedCallers lists service caller names granted read-tier access.
+	AllowedCallers []string `yaml:"allowed_callers,omitempty"`
+}
+
 // Validate checks the auth configuration. Unknown types are rejected so a
 // typo fails closed at startup rather than silently disabling auth.
 func (a *AuthConfig) Validate() error {
 	switch a.Type {
 	case "", "none":
+		if a.ServiceReadAuth.configured() {
+			return fmt.Errorf("service_read_auth requires auth type forward_auth")
+		}
 		return nil
 	case "oidc":
+		if a.ServiceReadAuth.configured() {
+			return fmt.Errorf("service_read_auth requires auth type forward_auth")
+		}
 		if strings.TrimSpace(a.Issuer) == "" {
 			return fmt.Errorf("issuer is required when auth type is oidc")
 		}
@@ -1362,7 +1394,10 @@ func (a *AuthConfig) Validate() error {
 		}
 		return nil
 	case "forward_auth":
-		return a.ForwardAuth.validate()
+		if err := a.ForwardAuth.validate(); err != nil {
+			return err
+		}
+		return a.ServiceReadAuth.validate()
 	default:
 		return fmt.Errorf("unknown auth type %q (supported: none, oidc, forward_auth)", a.Type)
 	}
@@ -1394,6 +1429,50 @@ func (f *ForwardAuthSettings) validate() error {
 		if _, _, err := net.ParseCIDR(c); err != nil {
 			return fmt.Errorf("forward_auth trusted_proxy_cidrs entry %q is not a valid CIDR: %w", c, err)
 		}
+	}
+	return nil
+}
+
+func (s *ServiceReadAuthSettings) configured() bool {
+	return strings.TrimSpace(s.CallerHeader) != "" ||
+		len(s.TrustedProxySPIFFE) > 0 ||
+		len(s.TrustedProxyCIDRs) > 0 ||
+		len(s.AllowedCallers) > 0
+}
+
+func (s *ServiceReadAuthSettings) validate() error {
+	if !s.configured() {
+		return nil
+	}
+	trimmedCIDRs := make([]string, 0, len(s.TrustedProxyCIDRs))
+	for _, c := range s.TrustedProxyCIDRs {
+		if c = strings.TrimSpace(c); c != "" {
+			trimmedCIDRs = append(trimmedCIDRs, c)
+		}
+	}
+	trimmedSPIFFE := make([]string, 0, len(s.TrustedProxySPIFFE))
+	for _, spiffe := range s.TrustedProxySPIFFE {
+		if spiffe = strings.TrimSpace(spiffe); spiffe != "" {
+			trimmedSPIFFE = append(trimmedSPIFFE, spiffe)
+		}
+	}
+	trimmedCallers := make([]string, 0, len(s.AllowedCallers))
+	for _, caller := range s.AllowedCallers {
+		if caller = strings.TrimSpace(caller); caller != "" {
+			trimmedCallers = append(trimmedCallers, caller)
+		}
+	}
+
+	if len(trimmedCIDRs) == 0 && len(trimmedSPIFFE) == 0 {
+		return fmt.Errorf("service_read_auth requires at least one trust anchor (trusted_proxy_spiffe or trusted_proxy_cidrs)")
+	}
+	for _, c := range trimmedCIDRs {
+		if _, _, err := net.ParseCIDR(c); err != nil {
+			return fmt.Errorf("service_read_auth trusted_proxy_cidrs entry %q is not a valid CIDR: %w", c, err)
+		}
+	}
+	if len(trimmedCallers) == 0 {
+		return fmt.Errorf("service_read_auth requires at least one allowed caller")
 	}
 	return nil
 }

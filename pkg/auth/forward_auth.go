@@ -44,6 +44,30 @@ type ForwardAuthConfig struct {
 	// WriteGroups are the groups granted the write tier. When empty, no caller
 	// can perform write-tier operations (read still works).
 	WriteGroups []string
+
+	// ServiceReadAuth optionally grants read-tier API access to service callers
+	// arriving through a separately trusted service ingress. Write-tier requests
+	// never use this path.
+	ServiceReadAuth *ServiceReadAuthConfig
+}
+
+// ServiceReadAuthConfig configures read-only service access through a trusted
+// service ingress proxy.
+type ServiceReadAuthConfig struct {
+	// CallerHeader carries the authenticated service caller identity. Defaults
+	// to "X-Sq-Caller-App-Name".
+	CallerHeader string
+
+	// TrustedProxySPIFFE lists SPIFFE IDs allowed to act as the service ingress
+	// proxy, read from the Envoy XFCC header.
+	TrustedProxySPIFFE []string
+
+	// TrustedProxyCIDRs lists source networks allowed to act as the service
+	// ingress proxy.
+	TrustedProxyCIDRs []string
+
+	// AllowedCallers lists service caller names granted read-tier access.
+	AllowedCallers []string
 }
 
 // ForwardAuthAuthorizer authenticates requests from an authenticating reverse
@@ -72,7 +96,15 @@ type ForwardAuthAuthorizer struct {
 	trustedNets   []*net.IPNet
 	readGroups    []string
 	writeGroups   []string
+	serviceRead   *serviceReadAuth
 	logger        *slog.Logger
+}
+
+type serviceReadAuth struct {
+	callerHeader   string
+	trustedSPIFFE  []string
+	trustedNets    []*net.IPNet
+	allowedCallers []string
 }
 
 // NewForwardAuthAuthorizer builds a forward-auth authorizer. It requires at
@@ -128,6 +160,18 @@ func NewForwardAuthAuthorizer(cfg ForwardAuthConfig, logger *slog.Logger) (*Forw
 		logger.Warn("forward-auth trusting XFCC with no source-CIDR anchor: ensure the proxy sanitizes inbound X-Forwarded-Client-Cert and the server is not directly reachable")
 	}
 
+	var serviceRead *serviceReadAuth
+	if cfg.ServiceReadAuth != nil {
+		serviceAuth, err := newServiceReadAuth(*cfg.ServiceReadAuth)
+		if err != nil {
+			return nil, err
+		}
+		serviceRead = serviceAuth
+		if len(serviceRead.trustedSPIFFE) > 0 && len(serviceRead.trustedNets) == 0 {
+			logger.Warn("service read-auth trusting XFCC with no source-CIDR anchor: ensure the proxy sanitizes inbound X-Forwarded-Client-Cert and the server is not directly reachable")
+		}
+	}
+
 	return &ForwardAuthAuthorizer{
 		userHeader:    userHeader,
 		groupsHeader:  groupsHeader,
@@ -136,6 +180,7 @@ func NewForwardAuthAuthorizer(cfg ForwardAuthConfig, logger *slog.Logger) (*Forw
 		trustedNets:   nets,
 		readGroups:    cfg.ReadGroups,
 		writeGroups:   cfg.WriteGroups,
+		serviceRead:   serviceRead,
 		logger:        logger,
 	}, nil
 }
@@ -152,6 +197,16 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 		}
 
 		tier := tierForRequest(r.Method, r.URL.Path)
+		if tier == TierRead {
+			serviceUser, handled := a.authorizeServiceRead(w, r, tier)
+			if handled {
+				if serviceUser != nil {
+					ctx := WithUser(r.Context(), serviceUser)
+					next.ServeHTTP(w, r.WithContext(ctx))
+				}
+				return
+			}
+		}
 
 		trusted, proxyID := a.isTrustedProxy(r)
 		if !trusted {
@@ -200,6 +255,86 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 	})
 }
 
+func newServiceReadAuth(cfg ServiceReadAuthConfig) (*serviceReadAuth, error) {
+	callerHeader := cfg.CallerHeader
+	if callerHeader == "" {
+		callerHeader = "X-Sq-Caller-App-Name"
+	}
+
+	var nets []*net.IPNet
+	for _, c := range cfg.TrustedProxyCIDRs {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		_, network, err := net.ParseCIDR(c)
+		if err != nil {
+			return nil, fmt.Errorf("parse service_read_auth trusted_proxy_cidr %q: %w", c, err)
+		}
+		nets = append(nets, network)
+	}
+
+	var spiffe []string
+	for _, s := range cfg.TrustedProxySPIFFE {
+		if s = strings.TrimSpace(s); s != "" {
+			spiffe = append(spiffe, s)
+		}
+	}
+
+	var callers []string
+	for _, c := range cfg.AllowedCallers {
+		if c = strings.TrimSpace(c); c != "" {
+			callers = append(callers, c)
+		}
+	}
+
+	if len(nets) == 0 && len(spiffe) == 0 {
+		return nil, fmt.Errorf("service_read_auth requires at least one trust anchor (trusted_proxy_spiffe or trusted_proxy_cidrs)")
+	}
+	if len(callers) == 0 {
+		return nil, fmt.Errorf("service_read_auth requires at least one allowed caller")
+	}
+
+	return &serviceReadAuth{
+		callerHeader:   callerHeader,
+		trustedSPIFFE:  spiffe,
+		trustedNets:    nets,
+		allowedCallers: callers,
+	}, nil
+}
+
+// authorizeServiceRead handles the optional read-only service auth path. If the
+// request came through the service-read proxy, it returns a service user for an
+// allowed caller or writes the denial response before returning handled=true.
+func (a *ForwardAuthAuthorizer) authorizeServiceRead(w http.ResponseWriter, r *http.Request, tier Tier) (*User, bool) {
+	if a.serviceRead == nil {
+		return nil, false
+	}
+	trusted, proxyID := trustedProxy(r, a.serviceRead.trustedNets, a.serviceRead.trustedSPIFFE)
+	if !trusted {
+		return nil, false
+	}
+
+	caller := strings.TrimSpace(r.Header.Get(a.serviceRead.callerHeader))
+	if caller == "" {
+		a.logger.Warn("service read-auth trusted proxy supplied no caller identity",
+			"path", r.URL.Path, "proxy", proxyID, "caller_header", a.serviceRead.callerHeader)
+		authDecision(r, tier, "deny", "no_service_identity")
+		writeAuthError(w, http.StatusUnauthorized, "no authenticated service caller in forwarded headers")
+		return nil, true
+	}
+	if !slices.Contains(a.serviceRead.allowedCallers, caller) {
+		a.logger.Warn("service read-auth caller denied for read operation",
+			"path", r.URL.Path, "proxy", proxyID, "caller", caller)
+		authDecision(r, tier, "deny", "service_not_authorized")
+		writeAuthError(w, http.StatusForbidden, "service caller is not authorized for read access")
+		return nil, true
+	}
+
+	authDecision(r, tier, "allow", "")
+	return &User{Subject: "service:" + caller}, true
+}
+
 // canRead reports whether the caller may use read-tier endpoints. With no
 // configured read groups, reads are open to any authenticated caller; otherwise
 // the caller must be in a read group (write-group members can always read).
@@ -235,16 +370,20 @@ func (a *ForwardAuthAuthorizer) extractGroups(r *http.Request) []string {
 //     when the proxy sanitizes inbound XFCC and the server isn't directly
 //     reachable (a service mesh); the constructor warns when this mode is used.
 func (a *ForwardAuthAuthorizer) isTrustedProxy(r *http.Request) (bool, string) {
+	return trustedProxy(r, a.trustedNets, a.trustedSPIFFE)
+}
+
+func trustedProxy(r *http.Request, trustedNets []*net.IPNet, trustedSPIFFE []string) (bool, string) {
 	// When CIDRs are configured they gate everything: a request from outside
 	// them is never trusted, regardless of XFCC.
-	if len(a.trustedNets) > 0 {
+	if len(trustedNets) > 0 {
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
 			host = r.RemoteAddr
 		}
 		ip := net.ParseIP(strings.TrimSpace(host))
 		inTrustedNet := false
-		for _, network := range a.trustedNets {
+		for _, network := range trustedNets {
 			if ip != nil && network.Contains(ip) {
 				inTrustedNet = true
 				break
@@ -253,7 +392,7 @@ func (a *ForwardAuthAuthorizer) isTrustedProxy(r *http.Request) (bool, string) {
 		if !inTrustedNet {
 			return false, ""
 		}
-		if len(a.trustedSPIFFE) == 0 {
+		if len(trustedSPIFFE) == 0 {
 			return true, "cidr:" + ip.String()
 		}
 	}
@@ -261,7 +400,7 @@ func (a *ForwardAuthAuthorizer) isTrustedProxy(r *http.Request) (bool, string) {
 	// SPIFFE check: either SPIFFE-only mode, or the CIDR gate above has passed
 	// and a matching SPIFFE ID is additionally required.
 	for _, uri := range parseXFCCURIs(r.Header.Get("X-Forwarded-Client-Cert")) {
-		if slices.Contains(a.trustedSPIFFE, uri) {
+		if slices.Contains(trustedSPIFFE, uri) {
 			return true, "spiffe:" + uri
 		}
 	}

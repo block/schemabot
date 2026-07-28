@@ -93,4 +93,42 @@ func TestAuthConfigValidate(t *testing.T) {
 			WriteGroups:        []string{"owners"},
 		}}).Validate())
 	})
+
+	t.Run("service_read_auth requires forward_auth", func(t *testing.T) {
+		err := (&api.AuthConfig{Type: "none", ServiceReadAuth: api.ServiceReadAuthSettings{
+			TrustedProxySPIFFE: []string{"spiffe://example.org/ns/square-ingress/sa/proxy"},
+			AllowedCallers:     []string{"metanexus"},
+		}}).Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "forward_auth")
+	})
+
+	t.Run("service_read_auth requires a trust anchor", func(t *testing.T) {
+		err := (&api.AuthConfig{Type: "forward_auth", ForwardAuth: api.ForwardAuthSettings{
+			TrustedProxySPIFFE: []string{"spiffe://example.org/ns/ingress/sa/proxy"},
+		}, ServiceReadAuth: api.ServiceReadAuthSettings{
+			AllowedCallers: []string{"metanexus"},
+		}}).Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "trust anchor")
+	})
+
+	t.Run("service_read_auth requires an allowed caller", func(t *testing.T) {
+		err := (&api.AuthConfig{Type: "forward_auth", ForwardAuth: api.ForwardAuthSettings{
+			TrustedProxySPIFFE: []string{"spiffe://example.org/ns/ingress/sa/proxy"},
+		}, ServiceReadAuth: api.ServiceReadAuthSettings{
+			TrustedProxySPIFFE: []string{"spiffe://example.org/ns/square-ingress/sa/proxy"},
+		}}).Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "allowed caller")
+	})
+
+	t.Run("service_read_auth with spiffe and allowed caller is valid", func(t *testing.T) {
+		require.NoError(t, (&api.AuthConfig{Type: "forward_auth", ForwardAuth: api.ForwardAuthSettings{
+			TrustedProxySPIFFE: []string{"spiffe://example.org/ns/ingress/sa/proxy"},
+		}, ServiceReadAuth: api.ServiceReadAuthSettings{
+			TrustedProxySPIFFE: []string{"spiffe://example.org/ns/square-ingress/sa/proxy"},
+			AllowedCallers:     []string{"metanexus"},
+		}}).Validate())
+	})
 }

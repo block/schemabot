@@ -908,11 +908,23 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups []stri
 		return authz, nil
 	case "forward_auth":
 		fa := cfg.ForwardAuth
+		sra := cfg.ServiceReadAuth
+		var serviceReadAuth *auth.ServiceReadAuthConfig
+		if serviceReadAuthConfigured(sra) {
+			serviceReadAuth = &auth.ServiceReadAuthConfig{
+				CallerHeader:       sra.CallerHeader,
+				TrustedProxySPIFFE: sra.TrustedProxySPIFFE,
+				TrustedProxyCIDRs:  sra.TrustedProxyCIDRs,
+				AllowedCallers:     sra.AllowedCallers,
+			}
+		}
 		logger.Info("initializing forward-auth authentication",
 			"trusted_proxy_cidrs", len(fa.TrustedProxyCIDRs),
 			"trusted_proxy_spiffe", len(fa.TrustedProxySPIFFE),
 			"read_groups", len(fa.ReadGroups),
-			"write_groups", len(fa.WriteGroups))
+			"write_groups", len(fa.WriteGroups),
+			"service_read_auth", serviceReadAuth != nil,
+			"service_read_callers", len(sra.AllowedCallers))
 		authz, err := auth.NewForwardAuthAuthorizer(auth.ForwardAuthConfig{
 			UserHeader:         fa.UserHeader,
 			GroupsHeader:       fa.GroupsHeader,
@@ -921,6 +933,7 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups []stri
 			TrustedProxyCIDRs:  fa.TrustedProxyCIDRs,
 			ReadGroups:         fa.ReadGroups,
 			WriteGroups:        fa.WriteGroups,
+			ServiceReadAuth:    serviceReadAuth,
 		}, logger)
 		if err != nil {
 			return nil, err
@@ -936,4 +949,11 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups []stri
 	default:
 		return nil, fmt.Errorf("auth type %q is not yet supported", cfg.Type)
 	}
+}
+
+func serviceReadAuthConfigured(cfg api.ServiceReadAuthSettings) bool {
+	return strings.TrimSpace(cfg.CallerHeader) != "" ||
+		len(cfg.TrustedProxySPIFFE) > 0 ||
+		len(cfg.TrustedProxyCIDRs) > 0 ||
+		len(cfg.AllowedCallers) > 0
 }
