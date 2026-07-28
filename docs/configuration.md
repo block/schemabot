@@ -745,8 +745,38 @@ auth:
 The authorizer proves the request came from the trusted proxy, then reads the forwarded identity:
 
 - **Trust anchor (required, fail-closed).** With neither `trusted_proxy_cidrs` nor `trusted_proxy_spiffe` set, the server refuses to start. There are three modes: **CIDR only** (trust any request whose source IP is in a trusted network), **SPIFFE only** (trust any request whose XFCC carries a trusted SPIFFE ID), or **both** (require the source CIDR *and* a matching XFCC SPIFFE ID — defense in depth). `X-Forwarded-Client-Cert` (XFCC) is a spoofable HTTP header, so SPIFFE-only is safe only when the proxy sanitizes inbound XFCC and the server is not directly reachable (a service mesh) — the server logs a startup warning in that mode.
-- **Tiers.** Reads are open to any authenticated caller unless `read_groups` is set; writes require membership in `write_groups`. Only the canonical header is read, so a smuggled underscore variant (`X_Forwarded_User`) is ignored.
+- **Tiers.** Reads are open to any authenticated caller unless `read_groups` is set; writes require membership in `write_groups`, or in a database's `operator_groups` (see [Per-database write scoping](#per-database-write-scoping-forward-auth)). Only the canonical header is read, so a smuggled underscore variant (`X_Forwarded_User`) is ignored.
 - **Service callers (read-only).** `trusted_gateway_spiffe` + `read_service_spiffe` open a second lane for services calling as themselves: a caller-forwarding gateway terminates the caller's mTLS, verifies the client certificate, and forwards the caller's SPIFFE ID in `caller_spiffe_header`. The header is honored only when the XFCC-verified peer is a listed gateway, the forwarded caller must appear in `read_service_spiffe`, and service callers never get the write tier (denied with reason `service_caller_write`). The user and groups headers are never read on this lane, and the identity-header proxy always wins — the gateway lane is consulted only when the request did not arrive through the trusted proxy. `trusted_proxy_cidrs`, when set, gate this lane like everything else: a gateway SVID claimed from outside the trusted networks is never honored. **List a gateway only if it strips inbound copies of the caller header before setting it from the verified certificate** — otherwise any caller could forge an identity through it. The lane fails closed: gateways without callers (or callers without a gateway) refuse to start, the lane requires SPIFFE-anchored proxy trust (`trusted_proxy_spiffe`) — under CIDR-only trust an in-CIDR gateway request would be mistaken for the identity-header proxy, leaving the lane unreachable, so that combination refuses to start too — and an empty config disables the lane entirely.
+
+### Per-database write scoping (forward-auth)
+
+`write_groups` grants every database in the deployment. To let a database's owning team run mutating CLI/API operations against *their* database only, set `operator_groups` on the database and `operator_environments` — the instance-wide list of environments where scoped writes are allowed at all — in the forward-auth settings:
+
+```yaml
+auth:
+  type: forward_auth
+  forward_auth:
+    operator_environments: [staging]      # scoped writes allowed here, instance-wide
+databases:
+  payments:
+    type: mysql
+    operator_groups: [payments-team]      # forwarded groups granted scoped write
+    environments:
+      staging:
+        dsn: "env:STAGING_PAYMENTS_DSN"
+      production:
+        dsn: "env:PROD_PAYMENTS_DSN"
+```
+
+Which environments accept scoped writes is a deployment policy, uniform across databases, so it is stated once rather than repeated on every entry. On a server that hosts several environments, that one line is the guard keeping scoped writes out of the environments not named in it.
+
+The decision has two halves. The middleware admits any caller in `write_groups` or in any database's `operator_groups` to write-tier endpoints — it runs before the request body is parsed, so it cannot know the target. Each mutating handler then enforces the scope once the target database resolves: `plan` and `apply` from the request/stored plan, control operations (`stop`, `start`, `cutover`, `cancel`, `volume`, `release`, `revert`, `skip-revert`, `rollback plan`) from the stored apply, and lock acquire/release from the named database (locks are operator controls in the same family as stop/cancel and have no environment dimension, so the grant applies database-wide). Operations with no single target database — settings mutation, checks scan/synthesize/repos, webhook redrive — stay admin-only (`write_groups`). Operator members also get the read tier, deployment-wide.
+
+The grant fails closed everywhere: an unconfigured database, an environment outside `operator_environments`, or an unresolvable target denies scoped callers with a `403` naming the groups that would grant access. Misconfiguration is a startup error, not a silent no-op: any `operator_groups` grant requires a non-empty `operator_environments` (and the reverse), requires `auth.type: forward_auth`, and every listed environment must exist on at least one configured database.
+
+These are server-instance values owned by the platform operator. Keep them in the server's own configuration — never in repo-editable config, where a database team could grant themselves direct write with a self-merged PR.
+
+Scoped operators bypass PR source policy (`allowed_repos`/`allowed_dirs` are not evaluated for direct API plans), so a scoped grant trades the GitOps audit trail for direct access. Grant it for staging-style environments; before granting a production environment, add a trusted-source or stored-plan gate.
 
 ## Multi-Environment Deployment
 

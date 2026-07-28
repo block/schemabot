@@ -572,6 +572,66 @@ func TestForwardAuth_WriteRequiresWriteGroup(t *testing.T) {
 	})
 }
 
+func TestForwardAuth_OperatorGroupsAdmittedToWriteTier(t *testing.T) {
+	// Per-database operator group members are admitted to write-tier endpoints
+	// by the middleware; the handler enforces their per-database scope once the
+	// target resolves. Callers in neither write nor operator groups stay denied.
+	cfg := auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{trustedCIDR},
+		WriteGroups:       []string{"ops"},
+		OperatorGroups:    []string{"payments-team"},
+	}
+
+	t.Run("operator member is admitted", func(t *testing.T) {
+		handler, captured := newForwardAuth(t, cfg)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", nil)
+		req.RemoteAddr = trustedIPAddr
+		req.Header.Set("X-Forwarded-User", "bob")
+		req.Header.Set("X-Forwarded-Groups", "payments-team")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		require.NotNil(t, captured.user)
+		assert.Equal(t, "bob", captured.user.Subject)
+		assert.Equal(t, []string{"payments-team"}, captured.user.Groups,
+			"groups reach the handler so it can enforce the per-database scope")
+	})
+
+	t.Run("caller in neither lane is denied", func(t *testing.T) {
+		handler, captured := newForwardAuth(t, cfg)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", nil)
+		req.RemoteAddr = trustedIPAddr
+		req.Header.Set("X-Forwarded-User", "alice")
+		req.Header.Set("X-Forwarded-Groups", "readers")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Nil(t, captured.user)
+	})
+}
+
+func TestForwardAuth_OperatorGroupsGetReadTier(t *testing.T) {
+	// A caller who can mutate their database must be able to watch the result,
+	// so operator members clear restricted read groups too.
+	handler, _ := newForwardAuth(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{trustedCIDR},
+		ReadGroups:        []string{"users"},
+		WriteGroups:       []string{"ops"},
+		OperatorGroups:    []string{"payments-team"},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+	req.RemoteAddr = trustedIPAddr
+	req.Header.Set("X-Forwarded-User", "bob")
+	req.Header.Set("X-Forwarded-Groups", "payments-team")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
 func TestForwardAuth_SPIFFEOnlyMode(t *testing.T) {
 	// SPIFFE-only (no CIDR) trusts a request purely by the SVID its XFCC carries —
 	// the mesh sidecar mode. The source IP is irrelevant; only the SVID matters.

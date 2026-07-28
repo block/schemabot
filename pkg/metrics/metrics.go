@@ -487,6 +487,73 @@ func RecordPRCommandActorAuthorization(ctx context.Context, command, database, e
 	)
 }
 
+var knownDirectWriteAuthOperations = map[string]bool{
+	"plan":              true,
+	"apply":             true,
+	"rollback_plan":     true,
+	"stop":              true,
+	"start":             true,
+	"cutover":           true,
+	"cancel":            true,
+	"volume":            true,
+	"release":           true,
+	"revert":            true,
+	"skip_revert":       true,
+	"lock_acquire":      true,
+	"lock_release":      true,
+	"checks_scan":       true,
+	"checks_synthesize": true,
+	"checks_repos":      true,
+	"webhook_redrive":   true,
+	"settings_set":      true,
+}
+
+var knownDirectWriteAuthStatuses = map[string]bool{
+	"allowed": true,
+	"denied":  true,
+	"skipped": true,
+}
+
+var knownDirectWriteAuthReasons = map[string]bool{
+	"scoped_lane_disabled":    true,
+	"admin_allow":             true,
+	"scoped_allow":            true,
+	"missing_identity":        true,
+	"not_admin":               true,
+	"not_database_operator":   true,
+	"environment_not_allowed": true,
+	"missing_database_config": true,
+	"unknown":                 true,
+}
+
+// RecordDirectWriteAuthorization increments the counter for per-database
+// direct-write (CLI/API) authorization decisions made at the handler layer,
+// after the forward-auth middleware has admitted the caller to the write tier.
+// A spike in denied decisions means scoped operators are attempting operations
+// outside their grant — check the reason attribute to see whether the target
+// database, the environment, or the group membership is what mismatched.
+// Operation, status, and reason are allowlisted to keep cardinality bounded.
+func RecordDirectWriteAuthorization(ctx context.Context, operation, database, environment, status, reason string) {
+	if !knownDirectWriteAuthOperations[operation] {
+		operation = "unknown"
+	}
+	if !knownDirectWriteAuthStatuses[status] {
+		status = "unknown"
+	}
+	if !knownDirectWriteAuthReasons[reason] {
+		reason = "unknown"
+	}
+
+	addCounter(ctx, "schemabot.direct_write_authorization.total",
+		"Total per-database direct write authorization decisions", "{decision}",
+		attribute.String("operation", operation),
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("status", status),
+		attribute.String("reason", reason),
+	)
+}
+
 // RecordAuthDecision increments the counter for API auth decisions on the
 // direct request path (the OIDC and forward-auth authorizers). Labels are
 // inherently low-cardinality: tier is read/write, decision is allow/deny,

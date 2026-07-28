@@ -66,6 +66,13 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A named lock is an operator control on the database itself (holding
+	// applies off), in the same family as stop/cancel, so a database's
+	// operator grant covers it. Locks have no environment dimension.
+	if !s.authorizeDirectDatabaseWrite(w, r, "lock_acquire", req.Database) {
+		return
+	}
+
 	lock := &storage.Lock{
 		DatabaseName: req.Database,
 		DatabaseType: req.DatabaseType,
@@ -124,6 +131,10 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 
 	if req.Database == "" || req.DatabaseType == "" {
 		s.writeError(w, http.StatusBadRequest, "database and database_type are required")
+		return
+	}
+
+	if !s.authorizeDirectDatabaseWrite(w, r, "lock_release", req.Database) {
 		return
 	}
 

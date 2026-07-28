@@ -382,7 +382,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	// allow-all NoneAuthorizer that lets every request through (attaching an
 	// anonymous user); with "oidc" it validates Bearer JWTs and bypasses
 	// non-API paths (/webhook, health) itself.
-	authz, err := buildAuthorizer(ctx, cfg.Auth, cfg.PRCommandAuthorization.AdminTeams, logger)
+	authz, err := buildAuthorizer(ctx, cfg.Auth, cfg.PRCommandAuthorization.AdminTeams, cfg.OperatorGroupUnion(), logger)
 	if err != nil {
 		return nil, fmt.Errorf("setup auth: %w", err)
 	}
@@ -894,7 +894,10 @@ func applyDataPlaneClaimDefault(cfg *api.ServerConfig, isDataPlane bool) bool {
 // in context); "oidc" validates Bearer JWTs against the issuer's JWKS. Unknown
 // types are rejected so a misconfigured auth type fails closed at startup
 // rather than silently disabling auth.
-func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups []string, logger *slog.Logger) (auth.Authorizer, error) {
+// operatorGroups is the union of every database's operator_groups; forward-auth
+// admits its members to the write tier, with per-database enforcement in the
+// handlers.
+func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups, operatorGroups []string, logger *slog.Logger) (auth.Authorizer, error) {
 	switch cfg.Type {
 	case "", "none":
 		logger.Info("API authentication disabled — all requests allowed")
@@ -922,6 +925,7 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups []stri
 			"trusted_proxy_spiffe", len(fa.TrustedProxySPIFFE),
 			"read_groups", len(fa.ReadGroups),
 			"write_groups", len(fa.WriteGroups),
+			"operator_groups", len(operatorGroups),
 			"trusted_gateway_spiffe", len(fa.TrustedGatewaySPIFFE),
 			"read_service_spiffe", len(fa.ReadServiceSPIFFE))
 		authz, err := auth.NewForwardAuthAuthorizer(auth.ForwardAuthConfig{
@@ -932,6 +936,7 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups []stri
 			TrustedProxyCIDRs:    fa.TrustedProxyCIDRs,
 			ReadGroups:           fa.ReadGroups,
 			WriteGroups:          fa.WriteGroups,
+			OperatorGroups:       operatorGroups,
 			TrustedGatewaySPIFFE: fa.TrustedGatewaySPIFFE,
 			CallerSPIFFEHeader:   fa.CallerSPIFFEHeader,
 			ReadServiceSPIFFE:    fa.ReadServiceSPIFFE,
@@ -939,8 +944,11 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups []stri
 		if err != nil {
 			return nil, err
 		}
-		if len(fa.WriteGroups) == 0 {
+		switch {
+		case len(fa.WriteGroups) == 0 && len(operatorGroups) == 0:
 			logger.Warn("forward-auth enabled with no write groups configured: all write operations will be denied (read still works). Set auth.forward_auth.write_groups to allow writes.")
+		case len(fa.WriteGroups) == 0:
+			logger.Warn("forward-auth enabled with no write groups configured: only per-database operator writes will be allowed; operations with no target database (settings, checks, redrive) will be denied. Set auth.forward_auth.write_groups to allow admin writes.")
 		}
 		if len(fa.ReadGroups) == 0 {
 			logger.Info("forward-auth enabled with no read groups configured: read operations are open to any authenticated caller from the trusted proxy. Set auth.forward_auth.read_groups to restrict reads.")

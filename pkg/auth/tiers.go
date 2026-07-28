@@ -88,14 +88,23 @@ func groupMatches(callerGroup, configured string) bool {
 // matchesAnyGroup reports whether any of the caller's groups matches any of the
 // configured groups (see groupMatches).
 func matchesAnyGroup(callerGroups, configured []string) bool {
+	_, ok := MatchedGroup(callerGroups, configured)
+	return ok
+}
+
+// MatchedGroup returns the first configured group any of the caller's groups
+// matches (see groupMatches), for callers that need to report which principal
+// granted access. The configured name is returned — not the caller's raw group
+// string — so decisions attribute to the name an operator can find in config.
+func MatchedGroup(callerGroups, configured []string) (string, bool) {
 	for _, cg := range callerGroups {
 		for _, want := range configured {
 			if groupMatches(cg, want) {
-				return true
+				return want, true
 			}
 		}
 	}
-	return false
+	return "", false
 }
 
 // authDecision records an API auth decision metric for the request.
