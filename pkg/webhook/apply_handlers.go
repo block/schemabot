@@ -587,6 +587,14 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 	}
 
 	if len(locks) == 0 {
+		// On an unscoped fan-out every deployment runs the same lookup, but only
+		// the one holding a lock has anything to release. One with no locks stays
+		// silent so only the owning deployment answers.
+		if h.silentOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("unscoped fan-out unlock found no locks on this deployment; staying silent so the owning deployment responds",
+				"repo", repo, "pr", pr)
+			return
+		}
 		h.logger.Info("unlock: no locks found", "repo", repo, "pr", pr)
 		h.postComment(repo, pr, installationID, templates.RenderNoLocksFound())
 		return

@@ -35,6 +35,15 @@ func (h *Handler) logControlCommandError(command, repo string, pr int, applyID, 
 
 func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int, installationID int64, requestedBy string, result CommandResult, command string) (*storage.Apply, bool) {
 	if result.ApplyID == "" {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping missing-apply-id reply for unscoped fan-out control command; the leader posts it once",
+				"command", command,
+				"repo", repo,
+				"pr", pr,
+				"environment", result.Environment,
+				"requested_by", requestedBy)
+			return nil, false
+		}
 		h.postComment(repo, pr, installationID, templates.RenderControlMissingApplyID(command))
 		return nil, false
 	}
@@ -87,6 +96,20 @@ func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int
 		return nil, false
 	}
 	if apply == nil {
+		// On an aggregate repo an unscoped control command fans out to every
+		// deployment, but the apply lives in exactly one tenant's storage. A
+		// deployment that doesn't have it is not the owner and stays silent so
+		// only the owning deployment answers.
+		if h.silentOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("unscoped fan-out control command targets an apply not stored on this deployment; staying silent so the owning deployment responds",
+				"command", command,
+				"repo", repo,
+				"pr", pr,
+				"apply_id", result.ApplyID,
+				"environment", result.Environment,
+				"requested_by", requestedBy)
+			return nil, false
+		}
 		h.logger.Warn("PR control command rejected because apply was not found",
 			"command", command,
 			"repo", repo,
@@ -373,6 +396,17 @@ func (h *Handler) handleVolumeCommand(repo string, pr int, installationID int64,
 	// command posts the standard missing-apply-ID guidance shared by all
 	// apply-scoped control commands (runControlCommand handles that case).
 	if result.ApplyID != "" && !volumeCommandLevelValid(result) {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping invalid-volume-level reply for unscoped fan-out; the leader posts it once",
+				"repo", repo,
+				"pr", pr,
+				"apply_id", result.ApplyID,
+				"environment", result.Environment,
+				"requested_by", requestedBy,
+				"volume", result.VolumeLevel,
+				"volume_flag_error", result.VolumeLevelError)
+			return
+		}
 		h.logger.Warn("volume PR command rejected because the level is missing or invalid",
 			"repo", repo,
 			"pr", pr,

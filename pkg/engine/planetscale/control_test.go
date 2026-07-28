@@ -183,6 +183,24 @@ func TestCancel_AlreadyClosedDeployRequest(t *testing.T) {
 		assert.Contains(t, err.Error(), "cancel deploy request #121 (may have been deleted; state read also failed: deploy request not found)")
 		assert.Contains(t, err.Error(), "The deploy request is closed.")
 	})
+
+	t.Run("deploy request PlanetScale has no record of reads as permanent", func(t *testing.T) {
+		notFoundErr := &ps.Error{Code: ps.ErrNotFound, Meta: map[string]string{"message": "Not Found"}}
+		e := newEngine(&cancelDeployRequestClient{
+			cancelErr: closedErr,
+			getErr:    notFoundErr,
+		})
+
+		_, err := e.Cancel(t.Context(), controlReq())
+
+		require.Error(t, err)
+		assert.False(t, engine.IsRetryable(err), "a deploy request with no record can never accept the cancel")
+		assert.Contains(t, err.Error(), "cancel deploy request #121 rejected")
+		assert.Contains(t, err.Error(), "The deploy request is closed.")
+		assert.Contains(t, err.Error(), "deploy request not found")
+		var psErr *ps.Error
+		assert.ErrorAs(t, err, &psErr, "the not-found error must stay in the unwrap chain")
+	})
 }
 
 // applyDeployRequestErrorClient fails every cutover attempt with a fixed error.

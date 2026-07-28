@@ -1013,11 +1013,13 @@ If `environment_order` is omitted, SchemaBot defaults to staging before
 production.
 
 Before applying to an environment from a PR comment, SchemaBot checks prior
-environments from the server-owned promotion order. In a single deployment, the
-promotion gate uses the database environments configured on that server. In a
-deployment scoped with `allowed_environments`, the promotion gate uses
-`environment_order` so an environment-local deployment can still verify earlier
-environments owned by another SchemaBot deployment.
+environments from the database's effective promotion order — the database's
+`environment_order` override when set, otherwise the server-wide
+`environment_order`. In a single deployment, the promotion gate uses the
+database environments configured on that server. In a deployment scoped with
+`allowed_environments`, the promotion gate uses the effective order so an
+environment-local deployment can still verify earlier environments owned by
+another SchemaBot deployment.
 
 | Prior environment state | Apply allowed? | Reason |
 | --- | --- | --- |
