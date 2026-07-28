@@ -173,6 +173,16 @@ type Handler struct {
 	webhookReconcileGrace    time.Duration
 	webhookReconcileMaxPages int
 
+	// Check refresh processor lifecycle (see check_refresh.go). The intervals
+	// have package defaults set at construction; tests override them directly.
+	checkRefreshPollInterval  time.Duration
+	checkRefreshLeaseDuration time.Duration
+	checkRefreshSweepLookback time.Duration
+	checkRefreshMu            sync.Mutex
+	checkRefreshStop          chan struct{}
+	checkRefreshCancel        context.CancelFunc
+	checkRefreshWg            sync.WaitGroup
+
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
 	priorEnvCheckRetryInterval time.Duration
@@ -258,6 +268,9 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 		webhookReconcileLookback:    defaultWebhookReconcileLookback,
 		webhookReconcileGrace:       defaultWebhookReconcileGrace,
 		webhookReconcileMaxPages:    defaultWebhookReconcileMaxPages,
+		checkRefreshPollInterval:    defaultCheckRefreshPollInterval,
+		checkRefreshLeaseDuration:   defaultCheckRefreshLeaseDuration,
+		checkRefreshSweepLookback:   defaultCheckRefreshSweepLookback,
 		priorEnvCheckMaxAttempts:    defaultPriorEnvCheckMaxAttempts,
 		priorEnvCheckRetryInterval:  defaultPriorEnvCheckRetryInterval,
 	}
