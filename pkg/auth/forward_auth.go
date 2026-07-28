@@ -155,8 +155,13 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 
 		trusted, proxyID := a.isTrustedProxy(r)
 		if !trusted {
+			// Log the certificate identities that DID arrive so an operator can
+			// tell a missing trust-anchor entry apart from a request that never
+			// carried a client certificate at all.
+			uris, uriCount := deniedRequestXFCCURIs(r)
 			a.logger.Warn("forward-auth request did not arrive through the trusted proxy; refusing to honor identity headers",
-				"path", r.URL.Path, "remote_addr", r.RemoteAddr)
+				"path", r.URL.Path, "remote_addr", r.RemoteAddr,
+				"xfcc_uris", uris, "xfcc_uri_count", uriCount)
 			authDecision(r, tier, "deny", "untrusted_proxy")
 			writeAuthError(w, http.StatusUnauthorized, "request did not arrive through the trusted authenticating proxy")
 			return
@@ -266,6 +271,25 @@ func (a *ForwardAuthAuthorizer) isTrustedProxy(r *http.Request) (bool, string) {
 		}
 	}
 	return false, ""
+}
+
+// maxLoggedXFCCURIs bounds how many XFCC URI values a denial log records, so a
+// hostile caller cannot bloat log lines with a synthetic header. Legitimate
+// chains carry one URI per hop and stay far below this.
+const maxLoggedXFCCURIs = 8
+
+// deniedRequestXFCCURIs returns the URI (SPIFFE SVID) values from the
+// request's XFCC header for denial logging, clamped to maxLoggedXFCCURIs, plus
+// the unclamped total. Only parsed URI values are returned — never the raw
+// header, which is untrusted caller input. A zero count means no client
+// certificate was recorded at any hop.
+func deniedRequestXFCCURIs(r *http.Request) ([]string, int) {
+	uris := parseXFCCURIs(r.Header.Get("X-Forwarded-Client-Cert"))
+	total := len(uris)
+	if total > maxLoggedXFCCURIs {
+		uris = uris[:maxLoggedXFCCURIs]
+	}
+	return uris, total
 }
 
 // parseXFCCURIs extracts the URI (SPIFFE SVID) values from an Envoy
