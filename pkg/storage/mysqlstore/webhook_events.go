@@ -187,21 +187,40 @@ func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDur
 	}
 	defer rollbackTx(ctx, tx, "claim webhook event")
 
-	row := tx.QueryRowContext(ctx, `
-		SELECT `+webhookEventColumns+`
+	// Select only the id under the sort. MySQL's filesort packs every selected
+	// column into its sort rows, so sorting with `payload` (JSON, unbounded — a
+	// monorepo push event can exceed sort_buffer_size) in the select list fails
+	// with error 1038 (out of sort memory) on the first oversized row and wedges
+	// the claim loop on that row forever. Sorting ids keeps the sort rows tiny
+	// regardless of payload size; the full row is fetched by primary key below,
+	// inside the same transaction, while the claim lock is held.
+	var eventID int64
+	err = tx.QueryRowContext(ctx, `
+		SELECT id
 		FROM webhook_events
 		WHERE `+s.webhookClaimablePredicate()+`
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, webhookClaimableArgs()...)
-
-	event, err := scanWebhookEventInto(row)
+	`, webhookClaimableArgs()...).Scan(&eventID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query next claimable webhook event: %w", err)
+	}
+
+	row := tx.QueryRowContext(ctx, `
+		SELECT `+webhookEventColumns+`
+		FROM webhook_events
+		WHERE id = ?
+	`, eventID)
+	event, err := scanWebhookEventInto(row)
+	if err != nil {
+		// Includes sql.ErrNoRows: the id was locked FOR UPDATE moments ago in
+		// this transaction, so a missing row is an invariant violation, not an
+		// empty inbox.
+		return nil, fmt.Errorf("load claimable webhook event %d: %w", eventID, err)
 	}
 
 	leaseToken := uuid.NewString()
@@ -222,7 +241,7 @@ func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDur
 	}
 
 	// Reflect the committed claim on the scanned row instead of reloading it,
-	// avoiding a second round trip that would re-transfer the full payload. The
+	// avoiding another round trip that would re-transfer the full payload. The
 	// row was held under FOR UPDATE for the whole transaction, so no other writer
 	// could have changed it. lease_expires_at is the application-clock estimate of
 	// the database's NOW(6)+leaseDuration; callers schedule heartbeats from

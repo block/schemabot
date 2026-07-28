@@ -5,9 +5,12 @@ package mysqlstore
 import (
 	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -786,4 +789,56 @@ func TestWebhookEventStore_TerminateStuckProcessing(t *testing.T) {
 	reopened, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "stuck", Event: "pull_request", Payload: []byte(`{}`)})
 	require.NoError(t, err)
 	require.True(t, reopened)
+}
+
+// TestWebhookEventStore_FindNextClaimsOversizedPayload verifies that a
+// claimable row whose JSON payload is far larger than the server's sort
+// buffer is still claimed and processed. The claim query's sort must never
+// pack the payload into its sort rows: if it does, MySQL rejects the query
+// with error 1038 (out of sort memory) on every poll, and that row becomes a
+// poison pill that wedges the whole inbox — the event behind it never gets
+// its check, and every event queued after it waits forever.
+func TestWebhookEventStore_FindNextClaimsOversizedPayload(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+
+	// A dedicated single-connection pool so the session sort_buffer_size below
+	// applies to every statement FindNext runs, including its transaction.
+	db, err := sql.Open("mysql", testDSN)
+	require.NoError(t, err)
+	db.SetMaxOpenConns(1)
+	store := New(db)
+	t.Cleanup(func() { utils.CloseAndLog(store) })
+	require.NoError(t, db.PingContext(ctx))
+
+	// Pin the session to MySQL's minimum sort buffer so a filesort whose sort
+	// rows include the payload cannot fit even one row, while a sort over just
+	// the key columns fits easily.
+	_, err = db.ExecContext(ctx, "SET SESSION sort_buffer_size = 32768")
+	require.NoError(t, err)
+
+	oversized := fmt.Sprintf(`{"ref":"refs/heads/main","filler":%q}`, strings.Repeat("a", 400_000))
+	for i := range 3 {
+		created, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+			DeliveryID: fmt.Sprintf("oversized-%d", i),
+			Event:      "push",
+			Repository: "block/example",
+			Payload:    []byte(oversized),
+		})
+		require.NoError(t, err)
+		require.True(t, created)
+	}
+
+	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-1", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "oversized-payload row must be claimable")
+	assert.Equal(t, "oversized-0", claimed.DeliveryID, "claims the oldest claimable row")
+	assert.Equal(t, storage.WebhookEventProcessing, claimed.State)
+	assert.JSONEq(t, oversized, string(claimed.Payload), "payload must round-trip intact")
+
+	require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, claimed.ID, claimed.LeaseToken))
+	got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "oversized-0")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, storage.WebhookEventCompleted, got.State)
 }
