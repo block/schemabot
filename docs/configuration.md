@@ -236,6 +236,45 @@ tern_deployments:
 
 The production deployment does not need a staging target. It verifies staging by reading the staging deployment's GitHub aggregate check, then resolves only the production target from its own config.
 
+### Per-Database Environment Order
+
+Databases promote through different environment sequences — one database may run `qa → sandbox → production` while another runs `qa → staging → production` — and a single server-wide order cannot express both. A database entry may override the promotion order with its own `environment_order`. In this example a qa/sandbox-scoped instance promotes `payments` through `qa → sandbox` locally, with `production` owned by a peer instance:
+
+```yaml
+allowed_environments:
+  - qa
+  - sandbox
+
+environment_order:
+  - qa
+  - staging
+  - production
+
+databases:
+  payments:
+    type: mysql
+    environment_order:
+      - qa
+      - sandbox
+      - production
+    environments:
+      qa:
+        target: "payments-qa"
+        deployment: primary
+      sandbox:
+        target: "payments-sandbox"
+        deployment: primary
+```
+
+When set, the database's `environment_order` replaces the server-wide order entirely for that database's promotion gating: an apply to an environment in the list requires a successful SchemaBot check for every earlier entry, and environments the database does not promote through simply do not appear. Databases without an override keep using the server-wide `environment_order` unchanged.
+
+The override is validated at startup, fail-fast in both directions:
+
+- Every environment configured under the database's `environments` must appear in its `environment_order` — otherwise applies to it would be blocked as unlisted.
+- Every `environment_order` entry owned by this instance (per `allowed_environments`; all entries when the instance is unscoped) must be configured under the database's `environments` — otherwise a later environment's apply would wait on a prior check that can never exist.
+
+Entries owned by another instance in the promotion chain (outside this instance's `allowed_environments`) may be absent from the database's local `environments`: the promotion gate verifies them through the peer's GitHub aggregate check, exactly as with the server-wide order. Instances sharing a database must declare the same effective order for it — render all instances' config from a single source.
+
 ## Hybrid Mode
 
 Both modes can be used simultaneously. Each database environment in the `databases` section chooses one route: local mode with `dsn`, or gRPC mode with `target` and `deployment`. This is useful when some databases are co-located with SchemaBot and others are in remote environments.
@@ -728,6 +767,40 @@ gate and cannot be hidden from the passing-checks gate. When the passing-checks
 gate sees an aggregate-named check from an untrusted app, it blocks as usual
 and emits a warning log and metric so operators can distinguish a check-name
 spoof from a chain member missing from the list.
+
+### Shared prior environment: `promotion-check-name`
+
+By default, the promotion gate looks for the prior environment's aggregate
+check run under this instance's own `check-name` base — for example, a
+production instance with `check-name: "SchemaBot X"` looks for
+`SchemaBot X (staging)`. That works when each promotion chain is a matched
+pair of instances publishing under the same base name.
+
+Some fleets instead share one staging instance across several production
+instances, each with its own distinct `check-name`. The shared staging
+instance publishes its aggregate under *its* base name, so a production
+instance's default lookup targets a check run that is never created and every
+apply fails closed. Set `promotion-check-name` to the shared prior
+deployment's `check-name` base to point the gate at the check run that
+actually exists:
+
+```yaml
+github:
+  check-name: "SchemaBot Y"            # this instance's own aggregate base
+  promotion-check-name: "SchemaBot X"  # the shared staging instance's base
+  trusted-check-app-slugs:
+    - schemabot-x-staging              # the shared staging instance's App slug
+```
+
+The prior environment is still appended in parentheses: with the config above,
+a production apply requires `SchemaBot X (staging)` to be successful. The
+shared prior deployment's App slug must be listed in
+`trusted-check-app-slugs` — the overridden name is published by a different
+App, and the gate only accepts check runs from trusted Apps. Config load
+rejects an override that differs from the instance's own base while
+`trusted-check-app-slugs` is empty, since no check run could ever satisfy that
+gate. `promotion-check-name` only redirects the promotion gate's prior-env
+lookup; the instance's own aggregate check runs keep using `check-name`.
 
 **Command routing across instances.** Every instance receives every PR comment
 through its own App's webhook. A command whose `-e` value is in the instance's

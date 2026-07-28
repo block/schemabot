@@ -1945,6 +1945,172 @@ func TestServerConfig_OrderedEnvironments(t *testing.T) {
 	})
 }
 
+// TestServerConfig_PromotionOrderForDatabase covers per-database promotion
+// order resolution: a database's environment_order override replaces the
+// server-wide order for that database only, databases without an override
+// inherit the server order, and databases sharing an instance can promote
+// through disjoint environment sequences.
+func TestServerConfig_PromotionOrderForDatabase(t *testing.T) {
+	t.Run("no override inherits the server order", func(t *testing.T) {
+		cfg := ServerConfig{
+			EnvironmentOrder: []string{"qa", "staging", "production"},
+			Databases: map[string]DatabaseConfig{
+				"payments": {Environments: map[string]EnvironmentConfig{"qa": {}}},
+			},
+		}
+
+		assert.Equal(t, []string{"qa", "staging", "production"}, cfg.PromotionOrderForDatabase("payments"))
+	})
+
+	t.Run("override replaces the server order for that database only", func(t *testing.T) {
+		cfg := ServerConfig{
+			EnvironmentOrder: []string{"qa", "staging", "production"},
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					EnvironmentOrder: []string{"qa", "sandbox", "production"},
+					Environments:     map[string]EnvironmentConfig{"qa": {}, "sandbox": {}},
+				},
+				"orders": {Environments: map[string]EnvironmentConfig{"qa": {}}},
+			},
+		}
+
+		assert.Equal(t, []string{"qa", "sandbox", "production"}, cfg.PromotionOrderForDatabase("payments"))
+		assert.Equal(t, []string{"qa", "staging", "production"}, cfg.PromotionOrderForDatabase("orders"))
+	})
+
+	t.Run("unknown database inherits the server order", func(t *testing.T) {
+		cfg := ServerConfig{EnvironmentOrder: []string{"qa", "production"}}
+
+		assert.Equal(t, []string{"qa", "production"}, cfg.PromotionOrderForDatabase("missing"))
+	})
+
+	t.Run("nil config uses the default order", func(t *testing.T) {
+		var cfg *ServerConfig
+
+		assert.Equal(t, []string{"staging", "production"}, cfg.PromotionOrderForDatabase("payments"))
+	})
+}
+
+func TestServerConfig_OrderedEnvironmentsForDatabase(t *testing.T) {
+	cfg := ServerConfig{
+		EnvironmentOrder: []string{"qa", "staging", "production"},
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				EnvironmentOrder: []string{"qa", "sandbox", "production"},
+				Environments:     map[string]EnvironmentConfig{"qa": {}, "sandbox": {}},
+			},
+		},
+	}
+
+	t.Run("override orders the enabled environments", func(t *testing.T) {
+		got := cfg.OrderedEnvironmentsForDatabase("payments", []string{"sandbox", "qa"})
+
+		assert.Equal(t, []string{"qa", "sandbox"}, got)
+	})
+
+	t.Run("no override falls back to the server order", func(t *testing.T) {
+		got := cfg.OrderedEnvironmentsForDatabase("orders", []string{"production", "staging"})
+
+		assert.Equal(t, []string{"staging", "production"}, got)
+	})
+}
+
+// TestServerConfig_DatabaseEnvironmentsWithOverride verifies that a database's
+// configured environments are returned in its own promotion order, not the
+// server-wide order, when an environment_order override is set.
+func TestServerConfig_DatabaseEnvironmentsWithOverride(t *testing.T) {
+	cfg := ServerConfig{
+		EnvironmentOrder: []string{"sandbox", "qa", "production"},
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				EnvironmentOrder: []string{"qa", "sandbox", "production"},
+				Environments:     map[string]EnvironmentConfig{"sandbox": {}, "qa": {}},
+			},
+		},
+	}
+
+	got, err := cfg.DatabaseEnvironments("payments")
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"qa", "sandbox"}, got)
+}
+
+// TestValidateDatabaseEnvironmentOrder covers the fail-fast startup validation
+// of a database's environment_order override: each mismatch between the
+// override and the database's configured environments would otherwise
+// silently block applies at runtime.
+func TestValidateDatabaseEnvironmentOrder(t *testing.T) {
+	base := func() ServerConfig {
+		return ServerConfig{
+			AllowedEnvironments: []string{"qa", "sandbox"},
+			EnvironmentOrder:    []string{"qa", "staging", "production"},
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					Type:             "mysql",
+					EnvironmentOrder: []string{"qa", "sandbox", "production"},
+					Environments: map[string]EnvironmentConfig{
+						"qa":      {DSN: "root@tcp(localhost)/payments"},
+						"sandbox": {DSN: "root@tcp(localhost)/payments"},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("valid override with a remote-owned trailing environment", func(t *testing.T) {
+		cfg := base()
+
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("rejects duplicate environments in the override", func(t *testing.T) {
+		cfg := base()
+		db := cfg.Databases["payments"]
+		db.EnvironmentOrder = []string{"qa", "qa", "production"}
+		db.Environments = map[string]EnvironmentConfig{"qa": {DSN: "root@tcp(localhost)/payments"}}
+		cfg.Databases["payments"] = db
+
+		err := cfg.Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `database "payments" environment_order contains duplicate value "qa"`)
+	})
+
+	t.Run("rejects a configured environment missing from the override", func(t *testing.T) {
+		cfg := base()
+		db := cfg.Databases["payments"]
+		db.EnvironmentOrder = []string{"qa", "production"}
+		cfg.Databases["payments"] = db
+
+		err := cfg.Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `database "payments" environment "sandbox" is configured but missing from the database environment_order`)
+	})
+
+	t.Run("rejects a locally-owned override environment that is not configured", func(t *testing.T) {
+		cfg := base()
+		db := cfg.Databases["payments"]
+		db.Environments = map[string]EnvironmentConfig{"qa": {DSN: "root@tcp(localhost)/payments"}}
+		cfg.Databases["payments"] = db
+
+		err := cfg.Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `database "payments" environment_order lists "sandbox" but the database does not configure it`)
+	})
+
+	t.Run("unscoped instance must configure every override environment", func(t *testing.T) {
+		cfg := base()
+		cfg.AllowedEnvironments = nil
+
+		err := cfg.Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `database "payments" environment_order lists "production" but the database does not configure it`)
+	})
+}
+
 func TestLoadServerConfigFromFile_InvalidConfig(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
@@ -3063,6 +3229,92 @@ func TestServerConfig_GitHubCheckNameBaseForRepo(t *testing.T) {
 	})
 }
 
+func TestServerConfig_PromotionCheckNameBaseForRepo(t *testing.T) {
+	t.Run("defaults to the app's own check-name base", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{CheckName: "SchemaBot X"}}
+		assert.Equal(t, "SchemaBot X", cfg.PromotionCheckNameBaseForRepo("any/repo"))
+	})
+
+	t.Run("legacy single-app override trims configured name", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{
+			CheckName:          "SchemaBot X",
+			PromotionCheckName: "  SchemaBot Shared  ",
+		}}
+		assert.Equal(t, "SchemaBot Shared", cfg.PromotionCheckNameBaseForRepo("any/repo"))
+	})
+
+	t.Run("multi-app uses the owning app's override", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {CheckName: "SchemaBot X", PromotionCheckName: "SchemaBot Shared"},
+				"app-b": {CheckName: "SchemaBot Y"},
+			},
+			Repos: map[string]RepoConfig{
+				"org-a/repo-x": {GitHubApp: "app-a"},
+				"org-b/repo-y": {GitHubApp: "app-b"},
+			},
+		}
+
+		assert.Equal(t, "SchemaBot Shared", cfg.PromotionCheckNameBaseForRepo("org-a/repo-x"))
+		assert.Equal(t, "SchemaBot Y", cfg.PromotionCheckNameBaseForRepo("org-b/repo-y"))
+	})
+
+	t.Run("multi-app falls back for unknown repository", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps:  map[string]GitHubAppConfig{"app-a": {PromotionCheckName: "SchemaBot Shared"}},
+			Repos: map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+		}
+		assert.Equal(t, DefaultGitHubCheckName, cfg.PromotionCheckNameBaseForRepo("org/unknown"))
+	})
+}
+
+// A promotion-check-name that differs from the App's own check-name can only
+// be satisfied by another deployment's Check Run, so configuring it without
+// trusting any sibling App would block every apply. Config load must reject
+// that combination instead of shipping a gate that always fails closed.
+func TestValidatePromotionCheckName(t *testing.T) {
+	t.Run("override without trusted slugs is rejected", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{
+			CheckName:          "SchemaBot X",
+			PromotionCheckName: "SchemaBot Shared",
+		}}
+		err := cfg.validateGitHubAppsConfig()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "promotion-check-name")
+		assert.Contains(t, err.Error(), "trusted-check-app-slugs")
+	})
+
+	t.Run("override with trusted slugs is accepted", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{
+			CheckName:            "SchemaBot X",
+			PromotionCheckName:   "SchemaBot Shared",
+			TrustedCheckAppSlugs: []string{"schemabot-shared-staging"},
+		}}
+		require.NoError(t, cfg.validateGitHubAppsConfig())
+	})
+
+	t.Run("override equal to own base needs no trusted slugs", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{
+			CheckName:          "SchemaBot X",
+			PromotionCheckName: "SchemaBot X",
+		}}
+		require.NoError(t, cfg.validateGitHubAppsConfig())
+	})
+
+	t.Run("multi-app override without trusted slugs is rejected", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {AppID: "1001", PrivateKey: "x", WebhookSecret: "y", PromotionCheckName: "SchemaBot Shared"},
+			},
+			Repos: map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+		}
+		err := cfg.validateGitHubAppsConfig()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `app "app-a"`)
+		assert.Contains(t, err.Error(), "promotion-check-name")
+	})
+}
+
 func TestServerConfig_ResolveGitHubAppsByID(t *testing.T) {
 	t.Run("multi-app config resolves each entry's app-id", func(t *testing.T) {
 		cfg := &ServerConfig{
@@ -3518,6 +3770,21 @@ func TestKnownEnvironments(t *testing.T) {
 		assert.True(t, cfg.IsEnvironmentKnown("load"))
 		assert.True(t, cfg.IsEnvironmentKnown("qa"))
 		assert.False(t, cfg.IsEnvironmentKnown("dev"))
+	})
+
+	t.Run("includes database environment_order overrides", func(t *testing.T) {
+		cfg := &ServerConfig{
+			AllowedEnvironments: []string{"qa"},
+			EnvironmentOrder:    []string{"staging", "production"},
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					EnvironmentOrder: []string{"qa", "sandbox", "production"},
+					Environments:     map[string]EnvironmentConfig{"qa": {}},
+				},
+			},
+		}
+		assert.Equal(t, []string{"production", "qa", "sandbox", "staging"}, cfg.KnownEnvironments())
+		assert.True(t, cfg.IsEnvironmentKnown("sandbox"))
 	})
 
 	t.Run("nil config knows no environments", func(t *testing.T) {
