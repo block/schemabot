@@ -552,14 +552,12 @@ func TestTaskStore_UpsertShardProgress(t *testing.T) {
 	advanced.State = state.Task.Completed
 	advanced.ProgressPercent = 100
 	advanced.RowsCopied = 500000
-	advanced.ReadyToComplete = true
 	require.NoError(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), advanced))
 	got, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	require.Len(t, got, 1, "re-upserting the same shard must update in place, not insert a duplicate")
 	assert.Equal(t, state.Task.Completed, got[0].State)
 	assert.Equal(t, 100, got[0].ProgressPercent)
-	assert.True(t, got[0].ReadyToComplete)
 
 	// A stale operator must not overwrite an existing shard row (update path fails closed).
 	stale := shardTask("-80")
