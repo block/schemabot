@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -1022,13 +1023,13 @@ func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 	// Hold the same target lock that the create path must acquire. The creates
 	// below use the public store API; a result before release means active
 	// apply writes are not serialized by the per-target lock.
-	guardConn, guardLockName, err := acquireApplyTargetLockConn(ctx, testDB, "testdb", "mysql", "staging")
+	guardConn, guardLockName, err := acquireApplyTargetLockConn(ctx, testDB, namedlock.MySQL{}, "testdb", "mysql", "staging")
 	require.NoError(t, err)
 	releaseGuard := func() {
 		if guardConn == nil {
 			return
 		}
-		releaseApplyTargetLockConn(ctx, guardConn, guardLockName, "test active apply guard")
+		releaseApplyTargetLockConn(ctx, namedlock.MySQL{}, guardConn, guardLockName, "test active apply guard")
 		guardConn = nil
 	}
 	t.Cleanup(releaseGuard)
