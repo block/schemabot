@@ -93,4 +93,41 @@ func TestAuthConfigValidate(t *testing.T) {
 			WriteGroups:        []string{"owners"},
 		}}).Validate())
 	})
+
+	t.Run("forward_auth with gateway and service callers is valid", func(t *testing.T) {
+		require.NoError(t, (&api.AuthConfig{Type: "forward_auth", ForwardAuth: api.ForwardAuthSettings{
+			TrustedProxySPIFFE:   []string{"spiffe://example.org/ns/ingress/sa/proxy"},
+			WriteGroups:          []string{"owners"},
+			TrustedGatewaySPIFFE: []string{"spiffe://example.org/ns/service-ingress/sa/gateway"},
+			ReadServiceSPIFFE:    []string{"spiffe://example.org/ns/reporting/sa/reporting"},
+		}}).Validate())
+	})
+
+	t.Run("forward_auth gateway requires service callers", func(t *testing.T) {
+		err := (&api.AuthConfig{Type: "forward_auth", ForwardAuth: api.ForwardAuthSettings{
+			TrustedProxySPIFFE:   []string{"spiffe://example.org/ns/ingress/sa/proxy"},
+			TrustedGatewaySPIFFE: []string{"spiffe://example.org/ns/service-ingress/sa/gateway"},
+		}}).Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "read_service_spiffe")
+	})
+
+	t.Run("forward_auth service callers require a gateway", func(t *testing.T) {
+		err := (&api.AuthConfig{Type: "forward_auth", ForwardAuth: api.ForwardAuthSettings{
+			TrustedProxySPIFFE: []string{"spiffe://example.org/ns/ingress/sa/proxy"},
+			ReadServiceSPIFFE:  []string{"spiffe://example.org/ns/reporting/sa/reporting"},
+		}}).Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "trusted_gateway_spiffe")
+	})
+
+	t.Run("forward_auth rejects proxy/gateway spiffe overlap", func(t *testing.T) {
+		err := (&api.AuthConfig{Type: "forward_auth", ForwardAuth: api.ForwardAuthSettings{
+			TrustedProxySPIFFE:   []string{"spiffe://example.org/ns/ingress/sa/proxy"},
+			TrustedGatewaySPIFFE: []string{"spiffe://example.org/ns/ingress/sa/proxy"},
+			ReadServiceSPIFFE:    []string{"spiffe://example.org/ns/reporting/sa/reporting"},
+		}}).Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "both trusted_proxy_spiffe and trusted_gateway_spiffe")
+	})
 }

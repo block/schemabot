@@ -44,6 +44,24 @@ type ForwardAuthConfig struct {
 	// WriteGroups are the groups granted the write tier. When empty, no caller
 	// can perform write-tier operations (read still works).
 	WriteGroups []string
+
+	// TrustedGatewaySPIFFE lists the SPIFFE IDs of caller-forwarding gateways.
+	// Such a gateway terminates the caller's mTLS, verifies the client
+	// certificate, and forwards the caller's SPIFFE ID in CallerSPIFFEHeader.
+	// List a gateway only if it strips inbound copies of that header before
+	// setting it from the verified certificate — otherwise any caller could
+	// forge an identity through it. Must not overlap TrustedProxySPIFFE: a peer
+	// either forwards user identity headers or a caller SPIFFE ID, never both.
+	TrustedGatewaySPIFFE []string
+
+	// CallerSPIFFEHeader carries the gateway-verified caller SPIFFE ID.
+	// Defaults to "X-Forwarded-Caller-Spiffe-Id". Honored only when the request
+	// provably arrived through a listed gateway.
+	CallerSPIFFEHeader string
+
+	// ReadServiceSPIFFE lists caller SPIFFE IDs granted read-tier access
+	// through a trusted gateway. Service callers never get the write tier.
+	ReadServiceSPIFFE []string
 }
 
 // ForwardAuthAuthorizer authenticates requests from an authenticating reverse
@@ -64,15 +82,26 @@ type ForwardAuthConfig struct {
 // since a plan stages a change against a database — require membership in a
 // configured write group. The direct-API/CLI write path is for a small
 // privileged set; general users go through the PR-comment workflow instead.
+//
+// A second, optional lane serves services calling as themselves through a
+// caller-forwarding gateway (TrustedGatewaySPIFFE): the gateway verifies the
+// caller's client certificate and forwards the caller's SPIFFE ID in a
+// dedicated header. That lane is read-only, honors the caller header only when
+// the XFCC-verified peer is a listed gateway, and never reads the user or
+// groups headers. The identity-header proxy always wins: the gateway lane is
+// consulted only when the request did not arrive through the trusted proxy.
 type ForwardAuthAuthorizer struct {
-	userHeader    string
-	groupsHeader  string
-	groupsDelim   string
-	trustedSPIFFE []string
-	trustedNets   []*net.IPNet
-	readGroups    []string
-	writeGroups   []string
-	logger        *slog.Logger
+	userHeader        string
+	groupsHeader      string
+	groupsDelim       string
+	trustedSPIFFE     []string
+	trustedNets       []*net.IPNet
+	readGroups        []string
+	writeGroups       []string
+	gatewaySPIFFE     []string
+	callerHeader      string
+	readServiceSPIFFE []string
+	logger            *slog.Logger
 }
 
 // NewForwardAuthAuthorizer builds a forward-auth authorizer. It requires at
@@ -128,15 +157,53 @@ func NewForwardAuthAuthorizer(cfg ForwardAuthConfig, logger *slog.Logger) (*Forw
 		logger.Warn("forward-auth trusting XFCC with no source-CIDR anchor: ensure the proxy sanitizes inbound X-Forwarded-Client-Cert and the server is not directly reachable")
 	}
 
+	callerHeader := cfg.CallerSPIFFEHeader
+	if callerHeader == "" {
+		callerHeader = "X-Forwarded-Caller-Spiffe-Id"
+	}
+	var gateways []string
+	for _, g := range cfg.TrustedGatewaySPIFFE {
+		if g = strings.TrimSpace(g); g != "" {
+			gateways = append(gateways, g)
+		}
+	}
+	var readServices []string
+	for _, s := range cfg.ReadServiceSPIFFE {
+		if s = strings.TrimSpace(s); s != "" {
+			readServices = append(readServices, s)
+		}
+	}
+	// The service-caller lane fails closed: a gateway list without callers (or
+	// callers without a gateway to vouch for them) is a configuration mistake,
+	// not an empty allowlist.
+	if len(gateways) > 0 && len(readServices) == 0 {
+		return nil, fmt.Errorf("forward_auth trusted_gateway_spiffe requires at least one read_service_spiffe caller")
+	}
+	if len(readServices) > 0 && len(gateways) == 0 {
+		return nil, fmt.Errorf("forward_auth read_service_spiffe requires at least one trusted_gateway_spiffe gateway")
+	}
+	for _, g := range gateways {
+		if slices.Contains(spiffe, g) {
+			return nil, fmt.Errorf("SPIFFE ID %q is listed in both trusted_proxy_spiffe and trusted_gateway_spiffe: a peer either forwards user identity headers or a caller SPIFFE ID, never both", g)
+		}
+	}
+	if len(gateways) > 0 {
+		logger.Warn("forward-auth honoring gateway-forwarded caller identity: every listed gateway must strip inbound copies of the caller header before setting it from the verified client certificate",
+			"caller_header", callerHeader, "gateways", len(gateways), "read_service_callers", len(readServices))
+	}
+
 	return &ForwardAuthAuthorizer{
-		userHeader:    userHeader,
-		groupsHeader:  groupsHeader,
-		groupsDelim:   delim,
-		trustedSPIFFE: spiffe,
-		trustedNets:   nets,
-		readGroups:    cfg.ReadGroups,
-		writeGroups:   cfg.WriteGroups,
-		logger:        logger,
+		userHeader:        userHeader,
+		groupsHeader:      groupsHeader,
+		groupsDelim:       delim,
+		trustedSPIFFE:     spiffe,
+		trustedNets:       nets,
+		readGroups:        cfg.ReadGroups,
+		writeGroups:       cfg.WriteGroups,
+		gatewaySPIFFE:     gateways,
+		callerHeader:      callerHeader,
+		readServiceSPIFFE: readServices,
+		logger:            logger,
 	}, nil
 }
 
@@ -155,6 +222,14 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 
 		trusted, proxyID := a.isTrustedProxy(r)
 		if !trusted {
+			// The identity-header proxy did not vouch for this request; try the
+			// service-caller lane before rejecting.
+			if user, handled := a.authorizeGatewayCaller(w, r, tier); handled {
+				if user != nil {
+					next.ServeHTTP(w, r.WithContext(WithUser(r.Context(), user)))
+				}
+				return
+			}
 			// Log the URI identities present in the XFCC header so an operator
 			// can tell a missing trust-anchor entry apart from a request whose
 			// header carried no identity at all. On this path the values are
@@ -204,6 +279,55 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 		ctx := WithUser(r.Context(), &User{Subject: user, Groups: groups})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// authorizeGatewayCaller handles the service-caller lane: a caller-forwarding
+// gateway terminated the caller's mTLS, verified the client certificate, and
+// forwarded the caller's SPIFFE ID in the caller header. The lane grants the
+// read tier only, to callers explicitly listed in ReadServiceSPIFFE, and never
+// reads the user or groups headers. handled=false means the request did not
+// arrive through a listed gateway, so the caller falls through to the standard
+// untrusted-proxy denial.
+func (a *ForwardAuthAuthorizer) authorizeGatewayCaller(w http.ResponseWriter, r *http.Request, tier Tier) (*User, bool) {
+	if len(a.gatewaySPIFFE) == 0 {
+		return nil, false
+	}
+	var gatewayID string
+	for _, uri := range parseXFCCURIs(r.Header.Get("X-Forwarded-Client-Cert")) {
+		if slices.Contains(a.gatewaySPIFFE, uri) {
+			gatewayID = uri
+			break
+		}
+	}
+	if gatewayID == "" {
+		return nil, false
+	}
+
+	caller := strings.TrimSpace(r.Header.Get(a.callerHeader))
+	if caller == "" {
+		a.logger.Warn("forward-auth gateway forwarded no caller identity; denying",
+			"path", r.URL.Path, "gateway", gatewayID, "caller_header", a.callerHeader)
+		authDecision(r, tier, "deny", "no_service_identity")
+		writeAuthError(w, http.StatusUnauthorized, "no forwarded service caller identity from the gateway")
+		return nil, true
+	}
+	if !slices.Contains(a.readServiceSPIFFE, caller) {
+		a.logger.Warn("forward-auth service caller is not in the read allowlist; denying",
+			"path", r.URL.Path, "gateway", gatewayID, "caller", caller)
+		authDecision(r, tier, "deny", "service_not_authorized")
+		writeAuthError(w, http.StatusForbidden, "service caller is not authorized for read access")
+		return nil, true
+	}
+	if tier == TierWrite {
+		a.logger.Warn("forward-auth service caller denied for write operation; service callers are read-only",
+			"path", r.URL.Path, "gateway", gatewayID, "caller", caller)
+		authDecision(r, tier, "deny", "service_caller_write")
+		writeAuthError(w, http.StatusForbidden, "service callers are limited to read-only operations")
+		return nil, true
+	}
+
+	authDecision(r, tier, "allow", "")
+	return &User{Subject: caller}, true
 }
 
 // canRead reports whether the caller may use read-tier endpoints. With no

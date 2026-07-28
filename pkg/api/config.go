@@ -1381,6 +1381,21 @@ type ForwardAuthSettings struct {
 	// WriteGroups are the groups granted the write tier. Empty means no caller
 	// can perform write-tier operations.
 	WriteGroups []string `yaml:"write_groups,omitempty"`
+
+	// TrustedGatewaySPIFFE lists the SPIFFE IDs of caller-forwarding gateways —
+	// proxies that verify a service caller's client certificate and forward the
+	// caller's SPIFFE ID in CallerSPIFFEHeader. List a gateway only if it strips
+	// inbound copies of that header before setting it. Must not overlap
+	// TrustedProxySPIFFE.
+	TrustedGatewaySPIFFE []string `yaml:"trusted_gateway_spiffe,omitempty"`
+
+	// CallerSPIFFEHeader carries the gateway-verified caller SPIFFE ID (default
+	// "X-Forwarded-Caller-Spiffe-Id").
+	CallerSPIFFEHeader string `yaml:"caller_spiffe_header,omitempty"`
+
+	// ReadServiceSPIFFE lists caller SPIFFE IDs granted read-tier access
+	// through a trusted gateway. Service callers never get the write tier.
+	ReadServiceSPIFFE []string `yaml:"read_service_spiffe,omitempty"`
 }
 
 // Validate checks the auth configuration. Unknown types are rejected so a
@@ -1432,6 +1447,32 @@ func (f *ForwardAuthSettings) validate() error {
 	for _, c := range trimmedCIDRs {
 		if _, _, err := net.ParseCIDR(c); err != nil {
 			return fmt.Errorf("forward_auth trusted_proxy_cidrs entry %q is not a valid CIDR: %w", c, err)
+		}
+	}
+
+	trimmedGateways := make([]string, 0, len(f.TrustedGatewaySPIFFE))
+	for _, g := range f.TrustedGatewaySPIFFE {
+		if g = strings.TrimSpace(g); g != "" {
+			trimmedGateways = append(trimmedGateways, g)
+		}
+	}
+	trimmedServices := make([]string, 0, len(f.ReadServiceSPIFFE))
+	for _, s := range f.ReadServiceSPIFFE {
+		if s = strings.TrimSpace(s); s != "" {
+			trimmedServices = append(trimmedServices, s)
+		}
+	}
+	// The service-caller lane fails closed: gateways without callers (or
+	// callers without a vouching gateway) is a configuration mistake.
+	if len(trimmedGateways) > 0 && len(trimmedServices) == 0 {
+		return fmt.Errorf("forward_auth trusted_gateway_spiffe requires at least one read_service_spiffe caller")
+	}
+	if len(trimmedServices) > 0 && len(trimmedGateways) == 0 {
+		return fmt.Errorf("forward_auth read_service_spiffe requires at least one trusted_gateway_spiffe gateway")
+	}
+	for _, g := range trimmedGateways {
+		if slices.Contains(trimmedSPIFFE, g) {
+			return fmt.Errorf("forward_auth SPIFFE ID %q is listed in both trusted_proxy_spiffe and trusted_gateway_spiffe: a peer either forwards user identity headers or a caller SPIFFE ID, never both", g)
 		}
 	}
 	return nil
