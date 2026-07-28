@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -163,6 +164,7 @@ func (s *Service) pendingDropsTargets(ctx context.Context) ([]pendingdrops.Targe
 				Database:    dbName,
 				Environment: envName,
 				DSN:         dsn,
+				Locker:      namedlock.MySQL{},
 			})
 		}
 	}

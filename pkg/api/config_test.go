@@ -18,6 +18,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
@@ -3372,7 +3373,7 @@ func TestPendingDropsTargetsResolveEachPass(t *testing.T) {
 	targets, unresolved = svc.pendingDropsTargets(t.Context())
 	require.Len(t, targets, 1)
 	assert.Equal(t, 0, unresolved)
-	assert.Equal(t, pendingdrops.Target{Database: "mydb", Environment: "staging", DSN: dsn}, targets[0])
+	assert.Equal(t, pendingdrops.Target{Database: "mydb", Environment: "staging", DSN: dsn, Locker: namedlock.MySQL{}}, targets[0])
 }
 
 func TestSchemaDirHintsForRepo(t *testing.T) {
