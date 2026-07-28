@@ -62,6 +62,9 @@ type Storage interface {
 	// WebhookEvents returns the durable webhook event inbox store.
 	WebhookEvents() WebhookEventStore
 
+	// CheckRefreshRequests returns the durable check refresh request store.
+	CheckRefreshRequests() CheckRefreshRequestStore
+
 	// Ping verifies the database connection is alive.
 	Ping(ctx context.Context) error
 
@@ -172,6 +175,21 @@ type CheckStore interface {
 	// GetByDatabase returns all stored check state for a database across all PRs.
 	// Used for cross-PR coordination (blocking other PRs when one is applying).
 	GetByDatabase(ctx context.Context, repo, environment, dbType, database string) ([]*Check, error)
+
+	// GetByTarget returns all stored check state for a target across all
+	// repositories and PRs. The check refresh fan-out uses it: a CLI/gRPC apply
+	// carries no repository, so the fan-out must find every PR whose plan was
+	// computed against the target's previous live schema regardless of repo.
+	GetByTarget(ctx context.Context, environment, dbType, database string) ([]*Check, error)
+
+	// MarkBlockedForFailedRefresh flips stored check state to a blocking
+	// conclusion after a check refresh re-plan failed, so a plan computed
+	// against a schema that has since changed cannot keep passing. The update
+	// is conditional on the head SHA the refresher read: a racing synchronize
+	// that already re-planned a newer commit wins and is preserved. It also
+	// never touches an in-progress apply-owned row — a started apply's
+	// lifecycle stays authoritative. Returns true when the row was flipped.
+	MarkBlockedForFailedRefresh(ctx context.Context, check *Check) (bool, error)
 
 	// Delete removes stored check state by ID.
 	Delete(ctx context.Context, id int64) error
@@ -286,6 +304,71 @@ type WebhookEventStore interface {
 	// terminalizes rows nobody redelivered, emitting each as a durable failure
 	// (for metrics/alerting) and draining the stuck-processing gauge without
 	// operator action. Returns the number of rows terminated.
+	TerminateStuckProcessing(ctx context.Context, reason string) (int64, error)
+}
+
+// CheckRefreshRequestStore manages durable check refresh requests. A request
+// records that an apply successfully changed a target's live schema, so stored
+// check state on every other open PR against that target must be re-planned.
+// The row is behavioral state, not just audit: the check refresh processor
+// consumes pending rows to recover the fan-out after process restarts.
+type CheckRefreshRequestStore interface {
+	// Record records a pending refresh request for a completed apply. Returns
+	// recorded=false when a request for the apply already exists (any state),
+	// so recording is idempotent across drive tails and the backfill sweep.
+	Record(ctx context.Context, req *CheckRefreshRequest) (recorded bool, err error)
+
+	// GetByApplyID returns the request for an originating apply, or nil if not
+	// found.
+	GetByApplyID(ctx context.Context, applyID int64) (*CheckRefreshRequest, error)
+
+	// ClaimNext atomically claims one pending, retryable, or lease-expired
+	// request. The claim rotates lease_owner/lease_token, increments attempts,
+	// and sets a lease expiry in the same transaction. Retryable and
+	// lease-expired rows are only reclaimed while attempts <
+	// MaxCheckRefreshAttempts, so a poison request cannot be reclaimed forever.
+	// Returns nil when no request is claimable.
+	ClaimNext(ctx context.Context, owner string, leaseDuration time.Duration) (*CheckRefreshRequest, error)
+
+	// PendingForTarget returns the pending requests for the same
+	// (environment, database_type, database_name) target, excluding the given
+	// request id. The processor coalesces them: one fan-out covers every
+	// schema change recorded before it started, so the siblings complete
+	// together with the claimed request.
+	PendingForTarget(ctx context.Context, environment, databaseType, databaseName string, excludeID int64) ([]*CheckRefreshRequest, error)
+
+	// Heartbeat extends the lease on a claimed request so a fan-out that spans
+	// many PRs can outlive the initial lease without being reclaimed
+	// mid-flight. Returns ErrCheckRefreshLeaseLost when the lease token is
+	// stale.
+	Heartbeat(ctx context.Context, id int64, leaseToken string, leaseDuration time.Duration) error
+
+	// MarkCompleted marks a claimed request terminal-successful. Returns
+	// ErrCheckRefreshLeaseLost when the lease token is stale.
+	MarkCompleted(ctx context.Context, id int64, leaseToken string) error
+
+	// CompletePendingCoalesced marks a still-pending sibling request completed
+	// because a fan-out for the same target covered it. Returns true when the
+	// row was completed; false when it was no longer pending (for example a
+	// concurrent claim), in which case its own lifecycle finishes it.
+	CompletePendingCoalesced(ctx context.Context, id int64) (bool, error)
+
+	// MarkFailed marks a claimed request failed. A non-nil retryAfter keeps it
+	// retryable after that time; nil makes the failure terminal. Returns
+	// ErrCheckRefreshLeaseLost when the lease token is stale.
+	MarkFailed(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error
+
+	// FindCompletedAppliesMissingRequest returns applies that reached the
+	// completed state within the lookback window but have no refresh request
+	// row. The applies table is the outbox: a pod crash between an apply's
+	// terminal write and its refresh recording loses the in-line record, and
+	// this sweep is how the processor backfills it.
+	FindCompletedAppliesMissingRequest(ctx context.Context, lookback time.Duration) ([]*Apply, error)
+
+	// TerminateStuckProcessing marks as terminally failed every processing row
+	// whose lease has expired and whose attempts have reached
+	// MaxCheckRefreshAttempts — a driver hard-killed on its final attempt.
+	// Returns the number of rows terminated.
 	TerminateStuckProcessing(ctx context.Context, reason string) (int64, error)
 }
 

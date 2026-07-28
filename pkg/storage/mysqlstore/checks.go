@@ -508,6 +508,59 @@ func (s *checkStore) GetByDatabase(ctx context.Context, repo, environment, dbTyp
 	return scanChecks(rows)
 }
 
+// GetByTarget returns all checks for a target across all repositories and PRs.
+// The check refresh fan-out uses it: a CLI/gRPC apply carries no repository, so
+// the fan-out must find every PR planned against the target regardless of repo.
+func (s *checkStore) GetByTarget(ctx context.Context, environment, dbType, database string) ([]*storage.Check, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+checkColumns+`
+		FROM checks
+		WHERE environment = ? AND database_type = ? AND database_name = ?
+		ORDER BY repository, pull_request
+	`, environment, dbType, database)
+	if err != nil {
+		return nil, fmt.Errorf("query checks for target %s/%s in %s: %w", dbType, database, environment, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	return scanChecks(rows)
+}
+
+// MarkBlockedForFailedRefresh flips stored check state to a blocking conclusion
+// after a check refresh re-plan failed. The head SHA predicate makes the write
+// optimistic-concurrency: a racing synchronize that already stored a result for
+// a newer commit does not match and is preserved. An in-progress apply-owned
+// row is never touched — the started apply's lifecycle stays authoritative.
+func (s *checkStore) MarkBlockedForFailedRefresh(ctx context.Context, check *storage.Check) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE checks
+		SET apply_id = NULL,
+		    has_changes = ?,
+		    status = ?,
+		    conclusion = ?,
+		    blocking_reason = ?,
+		    error_message = ?,
+		    change_summary = ?
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+		  AND head_sha = ?
+		  AND NOT (status = ? AND apply_id IS NOT NULL)
+	`, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, nullString(check.ChangeSummary),
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		check.HeadSHA,
+		checkStatusInProgress)
+	if err != nil {
+		return false, fmt.Errorf("mark check blocked for failed refresh %s#%d %s/%s/%s (head %s): %w",
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, check.HeadSHA, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("rows affected marking check blocked for failed refresh %s#%d %s/%s/%s: %w",
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, err)
+	}
+	return rows > 0, nil
+}
+
 // Delete removes stored check state by ID.
 func (s *checkStore) Delete(ctx context.Context, id int64) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM checks WHERE id = ?`, id)
