@@ -919,7 +919,9 @@ type EnvironmentConfig struct {
 	// within max_table_rows runs verbatim as native MySQL DDL: synchronous,
 	// blocking writes to the table while it runs, and not revertible. When
 	// unset or disabled (the default), refused statements are blocked. Only
-	// meaningful for MySQL databases.
+	// valid for MySQL databases: setting this block on any other database
+	// type fails config validation, even when disabled, so a policy that can
+	// never take effect is never silently carried in config.
 	DirectExecution *DirectExecutionConfig `yaml:"direct_execution,omitempty"`
 
 	// For PlanetScale/Vitess:
