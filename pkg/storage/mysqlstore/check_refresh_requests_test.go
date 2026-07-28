@@ -168,7 +168,9 @@ func TestCheckRefreshStore_MarkFailedRetryableAndTerminal(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 
-	past := time.Now().Add(-time.Second)
+	// The claim predicate compares retry_after against the database clock, so
+	// place it far enough in the past to be immune to client/server skew.
+	past := time.Now().Add(-time.Minute)
 	require.NoError(t, store.CheckRefreshRequests().MarkFailed(ctx, claimed.ID, claimed.LeaseToken, "plan engine unavailable", &past))
 
 	got, err := store.CheckRefreshRequests().GetByApplyID(ctx, req.ApplyID)
