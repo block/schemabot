@@ -608,8 +608,10 @@ func RecordLeaderParticipantGate(ctx context.Context, repository, environment, t
 // promotion order on a scoped SchemaBot instance. This fires only on operator
 // misconfiguration: the gate cannot identify the target's prior environments,
 // so it fails closed. A non-zero count means an operator must add the
-// environment to environment_order; the matching warn log carries the
-// promotion_order so they can see what is configured.
+// environment to the database's effective promotion order (its
+// environment_order override when set, otherwise the server-wide
+// environment_order); the matching warn log carries the promotion_order so
+// they can see what is configured.
 func RecordPromotionConfigErrorBlock(ctx context.Context, repository, database, environment string) {
 	addCounter(ctx, "schemabot.promotion.config_error_blocks_total",
 		"Total applies blocked because the target environment is absent from the configured promotion order", "{block}",
