@@ -95,8 +95,11 @@ func (c *Cleaner) Run(ctx context.Context) error {
 // cleanTarget connects to one target, serializes against other SchemaBot
 // instances with an advisory lock, and drops expired quarantined tables.
 func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
+	// A missing locker is a producer wiring bug, not a connectivity failure:
+	// it fails every pass until the producer is fixed, so it gets its own
+	// metric reason instead of blending into transient target errors.
 	if target.Locker == nil {
-		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "target_error")
+		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "locker_missing")
 		return fmt.Errorf("target %s/%s has no advisory locker; cleanup cannot serialize across instances without one", target.Database, target.Environment)
 	}
 
