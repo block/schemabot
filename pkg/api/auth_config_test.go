@@ -121,6 +121,17 @@ func TestAuthConfigValidate(t *testing.T) {
 		assert.Contains(t, err.Error(), "trusted_gateway_spiffe")
 	})
 
+	t.Run("forward_auth caller header with surrounding whitespace is rejected", func(t *testing.T) {
+		err := (&api.AuthConfig{Type: "forward_auth", ForwardAuth: api.ForwardAuthSettings{
+			TrustedProxySPIFFE:   []string{"spiffe://example.org/ns/ingress/sa/proxy"},
+			TrustedGatewaySPIFFE: []string{"spiffe://example.org/ns/service-ingress/sa/gateway"},
+			ReadServiceSPIFFE:    []string{"spiffe://example.org/ns/reporting/sa/reporting"},
+			CallerSPIFFEHeader:   " X-Forwarded-Caller-Spiffe-Id ",
+		}}).Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "whitespace")
+	})
+
 	t.Run("forward_auth rejects proxy/gateway spiffe overlap", func(t *testing.T) {
 		err := (&api.AuthConfig{Type: "forward_auth", ForwardAuth: api.ForwardAuthSettings{
 			TrustedProxySPIFFE:   []string{"spiffe://example.org/ns/ingress/sa/proxy"},

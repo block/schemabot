@@ -157,7 +157,7 @@ func NewForwardAuthAuthorizer(cfg ForwardAuthConfig, logger *slog.Logger) (*Forw
 		logger.Warn("forward-auth trusting XFCC with no source-CIDR anchor: ensure the proxy sanitizes inbound X-Forwarded-Client-Cert and the server is not directly reachable")
 	}
 
-	callerHeader := cfg.CallerSPIFFEHeader
+	callerHeader := strings.TrimSpace(cfg.CallerSPIFFEHeader)
 	if callerHeader == "" {
 		callerHeader = "X-Forwarded-Caller-Spiffe-Id"
 	}
@@ -222,9 +222,12 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 
 		trusted, proxyID := a.isTrustedProxy(r)
 		if !trusted {
+			// Parse the XFCC header once for the whole deny path: the gateway
+			// lane and the denial log both consume the URI values.
+			xfccURIs := parseXFCCURIs(r.Header.Get("X-Forwarded-Client-Cert"))
 			// The identity-header proxy did not vouch for this request; try the
 			// service-caller lane before rejecting.
-			if user, handled := a.authorizeGatewayCaller(w, r, tier); handled {
+			if user, handled := a.authorizeGatewayCaller(w, r, tier, xfccURIs); handled {
 				if user != nil {
 					next.ServeHTTP(w, r.WithContext(WithUser(r.Context(), user)))
 				}
@@ -234,7 +237,7 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 			// can tell a missing trust-anchor entry apart from a request whose
 			// header carried no identity at all. On this path the values are
 			// unverified caller input — triage signal, never a trust decision.
-			uris, uriCount := deniedRequestXFCCURIs(r)
+			uris, uriCount := clampLoggedXFCCURIs(xfccURIs)
 			a.logger.Warn("forward-auth request did not arrive through the trusted proxy; refusing to honor identity headers",
 				"path", r.URL.Path, "remote_addr", r.RemoteAddr,
 				"xfcc_uris", uris, "xfcc_uri_count", uriCount)
@@ -287,13 +290,14 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 // read tier only, to callers explicitly listed in ReadServiceSPIFFE, and never
 // reads the user or groups headers. handled=false means the request did not
 // arrive through a listed gateway, so the caller falls through to the standard
-// untrusted-proxy denial.
-func (a *ForwardAuthAuthorizer) authorizeGatewayCaller(w http.ResponseWriter, r *http.Request, tier Tier) (*User, bool) {
+// untrusted-proxy denial. xfccURIs are the URI values already parsed from the
+// request's XFCC header.
+func (a *ForwardAuthAuthorizer) authorizeGatewayCaller(w http.ResponseWriter, r *http.Request, tier Tier, xfccURIs []string) (*User, bool) {
 	if len(a.gatewaySPIFFE) == 0 {
 		return nil, false
 	}
 	var gatewayID string
-	for _, uri := range parseXFCCURIs(r.Header.Get("X-Forwarded-Client-Cert")) {
+	for _, uri := range xfccURIs {
 		if slices.Contains(a.gatewaySPIFFE, uri) {
 			gatewayID = uri
 			break
@@ -409,16 +413,15 @@ const (
 	maxLoggedXFCCURIBytes = 512
 )
 
-// deniedRequestXFCCURIs returns the URI (SPIFFE SVID) values present in the
-// request's XFCC header for denial logging, clamped to maxLoggedXFCCURIs
-// values of at most maxLoggedXFCCURIBytes each (oversized values end in "…"),
-// plus the unclamped total. Only parsed URI values are returned — never the
-// raw header — and on a denied request they are unverified caller input: a
-// triage signal, not verified certificate identities. Like the trust check
-// itself, only the first XFCC header line is read, so a zero count means the
-// header the trust decision evaluated carried no URI identity.
-func deniedRequestXFCCURIs(r *http.Request) ([]string, int) {
-	uris := parseXFCCURIs(r.Header.Get("X-Forwarded-Client-Cert"))
+// clampLoggedXFCCURIs bounds the URI (SPIFFE SVID) values a denial log records
+// to maxLoggedXFCCURIs values of at most maxLoggedXFCCURIBytes each (oversized
+// values end in "…") and returns the unclamped total. Only parsed URI values
+// are logged — never the raw header — and on a denied request they are
+// unverified caller input: a triage signal, not verified certificate
+// identities. Like the trust check itself, only the first XFCC header line is
+// parsed, so a zero count means the header the trust decision evaluated
+// carried no URI identity.
+func clampLoggedXFCCURIs(uris []string) ([]string, int) {
 	total := len(uris)
 	if total > maxLoggedXFCCURIs {
 		uris = uris[:maxLoggedXFCCURIs]

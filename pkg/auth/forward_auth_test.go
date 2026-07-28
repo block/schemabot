@@ -252,6 +252,27 @@ func TestForwardAuth_GatewayServiceCallerReadAllowed(t *testing.T) {
 	assert.Empty(t, captured.user.Groups)
 }
 
+func TestForwardAuth_GatewayServiceCallerCustomHeader(t *testing.T) {
+	// A deployment whose gateway forwards the caller identity under a
+	// different header name configures caller_spiffe_header; the default
+	// header is then ignored.
+	cfg := serviceCallerConfig()
+	cfg.CallerSPIFFEHeader = "X-Custom-Caller-Id"
+	handler, captured := newForwardAuth(t, cfg)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", "URI="+gatewaySVID)
+	req.Header.Set("X-Custom-Caller-Id", callerSVID)
+	req.Header.Set("X-Forwarded-Caller-Spiffe-Id", "spiffe://example.org/ns/other/sa/other")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, captured.user)
+	assert.Equal(t, callerSVID, captured.user.Subject)
+}
+
 func TestForwardAuth_GatewayServiceCallerReadOnlyPOSTAllowed(t *testing.T) {
 	// Read-only POST endpoints (the explicit readPaths set) are part of the
 	// read tier, so a listed service caller can use them.

@@ -1462,6 +1462,9 @@ func (f *ForwardAuthSettings) validate() error {
 			trimmedServices = append(trimmedServices, s)
 		}
 	}
+	if f.CallerSPIFFEHeader != strings.TrimSpace(f.CallerSPIFFEHeader) {
+		return fmt.Errorf("forward_auth caller_spiffe_header must not have leading or trailing whitespace")
+	}
 	// The service-caller lane fails closed: gateways without callers (or
 	// callers without a vouching gateway) is a configuration mistake.
 	if len(trimmedGateways) > 0 && len(trimmedServices) == 0 {
