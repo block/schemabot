@@ -1511,3 +1511,39 @@ func RecordPendingDropsCleanupError(ctx context.Context, database, environment, 
 		attribute.String("reason", reason),
 	)
 }
+
+// Check refresh recording sources for RecordCheckRefreshRecorded.
+const (
+	// CheckRefreshSourceDriveTail marks a request recorded inline by the
+	// operator drive tail that settled the apply.
+	CheckRefreshSourceDriveTail = "drive_tail"
+	// CheckRefreshSourceSweep marks a request recorded by the backstop sweep
+	// over recently completed applies.
+	CheckRefreshSourceSweep = "sweep"
+)
+
+// RecordCheckRefreshRecorded counts durable check refresh requests recorded
+// when an apply settles to terminal success. A sustained "sweep" rate means
+// drive tails are failing to record — check the operator logs for the
+// recording error.
+func RecordCheckRefreshRecorded(ctx context.Context, database, environment, source string) {
+	addCounter(ctx, "schemabot.check_refresh.requests_recorded_total",
+		"Total durable check refresh requests recorded for applies that settled to terminal success", "{request}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("source", source),
+	)
+}
+
+// RecordCheckRefreshRecordFailure counts failures to record a durable check
+// refresh request for a completed apply. The backstop sweep retries the
+// recording on its next pass, so a transient blip self-heals; a sustained rate
+// means storage writes are failing and sibling PR checks are going stale —
+// check the operator logs for the storage error.
+func RecordCheckRefreshRecordFailure(ctx context.Context, database, environment string) {
+	addCounter(ctx, "schemabot.check_refresh.record_failures_total",
+		"Total failures to record a durable check refresh request for a completed apply", "{failure}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+	)
+}
