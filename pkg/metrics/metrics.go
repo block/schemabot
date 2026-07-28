@@ -608,8 +608,10 @@ func RecordLeaderParticipantGate(ctx context.Context, repository, environment, t
 // promotion order on a scoped SchemaBot instance. This fires only on operator
 // misconfiguration: the gate cannot identify the target's prior environments,
 // so it fails closed. A non-zero count means an operator must add the
-// environment to environment_order; the matching warn log carries the
-// promotion_order so they can see what is configured.
+// environment to the database's effective promotion order (its
+// environment_order override when set, otherwise the server-wide
+// environment_order); the matching warn log carries the promotion_order so
+// they can see what is configured.
 func RecordPromotionConfigErrorBlock(ctx context.Context, repository, database, environment string) {
 	addCounter(ctx, "schemabot.promotion.config_error_blocks_total",
 		"Total applies blocked because the target environment is absent from the configured promotion order", "{block}",
@@ -675,6 +677,45 @@ func RecordRemoteControlRequestStale(ctx context.Context, operation, database, d
 		attribute.String("database", database),
 		DeploymentAttribute(deployment),
 		EnvironmentAttribute(environment),
+	)
+}
+
+// RecordEngineTerminalTruthReconcile counts drive claims that read the
+// engine's authoritative state before consuming a pending stop/cancel control
+// request. Outcomes:
+//   - "adopted_completed" / "adopted_failed" / "adopted_cancelled" /
+//     "adopted_reverted": the engine's change was already terminal, so the
+//     drive settled stored state to that outcome and mooted the pending
+//     command instead of running it. A sustained rate means operator commands
+//     are routinely losing the race with the engine — check why commands are
+//     queued so late (e.g. webhook delivery lag, slow claim turnaround).
+//   - "progress_error": the authoritative read failed and the drive fell back
+//     to consuming the pending command as before. A sustained rate means the
+//     drive cannot see the engine's backend — check engine API connectivity
+//     and the persisted engine resume state for the apply in the drive logs.
+func RecordEngineTerminalTruthReconcile(ctx context.Context, database, deployment, environment, outcome string) {
+	addCounter(ctx, "schemabot.operator.engine_terminal_truth_reconciles_total",
+		"Total drive claims that read the engine's authoritative state before consuming a pending stop/cancel command", "{reconcile}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
+// RecordPlanetScaleUnclassifiedCancelRejection counts PlanetScale cancel
+// rejections whose live deployment state has no explicit classification. Every
+// known deployment state is classified explicitly; a hit here means PlanetScale
+// introduced a new deployment state (or returned one SchemaBot has never
+// mapped), and the rejection fell back to a plain retryable error. Add an
+// explicit classification for the state — until then the durable stop/cancel
+// request may be retried against a rejection that can never succeed, and only
+// the drive's terminal-truth reconcile can converge it.
+func RecordPlanetScaleUnclassifiedCancelRejection(ctx context.Context, database, deploymentState string) {
+	addCounter(ctx, "schemabot.engine.planetscale.unclassified_cancel_rejections_total",
+		"Total PlanetScale cancel rejections observed in a deployment state with no explicit classification", "{rejection}",
+		attribute.String("database", database),
+		attribute.String("deployment_state", deploymentState),
 	)
 }
 
@@ -1375,6 +1416,7 @@ var knownStatusCheckStatuses = map[string]bool{
 	"blocked":   true,
 	"scheduled": true,
 	"exhausted": true,
+	"recreated": true,
 }
 
 // StatusCheckOperation describes one status-check storage or GitHub operation.

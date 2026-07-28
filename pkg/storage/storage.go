@@ -396,6 +396,11 @@ type ApplyStore interface {
 	// Used by `schemabot status` (no args) to show recent activity.
 	GetRecent(ctx context.Context, filter RecentAppliesFilter) ([]*Apply, error)
 
+	// CountRecentByState returns how many applies match the filter, grouped by
+	// state. The filter's Limit is ignored: counts cover every matching row, so
+	// a status summary is not truncated by list pagination.
+	CountRecentByState(ctx context.Context, filter RecentAppliesFilter) (map[string]int, error)
+
 	// GetInProgress returns all applies in non-terminal states.
 	// Note: For recovery, use FindNextApply which handles locking.
 	GetInProgress(ctx context.Context) ([]*Apply, error)
@@ -506,6 +511,12 @@ type RecentAppliesFilter struct {
 	Environment string
 	Deployment  string
 	States      []string
+	// UpdatedSince, when set, restricts results to applies whose updated_at
+	// falls at or after this instant. Filtering on updated_at rather than
+	// started_at keeps two kinds of applies visible in a window: those that
+	// reached a terminal state within it, and those started earlier but
+	// still active (progress keeps touching updated_at).
+	UpdatedSince time.Time
 }
 
 // RetryableExpirationReason identifies why operator retry recovery stopped.
@@ -807,7 +818,8 @@ type ApplyLogStore interface {
 	// caller rendering a tail needs.
 	GetRecentByApply(ctx context.Context, applyID int64, limit int) ([]*ApplyLog, error)
 
-	// List returns logs matching the filter criteria, ordered by created_at.
+	// List returns the newest Limit logs matching the filter criteria,
+	// ordered by created_at ascending so the result reads chronologically.
 	List(ctx context.Context, filter ApplyLogFilter) ([]*ApplyLog, error)
 }
 

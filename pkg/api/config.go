@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/routing"
@@ -173,6 +174,14 @@ type ServerConfig struct {
 	// background cleaner can be run by this process or disabled so another
 	// deployment owns permanent cleanup after the retention period.
 	PendingDrops PendingDropsConfig `yaml:"pending_drops,omitempty"`
+
+	// Spirit overrides the Spirit engine's default run settings for every
+	// MySQL database this server drives directly. Unset fields keep the
+	// engine defaults (see pkg/engine/spirit), so the block is only needed
+	// to deviate — for example to disable write-thread autoscaling as an
+	// incident kill switch. A database's own metadata entry for the same
+	// key wins over this server-level value.
+	Spirit SpiritConfig `yaml:"spirit,omitempty"`
 }
 
 // PendingDropsConfig configures the pending drops quarantine for MySQL/Spirit
@@ -240,6 +249,66 @@ func (c *ServerConfig) PendingDropsRetention() (time.Duration, error) {
 	return d, nil
 }
 
+// SpiritConfig overrides the Spirit engine's default run settings. Each field
+// maps to an engine metadata key (see spirit.SettingsFromMetadata); values set
+// here are merged into every locally driven MySQL database's metadata unless
+// the database sets the same key itself.
+type SpiritConfig struct {
+	// EnableExperimentalAutoscaling controls whether Spirit scales write
+	// threads dynamically from throttler feedback. Defaults to true when not
+	// configured (nil = enabled); set false as the operator kill switch when
+	// autoscaling misbehaves on a target fleet.
+	EnableExperimentalAutoscaling *bool `yaml:"enable_experimental_autoscaling"`
+
+	// CheckpointMaxAge bounds how old a Spirit checkpoint may be and still be
+	// resumed, as a Go duration string (e.g. "72h"). Defaults to 3 days:
+	// a copy stalled that long restarts cleanly instead of replaying days of
+	// old binlogs.
+	CheckpointMaxAge string `yaml:"checkpoint_max_age,omitempty"`
+
+	// ChecksumYieldTimeout bounds each checksum read transaction before it
+	// yields its REPEATABLE READ snapshot, as a Go duration string (e.g.
+	// "12h"). Defaults to 12 hours so a long checksum cannot pin InnoDB purge
+	// on the target.
+	ChecksumYieldTimeout string `yaml:"checksum_yield_timeout,omitempty"`
+}
+
+// SpiritMetadata validates the configured Spirit overrides and returns them as
+// engine metadata entries, containing only the keys the config sets. Duration
+// values must parse and be positive; a misconfigured override fails server
+// construction instead of silently running applies with the defaults.
+func (c *ServerConfig) SpiritMetadata() (map[string]string, error) {
+	metadata := map[string]string{}
+	if c.Spirit.EnableExperimentalAutoscaling != nil {
+		metadata[spirit.MetadataEnableExperimentalAutoscaling] = strconv.FormatBool(*c.Spirit.EnableExperimentalAutoscaling)
+	}
+	if err := setSpiritDuration(metadata, spirit.MetadataCheckpointMaxAge, c.Spirit.CheckpointMaxAge); err != nil {
+		return nil, err
+	}
+	if err := setSpiritDuration(metadata, spirit.MetadataChecksumYieldTimeout, c.Spirit.ChecksumYieldTimeout); err != nil {
+		return nil, err
+	}
+	return metadata, nil
+}
+
+// setSpiritDuration validates an optional spirit duration override and records
+// it under the given metadata key. Empty values are skipped so the engine
+// default applies.
+func setSpiritDuration(metadata map[string]string, key, raw string) error {
+	if raw == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf("parse spirit.%s %q: %w", key, raw, err)
+	}
+	if d <= 0 {
+		return fmt.Errorf("spirit.%s must be positive, got %q", key, raw)
+	}
+	metadata[key] = raw
+	return nil
+}
+
 // GitHubConfig configures the GitHub App used for webhook-driven schema changes.
 type GitHubConfig struct {
 	// AppID is the GitHub App's numeric ID.
@@ -286,6 +355,19 @@ type GitHubConfig struct {
 	// this deployment's applies. Check Runs from Apps not in this list (and
 	// not this deployment's own App) never satisfy SchemaBot gates.
 	TrustedCheckAppSlugs []string `yaml:"trusted-check-app-slugs,omitempty"`
+
+	// PromotionCheckName overrides the aggregate Check Run base name the
+	// promotion gate looks for when verifying a prior environment owned by
+	// another deployment. By default the gate queries its own check-name base
+	// scoped to the prior environment (for example "SchemaBot (staging)").
+	// When several scoped deployments promote from one shared
+	// prior-environment deployment that publishes under a different base name,
+	// set this to that deployment's check-name so the gate queries the Check
+	// Run that actually exists on the commit. The prior environment is still
+	// appended in parentheses. The owning deployment's App slug must also be
+	// listed in trusted-check-app-slugs, or the gate rejects its Check Run and
+	// blocks every apply.
+	PromotionCheckName string `yaml:"promotion-check-name,omitempty"`
 }
 
 // CheckRunNameBase returns the configured aggregate GitHub Check Run base name.
@@ -293,6 +375,18 @@ func (g GitHubConfig) CheckRunNameBase() string {
 	name := strings.TrimSpace(g.CheckName)
 	if name == "" {
 		return DefaultGitHubCheckName
+	}
+	return name
+}
+
+// PromotionCheckRunNameBase returns the aggregate Check Run base name the
+// promotion gate queries when a prior environment is owned by another
+// deployment: promotion-check-name when configured, otherwise this
+// deployment's own check-name base.
+func (g GitHubConfig) PromotionCheckRunNameBase() string {
+	name := strings.TrimSpace(g.PromotionCheckName)
+	if name == "" {
+		return g.CheckRunNameBase()
 	}
 	return name
 }
@@ -383,6 +477,148 @@ type StorageConfig struct {
 	// columns, after every running pod is on a binary whose embedded schema no
 	// longer declares them.
 	AllowDestructiveSchemaChanges bool `yaml:"allow_destructive_schema_changes,omitempty"`
+
+	// Pool tunes SchemaBot's internal storage connection pool. Every field is
+	// optional; each falls back to a built-in default that preserves the prior
+	// hardcoded behavior when left unset.
+	Pool StoragePoolConfig `yaml:"pool,omitempty"`
+}
+
+// Storage connection-pool defaults. These reproduce the values that were
+// previously hardcoded in the server build path, so an unset pool config
+// behaves exactly as before.
+const (
+	// DefaultStorageMaxIdleConns sizes the idle pool to cover the per-pod
+	// background concurrency so idle connections stay pooled instead of being
+	// closed and reopened every poll tick. Go's driver default of 2 is smaller
+	// than that concurrency, so idle connections returned by the durable
+	// webhook drivers (4 × 1 s poll), operator drivers (4 × 10 s poll), and
+	// background monitors were closed and reopened on nearly every tick,
+	// producing constant CONNECT/DISCONNECT churn (visible as paired entries in
+	// the MySQL audit log). 10 keeps those connections warm.
+	DefaultStorageMaxIdleConns = 10
+
+	// DefaultStorageConnMaxLifetime proactively retires connections before
+	// MySQL's wait_timeout (default 28800s) to avoid "invalid connection"
+	// errors when the pool hands out a stale connection.
+	DefaultStorageConnMaxLifetime = 5 * time.Minute
+
+	// DefaultStorageConnMaxIdleTime discards connections that have sat idle
+	// this long, complementing the lifetime cap for connections that are
+	// rarely reused.
+	DefaultStorageConnMaxIdleTime = 3 * time.Minute
+)
+
+// StoragePoolConfig tunes the database/sql connection pool and driver dial
+// timeout for SchemaBot's internal storage database. Durations are Go duration
+// strings (e.g. "5m", "30s"). Zero/empty fields fall back to defaults; an
+// unset MaxOpenConns leaves the pool unbounded (the database/sql default) and
+// an unset ConnectTimeout leaves the driver's own dial behavior unchanged.
+type StoragePoolConfig struct {
+	// MaxIdleConns caps the number of idle connections kept in the pool.
+	// Unset (0) uses DefaultStorageMaxIdleConns.
+	MaxIdleConns int `yaml:"max_idle_conns,omitempty"`
+
+	// MaxOpenConns caps the total number of open connections (the max pool
+	// size). Unset (0) leaves the pool unbounded, matching database/sql's
+	// default.
+	MaxOpenConns int `yaml:"max_open_conns,omitempty"`
+
+	// ConnMaxLifetime is the maximum age of a pooled connection before it is
+	// retired. Unset uses DefaultStorageConnMaxLifetime.
+	ConnMaxLifetime string `yaml:"conn_max_lifetime,omitempty"`
+
+	// ConnMaxIdleTime is the maximum time a connection may sit idle before it
+	// is retired. Unset uses DefaultStorageConnMaxIdleTime.
+	ConnMaxIdleTime string `yaml:"conn_max_idle_time,omitempty"`
+
+	// ConnectTimeout bounds how long a single connection attempt (the TCP dial
+	// plus handshake) may take. It maps to the go-sql-driver `timeout` DSN
+	// parameter and does not bound query execution. Unset leaves the driver
+	// default (no explicit dial timeout).
+	ConnectTimeout string `yaml:"connect_timeout,omitempty"`
+}
+
+// MaxIdleConnsOrDefault returns the configured idle-pool cap or the default
+// when unset.
+func (p StoragePoolConfig) MaxIdleConnsOrDefault() int {
+	if p.MaxIdleConns > 0 {
+		return p.MaxIdleConns
+	}
+	return DefaultStorageMaxIdleConns
+}
+
+// ConnMaxLifetimeOrDefault returns the configured connection lifetime or the
+// default when unset. It assumes the value has already passed validation.
+func (p StoragePoolConfig) ConnMaxLifetimeOrDefault() time.Duration {
+	return parseDurationOrDefault(p.ConnMaxLifetime, DefaultStorageConnMaxLifetime)
+}
+
+// ConnMaxIdleTimeOrDefault returns the configured idle timeout or the default
+// when unset. It assumes the value has already passed validation.
+func (p StoragePoolConfig) ConnMaxIdleTimeOrDefault() time.Duration {
+	return parseDurationOrDefault(p.ConnMaxIdleTime, DefaultStorageConnMaxIdleTime)
+}
+
+// ConnectTimeoutOrZero returns the configured dial timeout, or zero when unset,
+// meaning "leave the driver default". It assumes the value has already passed
+// validation.
+func (p StoragePoolConfig) ConnectTimeoutOrZero() time.Duration {
+	return parseDurationOrDefault(p.ConnectTimeout, 0)
+}
+
+// parseDurationOrDefault parses a Go duration string, returning def when the
+// string is empty or unparseable. Callers validate values at config load, so a
+// parse failure here only happens on an already-rejected config.
+func parseDurationOrDefault(s string, def time.Duration) time.Duration {
+	if s == "" {
+		return def
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return def
+	}
+	return d
+}
+
+// Validate rejects out-of-range or malformed pool settings at config load so a
+// typo fails fast instead of silently reverting to a default at runtime.
+func (p StoragePoolConfig) Validate(context string) error {
+	if p.MaxIdleConns < 0 {
+		return fmt.Errorf("%s pool.max_idle_conns %d must not be negative", context, p.MaxIdleConns)
+	}
+	if p.MaxOpenConns < 0 {
+		return fmt.Errorf("%s pool.max_open_conns %d must not be negative", context, p.MaxOpenConns)
+	}
+	if p.MaxOpenConns > 0 && p.MaxIdleConns > 0 && p.MaxIdleConns > p.MaxOpenConns {
+		return fmt.Errorf("%s pool.max_idle_conns %d must not exceed pool.max_open_conns %d", context, p.MaxIdleConns, p.MaxOpenConns)
+	}
+	if err := validatePositiveDuration(context, "pool.conn_max_lifetime", p.ConnMaxLifetime); err != nil {
+		return err
+	}
+	if err := validatePositiveDuration(context, "pool.conn_max_idle_time", p.ConnMaxIdleTime); err != nil {
+		return err
+	}
+	if err := validatePositiveDuration(context, "pool.connect_timeout", p.ConnectTimeout); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validatePositiveDuration accepts an empty value (meaning "use the default")
+// and otherwise requires a parseable, strictly positive Go duration.
+func validatePositiveDuration(context, field, value string) error {
+	if value == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return fmt.Errorf("%s %s %q is not a valid duration: %w", context, field, value, err)
+	}
+	if d <= 0 {
+		return fmt.Errorf("%s %s %q must be positive (omit it to use the default)", context, field, value)
+	}
+	return nil
 }
 
 // DSNFromConfig configures a MySQL DSN assembled from separate secret values.
@@ -560,6 +796,17 @@ type DatabaseConfig struct {
 
 	// Environments contains per-environment configuration.
 	Environments map[string]EnvironmentConfig `yaml:"environments"`
+
+	// EnvironmentOrder optionally overrides the server-wide environment_order
+	// for this database's promotion gating. Databases promote through different
+	// environment sequences (one may run qa → sandbox → production while
+	// another runs qa → staging → production), and a single server-wide order
+	// cannot express both. When set it replaces the server order entirely for
+	// this database: a PR apply to an environment in this list requires a
+	// successful SchemaBot check for every earlier entry, and environments the
+	// database does not promote through simply do not appear. When empty, the
+	// server-wide environment_order applies.
+	EnvironmentOrder []string `yaml:"environment_order,omitempty"`
 
 	// AllowedRepos restricts which trusted GitHub PR repositories may manage
 	// this database. Values are exact owner/repo names. A literal "*" allows
@@ -953,6 +1200,9 @@ func (c *ServerConfig) Validate() error {
 		if len(dbConfig.Environments) == 0 {
 			return fmt.Errorf("database %q has no environments configured", name)
 		}
+		if err := c.validateDatabaseEnvironmentOrder(name, dbConfig); err != nil {
+			return err
+		}
 		for env, envConfig := range dbConfig.Environments {
 			if err := envConfig.validateRevertWindowDuration(fmt.Sprintf("database %q environment %q", name, env)); err != nil {
 				return err
@@ -1276,7 +1526,7 @@ func (c *ServerConfig) validateNoLocalRemoteRouteCollision() error {
 //   - If apps: is NOT set, repos must not declare github_app (it would be a
 //     silently ignored field, which we want to fail closed on).
 func (c *ServerConfig) validateGitHubAppsConfig() error {
-	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != "" || c.GitHub.CheckName != "" || len(c.GitHub.TrustedCheckAppSlugs) > 0
+	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != "" || c.GitHub.CheckName != "" || len(c.GitHub.TrustedCheckAppSlugs) > 0 || c.GitHub.PromotionCheckName != ""
 	hasApps := c.Apps != nil
 
 	if hasGitHub && hasApps {
@@ -1285,6 +1535,9 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 
 	if hasGitHub {
 		if err := validateUniqueNames("github.trusted-check-app-slugs", c.GitHub.TrustedCheckAppSlugs); err != nil {
+			return err
+		}
+		if err := c.GitHub.validatePromotionCheckName("github"); err != nil {
 			return err
 		}
 	}
@@ -1309,6 +1562,9 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 			if err := validateUniqueNames(fmt.Sprintf("app %q trusted-check-app-slugs", name), app.TrustedCheckAppSlugs); err != nil {
 				return err
 			}
+			if err := app.validatePromotionCheckName(fmt.Sprintf("app %q", name)); err != nil {
+				return err
+			}
 		}
 		for repo, repoConfig := range c.Repos {
 			if repoConfig.GitHubApp == "" {
@@ -1326,6 +1582,54 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 	for repo, repoConfig := range c.Repos {
 		if repoConfig.GitHubApp != "" {
 			return fmt.Errorf("repository %q sets github_app %q but apps: is not configured", repo, repoConfig.GitHubApp)
+		}
+	}
+	return nil
+}
+
+// validatePromotionCheckName rejects a promotion-check-name override that no
+// deployment this App trusts could satisfy. A base name different from this
+// App's own check-name can only be published by another deployment's App, so
+// with trusted-check-app-slugs empty the promotion gate would reject every
+// Check Run under that name and block every apply.
+func (g GitHubConfig) validatePromotionCheckName(context string) error {
+	name := strings.TrimSpace(g.PromotionCheckName)
+	if name == "" || name == g.CheckRunNameBase() {
+		return nil
+	}
+	if len(g.TrustedCheckAppSlugs) == 0 {
+		return fmt.Errorf("%s sets promotion-check-name %q, which differs from its own check-name base %q, but trusted-check-app-slugs is empty; the promotion gate only accepts that Check Run from a trusted sibling App, so every apply would be blocked", context, name, g.CheckRunNameBase())
+	}
+	return nil
+}
+
+// validateDatabaseEnvironmentOrder checks a database's environment_order
+// override against the database's configured environments and this instance's
+// environment scope. Both directions fail fast at startup because each
+// mismatch would silently block applies at runtime: a configured environment
+// absent from the override is rejected as an unlisted apply target, and a
+// locally-owned override entry with no configuration makes every later
+// environment wait on a prior check that can never exist. Entries owned by a
+// peer instance (outside allowed_environments) may legitimately be absent
+// locally — the promotion gate resolves them through the GitHub Checks API.
+func (c *ServerConfig) validateDatabaseEnvironmentOrder(name string, db DatabaseConfig) error {
+	if len(db.EnvironmentOrder) == 0 {
+		return nil
+	}
+	if err := validateUniqueNames(fmt.Sprintf("database %q environment_order", name), db.EnvironmentOrder); err != nil {
+		return err
+	}
+	for env := range db.Environments {
+		if !slices.Contains(db.EnvironmentOrder, env) {
+			return fmt.Errorf("database %q environment %q is configured but missing from the database environment_order; applies to it will be blocked as unlisted", name, env)
+		}
+	}
+	for _, env := range db.EnvironmentOrder {
+		if !c.IsEnvironmentAllowed(env) {
+			continue
+		}
+		if _, ok := db.Environments[env]; !ok {
+			return fmt.Errorf("database %q environment_order lists %q but the database does not configure it; applies to later environments will wait on a prior check that can never exist", name, env)
 		}
 	}
 	return nil
@@ -1466,7 +1770,7 @@ func (e *DatabaseNotConfiguredError) Error() string {
 }
 
 // DatabaseEnvironments returns the environments configured server-side for a
-// database, ordered by the server-owned promotion order. Returns
+// database, ordered by the database's effective promotion order. Returns
 // *DatabaseNotConfiguredError when the database has no registry entry.
 func (c *ServerConfig) DatabaseEnvironments(database string) ([]string, error) {
 	if c == nil {
@@ -1480,7 +1784,7 @@ func (c *ServerConfig) DatabaseEnvironments(database string) ([]string, error) {
 	for environment := range db.Environments {
 		environments = append(environments, environment)
 	}
-	return c.OrderedEnvironments(environments), nil
+	return c.OrderedEnvironmentsForDatabase(database, environments), nil
 }
 
 // ResolveDatabaseTarget returns the complete routing metadata for a configured
@@ -1808,9 +2112,10 @@ func isValidTenantName(tenant string) bool {
 // KnownEnvironments returns every environment name visible in this instance's
 // configuration: its own allowed environments, the server-owned promotion
 // order (which lists peer-owned environments in environment-isolated
-// deployments), and each database's routing environments. The result is
-// sorted and deduplicated. A command environment outside this set belongs to
-// no SchemaBot instance and can be rejected instead of deferred to a peer.
+// deployments), each database's environment_order override, and each
+// database's routing environments. The result is sorted and deduplicated. A
+// command environment outside this set belongs to no SchemaBot instance and
+// can be rejected instead of deferred to a peer.
 func (c *ServerConfig) KnownEnvironments() []string {
 	if c == nil {
 		return nil
@@ -1826,6 +2131,7 @@ func (c *ServerConfig) KnownEnvironments() []string {
 	add(c.AllowedEnvironments...)
 	add(c.PromotionEnvironmentOrder()...)
 	for _, db := range c.Databases {
+		add(db.EnvironmentOrder...)
 		for env := range db.Environments {
 			add(env)
 		}
@@ -1857,6 +2163,9 @@ func (c *ServerConfig) IsEnvironmentKnown(env string) bool {
 		if _, ok := db.Environments[env]; ok {
 			return true
 		}
+		if slices.Contains(db.EnvironmentOrder, env) {
+			return true
+		}
 	}
 	return false
 }
@@ -1870,10 +2179,38 @@ func (c *ServerConfig) PromotionEnvironmentOrder() []string {
 	return slices.Clone(c.EnvironmentOrder)
 }
 
+// PromotionOrderForDatabase returns the environment promotion order used by PR
+// apply gating for a database: the database's environment_order override when
+// configured, otherwise the server-owned order. Databases without an override
+// behave exactly as before the override existed.
+func (c *ServerConfig) PromotionOrderForDatabase(database string) []string {
+	if c == nil {
+		return slices.Clone(defaultEnvironmentOrder)
+	}
+	if db := c.Database(database); db != nil && len(db.EnvironmentOrder) > 0 {
+		return slices.Clone(db.EnvironmentOrder)
+	}
+	return c.PromotionEnvironmentOrder()
+}
+
 // OrderedEnvironments returns the enabled environments sorted by the server-owned
 // promotion order. Unknown environments are appended alphabetically so callers
 // get deterministic behavior even before a custom environment_order is added.
 func (c *ServerConfig) OrderedEnvironments(enabled []string) []string {
+	return orderEnvironments(c.PromotionEnvironmentOrder(), enabled)
+}
+
+// OrderedEnvironmentsForDatabase returns the enabled environments sorted by the
+// database's effective promotion order: its environment_order override when
+// configured, otherwise the server-owned order. Unknown environments are
+// appended alphabetically so callers get deterministic behavior.
+func (c *ServerConfig) OrderedEnvironmentsForDatabase(database string, enabled []string) []string {
+	return orderEnvironments(c.PromotionOrderForDatabase(database), enabled)
+}
+
+// orderEnvironments sorts the enabled environments by the given promotion
+// order, appending environments absent from the order alphabetically.
+func orderEnvironments(order, enabled []string) []string {
 	enabledSet := make(map[string]struct{}, len(enabled))
 	for _, env := range enabled {
 		if env == "" {
@@ -1883,7 +2220,7 @@ func (c *ServerConfig) OrderedEnvironments(enabled []string) []string {
 	}
 
 	ordered := make([]string, 0, len(enabledSet))
-	for _, env := range c.PromotionEnvironmentOrder() {
+	for _, env := range order {
 		if _, ok := enabledSet[env]; ok {
 			ordered = append(ordered, env)
 			delete(enabledSet, env)
@@ -1976,6 +2313,28 @@ func (c *ServerConfig) GitHubCheckNameBaseForRepo(repo string) string {
 	return c.GitHub.CheckRunNameBase()
 }
 
+// PromotionCheckNameBaseForRepo returns the aggregate Check Run base name the
+// promotion gate queries when a prior environment of repo is owned by another
+// deployment: the owning App's promotion-check-name when configured, otherwise
+// that App's own check-name base.
+func (c *ServerConfig) PromotionCheckNameBaseForRepo(repo string) string {
+	if c == nil {
+		return DefaultGitHubCheckName
+	}
+	if len(c.Apps) > 0 {
+		repoConfig, ok := c.Repos[repo]
+		if !ok {
+			return DefaultGitHubCheckName
+		}
+		appConfig, ok := c.Apps[repoConfig.GitHubApp]
+		if !ok {
+			return DefaultGitHubCheckName
+		}
+		return appConfig.PromotionCheckRunNameBase()
+	}
+	return c.GitHub.PromotionCheckRunNameBase()
+}
+
 // StorageDSN returns the resolved storage DSN.
 // It handles special prefixes (env:, file:) to read from various sources and
 // can build a DSN from separate config/password references.
@@ -1992,9 +2351,11 @@ func (c StorageConfig) validateLocalDSNConfig(context string) error {
 		return fmt.Errorf("%s cannot configure both dsn and dsn_from", context)
 	}
 	if c.DSNFrom != nil {
-		return c.DSNFrom.Validate(context)
+		if err := c.DSNFrom.Validate(context); err != nil {
+			return err
+		}
 	}
-	return nil
+	return c.Pool.Validate(context)
 }
 
 // HasLocalDSN returns true when the environment should use a local database connection.

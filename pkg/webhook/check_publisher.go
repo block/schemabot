@@ -281,7 +281,18 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 	if participantsRetriable {
 		return aggregateFoldScheduleParticipantRefold, errors.Join(upsertErrs...)
 	}
-	return aggregateFoldClearParticipantRefoldBudget, errors.Join(upsertErrs...)
+	if len(upsertErrs) > 0 {
+		// A failed aggregate publish (the GitHub Check Run write or the storage
+		// write recording it) left at least one environment's gate not
+		// reflecting this fold. Callers that own a durable retry act on the
+		// returned error, but the fire-and-forget entry points (apply and
+		// rollback claims, webhook events) have none — arm the bounded re-fold
+		// so one transient write failure cannot strand the gate on its previous
+		// state, such as a passing aggregate persisting over a just-claimed
+		// rollback.
+		return aggregateFoldScheduleParticipantRefold, errors.Join(upsertErrs...)
+	}
+	return aggregateFoldClearParticipantRefoldBudget, nil
 }
 
 // prFilePaths extracts the changed-file paths from a PR file listing for
@@ -382,9 +393,71 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 	// Create a new check run if no existing record, or if the HEAD SHA changed
 	// (new commit pushed). Updating an old check run tied to a previous SHA is
 	// invisible on the PR — GitHub only shows checks for the HEAD commit.
+	reuseExistingRun := existing != nil && existing.CheckRunID != 0 && existing.HeadSHA == headSHA
+
+	// Branch protection gates on the newest Check Run for this name on this
+	// commit, and stored state can skew from it: the GitHub write and the
+	// storage write are not atomic, and concurrent folds can each publish a
+	// run. Decide reuse against that newest run's real status, not the stored
+	// one — updating the run stored state names can leave a newer, concluded
+	// run gating the PR with a conclusion this fold never intended.
+	var liveRun *ghclient.CheckRunResult
+	if reuseExistingRun {
+		run, _, err := client.FindCheckRunByName(ctx, repo, headSHA, checkName)
+		if err != nil {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_check_sync",
+				Repository:  repo,
+				Environment: environment,
+				Status:      "error",
+			})
+			h.logger.Error("failed to resolve the newest aggregate check run, not publishing aggregate",
+				"repo", repo, "pr", pr, "check_name", checkName,
+				"environment", environment, "head_sha", headSHA,
+				"stored_check_run_id", existing.CheckRunID, "error", err)
+			return fmt.Errorf("resolve newest aggregate check run %q for %s#%d@%s (env %s): %w", checkName, repo, pr, headSHA, environment, err)
+		}
+		if run == nil {
+			// Stored state names a run for this commit that no trusted App run
+			// matches on GitHub. Publish a fresh run instead of updating a run
+			// this deployment cannot see.
+			h.logger.Warn("stored aggregate check run not found on the commit, publishing a fresh aggregate check run",
+				"repo", repo, "pr", pr, "check_name", checkName,
+				"environment", environment, "head_sha", headSHA,
+				"stored_check_run_id", existing.CheckRunID)
+			reuseExistingRun = false
+		}
+		liveRun = run
+	}
+
+	// A concluded Check Run cannot be rewound: GitHub does not move a
+	// completed run back to in_progress — it applies the new output but keeps
+	// the stored conclusion, leaving a passing Check Run whose text says an
+	// apply is running. Publish the rewind as a fresh Check Run on the same
+	// name and SHA instead; the new in-progress run replaces the concluded one
+	// on the PR and in branch protection.
+	rewound := reuseExistingRun && rewindsConcludedCheckRun(liveRun, status)
+	if rewound {
+		h.logger.Info("re-creating aggregate check run: the newest run already concluded and GitHub cannot move it back out of completed",
+			"repo", repo, "pr", pr, "check_name", checkName,
+			"environment", environment, "head_sha", headSHA,
+			"concluded_check_run_id", liveRun.ID,
+			"concluded_conclusion", liveRun.Conclusion, "status", status)
+		reuseExistingRun = false
+	}
 	var checkRunID int64
-	if existing != nil && existing.CheckRunID != 0 && existing.HeadSHA == headSHA {
-		if err := client.UpdateCheckRun(ctx, repo, existing.CheckRunID, opts); err != nil {
+	if reuseExistingRun {
+		if liveRun.ID != existing.CheckRunID {
+			// The newest run is not the one stored state recorded — a previous
+			// fold published a run but failed the storage write, or another
+			// fold raced this one. Adopt the newest run: it is what gates the
+			// PR, and recording it below re-converges stored state with GitHub.
+			h.logger.Warn("adopting a newer aggregate check run than the stored one",
+				"repo", repo, "pr", pr, "check_name", checkName,
+				"environment", environment, "head_sha", headSHA,
+				"stored_check_run_id", existing.CheckRunID, "check_run_id", liveRun.ID)
+		}
+		if err := client.UpdateCheckRun(ctx, repo, liveRun.ID, opts); err != nil {
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 				Operation:   "aggregate_check_sync",
 				Repository:  repo,
@@ -393,12 +466,12 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 			})
 			h.logger.Error("failed to update aggregate check run",
 				"repo", repo, "pr", pr, "check_name", checkName,
-				"environment", environment, "check_run_id", existing.CheckRunID,
+				"environment", environment, "check_run_id", liveRun.ID,
 				"head_sha", headSHA, "status", status,
 				"conclusion", conclusion, "error", err)
-			return fmt.Errorf("update aggregate check run %d for %s#%d (env %s): %w", existing.CheckRunID, repo, pr, environment, err)
+			return fmt.Errorf("update aggregate check run %d for %s#%d (env %s): %w", liveRun.ID, repo, pr, environment, err)
 		}
-		checkRunID = existing.CheckRunID
+		checkRunID = liveRun.ID
 	} else {
 		if existing != nil && existing.HeadSHA != headSHA {
 			h.logger.Info("re-creating aggregate check on new HEAD SHA",
@@ -418,6 +491,14 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 				"environment", environment, "head_sha", headSHA,
 				"status", status, "conclusion", conclusion, "error", err)
 			return fmt.Errorf("create aggregate check run for %s#%d@%s (env %s): %w", repo, pr, headSHA, environment, err)
+		}
+		if rewound {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_check_sync",
+				Repository:  repo,
+				Environment: environment,
+				Status:      "recreated",
+			})
 		}
 		checkRunID = id
 	}
@@ -461,6 +542,15 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 		"status", status, "conclusion", conclusion,
 		"per_database_checks", len(dbChecks))
 	return nil
+}
+
+// rewindsConcludedCheckRun reports whether publishing the recomputed status to
+// the given live Check Run would move an already-concluded run out of
+// "completed". The GitHub Checks API does not allow that transition on an
+// existing run, so callers must publish the rewind as a fresh Check Run
+// instead.
+func rewindsConcludedCheckRun(run *ghclient.CheckRunResult, status string) bool {
+	return run.Status == checkStatusCompleted && status != checkStatusCompleted
 }
 
 // postPassingAggregates posts a passing aggregate check for each allowed environment.

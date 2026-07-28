@@ -37,12 +37,16 @@ const (
 // but that depends on live table state, not the statement text, so it cannot
 // be claimed here — it surfaces as an apply-time failure instead.
 //
-// Statements a preflight check would refuse but that can complete through the
-// engine's instant-DDL fast path are not reported here — the verdict must
-// never claim an apply will fail when it can succeed. The fast path is only
-// guaranteed for single-ALTER applies: when the engine batches several ALTERs
-// into one run it may skip the fast path and refuse such a statement anyway.
-// That is a tolerated false negative — the verdict errs toward silence.
+// The engine tags its statement-scope preflight checks with
+// check.ScopeStatement, but that set is broader than what this function may
+// claim: the engine attempts MySQL's native DDL (ALGORITHM=INSTANT, then a
+// safe-INPLACE subset) before running preflight checks, so a statement those
+// checks would refuse can still complete through that fast path — for example
+// dropping and re-adding a column of the same name, or renaming a column.
+// The verdict must never claim an apply will fail when it can succeed, so
+// only checks no fast path can bypass are mirrored here; the rest err toward
+// silence, a tolerated false negative that surfaces as an apply-time failure
+// at worst. Agreement with the engine's own checks is enforced by test.
 // Only ALTER TABLE statements can be refused; everything else returns false.
 func EngineRefusalReason(stmt string) (string, bool, error) {
 	stmts, err := statement.New(stmt)

@@ -223,6 +223,110 @@ func TestChecksBackfillRunSkipsNamedDisabledRepo(t *testing.T) {
 	assert.Empty(t, report.Actions)
 }
 
+// checksBackfillScanServer serves a single-page checks scan returning the
+// given missing and stuck PRs, the shape a dry-run sweep consumes.
+func checksBackfillScanServer(t *testing.T, missing []apitypes.MissingCheckPR, stuck []apitypes.StuckCheckPR) *httptest.Server {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/checks/scan", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(apitypes.ChecksScanResponse{
+			Repo:       "octo/repo",
+			CheckNames: []string{"SchemaBot (production)"},
+			Scanned:    5,
+			Missing:    missing,
+			Stuck:      stuck,
+		}))
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// A dry-run scan that surfaces PRs needing attention — missing Check Runs
+// and stuck Check Runs — exits nonzero with a one-line error stating the
+// counts, after the full report has already been printed, so a scheduled
+// sweep can alert on $? without parsing the output.
+func TestChecksBackfillDryRunFindingsExitNonzero(t *testing.T) {
+	server := checksBackfillScanServer(t,
+		[]apitypes.MissingCheckPR{
+			{Number: 7, URL: "https://github.com/octo/repo/pull/7", Title: "missing", HeadSHA: "sha7", MissingNames: []string{"SchemaBot (production)"}},
+		},
+		[]apitypes.StuckCheckPR{
+			{
+				Number: 9, URL: "https://github.com/octo/repo/pull/9", Title: "stuck", HeadSHA: "sha9",
+				Checks: []apitypes.IncompleteCheckRun{{Name: "SchemaBot (production)", CheckRunID: 90, Status: "queued"}},
+			},
+		})
+
+	cmd := &ChecksBackfillCmd{Repo: "octo/repo", DryRun: true, StuckAfter: "1h", JSON: true}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+	})
+
+	require.Error(t, runErr)
+	assert.EqualError(t, runErr, "checks backfill left 1 PR with missing Check Runs and 1 stuck Check Run needing attention")
+
+	var report checksBackfillReport
+	require.NoError(t, json.Unmarshal([]byte(output), &report), "the full report is still printed before the exit-code error")
+	require.Len(t, report.Actions, 1)
+	assert.Equal(t, 7, report.Actions[0].PR)
+	require.Len(t, report.Stuck, 1)
+	assert.Equal(t, 9, report.Stuck[0].PR)
+}
+
+// A clean scan — nothing missing, nothing stuck — exits zero, so a scheduled
+// sweep alerts only when an operator has something to do.
+func TestChecksBackfillCleanScanExitsZero(t *testing.T) {
+	server := checksBackfillScanServer(t, nil, nil)
+
+	cmd := &ChecksBackfillCmd{Repo: "octo/repo", DryRun: true, StuckAfter: "1h", JSON: true}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+	})
+
+	require.NoError(t, runErr)
+	var report checksBackfillReport
+	require.NoError(t, json.Unmarshal([]byte(output), &report))
+	assert.Empty(t, report.Actions)
+	assert.Empty(t, report.Stuck)
+}
+
+// The exit code means "nothing needs an operator after this run". In a
+// dry-run every finding remains. After an act phase, a successfully
+// recreated check is resolved and does not fail the run, while held PRs,
+// failed recreations, and stuck Check Runs — which the backfill never acts
+// on — still do.
+func TestChecksBackfillAttentionExitError(t *testing.T) {
+	assert.NoError(t, attentionExitError(&checksBackfillReport{DryRun: true}))
+
+	err := attentionExitError(&checksBackfillReport{
+		DryRun:  true,
+		Actions: []checksBackfillAction{{PR: 1}, {PR: 2, Held: true}},
+	})
+	assert.EqualError(t, err, "checks backfill left 2 PRs with missing Check Runs (1 held) needing attention")
+
+	err = attentionExitError(&checksBackfillReport{
+		DryRun: true,
+		Stuck:  []checksStuckCheck{{PR: 3}, {PR: 4}},
+	})
+	assert.EqualError(t, err, "checks backfill left 2 stuck Check Runs needing attention")
+
+	assert.NoError(t, attentionExitError(&checksBackfillReport{
+		Actions: []checksBackfillAction{{PR: 1, Outcome: "created 1 Check Run"}},
+	}), "a recreated check is resolved, not left needing attention")
+
+	err = attentionExitError(&checksBackfillReport{
+		Actions: []checksBackfillAction{
+			{PR: 1, Outcome: "created 1 Check Run"},
+			{PR: 2, Held: true},
+			{PR: 3, Error: "boom"},
+		},
+		Stuck: []checksStuckCheck{{PR: 4}},
+	})
+	assert.EqualError(t, err, "checks backfill left 1 held PR and 1 failed Check Run recreation and 1 stuck Check Run needing attention")
+}
+
 // The pacing decision: pause only when the budget snapshot is below the floor
 // and a future reset exists to wait for. Missing snapshots, disabled pacing,
 // healthy budgets, and already-past resets all proceed without waiting.

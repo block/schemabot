@@ -151,6 +151,48 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	return sb.String()
 }
 
+// RenderBlockedChangesApplyRejected renders the rejection comment for an
+// apply whose plan contains statements the schema-change engine refuses.
+// Unlike unsafe changes there is no opt-in flag that lets a refused statement
+// through, so the comment carries no retry instructions — the guidance is to
+// rewrite the change or contact the operators.
+func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
+	var sb strings.Builder
+
+	// Render the full plan first (DDL, summary) so the user can see what was
+	// planned — but without a lock or confirm footer.
+	writeEnvironmentTitle(&sb, "Schema Change Plan", data.Environment)
+
+	writePlanMetadata(&sb, data)
+	writePlanAttribution(&sb, data)
+	sb.WriteString("\n")
+
+	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
+	if totalStatements+keyspacesWithVSchema > 0 {
+		writeKeyspaceChanges(&sb, data)
+	}
+
+	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
+
+	sb.WriteString("---\n\n")
+	n := len(data.BlockedChanges)
+	fmt.Fprintf(&sb, "**⛔ Apply rejected**: **%d** planned %s not supported by the schema-change engine\n", n, pluralize("change", n))
+	for _, c := range data.BlockedChanges {
+		table := "`" + c.Table + "`"
+		if len(c.Shards) > 0 {
+			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
+		}
+		if c.Reason != "" {
+			fmt.Fprintf(&sb, "- %s: %s\n", table, c.Reason)
+		} else {
+			fmt.Fprintf(&sb, "- %s\n", table)
+		}
+	}
+	sb.WriteString("\nRewrite these statements as a supported schema change, or contact your SchemaBot operators for help.\n")
+
+	return sb.String()
+}
+
 // RenderApplyStarted renders the initial body of the live progress comment when
 // an apply begins. It uses the same stable status title as the in-place status
 // comment the observer later edits this into, so the headline does not jump from
@@ -669,7 +711,7 @@ func RenderApplyBlockedByUnlistedEnvironment(environment string, promotionOrder 
 	if len(promotionOrder) > 0 {
 		fmt.Fprintf(&sb, "Configured promotion order: `%s`\n\n", strings.Join(promotionOrder, "` → `"))
 	}
-	fmt.Fprintf(&sb, "Add `%s` to `environment_order` so SchemaBot knows where it sits in the promotion sequence, then retry the apply.\n", environment)
+	fmt.Fprintf(&sb, "Add `%s` to `environment_order` (the server-wide list, or this database's override when it has one) so SchemaBot knows where it sits in the promotion sequence, then retry the apply.\n", environment)
 
 	return sb.String()
 }

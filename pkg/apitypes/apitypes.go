@@ -496,6 +496,32 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 	return result
 }
 
+// HasBlockedChanges reports whether any planned change carries the blocked
+// execution-mode verdict, across namespace-level and per-shard changes. A
+// blocked change guarantees the apply fails, so gates use this to reject the
+// apply before it starts.
+func (r *PlanResponse) HasBlockedChanges() bool {
+	if r == nil {
+		return false
+	}
+	for _, t := range r.FlatTables() {
+		if t.EngineBlocked() {
+			return true
+		}
+	}
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if t.EngineBlocked() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // LintWarnings returns lint results with warning severity.
 func (r *PlanResponse) LintWarnings() []LintViolationResponse {
 	var result []LintViolationResponse
@@ -584,8 +610,19 @@ type TableChangeResponse struct {
 	ModeReason    string `json:"mode_reason,omitempty"`
 }
 
+// executionModeBlocked is the execution-mode verdict a planner records on a
+// table change the engine refuses. It mirrors the engine-side constant
+// (pkg/ddl); apitypes keeps its own copy so this package stays dependency-free.
+const executionModeBlocked = "blocked"
+
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
 func (t *TableChangeResponse) GetTableName() string { return t.TableName }
+
+// EngineBlocked reports whether the planner's execution-mode verdict says the
+// engine deterministically refuses this change: an apply will fail on it.
+func (t *TableChangeResponse) EngineBlocked() bool {
+	return t != nil && strings.EqualFold(t.ExecutionMode, executionModeBlocked)
+}
 
 // UnsafeChange returns the unsafe-change view for table changes that require
 // explicit operator opt-in. Engines should mark unsafe table changes directly;
@@ -813,10 +850,20 @@ type ActiveApplyResponse struct {
 
 // StatusResponse is the HTTP response for GET /api/status.
 type StatusResponse struct {
-	ActiveCount  int                    `json:"active_count"`
-	Limit        int                    `json:"limit,omitempty"`
-	MaxLimit     int                    `json:"max_limit,omitempty"`
-	HasMore      bool                   `json:"has_more,omitempty"`
-	FailuresOnly bool                   `json:"failures_only,omitempty"`
-	Applies      []*ActiveApplyResponse `json:"applies"`
+	ActiveCount  int  `json:"active_count"`
+	Limit        int  `json:"limit,omitempty"`
+	MaxLimit     int  `json:"max_limit,omitempty"`
+	HasMore      bool `json:"has_more,omitempty"`
+	FailuresOnly bool `json:"failures_only,omitempty"`
+	// Last echoes the window bounding the list to applies updated within it;
+	// empty means the list is bounded by limit alone.
+	Last string `json:"last,omitempty"`
+	// State echoes the canonical form of the state filter restricting the
+	// list; empty means no state filter.
+	State string `json:"state,omitempty"`
+	// StateCounts tallies every apply matching the request's filters by state,
+	// unbounded by limit — the applies list may be a truncated page, but these
+	// counts never are.
+	StateCounts map[string]int         `json:"state_counts,omitempty"`
+	Applies     []*ActiveApplyResponse `json:"applies"`
 }

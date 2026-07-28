@@ -251,6 +251,18 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 		return false, nil
 	}
 
+	// Engine-blocked changes reject the apply before the unsafe gate: no flag
+	// lets a refused statement through, so the user must never be coached
+	// toward --allow-unsafe for a guaranteed failure. No lock is held yet, so
+	// the rejection needs no release.
+	if planResp.HasBlockedChanges() {
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+		h.logger.Info("apply rejected: plan contains engine-blocked changes",
+			"repo", repo, "pr", pr, "database", database, "environment", environment)
+		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
+		return false, nil
+	}
+
 	// Block unsafe changes unless --allow-unsafe was specified
 	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
@@ -575,6 +587,14 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 	}
 
 	if len(locks) == 0 {
+		// On an unscoped fan-out every deployment runs the same lookup, but only
+		// the one holding a lock has anything to release. One with no locks stays
+		// silent so only the owning deployment answers.
+		if h.silentOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("unscoped fan-out unlock found no locks on this deployment; staying silent so the owning deployment responds",
+				"repo", repo, "pr", pr)
+			return
+		}
 		h.logger.Info("unlock: no locks found", "repo", repo, "pr", pr)
 		h.postComment(repo, pr, installationID, templates.RenderNoLocksFound())
 		return

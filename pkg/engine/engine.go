@@ -111,6 +111,16 @@ type ExternallyAuthoritativeProgress interface {
 	ProgressIsExternallyAuthoritative() bool
 }
 
+// ProgressIsExternallyAuthoritative reports whether eng declares its Progress
+// result authoritative regardless of which instance answers. Engines that do
+// not implement ExternallyAuthoritativeProgress are treated as instance-local —
+// this fails closed: a new engine's progress is never trusted as backend truth
+// unless it explicitly declares it.
+func ProgressIsExternallyAuthoritative(eng Engine) bool {
+	auth, ok := eng.(ExternallyAuthoritativeProgress)
+	return ok && auth.ProgressIsExternallyAuthoritative()
+}
+
 // DeferredCutoverSignalRequest identifies the target database whose deferred
 // cutover signal should be inspected.
 type DeferredCutoverSignalRequest struct {

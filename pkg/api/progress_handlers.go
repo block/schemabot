@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/block/spirit/pkg/statement"
@@ -649,7 +650,8 @@ func (s *Service) handleDatabaseList(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	resp, err := databaseListResponse(s.config, databaseType)
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	resp, err := databaseListResponse(s.config, databaseType, name)
 	if err != nil {
 		s.logger.Error("database list failed", "error", err)
 		s.writeError(w, http.StatusInternalServerError, "failed to list databases: "+err.Error())
@@ -668,13 +670,21 @@ func parseDatabaseListTypeFilter(r *http.Request) (string, error) {
 	}
 }
 
-func databaseListResponse(config *ServerConfig, databaseType string) (*apitypes.DatabaseListResponse, error) {
+// databaseListResponse builds the sanitized database list, keeping only
+// databases matching the optional type and name filters. The name filter is a
+// case-insensitive substring match so one query covers a sharded family
+// (omnibus matches omnibus_001, omnibus_002, ...).
+func databaseListResponse(config *ServerConfig, databaseType, name string) (*apitypes.DatabaseListResponse, error) {
 	if config == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
+	nameFilter := strings.ToLower(name)
 	databaseNames := make([]string, 0, len(config.Databases))
 	for database, dbConfig := range config.Databases {
 		if databaseType != "" && dbConfig.Type != databaseType {
+			continue
+		}
+		if nameFilter != "" && !strings.Contains(strings.ToLower(database), nameFilter) {
 			continue
 		}
 		databaseNames = append(databaseNames, database)
@@ -753,6 +763,16 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	last, err := parseStatusLast(r)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	stateFilter, err := parseStatusState(r, failuresOnly)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	filter := storage.RecentAppliesFilter{
 		Limit:       limit + 1,
@@ -761,6 +781,12 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if failuresOnly {
 		filter.States = []string{state.Apply.Failed, state.Apply.FailedRetryable}
+	}
+	if stateFilter != "" {
+		filter.States = []string{stateFilter}
+	}
+	if last > 0 {
+		filter.UpdatedSince = time.Now().Add(-last)
 	}
 	applies, err := s.storage.Applies().GetRecent(r.Context(), filter)
 	if err != nil {
@@ -772,14 +798,25 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if hasMore {
 		applies = applies[:limit]
 	}
+	stateCounts, err := s.storage.Applies().CountRecentByState(r.Context(), filter)
+	if err != nil {
+		s.logger.Error("count recent applies by state failed", "error", err)
+		s.writeError(w, http.StatusInternalServerError, "failed to count recent applies by state")
+		return
+	}
 
 	resp := &apitypes.StatusResponse{
 		Limit:        limit,
 		MaxLimit:     maxStatusLimit,
 		HasMore:      hasMore,
 		FailuresOnly: failuresOnly,
+		StateCounts:  stateCounts,
 		Applies:      make([]*apitypes.ActiveApplyResponse, 0, len(applies)),
 	}
+	if last > 0 {
+		resp.Last = last.String()
+	}
+	resp.State = stateFilter
 	operationsByApply := map[int64][]*storage.ApplyOperation{}
 	if filter.Deployment != "" {
 		applyIDs := make([]int64, 0, len(applies))
@@ -925,6 +962,20 @@ func parseStatusLimit(r *http.Request) (int, error) {
 	return limit, nil
 }
 
+// parseStatusLast parses the optional `last` query parameter bounding the
+// status list to applies updated within the window. Zero means unbounded.
+func parseStatusLast(r *http.Request) (time.Duration, error) {
+	raw := r.URL.Query().Get("last")
+	if raw == "" {
+		return 0, nil
+	}
+	last, err := time.ParseDuration(raw)
+	if err != nil || last <= 0 {
+		return 0, fmt.Errorf("last must be a positive duration such as 30m or 24h")
+	}
+	return last, nil
+}
+
 func parseStatusFailuresOnly(r *http.Request) (bool, error) {
 	raw := r.URL.Query().Get("failed")
 	if raw == "" {
@@ -935,6 +986,26 @@ func parseStatusFailuresOnly(r *http.Request) (bool, error) {
 		return false, fmt.Errorf("failed must be a boolean")
 	}
 	return failed, nil
+}
+
+// parseStatusState parses the optional `state` query parameter restricting the
+// status list to one apply state. The value is normalized to canonical
+// lowercase and must name a known apply state, so a typo returns an error
+// instead of a silently empty list. It cannot be combined with `failed`, which
+// is its own state filter.
+func parseStatusState(r *http.Request, failuresOnly bool) (string, error) {
+	raw := r.URL.Query().Get("state")
+	if raw == "" {
+		return "", nil
+	}
+	if failuresOnly {
+		return "", fmt.Errorf("state cannot be combined with failed")
+	}
+	normalized := state.NormalizeState(raw)
+	if _, ok := state.LookupApply(normalized); !ok {
+		return "", fmt.Errorf("unknown state %q", raw)
+	}
+	return normalized, nil
 }
 
 // progressFromLocalStorage builds a ProgressResponse from local apply + task

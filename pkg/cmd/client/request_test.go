@@ -45,6 +45,63 @@ func sendThroughTransport(t *testing.T, rawURL string, presetAuth string) (*http
 	return httpClient.Do(req)
 }
 
+// controlStatusServer returns a test server that answers every request with
+// the given status code and JSON body, for exercising the client's status
+// handling.
+func controlStatusServer(t *testing.T, statusCode int, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(statusCode)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A 202 Accepted from a control endpoint means the request was durably
+// recorded and the apply owner completes it asynchronously — the operator's
+// command succeeded. The client must decode the response body as a success,
+// not surface the status code as an error.
+func TestDoPostIntoAcceptsAccepted(t *testing.T) {
+	srv := controlStatusServer(t, http.StatusAccepted, `{"accepted": true, "status": "already_requested"}`)
+
+	var result struct {
+		Accepted bool   `json:"accepted"`
+		Status   string `json:"status"`
+	}
+	err := doPostInto(srv.URL, "/api/skip-revert", map[string]string{"apply_id": "apply-abc"}, &result)
+
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	assert.Equal(t, "already_requested", result.Status)
+}
+
+func TestDoPostIntoAcceptsOK(t *testing.T) {
+	srv := controlStatusServer(t, http.StatusOK, `{"accepted": true}`)
+
+	var result struct {
+		Accepted bool `json:"accepted"`
+	}
+	err := doPostInto(srv.URL, "/api/skip-revert", map[string]string{"apply_id": "apply-abc"}, &result)
+
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+}
+
+func TestDoPostIntoErrorStatusReturnsAPIError(t *testing.T) {
+	srv := controlStatusServer(t, http.StatusConflict, `{"error": "schema change is not in its revert window", "error_code": "conflict"}`)
+
+	var result struct{}
+	err := doPostInto(srv.URL, "/api/skip-revert", map[string]string{"apply_id": "apply-abc"}, &result)
+
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusConflict, apiErr.Status)
+	assert.Equal(t, "conflict", apiErr.ErrorCode)
+	assert.Contains(t, apiErr.Message, "not in its revert window")
+}
+
 func TestAuthTokenAttachedAsBearer(t *testing.T) {
 	var gotAuth string
 	srv := captureAuthServer(t, &gotAuth)

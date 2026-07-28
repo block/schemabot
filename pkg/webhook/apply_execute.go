@@ -98,6 +98,20 @@ func (h *Handler) executeApply(
 		return
 	}
 
+	// Engine-blocked changes reject the apply outright — the re-plan may have
+	// resolved a change to blocked even if the reviewed plan had none (e.g.
+	// the direct execution policy changed, or the table grew past its bound).
+	// Release the lock: no retry of this command can succeed, so holding it
+	// would only force a manual unlock after the schema is rewritten.
+	if planResp.HasBlockedChanges() {
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+		h.logger.Info("apply rejected: re-plan contains engine-blocked changes",
+			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
+		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "engine-blocked changes rejection")
+		return
+	}
+
 	// Automatic apply DDL drift check: if the re-plan DDL differs from the stored auto-plan,
 	// downgrade to manual confirmation so the user reviews the new plan.
 	if storedPlan != nil && !ddlMatchesStoredPlan(planResp, storedPlan) {
@@ -212,14 +226,14 @@ func (h *Handler) executeApply(
 		h.logger.Error("failed to load apply after accepted apply",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", schemaResult.Type, "environment", environment,
-			"apply_id", applyID, "error", err)
+			"apply_id", applyResp.ApplyID, "error", err)
 		return
 	}
 	if apply == nil {
 		h.logger.Error("apply missing after accepted apply",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", schemaResult.Type, "environment", environment,
-			"apply_id", applyID)
+			"apply_id", applyResp.ApplyID)
 		return
 	}
 
@@ -238,11 +252,9 @@ func (h *Handler) executeApply(
 	h.postInitialProgressComment(ctx, repo, pr, installationID, apply, progressBody)
 
 	// Update stored check state to in_progress (transitions action_required to in_progress).
-	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID); err != nil {
+	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply); err != nil {
 		h.logger.Error("failed to mark check in_progress for apply",
-			"repo", repo, "pr", pr, "database", database,
-			"database_type", schemaResult.Type, "environment", environment,
-			"apply_id", applyID, "error", err)
+			append(apply.LogAttrs(), "error", err)...)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot could not update the required status check: "+err.Error())
 		return
 	}

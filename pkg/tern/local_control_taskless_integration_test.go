@@ -28,8 +28,9 @@ import (
 type invocationTrackingEngine struct {
 	engine.Engine
 
-	mu    sync.Mutex
-	calls []string
+	mu        sync.Mutex
+	calls     []string
+	cancelErr error
 }
 
 func (e *invocationTrackingEngine) record(call string) {
@@ -68,6 +69,9 @@ func (e *invocationTrackingEngine) Stop(context.Context, *engine.ControlRequest)
 
 func (e *invocationTrackingEngine) Cancel(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.record("Cancel")
+	if e.cancelErr != nil {
+		return nil, e.cancelErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 

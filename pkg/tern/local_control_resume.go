@@ -1412,6 +1412,14 @@ func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.E
 // of tasks the caller has loaded. Callers choose whether tasks are scoped to the
 // whole apply or to a single operation.
 func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, options map[string]string, releaseAtCutoverBarrier bool, forceCutoverResume bool) error {
+	// Before consuming a pending stop/cancel, learn whether the engine's
+	// backend already drove the change to a terminal outcome. If it did, the
+	// command can no longer act — the drive adopts the engine's truth and the
+	// pending commands are mooted; otherwise (and on any uncertainty) the
+	// commands are consumed exactly as before.
+	if handled, err := c.reconcileEngineTerminalTruthBeforeCommands(ctx, apply, tasks); handled || err != nil {
+		return err
+	}
 	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); handled || err != nil {
 		return err
 	}

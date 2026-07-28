@@ -169,8 +169,9 @@ error. Uncertainty is never converted into a passing check. A check run belongs
 to one commit SHA, so stale work from an older commit can never satisfy branch
 protection for a newer PR head.
 
-**Environment ordering.** PR comment applies follow the server-owned promotion
-order (`environment_order`, default staging before production). Production
+**Environment ordering.** PR comment applies follow the database's effective
+promotion order (its `environment_order` override when set, otherwise the
+server-wide `environment_order`; default staging before production). Production
 applies are blocked until the prior environment's check state is `success`. When
 another SchemaBot deployment owns the prior environment, the gate reads that
 environment's aggregate check run from GitHub — check runs are the shared

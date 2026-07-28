@@ -2,6 +2,7 @@ package commands
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
@@ -15,6 +16,8 @@ type StatusCmd struct {
 	Database    string `short:"d" help:"Database name (show apply history)"`
 	Environment string `short:"e" help:"Environment filter"`
 	Deployment  string `help:"Deployment filter"`
+	Last        string `help:"Only show applies updated within this window, for example 6h or 2d; by default the list is bounded by --limit alone"`
+	State       string `help:"Only show applies in this state, for example running, completed, or failed_retryable; cannot be combined with --failed"`
 	Limit       int    `short:"n" help:"Maximum recent applies to show (default 20, max 1000)"`
 	Failed      bool   `help:"Show only failed recent applies" name:"failed"`
 	ExternalID  bool   `help:"Show external engine apply IDs" name:"external-id"`
@@ -39,6 +42,17 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 	}
 
 	// Mode 3: List recent applies
+	if cmd.State != "" && cmd.Failed {
+		return fmt.Errorf("--state cannot be combined with --failed")
+	}
+	var last time.Duration
+	if cmd.Last != "" {
+		window, err := parseOperatorDuration(cmd.Last)
+		if err != nil {
+			return fmt.Errorf("parse --last: %w", err)
+		}
+		last = window
+	}
 	var result *apitypes.StatusResponse
 	err = withLoading("Loading schema change status...", !cmd.JSON, func() error {
 		var loadErr error
@@ -46,7 +60,9 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 			Limit:       cmd.Limit,
 			Environment: cmd.Environment,
 			Deployment:  cmd.Deployment,
+			State:       cmd.State,
 			Failed:      cmd.Failed,
+			Last:        last,
 		})
 		return loadErr
 	})
@@ -70,6 +86,9 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 		MaxLimit:       result.MaxLimit,
 		HasMore:        result.HasMore,
 		FailuresOnly:   result.FailuresOnly,
+		Last:           cmd.Last,
+		StateFilter:    result.State,
+		StateCounts:    result.StateCounts,
 		ShowExternalID: cmd.ExternalID,
 		Deployment:     cmd.Deployment,
 		Applies:        applies,
