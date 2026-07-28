@@ -337,6 +337,56 @@ func TestDurableWebhookDriverFailsMalformedPullRequestTerminally(t *testing.T) {
 	require.Empty(t, store.completed)
 }
 
+func TestDurableInstallationID(t *testing.T) {
+	tests := []struct {
+		name     string
+		tenantID string
+		wantID   int64
+		wantErr  string
+	}{
+		{name: "valid tenant", tenantID: "12345", wantID: 12345},
+		{name: "unparseable tenant", tenantID: "not-an-installation-id", wantErr: "unparseable tenant ID"},
+		{name: "empty tenant", tenantID: "", wantErr: "unparseable tenant ID"},
+		{name: "zero tenant", tenantID: "0", wantErr: "missing an installation ID"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := &storage.WebhookEvent{
+				DeliveryID:  "delivery-tenant",
+				Event:       "pull_request",
+				Repository:  "octocat/hello-world",
+				PullRequest: 7,
+				TenantID:    tt.tenantID,
+			}
+			id, err := durableInstallationID(event)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantID, id)
+		})
+	}
+}
+
+func TestDurableWebhookDriverFailsUnparseableTenantTerminally(t *testing.T) {
+	event := durablePullRequestEvent(t)
+	event.TenantID = "not-an-installation-id"
+	store := newScriptedWebhookEventStore(event)
+	h := newDurableDriverHandler(t, store, nil, nil)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case failure := <-store.failed:
+		require.Nil(t, failure.retryAfter, "a corrupted persisted tenant must not be retried")
+		require.Contains(t, failure.errMsg, "unparseable tenant ID")
+	default:
+		t.Fatal("expected unparseable tenant to be marked failed")
+	}
+	require.Empty(t, store.completed)
+}
+
 func TestDurableWebhookDriverRetriesBootstrapFailure(t *testing.T) {
 	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
 	factory := &fakeClientFactory{forInstallationErr: errors.New("installation token unavailable")}
