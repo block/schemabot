@@ -1821,7 +1821,7 @@ func (c *LocalClient) processPendingVolumeControlRequest(ctx context.Context, ap
 			message = result.Message
 		}
 		c.logger.Warn("engine did not accept pending volume request; schema change continues at its current volume",
-			append(apply.LogAttrs(), "volume", volume, "requested_by", caller, "message", message)...)
+			append(apply.LogAttrs(), "volume", volume, "requested_by", caller, "engine_message", message)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Volume change to %d was not accepted: %s; schema change continues at its current volume", volume, message), "", "")
 		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationVolume, message)
@@ -1907,7 +1907,7 @@ func (c *LocalClient) convergeTaskVolumeToStoredLevel(ctx context.Context, apply
 			message = result.Message
 		}
 		c.logger.Warn("engine did not accept converging task to the stored volume level; task continues at the engine default",
-			append(task.LogAttrs(), "volume", volume, "message", message)...)
+			append(task.LogAttrs(), "volume", volume, "engine_message", message)...)
 		return
 	}
 	c.logger.Info("task volume converged to the apply's stored level",

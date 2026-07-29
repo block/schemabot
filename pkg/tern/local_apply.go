@@ -170,7 +170,7 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		c.logger.Warn("conflict check: engine progress failed", append(t.LogAttrs(), "err", err)...)
 		return false
 	}
-	c.logger.Debug("conflict check: engine progress", "task_id", t.TaskIdentifier, "engine_state", result.State, "message", result.Message)
+	c.logger.Debug("conflict check: engine progress", "task_id", t.TaskIdentifier, "engine_state", result.State, "engine_message", result.Message)
 
 	// Engine says terminal — update storage and unblock.
 	// IMPORTANT: Only trust terminal states, NOT "No active schema change".
@@ -225,7 +225,7 @@ func (c *LocalClient) logApplyEvent(ctx context.Context, applyID int64, taskID *
 		CreatedAt: time.Now(),
 	}
 	if err := c.storage.ApplyLogs().Append(ctx, log); err != nil {
-		c.logger.Warn("failed to log apply event", "error", err, "event", eventType, "message", message)
+		c.logger.Warn("failed to log apply event", "error", err, "event", eventType, "event_message", message)
 	}
 }
 
