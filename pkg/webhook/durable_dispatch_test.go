@@ -339,28 +339,38 @@ func TestDurableWebhookDriverFailsMalformedPullRequestTerminally(t *testing.T) {
 
 func TestDurableInstallationID(t *testing.T) {
 	tests := []struct {
-		name     string
-		tenantID string
-		wantID   int64
-		wantErr  string
+		name        string
+		event       string
+		pullRequest int
+		tenantID    string
+		wantID      int64
+		wantErr     string
 	}{
-		{name: "valid tenant", tenantID: "12345", wantID: 12345},
-		{name: "unparseable tenant", tenantID: "not-an-installation-id", wantErr: "unparseable tenant ID"},
-		{name: "empty tenant", tenantID: "", wantErr: "unparseable tenant ID"},
-		{name: "zero tenant", tenantID: "0", wantErr: "missing an installation ID"},
+		{name: "valid tenant", event: "pull_request", pullRequest: 7, tenantID: "12345", wantID: 12345},
+		{name: "unparseable tenant", event: "pull_request", pullRequest: 7, tenantID: "not-an-installation-id", wantErr: "unparseable tenant ID"},
+		{name: "empty tenant", event: "pull_request", pullRequest: 7, tenantID: "", wantErr: "unparseable tenant ID"},
+		{name: "zero tenant", event: "pull_request", pullRequest: 7, tenantID: "0", wantErr: "non-positive installation ID"},
+		{name: "negative tenant", event: "pull_request", pullRequest: 7, tenantID: "-42", wantErr: "non-positive installation ID"},
+		{name: "zero tenant on PR-less event", event: "push", tenantID: "0", wantErr: "non-positive installation ID"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			event := &storage.WebhookEvent{
 				DeliveryID:  "delivery-tenant",
-				Event:       "pull_request",
+				Event:       tt.event,
 				Repository:  "octocat/hello-world",
-				PullRequest: 7,
+				PullRequest: tt.pullRequest,
 				TenantID:    tt.tenantID,
 			}
 			id, err := durableInstallationID(event)
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
+				require.ErrorContains(t, err, "octocat/hello-world")
+				if tt.pullRequest > 0 {
+					require.ErrorContains(t, err, "octocat/hello-world#7")
+				} else {
+					require.NotContains(t, err.Error(), "#0", "PR-less deliveries must not render a fabricated #0 location")
+				}
 				return
 			}
 			require.NoError(t, err)

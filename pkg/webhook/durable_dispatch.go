@@ -705,21 +705,32 @@ func (h *Handler) enqueueDurableWebhookEvent(ctx context.Context, event *storage
 
 // durableInstallationID resolves the installation ID for a claimed delivery
 // from the tenant persisted at enqueue. Every producer stores a resolved
-// non-zero installation ID in TenantID, so an unparseable or zero tenant is a
-// corrupted or hand-crafted row: retrying cannot repair it, and driver work
-// runs outside an HTTP request, so there is no out-of-band resolution to
-// recover with. Callers treat the returned error as terminal.
+// positive installation ID in TenantID, so an unparseable or non-positive
+// tenant is a corrupted or hand-crafted row: retrying cannot repair it, and
+// driver work runs outside an HTTP request, so there is no out-of-band
+// resolution to recover with. Callers treat the returned error as terminal.
 func durableInstallationID(event *storage.WebhookEvent) (int64, error) {
 	installationID, err := strconv.ParseInt(event.TenantID, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("durable %s delivery %s for %s#%d has an unparseable tenant ID %q: %w",
-			event.Event, event.DeliveryID, event.Repository, event.PullRequest, event.TenantID, err)
+		return 0, fmt.Errorf("durable %s delivery %s for %s has an unparseable tenant ID %q: %w",
+			event.Event, event.DeliveryID, durableDeliveryLocation(event), event.TenantID, err)
 	}
-	if installationID == 0 {
-		return 0, fmt.Errorf("durable %s delivery %s for %s#%d is missing an installation ID in its tenant",
-			event.Event, event.DeliveryID, event.Repository, event.PullRequest)
+	if installationID <= 0 {
+		return 0, fmt.Errorf("durable %s delivery %s for %s has a non-positive installation ID %d in its tenant",
+			event.Event, event.DeliveryID, durableDeliveryLocation(event), installationID)
 	}
 	return installationID, nil
+}
+
+// durableDeliveryLocation renders the repository location of a durable
+// delivery for error messages: repo#pr when the delivery targets a pull
+// request, or just the repository for PR-less events such as push and
+// merge_group.
+func durableDeliveryLocation(event *storage.WebhookEvent) string {
+	if event.PullRequest > 0 {
+		return fmt.Sprintf("%s#%d", event.Repository, event.PullRequest)
+	}
+	return event.Repository
 }
 
 func (h *Handler) webhookEventStore() storage.WebhookEventStore {
