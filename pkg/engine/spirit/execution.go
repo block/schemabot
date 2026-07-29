@@ -363,8 +363,10 @@ func (e *Engine) executeSingleStatement(ctx context.Context, host, username, pas
 		return fmt.Errorf("create runner: %w", err)
 	}
 	// Use spiritLogger so Spirit's log lines reach the apply log stream and
-	// respect the runtime debug-log filter, same as the ALTER path.
-	runner.SetLogger(e.spiritLogger.With("database", database))
+	// respect the runtime debug-log filter, same as the ALTER path. The table
+	// attr gives every routed line its table context so multi-table applies
+	// stay attributable in the apply log stream.
+	runner.SetLogger(e.spiritLogger.With("database", database, "table", parsed[0].Table))
 	// Run opens the runner's connection pool and background routines; they are
 	// only released by Close. Close on every return path so each single DDL
 	// statement leaves no leaked connections or goroutines behind.
@@ -407,8 +409,10 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 		return err
 	}
 
-	// Use spiritLogger which filters noisy debug logs unless DebugLogs is enabled
-	spiritLogger := e.spiritLogger.With("database", database)
+	// Use spiritLogger which filters noisy debug logs unless DebugLogs is
+	// enabled. The table attr gives every routed line its table context so
+	// multi-table applies stay attributable in the apply log stream.
+	spiritLogger := e.spiritLogger.With("database", database, "table", uniqueTableList(tables))
 	runner.SetLogger(spiritLogger)
 
 	// Track schema change state

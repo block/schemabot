@@ -1652,10 +1652,12 @@ func TestEngine_ExecuteSchemaChange_SingleStatementRoutesSpiritLogs(t *testing.T
 
 	var mu sync.Mutex
 	var captured []string
+	capturedTables := make(map[string]bool)
 	eng.SetLogCallback(func(level slog.Level, table, msg string) {
 		mu.Lock()
 		defer mu.Unlock()
 		captured = append(captured, msg)
+		capturedTables[table] = true
 	})
 
 	host, username, password, database, err := parseDSN(dsn)
@@ -1686,6 +1688,10 @@ func TestEngine_ExecuteSchemaChange_SingleStatementRoutesSpiritLogs(t *testing.T
 		"Spirit's run-start log line was not routed through the engine log callback")
 	assert.Contains(t, captured, "apply complete",
 		"Spirit's completion log line was not routed through the engine log callback")
+	// Every routed line must carry the table so operators can attribute
+	// interleaved log lines during multi-table applies.
+	assert.Equal(t, map[string]bool{"log_routed": true}, capturedTables,
+		"every routed Spirit log line should carry the table being changed")
 }
 
 // TestEngine_Apply_StartsGoroutine tests that Apply starts a schema change goroutine
