@@ -102,7 +102,11 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	if blocked {
 		return
 	}
-	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.Rollback); blocked {
+	// The rollback handler is not a durable core, so an authorization
+	// evaluation failure and a merit denial both stop the command here; the
+	// gate has already logged and posted the distinction.
+	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.Rollback)
+	if authErr != nil || blocked {
 		return
 	}
 
@@ -340,7 +344,11 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 	// must be an authorized admin/operator before any lock is released or acted
 	// on. The database comes from the lock-pinned rollback plan instead of
 	// current PR files so confirmation follows the reviewed rollback artifact.
-	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.RollbackConfirm); blocked {
+	// The rollback-confirm handler is not a durable core, so an authorization
+	// evaluation failure and a merit denial both stop the command here; the
+	// gate has already logged and posted the distinction.
+	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.RollbackConfirm)
+	if authErr != nil || blocked {
 		return
 	}
 

@@ -173,7 +173,11 @@ func runControlCommand[R any](
 	if blocked {
 		return nil
 	}
-	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, apply.Database, apply.DatabaseType, result.Environment, actionName); blocked {
+	// Control commands are not durable cores, so an authorization evaluation
+	// failure and a merit denial both stop the command here; the gate has
+	// already logged and posted the distinction.
+	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, apply.Database, apply.DatabaseType, result.Environment, actionName)
+	if authErr != nil || blocked {
 		return nil
 	}
 

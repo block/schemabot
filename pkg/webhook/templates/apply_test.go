@@ -1665,16 +1665,17 @@ func TestRenderApplyBlockedByNonPassingChecks_EmptyList(t *testing.T) {
 }
 
 func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
-	t.Run("generic error is shown verbatim with retry block", func(t *testing.T) {
+	t.Run("generic error posts sanitized copy with retry block", func(t *testing.T) {
 		err := errors.New("get combined commit status: 500 Internal Server Error")
 
 		result := RenderApplyBlockedByCheckStatusError("staging", err, nil)
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "— Staging")
-		assert.Contains(t, result, "Unable to verify PR check statuses")
-		assert.Contains(t, result, "get combined commit status: 500 Internal Server Error")
-		assert.Contains(t, result, "Resolve the issue and retry:\n```\nschemabot apply -e staging\n```",
+		assert.Contains(t, result, "Unable to verify PR check statuses; see server logs for details.")
+		assert.NotContains(t, result, "500 Internal Server Error",
+			"raw error text must never render in PR markdown")
+		assert.Contains(t, result, "Retry:\n```\nschemabot apply -e staging\n```",
 			"retry command must be inside a fenced code block immediately after the retry copy")
 	})
 
@@ -1715,56 +1716,37 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 		assert.NotContains(t, result, "Grant or accept those permissions")
 	})
 
-	t.Run("nil error skips empty fence and uses concise retry copy", func(t *testing.T) {
+	t.Run("nil error renders the same sanitized copy", func(t *testing.T) {
 		result := RenderApplyBlockedByCheckStatusError("staging", nil, nil)
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "— Staging")
-		assert.Contains(t, result, "Unable to verify PR check statuses.")
+		assert.Contains(t, result, "Unable to verify PR check statuses; see server logs for details.")
 		assert.Contains(t, result, "Retry:\n```\nschemabot apply -e staging\n```",
 			"retry command must be inside a fenced code block immediately after the retry copy")
-		assert.NotContains(t, result, "```\n```",
-			"nil-error branch should not emit an empty fenced code block")
-		assert.NotContains(t, result, "Resolve the issue and retry:",
-			"nil-error branch should not reference an issue that was not surfaced")
 	})
 }
 
 func TestRenderApplyBlockedByPriorEnvCheckError(t *testing.T) {
-	t.Run("renders reason and wrapped error verbatim", func(t *testing.T) {
-		err := errors.New("404 Not Found")
-
-		result := RenderApplyBlockedByPriorEnvCheckError("staging", "fetch PR details", err)
+	t.Run("renders reason with sanitized detail", func(t *testing.T) {
+		result := RenderApplyBlockedByPriorEnvCheckError("staging", "fetch PR details")
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "Could not verify staging status: failed to fetch PR details. Retry the apply command.")
-		assert.Contains(t, result, "_Error: 404 Not Found_")
+		assert.Contains(t, result, "_See server logs for details._")
 	})
 
 	t.Run("each reason variant produces matching body", func(t *testing.T) {
-		err := errors.New("boom")
-
 		for _, reason := range []string{"create GitHub client", "fetch PR details", "query check runs"} {
-			result := RenderApplyBlockedByPriorEnvCheckError("production", reason, err)
+			result := RenderApplyBlockedByPriorEnvCheckError("production", reason)
 			assert.Contains(t, result, "Could not verify production status: failed to "+reason+". Retry the apply command.")
 		}
 	})
 
-	t.Run("nil error renders <nil>", func(t *testing.T) {
-		result := RenderApplyBlockedByPriorEnvCheckError("staging", "query check runs", nil)
+	t.Run("full body is stable", func(t *testing.T) {
+		expected := "## ❌ Apply Blocked\n\nCould not verify staging status: failed to create GitHub client. Retry the apply command.\n\n_See server logs for details._"
 
-		assert.Contains(t, result, "## ❌ Apply Blocked")
-		assert.Contains(t, result, "_Error: <nil>_")
-	})
-
-	t.Run("output matches prior inline rendering byte-for-byte", func(t *testing.T) {
-		err := errors.New("rate limited")
-		priorEnv := "staging"
-		reason := "create GitHub client"
-
-		expected := "## ❌ Apply Blocked\n\nCould not verify " + priorEnv + " status: failed to " + reason + ". Retry the apply command.\n\n_Error: " + err.Error() + "_"
-
-		assert.Equal(t, expected, RenderApplyBlockedByPriorEnvCheckError(priorEnv, reason, err))
+		assert.Equal(t, expected, RenderApplyBlockedByPriorEnvCheckError("staging", "create GitHub client"))
 	})
 }
 

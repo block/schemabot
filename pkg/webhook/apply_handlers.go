@@ -38,11 +38,11 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 //     user-facing rejection; an unexpected failure there (for example a
 //     transient GitHub config read) stays retryable.
 //
-// Gate blocks are terminal even when the gate blocked because it could not
-// evaluate its own inputs (for example a GitHub read inside the gate failed):
-// gates fail closed and post their own retry guidance, so the block is the
-// command's answer and recovery is the user re-issuing the command, not a
-// driver re-driving the delivery.
+// A gate block is terminal only when the gate evaluated its inputs and
+// blocked on the merits. A gate that could not evaluate (for example a
+// GitHub or storage read inside the gate failed) returns an error, which
+// the core classifies retryable: the gate still fails closed for this
+// delivery, but the outcome is not the command's answer.
 //
 // A posted PR comment does not imply a terminal disposition: retryable sites
 // post best-effort error comments too, so a durable driver re-driving one may
@@ -91,11 +91,15 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 		h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 	}
 
-	if blocked := h.enforceOpenPR(ctx, client, repo, pr, installationID, action.Apply, environment, requestedBy); blocked {
+	if blocked, gateErr := h.enforceOpenPR(ctx, client, repo, pr, installationID, action.Apply, environment, requestedBy); gateErr != nil {
+		return true, fmt.Errorf("apply command open-PR gate %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
 		return false, nil
 	}
 
-	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.Apply); blocked {
+	if blocked, gateErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.Apply); gateErr != nil {
+		return true, fmt.Errorf("apply command actor authorization gate %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
 		return false, nil
 	}
 
@@ -103,12 +107,14 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 	// is authorized to run apply for this database.
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
 		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to reconcile stale status checks: "+err.Error())
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to reconcile stale status checks. Retry, and see server logs if it persists.")
 		return true, fmt.Errorf("apply command reconcile stale checks %s#%d: %w", repo, pr, err)
 	}
 
 	// Tier 1: review gate (server-owned review policy for this database)
-	if blocked := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, action.Apply); blocked {
+	if blocked, gateErr := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, action.Apply); gateErr != nil {
+		return true, fmt.Errorf("apply command review gate %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
 		h.logger.Info("apply blocked by review gate", "repo", repo, "pr", pr, "environment", environment, "requested_by", requestedBy)
 		return false, nil
 	}
@@ -117,10 +123,12 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to fetch PR for checks gate", "repo", repo, "pr", pr, "database", schemaResult.Database, "database_type", schemaResult.Type, "environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to fetch PR info: "+err.Error())
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to fetch PR info. Retry, and see server logs if it persists.")
 		return true, fmt.Errorf("apply command fetch PR for checks gate %s#%d: %w", repo, pr, err)
 	}
-	if blocked := h.enforcePassingChecks(ctx, client, repo, pr, installationID, prInfo.HeadSHA, environment); blocked {
+	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, prInfo.HeadSHA, environment); gateErr != nil {
+		return true, fmt.Errorf("apply command checks gate %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
 		return false, nil
 	}
 
@@ -129,7 +137,9 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
 
 	// Environment ordering enforcement: prior server-configured environments must be clean before applying.
-	if blocked := h.checkPriorEnvironments(ctx, repo, pr, database, dbType, environment, schemaResult.Environments, installationID); blocked {
+	if blocked, gateErr := h.checkPriorEnvironments(ctx, repo, pr, database, dbType, environment, schemaResult.Environments, installationID); gateErr != nil {
+		return true, fmt.Errorf("apply command prior environment gate %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
 		h.logger.Info("apply blocked by environment ordering", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		return false, nil
 	}
@@ -210,7 +220,9 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, prInfo.HeadSHA, environment, requestedBy, action.Apply); rejected {
 		return false, nil
 	}
-	if rejected := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, prInfo, environment, requestedBy, action.Apply); rejected {
+	if rejected, gateErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, prInfo, environment, requestedBy, action.Apply); gateErr != nil {
+		return true, fmt.Errorf("apply command base schema freshness gate %s#%d: %w", repo, pr, gateErr)
+	} else if rejected {
 		return false, nil
 	}
 
@@ -314,8 +326,14 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 	// the lock on block so the user can re-run `schemabot apply -e <env>`
 	// once the checks recover, without a manual unlock. The release is keyed
 	// on the (owner, pending plan) intent acquired above, so a lock that has
-	// since changed hands or been re-pinned is preserved.
-	if blocked := h.enforcePassingChecks(ctx, client, repo, pr, installationID, prInfo.HeadSHA, environment); blocked {
+	// since changed hands or been re-pinned is preserved. A check-status read
+	// failure releases the same way — the retryable re-drive (or a user retry)
+	// re-plans from the top and reacquires the lock, so leaving it pinned
+	// would only force the stale-lock release path on the next attempt.
+	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, prInfo.HeadSHA, environment); gateErr != nil {
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "fresh-HEAD checks gate read failure")
+		return true, fmt.Errorf("apply command fresh-HEAD checks gate %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "fresh-HEAD checks gate block")
 		return false, nil
 	}
@@ -376,11 +394,14 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 //     rejection; an unexpected failure there (for example a transient GitHub
 //     config read) stays retryable.
 //
-// Gate blocks are terminal even when the gate blocked because it could not
-// evaluate its own inputs (for example a GitHub read inside the gate failed):
-// gates fail closed and post their own retry guidance, so the block is the
-// command's answer and recovery is the user re-issuing the command, not a
-// driver re-driving the delivery.
+// A gate block is terminal only when the gate evaluated its inputs and
+// blocked on the merits. A gate that could not evaluate (for example a
+// GitHub or storage read inside the gate failed) returns an error, which
+// the core classifies retryable: the gate still fails closed for this
+// delivery, but the outcome is not the command's answer. In particular a
+// base-schema freshness verification failure keeps the pending confirmation
+// lock pinned, so a re-drive (or user retry) can still confirm the reviewed
+// plan.
 //
 // A posted PR comment does not imply a terminal disposition: retryable sites
 // post best-effort error comments too, so a durable driver re-driving one may
@@ -424,16 +445,22 @@ func (h *Handler) applyConfirmCommandCore(repo string, pr int, environment, data
 		return true, fmt.Errorf("apply-confirm command attach server environments %s#%d: %w", repo, pr, err)
 	}
 
-	if blocked := h.enforceOpenPR(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, requestedBy); blocked {
+	if blocked, gateErr := h.enforceOpenPR(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, requestedBy); gateErr != nil {
+		return true, fmt.Errorf("apply-confirm command open-PR gate %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
 		return false, nil
 	}
 
-	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.ApplyConfirm); blocked {
+	if blocked, gateErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.ApplyConfirm); gateErr != nil {
+		return true, fmt.Errorf("apply-confirm command actor authorization gate %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
 		return false, nil
 	}
 
 	// Tier 1: review gate (re-check on confirm to prevent bypass)
-	if blocked := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, action.ApplyConfirm); blocked {
+	if blocked, gateErr := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, action.ApplyConfirm); gateErr != nil {
+		return true, fmt.Errorf("apply-confirm command review gate %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
 		h.logger.Info("apply-confirm blocked by review gate", "repo", repo, "pr", pr, "environment", environment, "requested_by", requestedBy)
 		return false, nil
 	}
@@ -448,11 +475,13 @@ func (h *Handler) applyConfirmCommandCore(repo string, pr int, environment, data
 	confirmPRInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to fetch PR for checks gate", "repo", repo, "pr", pr, "database", schemaResult.Database, "database_type", schemaResult.Type, "environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Failed to fetch PR info: "+err.Error())
+		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Failed to fetch PR info. Retry, and see server logs if it persists.")
 		return true, fmt.Errorf("apply-confirm command fetch PR for checks gate %s#%d: %w", repo, pr, err)
 	}
 
-	if blocked := h.enforcePassingChecks(ctx, client, repo, pr, installationID, confirmPRInfo.HeadSHA, environment); blocked {
+	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, confirmPRInfo.HeadSHA, environment); gateErr != nil {
+		return true, fmt.Errorf("apply-confirm command checks gate %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
 		return false, nil
 	}
 
@@ -506,7 +535,14 @@ func (h *Handler) applyConfirmCommandCore(repo string, pr int, environment, data
 		releaseObservedApplyIntent("stale-schema rejection")
 		return false, nil
 	}
-	if rejected := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, confirmPRInfo, environment, requestedBy, action.ApplyConfirm); rejected {
+	// A verification failure keeps the pending confirmation pinned: the plan
+	// is not known stale, and confirming again (or a durable re-drive)
+	// requires the lock, so releasing it would turn a transient GitHub read
+	// failure into a lost confirmation. Only a verified-stale rejection
+	// releases the observed intent.
+	if rejected, gateErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, confirmPRInfo, environment, requestedBy, action.ApplyConfirm); gateErr != nil {
+		return true, fmt.Errorf("apply-confirm command base schema freshness gate %s#%d: %w", repo, pr, gateErr)
+	} else if rejected {
 		releaseObservedApplyIntent("base-schema freshness rejection")
 		return false, nil
 	}
@@ -611,7 +647,11 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 		return
 	}
 	for _, lock := range locks {
-		if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, lock.DatabaseName, lock.DatabaseType, "", action.Unlock); blocked {
+		// The unlock handler is not a durable core, so an authorization
+		// evaluation failure and a merit denial both stop it here; the gate
+		// has already logged and posted the distinction.
+		blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, lock.DatabaseName, lock.DatabaseType, "", action.Unlock)
+		if authErr != nil || blocked {
 			return
 		}
 	}
