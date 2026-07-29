@@ -144,9 +144,9 @@ func TestAggregateShardProgress(t *testing.T) {
 		assert.Equal(t, int64(5000), tables[0].Shards[1].RowsCopied)
 	})
 
-	t.Run("queued shard with ready_to_complete shows ready", func(t *testing.T) {
+	t.Run("queued shard with ready_to_complete shows ready_to_complete", func(t *testing.T) {
 		// Immediate operations (CREATE/DROP TABLE) are ready for cutover while
-		// their Vitess migration status is still queued. The per-shard display
+		// their Vitess migration_status is still queued. The per-shard display
 		// and the table state must both show ready_to_complete so they agree
 		// with the deploy request state, which treats these shards as waiting
 		// for cutover.
