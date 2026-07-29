@@ -162,6 +162,31 @@ func TestForwardAuth_UntrustedProxyDenialClampsLoggedXFCCIdentities(t *testing.T
 	assert.NotContains(t, logged, "spiffe://example.org/ns/flood/sa/svc-9")
 }
 
+func TestForwardAuth_UntrustedProxyDenialTruncatesOversizedXFCCIdentity(t *testing.T) {
+	// The count clamp alone would still let a single synthetic multi-hundred-KB
+	// URI value bloat every denial line; each logged value is also truncated to
+	// a fixed byte bound, marked so the operator can tell it was cut.
+	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{trustedCIDR},
+		WriteGroups:       []string{"ops"},
+	})
+
+	huge := "spiffe://example.org/ns/flood/sa/" + strings.Repeat("x", 4096)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", `URI="`+huge+`"`)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	logged := logs.String()
+	assert.Contains(t, logged, "xfcc_uri_count=1")
+	assert.Contains(t, logged, "spiffe://example.org/ns/flood/sa/x", "a recognizable prefix survives for triage")
+	assert.Contains(t, logged, "…", "the truncation is marked")
+	assert.NotContains(t, logged, huge, "the full oversized value is never logged")
+	assert.Less(t, len(logged), 2048, "the denial line stays bounded")
+}
+
 func TestForwardAuth_TrustedCIDRReadAllowedForAnyUser(t *testing.T) {
 	// With no read_groups configured, reads are open to any authenticated caller
 	// arriving through the trusted proxy.

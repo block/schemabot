@@ -274,22 +274,35 @@ func (a *ForwardAuthAuthorizer) isTrustedProxy(r *http.Request) (bool, string) {
 	return false, ""
 }
 
-// maxLoggedXFCCURIs bounds how many XFCC URI values a denial log records, so a
-// hostile caller cannot bloat log lines with a synthetic header. Legitimate
-// chains carry one URI per hop and stay far below this.
-const maxLoggedXFCCURIs = 8
+// maxLoggedXFCCURIs and maxLoggedXFCCURIBytes bound a denial log in both
+// dimensions — how many XFCC URI values it records and how long each recorded
+// value may be — so a hostile caller cannot bloat log lines with a synthetic
+// header (Go's default request-header limit otherwise allows a single quoted
+// URI value near 1MB). Legitimate chains carry one URI per hop and real SPIFFE
+// IDs stay far below both bounds.
+const (
+	maxLoggedXFCCURIs     = 8
+	maxLoggedXFCCURIBytes = 512
+)
 
 // deniedRequestXFCCURIs returns the URI (SPIFFE SVID) values present in the
-// request's XFCC header for denial logging, clamped to maxLoggedXFCCURIs, plus
-// the unclamped total. Only parsed URI values are returned — never the raw
-// header — and on a denied request they are unverified caller input: a triage
-// signal, not verified certificate identities. A zero count means the header
-// carried no URI identity at all.
+// request's XFCC header for denial logging, clamped to maxLoggedXFCCURIs
+// values of at most maxLoggedXFCCURIBytes each (oversized values end in "…"),
+// plus the unclamped total. Only parsed URI values are returned — never the
+// raw header — and on a denied request they are unverified caller input: a
+// triage signal, not verified certificate identities. Like the trust check
+// itself, only the first XFCC header line is read, so a zero count means the
+// header the trust decision evaluated carried no URI identity.
 func deniedRequestXFCCURIs(r *http.Request) ([]string, int) {
 	uris := parseXFCCURIs(r.Header.Get("X-Forwarded-Client-Cert"))
 	total := len(uris)
 	if total > maxLoggedXFCCURIs {
 		uris = uris[:maxLoggedXFCCURIs]
+	}
+	for i, uri := range uris {
+		if len(uri) > maxLoggedXFCCURIBytes {
+			uris[i] = uri[:maxLoggedXFCCURIBytes] + "…"
+		}
 	}
 	return uris, total
 }
