@@ -770,11 +770,7 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 				latestCompletedAt = sh.completedAt
 			}
 
-			// Resolve effective shard state: running + ready_to_complete = ready_to_complete
-			shardState := sh.status
-			if sh.status == state.Vitess.Running && sh.readyToComplete {
-				shardState = state.Vitess.ReadyToComplete
-			}
+			shardState := effectiveShardState(sh.status, sh.readyToComplete)
 
 			shardPct := min(sh.progress, 100)
 			shardCopied := sh.rowsCopied
@@ -851,6 +847,26 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 	}
 
 	return tables, overallProgress
+}
+
+// effectiveShardState resolves the shard state to display from the raw Vitess
+// migration status and its ready_to_complete flag. ready_to_complete is the
+// authoritative cutover-readiness signal: Vitess sets it while migration_status
+// is still "running" (brief race before the status catches up) or still in an
+// early status like "queued" (immediate operations such as CREATE/DROP TABLE
+// are ready before they ever start copying). Folding those cases into
+// ready_to_complete keeps the per-shard display consistent with the deploy
+// request state, which counts the same shards as waiting for cutover. Terminal
+// statuses (complete, failed, cancelled) take precedence — ready_to_complete
+// can remain set after a migration finishes or is cancelled.
+func effectiveShardState(status string, readyToComplete bool) string {
+	switch status {
+	case state.Vitess.Running, state.Vitess.Queued, state.Vitess.Requested, state.Vitess.Ready:
+		if readyToComplete {
+			return state.Vitess.ReadyToComplete
+		}
+	}
+	return status
 }
 
 // resolveTableState merges a shard's state into the current table state.

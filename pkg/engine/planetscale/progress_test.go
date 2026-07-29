@@ -144,6 +144,40 @@ func TestAggregateShardProgress(t *testing.T) {
 		assert.Equal(t, int64(5000), tables[0].Shards[1].RowsCopied)
 	})
 
+	t.Run("queued shard with ready_to_complete shows ready", func(t *testing.T) {
+		// Immediate operations (CREATE/DROP TABLE) are ready for cutover while
+		// their Vitess migration status is still queued. The per-shard display
+		// and the table state must both show ready_to_complete so they agree
+		// with the deploy request state, which treats these shards as waiting
+		// for cutover.
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "queued", ReadyToComplete: true},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "queued", ReadyToComplete: true},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].State)
+		assert.Equal(t, 100, tables[0].Progress)
+		for _, sh := range tables[0].Shards {
+			assert.Equal(t, state.Vitess.ReadyToComplete, sh.State, "shard %s", sh.Shard)
+			assert.Equal(t, 100, sh.Progress, "shard %s", sh.Shard)
+		}
+	})
+
+	t.Run("queued shard without ready_to_complete stays queued", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "queued"},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "ready_to_complete"},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		assert.Equal(t, state.Vitess.Queued, tables[0].State)
+		assert.Equal(t, state.Vitess.Queued, tables[0].Shards[0].State)
+		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].Shards[1].State)
+	})
+
 	t.Run("rows_copied exceeding table_rows clamps to 100%", func(t *testing.T) {
 		// While a shard is still copying, rows_copied can momentarily exceed the
 		// estimated table_rows because of concurrent inserts. Table and overall
@@ -158,6 +192,35 @@ func TestAggregateShardProgress(t *testing.T) {
 		assert.Equal(t, 100, tables[0].Progress)
 		assert.Equal(t, 100, overall)
 	})
+}
+
+func TestEffectiveShardState(t *testing.T) {
+	tests := []struct {
+		status          string
+		readyToComplete bool
+		want            string
+	}{
+		{state.Vitess.Running, true, state.Vitess.ReadyToComplete},
+		{state.Vitess.Running, false, state.Vitess.Running},
+		{state.Vitess.Queued, true, state.Vitess.ReadyToComplete},
+		{state.Vitess.Queued, false, state.Vitess.Queued},
+		{state.Vitess.Requested, true, state.Vitess.ReadyToComplete},
+		{state.Vitess.Ready, true, state.Vitess.ReadyToComplete},
+		{state.Vitess.ReadyToComplete, false, state.Vitess.ReadyToComplete},
+		// Terminal statuses win even when ready_to_complete is still set.
+		{state.Vitess.Complete, true, state.Vitess.Complete},
+		{state.Vitess.Failed, true, state.Vitess.Failed},
+		{state.Vitess.Cancelled, true, state.Vitess.Cancelled},
+	}
+	for _, tc := range tests {
+		name := tc.status
+		if tc.readyToComplete {
+			name += "+ready_to_complete"
+		}
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, effectiveShardState(tc.status, tc.readyToComplete))
+		})
+	}
 }
 
 func TestParseProgressPercent(t *testing.T) {
