@@ -680,12 +680,20 @@ auth:
       - 127.0.0.1/32
     read_groups: [readers]                # groups granted read (empty = any authenticated caller)
     write_groups: [operators]             # groups granted write (empty = no writes)
+    # Optional service-caller lane — read-only access for services calling as
+    # themselves through a caller-forwarding gateway:
+    trusted_gateway_spiffe:               # gateways allowed to forward a verified caller SPIFFE ID
+      - spiffe://example.org/ns/service-ingress/sa/gateway
+    read_service_spiffe:                  # caller SPIFFE IDs granted read-tier access
+      - spiffe://example.org/ns/reporting/sa/reporting
+    caller_spiffe_header: X-Forwarded-Caller-Spiffe-Id   # optional (default)
 ```
 
 The authorizer proves the request came from the trusted proxy, then reads the forwarded identity:
 
 - **Trust anchor (required, fail-closed).** With neither `trusted_proxy_cidrs` nor `trusted_proxy_spiffe` set, the server refuses to start. There are three modes: **CIDR only** (trust any request whose source IP is in a trusted network), **SPIFFE only** (trust any request whose XFCC carries a trusted SPIFFE ID), or **both** (require the source CIDR *and* a matching XFCC SPIFFE ID — defense in depth). `X-Forwarded-Client-Cert` (XFCC) is a spoofable HTTP header, so SPIFFE-only is safe only when the proxy sanitizes inbound XFCC and the server is not directly reachable (a service mesh) — the server logs a startup warning in that mode.
 - **Tiers.** Reads are open to any authenticated caller unless `read_groups` is set; writes require membership in `write_groups`. Only the canonical header is read, so a smuggled underscore variant (`X_Forwarded_User`) is ignored.
+- **Service callers (read-only).** `trusted_gateway_spiffe` + `read_service_spiffe` open a second lane for services calling as themselves: a caller-forwarding gateway terminates the caller's mTLS, verifies the client certificate, and forwards the caller's SPIFFE ID in `caller_spiffe_header`. The header is honored only when the XFCC-verified peer is a listed gateway, the forwarded caller must appear in `read_service_spiffe`, and service callers never get the write tier (denied with reason `service_caller_write`). The user and groups headers are never read on this lane, and the identity-header proxy always wins — the gateway lane is consulted only when the request did not arrive through the trusted proxy. `trusted_proxy_cidrs`, when set, gate this lane like everything else: a gateway SVID claimed from outside the trusted networks is never honored. **List a gateway only if it strips inbound copies of the caller header before setting it from the verified certificate** — otherwise any caller could forge an identity through it. The lane fails closed: gateways without callers (or callers without a gateway) refuse to start, the lane requires SPIFFE-anchored proxy trust (`trusted_proxy_spiffe`) — under CIDR-only trust an in-CIDR gateway request would be mistaken for the identity-header proxy, leaving the lane unreachable, so that combination refuses to start too — and an empty config disables the lane entirely.
 
 ## Multi-Environment Deployment
 

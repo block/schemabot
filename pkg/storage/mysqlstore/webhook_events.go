@@ -187,21 +187,39 @@ func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDur
 	}
 	defer rollbackTx(ctx, tx, "claim webhook event")
 
-	row := tx.QueryRowContext(ctx, `
-		SELECT `+webhookEventColumns+`
+	// Claim in two steps so the ordering filesort only ever handles narrow sort
+	// records. No index satisfies this ordering across the claimable
+	// predicate's OR-branches, so the sort packs every selected column into
+	// each sort record — selecting the payload JSON here would let a single
+	// oversized delivery exceed sort_buffer_size and fail every claim attempt
+	// (MySQL error 1038), wedging the whole inbox behind one wide row.
+	var id int64
+	err = tx.QueryRowContext(ctx, `
+		SELECT id
 		FROM webhook_events
 		WHERE `+s.webhookClaimablePredicate()+`
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, webhookClaimableArgs()...)
-
-	event, err := scanWebhookEventInto(row)
+	`, webhookClaimableArgs()...).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query next claimable webhook event: %w", err)
+	}
+
+	// The claim above holds the row's exclusive lock for the rest of the
+	// transaction, so this primary-key load sees a stable row. A missing row
+	// here is an invariant violation, not an empty inbox.
+	row := tx.QueryRowContext(ctx, `
+		SELECT `+webhookEventColumns+`
+		FROM webhook_events
+		WHERE id = ?
+	`, id)
+	event, err := scanWebhookEventInto(row)
+	if err != nil {
+		return nil, fmt.Errorf("load claimed webhook event %d: %w", id, err)
 	}
 
 	leaseToken := uuid.NewString()

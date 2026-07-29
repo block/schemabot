@@ -8,10 +8,10 @@
 //
 // Engine selection is per-target, not per-process: a single server can serve
 // multiple engines and the pending-drops cleaner iterates heterogeneous targets
-// in one pass. A second implementation should therefore be supplied as an
-// injected dependency chosen per target (a struct field or parameter), not by
-// swapping the package-level Locker bindings the call sites currently default
-// to MySQL.
+// in one pass. Implementations are therefore supplied as injected dependencies
+// chosen per target (a struct field or parameter), never as package-level
+// bindings; a caller without a locker for its target fails closed rather than
+// assuming MySQL semantics.
 package namedlock
 
 import (

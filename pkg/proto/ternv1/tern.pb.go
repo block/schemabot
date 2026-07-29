@@ -2160,7 +2160,6 @@ type ShardProgress struct {
 	EtaSeconds         int64                  `protobuf:"varint,5,opt,name=eta_seconds,json=etaSeconds,proto3" json:"eta_seconds,omitempty"`
 	CutoverAttempts    int32                  `protobuf:"varint,6,opt,name=cutover_attempts,json=cutoverAttempts,proto3" json:"cutover_attempts,omitempty"`
 	LastCutoverAttempt string                 `protobuf:"bytes,7,opt,name=last_cutover_attempt,json=lastCutoverAttempt,proto3" json:"last_cutover_attempt,omitempty"`
-	ReadyToComplete    bool                   `protobuf:"varint,8,opt,name=ready_to_complete,json=readyToComplete,proto3" json:"ready_to_complete,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -2242,13 +2241,6 @@ func (x *ShardProgress) GetLastCutoverAttempt() string {
 		return x.LastCutoverAttempt
 	}
 	return ""
-}
-
-func (x *ShardProgress) GetReadyToComplete() bool {
-	if x != nil {
-		return x.ReadyToComplete
-	}
-	return false
 }
 
 // TableProgress contains progress information for a single table.
@@ -3652,7 +3644,7 @@ const file_tern_proto_rawDesc = "" +
 	"\b_task_id\"P\n" +
 	"\fLogsResponse\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12%\n" +
-	"\x04logs\x18\x02 \x03(\v2\x11.tern.v1.ApplyLogR\x04logs\"\xa7\x02\n" +
+	"\x04logs\x18\x02 \x03(\v2\x11.tern.v1.ApplyLogR\x04logs\"\x94\x02\n" +
 	"\rShardProgress\x12\x14\n" +
 	"\x05shard\x18\x01 \x01(\tR\x05shard\x12\x16\n" +
 	"\x06status\x18\x02 \x01(\tR\x06status\x12\x1f\n" +
@@ -3663,8 +3655,7 @@ const file_tern_proto_rawDesc = "" +
 	"\veta_seconds\x18\x05 \x01(\x03R\n" +
 	"etaSeconds\x12)\n" +
 	"\x10cutover_attempts\x18\x06 \x01(\x05R\x0fcutoverAttempts\x120\n" +
-	"\x14last_cutover_attempt\x18\a \x01(\tR\x12lastCutoverAttempt\x12*\n" +
-	"\x11ready_to_complete\x18\b \x01(\bR\x0freadyToComplete\"\xad\x04\n" +
+	"\x14last_cutover_attempt\x18\a \x01(\tR\x12lastCutoverAttemptJ\x04\b\b\x10\tR\x11ready_to_complete\"\xad\x04\n" +
 	"\rTableProgress\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12\x1d\n" +
