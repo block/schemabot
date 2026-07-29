@@ -343,7 +343,8 @@ func TestEnforcePRCommandActorAuthorizationComments(t *testing.T) {
 	})
 	h := actorAuthTestHandler(cfg, installClient)
 
-	blocked := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply)
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply)
+	require.NoError(t, err)
 	assert.True(t, blocked)
 
 	body := requireComment(t, comments, "authorization comment")
@@ -366,7 +367,8 @@ func TestEnforcePRCommandActorAuthorizationUnconfiguredDatabaseComment(t *testin
 	})
 	h := actorAuthTestHandler(cfg, installClient)
 
-	blocked := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "payments", storage.DatabaseTypeMySQL, "", action.Unlock)
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "payments", storage.DatabaseTypeMySQL, "", action.Unlock)
+	require.NoError(t, err)
 	assert.True(t, blocked)
 
 	body := requireComment(t, comments, "unconfigured-database authorization comment")
@@ -385,8 +387,9 @@ func TestEnforcePRCommandActorAuthorizationTeamLookupErrorComment(t *testing.T) 
 	})
 	h := actorAuthTestHandler(cfg, installClient)
 
-	blocked := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply)
-	assert.True(t, blocked)
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply)
+	require.Error(t, err)
+	assert.False(t, blocked)
 
 	body := requireComment(t, comments, "authorization failure comment")
 	assert.Contains(t, body, "SchemaBot Authorization Check Failed")
@@ -833,11 +836,12 @@ func (s *actorAuthTaskStore) GetByDatabase(_ context.Context, database string) (
 // a storage outage during lock release.
 type actorAuthLockStore struct {
 	storage.LockStore
-	locks         []*storage.Lock
-	acquired      []*storage.Lock
-	released      []string
-	forceReleased []string
-	releaseErr    error
+	locks             []*storage.Lock
+	acquired          []*storage.Lock
+	released          []string
+	releasedIfPending []string
+	forceReleased     []string
+	releaseErr        error
 }
 
 func (s *actorAuthLockStore) Get(_ context.Context, database, dbType string) (*storage.Lock, error) {
@@ -874,6 +878,11 @@ func (s *actorAuthLockStore) Release(_ context.Context, database, _, _ string) e
 	}
 	s.released = append(s.released, database)
 	return nil
+}
+
+func (s *actorAuthLockStore) ReleaseIfPendingPlanID(_ context.Context, _, _, _, pendingPlanID string) (bool, error) {
+	s.releasedIfPending = append(s.releasedIfPending, pendingPlanID)
+	return true, nil
 }
 
 func (s *actorAuthLockStore) ForceRelease(_ context.Context, database, _ string) error {
@@ -1064,9 +1073,10 @@ func registerApplyDiscoveryEndpoints(t *testing.T, mux *http.ServeMux, database 
 
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"head": map[string]any{"sha": "abc123", "ref": "feature-branch"},
-			"base": map[string]any{"sha": "def456", "ref": "main"},
-			"user": map[string]any{"login": "testuser"},
+			"state": "open",
+			"head":  map[string]any{"sha": "abc123", "ref": "feature-branch"},
+			"base":  map[string]any{"sha": "def456", "ref": "main"},
+			"user":  map[string]any{"login": "testuser"},
 		}))
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {

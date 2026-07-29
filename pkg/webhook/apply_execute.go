@@ -74,7 +74,17 @@ func (h *Handler) executeApply(
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final stale-schema rejection")
 		return
 	}
-	if rejected := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, freshPRInfo, environment, requestedBy, actionName); rejected {
+	// executeApply runs past the durable hand-off boundary, so a verification
+	// failure and a verified-stale rejection both stop the apply here and
+	// release the observed lock intent; the gate has already logged and
+	// posted the distinction, and the user's recovery is re-issuing the
+	// command.
+	rejected, freshnessErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, freshPRInfo, environment, requestedBy, actionName)
+	if freshnessErr != nil {
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final base-schema freshness verification failure")
+		return
+	}
+	if rejected {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final base-schema freshness rejection")
 		return
 	}

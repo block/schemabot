@@ -397,7 +397,7 @@ func PreviewCommentReviewGateError() string {
 		RequestedBy: previewRequestedBy,
 		Environment: "staging",
 		CommandName: action.Apply,
-		ErrorDetail: "Review gate check failed: expand team @acme/schema-reviewers: team membership cannot be read. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
+		ErrorDetail: "Review gate check failed; see server logs for details. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
 	})
 }
 
@@ -463,8 +463,7 @@ func PreviewCommentApplyBlockedByCheckStatusError() string {
 // PreviewCommentApplyBlockedByPriorEnvCheckError renders a sample fail-closed
 // block for a prior-environment check that could not be read.
 func PreviewCommentApplyBlockedByPriorEnvCheckError() string {
-	return RenderApplyBlockedByPriorEnvCheckError("staging", "query check runs",
-		fmt.Errorf("list check runs for ref: 502 Bad Gateway"))
+	return RenderApplyBlockedByPriorEnvCheckError("staging", "query check runs")
 }
 
 // PreviewCommentApplyBlockedByMissingPriorEnvCheck renders a sample block for
