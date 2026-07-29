@@ -106,8 +106,8 @@ func TestForwardAuth_UntrustedProxyDenialLogsArrivingXFCCIdentities(t *testing.T
 	// An operator triaging an untrusted-proxy denial needs to see which URI
 	// identities were present in the XFCC header, so they can tell a missing
 	// trust anchor apart from a caller that forwarded no identity. The log
-	// carries the parsed URI values — never the raw header, which is untrusted
-	// input on this path.
+	// carries the parsed URI values — never the raw header, so the logged
+	// content stays bounded and structured no matter what the caller sent.
 	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
 		TrustedProxyCIDRs:  []string{trustedCIDR},
 		TrustedProxySPIFFE: []string{ingressSVID},
@@ -417,6 +417,70 @@ func TestForwardAuth_GatewayLaneGatedByTrustedCIDR(t *testing.T) {
 		require.NotNil(t, captured.user)
 		assert.Equal(t, callerSVID, captured.user.Subject)
 	})
+}
+
+func TestForwardAuth_GatewayMatchedFromMultiElementXFCCChain(t *testing.T) {
+	// An XFCC header carries one element per certificate in the chain. A
+	// gateway whose SVID rides in a later chain element — behind the mesh
+	// sidecar's own element — is still recognized: every URI in the chain is
+	// checked against the gateway list.
+	handler, captured := newForwardAuth(t, serviceCallerConfig())
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert",
+		`By=spiffe://example.org/ns/schemabot/sa/schemabot;URI=spiffe://example.org/ns/sidecar/sa/sidecar,Hash=abc123;URI="`+gatewaySVID+`"`)
+	req.Header.Set("X-Forwarded-Caller-Spiffe-Id", callerSVID)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, captured.user)
+	assert.Equal(t, callerSVID, captured.user.Subject)
+}
+
+func TestForwardAuth_MultipleConfiguredGatewaysHonored(t *testing.T) {
+	// A deployment can trust more than one caller-forwarding gateway (for
+	// example one per source mesh); a caller arriving through any listed
+	// gateway is honored.
+	secondGatewaySVID := "spiffe://example.org/ns/partner-ingress/sa/gateway"
+	cfg := serviceCallerConfig()
+	cfg.TrustedGatewaySPIFFE = append(cfg.TrustedGatewaySPIFFE, secondGatewaySVID)
+	handler, captured := newForwardAuth(t, cfg)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", "URI="+secondGatewaySVID)
+	req.Header.Set("X-Forwarded-Caller-Spiffe-Id", callerSVID)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, captured.user)
+	assert.Equal(t, callerSVID, captured.user.Subject)
+}
+
+func TestForwardAuth_EscapedQuoteInXFCCValueDoesNotDropURIs(t *testing.T) {
+	// Envoy escapes embedded quotes inside quoted XFCC values as \" — a
+	// certificate Subject containing an escaped quote must not desync the
+	// header tokenizer, or a trusted SPIFFE ID later in the header would be
+	// dropped and the request wrongly denied.
+	handler, captured := newForwardAuth(t, auth.ForwardAuthConfig{
+		TrustedProxySPIFFE: []string{ingressSVID},
+		WriteGroups:        []string{"ops"},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert",
+		`Subject="CN=\"quoted, name\";OU=x";URI="`+ingressSVID+`"`)
+	req.Header.Set("X-Forwarded-User", "alice")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, captured.user)
+	assert.Equal(t, "alice", captured.user.Subject)
 }
 
 func TestForwardAuth_ForgedCallerHeaderWithoutGatewayDenied(t *testing.T) {

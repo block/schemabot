@@ -513,7 +513,9 @@ func parseXFCCURIs(header string) []string {
 
 // splitXFCC splits an XFCC header into key=value tokens, treating both the
 // element separator (comma) and the pair separator (semicolon) as boundaries
-// while respecting double-quoted values.
+// while respecting double-quoted values. Envoy escapes embedded quotes inside
+// a quoted value as \" — the escape is consumed as part of the value so it
+// cannot end the quoted section and desync the tokenizer.
 func splitXFCC(header string) []string {
 	var (
 		tokens  []string
@@ -523,6 +525,10 @@ func splitXFCC(header string) []string {
 	for i := 0; i < len(header); i++ {
 		c := header[i]
 		switch {
+		case c == '\\' && inQuote && i+1 < len(header):
+			current.WriteByte(c)
+			i++
+			current.WriteByte(header[i])
 		case c == '"':
 			inQuote = !inQuote
 			current.WriteByte(c)
