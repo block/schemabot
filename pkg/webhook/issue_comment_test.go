@@ -7,9 +7,11 @@ import (
 )
 
 // The support-channel footer is offered on comments that report a problem the
-// operator may need help with. Unsafe-change comments qualify, whether they use
-// the plan warning's "Issues" summary line or the apply-blocked header, and in
-// both singular and plural forms. A clean plan does not trigger the footer.
+// operator may need help with. The apply-blocked refusal (unsafe changes
+// without --allow-unsafe) qualifies, in both singular and plural forms. The
+// plan comment's advisory unsafe-change summary does not: it is informational,
+// appears on routine plans, and would otherwise put the footer on nearly every
+// plan for schemas that trip a common lint.
 func TestShouldShowSupportChannel_UnsafeChanges(t *testing.T) {
 	tests := []struct {
 		name string
@@ -17,14 +19,14 @@ func TestShouldShowSupportChannel_UnsafeChanges(t *testing.T) {
 		want bool
 	}{
 		{
-			name: "plan warning summary plural",
+			name: "plan advisory summary plural",
 			body: "## MySQL Schema Change Plan\n\n⚠️ **Issues**: **3** unsafe changes detected\n- `orders`: DROP INDEX\n",
-			want: true,
+			want: false,
 		},
 		{
-			name: "plan warning summary singular",
+			name: "plan advisory summary singular",
 			body: "## MySQL Schema Change Plan\n\n⚠️ **Issues**: **1** unsafe change detected\n- `orders`: DROP INDEX\n",
-			want: true,
+			want: false,
 		},
 		{
 			name: "apply-blocked header plural",
