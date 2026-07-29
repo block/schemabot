@@ -30,7 +30,7 @@ func TestSpiritApplyLogFunc_TableContextAndTaskAttribution(t *testing.T) {
 
 	logFn(slog.LevelInfo, "customers", "copy rows complete")
 	logFn(slog.LevelError, "baristas", "fatal error processing GTID rows event: row has 8 values")
-	logFn(slog.LevelInfo, "", "Starting spirit migration")
+	logFn(slog.LevelInfo, "", "starting schema change")
 
 	require.Len(t, logs.logs, 3)
 
@@ -44,7 +44,7 @@ func TestSpiritApplyLogFunc_TableContextAndTaskAttribution(t *testing.T) {
 	require.NotNil(t, logs.logs[1].TaskID)
 	assert.Equal(t, baristas.ID, *logs.logs[1].TaskID)
 
-	assert.Equal(t, "Starting spirit migration", logs.logs[2].Message)
+	assert.Equal(t, "starting schema change", logs.logs[2].Message)
 	assert.Nil(t, logs.logs[2].TaskID, "a line with no table belongs to the apply, not an arbitrary task")
 
 	for _, stored := range logs.logs {
