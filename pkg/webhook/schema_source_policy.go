@@ -128,15 +128,34 @@ func (e *schemaConfigOutsideAllowedDirsError) Error() string {
 	return fmt.Sprintf("schema config for database %q at %q is outside server allowed_dirs", e.Database, e.SchemaPath)
 }
 
-func newSchemaConfigOutsideAllowedDirsError(config *ghclient.SchemabotConfig, schemaPath string) error {
+// unownedSchemaConfigError describes why a discovered schema config is not
+// this deployment's to process, matching the error class to the ownership
+// contract that dropped it. When the repo has a directory allowlist, the
+// config was outside it. In open mode (no allowlist for the repo) the only
+// drop reason is the database registry, so the database is reported as not
+// configured — an allowed_dirs remediation would be misleading on a repo that
+// has no allowlist to amend. Both classes count as unowned for unscoped
+// fan-out silencing (isSchemaUnownedByDeploymentError); the distinction only
+// changes what a -t/-d-scoped command reports.
+func (h *Handler) unownedSchemaConfigError(repo, database, databaseType, schemaPath string) error {
+	if config, ok := h.serverConfig(); ok && !config.RepoHasSchemaDirAllowlist(repo) {
+		return &api.DatabaseNotConfiguredError{Database: database}
+	}
+	return &schemaConfigOutsideAllowedDirsError{
+		Database:     database,
+		DatabaseType: databaseType,
+		SchemaPath:   schemaPath,
+	}
+}
+
+// unownedDiscoveredConfigError is unownedSchemaConfigError for a discovered
+// config that may have failed to parse: a nil config carries no database
+// identity to report, so it surfaces as ErrNoConfig instead.
+func (h *Handler) unownedDiscoveredConfigError(repo string, config *ghclient.SchemabotConfig, schemaPath string) error {
 	if config == nil {
 		return ghclient.ErrNoConfig
 	}
-	return &schemaConfigOutsideAllowedDirsError{
-		Database:     config.Database,
-		DatabaseType: string(config.GetType()),
-		SchemaPath:   schemaPath,
-	}
+	return h.unownedSchemaConfigError(repo, config.Database, string(config.GetType()), schemaPath)
 }
 
 func (h *Handler) createManagedSchemaRequestFromPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, environment, databaseName, source string) (*ghclient.SchemaRequestResult, error) {
@@ -155,11 +174,7 @@ func (h *Handler) createManagedSchemaRequestFromPR(ctx context.Context, client *
 	// the path the schema files were actually fetched from, not just the
 	// discovered config directory.
 	if !h.shouldProcessSchemaConfig(ctx, repo, pr, schemaResult.HeadSHA, schemaResult.Database, schemaResult.Type, schemaResult.SchemaPath, source) {
-		return nil, &schemaConfigOutsideAllowedDirsError{
-			Database:     schemaResult.Database,
-			DatabaseType: schemaResult.Type,
-			SchemaPath:   schemaResult.SchemaPath,
-		}
+		return nil, h.unownedSchemaConfigError(repo, schemaResult.Database, schemaResult.Type, schemaResult.SchemaPath)
 	}
 	return schemaResult, nil
 }
@@ -199,7 +214,7 @@ func (h *Handler) resolveUnscopedManagedConfig(ctx context.Context, client *ghcl
 			return nil, "", err
 		}
 		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, source) {
-			return nil, "", newSchemaConfigOutsideAllowedDirsError(config, configDir)
+			return nil, "", h.unownedDiscoveredConfigError(repo, config, configDir)
 		}
 		return config, configDir, nil
 	}
@@ -210,7 +225,7 @@ func (h *Handler) resolveUnscopedManagedConfig(ctx context.Context, client *ghcl
 		h.logger.Info("unscoped command discovered only schema configs this deployment does not manage",
 			"repo", repo, "pr", pr, "source", source,
 			"discovered_configs", len(configs))
-		return nil, "", newSchemaConfigOutsideAllowedDirsError(configs[0].Config, configs[0].SchemaDir)
+		return nil, "", h.unownedDiscoveredConfigError(repo, configs[0].Config, configs[0].SchemaDir)
 	}
 	// The directory allowlist is only half the ownership contract: on repos
 	// partitioned by database registry rather than allowed_dirs, a config for
@@ -294,7 +309,35 @@ func (h *Handler) shouldProcessSchemaConfig(ctx context.Context, repo string, pr
 	}
 
 	if !config.RepoHasSchemaDirAllowlist(repo) {
-		return true
+		// Open mode: with no directory allowlist for the repo, every discovered
+		// config is this deployment's to process. On an aggregate-role repo,
+		// however, ownership is partitioned across deployments by database
+		// registry — a config for a database this deployment has not registered
+		// belongs to a sibling deployment. Keeping it would plan a database this
+		// deployment cannot resolve and convert routine fan-out into a failing
+		// aggregate, so it is dropped: the leader gates on the owner's Check Run
+		// via the expected-participants fold, and a participant stays silent.
+		// Deployments that resolve databases dynamically instead of through the
+		// registry keep open mode as-is — the registry says nothing about what
+		// they manage.
+		if config.AggregateRoleForRepo(repo) == "" || config.TargetResolver.Enabled() {
+			return true
+		}
+		if config.Database(database) != nil {
+			return true
+		}
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "schema_config_source_policy",
+			Repository:   repo,
+			Database:     database,
+			DatabaseType: databaseType,
+			Status:       "skipped",
+		})
+		h.logger.Info("schema config on aggregate repo is for a database not registered on this deployment; its owning deployment handles it",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", database, "database_type", databaseType,
+			"schema_path", schemaPath, "source", source)
+		return false
 	}
 
 	if !config.SchemaPathAllowedForRepo(repo, schemaPath) {
