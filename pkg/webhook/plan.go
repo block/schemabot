@@ -252,13 +252,24 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			return
 		}
 		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Plan) {
-			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, h.unownedDiscoveredConfigError(repo, config, configDir))
+			unownedErr := h.unownedDiscoveredConfigError(repo, config, configDir)
+			if h.skipUnownedUnscopedCommand(repo, tenant, unownedErr) {
+				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
+					"repo", repo, "pr", pr, "database", databaseName, "error", unownedErr)
+				return
+			}
+			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, unownedErr)
 			return
 		}
 		schemaDatabase = config.Database
 	} else {
 		config, _, findErr := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, action.Plan)
 		if findErr != nil {
+			if h.skipUnownedUnscopedCommand(repo, tenant, findErr) {
+				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
+					"repo", repo, "pr", pr, "error", findErr)
+				return
+			}
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr)
 			return
 		}

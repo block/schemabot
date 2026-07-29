@@ -151,6 +151,69 @@ func TestUnscopedApplyOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 	})
 }
 
+// A bare `schemabot plan` (no -e) on an aggregate repo fans out to every
+// installed deployment just like its -e sibling. A deployment whose databases
+// registry has no entry for the database discovered from the PR's
+// schemabot.yaml is not the owner under the aggregate contract, so it stays
+// silent instead of posting a "database is not configured on this server"
+// failure comment next to the owning deployment's real plan. A -t-scoped
+// command and a non-aggregate repo still surface the error.
+func TestUnscopedMultiEnvPlanOnUnregisteredDatabaseStaysSilent(t *testing.T) {
+	barePlan := func(h *Handler, databaseName, tenant string) {
+		h.handleMultiEnvPlan("octocat/hello-world", 1, databaseName, tenant, 12345, "hubot", false, true, 0)
+	}
+
+	t.Run("bare plan on aggregate repo stays silent", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		barePlan(h, "", "")
+
+		assert.Empty(t, comments, "non-owning deployment must not post a comment for an unscoped fan-out plan")
+	})
+
+	t.Run("bare plan on participant deployment stays silent", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		barePlan(h, "", "")
+
+		assert.Empty(t, comments, "a participant must not post a plan failure for a database another deployment owns")
+	})
+
+	// Naming the database with -d does not name a deployment: the discovered
+	// config still belongs to whichever deployment registers the database, so a
+	// non-owner defers just as silently as it does for the unscoped form.
+	t.Run("database-scoped bare plan stays silent", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		barePlan(h, "orders", "")
+
+		assert.Empty(t, comments, "a -d-scoped fan-out plan on an unowned database must stay silent")
+	})
+
+	t.Run("tenant-scoped plan still reports the error", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		barePlan(h, "", "tenant-b")
+
+		body := requireComment(t, comments, "database-not-configured plan error")
+		assert.Contains(t, body, `database "orders" is not configured on this server`)
+	})
+
+	t.Run("non-aggregate repo still reports the error", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		barePlan(h, "", "")
+
+		body := requireComment(t, comments, "database-not-configured plan error")
+		assert.Contains(t, body, `database "orders" is not configured on this server`)
+	})
+}
+
 // On an aggregate repo, an unscoped `rollback <apply-id> -e <env>` fans out to
 // every deployment, but the apply lives in exactly one tenant's storage. A
 // deployment whose storage has no such apply stays silent so only the owning
