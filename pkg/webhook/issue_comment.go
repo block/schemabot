@@ -793,6 +793,10 @@ func shouldShowSupportChannel(body string) bool {
 			return true
 		}
 	}
-	lower := strings.ToLower(body)
-	return strings.Contains(lower, "unsafe changes detected") || strings.Contains(lower, "unsafe change detected")
+	// The apply refusal for unsafe changes without --allow-unsafe shares its
+	// title with the plan comment, so only its blocked header identifies it.
+	// The plan comment's advisory unsafe-change summary ("**Issues**: ...
+	// unsafe changes detected") is informational and appears on routine
+	// plans, so it does not warrant the footer.
+	return strings.Contains(body, "Unsafe Changes Detected:**") || strings.Contains(body, "Unsafe Change Detected:**")
 }
