@@ -22,6 +22,10 @@ import (
 // for a remotely owned one — stops the command (fail closed) and is returned
 // as an error, not a block: the ordering could not be verified, so the outcome
 // is not the command's answer and a durable driver may re-drive it.
+// Deployment-shape errors in that class (for example an own-App slug the
+// Check Run trust check cannot verify) may not clear on a re-drive alone, but
+// they are bounded by the driver's retry budget, so the gate does not
+// maintain a separate taxonomy for them.
 //
 // For environments: [sandbox, staging, production]
 //   - applying to sandbox: no prior envs, always allowed
