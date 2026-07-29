@@ -1254,7 +1254,7 @@ func logUnknownWebhookMetricLabel(label, value, appName, repo, status string) {
 		"value", value,
 		"app_name", appName,
 		"repo", repo,
-		"status", status)
+		"event_status", status)
 }
 
 // RecordUnregisteredRepositoryWebhook increments the counter for webhook events

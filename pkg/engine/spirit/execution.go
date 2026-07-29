@@ -80,14 +80,14 @@ func (e *Engine) gtidChangeSourceSupported(ctx context.Context, host, username, 
 	db, err := mysqlconn.Open(cfg.FormatDSN())
 	if err != nil {
 		e.logger.Warn("failed to probe target GTID support, using the binlog file+position change source",
-			"host", host, "database", database, "error", err)
+			"target_host", host, "database", database, "error", err)
 		return false
 	}
 	defer utils.CloseAndLog(db)
 
 	if err := db.PingContext(ctx); err != nil {
 		e.logger.Warn("failed to connect to target for GTID support probe, using the binlog file+position change source",
-			"host", host, "database", database, "error", err)
+			"target_host", host, "database", database, "error", err)
 		return false
 	}
 
@@ -95,17 +95,17 @@ func (e *Engine) gtidChangeSourceSupported(ctx context.Context, host, username, 
 	if err := db.QueryRowContext(ctx,
 		`SELECT @@global.gtid_mode, @@global.enforce_gtid_consistency`).Scan(&gtidMode, &enforceConsistency); err != nil {
 		e.logger.Warn("failed to probe target GTID support, using the binlog file+position change source",
-			"host", host, "database", database, "error", err)
+			"target_host", host, "database", database, "error", err)
 		return false
 	}
 	if gtidMode != "ON" || enforceConsistency != "ON" {
 		e.logger.Info("target does not support GTID, using the binlog file+position change source",
-			"host", host, "database", database,
+			"target_host", host, "database", database,
 			"gtid_mode", gtidMode, "enforce_gtid_consistency", enforceConsistency)
 		return false
 	}
 	e.logger.Info("target supports GTID, using the GTID change source",
-		"host", host, "database", database)
+		"target_host", host, "database", database)
 	return true
 }
 

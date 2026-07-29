@@ -221,7 +221,7 @@ func (h *Handler) schemaChangeReconciliationRecords(ctx context.Context, repo st
 			h.logger.Warn("stored check has started-apply state without an apply ID during schema change reconciliation; check will still block",
 				"repo", repo, "pr", pr, "database", check.DatabaseName,
 				"environment", check.Environment, "check_id", check.ID,
-				"status", check.Status)
+				"check_status", check.Status)
 		}
 
 		records = append(records, schemaChangeReconciliationRecord{check: check, apply: apply})

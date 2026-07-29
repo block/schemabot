@@ -366,7 +366,7 @@ func (c *GRPCClient) logApplyEvent(ctx context.Context, applyID int64, taskID *i
 		slog.Error("missing apply log store for gRPC apply event",
 			"apply_id", applyID,
 			"event", eventType,
-			"message", message)
+			"event_message", message)
 		return
 	}
 	log := &storage.ApplyLog{
@@ -384,7 +384,7 @@ func (c *GRPCClient) logApplyEvent(ctx context.Context, applyID int64, taskID *i
 		slog.Error("failed to log gRPC apply event",
 			"apply_id", applyID,
 			"event", eventType,
-			"message", message,
+			"event_message", message,
 			"error", err)
 	}
 }

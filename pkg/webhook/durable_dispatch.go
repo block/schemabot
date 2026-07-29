@@ -517,7 +517,7 @@ func (h *Handler) processDurablePullRequestAutoPlan(ctx context.Context, event *
 	}
 	h.logger.Info("durable pull_request auto-plan dispatched",
 		"action", payload.Action, "repo", repo, "pr", pr, "head_sha", headSHA,
-		"delivery_id", event.DeliveryID, "message", message)
+		"delivery_id", event.DeliveryID, "outcome", message)
 	return false, nil
 }
 
@@ -649,7 +649,7 @@ func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *st
 	}
 	h.logger.Info("durable check_run rerequest auto-plan dispatched",
 		"action", payload.Action, "repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA,
-		"delivery_id", event.DeliveryID, "message", message)
+		"delivery_id", event.DeliveryID, "outcome", message)
 	return false, nil
 }
 

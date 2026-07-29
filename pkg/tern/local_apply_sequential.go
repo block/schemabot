@@ -202,7 +202,7 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	}
 	if !result.Accepted {
 		c.markTaskFailed(ctx, task, result.Message)
-		c.logger.Error("task rejected", append(task.LogAttrs(), "message", result.Message)...)
+		c.logger.Error("task rejected", append(task.LogAttrs(), "engine_message", result.Message)...)
 		return taskFailed
 	}
 

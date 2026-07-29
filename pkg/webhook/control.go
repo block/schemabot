@@ -241,7 +241,7 @@ func (h *Handler) handleStopCommand(repo string, pr int, installationID int64, r
 		"apply_id", result.ApplyID,
 		"environment", result.Environment,
 		"requested_by", requestedBy,
-		"status", resp.Status,
+		"apply_status", resp.Status,
 		"stopped_count", resp.StoppedCount,
 		"skipped_count", resp.SkippedCount)
 	h.postComment(repo, pr, installationID, templates.RenderStopCommandAccepted(templates.StopCommandAcceptedData{
@@ -274,7 +274,7 @@ func (h *Handler) handleCancelCommand(repo string, pr int, installationID int64,
 		"apply_id", result.ApplyID,
 		"environment", result.Environment,
 		"requested_by", requestedBy,
-		"status", resp.Status,
+		"apply_status", resp.Status,
 		"cancelled_count", resp.CancelledCount,
 		"skipped_count", resp.SkippedCount)
 	h.postComment(repo, pr, installationID, templates.RenderCancelCommandAccepted(templates.CancelCommandAcceptedData{
@@ -307,7 +307,7 @@ func (h *Handler) handleStartCommand(repo string, pr int, installationID int64, 
 		"apply_id", result.ApplyID,
 		"environment", result.Environment,
 		"requested_by", requestedBy,
-		"status", resp.Status,
+		"apply_status", resp.Status,
 		"started_count", resp.StartedCount,
 		"skipped_count", resp.SkippedCount)
 	h.postComment(repo, pr, installationID, templates.RenderStartCommandAccepted(templates.StartCommandAcceptedData{
@@ -341,7 +341,7 @@ func (h *Handler) handleReleaseCommand(repo string, pr int, installationID int64
 		"apply_id", result.ApplyID,
 		"environment", result.Environment,
 		"requested_by", requestedBy,
-		"status", resp.Status)
+		"apply_status", resp.Status)
 	h.postComment(repo, pr, installationID, templates.RenderReleaseCommandAccepted(templates.ReleaseCommandAcceptedData{
 		ApplyID:     result.ApplyID,
 		Environment: result.Environment,
@@ -370,7 +370,7 @@ func (h *Handler) handleCutoverCommand(repo string, pr int, installationID int64
 		"apply_id", result.ApplyID,
 		"environment", result.Environment,
 		"requested_by", requestedBy,
-		"status", resp.Status)
+		"apply_status", resp.Status)
 	h.postComment(repo, pr, installationID, templates.RenderCutoverCommandAccepted(templates.CutoverCommandAcceptedData{
 		ApplyID:     result.ApplyID,
 		Environment: result.Environment,
