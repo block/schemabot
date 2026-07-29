@@ -191,10 +191,10 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 				newState = dr.InProgressCancel
 			}
 
-			// Log migration details on failure for debugging
+			// Log Vitess schema change details on failure for debugging
 			if newState == dr.CompleteError {
 				for _, m := range migrations {
-					s.logger.Warn("migration failed", "number", r.number, "status", m.status, "message", m.message)
+					s.logger.Warn("vitess schema change failed", "number", r.number, "vitess_status", m.status, "vitess_message", m.message)
 				}
 			}
 
@@ -388,7 +388,7 @@ func deriveDeployState(migrations []migrationInfo, cutoverRequested bool, instan
 		default:
 			// Unknown Vitess status — count as queued so the processor keeps
 			// polling until Vitess resolves it to a known status.
-			slog.Warn("unknown vitess migration status, treating as pending", "status", m.status, "ddl_action", m.ddlAction)
+			slog.Warn("unknown vitess schema change status, treating as pending", "vitess_status", m.status, "ddl_action", m.ddlAction)
 			queued++
 		}
 	}

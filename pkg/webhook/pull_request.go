@@ -208,7 +208,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			"pr", pr,
 			"head_sha", headSHA,
 			"delivery_id", deliveryID,
-			"message", message,
+			"outcome", message,
 		)
 	})
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan started"})

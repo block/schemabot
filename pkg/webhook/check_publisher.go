@@ -442,7 +442,7 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 			"repo", repo, "pr", pr, "check_name", checkName,
 			"environment", environment, "head_sha", headSHA,
 			"concluded_check_run_id", liveRun.ID,
-			"concluded_conclusion", liveRun.Conclusion, "status", status)
+			"concluded_conclusion", liveRun.Conclusion, "check_status", status)
 		reuseExistingRun = false
 	}
 	var checkRunID int64
@@ -467,7 +467,7 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 			h.logger.Error("failed to update aggregate check run",
 				"repo", repo, "pr", pr, "check_name", checkName,
 				"environment", environment, "check_run_id", liveRun.ID,
-				"head_sha", headSHA, "status", status,
+				"head_sha", headSHA, "check_status", status,
 				"conclusion", conclusion, "error", err)
 			return fmt.Errorf("update aggregate check run %d for %s#%d (env %s): %w", liveRun.ID, repo, pr, environment, err)
 		}
@@ -489,7 +489,7 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 			h.logger.Error("failed to create aggregate check run",
 				"repo", repo, "pr", pr, "check_name", checkName,
 				"environment", environment, "head_sha", headSHA,
-				"status", status, "conclusion", conclusion, "error", err)
+				"check_status", status, "conclusion", conclusion, "error", err)
 			return fmt.Errorf("create aggregate check run for %s#%d@%s (env %s): %w", repo, pr, headSHA, environment, err)
 		}
 		if rewound {
@@ -525,7 +525,7 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 		h.logger.Error("failed to store aggregate check state",
 			"repo", repo, "pr", pr, "check_name", checkName,
 			"environment", environment, "check_run_id", checkRunID,
-			"head_sha", headSHA, "status", status,
+			"head_sha", headSHA, "check_status", status,
 			"conclusion", conclusion, "error", err)
 		return fmt.Errorf("store aggregate check state for %s#%d (env %s): %w", repo, pr, environment, err)
 	}
@@ -539,7 +539,7 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 	h.logger.Info("aggregate check updated",
 		"repo", repo, "pr", pr, "check_name", checkName,
 		"environment", environment, "check_run_id", checkRunID,
-		"status", status, "conclusion", conclusion,
+		"check_status", status, "conclusion", conclusion,
 		"per_database_checks", len(dbChecks))
 	return nil
 }

@@ -790,7 +790,7 @@ func (s *Server) vitessSchemaChangeDiagnostics(ctx context.Context) ([]string, e
 					status := colMap["migration_status"]
 					switch status {
 					case state.Vitess.Complete, state.Vitess.Failed, state.Vitess.Cancelled:
-						s.logger.Debug("terminal Vitess schema change omitted from reset diagnostics", "keyspace", keyspace, "uuid", colMap["uuid"], "status", status)
+						s.logger.Debug("terminal Vitess schema change omitted from reset diagnostics", "keyspace", keyspace, "uuid", colMap["uuid"], "vitess_status", status)
 						continue
 					}
 					result = append(result, fmt.Sprintf("keyspace=%s uuid=%s status=%s context=%s message=%s",

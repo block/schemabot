@@ -621,7 +621,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	appName, appID, authStatus, ok := h.authenticateWebhook(r, body)
 	if !ok {
 		h.logger.Warn("webhook rejected",
-			"status", authStatus,
+			"auth_status", authStatus,
 			"app_name", appName,
 			"app_id", appID,
 			"delivery_id", r.Header.Get(headerDeliveryID),
