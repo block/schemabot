@@ -217,12 +217,12 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	// Atomically mark as deployed — deployed=FALSE prevents double-deploy races.
 	// Include timestamp to ensure uniqueness across reset-state cycles
 	// (which truncate deploy_requests and reset auto-increment numbering).
-	migrationContext := fmt.Sprintf("localscale:%d_%d", number, time.Now().UnixMilli()%1000000)
+	schemaChangeContext := fmt.Sprintf("localscale:%d_%d", number, time.Now().UnixMilli()%1000000)
 	result, err := s.metadataDB.ExecContext(r.Context(),
 		`UPDATE localscale_deploy_requests
 		 SET deployed = TRUE, migration_context = ?, instant_ddl = ?, deployment_state = ?
 		 WHERE org = ? AND database_name = ? AND number = ? AND deployed = FALSE`,
-		migrationContext, body.InstantDDL, dr.Submitting, org, database, number,
+		schemaChangeContext, body.InstantDDL, dr.Submitting, org, database, number,
 	)
 	if err != nil {
 		return newHTTPError(http.StatusInternalServerError, "update deploy request: %v", err)
@@ -246,15 +246,15 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	s.wg.Go(func() {
 		defer unregisterDeploy()
 		params := deployExecParams{
-			backend:          backend,
-			ref:              ref,
-			hasVSchema:       hasVSchema,
-			vschemaData:      vschemaDataSQL.String,
-			totalDDL:         totalDDL,
-			ddlByKeyspace:    ddlByKeyspace,
-			instantDDL:       instantDDL,
-			migrationContext: migrationContext,
-			autoCutover:      autoCutover,
+			backend:             backend,
+			ref:                 ref,
+			hasVSchema:          hasVSchema,
+			vschemaData:         vschemaDataSQL.String,
+			totalDDL:            totalDDL,
+			ddlByKeyspace:       ddlByKeyspace,
+			instantDDL:          instantDDL,
+			schemaChangeContext: schemaChangeContext,
+			autoCutover:         autoCutover,
 		}
 		if err := s.executeDeployRequest(execCtx, params); err != nil {
 			if execCtx.Err() != nil {
@@ -461,15 +461,15 @@ func (s *Server) computeDeployRequestDiff(ctx context.Context, backend *database
 
 // deployExecParams holds the parameters for executeDeployRequest.
 type deployExecParams struct {
-	backend          *databaseBackend
-	ref              deployRequest
-	hasVSchema       bool
-	vschemaData      string
-	totalDDL         int
-	ddlByKeyspace    map[string][]string
-	instantDDL       bool
-	migrationContext string
-	autoCutover      bool
+	backend             *databaseBackend
+	ref                 deployRequest
+	hasVSchema          bool
+	vschemaData         string
+	totalDDL            int
+	ddlByKeyspace       map[string][]string
+	instantDDL          bool
+	schemaChangeContext string
+	autoCutover         bool
 }
 
 // executeDeployRequest applies VSchema, snapshots schema, submits online DDL,
@@ -522,7 +522,7 @@ func (s *Server) executeDeployRequest(ctx context.Context, p deployExecParams) e
 		// Build ddl_strategy
 		ddlStrategy := buildDDLStrategy(p.instantDDL)
 
-		if err := s.submitOnlineDDL(ctx, p.backend, p.ddlByKeyspace, ddlStrategy, p.migrationContext); err != nil {
+		if err := s.submitOnlineDDL(ctx, p.backend, p.ddlByKeyspace, ddlStrategy, p.schemaChangeContext); err != nil {
 			return fmt.Errorf("submit online DDL for deploy request %d: %w", p.ref.number, err)
 		}
 	}
@@ -548,7 +548,7 @@ func (s *Server) executeDeployRequest(ctx context.Context, p deployExecParams) e
 		"number", p.ref.number,
 		"ddl_count", p.totalDDL,
 		"has_vschema", p.hasVSchema,
-		"migration_context", p.migrationContext,
+		"schema_change_context", p.schemaChangeContext,
 		"auto_cutover", p.autoCutover,
 		"instant_ddl", p.instantDDL,
 	)

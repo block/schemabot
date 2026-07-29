@@ -94,10 +94,10 @@ func TestHasAlterTableStatements(t *testing.T) {
 }
 
 func TestDeriveDeployState_InstantDDLRequestedControlsRevertWindow(t *testing.T) {
-	migrations := []migrationInfo{{status: state.Vitess.Complete}}
+	schemaChanges := []schemaChangeInfo{{status: state.Vitess.Complete}}
 
-	require.Equal(t, dr.CompletePendingRevert, deriveDeployState(migrations, true, false))
-	require.Equal(t, dr.Complete, deriveDeployState(migrations, true, true))
+	require.Equal(t, dr.CompletePendingRevert, deriveDeployState(schemaChanges, true, false))
+	require.Equal(t, dr.Complete, deriveDeployState(schemaChanges, true, true))
 }
 
 func TestQualifyAlterTableName(t *testing.T) {

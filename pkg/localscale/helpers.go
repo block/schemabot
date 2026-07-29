@@ -341,12 +341,12 @@ func (s *Server) getBranchSchemaWithDSN(ctx context.Context, dsnBase, branch, ke
 	return stmts, nil
 }
 
-// submitOnlineDDL submits DDL statements as Vitess online DDL migrations.
-func (s *Server) submitOnlineDDL(ctx context.Context, backend *databaseBackend, ddlByKeyspace map[string][]string, strategy, migrationContext string) error {
+// submitOnlineDDL submits DDL statements as Vitess online DDL schema changes.
+func (s *Server) submitOnlineDDL(ctx context.Context, backend *databaseBackend, ddlByKeyspace map[string][]string, strategy, schemaChangeContext string) error {
 	if err := validateSessionString(strategy); err != nil {
 		return fmt.Errorf("invalid ddl_strategy: %w", err)
 	}
-	if err := validateSessionString(migrationContext); err != nil {
+	if err := validateSessionString(schemaChangeContext); err != nil {
 		return fmt.Errorf("invalid migration_context: %w", err)
 	}
 	for keyspace, stmts := range ddlByKeyspace {
@@ -363,7 +363,7 @@ func (s *Server) submitOnlineDDL(ctx context.Context, backend *databaseBackend, 
 				utils.CloseAndLog(conn)
 				return fmt.Errorf("set ddl_strategy for %s: %w", keyspace, err)
 			}
-			if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET @@migration_context='%s'", migrationContext)); err != nil {
+			if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET @@migration_context='%s'", schemaChangeContext)); err != nil {
 				utils.CloseAndLog(conn)
 				return fmt.Errorf("set migration_context for %s: %w", keyspace, err)
 			}
@@ -372,7 +372,7 @@ func (s *Server) submitOnlineDDL(ctx context.Context, backend *databaseBackend, 
 				return fmt.Errorf("submit online DDL to %s: %w\nstatement: %s", keyspace, err, stmt)
 			}
 			utils.CloseAndLog(conn)
-			s.logger.Info("submitted online DDL", "keyspace", keyspace, "stmt", stmt, "context", migrationContext)
+			s.logger.Info("submitted online DDL", "keyspace", keyspace, "stmt", stmt, "context", schemaChangeContext)
 		}
 	}
 	return nil
@@ -528,9 +528,9 @@ func deployResponse(number uint64, branch, state string) map[string]any {
 
 // deployRequestInfo holds commonly needed fields from a deploy request row.
 type deployRequestInfo struct {
-	branch           string
-	migrationContext string
-	deploymentState  string
+	branch              string
+	schemaChangeContext string
+	deploymentState     string
 }
 
 // getDeployRequestInfo fetches common deploy request fields.
@@ -541,7 +541,7 @@ func (s *Server) getDeployRequestInfo(ctx context.Context, ref deployRequest) (*
 		 FROM localscale_deploy_requests
 		 WHERE org = ? AND database_name = ? AND number = ?`,
 		ref.org, ref.database, ref.number,
-	).Scan(&info.branch, &info.migrationContext, &info.deploymentState)
+	).Scan(&info.branch, &info.schemaChangeContext, &info.deploymentState)
 	if err != nil {
 		return nil, newHTTPError(http.StatusNotFound, "deploy request not found: %d", ref.number)
 	}
@@ -811,7 +811,7 @@ func validateBranchName(name string) error {
 
 // waitForOnlineDDLReady polls each keyspace's sidecar database until Vitess's
 // online DDL executor is operational. The executor requires the per-shard sidecar
-// databases to be initialized before it can process migrations. Without this check,
+// databases to be initialized before it can process schema changes. Without this check,
 // the first deploy request's DDL submission can hang waiting for a sidecar that
 // hasn't been created yet.
 func (s *Server) waitForOnlineDDLReady(ctx context.Context) error {

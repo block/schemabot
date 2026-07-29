@@ -311,7 +311,7 @@ func TestMultiKeyspaceDDLDeploy(t *testing.T) {
 	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx := t.Context()
 
-	// Cancel any pending Vitess migrations from earlier tests to avoid
+	// Cancel any pending Vitess schema changes from earlier tests to avoid
 	// --singleton-context rejecting our DDL submission.
 	cancelAllVitessMigrations(t, ctx)
 

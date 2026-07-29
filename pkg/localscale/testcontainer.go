@@ -227,9 +227,9 @@ func (c *LocalScaleContainer) SeedDDL(ctx context.Context, org, database, keyspa
 }
 
 // SeedDDLWithStrategy executes DDL statements against vtgate with a specific DDL strategy
-// and migration context. Use for online DDL warmup where SET @@ddl_strategy must be on
-// the same connection as the DDL.
-func (c *LocalScaleContainer) SeedDDLWithStrategy(ctx context.Context, org, database, keyspace, strategy, migrationContext string, stmts ...string) error {
+// and schema change context (@@migration_context). Use for online DDL warmup where
+// SET @@ddl_strategy must be on the same connection as the DDL.
+func (c *LocalScaleContainer) SeedDDLWithStrategy(ctx context.Context, org, database, keyspace, strategy, schemaChangeContext string, stmts ...string) error {
 	body := map[string]any{
 		"org":        org,
 		"database":   database,
@@ -239,8 +239,8 @@ func (c *LocalScaleContainer) SeedDDLWithStrategy(ctx context.Context, org, data
 	if strategy != "" {
 		body["strategy"] = strategy
 	}
-	if migrationContext != "" {
-		body["migration_context"] = migrationContext
+	if schemaChangeContext != "" {
+		body["migration_context"] = schemaChangeContext
 	}
 	if err := c.postAdmin(ctx, "/admin/seed-ddl", body); err != nil {
 		return fmt.Errorf("seed DDL for %s/%s/%s: %w", org, database, keyspace, err)
@@ -365,7 +365,7 @@ func (c *LocalScaleContainer) MetadataQuery(ctx context.Context, query string, a
 	return result, nil
 }
 
-// ResetState cancels all running Vitess migrations, waits for terminal state,
+// ResetState cancels all running Vitess schema changes, waits for terminal state,
 // and truncates metadata tables.
 func (c *LocalScaleContainer) ResetState(ctx context.Context) error {
 	if err := c.postAdmin(ctx, "/admin/reset-state", nil); err != nil {

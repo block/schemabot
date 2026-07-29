@@ -440,7 +440,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 
 	// Wait for Vitess's online DDL executor to be ready in each keyspace.
 	// The executor requires per-shard sidecar databases to be initialized before
-	// it can process migrations. By waiting here, /health only returns 200 after
+	// it can process schema changes. By waiting here, /health only returns 200 after
 	// DDL submissions will succeed.
 	if err := s.waitForOnlineDDLReady(ctx); err != nil {
 		s.Close()
@@ -1121,7 +1121,7 @@ func (s *Server) handleProxyPortMap(w http.ResponseWriter, r *http.Request) erro
 // Optional fields:
 //   - strategy: DDL strategy (default "direct"). Use "vitess --prefer-instant-ddl ..."
 //     for online DDL warmup where SET @@ddl_strategy must be on the same connection.
-//   - migration_context: migration context for online DDL tracking.
+//   - migration_context: sets @@migration_context on the session for online DDL tracking.
 func (s *Server) handleSeedDDL(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
 		Org              string   `json:"org"`
@@ -1258,7 +1258,7 @@ func (s *Server) handleMetadataQuery(w http.ResponseWriter, r *http.Request) err
 	return nil
 }
 
-// handleResetState resets all LocalScale state (cancel migrations, truncate metadata).
+// handleResetState resets all LocalScale state (cancel schema changes, truncate metadata).
 func (s *Server) handleResetState(w http.ResponseWriter, r *http.Request) error {
 	if err := s.ResetState(r.Context()); err != nil {
 		return newHTTPError(http.StatusInternalServerError, "reset state: %v", err)

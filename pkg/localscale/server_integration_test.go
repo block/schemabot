@@ -496,13 +496,14 @@ func cleanupActiveDeployRequests(t *testing.T, ctx context.Context) {
 	}
 }
 
-// cancelAllVitessMigrations cancels all pending Vitess migrations across keyspaces.
+// cancelAllVitessMigrations issues ALTER VITESS_MIGRATION CANCEL ALL to cancel all
+// pending Vitess schema changes across keyspaces.
 func cancelAllVitessMigrations(t *testing.T, ctx context.Context) {
 	t.Helper()
 	for _, ks := range []string{"testapp", "testapp_sharded"} {
 		if _, err := testContainer.VtgateExec(ctx, testOrg, testDB, ks,
 			"ALTER VITESS_MIGRATION CANCEL ALL"); err != nil {
-			t.Logf("cancel all migrations for %s: %v (may be expected)", ks, err)
+			t.Logf("cancel all schema changes for %s: %v (may be expected)", ks, err)
 		}
 	}
 	// Brief wait to let Vitess process the cancellations

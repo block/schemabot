@@ -43,7 +43,7 @@ func TestPlanetScaleProgressRecoversMigrationContextFromBaseline(t *testing.T) {
 	// because it has not deployed yet.
 	baselineContexts := captureMigrationContexts(t, ctx, keyspace)
 
-	// One deploy with deferred cutover (auto_cutover=false): its migration parks
+	// One deploy with deferred cutover (auto_cutover=false): its schema change parks
 	// in flight (waiting for cutover) rather than completing, so its context is a
 	// live, non-terminal candidate that recovery can discover and attach progress
 	// to. A single deploy avoids an earlier deploy's revert window blocking it.
@@ -60,7 +60,7 @@ func TestPlanetScaleProgressRecoversMigrationContextFromBaseline(t *testing.T) {
 
 	// The stored context is blank (the bug condition); with only the persisted
 	// baseline in engine resume metadata, Progress must rediscover the in-flight
-	// context against the live migrations.
+	// context against the live schema changes.
 	rs, err := planetscale.BuildResumeState(planetscale.ResumeData{
 		BranchName:            changeBranch,
 		DeployRequestID:       changeDR.Number,
@@ -85,7 +85,7 @@ func TestPlanetScaleProgressRecoversMigrationContextFromBaseline(t *testing.T) {
 			return true
 		}
 		return false
-	}, 30*time.Second, 500*time.Millisecond, "Progress should recover the in-flight migration context from the baseline")
+	}, 30*time.Second, 500*time.Millisecond, "Progress should recover the in-flight schema-change context from the baseline")
 
 	assert.Contains(t, recovered, ":", "recovered value must be a real Vitess context, not a tern apply identifier")
 	_, inBaseline := baselineContexts[recovered]

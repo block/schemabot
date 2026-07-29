@@ -30,15 +30,15 @@ func (s *Server) handleCancelDeployRequest(w http.ResponseWriter, r *http.Reques
 		return newHTTPError(http.StatusConflict, "cannot cancel: deploy request is in state %q", info.deploymentState)
 	}
 
-	// Cancel all Vitess migrations for this deploy
-	if info.migrationContext != "" {
-		if err := s.alterVitessMigrations(r.Context(), backend, info.migrationContext, "CANCEL"); err != nil {
-			return newHTTPError(http.StatusInternalServerError, "cancel migrations: %v", err)
+	// Cancel all Vitess schema changes for this deploy
+	if info.schemaChangeContext != "" {
+		if err := s.alterVitessMigrations(r.Context(), backend, info.schemaChangeContext, "CANCEL"); err != nil {
+			return newHTTPError(http.StatusInternalServerError, "cancel schema changes: %v", err)
 		}
 	}
 
 	// Set in_progress_cancel — the processor will advance to complete_cancel
-	// once all Vitess migrations reach terminal state.
+	// once all Vitess schema changes reach terminal state.
 	if err := s.execLog(r.Context(),
 		`UPDATE localscale_deploy_requests
 		 SET deployment_state = ?
@@ -68,12 +68,12 @@ func (s *Server) handleApplyDeployRequest(w http.ResponseWriter, r *http.Request
 		return newHTTPError(http.StatusConflict, "cannot cutover: deploy request is in state %q, expected pending_cutover", info.deploymentState)
 	}
 
-	// Cutover: complete all Vitess migrations for this deploy.
+	// Cutover: complete all Vitess schema changes for this deploy.
 	// ALTER VITESS_MIGRATION ... COMPLETE triggers the cutover for all
-	// ready_to_complete migrations matching this context.
-	if info.migrationContext != "" {
-		if err := s.alterVitessMigrations(r.Context(), backend, info.migrationContext, "COMPLETE"); err != nil {
-			return newHTTPError(http.StatusInternalServerError, "complete migrations: %v", err)
+	// ready_to_complete schema changes matching this context.
+	if info.schemaChangeContext != "" {
+		if err := s.alterVitessMigrations(r.Context(), backend, info.schemaChangeContext, "COMPLETE"); err != nil {
+			return newHTTPError(http.StatusInternalServerError, "complete schema changes: %v", err)
 		}
 	}
 
@@ -99,7 +99,7 @@ func (s *Server) handleRevertDeployRequest(w http.ResponseWriter, r *http.Reques
 	}
 	number := ref.number
 
-	var branch, migrationContext, ddlJSON, currentState string
+	var branch, schemaChangeContext, ddlJSON, currentState string
 	var vschemaOriginalSQL, schemaBeforeSQL sql.NullString
 	var vschemaReverted bool
 	err = s.metadataDB.QueryRowContext(r.Context(),
@@ -107,7 +107,7 @@ func (s *Server) handleRevertDeployRequest(w http.ResponseWriter, r *http.Reques
 		 FROM localscale_deploy_requests
 		 WHERE org = ? AND database_name = ? AND number = ?`,
 		ref.org, ref.database, number,
-	).Scan(&branch, &migrationContext, &ddlJSON, &vschemaOriginalSQL, &vschemaReverted, &schemaBeforeSQL, &currentState)
+	).Scan(&branch, &schemaChangeContext, &ddlJSON, &vschemaOriginalSQL, &vschemaReverted, &schemaBeforeSQL, &currentState)
 	if err != nil {
 		return newHTTPError(http.StatusNotFound, "deploy request not found: %d", number)
 	}
@@ -254,7 +254,7 @@ func (s *Server) handleThrottleDeployRequest(w http.ResponseWriter, r *http.Requ
 	return nil
 }
 
-// applyThrottle sets the throttle ratio for online DDL migrations across all keyspaces.
+// applyThrottle sets the throttle ratio for online DDL schema changes across all keyspaces.
 // Ratio 0.0 = full speed, 0.95 = max throttle (PlanetScale caps at 0.95).
 //
 // Uses ALTER VITESS_MIGRATION THROTTLE/UNTHROTTLE ALL which operates at the online-ddl
@@ -386,38 +386,38 @@ func (s *Server) revertPendingVSchema(ctx context.Context, backend *databaseBack
 }
 
 // alterVitessMigrations runs ALTER VITESS_MIGRATION '<uuid>' <action> against
-// each migration's owning keyspace. action is "CANCEL", "COMPLETE", or "RETRY".
-func (s *Server) alterVitessMigrations(ctx context.Context, backend *databaseBackend, migrationContext, action string) error {
-	migrations, err := s.showMigrations(ctx, backend, migrationContext)
+// each schema change's owning keyspace. action is "CANCEL", "COMPLETE", or "RETRY".
+func (s *Server) alterVitessMigrations(ctx context.Context, backend *databaseBackend, schemaChangeContext, action string) error {
+	schemaChanges, err := s.showVitessMigrations(ctx, backend, schemaChangeContext)
 	if err != nil {
 		return err
 	}
 	targets := make(map[string][]string)
-	for _, m := range migrations {
+	for _, m := range schemaChanges {
 		uuid := m["migration_uuid"]
 		keyspace := m["_keyspace"]
 		shard := m["shard"]
 		if uuid == "" {
-			err := fmt.Errorf("migration for context %s is missing uuid: keyspace=%q shard=%q", migrationContext, keyspace, shard)
-			s.logger.Warn("migration control will fail because migration row is missing uuid", "keyspace", keyspace, "shard", shard, "error", err)
+			err := fmt.Errorf("schema change for context %s is missing uuid: keyspace=%q shard=%q", schemaChangeContext, keyspace, shard)
+			s.logger.Warn("schema change control will fail because schema change row is missing uuid", "keyspace", keyspace, "shard", shard, "error", err)
 			return err
 		}
 		if keyspace == "" {
-			err := fmt.Errorf("migration for context %s is missing keyspace: uuid=%q shard=%q", migrationContext, uuid, shard)
-			s.logger.Warn("migration control will fail because migration row is missing keyspace", "uuid", uuid, "shard", shard, "error", err)
+			err := fmt.Errorf("schema change for context %s is missing keyspace: uuid=%q shard=%q", schemaChangeContext, uuid, shard)
+			s.logger.Warn("schema change control will fail because schema change row is missing keyspace", "uuid", uuid, "shard", shard, "error", err)
 			return err
 		}
 		if shard == "" {
-			err := fmt.Errorf("migration for context %s is missing shard: uuid=%q keyspace=%q", migrationContext, uuid, keyspace)
-			s.logger.Warn("migration control will fail because migration row is missing shard", "uuid", uuid, "keyspace", keyspace, "error", err)
+			err := fmt.Errorf("schema change for context %s is missing shard: uuid=%q keyspace=%q", schemaChangeContext, uuid, keyspace)
+			s.logger.Warn("schema change control will fail because schema change row is missing shard", "uuid", uuid, "keyspace", keyspace, "error", err)
 			return err
 		}
 		if err := validateSessionString(uuid); err != nil {
-			s.logger.Warn("skipping migration with invalid UUID", "uuid", uuid, "error", err)
+			s.logger.Warn("skipping schema change with invalid UUID", "uuid", uuid, "error", err)
 			continue
 		}
 		if _, ok := backend.vtgateDBs[keyspace]; !ok {
-			s.logger.Warn("unknown keyspace for migration", "uuid", uuid, "keyspace", keyspace)
+			s.logger.Warn("unknown keyspace for schema change", "uuid", uuid, "keyspace", keyspace)
 			continue
 		}
 		targets[keyspace] = append(targets[keyspace], uuid)
@@ -436,27 +436,27 @@ func (s *Server) alterVitessMigrations(ctx context.Context, backend *databaseBac
 			return nil
 		}()
 		if err != nil {
-			s.logger.Warn("alter vitess_migration failed", "keyspace", keyspace, "action", action, "migration_count", len(uuids), "error", err)
+			s.logger.Warn("alter vitess_migration failed", "keyspace", keyspace, "action", action, "schema_change_count", len(uuids), "error", err)
 			if firstErr == nil {
 				firstErr = fmt.Errorf("alter vitess_migration %s on %s: %w", action, keyspace, err)
 			}
 		} else {
-			s.logger.Info("alter vitess_migration", "keyspace", keyspace, "action", action, "migration_count", len(uuids))
+			s.logger.Info("alter vitess_migration", "keyspace", keyspace, "action", action, "schema_change_count", len(uuids))
 		}
 	}
 	return firstErr
 }
 
-// showMigrations queries SHOW VITESS_MIGRATIONS for a context across all keyspaces
+// showVitessMigrations queries SHOW VITESS_MIGRATIONS for a context across all keyspaces
 // and returns the raw column maps with an added "_keyspace" field.
-func (s *Server) showMigrations(ctx context.Context, backend *databaseBackend, migrationContext string) ([]map[string]string, error) {
-	if err := validateSessionString(migrationContext); err != nil {
-		return nil, fmt.Errorf("invalid migration context: %w", err)
+func (s *Server) showVitessMigrations(ctx context.Context, backend *databaseBackend, schemaChangeContext string) ([]map[string]string, error) {
+	if err := validateSessionString(schemaChangeContext); err != nil {
+		return nil, fmt.Errorf("invalid schema change context: %w", err)
 	}
 	var result []map[string]string
 	var lastErr error
 	for keyspace, db := range backend.vtgateDBs {
-		rows, err := db.QueryContext(ctx, "SHOW VITESS_MIGRATIONS LIKE '"+migrationContext+"'")
+		rows, err := db.QueryContext(ctx, "SHOW VITESS_MIGRATIONS LIKE '"+schemaChangeContext+"'")
 		if err != nil {
 			s.logger.Warn("show vitess_migrations failed", "keyspace", keyspace, "error", err)
 			lastErr = fmt.Errorf("show vitess_migrations for %s: %w", keyspace, err)
@@ -481,40 +481,40 @@ func (s *Server) showMigrations(ctx context.Context, backend *databaseBackend, m
 	return result, nil
 }
 
-func (s *Server) getMigrationInfos(ctx context.Context, backend *databaseBackend, migrationContext string) []migrationInfo {
-	colMaps, err := s.showMigrations(ctx, backend, migrationContext)
+func (s *Server) getSchemaChangeInfos(ctx context.Context, backend *databaseBackend, schemaChangeContext string) []schemaChangeInfo {
+	colMaps, err := s.showVitessMigrations(ctx, backend, schemaChangeContext)
 	if err != nil {
-		s.logger.Warn("getMigrationInfos: show migrations failed", "migration_context", migrationContext, "error", err)
+		s.logger.Warn("getSchemaChangeInfos: show vitess_migrations failed", "schema_change_context", schemaChangeContext, "error", err)
 		return nil
 	}
-	var migrations []migrationInfo
+	var schemaChanges []schemaChangeInfo
 	for _, colMap := range colMaps {
-		migrations = append(migrations, migrationInfo{
+		schemaChanges = append(schemaChanges, schemaChangeInfo{
 			status:          colMap["migration_status"],
 			readyToComplete: colMap["ready_to_complete"] == "1",
 			ddlAction:       colMap["ddl_action"],
 			message:         colMap["message"],
 		})
 	}
-	return migrations
+	return schemaChanges
 }
 
 // deriveRevertState determines the revert progress for a deploy request.
 // Queries SHOW VITESS_MIGRATIONS by the revert context to find the reverse DDL
-// migrations and derive overall state.
+// schema changes and derive overall state.
 //
 // States: in_progress_revert → complete_revert or complete_error.
-func (s *Server) deriveRevertState(ctx context.Context, backend *databaseBackend, revertMigrationContext string) string {
-	if revertMigrationContext == "" {
+func (s *Server) deriveRevertState(ctx context.Context, backend *databaseBackend, revertSchemaChangeContext string) string {
+	if revertSchemaChangeContext == "" {
 		return dr.CompleteRevert
 	}
 
-	migrations := s.getMigrationInfos(ctx, backend, revertMigrationContext)
-	if len(migrations) == 0 {
-		return dr.InProgressRevert // revert migrations not yet visible
+	schemaChanges := s.getSchemaChangeInfos(ctx, backend, revertSchemaChangeContext)
+	if len(schemaChanges) == 0 {
+		return dr.InProgressRevert // revert schema changes not yet visible
 	}
 
-	revertDDLState := deriveDeployState(migrations, true) // cutoverRequested=true (auto-cutover)
+	revertDDLState := deriveDeployState(schemaChanges, true) // cutoverRequested=true (auto-cutover)
 	switch revertDDLState {
 	case dr.CompleteError:
 		return dr.CompleteRevertError
