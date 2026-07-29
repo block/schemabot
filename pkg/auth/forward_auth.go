@@ -155,8 +155,14 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 
 		trusted, proxyID := a.isTrustedProxy(r)
 		if !trusted {
+			// Log the URI identities present in the XFCC header so an operator
+			// can tell a missing trust-anchor entry apart from a request whose
+			// header carried no identity at all. On this path the values are
+			// unverified caller input — triage signal, never a trust decision.
+			uris, uriCount := deniedRequestXFCCURIs(r)
 			a.logger.Warn("forward-auth request did not arrive through the trusted proxy; refusing to honor identity headers",
-				"path", r.URL.Path, "remote_addr", r.RemoteAddr)
+				"path", r.URL.Path, "remote_addr", r.RemoteAddr,
+				"xfcc_uris", uris, "xfcc_uri_count", uriCount)
 			authDecision(r, tier, "deny", "untrusted_proxy")
 			writeAuthError(w, http.StatusUnauthorized, "request did not arrive through the trusted authenticating proxy")
 			return
@@ -266,6 +272,39 @@ func (a *ForwardAuthAuthorizer) isTrustedProxy(r *http.Request) (bool, string) {
 		}
 	}
 	return false, ""
+}
+
+// maxLoggedXFCCURIs and maxLoggedXFCCURIBytes bound a denial log in both
+// dimensions — how many XFCC URI values it records and how long each recorded
+// value may be — so a hostile caller cannot bloat log lines with a synthetic
+// header (Go's default request-header limit otherwise allows a single quoted
+// URI value near 1MB). Legitimate chains carry one URI per hop and real SPIFFE
+// IDs stay far below both bounds.
+const (
+	maxLoggedXFCCURIs     = 8
+	maxLoggedXFCCURIBytes = 512
+)
+
+// deniedRequestXFCCURIs returns the URI (SPIFFE SVID) values present in the
+// request's XFCC header for denial logging, clamped to maxLoggedXFCCURIs
+// values of at most maxLoggedXFCCURIBytes each (oversized values end in "…"),
+// plus the unclamped total. Only parsed URI values are returned — never the
+// raw header — and on a denied request they are unverified caller input: a
+// triage signal, not verified certificate identities. Like the trust check
+// itself, only the first XFCC header line is read, so a zero count means the
+// header the trust decision evaluated carried no URI identity.
+func deniedRequestXFCCURIs(r *http.Request) ([]string, int) {
+	uris := parseXFCCURIs(r.Header.Get("X-Forwarded-Client-Cert"))
+	total := len(uris)
+	if total > maxLoggedXFCCURIs {
+		uris = uris[:maxLoggedXFCCURIs]
+	}
+	for i, uri := range uris {
+		if len(uri) > maxLoggedXFCCURIBytes {
+			uris[i] = uri[:maxLoggedXFCCURIBytes] + "…"
+		}
+	}
+	return uris, total
 }
 
 // parseXFCCURIs extracts the URI (SPIFFE SVID) values from an Envoy
