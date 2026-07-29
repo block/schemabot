@@ -2064,7 +2064,7 @@ If the plan finds changes, apply `staging` and wait for the SchemaBot check to s
 
 Could not verify staging status: failed to query check runs. Retry the apply command.
 
-_Error: list check runs for ref: 502 Bad Gateway_
+_See server logs for details._
 </details>
 
 <details>
@@ -2135,7 +2135,7 @@ Schema changes require approval from an authorized reviewer before applying.
 
 ### Error
 
-> Review gate check failed: expand team @acme/schema-reviewers: team membership cannot be read. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
+> Review gate check failed; see server logs for details. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
 </details>
 
 <details>
