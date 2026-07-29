@@ -230,24 +230,27 @@ func (c *LocalClient) logApplyEvent(ctx context.Context, applyID int64, taskID *
 }
 
 // setupSpiritLogging wires up Spirit's log callback to route engine logs to the apply_logs table.
-// Builds a table-name-to-task lookup so each log line is attributed to the correct task.
 // Returns a cleanup function that must be deferred.
 func (c *LocalClient) setupSpiritLogging(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) func() {
 	spiritEng, ok := c.spiritEngine.(*spirit.Engine)
 	if !ok {
 		return func() {}
 	}
+	spiritEng.SetLogCallback(c.spiritApplyLogFunc(ctx, apply, tasks))
+	return func() { spiritEng.SetLogCallback(nil) }
+}
 
+// spiritApplyLogFunc builds the callback that records one Spirit log line in
+// the apply log stream. It attributes each line to its task by table name and
+// embeds the table in the stored message so operators can tell interleaved
+// lines apart during multi-table applies.
+func (c *LocalClient) spiritApplyLogFunc(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) func(level slog.Level, tableName, msg string) {
 	taskByTable := make(map[string]*storage.Task)
-	var firstTask *storage.Task
 	for _, task := range tasks {
 		taskByTable[task.TableName] = task
-		if firstTask == nil {
-			firstTask = task
-		}
 	}
 
-	spiritEng.SetLogCallback(func(level slog.Level, tableName, msg string) {
+	return func(level slog.Level, tableName, msg string) {
 		logLevel := storage.LogLevelInfo
 		if level >= slog.LevelWarn {
 			logLevel = storage.LogLevelWarn
@@ -255,18 +258,22 @@ func (c *LocalClient) setupSpiritLogging(ctx context.Context, apply *storage.App
 		if level >= slog.LevelError {
 			logLevel = storage.LogLevelError
 		}
-		task := taskByTable[tableName]
-		if task == nil {
-			task = firstTask
+		// Embed the table in the stored message so it survives every log
+		// surface — CLI output, deployment log fetches, and PR comment log
+		// folds render the message text only.
+		if tableName != "" {
+			msg = fmt.Sprintf("[%s] %s", tableName, msg)
 		}
+		// Run-level lines (or lines spanning several tables) carry no single
+		// task's table name; attribute those to the apply, not to an
+		// arbitrary task.
 		var taskID *int64
-		if task != nil {
+		if task := taskByTable[tableName]; task != nil {
 			id := task.ID
 			taskID = &id
 		}
 		c.logApplyEvent(ctx, apply.ID, taskID, logLevel, storage.LogEventInfo, storage.LogSourceSpirit, msg, "", "")
-	})
-	return func() { spiritEng.SetLogCallback(nil) }
+	}
 }
 
 // transitionTaskState updates a task's state, persists it, and optionally logs a state transition.
