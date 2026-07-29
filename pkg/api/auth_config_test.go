@@ -141,4 +141,14 @@ func TestAuthConfigValidate(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "both trusted_proxy_spiffe and trusted_gateway_spiffe")
 	})
+
+	t.Run("forward_auth rejects the gateway lane under CIDR-only proxy trust", func(t *testing.T) {
+		err := (&api.AuthConfig{Type: "forward_auth", ForwardAuth: api.ForwardAuthSettings{
+			TrustedProxyCIDRs:    []string{"127.0.0.1/32"},
+			TrustedGatewaySPIFFE: []string{"spiffe://example.org/ns/service-ingress/sa/gateway"},
+			ReadServiceSPIFFE:    []string{"spiffe://example.org/ns/reporting/sa/reporting"},
+		}}).Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "SPIFFE-anchored proxy trust")
+	})
 }

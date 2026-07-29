@@ -217,6 +217,30 @@ func TestNewForwardAuthAuthorizer_ReadServiceCallersRequireGateway(t *testing.T)
 	assert.Contains(t, err.Error(), "trusted_gateway_spiffe")
 }
 
+func TestNewForwardAuthAuthorizer_RejectsGatewayLaneWithCIDROnlyTrust(t *testing.T) {
+	// Under CIDR-only proxy trust the gateway lane can never authenticate
+	// anyone — an in-CIDR gateway request is treated as the identity-header
+	// proxy and an out-of-CIDR one is refused by the CIDR gate — so the
+	// combination is a startup error, not a silently dead lane.
+	cfg := serviceCallerConfig()
+	cfg.TrustedProxySPIFFE = nil
+	cfg.TrustedProxyCIDRs = []string{trustedCIDR}
+	_, err := auth.NewForwardAuthAuthorizer(cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "SPIFFE-anchored proxy trust")
+}
+
+func TestNewForwardAuthAuthorizer_WhitespaceOnlyGatewayEntriesFailClosed(t *testing.T) {
+	// Entries that trim to empty do not count as configuration: a gateway list
+	// of blanks leaves the callers without a vouching gateway, which is the
+	// same fail-closed startup error as omitting the list.
+	cfg := serviceCallerConfig()
+	cfg.TrustedGatewaySPIFFE = []string{"   "}
+	_, err := auth.NewForwardAuthAuthorizer(cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "trusted_gateway_spiffe")
+}
+
 func TestNewForwardAuthAuthorizer_RejectsProxyGatewayOverlap(t *testing.T) {
 	// A single peer cannot be both the identity-header proxy and a
 	// caller-forwarding gateway: the two lanes trust different headers, so an
@@ -340,6 +364,59 @@ func TestForwardAuth_GatewayMissingCallerIdentityDenied(t *testing.T) {
 
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	assert.Nil(t, captured.user)
+}
+
+func TestForwardAuth_GatewayBlankCallerIdentityDenied(t *testing.T) {
+	// A present-but-blank caller header is the same as no caller identity:
+	// there is nobody to authorize, so the request is denied.
+	handler, captured := newForwardAuth(t, serviceCallerConfig())
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", "URI="+gatewaySVID)
+	req.Header.Set("X-Forwarded-Caller-Spiffe-Id", "   ")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Nil(t, captured.user)
+}
+
+func TestForwardAuth_GatewayLaneGatedByTrustedCIDR(t *testing.T) {
+	// Configured trusted_proxy_cidrs gate the gateway lane like everything
+	// else: XFCC is a spoofable header, so a gateway SVID is honored only from
+	// inside the trusted networks. From inside, the lane works as usual.
+	cfg := serviceCallerConfig()
+	cfg.TrustedProxyCIDRs = []string{trustedCIDR}
+
+	t.Run("gateway SVID claimed from outside the CIDR is refused", func(t *testing.T) {
+		handler, captured := newForwardAuth(t, cfg)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+		req.RemoteAddr = untrustedAddr
+		req.Header.Set("X-Forwarded-Client-Cert", "URI="+gatewaySVID)
+		req.Header.Set("X-Forwarded-Caller-Spiffe-Id", callerSVID)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		assert.Contains(t, rec.Body.String(), "trusted authenticating proxy",
+			"the forged claim falls through to the standard untrusted-proxy denial")
+		assert.Nil(t, captured.user)
+	})
+
+	t.Run("gateway caller from inside the CIDR is allowed", func(t *testing.T) {
+		handler, captured := newForwardAuth(t, cfg)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+		req.RemoteAddr = trustedIPAddr
+		req.Header.Set("X-Forwarded-Client-Cert", "URI="+gatewaySVID)
+		req.Header.Set("X-Forwarded-Caller-Spiffe-Id", callerSVID)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		require.NotNil(t, captured.user)
+		assert.Equal(t, callerSVID, captured.user.Subject)
+	})
 }
 
 func TestForwardAuth_ForgedCallerHeaderWithoutGatewayDenied(t *testing.T) {

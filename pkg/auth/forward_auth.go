@@ -52,6 +52,10 @@ type ForwardAuthConfig struct {
 	// setting it from the verified certificate — otherwise any caller could
 	// forge an identity through it. Must not overlap TrustedProxySPIFFE: a peer
 	// either forwards user identity headers or a caller SPIFFE ID, never both.
+	// Requires a non-empty TrustedProxySPIFFE: the lane authenticates on the
+	// XFCC-carried gateway SVID, and under CIDR-only proxy trust it would be
+	// unreachable (see the constructor). TrustedProxyCIDRs, when set, gate
+	// this lane like everything else.
 	TrustedGatewaySPIFFE []string
 
 	// CallerSPIFFEHeader carries the gateway-verified caller SPIFFE ID.
@@ -88,8 +92,12 @@ type ForwardAuthConfig struct {
 // caller's client certificate and forwards the caller's SPIFFE ID in a
 // dedicated header. That lane is read-only, honors the caller header only when
 // the XFCC-verified peer is a listed gateway, and never reads the user or
-// groups headers. The identity-header proxy always wins: the gateway lane is
-// consulted only when the request did not arrive through the trusted proxy.
+// groups headers. Configured TrustedProxyCIDRs gate this lane too — a gateway
+// SVID claimed from outside the trusted networks is never honored — and the
+// lane requires SPIFFE-anchored proxy trust, since under CIDR-only trust an
+// in-CIDR gateway request would be mistaken for the identity-header proxy. The
+// identity-header proxy always wins: the gateway lane is consulted only when
+// the request did not arrive through the trusted proxy.
 type ForwardAuthAuthorizer struct {
 	userHeader        string
 	groupsHeader      string
@@ -157,7 +165,10 @@ func NewForwardAuthAuthorizer(cfg ForwardAuthConfig, logger *slog.Logger) (*Forw
 		logger.Warn("forward-auth trusting XFCC with no source-CIDR anchor: ensure the proxy sanitizes inbound X-Forwarded-Client-Cert and the server is not directly reachable")
 	}
 
-	callerHeader := strings.TrimSpace(cfg.CallerSPIFFEHeader)
+	callerHeader := cfg.CallerSPIFFEHeader
+	if callerHeader != strings.TrimSpace(callerHeader) {
+		return nil, fmt.Errorf("forward_auth caller_spiffe_header must not have leading or trailing whitespace")
+	}
 	if callerHeader == "" {
 		callerHeader = "X-Forwarded-Caller-Spiffe-Id"
 	}
@@ -184,8 +195,17 @@ func NewForwardAuthAuthorizer(cfg ForwardAuthConfig, logger *slog.Logger) (*Forw
 	}
 	for _, g := range gateways {
 		if slices.Contains(spiffe, g) {
-			return nil, fmt.Errorf("SPIFFE ID %q is listed in both trusted_proxy_spiffe and trusted_gateway_spiffe: a peer either forwards user identity headers or a caller SPIFFE ID, never both", g)
+			return nil, fmt.Errorf("forward_auth SPIFFE ID %q is listed in both trusted_proxy_spiffe and trusted_gateway_spiffe: a peer either forwards user identity headers or a caller SPIFFE ID, never both", g)
 		}
+	}
+	// The gateway lane authenticates on the XFCC-carried gateway SVID, so it
+	// needs SPIFFE-anchored proxy trust to coexist with. Under CIDR-only trust
+	// the lane can never authenticate anyone: an in-CIDR gateway request is
+	// treated as the identity-header proxy (and 401s with no user header),
+	// while an out-of-CIDR one is refused by the CIDR gate. Refuse to start
+	// rather than ship a dead lane.
+	if len(gateways) > 0 && len(spiffe) == 0 {
+		return nil, fmt.Errorf("forward_auth trusted_gateway_spiffe requires SPIFFE-anchored proxy trust (trusted_proxy_spiffe): with CIDR-only trust the service-caller lane is unreachable")
 	}
 	if len(gateways) > 0 {
 		logger.Warn("forward-auth honoring gateway-forwarded caller identity: every listed gateway must strip inbound copies of the caller header before setting it from the verified client certificate",
@@ -289,12 +309,23 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 // forwarded the caller's SPIFFE ID in the caller header. The lane grants the
 // read tier only, to callers explicitly listed in ReadServiceSPIFFE, and never
 // reads the user or groups headers. handled=false means the request did not
-// arrive through a listed gateway, so the caller falls through to the standard
+// arrive through a listed gateway — or, when CIDRs are configured, did not
+// arrive from a trusted network — so the caller falls through to the standard
 // untrusted-proxy denial. xfccURIs are the URI values already parsed from the
 // request's XFCC header.
 func (a *ForwardAuthAuthorizer) authorizeGatewayCaller(w http.ResponseWriter, r *http.Request, tier Tier, xfccURIs []string) (*User, bool) {
 	if len(a.gatewaySPIFFE) == 0 {
 		return nil, false
+	}
+	// Configured CIDRs gate everything, this lane included: XFCC is a
+	// spoofable header, so a gateway SVID claimed from outside the trusted
+	// networks is never honored — the request falls through to the standard
+	// untrusted-proxy denial, whose log records the source address and the
+	// claimed identities.
+	if len(a.trustedNets) > 0 {
+		if _, ok := a.trustedSourceIP(r); !ok {
+			return nil, false
+		}
 	}
 	var gatewayID string
 	for _, uri := range xfccURIs {
@@ -310,21 +341,24 @@ func (a *ForwardAuthAuthorizer) authorizeGatewayCaller(w http.ResponseWriter, r 
 	caller := strings.TrimSpace(r.Header.Get(a.callerHeader))
 	if caller == "" {
 		a.logger.Warn("forward-auth gateway forwarded no caller identity; denying",
-			"path", r.URL.Path, "gateway", gatewayID, "caller_header", a.callerHeader)
+			"path", r.URL.Path, "remote_addr", r.RemoteAddr, "gateway", gatewayID, "caller_header", a.callerHeader)
 		authDecision(r, tier, "deny", "no_service_identity")
 		writeAuthError(w, http.StatusUnauthorized, "no forwarded service caller identity from the gateway")
 		return nil, true
 	}
 	if !slices.Contains(a.readServiceSPIFFE, caller) {
+		// The caller value is unverified header input on this path — clamp it
+		// like the denial-logged XFCC URIs so a synthetic value cannot bloat
+		// the log line.
 		a.logger.Warn("forward-auth service caller is not in the read allowlist; denying",
-			"path", r.URL.Path, "gateway", gatewayID, "caller", caller)
+			"path", r.URL.Path, "remote_addr", r.RemoteAddr, "gateway", gatewayID, "caller", clampLoggedHeaderValue(caller))
 		authDecision(r, tier, "deny", "service_not_authorized")
 		writeAuthError(w, http.StatusForbidden, "service caller is not authorized for read access")
 		return nil, true
 	}
 	if tier == TierWrite {
 		a.logger.Warn("forward-auth service caller denied for write operation; service callers are read-only",
-			"path", r.URL.Path, "gateway", gatewayID, "caller", caller)
+			"path", r.URL.Path, "remote_addr", r.RemoteAddr, "gateway", gatewayID, "caller", caller)
 		authDecision(r, tier, "deny", "service_caller_write")
 		writeAuthError(w, http.StatusForbidden, "service callers are limited to read-only operations")
 		return nil, true
@@ -372,19 +406,8 @@ func (a *ForwardAuthAuthorizer) isTrustedProxy(r *http.Request) (bool, string) {
 	// When CIDRs are configured they gate everything: a request from outside
 	// them is never trusted, regardless of XFCC.
 	if len(a.trustedNets) > 0 {
-		host, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			host = r.RemoteAddr
-		}
-		ip := net.ParseIP(strings.TrimSpace(host))
-		inTrustedNet := false
-		for _, network := range a.trustedNets {
-			if ip != nil && network.Contains(ip) {
-				inTrustedNet = true
-				break
-			}
-		}
-		if !inTrustedNet {
+		ip, ok := a.trustedSourceIP(r)
+		if !ok {
 			return false, ""
 		}
 		if len(a.trustedSPIFFE) == 0 {
@@ -400,6 +423,36 @@ func (a *ForwardAuthAuthorizer) isTrustedProxy(r *http.Request) (bool, string) {
 		}
 	}
 	return false, ""
+}
+
+// trustedSourceIP parses the request's source IP and reports whether it falls
+// inside a configured trusted network. The source address is a transport
+// property the caller cannot forge, which is why both the proxy lane and the
+// gateway lane anchor on it whenever CIDRs are configured.
+func (a *ForwardAuthAuthorizer) trustedSourceIP(r *http.Request) (net.IP, bool) {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(strings.TrimSpace(host))
+	if ip == nil {
+		return nil, false
+	}
+	for _, network := range a.trustedNets {
+		if network.Contains(ip) {
+			return ip, true
+		}
+	}
+	return nil, false
+}
+
+// clampLoggedHeaderValue bounds a single untrusted header value recorded in a
+// denial log, mirroring the per-value bound on logged XFCC URIs.
+func clampLoggedHeaderValue(v string) string {
+	if len(v) > maxLoggedXFCCURIBytes {
+		return v[:maxLoggedXFCCURIBytes] + "…"
+	}
+	return v
 }
 
 // maxLoggedXFCCURIs and maxLoggedXFCCURIBytes bound a denial log in both

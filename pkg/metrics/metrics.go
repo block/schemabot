@@ -488,8 +488,9 @@ func RecordPRCommandActorAuthorization(ctx context.Context, command, database, e
 }
 
 // RecordAuthDecision increments the counter for API auth decisions on the
-// direct (OIDC) request path. Labels are inherently low-cardinality: tier is
-// read/plan/write, decision is allow/deny, reason is a fixed set.
+// direct request path (the OIDC and forward-auth authorizers). Labels are
+// inherently low-cardinality: tier is read/write, decision is allow/deny,
+// reason is a fixed set.
 func RecordAuthDecision(ctx context.Context, tier, decision, reason string) {
 	addCounter(ctx, "schemabot.auth_decisions.total",
 		"Total API auth decisions on the OIDC request path", "{decision}",

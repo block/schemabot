@@ -1478,6 +1478,13 @@ func (f *ForwardAuthSettings) validate() error {
 			return fmt.Errorf("forward_auth SPIFFE ID %q is listed in both trusted_proxy_spiffe and trusted_gateway_spiffe: a peer either forwards user identity headers or a caller SPIFFE ID, never both", g)
 		}
 	}
+	// Under CIDR-only proxy trust the service-caller lane is unreachable: an
+	// in-CIDR gateway request is treated as the identity-header proxy and an
+	// out-of-CIDR one is refused by the CIDR gate. Reject rather than ship a
+	// lane that can never authenticate anyone.
+	if len(trimmedGateways) > 0 && len(trimmedSPIFFE) == 0 {
+		return fmt.Errorf("forward_auth trusted_gateway_spiffe requires SPIFFE-anchored proxy trust (trusted_proxy_spiffe): with CIDR-only trust the service-caller lane is unreachable")
+	}
 	return nil
 }
 
