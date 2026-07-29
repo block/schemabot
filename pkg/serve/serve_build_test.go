@@ -149,3 +149,80 @@ func TestForwardAuthEnforcedThroughServerHandler(t *testing.T) {
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
 	})
 }
+
+// Configuring the service-caller lane (trusted_gateway_spiffe +
+// read_service_spiffe + caller_spiffe_header) wires all three settings through
+// buildAuthorizer into the real HTTP handler: a listed caller arriving through
+// a listed gateway under the configured header gets read access, and stays
+// read-only. This proves the config-to-middleware plumbing end to end, so a
+// dropped or swapped field in the authorizer construction fails behaviorally.
+func TestForwardAuthServiceCallerLaneThroughServerHandler(t *testing.T) {
+	const (
+		gatewaySVID  = "spiffe://example.org/ns/service-ingress/sa/gateway"
+		callerSVID   = "spiffe://example.org/ns/reporting/sa/reporting"
+		callerHeader = "X-Custom-Caller-Id"
+	)
+	logger := slog.New(slog.DiscardHandler)
+	cfg := &api.ServerConfig{
+		Auth: api.AuthConfig{
+			Type: "forward_auth",
+			ForwardAuth: api.ForwardAuthSettings{
+				TrustedProxySPIFFE:   []string{"spiffe://example.org/ns/ingress/sa/proxy"},
+				WriteGroups:          []string{"owners"},
+				TrustedGatewaySPIFFE: []string{gatewaySVID},
+				ReadServiceSPIFFE:    []string{callerSVID},
+				CallerSPIFFEHeader:   callerHeader,
+			},
+		},
+	}
+	svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
+	webhook, err := buildWebhookRuntime(cfg, svc, logger)
+	require.NoError(t, err)
+	authz, err := buildAuthorizer(t.Context(), cfg.Auth, nil, logger)
+	require.NoError(t, err)
+	telemetry, err := api.SetupTelemetry(logger)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		_ = telemetry.Shutdown(shutdownCtx)
+	})
+
+	srv := &Server{cfg: cfg, svc: svc, logger: logger, webhook: webhook, telemetry: telemetry, authz: authz}
+	handler := srv.Handler()
+
+	gatewayRequest := func(t *testing.T, method, path string) *http.Request {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), method, path, nil)
+		req.RemoteAddr = "203.0.113.5:1234"
+		req.Header.Set("X-Forwarded-Client-Cert", "URI="+gatewaySVID)
+		req.Header.Set(callerHeader, callerSVID)
+		return req
+	}
+
+	t.Run("listed service caller passes the auth gate on a read", func(t *testing.T) {
+		// The read is authorized — not rejected at auth — so it reaches the
+		// pull handler, which rejects this empty body with 400.
+		req := gatewayRequest(t, http.MethodPost, "/api/pull")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("service caller is denied a write with 403", func(t *testing.T) {
+		req := gatewayRequest(t, http.MethodPost, "/api/plan")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Contains(t, rec.Body.String(), "read-only")
+	})
+
+	t.Run("caller under the default header name is rejected when a custom header is configured", func(t *testing.T) {
+		req := gatewayRequest(t, http.MethodGet, "/api/status")
+		req.Header.Del(callerHeader)
+		req.Header.Set("X-Forwarded-Caller-Spiffe-Id", callerSVID)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
+}

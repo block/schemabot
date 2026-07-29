@@ -912,15 +912,20 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups []stri
 			"trusted_proxy_cidrs", len(fa.TrustedProxyCIDRs),
 			"trusted_proxy_spiffe", len(fa.TrustedProxySPIFFE),
 			"read_groups", len(fa.ReadGroups),
-			"write_groups", len(fa.WriteGroups))
+			"write_groups", len(fa.WriteGroups),
+			"trusted_gateway_spiffe", len(fa.TrustedGatewaySPIFFE),
+			"read_service_spiffe", len(fa.ReadServiceSPIFFE))
 		authz, err := auth.NewForwardAuthAuthorizer(auth.ForwardAuthConfig{
-			UserHeader:         fa.UserHeader,
-			GroupsHeader:       fa.GroupsHeader,
-			GroupsDelimiter:    fa.GroupsDelimiter,
-			TrustedProxySPIFFE: fa.TrustedProxySPIFFE,
-			TrustedProxyCIDRs:  fa.TrustedProxyCIDRs,
-			ReadGroups:         fa.ReadGroups,
-			WriteGroups:        fa.WriteGroups,
+			UserHeader:           fa.UserHeader,
+			GroupsHeader:         fa.GroupsHeader,
+			GroupsDelimiter:      fa.GroupsDelimiter,
+			TrustedProxySPIFFE:   fa.TrustedProxySPIFFE,
+			TrustedProxyCIDRs:    fa.TrustedProxyCIDRs,
+			ReadGroups:           fa.ReadGroups,
+			WriteGroups:          fa.WriteGroups,
+			TrustedGatewaySPIFFE: fa.TrustedGatewaySPIFFE,
+			CallerSPIFFEHeader:   fa.CallerSPIFFEHeader,
+			ReadServiceSPIFFE:    fa.ReadServiceSPIFFE,
 		}, logger)
 		if err != nil {
 			return nil, err
