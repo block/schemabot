@@ -1104,7 +1104,6 @@ type Task struct {
 
 	// Execution flags
 	IsInstant         bool   // True if INSTANT DDL (no copy needed)
-	ReadyToComplete   bool   // Row copy done, waiting for cutover
 	EngineMigrationID string // Engine-specific migration ID
 
 	// Timestamps

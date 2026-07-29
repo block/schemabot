@@ -1,8 +1,12 @@
 package auth_test
 
 import (
+	"bytes"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -69,6 +73,118 @@ func TestForwardAuth_UntrustedSourceDenied(t *testing.T) {
 	// any forwarded identity header is honored.
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	assert.Nil(t, captured.user)
+}
+
+// newForwardAuthWithLogs is newForwardAuth with a logger that records the
+// authorizer's output, so tests can assert on denial-log contents.
+func newForwardAuthWithLogs(t *testing.T, cfg auth.ForwardAuthConfig) (http.Handler, *bytes.Buffer) {
+	t.Helper()
+	var logs bytes.Buffer
+	authz, err := auth.NewForwardAuthAuthorizer(cfg, slog.New(slog.NewTextHandler(&logs, nil)))
+	require.NoError(t, err)
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	return authz.Middleware(inner), &logs
+}
+
+func TestForwardAuth_UntrustedProxyDenialLogsArrivingXFCCIdentities(t *testing.T) {
+	// An operator triaging an untrusted-proxy denial needs to see which URI
+	// identities were present in the XFCC header, so they can tell a missing
+	// trust anchor apart from a caller that forwarded no identity. The log
+	// carries the parsed URI values — never the raw header, which is untrusted
+	// input on this path.
+	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs:  []string{trustedCIDR},
+		TrustedProxySPIFFE: []string{ingressSVID},
+		WriteGroups:        []string{"ops"},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+	req.RemoteAddr = trustedIPAddr
+	req.Header.Set("X-Forwarded-Client-Cert",
+		`Hash=abc123;URI=spiffe://example.org/ns/gateway/sa/other-gateway,By=spiffe://example.org/ns/schemabot/sa/schemabot;URI="spiffe://example.org/ns/caller/sa/service"`)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	logged := logs.String()
+	assert.Contains(t, logged, "did not arrive through the trusted proxy")
+	assert.Contains(t, logged, "spiffe://example.org/ns/gateway/sa/other-gateway")
+	assert.Contains(t, logged, "spiffe://example.org/ns/caller/sa/service")
+	assert.Contains(t, logged, "xfcc_uri_count=2")
+	assert.NotContains(t, logged, "Hash=abc123")
+}
+
+func TestForwardAuth_UntrustedProxyDenialLogsZeroXFCCIdentities(t *testing.T) {
+	// A denial with no XFCC header logs a zero identity count, telling the
+	// operator no URI identity was forwarded at all — a routing or mesh
+	// problem, not a trust-anchor mismatch.
+	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{trustedCIDR},
+		WriteGroups:       []string{"ops"},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+	req.RemoteAddr = untrustedAddr
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Contains(t, logs.String(), "xfcc_uri_count=0")
+}
+
+func TestForwardAuth_UntrustedProxyDenialClampsLoggedXFCCIdentities(t *testing.T) {
+	// A hostile caller can stuff arbitrarily many URI values into a synthetic
+	// XFCC header; the denial log clamps the listed identities while still
+	// reporting the true total, so log lines stay bounded without hiding the
+	// flood.
+	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{trustedCIDR},
+		WriteGroups:       []string{"ops"},
+	})
+
+	elements := make([]string, 10)
+	for i := range elements {
+		elements[i] = fmt.Sprintf("URI=spiffe://example.org/ns/flood/sa/svc-%d", i)
+	}
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", strings.Join(elements, ","))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	logged := logs.String()
+	assert.Contains(t, logged, "xfcc_uri_count=10")
+	assert.Contains(t, logged, "spiffe://example.org/ns/flood/sa/svc-7")
+	assert.NotContains(t, logged, "spiffe://example.org/ns/flood/sa/svc-8")
+	assert.NotContains(t, logged, "spiffe://example.org/ns/flood/sa/svc-9")
+}
+
+func TestForwardAuth_UntrustedProxyDenialTruncatesOversizedXFCCIdentity(t *testing.T) {
+	// The count clamp alone would still let a single synthetic multi-hundred-KB
+	// URI value bloat every denial line; each logged value is also truncated to
+	// a fixed byte bound, marked so the operator can tell it was cut.
+	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{trustedCIDR},
+		WriteGroups:       []string{"ops"},
+	})
+
+	huge := "spiffe://example.org/ns/flood/sa/" + strings.Repeat("x", 4096)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", `URI="`+huge+`"`)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	logged := logs.String()
+	assert.Contains(t, logged, "xfcc_uri_count=1")
+	assert.Contains(t, logged, "spiffe://example.org/ns/flood/sa/x", "a recognizable prefix survives for triage")
+	assert.Contains(t, logged, "…", "the truncation is marked")
+	assert.NotContains(t, logged, huge, "the full oversized value is never logged")
+	assert.Less(t, len(logged), 2048, "the denial line stays bounded")
 }
 
 func TestForwardAuth_TrustedCIDRReadAllowedForAnyUser(t *testing.T) {

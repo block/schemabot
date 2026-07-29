@@ -596,7 +596,8 @@ message ShardProgress {
   int64 eta_seconds = 5;
   int32 cutover_attempts = 6;
   string last_cutover_attempt = 7;
-  bool ready_to_complete = 8;
+  reserved 8;
+  reserved "ready_to_complete";
 }
 
 // TableProgress contains progress information for a single table.
