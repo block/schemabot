@@ -311,7 +311,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			break
 		}
 
-		action := c.checkTaskReady(ctx, task)
+		action := c.checkTaskReady(ctx, logger, task)
 		if action == taskStopped {
 			stoppedByUser = true
 			break
