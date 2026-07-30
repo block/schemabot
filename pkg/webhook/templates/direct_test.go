@@ -52,6 +52,26 @@ func TestRenderPlanComment_DirectNamesShards(t *testing.T) {
 	assert.Contains(t, out, "`users` (shards `-40`, `40-80`): dropping primary key is not supported")
 }
 
+// The direct-execution consent copy is keyed by database type: MySQL-family
+// databases (including Strata, whose shards are MySQL) disclose MySQL
+// semantics, and a database type without registered copy gets the
+// conservative engine-neutral disclosure rather than inheriting MySQL's.
+func TestDirectConsentCopy_KeyedByDatabaseType(t *testing.T) {
+	mysqlHeader, mysqlFooter := directConsentCopy("mysql", true)
+	assert.Equal(t, "native MySQL DDL", mysqlHeader)
+	assert.Contains(t, mysqlFooter, "writes to each table are blocked while its statement runs")
+
+	strataHeader, strataFooter := directConsentCopy("strata", false)
+	assert.Equal(t, mysqlHeader, strataHeader, "Strata shards run the same native MySQL DDL")
+	assert.Equal(t, mysqlFooter, strataFooter)
+
+	otherHeader, otherFooter := directConsentCopy("postgres", false)
+	assert.Equal(t, "native DDL", otherHeader)
+	assert.Contains(t, otherFooter, "each table is unavailable while its statement runs")
+	assert.Contains(t, otherFooter, "**not revertible**")
+	assert.Contains(t, otherFooter, "Confirming the apply consents to this.")
+}
+
 // A multi-environment plan renders each environment's own direct section,
 // since the direct execution policy is configured per environment.
 func TestRenderMultiEnvPlanComment_DirectPerEnvironment(t *testing.T) {

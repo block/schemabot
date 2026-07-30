@@ -653,6 +653,11 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 	return out
 }
 
+// msgDeferCutoverAllDirect rejects --defer-cutover on a plan whose every
+// change the policy routes to direct execution: a direct statement has no
+// cutover to defer, so the flag is refused instead of silently ignored.
+const msgDeferCutoverAllDirect = "`--defer-cutover` has no effect on this plan: every change runs directly as native DDL, which has no cutover to defer. Re-run without the flag."
+
 // shardedDirectChanges collects direct-execution per-shard changes, grouped by
 // (table, reason) so a change present on several shards lists them together
 // rather than repeating. Returns nil when the plan carries no per-shard

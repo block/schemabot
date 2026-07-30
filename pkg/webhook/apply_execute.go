@@ -156,7 +156,7 @@ func (h *Handler) executeApply(
 		h.logger.Info("apply rejected: --defer-cutover on an all-direct plan",
 			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
 		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-			"`--defer-cutover` has no effect on this plan: every change runs as native MySQL DDL, which has no cutover to defer. Re-run without the flag.")
+			msgDeferCutoverAllDirect)
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "defer-cutover on all-direct plan rejection")
 		return
 	}

@@ -282,7 +282,7 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 		h.logger.Info("apply rejected: --defer-cutover on an all-direct plan",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-			"`--defer-cutover` has no effect on this plan: every change runs as native MySQL DDL, which has no cutover to defer. Re-run without the flag.")
+			msgDeferCutoverAllDirect)
 		return false, nil
 	}
 
