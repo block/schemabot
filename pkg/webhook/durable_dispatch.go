@@ -473,9 +473,9 @@ func (h *Handler) processDurablePullRequestClosed(ctx context.Context, event *st
 // request path, and its durability is owned by the applies/tasks layer once
 // plans are created.
 func (h *Handler) processDurablePullRequestAutoPlan(ctx context.Context, event *storage.WebhookEvent, payload pullRequestPayload) (retry bool, err error) {
-	installationID := h.durableInstallationID(ctx, event, payload.Installation.ID)
-	if installationID == 0 {
-		return false, fmt.Errorf("durable pull_request delivery %s missing installation ID", event.DeliveryID)
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		return false, err
 	}
 
 	repo := payload.Repository.FullName
@@ -578,25 +578,9 @@ func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *st
 		return false, nil
 	}
 
-	installationID, parseErr := strconv.ParseInt(event.TenantID, 10, 64)
-	if parseErr != nil {
-		// A non-numeric TenantID is a corrupted/enqueue-side bug, distinct from a
-		// legitimately empty tenant; surface it rather than silently folding it
-		// into the payload fallback below.
-		h.logger.Warn("durable check_run rerequest has an unparseable tenant ID; falling back to the payload installation",
-			"delivery_id", event.DeliveryID, "tenant_id", event.TenantID,
-			"repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA, "error", parseErr)
-	}
-	if parseErr != nil || installationID == 0 {
-		// Fallback for rows without a stored tenant. The only producer today
-		// (enqueueDurableCheckRun) always stores a resolved non-zero
-		// installation ID; check_run payloads carry an installation ID only for
-		// org/user App installs, so a repo-level delivery relying on this
-		// fallback would fail below.
-		installationID = h.effectiveInstallationID(ctx, payload.Installation.ID)
-	}
-	if installationID == 0 {
-		return false, fmt.Errorf("durable check_run rerequest %s missing installation ID", event.DeliveryID)
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		return false, err
 	}
 
 	// Keep the driver's run context: autoPlanBootstrap rebinds ctx to a
@@ -719,29 +703,34 @@ func (h *Handler) enqueueDurableWebhookEvent(ctx context.Context, event *storage
 	return inserted, nil
 }
 
-// durableInstallationID resolves the installation ID for a claimed delivery.
-// It prefers the resolved ID persisted in TenantID at enqueue (every producer
-// today stores a resolved non-zero ID there) and falls back to the payload
-// installation ID for replayed or future-producer rows that lack one. Driver
-// work runs outside an HTTP request, so the context carries no repo-level
-// resolved installation; the payload carries an ID only for org/user App
-// installs. A future producer that synthesizes rows for repo-level deliveries
-// (which have no payload installation) must persist a resolved installation ID
-// in TenantID rather than relying on this fallback, or those rows fail here.
-func (h *Handler) durableInstallationID(ctx context.Context, event *storage.WebhookEvent, payloadID int64) int64 {
-	installationID, parseErr := strconv.ParseInt(event.TenantID, 10, 64)
-	if parseErr != nil {
-		// A non-numeric TenantID is a corrupted/enqueue-side bug, distinct from a
-		// legitimately empty tenant; surface it rather than silently folding it
-		// into the payload fallback below.
-		h.logger.Warn("durable webhook delivery has an unparseable tenant ID; falling back to the payload installation",
-			"delivery_id", event.DeliveryID, "tenant_id", event.TenantID, "event", event.Event,
-			"repo", event.Repository, "pr", event.PullRequest, "error", parseErr)
+// durableInstallationID resolves the installation ID for a claimed delivery
+// from the tenant persisted at enqueue. Every producer stores a resolved
+// positive installation ID in TenantID, so an unparseable or non-positive
+// tenant is a corrupted or hand-crafted row: retrying cannot repair it, and
+// driver work runs outside an HTTP request, so there is no out-of-band
+// resolution to recover with. Callers treat the returned error as terminal.
+func durableInstallationID(event *storage.WebhookEvent) (int64, error) {
+	installationID, err := strconv.ParseInt(event.TenantID, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("durable %s delivery %s for %s has an unparseable tenant ID %q: %w",
+			event.Event, event.DeliveryID, durableDeliveryLocation(event), event.TenantID, err)
 	}
-	if parseErr != nil || installationID == 0 {
-		installationID = h.effectiveInstallationID(ctx, payloadID)
+	if installationID <= 0 {
+		return 0, fmt.Errorf("durable %s delivery %s for %s has a non-positive installation ID %d in its tenant",
+			event.Event, event.DeliveryID, durableDeliveryLocation(event), installationID)
 	}
-	return installationID
+	return installationID, nil
+}
+
+// durableDeliveryLocation renders the repository location of a durable
+// delivery for error messages: repo#pr when the delivery targets a pull
+// request, or just the repository for PR-less events such as push and
+// merge_group.
+func durableDeliveryLocation(event *storage.WebhookEvent) string {
+	if event.PullRequest > 0 {
+		return fmt.Sprintf("%s#%d", event.Repository, event.PullRequest)
+	}
+	return event.Repository
 }
 
 func (h *Handler) webhookEventStore() storage.WebhookEventStore {
