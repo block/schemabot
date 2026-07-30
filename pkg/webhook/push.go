@@ -235,9 +235,9 @@ func (h *Handler) processDurablePush(ctx context.Context, event *storage.Webhook
 		return false, nil
 	}
 
-	installationID := h.durableInstallationID(ctx, event, payload.Installation.ID)
-	if installationID == 0 {
-		return false, fmt.Errorf("durable push delivery %s missing installation ID", event.DeliveryID)
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		return false, err
 	}
 
 	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
