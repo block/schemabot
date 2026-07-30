@@ -9,7 +9,6 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/ddl"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -654,12 +653,6 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 	return out
 }
 
-// engineBlocked reports whether the planner's execution-mode verdict says the
-// engine will refuse this change at apply time.
-func engineBlocked(t *apitypes.TableChangeResponse) bool {
-	return t != nil && t.ExecutionMode == ddl.ExecutionModeBlocked
-}
-
 // shardedBlockedChanges collects blocked per-shard changes, grouped by (table,
 // reason) so a change present on several shards lists them together rather
 // than repeating. Returns nil when the plan carries no per-shard changes (the
@@ -676,7 +669,7 @@ func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.Blo
 			continue
 		}
 		for _, t := range sp.Changes {
-			if !engineBlocked(t) {
+			if !t.EngineBlocked() {
 				continue
 			}
 			k := key{table: t.TableName, reason: t.ModeReason}
@@ -790,7 +783,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 				continue
 			}
 			for _, t := range sc.TableChanges {
-				if !engineBlocked(t) {
+				if !t.EngineBlocked() {
 					continue
 				}
 				data.BlockedChanges = append(data.BlockedChanges, templates.BlockedChangeData{

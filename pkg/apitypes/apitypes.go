@@ -612,7 +612,8 @@ type TableChangeResponse struct {
 
 // executionModeBlocked is the execution-mode verdict a planner records on a
 // table change the engine refuses. It mirrors the engine-side constant
-// (pkg/ddl); apitypes keeps its own copy so this package stays dependency-free.
+// (pkg/engine); apitypes keeps its own copy so this package stays
+// dependency-free.
 const executionModeBlocked = "blocked"
 
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.

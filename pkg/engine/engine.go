@@ -264,11 +264,29 @@ type TableChange struct {
 	// Execution-mode verdict: how the engine will run this statement at apply
 	// time. Empty means the engine's default path. "blocked" means the engine
 	// deterministically refuses the statement — the apply will fail, and the
-	// plan surfaces that up front. Distinct from IsUnsafe, which flags a
-	// change the engine *can* run but the operator must acknowledge.
+	// plan surfaces that up front. "direct" means the database's direct
+	// execution policy routes the refused statement to native DDL on the
+	// target instead. Distinct from IsUnsafe, which flags a change the engine
+	// *can* run but the operator must acknowledge.
 	ExecutionMode string
-	ModeReason    string // Engine's reason when ExecutionMode is "blocked"
+	ModeReason    string // Engine's reason for any non-empty ExecutionMode verdict
 }
+
+// Execution-mode verdicts recorded on a planned table change. The verdict
+// answers "how will this statement actually run?" so operators learn about
+// engine limitations at plan time instead of at apply time.
+const (
+	// ExecutionModeBlocked marks a statement the engine deterministically
+	// refuses. An apply containing it will fail, and retrying cannot succeed
+	// until the statement changes.
+	ExecutionModeBlocked = "blocked"
+
+	// ExecutionModeDirect marks a statement the engine refuses but that the
+	// database's direct execution policy routes to native DDL on the target
+	// instead: it runs synchronously, it blocks writes to the table while it
+	// runs, and it is not revertible.
+	ExecutionModeDirect = "direct"
+)
 
 // ApplyRequest contains the input for starting a schema change.
 // On first apply, set the resume context to group related DDL.
