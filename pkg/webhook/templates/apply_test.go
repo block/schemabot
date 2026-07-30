@@ -1744,7 +1744,7 @@ func TestRenderApplyBlockedByPriorEnvCheckError(t *testing.T) {
 	})
 
 	t.Run("full body is stable", func(t *testing.T) {
-		expected := "## ❌ Apply Blocked\n\nCould not verify staging status: failed to create GitHub client. Retry the apply command.\n\n_See server logs for details._"
+		expected := "## ❌ Apply Blocked\n\nCould not verify staging status: failed to create GitHub client. Retry the apply command.\n\n_See server logs for details._\n" + supportChannelOfferMarker + "\n"
 
 		assert.Equal(t, expected, RenderApplyBlockedByPriorEnvCheckError("staging", "create GitHub client"))
 	})

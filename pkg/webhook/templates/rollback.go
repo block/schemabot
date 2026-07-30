@@ -88,18 +88,18 @@ func RenderRollbackConfirmNoLock(database, environment, tenant string) string {
 // tenant; when set, the suggested commands carry it so pasting a hint
 // addresses this deployment.
 func RenderRollbackMissingApplyID(tenant string) string {
-	return "## Missing Apply ID\n\n" +
+	return offerSupportChannel("## Missing Apply ID\n\n" +
 		fmt.Sprintf("Usage: `%s`\n\n", tenantCommand("schemabot rollback <apply-id>", "<environment>", tenant)) +
 		fmt.Sprintf("Confirm a generated rollback with `%s`.\n\n", tenantCommand("schemabot rollback-confirm", "<environment>", tenant)) +
 		"You can find the apply ID in the summary comment of a completed apply, " +
-		fmt.Sprintf("or by running `%s`.", appendTenantFlag("schemabot status", tenant))
+		fmt.Sprintf("or by running `%s`.", appendTenantFlag("schemabot status", tenant)))
 }
 
 // RenderRollbackApplyNotFound renders the message posted when the supplied apply ID
 // does not match any stored apply.
 func RenderRollbackApplyNotFound(applyID string) string {
-	return fmt.Sprintf("## Apply Not Found\n\n"+
-		"No apply found with ID `%s`. Check the ID and try again.", applyID)
+	return offerSupportChannel(fmt.Sprintf("## Apply Not Found\n\n"+
+		"No apply found with ID `%s`. Check the ID and try again.", applyID))
 }
 
 // RollbackRejectedData contains the details shown when SchemaBot refuses to
@@ -153,20 +153,20 @@ func sanitizedRollbackRejectionReason(reason string) string {
 // deployment.
 func RenderRollbackBlockedByLock(database, environment, lockOwner, lockRepo string, lockPR int, tenant string) string {
 	if lockPR > 0 && lockRepo != "" {
-		return fmt.Sprintf("## Rollback Blocked\n\n"+
+		return offerSupportChannel(fmt.Sprintf("## Rollback Blocked\n\n"+
 			"**Database**: `%s` | **Environment**: `%s`\n\n"+
 			"A lock is currently held by [%s#%d](https://github.com/%s/pull/%d).\n\n"+
 			"Wait for that operation to complete, or ask the lock owner to run `%s`.",
 			database, environment,
 			lockRepo, lockPR,
 			lockRepo, lockPR,
-			appendTenantFlag("schemabot unlock", tenant))
+			appendTenantFlag("schemabot unlock", tenant)))
 	}
-	return fmt.Sprintf("## Rollback Blocked\n\n"+
+	return offerSupportChannel(fmt.Sprintf("## Rollback Blocked\n\n"+
 		"**Database**: `%s` | **Environment**: `%s`\n\n"+
 		"A lock is currently held by `%s`.\n\n"+
 		"Wait for that operation to complete, or ask the lock owner to release it.",
-		database, environment, lockOwner)
+		database, environment, lockOwner))
 }
 
 // RenderRollbackNothingToDo renders the message posted when a rollback plan

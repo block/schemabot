@@ -212,6 +212,7 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 		writeEnvironmentTitle(sb, "✅ Schema Change Applied", data.Environment)
 	case state.Apply.Failed:
 		writeEnvironmentTitle(sb, "❌ Schema Change Failed", data.Environment)
+		writeSupportChannelOffer(sb)
 	case state.Apply.Stopped:
 		writeEnvironmentTitle(sb, "⏹️ Schema Change Stopped", data.Environment)
 	case state.Apply.Reverted:
@@ -233,6 +234,7 @@ func writeRollbackHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 		writeEnvironmentTitle(sb, "⏪ Rollback Complete", data.Environment)
 	case state.Apply.Failed:
 		writeEnvironmentTitle(sb, "❌ Rollback Failed", data.Environment)
+		writeSupportChannelOffer(sb)
 	case state.Apply.Stopped:
 		writeEnvironmentTitle(sb, "⏹️ Rollback Stopped", data.Environment)
 	case state.Apply.Cancelled:
@@ -288,6 +290,9 @@ func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
 		detail += fmt.Sprintf(" | Volume: %d/%d", data.Volume, storage.MaxVolume)
 	}
 	fmt.Fprintf(sb, "\n**Status**: %s\n", detail)
+	if state.IsState(data.State, state.Apply.Failed) {
+		writeSupportChannelOffer(sb)
+	}
 }
 
 func applyStatusDetail(applyState string) string {
