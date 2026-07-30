@@ -2943,7 +2943,41 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 	if err := c.reconcileStoredTasksForTerminalRemoteApply(ctx, storedApply, remoteApply, storedTasks, now); err != nil {
 		return err
 	}
+	if err := c.stampRemoteApplyErrorOnFailedTasks(ctx, storedApply, remoteApply, storedTasks, now); err != nil {
+		return err
+	}
 	return c.persistTerminalStateFromRemote(ctx, storedApply, remoteApply, now, scope)
+}
+
+// stampRemoteApplyErrorOnFailedTasks copies a failed remote apply's error
+// message onto its failed stored task rows that carry no error of their own.
+// A remote TableProgress snapshot carries no per-table error text, so a task
+// mirrored to failed from remote progress persists with an empty ErrorMessage
+// even when the remote apply carries the actionable failure reason (for
+// example an engine preflight rejection). The stored task row is what the
+// operator derives the operation row from, so an empty task error would
+// otherwise become an empty operation — and PR-comment — failure reason. A
+// task that already carries its own, more specific error keeps it.
+func (c *GRPCClient) stampRemoteApplyErrorOnFailedTasks(ctx context.Context, storedApply, remoteApply *storage.Apply, storedTasks []*storage.Task, now time.Time) error {
+	if !state.IsState(remoteApply.State, state.Apply.Failed) || remoteApply.ErrorMessage == "" {
+		return nil
+	}
+	for _, storedTask := range storedTasks {
+		if !state.IsState(storedTask.State, state.Task.Failed) || storedTask.ErrorMessage != "" {
+			continue
+		}
+		storedTask.ErrorMessage = remoteApply.ErrorMessage
+		storedTask.UpdatedAt = now
+		if err := c.storage.Tasks().Update(ctx, storedTask); err != nil {
+			return fmt.Errorf("stamp remote apply error on failed task %s for %s: %w", storedTask.TaskIdentifier, storedApply.ApplyIdentifier, err)
+		}
+		slog.Info("stamped remote apply failure reason on failed task that carried no error",
+			append(storedApply.LogAttrs(),
+				"task_id", storedTask.TaskIdentifier,
+				"table", storedTask.TableName,
+				"error_message", remoteApply.ErrorMessage)...)
+	}
+	return nil
 }
 
 func storedStoppedApplyCanAdoptRemoteTerminalState(storedApply, remoteApply *storage.Apply) bool {
