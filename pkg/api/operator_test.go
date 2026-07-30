@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
@@ -135,6 +137,98 @@ func TestResumeClaimedApplyWithOptions_SuppressesRecoveredObserverForMultiOp(t *
 	assert.False(t, observerSet, "a multi-op drive must not fire the per-driver observer hook")
 	assert.Zero(t, deploymentClient.observerApplyID, "no observer must be registered for a multi-op drive")
 	assert.Nil(t, deploymentClient.observer)
+}
+
+// An operator drive binds a drive-scoped logger once at the claim boundary, so
+// every log line of the drive carries the apply's identity (apply_id, repo, pr,
+// database, environment) and the effective deployment without each call site
+// hand-listing them — including calls that pass no identity attrs at all, such
+// as the missing-apply-log-store warning. Mutable state is not frozen into the
+// bound logger: lines carry a state attribute only where the call site supplies
+// the value that is current at emit time.
+func TestResumeClaimedApply_DriveLogsCarryApplyIdentity(t *testing.T) {
+	deploymentClient := &mockTernClient{}
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, &ServerConfig{}, map[string]tern.Client{
+		"east/staging": deploymentClient,
+	}, logger)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "appdb",
+		DatabaseType:    "mysql",
+		Deployment:      "east",
+		Environment:     "staging",
+		Repository:      "org/repo",
+		PullRequest:     123,
+		State:           state.Apply.Pending,
+	}
+
+	resumed, err := svc.resumeClaimedApply(t.Context(), 1, apply, 0, "")
+	require.NoError(t, err)
+	assert.True(t, resumed)
+
+	lines := decodeLogLines(t, logBuf.Bytes())
+
+	assertDriveIdentity := func(line map[string]any) {
+		t.Helper()
+		assert.Equal(t, "apply-42", line["apply_id"])
+		assert.Equal(t, "appdb", line["database"])
+		assert.Equal(t, "mysql", line["database_type"])
+		assert.Equal(t, "staging", line["environment"])
+		assert.Equal(t, "org/repo", line["repo"])
+		assert.Equal(t, float64(123), line["pr"])
+		assert.Equal(t, "east", line["deployment"])
+		assert.Equal(t, float64(1), line["driver"])
+	}
+
+	claimed := requireLogLine(t, lines, "operator: claimed apply")
+	assertDriveIdentity(claimed)
+	assert.Equal(t, state.Apply.Pending, claimed["state"],
+		"claim line must snapshot the state current at claim time")
+
+	// The call site passes only the message — every identity attr must come
+	// from the bound logger.
+	noStore := requireLogLine(t, lines, "operator: no apply log store configured; apply claim will not appear in apply logs")
+	assertDriveIdentity(noStore)
+
+	resumedLine := requireLogLine(t, lines, "operator: resumed apply")
+	assertDriveIdentity(resumedLine)
+	assert.Equal(t, state.Apply.Pending, resumedLine["previous_state"])
+	assert.NotContains(t, resumedLine, "state",
+		"mutable state must not be frozen into the bound drive logger")
+}
+
+// decodeLogLines parses newline-delimited slog JSON output into one map per line.
+func decodeLogLines(t *testing.T, output []byte) []map[string]any {
+	t.Helper()
+	var lines []map[string]any
+	for raw := range bytes.SplitSeq(bytes.TrimSpace(output), []byte("\n")) {
+		if len(raw) == 0 {
+			continue
+		}
+		var line map[string]any
+		require.NoError(t, json.Unmarshal(raw, &line), "log output must be valid JSON: %s", raw)
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// requireLogLine returns the first log line with the given message, failing the
+// test when none exists.
+func requireLogLine(t *testing.T, lines []map[string]any, msg string) map[string]any {
+	t.Helper()
+	for _, line := range lines {
+		if line["msg"] == msg {
+			return line
+		}
+	}
+	require.Failf(t, "log line not found", "no log line with msg %q in %d lines", msg, len(lines))
+	return nil
 }
 
 // TestMarkOperationFromApplyState_MirrorsFailedRetryable verifies that a parent

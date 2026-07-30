@@ -17,22 +17,46 @@ func (a *Apply) LogAttrs() []any {
 	if a == nil {
 		return nil
 	}
+	attrs := append(a.IdentityLogAttrs(),
+		"deployment", a.Deployment,
+		"state", a.State,
+	)
+	if a.ExternalID != "" {
+		attrs = append(attrs, "external_id", a.ExternalID)
+	}
+	return attrs
+}
+
+// IdentityLogAttrs returns the apply attributes that stay fixed for the
+// lifetime of a drive claim: the searchable identifier, the target database,
+// and — when set — the PR provenance (repo, pr, caller). It exists so a
+// driver can bind a drive-scoped logger once at the claim boundary:
+//
+//	logger := s.logger.With(apply.IdentityLogAttrs()...)
+//
+// and have every line of the drive inherit the identity without hand-listing
+// it per call. Mutable attributes are deliberately excluded because With
+// snapshots values at bind time: state changes throughout the drive, the
+// deployment being driven may be an operation's own rather than the apply
+// row's, and external_id is assigned by the remote data plane mid-drive —
+// bind or append those explicitly where they are current. LogAttrs remains
+// the per-call helper that also snapshots deployment, state, and external_id.
+// A nil receiver returns nil.
+func (a *Apply) IdentityLogAttrs() []any {
+	if a == nil {
+		return nil
+	}
 	attrs := []any{
 		"apply_id", a.ApplyIdentifier,
 		"database", a.Database,
 		"database_type", a.DatabaseType,
 		"environment", a.Environment,
-		"deployment", a.Deployment,
-		"state", a.State,
 	}
 	if a.Repository != "" {
 		attrs = append(attrs, "repo", a.Repository)
 	}
 	if a.PullRequest > 0 {
 		attrs = append(attrs, "pr", a.PullRequest)
-	}
-	if a.ExternalID != "" {
-		attrs = append(attrs, "external_id", a.ExternalID)
 	}
 	if a.Caller != "" {
 		attrs = append(attrs, "caller", a.Caller)
