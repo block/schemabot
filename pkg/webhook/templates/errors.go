@@ -257,15 +257,16 @@ func RenderUnmanagedSchemaConfigsNotice(configs []UnmanagedSchemaConfigNoticeDat
 	if err := tmplUnmanagedNotice.Execute(&sb, data); err != nil {
 		return fmt.Sprintf("Error rendering template: %v", err)
 	}
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // PreviewCommentUnmanagedSchemaConfigsNotice renders a sample notice for
-// schema changes under configs this deployment does not manage.
+// schema changes under configs this deployment does not manage, with the
+// support-channel footer a configured deployment appends to it.
 func PreviewCommentUnmanagedSchemaConfigsNotice() string {
-	return RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
+	return RenderSupportChannelFooter(RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
 		{Database: "inventory", SchemaPath: "services/inventory/schema"},
-	})
+	}), previewSupportChannel())
 }
 
 // RenderMultipleConfigs renders the "multiple configs" error comment.
