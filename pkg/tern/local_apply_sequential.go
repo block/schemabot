@@ -21,9 +21,13 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 	seqStart := time.Now()
 	creds := c.credentials()
 	defer c.setupSpiritLogging(ctx, apply, tasks)()
+	// Bind the apply's identity once so every line of this sequential drive is
+	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
+	// Mutable attrs (task state, apply state) stay per-call so they are never
+	// frozen stale into the bound logger.
+	logger := c.logger.With(apply.IdentityLogAttrs()...)
 
-	c.logger.Info("executeApplySequential starting",
-		"apply_id", apply.ApplyIdentifier,
+	logger.Info("executeApplySequential starting",
 		"task_count", len(tasks),
 		"plan_ddl_count", len(plan.FlatDDLChanges()),
 		"elapsed_ms", time.Since(seqStart).Milliseconds(),
@@ -34,7 +38,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 	apply.StartedAt = &now
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
+		logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
 	}
 
 	var failedTask *storage.Task
@@ -42,8 +46,8 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 
 	for i, task := range tasks {
 		if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
-			c.logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
-				"apply_id", apply.ApplyIdentifier, "error", err)
+			logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
+				"error", err)
 			return
 		} else if handled {
 			stoppedByUser = true
@@ -59,7 +63,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 			continue
 		}
 
-		c.logger.Info("executeApplySequential: starting task",
+		logger.Info("executeApplySequential: starting task",
 			"iteration", i+1, "total_tasks", len(tasks),
 			"task_id", task.TaskIdentifier, "table", task.TableName,
 			"elapsed_ms", time.Since(seqStart).Milliseconds(),
@@ -86,14 +90,13 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 	}
 
 	// Update apply state based on task outcomes
-	c.logger.Info("executeApplySequential loop finished",
-		"apply_id", apply.ApplyIdentifier,
+	logger.Info("executeApplySequential loop finished",
 		"tasks_processed", len(tasks),
 		"failed_task", failedTask != nil,
 		"stopped_by_user", stoppedByUser,
 	)
 	c.finalizeSequentialApply(ctx, apply, tasks, failedTask, stoppedByUser)
-	c.logger.Info("sequential apply finished", "apply_id", apply.ApplyIdentifier, "state", apply.State)
+	logger.Info("sequential apply finished", "state", apply.State)
 }
 
 // taskAction indicates the outcome of a single task execution step.
@@ -168,9 +171,10 @@ func sequentialEngineApplyRequest(task *storage.Task, options map[string]string,
 // runEngineTask calls the engine for a single DDL, marks the task running, and polls to completion.
 // Returns the outcome: taskContinue (completed), taskFailed, or taskStopped.
 func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, task *storage.Task, options map[string]string, creds *engine.Credentials) taskAction {
+	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
-		c.logger.Warn("pending stop request processing failed before sequential engine apply; current apply owner will exit for operator retry",
-			"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
+		logger.Warn("pending stop request processing failed before sequential engine apply; current apply owner will exit for operator retry",
+			"task_id", task.TaskIdentifier, "error", err)
 		return taskAbort
 	} else if handled {
 		return taskStopped
@@ -181,7 +185,8 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 		taskCreds, err = c.credentialsForMySQLNamespace(task.Namespace)
 		if err != nil {
 			c.markTaskFailed(ctx, task, err.Error())
-			c.logger.Error("task failed to resolve namespace credentials", append(task.LogAttrs(), "namespace", task.Namespace, "error", err)...)
+			logger.Error("task failed to resolve namespace credentials",
+				"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "namespace", task.Namespace, "error", err)
 			return taskFailed
 		}
 	}
@@ -197,12 +202,14 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 		} else {
 			c.markTaskFailed(ctx, task, err.Error())
 		}
-		c.logger.Error("task failed", append(task.LogAttrs(), "error", err)...)
+		logger.Error("task failed",
+			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
 		return taskFailed
 	}
 	if !result.Accepted {
 		c.markTaskFailed(ctx, task, result.Message)
-		c.logger.Error("task rejected", append(task.LogAttrs(), "engine_message", result.Message)...)
+		logger.Error("task rejected",
+			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "engine_message", result.Message)
 		return taskFailed
 	}
 
@@ -210,7 +217,7 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	now := time.Now()
 	task.StartedAt = &now
 	c.transitionTaskState(ctx, task, 0, state.Task.Running, "")
-	c.logger.Info("task running", "task_id", task.TaskIdentifier, "table", task.TableName)
+	logger.Info("task running", "task_id", task.TaskIdentifier, "table", task.TableName)
 
 	c.convergeTaskVolumeToStoredLevel(ctx, apply, task, taskCreds, result.ResumeState)
 
@@ -358,19 +365,20 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 // already have reclaimed the stale row. A transient failure inside the window
 // keeps the drive running and is retried on the next tick.
 func (c *LocalClient) applyHeartbeatFailureStopsDrive(ctx context.Context, apply *storage.Apply, hbErr error, lastSuccess time.Time) bool {
+	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if errors.Is(hbErr, storage.ErrApplyLeaseLost) {
-		c.logger.Warn("heartbeat failed because apply lease was lost; local driver will stop executing and writing apply state",
-			append(apply.LogAttrs(), "error", hbErr)...)
+		logger.Warn("heartbeat failed because apply lease was lost; local driver will stop executing and writing apply state",
+			append(apply.MutableLogAttrs(), "error", hbErr)...)
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, "lease_lost")
 		return true
 	}
 	if time.Since(lastSuccess) >= storage.ApplyLeaseStaleAfter {
-		c.logger.Warn("heartbeat has failed for the full lease staleness window; a peer operator can reclaim the apply, so this local driver will stop executing and writing apply state",
-			append(apply.LogAttrs(), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
+		logger.Warn("heartbeat has failed for the full lease staleness window; a peer operator can reclaim the apply, so this local driver will stop executing and writing apply state",
+			append(apply.MutableLogAttrs(), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, "lease_presumed_lost")
 		return true
 	}
-	c.logger.Warn("heartbeat failed; will retry", append(apply.LogAttrs(), "error", hbErr)...)
+	logger.Warn("heartbeat failed; will retry", append(apply.MutableLogAttrs(), "error", hbErr)...)
 	return false
 }
 
@@ -381,6 +389,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 	eng := c.getEngine()
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
+	logger := c.logger.With(apply.IdentityLogAttrs()...)
 
 	var consecutiveErrors int
 
@@ -390,16 +399,16 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			return taskStopped
 		case <-ticker.C:
 			if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
-				c.logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
-					"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
+				logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
+					"task_id", task.TaskIdentifier, "error", err)
 				return taskAbort
 			} else if handled {
 				task.State = state.Task.Stopped
 				return taskStopped
 			}
 			if err := c.processPendingCutoverControlRequest(ctx, apply); err != nil {
-				c.logger.Warn("pending cutover request processing failed; current apply owner will exit for operator retry",
-					"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
+				logger.Warn("pending cutover request processing failed; current apply owner will exit for operator retry",
+					"task_id", task.TaskIdentifier, "error", err)
 				return taskAbort
 			}
 			// A volume failure never aborts the drive: the copy continues at
@@ -408,12 +417,12 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			// driving.
 			if err := c.processPendingVolumeControlRequest(ctx, apply, eng, creds, resumeState); err != nil {
 				if errors.Is(err, storage.ErrApplyLeaseLost) {
-					c.logger.Warn("pending volume request processing lost the apply lease; current apply owner will exit for operator retry",
-						"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
+					logger.Warn("pending volume request processing lost the apply lease; current apply owner will exit for operator retry",
+						"task_id", task.TaskIdentifier, "error", err)
 					return taskAbort
 				}
-				c.logger.Warn("pending volume request processing failed; the drive continues and retries at the next progress tick",
-					"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
+				logger.Warn("pending volume request processing failed; the drive continues and retries at the next progress tick",
+					"task_id", task.TaskIdentifier, "error", err)
 			}
 
 			// Re-fetch task state from storage to detect external changes (e.g., Stop).
@@ -437,7 +446,8 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				// grouped poll.
 				var permanent *engine.PermanentError
 				if errors.As(err, &permanent) {
-					c.logger.Error("progress check failed with permanent error", append(task.LogAttrs(), "error", err)...)
+					logger.Error("progress check failed with permanent error",
+						"task_id", task.TaskIdentifier, "table", task.TableName, "error", err)
 					c.markTaskFailed(ctx, task, fmt.Sprintf("progress polling failed: %v", err))
 					return taskFailed
 				}
@@ -446,7 +456,8 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				// database's active-apply slot and blocks every later apply. Fail
 				// after a bounded run of errors, matching the grouped poll.
 				consecutiveErrors++
-				c.logger.Warn("progress check failed", append(task.LogAttrs(), "error", err, "consecutive_errors", consecutiveErrors)...)
+				logger.Warn("progress check failed",
+					"task_id", task.TaskIdentifier, "table", task.TableName, "error", err, "consecutive_errors", consecutiveErrors)
 				if consecutiveErrors >= 10 {
 					if c.shouldRetryEngineError(err) {
 						c.markTaskRetryable(ctx, task, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", consecutiveErrors, err))
@@ -498,7 +509,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 						task.TaskIdentifier, result.State, result.Message, task.RowsCopied, task.RowsTotal)
 				}
 				c.transitionTaskState(ctx, task, task.ApplyID, task.State, logMsg)
-				c.logger.Info("task finished",
+				logger.Info("task finished",
 					"task_id", task.TaskIdentifier,
 					"table", task.TableName,
 					"engine_state", result.State,
@@ -552,17 +563,18 @@ func (c *LocalClient) shouldRetryEngineError(err error) bool {
 // pending tasks queued for operator recovery.
 func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, failedTask *storage.Task, stoppedByUser bool) {
 	now := time.Now()
+	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err != nil {
-		c.logger.Error("failed to reload apply before sequential finalization", append(apply.LogAttrs(), "error", err)...)
+		logger.Error("failed to reload apply before sequential finalization",
+			append(apply.MutableLogAttrs(), "error", err)...)
 		return
 	} else if freshApply != nil && state.IsTerminalApplyState(freshApply.State) {
-		c.logger.Info("apply already terminal in storage, not overwriting during sequential finalization",
-			"apply_id", apply.ApplyIdentifier,
+		logger.Info("apply already terminal in storage, not overwriting during sequential finalization",
 			"stored_state", freshApply.State)
 		*apply = *freshApply
 		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
-			c.logger.Warn("failed to complete pending control requests for terminal sequential apply",
-				"apply_id", apply.ApplyIdentifier, "error", err)
+			logger.Warn("failed to complete pending control requests for terminal sequential apply",
+				"error", err)
 		}
 		return
 	}
@@ -588,12 +600,12 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 	}
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
+		logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
 	}
 	if state.IsTerminalApplyState(apply.State) {
 		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
-			c.logger.Warn("failed to complete pending control requests after sequential finalization",
-				append(apply.LogAttrs(), "error", err)...)
+			logger.Warn("failed to complete pending control requests after sequential finalization",
+				append(apply.MutableLogAttrs(), "error", err)...)
 			return
 		}
 	}
