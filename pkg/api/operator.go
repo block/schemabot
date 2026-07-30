@@ -1076,6 +1076,9 @@ func (s *Service) recordCheckRefreshIfApplyResolved(ctx context.Context, driverI
 	s.logger.Info("operator: recorded check refresh request for completed apply; sibling PR checks against the target will be re-planned",
 		append(apply.LogAttrs(), "driver", driverID)...)
 	metrics.RecordCheckRefreshRecorded(ctx, apply.Database, apply.Environment, metrics.CheckRefreshSourceDriveTail)
+	if s.OnCheckRefreshRecorded != nil {
+		s.OnCheckRefreshRecorded()
+	}
 }
 
 // reconcileUnclaimableParent handles a claimed operation whose parent apply

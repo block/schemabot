@@ -178,6 +178,15 @@ type Service struct {
 	// against any still-live per-driver observer.
 	OnApplyTerminalSummary ApplyTerminalSummaryCallback
 
+	// OnCheckRefreshRecorded is called after a drive tail durably records a
+	// check refresh request. Set by the webhook handler to wake its refresh
+	// processor immediately instead of waiting for the next poll tick. The
+	// durable request row stays the source of truth: a missed call (no
+	// processor on this pod, callback unset) only costs poll latency, never
+	// the refresh. Implementations must be non-blocking and safe for
+	// concurrent drivers.
+	OnCheckRefreshRecorded func()
+
 	pendingObserverMu sync.Mutex
 	pendingObservers  map[pendingObserverKey]tern.ProgressObserver
 }

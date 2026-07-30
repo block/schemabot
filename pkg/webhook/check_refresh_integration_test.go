@@ -65,6 +65,18 @@ func TestE2ECheckRefreshRecordedOnApplyTerminalSuccess(t *testing.T) {
 
 	h := newE2EHandler(t, svc, client)
 
+	// The drive tail must invoke the registered recorded-notifier so a
+	// co-located processor drains the request immediately instead of waiting
+	// for its next poll tick. Installed after the handler so this probe is
+	// the active registration.
+	kicked := make(chan struct{}, 1)
+	svc.OnCheckRefreshRecorded = func() {
+		select {
+		case kicked <- struct{}{}:
+		default:
+		}
+	}
+
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply -e staging",
 		isPR:    true,
@@ -121,4 +133,10 @@ func TestE2ECheckRefreshRecordedOnApplyTerminalSuccess(t *testing.T) {
 	assert.Equal(t, 1, refreshReq.PullRequest)
 	assert.Equal(t, apply.Caller, refreshReq.RequestedBy)
 	assert.Equal(t, storage.CheckRefreshPending, refreshReq.State)
+
+	select {
+	case <-kicked:
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the drive tail to invoke the check refresh recorded-notifier")
+	}
 }
