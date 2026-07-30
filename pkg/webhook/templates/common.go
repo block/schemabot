@@ -68,6 +68,40 @@ func currentTimestamp() string {
 	return TimestampFunc()
 }
 
+// supportChannelOfferMarker flags a rendered comment as reporting a problem
+// the author may need help resolving. GitHub never renders HTML comments, so
+// the marker is invisible on the PR. Render functions declare footer
+// eligibility explicitly with offerSupportChannel/writeSupportChannelOffer;
+// the webhook layer appends the support-channel footer to any comment that
+// carries the marker, without inspecting human-visible copy.
+const supportChannelOfferMarker = "<!-- schemabot:offer-support-channel -->"
+
+// OffersSupportChannel reports whether a rendered comment declared itself
+// eligible for the support-channel footer. Embedded sections keep their
+// marker, so an aggregate comment containing a failed per-deployment section
+// offers support just like the standalone comment would.
+func OffersSupportChannel(body string) bool {
+	return strings.Contains(body, supportChannelOfferMarker)
+}
+
+// offerSupportChannel appends the support marker to a rendered comment body.
+func offerSupportChannel(body string) string {
+	if strings.Contains(body, supportChannelOfferMarker) {
+		return body
+	}
+	return strings.TrimRight(body, "\n") + "\n" + supportChannelOfferMarker + "\n"
+}
+
+// writeSupportChannelOffer writes the support marker into a comment being
+// composed, for builders that decide eligibility mid-composition (e.g. on a
+// failed status line). At most one marker is written per comment.
+func writeSupportChannelOffer(sb *strings.Builder) {
+	if strings.Contains(sb.String(), supportChannelOfferMarker) {
+		return
+	}
+	sb.WriteString(supportChannelOfferMarker + "\n")
+}
+
 // RenderSupportChannelFooter appends a support-channel footer to a rendered PR comment.
 func RenderSupportChannelFooter(body string, support SupportChannelData) string {
 	if support.Name == "" || support.URL == "" {
