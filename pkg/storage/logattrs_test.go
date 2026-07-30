@@ -70,6 +70,40 @@ func TestApplyIdentityLogAttrs(t *testing.T) {
 	})
 }
 
+func TestApplyMutableLogAttrs(t *testing.T) {
+	t.Run("nil receiver returns nil", func(t *testing.T) {
+		var a *Apply
+		assert.Nil(t, a.MutableLogAttrs())
+	})
+
+	t.Run("carries only per-call attrs, never bound identity", func(t *testing.T) {
+		a := &Apply{
+			ApplyIdentifier: "apply-abc123",
+			Database:        "orders",
+			DatabaseType:    "mysql",
+			Environment:     "staging",
+			Deployment:      "primary",
+			State:           "running",
+			Repository:      "org/repo",
+			PullRequest:     1090,
+		}
+		m := attrsToMap(t, a.MutableLogAttrs())
+		assert.Equal(t, "primary", m["deployment"])
+		assert.Equal(t, "running", m["state"])
+		assert.NotContains(t, m, "external_id", "unset external_id is omitted")
+		assert.NotContains(t, m, "apply_id", "identity attrs belong to the bound logger")
+		assert.NotContains(t, m, "database")
+		assert.NotContains(t, m, "repo")
+
+		a.State = "completed"
+		a.ExternalID = "apply-remote456"
+		m = attrsToMap(t, a.MutableLogAttrs())
+		assert.Equal(t, "completed", m["state"], "MutableLogAttrs snapshots the state at each call")
+		assert.Equal(t, "apply-remote456", m["external_id"],
+			"MutableLogAttrs snapshots the external_id at each call once the data plane assigns it")
+	})
+}
+
 func TestApplyLogAttrs(t *testing.T) {
 	t.Run("nil receiver returns nil", func(t *testing.T) {
 		var a *Apply

@@ -3085,15 +3085,20 @@ type capturedLog struct {
 }
 
 // captureHandler is a minimal slog.Handler that records every emitted record so
-// tests can assert on level, message, and attributes.
+// tests can assert on level, message, and attributes — including attrs bound
+// with Logger.With, so tests can prove bound-logger inheritance.
 type captureHandler struct {
 	records *[]capturedLog
+	bound   []slog.Attr
 }
 
 func (h captureHandler) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
-	attrs := make(map[string]any, r.NumAttrs())
+	attrs := make(map[string]any, len(h.bound)+r.NumAttrs())
+	for _, a := range h.bound {
+		attrs[a.Key] = a.Value.Any()
+	}
 	r.Attrs(func(a slog.Attr) bool {
 		attrs[a.Key] = a.Value.Any()
 		return true
@@ -3102,8 +3107,24 @@ func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 
-func (h captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
-func (h captureHandler) WithGroup(string) slog.Handler      { return h }
+func (h captureHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	h.bound = append(slices.Clip(h.bound), attrs...)
+	return h
+}
+func (h captureHandler) WithGroup(string) slog.Handler { return h }
+
+// requireCapturedLog returns the first captured record with the given message,
+// failing the test when none exists.
+func requireCapturedLog(t *testing.T, records []capturedLog, msg string) capturedLog {
+	t.Helper()
+	for _, rec := range records {
+		if rec.msg == msg {
+			return rec
+		}
+	}
+	t.Fatalf("expected a log record with message %q; got %d records", msg, len(records))
+	return capturedLog{}
+}
 
 // A canonical, positive revert_window_duration in metadata is honored, while an
 // empty value falls back to the engine default. A malformed or non-positive
