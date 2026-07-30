@@ -1071,6 +1071,9 @@ This PR changes schema under the following path(s), which this SchemaBot instanc
 These schema changes will **not** be planned or applied, and the SchemaBot checks on this PR do not cover them.
 
 If SchemaBot should manage them, ask a SchemaBot operator to add the directory to the database's `allowed_dirs` in the server config; otherwise remove these schema changes from this PR.
+<!-- schemabot:offer-support-channel -->
+
+> 💬 Support: [#schema-help](https://chat.example.com/schema-help).
 </details>
 
 <details>

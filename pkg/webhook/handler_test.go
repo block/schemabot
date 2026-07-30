@@ -245,6 +245,22 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
 	})
 
+	t.Run("appends to unmanaged schema change notices", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment(templates.RenderUnmanagedSchemaConfigsNotice([]templates.UnmanagedSchemaConfigNoticeData{
+			{SchemaPath: "services/orders/schema", Database: "orders"},
+		}))
+
+		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
+	})
+
 	t.Run("does not append to plan comments with unsafe-change advisories", func(t *testing.T) {
 		cfg := &api.ServerConfig{
 			SupportChannel: api.SupportChannelConfig{
