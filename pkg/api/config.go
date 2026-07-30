@@ -924,6 +924,17 @@ type EnvironmentConfig struct {
 	// failed deployment. Only meaningful alongside a Deployments map.
 	OnFailure string `yaml:"on_failure,omitempty"`
 
+	// DirectExecution configures direct execution of ALTER statements the
+	// MySQL schema-change engine refuses (e.g. table reshapes it cannot copy).
+	// When enabled, a refused statement whose table's estimated row count is
+	// within max_table_rows runs verbatim as native MySQL DDL: synchronous,
+	// blocking writes to the table while it runs, and not revertible. When
+	// unset or disabled (the default), refused statements are blocked. Only
+	// valid for MySQL databases: setting this block on any other database
+	// type fails config validation, even when disabled, so a policy that can
+	// never take effect is never silently carried in config.
+	DirectExecution *DirectExecutionConfig `yaml:"direct_execution,omitempty"`
+
 	// For PlanetScale/Vitess:
 	// Organization is the PlanetScale organization name.
 	// sadscan:disable kingfisher.planetscale.2
@@ -944,6 +955,48 @@ type EnvironmentConfig struct {
 	// When set, registers a named TLS config with the Go MySQL driver.
 	// Omit for LocalScale (no TLS) or set for real PlanetScale (mTLS with CA bundle).
 	TLS *TLSConfig `yaml:"tls,omitempty"`
+}
+
+// DirectExecutionConfig configures direct execution of engine-refused ALTER
+// statements as native MySQL DDL for one database environment.
+type DirectExecutionConfig struct {
+	// Enabled turns on direct execution for this environment.
+	Enabled bool `yaml:"enabled"`
+
+	// MaxTableRows is the fail-closed size bound: a refused statement runs
+	// directly only when the target table's estimated row count is at or
+	// below this bound. Statements on larger tables — or tables whose size
+	// cannot be determined — are blocked. Required (positive) when Enabled
+	// is true.
+	MaxTableRows int64 `yaml:"max_table_rows,omitempty"`
+
+	// LockAcquisitionTimeout bounds how long each direct statement waits to
+	// acquire its locks before the apply fails with a retryable busy-table
+	// error — instead of queueing on the table's lock indefinitely while all
+	// new table traffic stalls behind the queued DDL. Each engine maps it to
+	// its native session lock timeout. A whole number of seconds (e.g.
+	// "10s"). Optional; the engine applies its default when omitted.
+	LockAcquisitionTimeout string `yaml:"lock_acquisition_timeout,omitempty"`
+}
+
+// lockAcquisitionTimeoutSeconds parses the configured lock acquisition
+// timeout into whole seconds. Returns (0, nil) when the field is unset,
+// leaving the engine default in effect.
+func (c *DirectExecutionConfig) lockAcquisitionTimeoutSeconds() (int64, error) {
+	if c.LockAcquisitionTimeout == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.LockAcquisitionTimeout)
+	if err != nil {
+		return 0, fmt.Errorf("lock_acquisition_timeout %q is not a valid duration: %w", c.LockAcquisitionTimeout, err)
+	}
+	if d < time.Second {
+		return 0, fmt.Errorf("lock_acquisition_timeout %q must be at least 1s", c.LockAcquisitionTimeout)
+	}
+	if d%time.Second != 0 {
+		return 0, fmt.Errorf("lock_acquisition_timeout %q must be a whole number of seconds (engines apply the bound with second granularity)", c.LockAcquisitionTimeout)
+	}
+	return int64(d / time.Second), nil
 }
 
 type externalDatabaseEndpoint struct {
@@ -1205,6 +1258,9 @@ func (c *ServerConfig) Validate() error {
 		}
 		for env, envConfig := range dbConfig.Environments {
 			if err := envConfig.validateRevertWindowDuration(fmt.Sprintf("database %q environment %q", name, env)); err != nil {
+				return err
+			}
+			if err := envConfig.validateDirectExecution(fmt.Sprintf("database %q environment %q", name, env), dbConfig.Type); err != nil {
 				return err
 			}
 			hasDSN := envConfig.HasLocalDSN()
@@ -2446,6 +2502,29 @@ func (c EnvironmentConfig) validateRevertWindowDuration(context string) error {
 	}
 	if d <= 0 {
 		return fmt.Errorf("%s revert_window_duration %q must be positive (omit it to use the engine default)", context, c.RevertWindowDuration)
+	}
+	return nil
+}
+
+// validateDirectExecution ensures a configured direct execution policy is
+// well-formed. Enabling direct execution requires a positive max_table_rows
+// bound so the size gate can never be accidentally unbounded, and the policy
+// is rejected on non-MySQL databases where it has no effect — a config that
+// looks like it grants direct execution must never be silently ignored.
+func (c EnvironmentConfig) validateDirectExecution(context, databaseType string) error {
+	if c.DirectExecution == nil {
+		return nil
+	}
+	if databaseType != storage.DatabaseTypeMySQL {
+		return fmt.Errorf("%s sets direct_execution, which is only supported for %s databases (type is %q)", context, storage.DatabaseTypeMySQL, databaseType)
+	}
+	if c.DirectExecution.Enabled && c.DirectExecution.MaxTableRows <= 0 {
+		return fmt.Errorf("%s enables direct_execution but max_table_rows is %d (a positive bound is required)", context, c.DirectExecution.MaxTableRows)
+	}
+	// Validated even when the block is disabled: a malformed value must fail
+	// at startup, never be silently carried until the policy is enabled.
+	if _, err := c.DirectExecution.lockAcquisitionTimeoutSeconds(); err != nil {
+		return fmt.Errorf("%s direct_execution: %w", context, err)
 	}
 	return nil
 }

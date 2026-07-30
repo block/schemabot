@@ -14,10 +14,14 @@
 - [Drivers](#drivers)
 - [Metrics](#metrics)
 - [Pending Drops](#pending-drops)
+- [Direct Execution](#direct-execution)
+- [Storage Connection Pool](#storage-connection-pool)
+- [Spirit Run Settings](#spirit-run-settings)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
 - [Repository Allowlist](#repository-allowlist)
 - [PR Checks Gate](#pr-checks-gate)
+- [Base Branch Schema Freshness](#base-branch-schema-freshness)
 - [Review Gate](#review-gate)
 - [Authentication](#authentication)
   - [OIDC (Bearer tokens)](#oidc-bearer-tokens)
@@ -25,6 +29,7 @@
 - [Multi-Environment Deployment](#multi-environment-deployment)
   - [Staging Instance](#staging-instance)
   - [Production Instance](#production-instance)
+  - [Shared prior environment: `promotion-check-name`](#shared-prior-environment-promotion-check-name)
   - [Environment-local gRPC targets](#environment-local-grpc-targets)
   - [Tenant-scoped command routing](#tenant-scoped-command-routing)
   - [How it works](#how-it-works)
@@ -358,6 +363,54 @@ The cleaner only runs against local-mode MySQL databases (environments with a
 process has no target DSN and cannot clean that target. Cleanup runs only if the
 remote deployment is also a SchemaBot server with the target configured as
 local-mode MySQL and `cleanup_enabled: true`.
+
+## Direct Execution
+
+For MySQL databases executed by the Spirit engine, some ALTER statements are
+deterministically refused by the engine — for example dropping a primary key or
+adding a foreign key, which its online copy cannot preserve. By default those
+statements block the apply. The per-database-environment `direct_execution`
+policy lets a refused statement instead run verbatim as native MySQL DDL when
+the target table is small enough:
+
+```yaml
+databases:
+  payments:
+    type: mysql
+    environments:
+      staging:
+        dsn_secret_ref: "..."
+        direct_execution:
+          enabled: true           # default: false
+          max_table_rows: 100000  # required (positive) when enabled
+          lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
+```
+
+A direct statement is synchronous, blocks writes to the table while it runs,
+and cannot be reverted — `max_table_rows` is the fail-closed blast-radius
+bound. A refused statement runs directly only when the table's estimated row
+count (`information_schema` `TABLE_ROWS`) is at or below the bound; larger
+tables, and tables whose size cannot be determined, stay blocked. The estimate
+is the InnoDB optimizer's, so it can be off by a meaningful factor — set the
+bound with margin below your real tolerance. The bound is re-evaluated when
+the apply executes, so a table that grew past it after planning is blocked,
+not run.
+
+`lock_acquisition_timeout` bounds how long each direct statement waits to
+acquire its locks. Each engine maps it to its native session lock timeout —
+on MySQL, `lock_wait_timeout` and `innodb_lock_wait_timeout`. Native DDL
+queues on the table's metadata lock behind any open transaction that has
+touched the table — and by default MySQL lets it queue essentially forever,
+with all new table traffic stalling behind it. When the bound expires the
+apply fails fast with a retryable "table is busy" error instead. Lower it for
+environments where even a short stall is unacceptable; the value must be a
+whole number of seconds (at least `1s`).
+
+Config validation fails at startup when a `direct_execution` block — even a
+disabled one — is set on a non-MySQL database, when the policy is enabled
+without a positive `max_table_rows`, or when `lock_acquisition_timeout` is malformed
+(not a duration, under a second, or not whole seconds). A policy that can
+never take effect is never silently carried in config.
 
 ## Storage Connection Pool
 
