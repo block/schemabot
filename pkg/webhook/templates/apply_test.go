@@ -804,6 +804,103 @@ func TestRenderApplyStatusComment_Failed(t *testing.T) {
 	assert.Contains(t, result, "schemabot apply -e staging")
 }
 
+// A schema change the engine rejected before copying a single row (e.g. a
+// failed preflight check) must not render a progress bar: a red 0% bar reads
+// as a copy that started and stalled, when in fact nothing ran. The row reads
+// as a failed check instead.
+func TestRenderApplyStatusComment_FailedBeforeRowCopyHasNoProgressBar(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "qa",
+		State:       state.Apply.Failed,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{
+				TableName: "profiles",
+				DDL:       "ALTER TABLE `profiles` MODIFY COLUMN `consent_version` enum('V1','V2') NULL",
+				Status:    state.Task.Failed,
+			},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "**`profiles`**: ❌ Failed (before row copy started)")
+	assert.NotContains(t, result, "🟥", "no red bar segments for a copy that never started")
+	assert.NotContains(t, result, "⬜", "no empty bar segments for a copy that never started")
+}
+
+// An instant DDL change has no row copy phase, so its failure renders a plain
+// failed label — no progress bar, and no mention of row copy.
+func TestRenderApplyStatusComment_FailedInstantDDLHasPlainLabel(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "qa",
+		State:       state.Apply.Failed,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{
+				TableName: "profiles",
+				DDL:       "ALTER TABLE `profiles` ADD COLUMN `nickname` VARCHAR(64) NULL",
+				Status:    state.Task.Failed,
+				IsInstant: true,
+			},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "**`profiles`**: ❌ Failed\n")
+	assert.NotContains(t, result, "(before row copy started)", "instant DDL has no row copy phase to reference")
+	assert.NotContains(t, result, "🟥")
+	assert.NotContains(t, result, "⬜")
+}
+
+// A failure after row copy made progress keeps the red progress bar: the bar
+// truthfully shows how far the copy got before the engine gave up.
+func TestRenderApplyStatusComment_FailedAfterCopyProgressKeepsBar(t *testing.T) {
+	tests := []struct {
+		name  string
+		table TableProgressData
+	}{
+		{
+			name: "percent reported",
+			table: TableProgressData{
+				TableName:       "users",
+				Status:          state.Task.Failed,
+				PercentComplete: 30,
+				RowsCopied:      300,
+				RowsTotal:       1000,
+			},
+		},
+		{
+			name: "rows copied but percent still zero",
+			table: TableProgressData{
+				TableName:  "users",
+				Status:     state.Task.Failed,
+				RowsCopied: 42,
+				RowsTotal:  1000000,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := ApplyStatusCommentData{
+				Database:    "testapp",
+				Environment: "staging",
+				State:       state.Apply.Failed,
+				Tables:      []TableProgressData{tt.table},
+			}
+
+			result := RenderApplyStatusComment(data)
+
+			assert.Contains(t, result, "❌ Failed")
+			assert.NotContains(t, result, "(before row copy started)")
+			assert.Contains(t, result, "🟥", "failed bar shows the progress the copy actually made")
+		})
+	}
+}
+
 func TestTerminalStatusAndSummaryCommentTitlesAreDistinct(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:     "testapp",

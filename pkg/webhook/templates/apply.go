@@ -726,8 +726,19 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Failed:
-		bar := ui.ProgressBarFailed(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
-		fmt.Fprintf(sb, "**`%s`**: %s \u274c Failed\n", table.TableName, bar)
+		// A progress bar asserts that row copy happened. When the engine failed
+		// before copying a single row (e.g. a preflight check rejected the
+		// change), a red 0% bar reads as a copy that started and stalled — render
+		// the failure without one. An instant DDL change has no row copy phase
+		// at all, so its failure label does not mention one.
+		switch pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied); {
+		case pct > 0:
+			fmt.Fprintf(sb, "**`%s`**: %s \u274c Failed\n", table.TableName, ui.ProgressBarFailed(pct))
+		case table.IsInstant:
+			fmt.Fprintf(sb, "**`%s`**: \u274c Failed\n", table.TableName)
+		default:
+			fmt.Fprintf(sb, "**`%s`**: \u274c Failed (before row copy started)\n", table.TableName)
+		}
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.FailedRetryable:

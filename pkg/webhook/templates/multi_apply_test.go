@@ -417,6 +417,37 @@ func TestRenderMultiDeploymentApplySummaryComment_FailedDeploymentSummary(t *tes
 	assert.Contains(t, out, "To retry:")
 }
 
+// When the first deployment's engine rejects the change before copying a
+// single row (e.g. a failed preflight check) and halts the rest of the
+// rollout, the failed deployment's detail must not render a 0% progress bar —
+// nothing ran, so the row reads as a failed check, not a stalled copy.
+func TestRenderMultiDeploymentApplyComment_PreflightFailureHasNoProgressBar(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("apse2", so.Failed),
+		rollingOp("euwe1", so.Pending),
+		rollingOp("usea1", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "qa",
+		Details: map[string]ApplyStatusCommentData{
+			"apse2": {
+				Database:    "profiles_db",
+				Environment: "qa",
+				State:       state.Apply.Failed,
+				Tables: []TableProgressData{
+					{TableName: "profiles", Status: state.Task.Failed},
+				},
+			},
+		},
+	})
+
+	assert.Contains(t, out, "**`profiles`**: ❌ Failed (before row copy started)")
+	assert.NotContains(t, out, "🟥")
+	assert.NotContains(t, out, "⬜")
+}
+
 // A deployment in an unrecognized engine state still renders a summary line and
 // section without a leading space where the glyph would be.
 func TestRenderMultiDeploymentApplyComment_UnknownStateNoGlyph(t *testing.T) {
