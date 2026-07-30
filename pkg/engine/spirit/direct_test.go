@@ -28,7 +28,9 @@ func TestDirectPolicyFromMetadata_Disabled(t *testing.T) {
 }
 
 // Enabling direct execution with a positive row bound resolves the policy,
-// accepting any standard boolean spelling of the enable flag.
+// accepting any standard boolean spelling of the enable flag. The lock wait
+// bound is optional: absent, the engine default applies; set, the configured
+// value wins.
 func TestDirectPolicyFromMetadata_Enabled(t *testing.T) {
 	for _, enable := range []string{"true", "True", "1"} {
 		t.Run(enable, func(t *testing.T) {
@@ -39,8 +41,19 @@ func TestDirectPolicyFromMetadata_Enabled(t *testing.T) {
 			require.NoError(t, err)
 			assert.True(t, policy.Enabled)
 			assert.Equal(t, int64(500000), policy.MaxTableRows)
+			assert.Zero(t, policy.LockAcquisitionTimeoutSeconds)
+			assert.Equal(t, int64(defaultDirectLockAcquisitionTimeoutSeconds), policy.lockAcquisitionTimeoutSeconds())
 		})
 	}
+
+	policy, err := directPolicyFromMetadata(map[string]string{
+		"direct_execution":                                  "true",
+		"direct_execution_max_table_rows":                   "500000",
+		"direct_execution_lock_acquisition_timeout_seconds": "5",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(5), policy.LockAcquisitionTimeoutSeconds)
+	assert.Equal(t, int64(5), policy.lockAcquisitionTimeoutSeconds())
 }
 
 // A malformed policy is a hard error, never a silent fallback to disabled:
@@ -70,6 +83,18 @@ func TestDirectPolicyFromMetadata_Malformed(t *testing.T) {
 		"unrecognized enable value": {
 			md:      map[string]string{"direct_execution": "yes"},
 			wantErr: `invalid direct_execution metadata value "yes"`,
+		},
+		"non-numeric lock wait": {
+			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "1000", "direct_execution_lock_acquisition_timeout_seconds": "fast"},
+			wantErr: `parse direct_execution_lock_acquisition_timeout_seconds metadata value "fast"`,
+		},
+		"zero lock wait": {
+			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "1000", "direct_execution_lock_acquisition_timeout_seconds": "0"},
+			wantErr: "direct_execution_lock_acquisition_timeout_seconds must be positive",
+		},
+		"negative lock wait": {
+			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "1000", "direct_execution_lock_acquisition_timeout_seconds": "-3"},
+			wantErr: "direct_execution_lock_acquisition_timeout_seconds must be positive",
 		},
 	}
 	for name, tc := range cases {

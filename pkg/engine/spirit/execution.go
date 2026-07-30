@@ -110,10 +110,11 @@ func (e *Engine) gtidChangeSourceSupported(ctx context.Context, host, username, 
 }
 
 // executeSchemaChange runs the Spirit schema change synchronously.
-// All DDL statements (CREATE, DROP, ALTER, RENAME) are passed through Spirit.
-// Spirit requires non-ALTER statements to be executed individually (not combined).
-// ALTER statements can be combined for atomic multi-table schema changes.
-func (e *Engine) executeSchemaChange(ctx context.Context, host, username, password, database string, ddlStatements []string, deferCutover bool) {
+// CREATE and DROP statements are executed individually through Spirit. ALTER
+// statements Spirit accepts are combined for atomic multi-table execution;
+// ALTERs Spirit refuses run as native MySQL DDL when the direct execution
+// policy permits, and fail the schema change otherwise.
+func (e *Engine) executeSchemaChange(ctx context.Context, host, username, password, database string, ddlStatements []string, deferCutover bool, policy directPolicy) {
 	phases, err := classifyDDLPhases(ddlStatements)
 	if err != nil {
 		e.logger.Error("failed to classify statement", "error", err)
@@ -126,9 +127,10 @@ func (e *Engine) executeSchemaChange(ctx context.Context, host, username, passwo
 		return
 	}
 
-	// Execute ALTER statements (combined for atomic multi-table execution).
+	// Execute ALTER statements (routed per statement between Spirit and
+	// direct execution).
 	if len(phases.alters) > 0 {
-		if !e.executeAlterPhase(ctx, host, username, password, database, phases.alters, deferCutover) {
+		if !e.executeAlterPhase(ctx, host, username, password, database, phases.alters, deferCutover, policy) {
 			return
 		}
 	}
@@ -165,9 +167,9 @@ func (e *Engine) executeSchemaChange(ctx context.Context, host, username, passwo
 // phase, so once an ALTER has started they are already applied; only the DROP
 // phase remains and must run after the resumed ALTER completes. When no ALTER was
 // in flight, the whole plan is run from the start.
-func (e *Engine) resumeSchemaChange(ctx context.Context, host, username, password, database string, originalDDLs []string, combinedStatement string, deferCutover bool) {
+func (e *Engine) resumeSchemaChange(ctx context.Context, host, username, password, database string, originalDDLs []string, combinedStatement string, deferCutover bool, policy directPolicy) {
 	if combinedStatement == "" {
-		e.executeSchemaChange(ctx, host, username, password, database, originalDDLs, deferCutover)
+		e.executeSchemaChange(ctx, host, username, password, database, originalDDLs, deferCutover, policy)
 		return
 	}
 
@@ -271,31 +273,42 @@ func (e *Engine) executeCreateStatements(ctx context.Context, host, username, pa
 	})
 }
 
-// executeAlterPhase combines the ALTER statements and runs them through Spirit.
-// It returns true when the ALTER ran and the caller may proceed to the DROP
-// phase, and false on a genuine failure (executeSpiritMigration has already set
-// StateFailed). A stop cancels the context but returns true; the caller's later
-// ctx.Err() checks then keep the state Stopped without running further phases.
-func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password, database string, alters []string, deferCutover bool) bool {
-	combinedStatement := strings.Join(alters, "; ")
+// executeAlterPhase routes each ALTER between the Spirit runner and direct
+// execution, runs the direct statements first (each is synchronous and fast
+// relative to an online copy, and a routing or direct failure should surface
+// before hours of copying), then combines the Spirit-accepted statements into
+// one runner. It returns true when the phase ran and the caller may proceed
+// to the DROP phase, and false on a genuine failure (the failing step has
+// already set StateFailed). A stop cancels the context but may return true;
+// the caller's later ctx.Err() checks then keep the state Stopped without
+// running further phases.
+func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password, database string, alters []string, deferCutover bool, policy directPolicy) bool {
+	target := &lazyTargetDB{dsn: targetDSN(host, username, password, database)}
+	defer target.close()
 
-	var tables []string
-	for _, stmt := range alters {
-		parsed, err := statement.New(stmt)
-		if err != nil {
-			e.logger.Error("failed to parse statement for logging", "database", database, "error", err, "statement", stmt)
-			e.setSchemaChangeFailed(fmt.Errorf("parse ALTER statement %q: %w", stmt, err))
-			return false
-		}
-		if len(parsed) > 0 {
-			tables = append(tables, parsed[0].Table)
+	routing, err := e.routeAlterStatements(ctx, target, database, alters, policy)
+	if err != nil {
+		e.logger.Error("ALTER routing failed", "database", database, "error", err)
+		e.setSchemaChangeFailed(err)
+		return false
+	}
+
+	if len(routing.direct) > 0 {
+		if !e.executeDirectStatements(ctx, target, database, routing.direct, policy) {
+			return ctx.Err() != nil
 		}
 	}
 
+	if len(routing.spiritAlters) == 0 {
+		return true
+	}
+
+	combinedStatement := strings.Join(routing.spiritAlters, "; ")
+
 	e.logger.Info("executing ALTER via Spirit",
 		"database", database,
-		"tables", tables,
-		"ddl_count", len(alters),
+		"tables", routing.spiritTables,
+		"ddl_count", len(routing.spiritAlters),
 		"defer_cutover", deferCutover,
 	)
 
