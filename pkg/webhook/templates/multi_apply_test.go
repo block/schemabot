@@ -498,6 +498,28 @@ func TestRenderMultiDeploymentApplyComment_PendingDetailUsesDerivedStatus(t *tes
 	assert.Contains(t, out, "**Status**: In Progress")
 }
 
+// A derived-status label interpolates deployment names, and the detail body
+// lives inside raw <details> HTML — a name carrying markup must be escaped in
+// the body's Status line, matching the <summary> line's escaping.
+func TestRenderMultiDeploymentApplyComment_DerivedStatusEscapesLabel(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu<b>", so.Running),
+		rollingOp("us", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "staging",
+		Details: map[string]ApplyStatusCommentData{
+			"eu<b>": {Database: "app_db", Environment: "staging", State: state.Apply.Running},
+			"us":    {Database: "app_db", Environment: "staging", State: state.Apply.Pending},
+		},
+	})
+
+	assert.Contains(t, out, "**Status**: ⏳ Waiting for eu&lt;b&gt;")
+	assert.NotContains(t, out, "**Status**: ⏳ Waiting for eu<b>")
+}
+
 // A deployment in an unrecognized engine state still renders a summary line and
 // section without a leading space where the glyph would be.
 func TestRenderMultiDeploymentApplyComment_UnknownStateNoGlyph(t *testing.T) {

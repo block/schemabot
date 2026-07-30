@@ -256,7 +256,9 @@ func writeDeploymentDetailSections(sb *strings.Builder, data MultiDeploymentAppl
 func siblingDerivedStatus(d presentation.Deployment) string {
 	switch d.Presentation {
 	case presentation.StateQueuedNext, presentation.StateWaiting, presentation.StateHalted, presentation.StatePaused:
-		label := ui.CapitalizeFirst(d.Label)
+		// The label interpolates deployment names; escape it like the
+		// <summary> line does so a name cannot inject markup into the body.
+		label := html.EscapeString(ui.CapitalizeFirst(d.Label))
 		if d.Emoji == "" {
 			return label
 		}
