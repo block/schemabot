@@ -2,6 +2,7 @@ package api
 
 import (
 	"log/slog"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -97,6 +98,14 @@ func TestBuildEtreResolverRejectsUnknownCredentialType(t *testing.T) {
 // The awssm backend validates its required fields with config-path context at
 // startup, before any AWS work, so a misconfiguration fails fast.
 func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
+	// Building the resolver loads the AWS shared config, which honors the
+	// ambient AWS_* environment (a developer's exported AWS_PROFILE can make
+	// the load fail on an unresolvable profile). Pin the test to an empty,
+	// hermetic AWS environment so it only exercises SchemaBot's validation.
+	t.Setenv("AWS_PROFILE", "")
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "aws-config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "aws-credentials"))
+
 	base := EtreCredentialsConfig{
 		Type:       "awssm",
 		Region:     "us-east-1",
