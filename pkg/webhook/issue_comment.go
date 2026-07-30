@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
@@ -757,46 +756,16 @@ func (h *Handler) supportChannel() api.SupportChannelConfig {
 	return cfg.SupportChannel
 }
 
+// appendSupportChannelFooter adds the configured support-channel footer to
+// comments that declared themselves eligible at render time (see
+// templates.OffersSupportChannel). Eligibility is a render-layer decision;
+// this layer only checks the deployment has a support channel configured.
 func appendSupportChannelFooter(body string, support api.SupportChannelConfig) string {
-	if !support.Enabled() || !shouldShowSupportChannel(body) {
+	if !support.Enabled() || !templates.OffersSupportChannel(body) {
 		return body
 	}
 	return templates.RenderSupportChannelFooter(body, templates.SupportChannelData{
 		Name: support.Name,
 		URL:  support.URL,
 	})
-}
-
-func shouldShowSupportChannel(body string) bool {
-	firstLine, _, _ := strings.Cut(body, "\n")
-	firstLine = strings.ToLower(firstLine)
-	if strings.Contains(body, "\n**Status**: Failed\n") {
-		return true
-	}
-
-	if strings.Contains(firstLine, "help") {
-		return true
-	}
-	for _, marker := range []string{
-		"failed",
-		"blocked",
-		"not authorized",
-		"authorization check failed",
-		"invalid",
-		"missing",
-		"not found",
-		"no valid",
-		"multiple",
-		"reconciliation required",
-	} {
-		if strings.Contains(firstLine, marker) {
-			return true
-		}
-	}
-	// The apply refusal for unsafe changes without --allow-unsafe shares its
-	// title with the plan comment, so only its blocked header identifies it.
-	// The plan comment's advisory unsafe-change summary ("**Issues**: ...
-	// unsafe changes detected") is informational and appears on routine
-	// plans, so it does not warrant the footer.
-	return strings.Contains(body, "Unsafe Changes Detected:**") || strings.Contains(body, "Unsafe Change Detected:**")
 }

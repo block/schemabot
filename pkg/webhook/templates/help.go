@@ -26,5 +26,5 @@ func commandReference() string {
 
 // RenderHelpComment generates the help message listing all available commands.
 func RenderHelpComment() string {
-	return "## 📚 SchemaBot Help\n\n" + commandReference()
+	return offerSupportChannel("## 📚 SchemaBot Help\n\n" + commandReference())
 }

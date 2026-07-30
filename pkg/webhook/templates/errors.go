@@ -208,12 +208,12 @@ var (
 
 // RenderDatabaseNotFound renders the "database not found" error comment.
 func RenderDatabaseNotFound(data SchemaErrorData) string {
-	return renderTemplate(tmplDatabaseNotFound, data)
+	return offerSupportChannel(renderTemplate(tmplDatabaseNotFound, data))
 }
 
 // RenderInvalidConfig renders the "invalid config" error comment.
 func RenderInvalidConfig(data SchemaErrorData) string {
-	return renderTemplate(tmplInvalidConfig, data)
+	return offerSupportChannel(renderTemplate(tmplInvalidConfig, data))
 }
 
 // RenderNoConfig renders the "no config found" error comment.
@@ -227,7 +227,7 @@ func RenderNoConfig(data SchemaErrorData) string {
 // RenderConfigNotAuthorized renders the error shown when schemabot.yaml exists
 // but its schema directory is outside the server-side allowed_dirs boundary.
 func RenderConfigNotAuthorized(data SchemaErrorData) string {
-	return renderTemplate(tmplConfigNotAuthorized, data)
+	return offerSupportChannel(renderTemplate(tmplConfigNotAuthorized, data))
 }
 
 // UnmanagedSchemaConfigNoticeData identifies one schema config discovered in
@@ -257,32 +257,33 @@ func RenderUnmanagedSchemaConfigsNotice(configs []UnmanagedSchemaConfigNoticeDat
 	if err := tmplUnmanagedNotice.Execute(&sb, data); err != nil {
 		return fmt.Sprintf("Error rendering template: %v", err)
 	}
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // PreviewCommentUnmanagedSchemaConfigsNotice renders a sample notice for
-// schema changes under configs this deployment does not manage.
+// schema changes under configs this deployment does not manage, with the
+// support-channel footer a configured deployment appends to it.
 func PreviewCommentUnmanagedSchemaConfigsNotice() string {
-	return RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
+	return RenderSupportChannelFooter(RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
 		{Database: "inventory", SchemaPath: "services/inventory/schema"},
-	})
+	}), previewSupportChannel())
 }
 
 // RenderMultipleConfigs renders the "multiple configs" error comment.
 func RenderMultipleConfigs(data SchemaErrorData) string {
-	return renderTemplate(tmplMultipleConfigs, data)
+	return offerSupportChannel(renderTemplate(tmplMultipleConfigs, data))
 }
 
 // RenderGenericError renders a generic error comment.
 func RenderGenericError(data SchemaErrorData) string {
 	// Capitalize command name for header
 	data.CommandName = capitalizeFirst(data.CommandName)
-	return renderTemplate(tmplGenericError, data)
+	return offerSupportChannel(renderTemplate(tmplGenericError, data))
 }
 
 // RenderInvalidCommand generates an error message for unrecognized commands.
 func RenderInvalidCommand() string {
-	return "## ❌ Invalid Command\n\nThat command wasn't recognized. Available commands:\n\n" + commandReference()
+	return offerSupportChannel("## ❌ Invalid Command\n\nThat command wasn't recognized. Available commands:\n\n" + commandReference())
 }
 
 // RenderInvalidEnv generates an error message when the -e value does not name
@@ -299,11 +300,11 @@ func RenderInvalidEnv(action string, available []string) string {
 	if len(quoted) > 0 {
 		availableLine = "\n**Available environments**: " + strings.Join(quoted, ", ") + "\n"
 	}
-	return fmt.Sprintf(`## ❌ Invalid Environment
+	return offerSupportChannel(fmt.Sprintf(`## ❌ Invalid Environment
 
 `+"`-e`"+` must name one of the configured environments.
 %s
-**Usage**: `+"`schemabot %s -e <environment> [flags]`", availableLine, action)
+**Usage**: `+"`schemabot %s -e <environment> [flags]`", availableLine, action))
 }
 
 // markdownInlineCode renders a value as a markdown inline code span,
@@ -316,7 +317,7 @@ func markdownInlineCode(s string) string {
 
 // RenderMissingEnv generates an error message when -e flag is missing.
 func RenderMissingEnv(action string) string {
-	return fmt.Sprintf(`## ❌ Missing Argument
+	return offerSupportChannel(fmt.Sprintf(`## ❌ Missing Argument
 
 You'll need to specify which environment to target with the `+"`-e`"+` flag.
 
@@ -325,7 +326,7 @@ You'll need to specify which environment to target with the `+"`-e`"+` flag.
 **Example**:
 `+"```"+`
 schemabot %s -e staging
-`+"```", action, action)
+`+"```", action, action))
 }
 
 func renderTemplate(tmpl *template.Template, data SchemaErrorData) string {
