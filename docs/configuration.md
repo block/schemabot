@@ -342,8 +342,9 @@ databases:
       staging:
         dsn_secret_ref: "..."
         direct_execution:
-          enabled: true          # default: false
-          max_table_rows: 100000 # required (positive) when enabled
+          enabled: true           # default: false
+          max_table_rows: 100000  # required (positive) when enabled
+          lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
 ```
 
 A direct statement is synchronous, blocks writes to the table while it runs,
@@ -356,10 +357,21 @@ bound with margin below your real tolerance. The bound is re-evaluated when
 the apply executes, so a table that grew past it after planning is blocked,
 not run.
 
+`lock_acquisition_timeout` bounds how long each direct statement waits to
+acquire its locks. Each engine maps it to its native session lock timeout —
+on MySQL, `lock_wait_timeout` and `innodb_lock_wait_timeout`. Native DDL
+queues on the table's metadata lock behind any open transaction that has
+touched the table — and by default MySQL lets it queue essentially forever,
+with all new table traffic stalling behind it. When the bound expires the
+apply fails fast with a retryable "table is busy" error instead. Lower it for
+environments where even a short stall is unacceptable; the value must be a
+whole number of seconds (at least `1s`).
+
 Config validation fails at startup when a `direct_execution` block — even a
-disabled one — is set on a non-MySQL database, and when the policy is enabled
-without a positive `max_table_rows`. A policy that can never take effect is
-never silently carried in config.
+disabled one — is set on a non-MySQL database, when the policy is enabled
+without a positive `max_table_rows`, or when `lock_acquisition_timeout` is malformed
+(not a duration, under a second, or not whole seconds). A policy that can
+never take effect is never silently carried in config.
 
 ## Storage Connection Pool
 

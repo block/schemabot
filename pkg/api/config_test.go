@@ -874,12 +874,48 @@ func TestServerConfig_ValidateRejectsDirectExecutionOnNonMySQL(t *testing.T) {
 	assert.Contains(t, err.Error(), "only supported for mysql databases")
 }
 
+// A malformed direct_execution lock_acquisition_timeout is a startup config error —
+// even on a disabled block — so a bad bound is never silently carried until
+// the policy is enabled. MySQL lock timeouts have second granularity, so the
+// value must be a whole number of seconds of at least 1s.
+func TestServerConfig_ValidateRejectsBadDirectExecutionLockAcquisitionTimeout(t *testing.T) {
+	for name, tc := range map[string]struct {
+		direct  *DirectExecutionConfig
+		wantErr string
+	}{
+		"not a duration":           {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "ten"}, "is not a valid duration"},
+		"sub-second":               {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "500ms"}, "must be at least 1s"},
+		"negative":                 {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "-5s"}, "must be at least 1s"},
+		"fractional seconds":       {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "1.5s"}, "must be a whole number of seconds"},
+		"malformed while disabled": {&DirectExecutionConfig{Enabled: false, LockAcquisitionTimeout: "bogus"}, "is not a valid duration"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: tc.direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" direct_execution`)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
 // A well-formed direct_execution policy on a MySQL database validates, and a
 // disabled block (even without a bound) is accepted as the fail-closed default.
 func TestServerConfig_ValidateAcceptsDirectExecution(t *testing.T) {
 	for name, direct := range map[string]*DirectExecutionConfig{
-		"enabled with bound": {Enabled: true, MaxTableRows: 500000},
-		"disabled":           {Enabled: false},
+		"enabled with bound":        {Enabled: true, MaxTableRows: 500000},
+		"enabled with lock timeout": {Enabled: true, MaxTableRows: 500000, LockAcquisitionTimeout: "5s"},
+		"disabled":                  {Enabled: false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := ServerConfig{

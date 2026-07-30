@@ -958,6 +958,34 @@ type DirectExecutionConfig struct {
 	// cannot be determined — are blocked. Required (positive) when Enabled
 	// is true.
 	MaxTableRows int64 `yaml:"max_table_rows,omitempty"`
+
+	// LockAcquisitionTimeout bounds how long each direct statement waits to
+	// acquire its locks before the apply fails with a retryable busy-table
+	// error — instead of queueing on the table's lock indefinitely while all
+	// new table traffic stalls behind the queued DDL. Each engine maps it to
+	// its native session lock timeout. A whole number of seconds (e.g.
+	// "10s"). Optional; the engine applies its default when omitted.
+	LockAcquisitionTimeout string `yaml:"lock_acquisition_timeout,omitempty"`
+}
+
+// lockAcquisitionTimeoutSeconds parses the configured lock acquisition
+// timeout into whole seconds. Returns (0, nil) when the field is unset,
+// leaving the engine default in effect.
+func (c *DirectExecutionConfig) lockAcquisitionTimeoutSeconds() (int64, error) {
+	if c.LockAcquisitionTimeout == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.LockAcquisitionTimeout)
+	if err != nil {
+		return 0, fmt.Errorf("lock_acquisition_timeout %q is not a valid duration: %w", c.LockAcquisitionTimeout, err)
+	}
+	if d < time.Second {
+		return 0, fmt.Errorf("lock_acquisition_timeout %q must be at least 1s", c.LockAcquisitionTimeout)
+	}
+	if d%time.Second != 0 {
+		return 0, fmt.Errorf("lock_acquisition_timeout %q must be a whole number of seconds (engines apply the bound with second granularity)", c.LockAcquisitionTimeout)
+	}
+	return int64(d / time.Second), nil
 }
 
 type externalDatabaseEndpoint struct {
@@ -2362,6 +2390,11 @@ func (c EnvironmentConfig) validateDirectExecution(context, databaseType string)
 	}
 	if c.DirectExecution.Enabled && c.DirectExecution.MaxTableRows <= 0 {
 		return fmt.Errorf("%s enables direct_execution but max_table_rows is %d (a positive bound is required)", context, c.DirectExecution.MaxTableRows)
+	}
+	// Validated even when the block is disabled: a malformed value must fail
+	// at startup, never be silently carried until the policy is enabled.
+	if _, err := c.DirectExecution.lockAcquisitionTimeoutSeconds(); err != nil {
+		return fmt.Errorf("%s direct_execution: %w", context, err)
 	}
 	return nil
 }
