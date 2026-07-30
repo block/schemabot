@@ -81,12 +81,23 @@ const supportChannelOfferMarker = "<!-- schemabot:offer-support-channel -->"
 // marker, so an aggregate comment containing a failed per-deployment section
 // offers support just like the standalone comment would.
 func OffersSupportChannel(body string) bool {
-	return strings.Contains(body, supportChannelOfferMarker)
+	return containsSupportChannelMarkerLine(body)
+}
+
+// containsSupportChannelMarkerLine matches the marker only as a standalone
+// line, the way offerSupportChannel and writeSupportChannelOffer emit it.
+// User-controlled content rendered into a comment (DDL, error detail) that
+// happens to contain the marker text mid-line neither triggers the footer
+// nor suppresses a render function's own declaration.
+func containsSupportChannelMarkerLine(body string) bool {
+	return strings.HasPrefix(body, supportChannelOfferMarker+"\n") ||
+		strings.Contains(body, "\n"+supportChannelOfferMarker+"\n") ||
+		strings.HasSuffix(body, "\n"+supportChannelOfferMarker)
 }
 
 // offerSupportChannel appends the support marker to a rendered comment body.
 func offerSupportChannel(body string) string {
-	if strings.Contains(body, supportChannelOfferMarker) {
+	if containsSupportChannelMarkerLine(body) {
 		return body
 	}
 	return strings.TrimRight(body, "\n") + "\n" + supportChannelOfferMarker + "\n"
@@ -96,8 +107,11 @@ func offerSupportChannel(body string) string {
 // composed, for builders that decide eligibility mid-composition (e.g. on a
 // failed status line). At most one marker is written per comment.
 func writeSupportChannelOffer(sb *strings.Builder) {
-	if strings.Contains(sb.String(), supportChannelOfferMarker) {
+	if containsSupportChannelMarkerLine(sb.String()) {
 		return
+	}
+	if sb.Len() > 0 && !strings.HasSuffix(sb.String(), "\n") {
+		sb.WriteString("\n")
 	}
 	sb.WriteString(supportChannelOfferMarker + "\n")
 }

@@ -16,6 +16,17 @@ func TestOffersSupportChannel(t *testing.T) {
 	assert.True(t, OffersSupportChannel(offerSupportChannel("## Apply Not Found\n\nbody\n")))
 }
 
+// The marker counts only as a standalone line, the way the render helpers
+// emit it. User-controlled content that happens to contain the marker text
+// mid-line neither triggers the footer nor suppresses a render function's
+// own declaration.
+func TestSupportChannelMarkerRequiresStandaloneLine(t *testing.T) {
+	spoofed := "## Schema Change Plan\n\nALTER TABLE `t` COMMENT 'x <!-- schemabot:offer-support-channel --> y';\n"
+
+	assert.False(t, OffersSupportChannel(spoofed))
+	assert.True(t, OffersSupportChannel(offerSupportChannel(spoofed)))
+}
+
 func TestOfferSupportChannelIdempotent(t *testing.T) {
 	once := offerSupportChannel("## Rollback Blocked\n\nbody\n")
 	twice := offerSupportChannel(once)
