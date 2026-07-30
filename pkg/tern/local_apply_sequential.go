@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -54,7 +55,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 			break
 		}
 
-		action := c.checkTaskReady(ctx, task)
+		action := c.checkTaskReady(ctx, logger, task)
 		if action == taskStopped {
 			stoppedByUser = true
 			break
@@ -91,7 +92,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 
 	// Update apply state based on task outcomes
 	logger.Info("executeApplySequential loop finished",
-		"tasks_processed", len(tasks),
+		"task_count", len(tasks),
 		"failed_task", failedTask != nil,
 		"stopped_by_user", stoppedByUser,
 	)
@@ -111,28 +112,31 @@ const (
 )
 
 // checkTaskReady verifies a task is ready to execute by checking context cancellation
-// and re-fetching the task's current state from storage.
-func (c *LocalClient) checkTaskReady(ctx context.Context, task *storage.Task) taskAction {
+// and re-fetching the task's current state from storage. The caller passes its
+// identity-bound drive logger so these lines stay filterable by apply/PR.
+func (c *LocalClient) checkTaskReady(ctx context.Context, logger *slog.Logger, task *storage.Task) taskAction {
 	if ctx.Err() != nil {
-		c.logger.Info("apply context cancelled, stopping sequential loop",
+		logger.Info("apply context cancelled, stopping sequential loop",
 			"task_id", task.TaskIdentifier, "table", task.TableName)
 		return taskStopped
 	}
 	freshTask, err := c.storage.Tasks().Get(ctx, task.TaskIdentifier)
 	if err != nil {
-		c.logger.Error("failed to fetch task state", append(task.LogAttrs(), "error", err)...)
+		logger.Error("failed to fetch task state",
+			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
 		return taskSkip
 	}
 	if freshTask == nil {
-		c.logger.Error("task not found", task.LogAttrs()...)
+		logger.Error("task not found",
+			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State)
 		return taskSkip
 	}
 	if freshTask.State == state.Task.Stopped {
-		c.logger.Info("task was stopped by user, skipping", "task_id", task.TaskIdentifier, "table", task.TableName)
+		logger.Info("task was stopped by user, skipping", "task_id", task.TaskIdentifier, "table", task.TableName)
 		return taskStopped
 	}
 	if state.IsTerminalTaskState(freshTask.State) {
-		c.logger.Info("task already in terminal state, skipping",
+		logger.Info("task already in terminal state, skipping",
 			"task_id", task.TaskIdentifier, "table", task.TableName, "state", freshTask.State)
 		return taskSkip
 	}
