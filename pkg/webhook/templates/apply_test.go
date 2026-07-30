@@ -830,6 +830,32 @@ func TestRenderApplyStatusComment_FailedBeforeRowCopyHasNoProgressBar(t *testing
 	assert.NotContains(t, result, "⬜", "no empty bar segments for a copy that never started")
 }
 
+// An instant DDL change has no row copy phase, so its failure renders a plain
+// failed label — no progress bar, and no mention of row copy.
+func TestRenderApplyStatusComment_FailedInstantDDLHasPlainLabel(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "qa",
+		State:       state.Apply.Failed,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{
+				TableName: "profiles",
+				DDL:       "ALTER TABLE `profiles` ADD COLUMN `nickname` VARCHAR(64) NULL",
+				Status:    state.Task.Failed,
+				IsInstant: true,
+			},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "**`profiles`**: ❌ Failed\n")
+	assert.NotContains(t, result, "(before row copy started)", "instant DDL has no row copy phase to reference")
+	assert.NotContains(t, result, "🟥")
+	assert.NotContains(t, result, "⬜")
+}
+
 // A failure after row copy made progress keeps the red progress bar: the bar
 // truthfully shows how far the copy got before the engine gave up.
 func TestRenderApplyStatusComment_FailedAfterCopyProgressKeepsBar(t *testing.T) {
