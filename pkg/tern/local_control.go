@@ -303,7 +303,7 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		// progress tick retries it — terminally failing it would strand a
 		// deferred cutover until an operator notices and re-issues the command.
 		logger.Info("pending cutover request not accepted yet by engine backend; retrying at the next progress tick",
-			"deployment", apply.Deployment, "state", apply.State, "requested_by", controlRequestCaller(controlReq), "error", err)
+			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq), "error", err)...)
 		return nil
 	}
 	if err != nil {
@@ -1009,7 +1009,7 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
 		logger.Info("completing pending cancel request for terminal apply",
-			"deployment", apply.Deployment, "state", apply.State, "requested_by", controlRequestCaller(controlReq))
+			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending cancel request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
@@ -1022,7 +1022,7 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 	} else if revertPhase != "" {
 		message := revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase)
 		logger.Warn("rejecting pending cancel request: schema change is in a revert phase and has already cut over",
-			"deployment", apply.Deployment, "state", apply.State, "requested_by", controlRequestCaller(controlReq), "revert_phase", revertPhase)
+			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq), "revert_phase", revertPhase)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending cancel request rejected: %s%s", message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel, message); err != nil {

@@ -1439,14 +1439,14 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil {
 		logger.Warn("failed to load plan during recovery; current apply owner will exit for operator retry",
-			"deployment", apply.Deployment, "state", apply.State, "error", err)
+			append(apply.MutableLogAttrs(), "error", err)...)
 		return fmt.Errorf("load plan for recovery of apply %s (database %s): %w", apply.ApplyIdentifier, apply.Database, err)
 	}
 	// A confirmed-missing plan row is unrecoverable: the reviewed DDL cannot be
 	// rebuilt, so the apply fails and its observer is notified.
 	if plan == nil {
 		logger.Warn("plan row does not exist for apply; recovery cannot rebuild the reviewed DDL, marking apply failed",
-			"deployment", apply.Deployment, "state", apply.State)
+			apply.MutableLogAttrs()...)
 		c.failApplyWithTasks(ctx, apply, tasks, "plan not found during recovery")
 		c.notifyTerminalObserver(apply, tasks)
 		return nil
@@ -1483,7 +1483,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		}
 		if totalTaskRows > 0 {
 			logger.Error("refusing to complete apply as a task-less no-op: it owns task rows this drive did not load; the apply stays claimable and will not finish until its tasks load",
-				"deployment", apply.Deployment, "state", apply.State, "task_row_count", totalTaskRows)
+				append(apply.MutableLogAttrs(), "task_row_count", totalTaskRows)...)
 			return fmt.Errorf("apply %s owns %d task rows: %w", apply.ApplyIdentifier, totalTaskRows, ErrApplyTasksNotLoaded)
 		}
 		logger.Info("no tasks found for apply during recovery; completing as a no-op")
@@ -1556,7 +1556,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 
 	rp, err := c.replanAndFilterTasks(ctx, apply, tasks, plan)
 	if err != nil {
-		logger.Error("re-plan failed during recovery", "deployment", apply.Deployment, "state", apply.State, "error", err)
+		logger.Error("re-plan failed during recovery", append(apply.MutableLogAttrs(), "error", err)...)
 		return fmt.Errorf("re-plan failed during recovery for apply %s (database %s): %w", apply.ApplyIdentifier, apply.Database, err)
 	}
 
@@ -1584,7 +1584,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		apply.CompletedAt = &now
 		apply.UpdatedAt = now
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
-			logger.Error("failed to update apply state", "deployment", apply.Deployment, "state", apply.State, "error", err)
+			logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
 		}
 		if startRequested {
 			if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
@@ -1617,7 +1617,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		apply.State = state.Apply.Running
 		apply.UpdatedAt = now
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
-			logger.Error("failed to update apply state", "deployment", apply.Deployment, "state", apply.State, "error", err)
+			logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
 			return fmt.Errorf("mark sequential resume apply %s running: %w", apply.ApplyIdentifier, err)
 		}
 		if startRequested {
