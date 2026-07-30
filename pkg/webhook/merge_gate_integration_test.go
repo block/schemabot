@@ -6,8 +6,9 @@
 // no longer exists. These tests exercise the durable refresh request lifecycle
 // end to end against the real webhook harness: recording at the operator drive
 // tail, the backstop sweep, the sibling PR fan-out with attribution, the
-// fail-closed flip when a re-plan fails, the in-flight apply guard, and
-// same-target request coalescing.
+// fail-closed flip when a re-plan fails, the in-flight apply guard,
+// same-target request coalescing, and the recorded-request kick that drains
+// without waiting for a poll tick.
 
 package webhook
 
@@ -481,4 +482,72 @@ func TestE2ECheckRefreshCoalescesPendingSiblingRequests(t *testing.T) {
 	require.NotNil(t, coalesced)
 	assert.Equal(t, storage.CheckRefreshCompleted, coalesced.State)
 	assert.Equal(t, 0, coalesced.Attempts, "the younger request is coalesced, never claimed")
+}
+
+// TestE2ECheckRefreshKickDrainsWithoutTick verifies the recorded-request kick:
+// a request recorded while the processor sleeps between polls is drained as
+// soon as the drive tail's notifier fires, so sibling PR checks re-plan
+// without waiting out the poll interval. The poll interval is set far beyond
+// the test deadline, so only the kick can explain the drain.
+func TestE2ECheckRefreshKickDrainsWithoutTick(t *testing.T) {
+	clearCheckRefreshRequests(t)
+	dbName := "webhook_checkrefresh_kick"
+	// The request lifecycle is storage-only when no sibling checks exist, so
+	// the lighter storage-backed service is enough — no target database or
+	// operator.
+	svc := setupE2EServiceWithConfig(t, &api.ServerConfig{})
+
+	client := gh.NewClient(nil)
+	server := httptest.NewServer(http.NewServeMux())
+	t.Cleanup(server.Close)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	h := newE2EHandler(t, svc, client)
+	require.NotNil(t, svc.OnCheckRefreshRecorded,
+		"the handler registers the drive-tail kick on the service at construction")
+
+	// A sentinel recorded before start is drained by the driver's startup
+	// pass; its completion means the driver is parked on the (hour-long)
+	// ticker, so nothing but a kick can drain the next request.
+	sentinel := recordRefreshRequest(t, svc, &storage.CheckRefreshRequest{
+		ApplyID:         91000006,
+		ApplyIdentifier: fmt.Sprintf("apply_checkrefresh_kick_sentinel_%d", time.Now().UnixNano()),
+		Environment:     "staging",
+		DatabaseType:    "mysql",
+		DatabaseName:    dbName,
+		RequestedBy:     "cli:tester@host",
+	})
+
+	h.checkRefreshPollInterval = time.Hour
+	h.StartCheckRefreshProcessor(t.Context())
+	t.Cleanup(h.StopCheckRefreshProcessor)
+
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		got, err := svc.Storage().CheckRefreshRequests().GetByApplyID(t.Context(), sentinel.ApplyID)
+		if !assert.NoError(collect, err) || !assert.NotNil(collect, got) {
+			return
+		}
+		assert.Equal(collect, storage.CheckRefreshCompleted, got.State)
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond,
+		"the startup pass drains the sentinel request")
+
+	kicked := recordRefreshRequest(t, svc, &storage.CheckRefreshRequest{
+		ApplyID:         91000007,
+		ApplyIdentifier: fmt.Sprintf("apply_checkrefresh_kick_%d", time.Now().UnixNano()),
+		Environment:     "staging",
+		DatabaseType:    "mysql",
+		DatabaseName:    dbName,
+		RequestedBy:     "cli:tester@host",
+	})
+	// Wake the driver through the same registration the drive tail uses.
+	svc.OnCheckRefreshRecorded()
+
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		got, err := svc.Storage().CheckRefreshRequests().GetByApplyID(t.Context(), kicked.ApplyID)
+		if !assert.NoError(collect, err) || !assert.NotNil(collect, got) {
+			return
+		}
+		assert.Equal(collect, storage.CheckRefreshCompleted, got.State)
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond,
+		"the kick drains the request without a poll tick")
 }

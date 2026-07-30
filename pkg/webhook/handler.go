@@ -182,6 +182,10 @@ type Handler struct {
 	checkRefreshStop          chan struct{}
 	checkRefreshCancel        context.CancelFunc
 	checkRefreshWg            sync.WaitGroup
+	// checkRefreshKick wakes the driver to run a pass now instead of waiting
+	// for the next poll tick; buffered so one pending kick coalesces any
+	// number of concurrent recordings.
+	checkRefreshKick chan struct{}
 
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
@@ -271,6 +275,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 		checkRefreshPollInterval:    defaultCheckRefreshPollInterval,
 		checkRefreshLeaseDuration:   defaultCheckRefreshLeaseDuration,
 		checkRefreshSweepLookback:   defaultCheckRefreshSweepLookback,
+		checkRefreshKick:            make(chan struct{}, 1),
 		priorEnvCheckMaxAttempts:    defaultPriorEnvCheckMaxAttempts,
 		priorEnvCheckRetryInterval:  defaultPriorEnvCheckRetryInterval,
 	}
@@ -357,6 +362,12 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 			obs.OnTerminal(apply, tasks)
 			return nil
 		}
+
+		// Wake the check refresh processor as soon as a drive tail records a
+		// request, so sibling PR checks re-plan without waiting for the next
+		// poll tick. The durable request row stays the source of truth: a
+		// kick lost to a pod boundary only costs poll latency.
+		service.OnCheckRefreshRecorded = h.KickCheckRefresh
 	}
 
 	return h

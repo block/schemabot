@@ -117,6 +117,19 @@ func (h *Handler) StopCheckRefreshProcessor() {
 	h.logger.Info("check refresh processor stopped")
 }
 
+// KickCheckRefresh wakes the check refresh driver to run a pass now instead
+// of waiting for the next poll tick. Non-blocking: when a kick is already
+// pending, the coming pass drains the new request too. The durable request
+// row is the source of truth — a kick that lands with no driver running, or
+// on a different pod than the one that will claim the request, only costs
+// poll latency, never the refresh.
+func (h *Handler) KickCheckRefresh() {
+	select {
+	case h.checkRefreshKick <- struct{}{}:
+	default:
+	}
+}
+
 func (h *Handler) checkRefreshDriver(ctx context.Context, stop <-chan struct{}) {
 	owner := checkRefreshLeaseOwner()
 	ticker := time.NewTicker(h.checkRefreshPollInterval)
@@ -133,6 +146,9 @@ func (h *Handler) checkRefreshDriver(ctx context.Context, stop <-chan struct{}) 
 		case <-ctx.Done():
 			h.logger.Debug("check refresh driver context cancelled")
 			return
+		case <-h.checkRefreshKick:
+			h.logger.Debug("check refresh driver woken by recorded-request kick")
+			h.runCheckRefreshPass(ctx, owner)
 		case <-ticker.C:
 			h.runCheckRefreshPass(ctx, owner)
 		}
