@@ -448,6 +448,78 @@ func TestRenderMultiDeploymentApplyComment_PreflightFailureHasNoProgressBar(t *t
 	assert.NotContains(t, out, "⬜")
 }
 
+// A deployment held by an earlier sibling's failure is "halted" — a derived
+// presentation; its persisted operation state is still pending. The <details>
+// body's Status line must carry the derived status so it agrees with its own
+// <summary> line, never the raw-state "Starting" gloss.
+func TestRenderMultiDeploymentApplyComment_HaltedDetailUsesDerivedStatus(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("apse2", so.Failed),
+		rollingOp("euwe1", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "qa",
+		Details: map[string]ApplyStatusCommentData{
+			"apse2": {Database: "app_db", Environment: "qa", State: state.Apply.Failed},
+			"euwe1": {Database: "app_db", Environment: "qa", State: state.Apply.Pending},
+		},
+	})
+
+	assert.Contains(t, out, "**Status**: ⏸ Halted — apse2 failed")
+	assert.NotContains(t, out, "**Status**: Starting")
+	// The failed deployment keeps its raw-state gloss.
+	assert.Contains(t, out, "**Status**: Failed")
+}
+
+// Pending deployments that are genuinely still coming — next in order, or
+// waiting on an earlier copy — also carry their derived status in the body, so
+// the body never shows the raw-state "Starting" gloss for a deployment that
+// has not been claimed.
+func TestRenderMultiDeploymentApplyComment_PendingDetailUsesDerivedStatus(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu", so.Running),
+		rollingOp("us", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "staging",
+		Details: map[string]ApplyStatusCommentData{
+			"eu": {Database: "app_db", Environment: "staging", State: state.Apply.Running},
+			"us": {Database: "app_db", Environment: "staging", State: state.Apply.Pending},
+		},
+	})
+
+	assert.Contains(t, out, "**Status**: ⏳ Waiting for eu")
+	assert.NotContains(t, out, "**Status**: Starting")
+	// The running deployment keeps its raw-state gloss and suffix behavior.
+	assert.Contains(t, out, "**Status**: In Progress")
+}
+
+// A derived-status label interpolates deployment names, and the detail body
+// lives inside raw <details> HTML — a name carrying markup must be escaped in
+// the body's Status line, matching the <summary> line's escaping.
+func TestRenderMultiDeploymentApplyComment_DerivedStatusEscapesLabel(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu<b>", so.Running),
+		rollingOp("us", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "staging",
+		Details: map[string]ApplyStatusCommentData{
+			"eu<b>": {Database: "app_db", Environment: "staging", State: state.Apply.Running},
+			"us":    {Database: "app_db", Environment: "staging", State: state.Apply.Pending},
+		},
+	})
+
+	assert.Contains(t, out, "**Status**: ⏳ Waiting for eu&lt;b&gt;")
+	assert.NotContains(t, out, "**Status**: ⏳ Waiting for eu<b>")
+}
+
 // A deployment in an unrecognized engine state still renders a summary line and
 // section without a leading space where the glyph would be.
 func TestRenderMultiDeploymentApplyComment_UnknownStateNoGlyph(t *testing.T) {

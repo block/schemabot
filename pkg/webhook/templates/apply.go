@@ -78,6 +78,14 @@ type ApplyStatusCommentData struct {
 	Engine       string
 	ErrorMessage string
 
+	// DerivedStatus, when set, replaces the raw-state **Status** line in the
+	// rendered body. Multi-deployment sections set it for deployments whose
+	// render-time presentation is derived from earlier siblings (queued,
+	// waiting, halted, paused): the raw operation state for all of those is
+	// pending, which alone cannot express them, so the body's status must come
+	// from the derived model to agree with its <summary> line.
+	DerivedStatus string
+
 	// Attempt is the apply's operator redispatch count so far; the retry the
 	// comment announces is Attempt+1 of storage.MaxRecoveryAttempts.
 	Attempt     int
@@ -271,6 +279,13 @@ func startedAtDisplay(startedAt, fallback string) string {
 }
 
 func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
+	// A sibling-derived status carries the whole story ("Halted — eu failed");
+	// the raw-state gloss and its running-state suffixes do not apply to the
+	// pending-derived presentations that set it.
+	if data.DerivedStatus != "" {
+		fmt.Fprintf(sb, "\n**Status**: %s\n", data.DerivedStatus)
+		return
+	}
 	detail := applyStatusDetail(data.State)
 	if data.Rollback && state.IsState(data.State, state.Apply.Completed) {
 		detail = "Rolled Back"
