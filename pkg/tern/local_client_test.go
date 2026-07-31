@@ -3708,3 +3708,62 @@ func TestLocalClient_ProgressRendersNonShardedTableFromStoredTask(t *testing.T) 
 	assert.Equal(t, int64(1000), tp.ChecksumRowsTotal)
 	assert.Empty(t, tp.Shards, "a non-sharded table has no per-shard breakdown")
 }
+
+// Progress serves each table's own failure reason from its stored task row, so
+// a multi-table apply where one table failed (for example an engine preflight
+// rejection) reports the error on exactly that table — the control plane and
+// the PR comment can attribute the failure to the right table instead of
+// showing a bare failed row.
+func TestLocalClient_ProgressCarriesPerTableErrorMessage(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              43,
+		ApplyIdentifier: "apply-table-error",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Failed,
+	}
+	failedTask := &storage.Task{
+		ID:             8,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-users",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		TableName:      "users",
+		State:          state.Task.Failed,
+		DDLAction:      "alter",
+		ErrorMessage:   "engine preflight: enumReorder check failed for table users",
+	}
+	completedTask := &storage.Task{
+		ID:             9,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-orders",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		TableName:      "orders",
+		State:          state.Task.Completed,
+		DDLAction:      "alter",
+	}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{failedTask, completedTask}},
+		},
+		logger: slog.Default(),
+	}
+
+	progress, err := client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: apply.ApplyIdentifier, Environment: "staging"})
+	require.NoError(t, err)
+	require.Len(t, progress.Tables, 2)
+
+	byTable := make(map[string]*ternv1.TableProgress, len(progress.Tables))
+	for _, tp := range progress.Tables {
+		byTable[tp.TableName] = tp
+	}
+	require.Contains(t, byTable, "users")
+	require.Contains(t, byTable, "orders")
+	assert.Equal(t, "engine preflight: enumReorder check failed for table users", byTable["users"].ErrorMessage)
+	assert.Empty(t, byTable["orders"].ErrorMessage, "a table that did not fail carries no error")
+}
