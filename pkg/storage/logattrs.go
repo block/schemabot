@@ -111,13 +111,14 @@ func (op *ApplyOperation) LogAttrs() []any {
 }
 
 // LogAttrs returns the canonical triage attributes for a task: which task, on
-// which database and environment, which table, and in what state. A nil receiver
-// returns nil.
+// which database and environment, which table, and in what state. repo and pr
+// are included only when set so operators can tie the task to its PR. A nil
+// receiver returns nil.
 func (t *Task) LogAttrs() []any {
 	if t == nil {
 		return nil
 	}
-	return []any{
+	attrs := []any{
 		"task_id", t.TaskIdentifier,
 		"database", t.Database,
 		"database_type", t.DatabaseType,
@@ -125,4 +126,11 @@ func (t *Task) LogAttrs() []any {
 		"table", t.TableName,
 		"state", t.State,
 	}
+	if t.Repository != "" {
+		attrs = append(attrs, "repo", t.Repository)
+	}
+	if t.PullRequest > 0 {
+		attrs = append(attrs, "pr", t.PullRequest)
+	}
+	return attrs
 }
