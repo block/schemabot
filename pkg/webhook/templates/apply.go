@@ -36,7 +36,8 @@ type TableProgressData struct {
 	ReadyToComplete bool
 
 	// ErrorMessage is the task's last error. Rendered for states where the
-	// per-table error explains what the user is seeing (e.g. a retrying task).
+	// per-table error explains what the user is seeing (e.g. a retrying or
+	// failed task).
 	ErrorMessage string
 
 	// Shards is the per-shard breakdown for a sharded table. Empty for unsharded
@@ -622,7 +623,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 				renderResumingTable(sb, table)
 				continue
 			}
-			renderTableProgress(sb, table, data.Attempt)
+			renderTableProgress(sb, table, data.Attempt, data.ErrorMessage)
 		}
 	}
 }
@@ -683,8 +684,11 @@ func tableStatePriority(tableStatus string) int {
 }
 
 // renderTableProgress renders a single table's progress as markdown.
-// Mirrors the CLI's writeTableProgressWithState logic but outputs markdown instead of ANSI.
-func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAttempt int) {
+// Mirrors the CLI's writeTableProgressWithState logic but outputs markdown
+// instead of ANSI. applyError is the apply-level error message the comment
+// renders as its own block, so a failed table's identical error is not
+// repeated below the row.
+func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAttempt int, applyError string) {
 	// Normalize to canonical Task state for consistent matching.
 	status := state.NormalizeTaskStatus(table.Status)
 
@@ -755,6 +759,9 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 			fmt.Fprintf(sb, "**`%s`**: \u274c Failed (before row copy started)\n", table.TableName)
 		}
 		writeDDLLine(sb, table.DDL)
+		if taskErrorAddsDetail(table.ErrorMessage, applyError) {
+			writeTableErrorLine(sb, table.ErrorMessage)
+		}
 
 	case state.Task.FailedRetryable:
 		bar := ui.ProgressBarStopped(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
