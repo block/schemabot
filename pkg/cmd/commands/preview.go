@@ -90,6 +90,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyProgress, templates.PreviewCommentApplyCompleted,
 		templates.PreviewCommentApplyEstimateExceeded,
 		templates.PreviewCommentApplyFailed,
+		templates.PreviewCommentApplyFailedBeforeRowCopy,
 		templates.PreviewCommentApplyRetrying,
 		templates.PreviewCommentApplyStopped,
 		templates.PreviewCommentApplyWaitingCutover, templates.PreviewCommentApplyCuttingOver,
@@ -270,6 +271,7 @@ Comment Templates (GitHub PR comments):
   comment_apply_estimate_exceeded Multi-table: running after MySQL row estimate was exceeded
   comment_apply_completed       Multi-table: completed (all tables done)
   comment_apply_failed          Multi-table: failed (with error and cancelled tables)
+  comment_apply_failed_before_row_copy Multi-table: failed before row copy (preflight rejection, per-table error)
   comment_apply_retrying        Multi-table: interrupted, retrying automatically (attempt counter)
   comment_apply_stopped         Multi-table: stopped (partial progress)
   comment_apply_waiting_cutover Waiting for cutover (deferred, operator triggers)
