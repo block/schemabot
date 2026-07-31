@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,7 +22,7 @@ func TestGRPCApplyLogger_BindsIdentity(t *testing.T) {
 		var records []capturedLog
 		client := &GRPCClient{logger: slog.New(captureHandler{records: &records})}
 
-		apply := driveLoggerTestApply("running")
+		apply := driveLoggerTestApply(state.Apply.Running)
 		client.applyLogger(apply).Warn("remote drive line")
 
 		line := requireCapturedLog(t, records, "remote drive line")
@@ -30,7 +31,7 @@ func TestGRPCApplyLogger_BindsIdentity(t *testing.T) {
 
 	t.Run("nil base logger falls back to the default logger", func(t *testing.T) {
 		client := &GRPCClient{}
-		apply := driveLoggerTestApply("running")
+		apply := driveLoggerTestApply(state.Apply.Running)
 		require.NotNil(t, client.applyLogger(apply))
 	})
 }
@@ -40,7 +41,7 @@ func TestGRPCApplyLogger_BindsIdentity(t *testing.T) {
 // carries the apply identity plus the current mutable state without
 // duplicated identity keys.
 func TestDriveEndingHeartbeatFailure_LogsCarryApplyIdentity(t *testing.T) {
-	apply := driveLoggerTestApply("running")
+	apply := driveLoggerTestApply(state.Apply.Running)
 	apply.ExternalID = "remote-apply-9"
 	var records []capturedLog
 	logger := slog.New(captureHandler{records: &records}).With(apply.IdentityLogAttrs()...)
@@ -52,7 +53,7 @@ func TestDriveEndingHeartbeatFailure_LogsCarryApplyIdentity(t *testing.T) {
 	line := requireCapturedLog(t, records,
 		"gRPC drive heartbeat has failed for the full lease staleness window; a peer driver can reclaim the work, so this owner will stop driving and writing apply state")
 	assertLogCarriesApplyIdentity(t, line)
-	assert.Equal(t, "running", line.attrs["state"])
+	assert.Equal(t, state.Apply.Running, line.attrs["state"])
 	assert.Equal(t, "remote-apply-9", line.attrs["external_id"])
 	assert.Equal(t, hbErr, line.attrs["error"])
 }
@@ -61,7 +62,7 @@ func TestDriveEndingHeartbeatFailure_LogsCarryApplyIdentity(t *testing.T) {
 // identity-bound drive logger, so the warning carries the apply identity and
 // the offending remote level an operator needs to triage the data plane.
 func TestMirrorRemoteVolume_OutOfRangeLogCarriesApplyIdentity(t *testing.T) {
-	apply := driveLoggerTestApply("running")
+	apply := driveLoggerTestApply(state.Apply.Running)
 	apply.Options = storage.MarshalApplyOptions(storage.ApplyOptions{Volume: 3})
 	var records []capturedLog
 	logger := slog.New(captureHandler{records: &records}).With(apply.IdentityLogAttrs()...)

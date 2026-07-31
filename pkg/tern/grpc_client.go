@@ -263,10 +263,10 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 
 // applyLogger returns a drive-scoped logger with the apply's identity
 // attributes bound, so every line of the drive inherits apply_id, database,
-// environment, and — when set — repo/pr without hand-listing them per call.
-// Mutable attributes (state, deployment, external_id) stay per-call via
-// Apply.MutableLogAttrs. Falls back to slog.Default() when no base logger was
-// configured.
+// database_type, environment, and — when set — repo/pr/caller without
+// hand-listing them per call. Mutable attributes (state, deployment,
+// external_id) stay per-call via Apply.MutableLogAttrs. Falls back to
+// slog.Default() when no base logger was configured.
 func (c *GRPCClient) applyLogger(apply *storage.Apply) *slog.Logger {
 	base := c.logger
 	if base == nil {
