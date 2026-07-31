@@ -150,9 +150,12 @@ func writeTableErrorLine(sb *strings.Builder, msg string) {
 // information beyond the apply-level error block rendered elsewhere in the
 // comment. The apply's failure reason is promoted from its first failed task,
 // so for the common single-table failure the two messages are identical and
-// repeating the text below the row would only add noise.
+// repeating the text below the row would only add noise. Comparison ignores
+// surrounding whitespace so a stray trailing newline on either message does
+// not defeat the duplicate suppression.
 func taskErrorAddsDetail(taskError, applyError string) bool {
-	return taskError != "" && taskError != applyError
+	trimmed := strings.TrimSpace(taskError)
+	return trimmed != "" && trimmed != strings.TrimSpace(applyError)
 }
 
 // writeSuccessBlock writes a success message as a blockquote.

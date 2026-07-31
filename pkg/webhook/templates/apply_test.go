@@ -961,6 +961,16 @@ func TestRenderApplyStatusComment_FailedTableErrorLine(t *testing.T) {
 		assert.NotContains(t, result, "> ⚠️ Last error:")
 	})
 
+	t.Run("table error differing only by whitespace is not repeated", func(t *testing.T) {
+		result := render("preflight enumReorder check failed", "preflight enumReorder check failed\n", 35)
+		assert.NotContains(t, result, "> ⚠️ Last error:")
+	})
+
+	t.Run("all-whitespace table error renders no error line", func(t *testing.T) {
+		result := render("apply-level failure", "  \n", 35)
+		assert.NotContains(t, result, "> ⚠️ Last error:")
+	})
+
 	t.Run("pre-copy failure renders error line without a progress bar", func(t *testing.T) {
 		result := render("1 of 2 tables failed", "preflight enumReorder check failed", 0)
 		assert.Contains(t, result, "**`users`**: ❌ Failed (before row copy started)")
