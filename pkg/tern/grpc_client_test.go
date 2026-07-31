@@ -3572,31 +3572,31 @@ func TestGRPCClient_PollForCompletionMirrorsRemoteVolume(t *testing.T) {
 func TestMirrorRemoteVolume(t *testing.T) {
 	t.Run("reported level lands on the apply options", func(t *testing.T) {
 		apply := &storage.Apply{ApplyIdentifier: "apply-x"}
-		require.True(t, mirrorRemoteVolume(apply, 5))
+		require.True(t, mirrorRemoteVolume(slog.Default(), apply, 5))
 		assert.Equal(t, 5, apply.GetOptions().Volume)
 	})
 
 	t.Run("level change overwrites the stored level", func(t *testing.T) {
 		apply := &storage.Apply{ApplyIdentifier: "apply-x", Options: storage.MarshalApplyOptions(storage.ApplyOptions{Volume: 3})}
-		require.True(t, mirrorRemoteVolume(apply, 5))
+		require.True(t, mirrorRemoteVolume(slog.Default(), apply, 5))
 		assert.Equal(t, 5, apply.GetOptions().Volume)
 	})
 
 	t.Run("unchanged level reports no transition", func(t *testing.T) {
 		apply := &storage.Apply{ApplyIdentifier: "apply-x", Options: storage.MarshalApplyOptions(storage.ApplyOptions{Volume: 5})}
-		assert.False(t, mirrorRemoteVolume(apply, 5))
+		assert.False(t, mirrorRemoteVolume(slog.Default(), apply, 5))
 		assert.Equal(t, 5, apply.GetOptions().Volume)
 	})
 
 	t.Run("zero level mirrors nothing", func(t *testing.T) {
 		apply := &storage.Apply{ApplyIdentifier: "apply-x", Options: storage.MarshalApplyOptions(storage.ApplyOptions{Volume: 3})}
-		assert.False(t, mirrorRemoteVolume(apply, 0))
+		assert.False(t, mirrorRemoteVolume(slog.Default(), apply, 0))
 		assert.Equal(t, 3, apply.GetOptions().Volume)
 	})
 
 	t.Run("out-of-range level keeps the stored level", func(t *testing.T) {
 		apply := &storage.Apply{ApplyIdentifier: "apply-x", Options: storage.MarshalApplyOptions(storage.ApplyOptions{Volume: 3})}
-		assert.False(t, mirrorRemoteVolume(apply, 12))
+		assert.False(t, mirrorRemoteVolume(slog.Default(), apply, 12))
 		assert.Equal(t, 3, apply.GetOptions().Volume)
 	})
 }
