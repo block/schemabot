@@ -118,6 +118,18 @@ func writeSupportChannelOffer(sb *strings.Builder) {
 	sb.WriteString(supportChannelOfferMarker + "\n")
 }
 
+// appendAgentHint ends a plan comment with the deployment's configured agent
+// hint. The hint is written as an HTML comment: GitHub never renders one, so
+// the PR page is unchanged for human readers, while agents — which read
+// comment bodies as raw markdown through the API — receive it verbatim. A
+// deployment that configures no hint gets an unchanged comment.
+func appendAgentHint(body, hint string) string {
+	if hint == "" {
+		return body
+	}
+	return strings.TrimRight(body, "\n") + "\n\n<!-- 💡 " + hint + " -->"
+}
+
 // RenderSupportChannelFooter appends a support-channel footer to a rendered PR comment.
 func RenderSupportChannelFooter(body string, support SupportChannelData) string {
 	if support.Name == "" || support.URL == "" {

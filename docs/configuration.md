@@ -585,6 +585,29 @@ Both `name` and `url` are required when `support_channel` is configured. The
 URL must be an absolute `http` or `https` link with no credentials, whitespace,
 or Markdown link delimiters. When omitted, SchemaBot comments are unchanged.
 
+## Agent Hint
+
+SchemaBot can append an opt-in hint to plan comments pointing AI agents at the
+preferred way to drive SchemaBot, such as a skill or internal tool to install.
+
+```yaml
+agent_hint: "Agents: fetch the SchemaBot command reference by commenting `schemabot help`."
+```
+
+The hint is appended to plan comments as an HTML comment:
+
+```html
+<!-- 💡 Agents: fetch the SchemaBot command reference by commenting `schemabot help`. -->
+```
+
+GitHub never renders HTML comments, so the PR page is unchanged for human
+readers. Agents read comment bodies as raw markdown through the API and
+receive the hint verbatim — so the copy can address them directly with
+imperative instructions.
+
+The hint must be a single bounded line and must not contain `-->`. When
+omitted, plan comments are unchanged.
+
 ## Repository Allowlist
 
 By default, any repository with the GitHub App installed can use SchemaBot. Adding a `repos` section creates an allowlist — only listed repositories are permitted.

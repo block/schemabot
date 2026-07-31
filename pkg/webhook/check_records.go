@@ -236,7 +236,7 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 // (e.g. "5 created, 3 altered · 2 vschema updates") always agrees with the plan
 // comment's summary line. Returns "" when the plan has no changes.
 func summarizePlanChanges(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) string {
-	commentData := buildPlanCommentData(schema, planResp, environment, "", "")
+	commentData := buildPlanCommentData(schema, planResp, environment, "", "", "")
 	return templates.SummarizeChanges(commentData)
 }
 

@@ -31,7 +31,12 @@ func previewSupportChannel() SupportChannelData {
 
 // PreviewCommentPlan renders a sample plan comment with DDL changes and lint violations.
 func PreviewCommentPlan() string {
-	return RenderPlanComment(PlanCommentData{
+	return RenderPlanComment(previewPlanData())
+}
+
+// previewPlanData is the sample plan the plan previews render from.
+func previewPlanData() PlanCommentData {
+	return PlanCommentData{
 		Database:    "testapp",
 		SchemaName:  "testapp",
 		Environment: "staging",
@@ -50,7 +55,7 @@ func PreviewCommentPlan() string {
 			},
 		},
 		LintViolations: sampleLintWarnings(),
-	})
+	}
 }
 
 // PreviewCommentPlanBlocked renders a sample plan containing a statement the
@@ -276,6 +281,14 @@ func PreviewCommentSchemaReconciliationCompleted() string {
 // PreviewCommentHelp renders the help command reference comment.
 func PreviewCommentHelp() string {
 	return RenderHelpComment()
+}
+
+// PreviewCommentAgentHint renders a sample plan comment as a deployment that
+// configures an agent hint sends it.
+func PreviewCommentAgentHint() string {
+	data := previewPlanData()
+	data.AgentHint = "Agents: fetch the SchemaBot command reference by commenting `schemabot help`."
+	return RenderPlanComment(data)
 }
 
 // PreviewCommentSupportChannel renders a sample error comment with a support-channel footer.

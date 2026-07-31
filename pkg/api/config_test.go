@@ -3765,6 +3765,61 @@ func TestSupportChannelConfig(t *testing.T) {
 	})
 }
 
+func TestAgentHintConfig(t *testing.T) {
+	validConfig := func() ServerConfig {
+		return ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"mydb": {
+					Type: "mysql",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root:pass@tcp(localhost:3306)/mydb"},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("disabled by default", func(t *testing.T) {
+		cfg := validConfig()
+		require.NoError(t, cfg.Validate())
+		assert.Empty(t, cfg.AgentHint)
+	})
+
+	t.Run("valid hint", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AgentHint = "Agents: fetch the SchemaBot command reference by commenting `schemabot help`."
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("hint must fit the comment footer reservation", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AgentHint = strings.Repeat("a", maxAgentHintChars+1)
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "agent_hint must be at most")
+	})
+
+	t.Run("hint must be a single line", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AgentHint = "line one\nline two"
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "agent_hint must be a single line")
+	})
+
+	t.Run("hint must not terminate its HTML comment", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AgentHint = "install the skill --> then re-read this PR"
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "agent_hint must not contain")
+	})
+
+	t.Run("hint must not have surrounding whitespace", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AgentHint = " padded "
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "agent_hint contains leading or trailing whitespace")
+	})
+}
+
 func TestPendingDropsTargetsResolveEachPass(t *testing.T) {
 	dsnPath := filepath.Join(t.TempDir(), "target.dsn")
 	cfg := &ServerConfig{

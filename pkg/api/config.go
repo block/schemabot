@@ -87,6 +87,13 @@ type ServerConfig struct {
 	// SchemaBot so PR authors know where to ask operators for help.
 	SupportChannel SupportChannelConfig `yaml:"support_channel,omitempty"`
 
+	// AgentHint is optional free-form guidance appended to plan comments as an
+	// HTML comment — invisible on the rendered PR, but delivered verbatim to
+	// AI agents, which read comment bodies as raw markdown through the API.
+	// Deployments use it to point agents at the preferred way to drive
+	// SchemaBot (for example, a skill or internal tool to install).
+	AgentHint string `yaml:"agent_hint,omitempty"`
+
 	// DefaultReviewers are GitHub teams/users required to review schema changes.
 	DefaultReviewers []string `yaml:"default_reviewers"`
 
@@ -1255,6 +1262,9 @@ func (c *ServerConfig) Validate() error {
 	if err := validateSupportChannel(c.SupportChannel); err != nil {
 		return err
 	}
+	if err := validateAgentHint(c.AgentHint); err != nil {
+		return err
+	}
 	if err := c.validateGitHubAppsConfig(); err != nil {
 		return err
 	}
@@ -1644,6 +1654,33 @@ func validateSupportChannel(c SupportChannelConfig) error {
 	}
 	if parsed.User != nil {
 		return fmt.Errorf("support_channel.url must not include credentials")
+	}
+	return nil
+}
+
+// The agent hint is appended to plan comments under GitHub's comment size
+// cap, so the free-text hint must be bounded — an unbounded footer could push
+// an otherwise budget-fitting plan comment over the cap and GitHub would
+// reject it outright. The hint is delivered as a single HTML-comment line, so
+// embedded newlines or a comment terminator would break out of it and render
+// the hint on the PR page.
+const maxAgentHintChars = 300
+
+func validateAgentHint(hint string) error {
+	if hint == "" {
+		return nil
+	}
+	if len(hint) > maxAgentHintChars {
+		return fmt.Errorf("agent_hint must be at most %d characters (got %d)", maxAgentHintChars, len(hint))
+	}
+	if strings.ContainsAny(hint, "\r\n") {
+		return fmt.Errorf("agent_hint must be a single line")
+	}
+	if strings.Contains(hint, "-->") {
+		return fmt.Errorf("agent_hint must not contain \"-->\": it would terminate the HTML comment the hint is delivered in")
+	}
+	if strings.TrimSpace(hint) != hint {
+		return fmt.Errorf("agent_hint contains leading or trailing whitespace")
 	}
 	return nil
 }

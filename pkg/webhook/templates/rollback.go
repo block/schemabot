@@ -27,7 +27,7 @@ func RenderRollbackPlanComment(data PlanCommentData) string {
 	// Summary
 	if totalChanges == 0 {
 		sb.WriteString("**No schema changes detected** — the database already matches the original schema.\n\n")
-		return sb.String()
+		return appendAgentHint(sb.String(), data.AgentHint)
 	}
 
 	// Detailed changes
@@ -56,7 +56,7 @@ func RenderRollbackPlanComment(data PlanCommentData) string {
 	sb.WriteString("To cancel, comment:\n")
 	fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag("schemabot unlock", data.Tenant))
 
-	return sb.String()
+	return appendAgentHint(sb.String(), data.AgentHint)
 }
 
 // RenderRollbackConfirmNoLock renders a message when rollback-confirm is run

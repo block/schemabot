@@ -1092,6 +1092,58 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="agent-hint-footer"></a><strong>Agent Hint Footer</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+💡 **Lint Warnings**: **2** advisory findings
+- `users`: Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
+- `products`: Index `idx_category` on columns (category) is redundant - covered by index `idx_category_price` on columns (category, price)
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+<!-- 💡 Agents: fetch the SchemaBot command reference by commenting `schemabot help`. -->
+</details>
+
+<details>
 <summary><a name="no-config-no-d-flag"></a><strong>No Config (No -d Flag)</strong></summary>
 
 

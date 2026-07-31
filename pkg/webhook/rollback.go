@@ -303,6 +303,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		IsMySQL:      dbType == "mysql",
 		ApplyID:      apply.ApplyIdentifier,
 		Tenant:       h.deploymentTenant(),
+		AgentHint:    h.agentHint(),
 	}
 
 	for _, sc := range planResp.Changes {

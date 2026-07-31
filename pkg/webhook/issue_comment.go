@@ -770,6 +770,14 @@ func (h *Handler) supportChannel() api.SupportChannelConfig {
 	return cfg.SupportChannel
 }
 
+func (h *Handler) agentHint() string {
+	cfg := h.config()
+	if cfg == nil {
+		return ""
+	}
+	return cfg.AgentHint
+}
+
 // appendSupportChannelFooter adds the configured support-channel footer to
 // comments that declared themselves eligible at render time (see
 // templates.OffersSupportChannel). Eligibility is a render-layer decision;
