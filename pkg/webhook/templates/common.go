@@ -145,10 +145,14 @@ var (
 	// dsnFragmentRe matches Go MySQL driver DSN fragments such as
 	// user:pass@tcp(host:3306)/db, which leak credentials and endpoints.
 	dsnFragmentRe = regexp.MustCompile(`\S*@tcp\([^)]*\)\S*`)
-	// hostPortRe matches dotted hostnames carrying an explicit port, such as
-	// db.internal.example.com:3306. Requiring the port avoids matching
-	// schema-qualified identifiers like db.table.
-	hostPortRe = regexp.MustCompile(`\b(?:[A-Za-z0-9][A-Za-z0-9-]*\.)+[A-Za-z0-9][A-Za-z0-9-]*:\d{1,5}\b`)
+	// hostPortRe matches hostnames carrying an explicit port: dotted names
+	// such as db.internal.example.com:3306 and single-label service names
+	// such as mysql-primary:3306, which are common in dial errors. Requiring
+	// the port avoids matching schema-qualified identifiers like db.table;
+	// the single-label form additionally requires a leading letter and a
+	// multi-digit port so line:column references and similar numeric pairs
+	// are not redacted.
+	hostPortRe = regexp.MustCompile(`\b(?:(?:[A-Za-z0-9][A-Za-z0-9-]*\.)+[A-Za-z0-9][A-Za-z0-9-]*:\d{1,5}|[A-Za-z][A-Za-z0-9-]*:\d{2,5})\b`)
 	// ipEndpointRe matches IPv4 addresses with an optional port.
 	ipEndpointRe = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b`)
 	// ansiEscapeRe matches ANSI terminal escape sequences (colors, cursor
@@ -157,8 +161,9 @@ var (
 )
 
 // sanitizeCommentError makes an untrusted engine or task error safe to render
-// in a public PR comment: it normalizes line endings, strips control
-// characters, redacts connection endpoints (DSN fragments, host:port pairs,
+// in a public PR comment: it normalizes line endings, strips control and
+// format characters (including bidi overrides usable for visual spoofing),
+// redacts connection endpoints (DSN fragments, host:port pairs,
 // IP addresses) that leak internal infrastructure, trims surrounding
 // whitespace, and clamps the length by rune count. The raw error remains
 // available server-side in the apply logs, so nothing is lost for triage.
@@ -170,7 +175,7 @@ func sanitizeCommentError(msg string) string {
 		if r == '\n' || r == '\t' {
 			return r
 		}
-		if unicode.IsControl(r) {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			return -1
 		}
 		return r

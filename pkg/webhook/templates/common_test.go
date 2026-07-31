@@ -35,6 +35,11 @@ func TestSanitizeCommentError(t *testing.T) {
 		assert.Equal(t, "a\n\tb", sanitizeCommentError("a\n\tb"))
 	})
 
+	t.Run("Unicode format characters are stripped", func(t *testing.T) {
+		assert.Equal(t, "renamed.txt",
+			sanitizeCommentError("re\u202enamed.txt\u202c\u200b\u2066\u2069"))
+	})
+
 	t.Run("DSN fragment is redacted", func(t *testing.T) {
 		got := sanitizeCommentError("dial failed: user:secret@tcp(db-primary.internal:3306)/orders?tls=true refused")
 		assert.Equal(t, "dial failed: [endpoint redacted] refused", got)
@@ -45,6 +50,17 @@ func TestSanitizeCommentError(t *testing.T) {
 	t.Run("hostname with port is redacted", func(t *testing.T) {
 		got := sanitizeCommentError("connect to db.internal.example.com:3306 timed out")
 		assert.Equal(t, "connect to [endpoint redacted] timed out", got)
+	})
+
+	t.Run("single-label service endpoint is redacted", func(t *testing.T) {
+		got := sanitizeCommentError("dial tcp mysql-primary:3306: connect: connection refused")
+		assert.Equal(t, "dial tcp [endpoint redacted]: connect: connection refused", got)
+		assert.NotContains(t, got, "mysql-primary")
+	})
+
+	t.Run("line:column references are not redacted", func(t *testing.T) {
+		msg := "parse error at line 3:14 near 'ENUM'"
+		assert.Equal(t, msg, sanitizeCommentError(msg))
 	})
 
 	t.Run("IP endpoints are redacted", func(t *testing.T) {
