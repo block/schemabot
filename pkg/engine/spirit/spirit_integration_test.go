@@ -360,6 +360,144 @@ func TestEngine_Plan_ExecutionVerdictBlocked(t *testing.T) {
 	assert.Equal(t, "adding foreign key constraints is not supported", orders.ModeReason)
 }
 
+// A desired schema that reorders an existing ENUM column's values — or
+// inserts a new value before retained ones — diffs to a MODIFY COLUMN that
+// Spirit's preflight deterministically refuses on the row-copy path. The
+// plan carries the blocked verdict with the engine's reason so the operator
+// learns before apply, while an append-at-the-end ENUM change in the same
+// plan stays on the engine's default path.
+func TestEngine_Plan_EnumReorderVerdictBlocked(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupCtx := context.WithoutCancel(t.Context())
+	t.Cleanup(func() {
+		for _, table := range []string{"enum_reordered", "enum_appended"} {
+			_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `"+table+"`")
+			assert.NoError(t, err, "drop table %s", table)
+		}
+	})
+
+	for _, table := range []string{"enum_reordered", "enum_appended"} {
+		_, err := db.ExecContext(t.Context(), "CREATE TABLE `"+table+"` ("+
+			"id INT NOT NULL AUTO_INCREMENT, "+
+			"status ENUM('active', 'inactive', 'pending') NOT NULL, "+
+			"PRIMARY KEY (id))")
+		require.NoError(t, err, "create %s table", table)
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"enum_reordered.sql": `CREATE TABLE enum_reordered (
+				id INT NOT NULL AUTO_INCREMENT,
+				status ENUM('pending', 'active', 'inactive') NOT NULL,
+				PRIMARY KEY (id)
+			)`,
+			"enum_appended.sql": `CREATE TABLE enum_appended (
+				id INT NOT NULL AUTO_INCREMENT,
+				status ENUM('active', 'inactive', 'pending', 'archived') NOT NULL,
+				PRIMARY KEY (id)
+			)`,
+		}),
+		Credentials: &engine.Credentials{
+			DSN: dsn,
+		},
+	})
+	require.NoError(t, err, "Plan()")
+	require.False(t, result.NoChanges, "expected changes, got NoChanges")
+
+	verdicts := make(map[string]engine.TableChange)
+	for _, tc := range result.FlatTableChanges() {
+		t.Logf("table %s: ddl=%s mode=%q reason=%q", tc.Table, tc.DDL, tc.ExecutionMode, tc.ModeReason)
+		verdicts[tc.Table] = tc
+	}
+
+	reordered, ok := verdicts["enum_reordered"]
+	require.True(t, ok, "plan carries the enum_reordered change")
+	assert.Equal(t, "blocked", reordered.ExecutionMode, "the ENUM reorder carries the blocked verdict")
+	assert.Contains(t, reordered.ModeReason, "unsafe ENUM value reorder")
+	assert.Contains(t, reordered.ModeReason, `"status"`)
+
+	appended, ok := verdicts["enum_appended"]
+	require.True(t, ok, "plan carries the enum_appended change")
+	assert.Empty(t, appended.ExecutionMode, "appending an ENUM value stays on the engine's default path")
+	assert.Empty(t, appended.ModeReason)
+}
+
+// The ENUM reorder verdict mirrors the engine's table-schema-aware preflight
+// check, so this test proves the mirror against the engine itself: every
+// ENUM change shape the verdict classifies as blocked is handed to a real
+// Spirit schema change, which must refuse it with the very reason the
+// verdict recorded. An engine upgrade that relaxes the check — or rewords
+// its refusal — fails this test, signaling that
+// ddl.EnumReorderRefusalReason must change in the same bump so the verdict
+// never claims an apply will fail when it can succeed.
+func TestEngine_SpiritRefusesEnumReorderVerdictBlockedStatements(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupCtx := context.WithoutCancel(t.Context())
+	t.Cleanup(func() {
+		_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `verdict_enum`")
+		assert.NoError(t, err, "drop table verdict_enum")
+	})
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE verdict_enum (
+		id INT NOT NULL AUTO_INCREMENT,
+		status ENUM('active', 'inactive', 'pending') NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create verdict_enum table")
+
+	var tableName, currentCreateTable string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SHOW CREATE TABLE `verdict_enum`").
+		Scan(&tableName, &currentCreateTable), "SHOW CREATE TABLE verdict_enum")
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	tests := []struct {
+		name string
+		stmt string
+	}{
+		{
+			name: "reorder existing values",
+			stmt: "ALTER TABLE `verdict_enum` MODIFY COLUMN `status` ENUM('pending', 'active', 'inactive') NOT NULL",
+		},
+		{
+			name: "insert new value mid-list",
+			stmt: "ALTER TABLE `verdict_enum` MODIFY COLUMN `status` ENUM('active', 'suspended', 'inactive', 'pending') NOT NULL",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reason, refused, err := ddl.EnumReorderRefusalReason(tt.stmt, currentCreateTable)
+			require.NoError(t, err, "EnumReorderRefusalReason")
+			require.True(t, refused, "the verdict must classify this statement as blocked")
+			require.NotEmpty(t, reason)
+
+			runner, err := spiritmigration.NewRunner(&spiritmigration.Migration{
+				Host:      host,
+				Username:  username,
+				Password:  &password,
+				Database:  database,
+				Statement: tt.stmt,
+			})
+			require.NoError(t, err, "NewRunner")
+			defer utils.CloseAndLog(runner)
+
+			runCtx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			runErr := runner.Run(runCtx)
+			require.Error(t, runErr, "the engine must refuse a statement the verdict marked blocked")
+			assert.Contains(t, runErr.Error(), reason,
+				"the engine's refusal must carry the reason the verdict recorded")
+		})
+	}
+}
+
 // The execution-mode verdict mirrors refusal checks that live inside the
 // engine, so this test proves the mirror against the engine itself: every
 // statement shape the verdict classifies as blocked is handed to a real

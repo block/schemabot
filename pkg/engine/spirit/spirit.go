@@ -318,6 +318,13 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		}, nil
 	}
 
+	// Current CREATE TABLE by table name, for verdicts that must compare a
+	// planned ALTER against the live column definitions (e.g. ENUM reorder).
+	currentCreateTables := make(map[string]string, len(currentSchema))
+	for _, ts := range currentSchema {
+		currentCreateTables[ts.Name] = ts.Schema
+	}
+
 	// Convert PlannedChanges to engine types
 	var lintViolations []engine.LintViolation
 	changes := make([]engine.TableChange, 0, len(plan.Changes))
@@ -357,6 +364,24 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 				change.ModeReason = reason
 				e.logger.Info("plan contains a statement the engine will refuse at apply time",
 					"database", database, "table", pc.TableName, "reason", reason)
+			}
+
+			// Table-schema-aware verdict: ENUM reorder / mid-list insertion
+			// is refused by the engine's preflight check against the live
+			// column definition, so it needs the current CREATE TABLE. Only
+			// consulted when the statement-scope verdict found nothing, so
+			// an already-blocked reason is never overwritten.
+			if currentCT, hasTable := currentCreateTables[pc.TableName]; !refused && hasTable {
+				enumReason, enumRefused, err := ddl.EnumReorderRefusalReason(pc.Statement, currentCT)
+				if err != nil {
+					return nil, fmt.Errorf("ENUM reorder verdict for table %q: %w", pc.TableName, err)
+				}
+				if enumRefused {
+					change.ExecutionMode = ddl.ExecutionModeBlocked
+					change.ModeReason = enumReason
+					e.logger.Info("plan contains a statement the engine will refuse at apply time",
+						"database", database, "table", pc.TableName, "reason", enumReason)
+				}
 			}
 		}
 
