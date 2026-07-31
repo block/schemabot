@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -42,8 +43,8 @@ func dropTablesOnCleanup(t *testing.T, db *sql.DB, tables ...string) {
 
 // With the direct execution policy enabled and the table within the size
 // bound, the plan resolves a statement the engine refuses to the direct
-// verdict, with the reason carrying the refusal and the row estimate — the
-// operator sees exactly what will run natively and why before confirming.
+// verdict, with the reason carrying the refusal and the measured row count —
+// the operator sees exactly what will run natively and why before confirming.
 func TestEngine_Plan_DirectVerdictWithinBound(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	dropTablesOnCleanup(t, db, "direct_plan")
@@ -83,10 +84,11 @@ func TestEngine_Plan_DirectVerdictWithinBound(t *testing.T) {
 	assert.Contains(t, changes[0].ModeReason, "runs as native MySQL DDL on a table with ~")
 }
 
-// A table whose estimated row count exceeds max_table_rows keeps the blocked
-// verdict even with the policy enabled: the bound is the fail-closed backstop
-// against unbounded native rebuilds, and the reason names both the estimate
-// and the configured limit so the operator sees why.
+// A table whose row count exceeds max_table_rows keeps the blocked verdict
+// even with the policy enabled: the bound is the fail-closed backstop against
+// unbounded native rebuilds, and the reason names the configured limit so
+// the operator sees why. The reason deliberately omits the measured count so
+// the same verdict on every shard of a sharded plan renders as one entry.
 func TestEngine_Plan_DirectBlockedAboveBound(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	dropTablesOnCleanup(t, db, "direct_bound")
@@ -167,4 +169,93 @@ func TestEngine_Plan_MalformedDirectPolicyFails(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "direct_execution_max_table_rows is not set")
+}
+
+// With direct execution enabled but the target unreachable, the verdict fails
+// closed to blocked: no connection means no size gate, and an unmeasured
+// table must never rebuild natively. The reason carries both the refusal and
+// why direct execution declined it.
+func TestResolveRefusedMode_UnreachableTargetBlocks(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	eng := New(Config{Logger: logger})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	target := &lazyTargetDB{dsn: "root:nopass@tcp(127.0.0.1:1)/absent"}
+	defer target.close()
+
+	policy := directPolicy{Enabled: true, MaxTableRows: 1000}
+	decision := eng.resolveRefusedMode(ctx, target, policy, "absent", "users", "dropping primary key is not supported")
+	assert.Equal(t, engine.ExecutionModeBlocked, decision.mode)
+	assert.Contains(t, decision.modeReason, "dropping primary key is not supported")
+	assert.Contains(t, decision.modeReason, "row count is unavailable")
+}
+
+// The size gate fails closed on every input it cannot measure: a table
+// missing from information_schema, and a view — which information_schema
+// lists with a NULL row count — both resolve to errors instead of a zero
+// count that would slip under any bound.
+func TestEstimatedTableRows_FailClosedInputs(t *testing.T) {
+	_, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "size_gate_base")
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE size_gate_base (
+		id INT NOT NULL AUTO_INCREMENT,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create size_gate_base table")
+
+	_, err = db.ExecContext(t.Context(), "CREATE VIEW `size_gate_view` AS SELECT `id` FROM `size_gate_base`")
+	require.NoError(t, err, "create size_gate_view")
+	cleanupCtx := context.WithoutCancel(t.Context())
+	t.Cleanup(func() {
+		_, err := db.ExecContext(cleanupCtx, "DROP VIEW IF EXISTS `size_gate_view`")
+		assert.NoError(t, err, "drop view size_gate_view")
+	})
+
+	t.Run("missing table", func(t *testing.T) {
+		_, err := estimatedTableRows(t.Context(), db, "testdb", "size_gate_absent")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not found in information_schema")
+	})
+
+	t.Run("view has no row count", func(t *testing.T) {
+		_, err := estimatedTableRows(t.Context(), db, "testdb", "size_gate_view")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "is unavailable")
+	})
+}
+
+// The exact bounded count confirms a direct verdict without trusting the
+// optimizer's statistics: it counts real rows but never scans past the
+// configured bound, and a missing table is an error rather than a zero count.
+func TestExactRowCountWithin(t *testing.T) {
+	_, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "exact_count")
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE exact_count (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create exact_count table")
+
+	var inserts strings.Builder
+	inserts.WriteString("INSERT INTO exact_count (tenant_id) VALUES (1)")
+	for range 19 {
+		inserts.WriteString(",(1)")
+	}
+	_, err = db.ExecContext(t.Context(), inserts.String())
+	require.NoError(t, err, "seed rows")
+
+	count, err := exactRowCountWithin(t.Context(), db, "testdb", "exact_count", 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(20), count, "a table within the bound reports its exact count")
+
+	count, err = exactRowCountWithin(t.Context(), db, "testdb", "exact_count", 10)
+	require.NoError(t, err)
+	assert.Equal(t, int64(11), count, "a table above the bound reports limit+1: the scan stops at the cap")
+
+	_, err = exactRowCountWithin(t.Context(), db, "testdb", "exact_count_absent", 10)
+	require.Error(t, err, "a missing table is an error, never a zero count")
 }

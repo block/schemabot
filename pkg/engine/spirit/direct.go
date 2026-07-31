@@ -3,7 +3,7 @@
 // DDL under the target database's policy. The policy arrives as engine
 // metadata, the plan records the resulting per-statement verdict, and every
 // uncertainty fails closed — a refused statement resolves to the direct
-// verdict only when the policy is enabled and the table's estimated size is
+// verdict only when the policy is enabled and the table's measured size is
 // within the configured bound.
 package spirit
 
@@ -21,23 +21,6 @@ import (
 	"github.com/block/schemabot/pkg/ui"
 )
 
-// Engine metadata keys carrying the direct execution policy. Config surfaces
-// (server config, embedder assemblers) resolve their policy into these keys;
-// the engine reads them from request credentials.
-const (
-	// metadataDirectExecution enables direct execution ("true") for ALTER
-	// statements the engine deterministically refuses. Absent or "false"
-	// leaves refused statements blocked.
-	metadataDirectExecution = "direct_execution"
-
-	// metadataDirectExecutionMaxTableRows bounds direct execution by the
-	// target table's estimated row count. Required (a positive integer) when
-	// direct execution is enabled, so a native table rebuild can never run
-	// unbounded: above the bound — or when the size cannot be estimated —
-	// the statement stays blocked.
-	metadataDirectExecutionMaxTableRows = "direct_execution_max_table_rows"
-)
-
 // directPolicy is the resolved direct execution policy for a target database.
 // The zero value is the fail-closed default: refused statements are blocked.
 type directPolicy struct {
@@ -50,35 +33,41 @@ type directPolicy struct {
 // disabled, so a misconfigured policy is surfaced instead of quietly turning
 // planned direct changes into apply-time failures.
 func directPolicyFromMetadata(md map[string]string) (directPolicy, error) {
-	switch md[metadataDirectExecution] {
-	case "", "false":
+	rawEnabled := md[engine.MetadataDirectExecution]
+	if rawEnabled == "" {
 		return directPolicy{}, nil
-	case "true":
-	default:
-		return directPolicy{}, fmt.Errorf("invalid %s metadata value %q: must be \"true\" or \"false\"", metadataDirectExecution, md[metadataDirectExecution])
 	}
-	raw := md[metadataDirectExecutionMaxTableRows]
+	enabled, err := strconv.ParseBool(rawEnabled)
+	if err != nil {
+		return directPolicy{}, fmt.Errorf("invalid %s metadata value %q: %w", engine.MetadataDirectExecution, rawEnabled, err)
+	}
+	if !enabled {
+		return directPolicy{}, nil
+	}
+	raw := md[engine.MetadataDirectExecutionMaxTableRows]
 	if raw == "" {
-		return directPolicy{}, fmt.Errorf("%s is enabled but %s is not set: the row bound is required so direct execution fails closed on large tables", metadataDirectExecution, metadataDirectExecutionMaxTableRows)
+		return directPolicy{}, fmt.Errorf("%s is enabled but %s is not set: the row bound is required so direct execution fails closed on large tables", engine.MetadataDirectExecution, engine.MetadataDirectExecutionMaxTableRows)
 	}
 	maxRows, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
-		return directPolicy{}, fmt.Errorf("parse %s metadata value %q: %w", metadataDirectExecutionMaxTableRows, raw, err)
+		return directPolicy{}, fmt.Errorf("parse %s metadata value %q: %w", engine.MetadataDirectExecutionMaxTableRows, raw, err)
 	}
 	if maxRows <= 0 {
-		return directPolicy{}, fmt.Errorf("%s must be positive, got %d", metadataDirectExecutionMaxTableRows, maxRows)
+		return directPolicy{}, fmt.Errorf("%s must be positive, got %d", engine.MetadataDirectExecutionMaxTableRows, maxRows)
 	}
 	return directPolicy{Enabled: true, MaxTableRows: maxRows}, nil
 }
 
 // estimatedTableRows returns MySQL's estimated row count for the table from
-// information_schema statistics. The estimate is approximate (it tracks the
-// optimizer's statistics, not an exact count), which is sufficient for the
-// order-of-magnitude bound the direct execution policy enforces. The read
-// happens on a dedicated connection with statistics caching disabled: MySQL
-// otherwise serves information_schema statistics cached for up to
+// information_schema statistics. The read happens on a dedicated connection
+// with statistics caching disabled: MySQL otherwise serves
+// information_schema statistics cached for up to
 // information_schema_stats_expiry seconds (a day by default), and a safety
-// bound must not be decided on a day-old row count.
+// bound must not be decided on a day-old row count. Even uncached, the value
+// is only the optimizer's estimate — InnoDB persistent statistics refresh in
+// the background and can grossly undercount right after a bulk load — so
+// callers trust it to block, never to approve: a verdict for direct
+// execution is corroborated with an exact bounded row count.
 func estimatedTableRows(ctx context.Context, db *sql.DB, schema, tableName string) (int64, error) {
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -110,18 +99,44 @@ func estimatedTableRows(ctx context.Context, db *sql.DB, schema, tableName strin
 	return rows.Int64, nil
 }
 
-// refusedModeDecision is how a statement the engine refuses will execute
-// under the direct execution policy. The plan records mode and modeReason on
-// the table change; the apply-time routing acts on the same decision.
-type refusedModeDecision struct {
-	mode       string // engine.ExecutionModeDirect or engine.ExecutionModeBlocked
-	modeReason string // operator-facing reason, including row-estimate context
-	rows       int64  // estimated rows when the estimate succeeded
+// exactRowCountWithin returns the table's exact row count, capped at limit+1.
+// The scan is bounded by the cap, so confirming a table within the policy
+// bound stays cheap no matter how wrong the optimizer's estimate is; a return
+// value of limit+1 means "more than limit rows", not a total.
+func exactRowCountWithin(ctx context.Context, db *sql.DB, schema, tableName string, limit int64) (int64, error) {
+	query := fmt.Sprintf("SELECT COUNT(*) FROM (SELECT 1 FROM `%s`.`%s` LIMIT %d) bounded", schema, tableName, limit+1)
+	var count int64
+	if err := db.QueryRowContext(ctx, query).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count rows of `%s`.`%s` (bounded at %d): %w", schema, tableName, limit+1, err)
+	}
+	return count, nil
 }
 
+// refusedModeDecision is how a statement the engine refuses will execute
+// under the direct execution policy. The plan records mode and modeReason on
+// the table change as an operator-facing preview; apply-time routing
+// re-resolves the decision against live policy and table state rather than
+// trusting the stored verdict.
+type refusedModeDecision struct {
+	mode       string // engine.ExecutionModeDirect or engine.ExecutionModeBlocked
+	modeReason string // operator-facing reason, including row-count context
+	rows       int64  // measured rows when the size gate ran: exact for a direct verdict, the estimate when the estimate alone blocked
+}
+
+// blockedSizeUnknownReason is the mode-reason suffix when the size gate could
+// not be evaluated at all: no target connection, no statistics row, or a
+// failed count. Every such uncertainty blocks.
+const blockedSizeUnknownReason = "; direct execution is enabled but the table's row count is unavailable"
+
 // resolveRefusedMode decides whether the policy routes a refused statement to
-// direct execution. Every uncertainty blocks: policy disabled, an estimated
-// size above the bound, or a size that cannot be estimated at all.
+// direct execution. Every uncertainty blocks: policy disabled, a size gate
+// that cannot be evaluated, or a table above the configured bound. The size
+// gate runs in two steps — the optimizer's estimate first, then an exact
+// bounded row count — because the estimate can lag reality in both
+// directions, so it is trusted to block but never to approve on its own.
+// The above-bound reason names only the configured limit, not the measured
+// count, so identical verdicts on different shards collapse into one row in
+// PR-facing summaries.
 func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, policy directPolicy, database, tableName, refusalReason string) refusedModeDecision {
 	if !policy.Enabled {
 		return refusedModeDecision{
@@ -131,39 +146,59 @@ func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, p
 	}
 	db, err := target.get(ctx)
 	if err != nil {
-		// Fail closed: without a connection there is no size estimate, and an
-		// unestimated table must never rebuild natively.
-		e.logger.Warn("direct execution blocked: cannot connect to target for the row estimate",
+		// Fail closed: without a connection there is no size gate, and an
+		// unmeasured table must never rebuild natively.
+		e.logger.Warn("direct execution blocked: cannot connect to target for the size gate",
 			"database", database, "table", tableName, "error", err)
 		return refusedModeDecision{
 			mode:       engine.ExecutionModeBlocked,
-			modeReason: refusalReason + "; direct execution is enabled but the table's estimated row count is unavailable",
+			modeReason: refusalReason + blockedSizeUnknownReason,
 		}
 	}
 	rows, err := estimatedTableRows(ctx, db, database, tableName)
 	if err != nil {
-		// Fail closed: a table whose size cannot be estimated must never
+		// Fail closed: a table whose size cannot be measured must never
 		// rebuild natively — block it and surface why in the mode reason.
 		e.logger.Warn("direct execution blocked: estimated row count unavailable",
 			"database", database, "table", tableName, "error", err)
 		return refusedModeDecision{
 			mode:       engine.ExecutionModeBlocked,
-			modeReason: refusalReason + "; direct execution is enabled but the table's estimated row count is unavailable",
+			modeReason: refusalReason + blockedSizeUnknownReason,
 		}
 	}
+	aboveBoundReason := fmt.Sprintf("%s; direct execution is enabled but the table is above the configured limit of %s rows",
+		refusalReason, ui.FormatNumber(policy.MaxTableRows))
 	if rows > policy.MaxTableRows {
+		e.logger.Info("direct execution blocked: estimated row count above the policy bound",
+			"database", database, "table", tableName, "estimated_rows", rows, "max_table_rows", policy.MaxTableRows)
 		return refusedModeDecision{
-			mode: engine.ExecutionModeBlocked,
-			modeReason: fmt.Sprintf("%s; direct execution is enabled but the table has ~%s rows, above the configured limit of %s",
-				refusalReason, ui.FormatNumber(rows), ui.FormatNumber(policy.MaxTableRows)),
-			rows: rows,
+			mode:       engine.ExecutionModeBlocked,
+			modeReason: aboveBoundReason,
+			rows:       rows,
+		}
+	}
+	count, err := exactRowCountWithin(ctx, db, database, tableName, policy.MaxTableRows)
+	if err != nil {
+		e.logger.Warn("direct execution blocked: exact row count unavailable",
+			"database", database, "table", tableName, "error", err)
+		return refusedModeDecision{
+			mode:       engine.ExecutionModeBlocked,
+			modeReason: refusalReason + blockedSizeUnknownReason,
+		}
+	}
+	if count > policy.MaxTableRows {
+		e.logger.Info("direct execution blocked: exact row count above the policy bound despite a smaller estimate",
+			"database", database, "table", tableName, "estimated_rows", rows, "max_table_rows", policy.MaxTableRows)
+		return refusedModeDecision{
+			mode:       engine.ExecutionModeBlocked,
+			modeReason: aboveBoundReason,
 		}
 	}
 	return refusedModeDecision{
 		mode: engine.ExecutionModeDirect,
 		modeReason: fmt.Sprintf("%s; runs as native MySQL DDL on a table with ~%s rows",
-			refusalReason, ui.FormatNumber(rows)),
-		rows: rows,
+			refusalReason, ui.FormatNumber(count)),
+		rows: count,
 	}
 }
 

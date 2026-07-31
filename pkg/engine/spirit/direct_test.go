@@ -14,6 +14,7 @@ func TestDirectPolicyFromMetadata_Disabled(t *testing.T) {
 		"nil metadata":    nil,
 		"empty metadata":  {},
 		"explicit false":  {"direct_execution": "false"},
+		"numeric false":   {"direct_execution": "0"},
 		"bound but off":   {"direct_execution": "false", "direct_execution_max_table_rows": "1000"},
 		"bound alone off": {"direct_execution_max_table_rows": "1000"},
 	} {
@@ -26,15 +27,20 @@ func TestDirectPolicyFromMetadata_Disabled(t *testing.T) {
 	}
 }
 
-// Enabling direct execution with a positive row bound resolves the policy.
+// Enabling direct execution with a positive row bound resolves the policy,
+// accepting any standard boolean spelling of the enable flag.
 func TestDirectPolicyFromMetadata_Enabled(t *testing.T) {
-	policy, err := directPolicyFromMetadata(map[string]string{
-		"direct_execution":                "true",
-		"direct_execution_max_table_rows": "500000",
-	})
-	require.NoError(t, err)
-	assert.True(t, policy.Enabled)
-	assert.Equal(t, int64(500000), policy.MaxTableRows)
+	for _, enable := range []string{"true", "True", "1"} {
+		t.Run(enable, func(t *testing.T) {
+			policy, err := directPolicyFromMetadata(map[string]string{
+				"direct_execution":                enable,
+				"direct_execution_max_table_rows": "500000",
+			})
+			require.NoError(t, err)
+			assert.True(t, policy.Enabled)
+			assert.Equal(t, int64(500000), policy.MaxTableRows)
+		})
+	}
 }
 
 // A malformed policy is a hard error, never a silent fallback to disabled:
