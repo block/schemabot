@@ -159,6 +159,24 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 // state transitions).
 func setupE2EServiceWithStorage(t *testing.T, appDBName string, wrapStorage func(storage.Storage) storage.Storage) *api.Service {
 	t.Helper()
+	return setupE2EServiceOpts(t, appDBName, e2eServiceOpts{wrapStorage: wrapStorage})
+}
+
+// e2eServiceOpts customizes setupE2EServiceOpts beyond the defaults.
+type e2eServiceOpts struct {
+	// wrapStorage wraps the service's storage so a test can observe every
+	// storage write the handler and observers perform.
+	wrapStorage func(storage.Storage) storage.Storage
+	// engineMetadata is forwarded to the LocalClient, enabling per-database
+	// engine policies (e.g. direct execution) for the test's plans and
+	// applies.
+	engineMetadata map[string]string
+}
+
+// setupE2EServiceOpts creates a real api.Service with a LocalClient for the
+// given database, customized by opts.
+func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *api.Service {
+	t.Helper()
 	ctx := t.Context()
 
 	// Create the app database on the target
@@ -184,8 +202,8 @@ func setupE2EServiceWithStorage(t *testing.T, appDBName string, wrapStorage func
 	t.Cleanup(func() { _ = schemabotDB.Close() })
 
 	st := storage.Storage(mysqlstore.New(schemabotDB))
-	if wrapStorage != nil {
-		st = wrapStorage(st)
+	if opts.wrapStorage != nil {
+		st = opts.wrapStorage(st)
 	}
 
 	// Clean up any stale data from previous test runs (shared storage DB)
@@ -203,6 +221,7 @@ func setupE2EServiceWithStorage(t *testing.T, appDBName string, wrapStorage func
 		Database:  appDBName,
 		Type:      "mysql",
 		TargetDSN: appDSN,
+		Metadata:  opts.engineMetadata,
 	}, st, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = localClient.Close() })

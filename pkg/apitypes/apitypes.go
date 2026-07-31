@@ -522,6 +522,31 @@ func (r *PlanResponse) HasBlockedChanges() bool {
 	return false
 }
 
+// DirectChanges returns all table changes the planner routed to direct
+// execution, across namespace-level and per-shard changes.
+func (r *PlanResponse) DirectChanges() []*TableChangeResponse {
+	if r == nil {
+		return nil
+	}
+	var result []*TableChangeResponse
+	for _, t := range r.FlatTables() {
+		if t.DirectExecution() {
+			result = append(result, t)
+		}
+	}
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if t.DirectExecution() {
+				result = append(result, t)
+			}
+		}
+	}
+	return result
+}
+
 // LintWarnings returns lint results with warning severity.
 func (r *PlanResponse) LintWarnings() []LintViolationResponse {
 	var result []LintViolationResponse
@@ -605,16 +630,22 @@ type TableChangeResponse struct {
 	UnsafeReason string `json:"unsafe_reason,omitempty"`
 	// ExecutionMode is the planner's execution-mode verdict. Empty means the
 	// engine's default path; "blocked" means the engine deterministically
-	// refuses the statement and the apply will fail.
+	// refuses the statement and the apply will fail; "direct" means the
+	// database's direct execution policy routes the refused statement to
+	// native DDL on the target instead.
 	ExecutionMode string `json:"execution_mode,omitempty"`
-	ModeReason    string `json:"mode_reason,omitempty"`
+	// ModeReason is the engine's reason for any non-empty ExecutionMode
+	// verdict.
+	ModeReason string `json:"mode_reason,omitempty"`
 }
 
-// executionModeBlocked is the execution-mode verdict a planner records on a
-// table change the engine refuses. It mirrors the engine-side constant
-// (pkg/engine); apitypes keeps its own copy so this package stays
-// dependency-free.
-const executionModeBlocked = "blocked"
+// Execution-mode verdicts a planner records on a table change. These mirror
+// the engine-side constants (pkg/engine); apitypes keeps its own copies so
+// this package stays dependency-free.
+const (
+	executionModeBlocked = "blocked"
+	executionModeDirect  = "direct"
+)
 
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
 func (t *TableChangeResponse) GetTableName() string { return t.TableName }
@@ -623,6 +654,13 @@ func (t *TableChangeResponse) GetTableName() string { return t.TableName }
 // engine deterministically refuses this change: an apply will fail on it.
 func (t *TableChangeResponse) EngineBlocked() bool {
 	return t != nil && strings.EqualFold(t.ExecutionMode, executionModeBlocked)
+}
+
+// DirectExecution reports whether the planner's execution-mode verdict routes
+// this change to direct execution: it runs as native MySQL DDL — synchronous,
+// blocking writes to the table while it runs, and not revertible.
+func (t *TableChangeResponse) DirectExecution() bool {
+	return t != nil && strings.EqualFold(t.ExecutionMode, executionModeDirect)
 }
 
 // UnsafeChange returns the unsafe-change view for table changes that require

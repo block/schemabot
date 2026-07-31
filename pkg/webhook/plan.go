@@ -653,6 +653,14 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 	return out
 }
 
+// rendersAsBlocked reports whether a planned change belongs in the ⛔ blocked
+// view: the engine refuses it outright, or the plan routes it to direct
+// execution — which the apply commands reject the same way, because running
+// native DDL requires operator consent the PR command flow does not collect.
+func rendersAsBlocked(t *apitypes.TableChangeResponse) bool {
+	return t.EngineBlocked() || t.DirectExecution()
+}
+
 // shardedBlockedChanges collects blocked per-shard changes, grouped by (table,
 // reason) so a change present on several shards lists them together rather
 // than repeating. Returns nil when the plan carries no per-shard changes (the
@@ -669,7 +677,7 @@ func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.Blo
 			continue
 		}
 		for _, t := range sp.Changes {
-			if !t.EngineBlocked() {
+			if !rendersAsBlocked(t) {
 				continue
 			}
 			k := key{table: t.TableName, reason: t.ModeReason}
@@ -772,7 +780,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		}
 	}
 
-	// Blocked changes — the engine will refuse these at apply time. Like the
+	// Blocked changes — the apply commands will reject these. Like the
 	// unsafe view, a sharded plan derives them per shard so a blocked change
 	// confined to one shard names the shard it applies to.
 	if blocked := shardedBlockedChanges(planResp.Shards); len(blocked) > 0 {
@@ -783,7 +791,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 				continue
 			}
 			for _, t := range sc.TableChanges {
-				if !t.EngineBlocked() {
+				if !rendersAsBlocked(t) {
 					continue
 				}
 				data.BlockedChanges = append(data.BlockedChanges, templates.BlockedChangeData{
