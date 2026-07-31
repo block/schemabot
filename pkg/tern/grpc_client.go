@@ -139,6 +139,7 @@ type GRPCClient struct {
 	client  ternv1.TernClient
 	address string          // dial address for logging/debugging
 	storage storage.Storage // SchemaBot's storage for apply/task management
+	logger  *slog.Logger    // base logger; drives bind apply identity via applyLogger
 
 	// Observer support — same pattern as LocalClient.
 	// For GRPCClient, the observer is notified by the local progress poller,
@@ -163,6 +164,10 @@ type Config struct {
 	// Storage is SchemaBot's storage for apply/task management.
 	// Required for ResumeApply to work.
 	Storage storage.Storage
+
+	// Logger is the base logger for drive-path logs. Defaults to
+	// slog.Default() when nil.
+	Logger *slog.Logger
 }
 
 // retryServiceConfig enables client-side retries for idempotent RPCs.
@@ -252,7 +257,22 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 		client:  ternv1.NewTernClient(conn),
 		address: config.Address,
 		storage: config.Storage,
+		logger:  config.Logger,
 	}, nil
+}
+
+// applyLogger returns a drive-scoped logger with the apply's identity
+// attributes bound, so every line of the drive inherits apply_id, database,
+// database_type, environment, and — when set — repo/pr/caller without
+// hand-listing them per call. Mutable attributes (state, deployment,
+// external_id) stay per-call via Apply.MutableLogAttrs. Falls back to
+// slog.Default() when no base logger was configured.
+func (c *GRPCClient) applyLogger(apply *storage.Apply) *slog.Logger {
+	base := c.logger
+	if base == nil {
+		base = slog.Default()
+	}
+	return base.With(apply.IdentityLogAttrs()...)
 }
 
 // IsRemote returns true — GRPCClient delegates to a separate Tern service
@@ -1515,10 +1535,9 @@ func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Ap
 		}
 		op.ExternalOperationID = remoteOperationID
 	}
-	slog.InfoContext(ctx, "stored remote gRPC apply identifiers for operation",
-		"apply_id", apply.ApplyIdentifier,
+	c.applyLogger(apply).InfoContext(ctx, "stored remote gRPC apply identifiers for operation",
 		"apply_operation_id", op.ID,
-		"deployment", op.Deployment,
+		"operation_deployment", op.Deployment,
 		"operation_key", op.OperationKey,
 		"operation_kind", op.OperationKind,
 		"external_id", remoteID,
@@ -1538,10 +1557,11 @@ func (c *GRPCClient) mirrorRemoteDisplayMetadata(ctx context.Context, apply *sto
 	if c.storage == nil || apply == nil || apply.Engine != storage.EnginePlanetScale {
 		return lastBlob
 	}
+	logger := c.applyLogger(apply)
 	blob, err := PSDisplayMetadataStorageBlob(md)
 	if err != nil {
-		slog.Warn("comment may omit engine display metadata: failed to encode remote display metadata",
-			"apply_id", apply.ApplyIdentifier, "error", err)
+		logger.Warn("comment may omit engine display metadata: failed to encode remote display metadata",
+			"error", err)
 		return lastBlob
 	}
 	if blob == "" || blob == lastBlob {
@@ -1554,8 +1574,8 @@ func (c *GRPCClient) mirrorRemoteDisplayMetadata(ctx context.Context, apply *sto
 	// apply after a restart. The mirror is best-effort — skip and retry next poll.
 	op, err := c.operationForDisplayMirror(ctx, apply, scope)
 	if err != nil || op == nil {
-		slog.Warn("comment may omit engine display metadata: could not load apply_operation to preserve resume context",
-			"apply_id", apply.ApplyIdentifier, "error", err)
+		logger.Warn("comment may omit engine display metadata: could not load apply_operation to preserve resume context",
+			"error", err)
 		return lastBlob
 	}
 	if err := c.storage.ApplyOperations().SaveEngineResumeState(ctx, op.ID, &storage.EngineResumeState{
@@ -1563,8 +1583,8 @@ func (c *GRPCClient) mirrorRemoteDisplayMetadata(ctx context.Context, apply *sto
 		MigrationContext: op.EngineResumeContext,
 		Metadata:         blob,
 	}); err != nil {
-		slog.Warn("comment may omit engine display metadata: failed to persist to control-plane operation",
-			"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
+		logger.Warn("comment may omit engine display metadata: failed to persist to control-plane operation",
+			"apply_operation_id", op.ID, "error", err)
 		return lastBlob
 	}
 	return blob
@@ -1577,16 +1597,17 @@ func (c *GRPCClient) mirrorRemoteDisplayMetadata(ctx context.Context, apply *sto
 // learns the resulting level from progress responses — the PR comment and the
 // control-plane progress API both read the level from the control-plane apply
 // options. Returns true when the stored level changed so the caller can log
-// the transition.
-func mirrorRemoteVolume(apply *storage.Apply, remoteVolume int32) bool {
+// the transition. The logger is expected to carry the apply's identity
+// attributes already bound.
+func mirrorRemoteVolume(logger *slog.Logger, apply *storage.Apply, remoteVolume int32) bool {
 	if remoteVolume == 0 {
 		// The data plane reports 0 when no volume level was ever set on the
 		// apply; there is nothing to mirror.
 		return false
 	}
 	if remoteVolume < storage.MinVolume || remoteVolume > storage.MaxVolume {
-		slog.Warn("remote progress reported an out-of-range volume level; keeping the stored level",
-			append(apply.LogAttrs(), "remote_volume", remoteVolume)...)
+		logger.Warn("remote progress reported an out-of-range volume level; keeping the stored level",
+			append(apply.MutableLogAttrs(), "remote_volume", remoteVolume)...)
 		return false
 	}
 	opts := apply.GetOptions()
@@ -1931,6 +1952,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 	if apply == nil {
 		return fmt.Errorf("apply is required")
 	}
+	logger := c.applyLogger(apply)
 	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
 		return err
 	}
@@ -2006,25 +2028,17 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		if err == nil {
 			if resp.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
 				message := fmt.Sprintf("remote apply %s returned no active schema change for exact apply_id during stopped-state check", apply.ExternalID)
-				slog.Warn("remote gRPC stopped-state check returned no active schema change; operator will not request remote start",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"stored_state", apply.State)
+				logger.Warn("remote gRPC stopped-state check returned no active schema change; operator will not request remote start",
+					apply.MutableLogAttrs()...)
 				return c.failMissingStoppedRemoteApply(ctx, apply, message, nil, scope)
 			}
 			remoteState := ProtoStateToStorage(resp.State)
 			if remoteState == "" {
 				message := fmt.Sprintf("Remote stopped-state check returned unmapped state %s; operator will not request remote start", remoteApplyStateDescription(resp.State))
-				slog.Warn("remote gRPC stopped-state check returned unmapped state; operator will not request remote start",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"remote_state", resp.State.String(),
-					"remote_state_number", int32(resp.State),
-					"stored_state", apply.State)
+				logger.Warn("remote gRPC stopped-state check returned unmapped state; operator will not request remote start",
+					append(apply.MutableLogAttrs(),
+						"remote_state", resp.State.String(),
+						"remote_state_number", int32(resp.State))...)
 				c.logApplyWarning(ctx, apply, message)
 				return fmt.Errorf("check stopped gRPC apply %s before start: unmapped remote state %s", apply.ApplyIdentifier, remoteApplyStateDescription(resp.State))
 			}
@@ -2050,12 +2064,8 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 				return fmt.Errorf("check stopped gRPC apply %s before start: %w", apply.ApplyIdentifier, err)
 			}
 			message := fmt.Sprintf("Remote stopped-state check failed before operator start: %v", err)
-			slog.Warn("remote gRPC stopped-state check failed; operator will not request remote start",
-				"apply_id", apply.ApplyIdentifier,
-				"external_id", apply.ExternalID,
-				"database", apply.Database,
-				"environment", apply.Environment,
-				"error", err)
+			logger.Warn("remote gRPC stopped-state check failed; operator will not request remote start",
+				append(apply.MutableLogAttrs(), "error", err)...)
 			c.logApplyWarning(ctx, apply, message)
 			return fmt.Errorf("check stopped gRPC apply %s before start: %w", apply.ApplyIdentifier, err)
 		}
@@ -2071,12 +2081,8 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 			})
 			if err != nil {
 				message := fmt.Sprintf("remote start failed for remote apply %s: %v", remoteID, err)
-				slog.Warn("remote gRPC start failed; storing stopped state for operator retry",
-					"apply_id", apply.ApplyIdentifier,
-					"remote_apply_id", remoteID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"error", err)
+				logger.Warn("remote gRPC start failed; storing stopped state for operator retry",
+					append(apply.MutableLogAttrs(), "remote_apply_id", remoteID, "error", err)...)
 				c.logApplyWarning(ctx, apply, message)
 				apply.State = state.Apply.Stopped
 				apply.ErrorMessage = message
@@ -2751,20 +2757,22 @@ func (c *GRPCClient) heartbeatScopedDrive(ctx context.Context, apply *storage.Ap
 // once. A transient failure inside the window returns nil so the drive keeps
 // polling and the heartbeat is retried on the next tick. The remote Tern keeps
 // executing either way; the next claimant reattaches to it.
-func driveEndingHeartbeatFailure(apply *storage.Apply, hbErr error, lastSuccess time.Time) error {
+// The logger is expected to carry the apply's identity attributes already
+// bound, so each line appends only the mutable snapshot.
+func driveEndingHeartbeatFailure(logger *slog.Logger, apply *storage.Apply, hbErr error, lastSuccess time.Time) error {
 	if errors.Is(hbErr, storage.ErrApplyLeaseLost) {
-		slog.Warn("gRPC drive heartbeat lost the lease; current owner will stop driving and writing apply state",
-			append(apply.LogAttrs(), "error", hbErr)...)
+		logger.Warn("gRPC drive heartbeat lost the lease; current owner will stop driving and writing apply state",
+			append(apply.MutableLogAttrs(), "error", hbErr)...)
 		return fmt.Errorf("heartbeat gRPC apply %s: %w", apply.ApplyIdentifier, hbErr)
 	}
 	if time.Since(lastSuccess) >= storage.ApplyLeaseStaleAfter {
-		slog.Warn("gRPC drive heartbeat has failed for the full lease staleness window; a peer driver can reclaim the work, so this owner will stop driving and writing apply state",
-			append(apply.LogAttrs(), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
+		logger.Warn("gRPC drive heartbeat has failed for the full lease staleness window; a peer driver can reclaim the work, so this owner will stop driving and writing apply state",
+			append(apply.MutableLogAttrs(), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
 		return fmt.Errorf("heartbeat gRPC apply %s: %w (heartbeats failing since %s): %w",
 			apply.ApplyIdentifier, ErrApplyLeasePresumedLost, lastSuccess.UTC().Format(time.RFC3339), hbErr)
 	}
-	slog.Warn("gRPC drive heartbeat failed; will retry",
-		append(apply.LogAttrs(), "error", hbErr)...)
+	logger.Warn("gRPC drive heartbeat failed; will retry",
+		append(apply.MutableLogAttrs(), "error", hbErr)...)
 	return nil
 }
 
@@ -3430,6 +3438,7 @@ func applyProgressRank(applyState string) int {
 // single-operation / whole-apply drives (which keep waiting for a manual
 // cutover unchanged).
 func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply, allowStoppedAfterStart bool, scope applyTaskScope, releaseAtCutoverBarrier bool) error {
+	logger := c.applyLogger(apply)
 	ticker := time.NewTicker(grpcProgressPollInterval)
 	defer ticker.Stop()
 
@@ -3459,46 +3468,30 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				// fallout, not lease trouble.
 				return ctx.Err()
 			}
-			if stopErr := driveEndingHeartbeatFailure(apply, err, lastHeartbeatSuccess); stopErr != nil {
+			if stopErr := driveEndingHeartbeatFailure(logger, apply, err, lastHeartbeatSuccess); stopErr != nil {
 				return stopErr
 			}
 		case <-ticker.C:
 			if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); err != nil {
-				slog.Warn("pending gRPC stop request processing failed; current apply owner will exit for operator retry",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"error", err)
+				logger.Warn("pending gRPC stop request processing failed; current apply owner will exit for operator retry",
+					append(apply.MutableLogAttrs(), "error", err)...)
 				return err
 			} else if handled {
 				return nil
 			}
 			if err := c.processPendingCutoverControlRequest(ctx, apply, scope); err != nil {
-				slog.Warn("pending gRPC cutover request processing failed; current apply owner will exit for operator retry",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"error", err)
+				logger.Warn("pending gRPC cutover request processing failed; current apply owner will exit for operator retry",
+					append(apply.MutableLogAttrs(), "error", err)...)
 				return err
 			}
 			if err := c.processPendingSkipRevertControlRequest(ctx, apply, scope.remoteApplyID(apply)); err != nil {
-				slog.Warn("pending gRPC skip-revert request processing failed; current apply owner will exit for operator retry",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"error", err)
+				logger.Warn("pending gRPC skip-revert request processing failed; current apply owner will exit for operator retry",
+					append(apply.MutableLogAttrs(), "error", err)...)
 				return err
 			}
 			if err := c.processPendingRevertControlRequest(ctx, apply, scope.remoteApplyID(apply)); err != nil {
-				slog.Warn("pending gRPC revert request processing failed; current apply owner will exit for operator retry",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"error", err)
+				logger.Warn("pending gRPC revert request processing failed; current apply owner will exit for operator retry",
+					append(apply.MutableLogAttrs(), "error", err)...)
 				return err
 			}
 
@@ -3521,14 +3514,11 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 					return fmt.Errorf("poll remote apply %s for %s: %w", apply.ExternalID, apply.ApplyIdentifier, err)
 				}
 				consecutiveProgressErrors++
-				slog.Warn("remote gRPC progress poll failed",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"consecutive_errors", consecutiveProgressErrors,
-					"max_consecutive_errors", maxGRPCProgressPollErrorStreak,
-					"error", err)
+				logger.Warn("remote gRPC progress poll failed",
+					append(apply.MutableLogAttrs(),
+						"consecutive_errors", consecutiveProgressErrors,
+						"max_consecutive_errors", maxGRPCProgressPollErrorStreak,
+						"error", err)...)
 				if consecutiveProgressErrors >= maxGRPCProgressPollErrorStreak {
 					message := fmt.Sprintf("remote progress polling failed after %d consecutive errors for remote apply %s: %v",
 						consecutiveProgressErrors, apply.ExternalID, err)
@@ -3559,14 +3549,10 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			newState := ProtoStateToStorage(resp.State)
 			if newState == "" {
 				message := fmt.Sprintf("Remote progress returned unmapped apply state %s; operator will retry without changing stored state", remoteApplyStateDescription(resp.State))
-				slog.Warn("remote gRPC progress returned unmapped apply state; operator will retry without changing stored state",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"remote_state", resp.State.String(),
-					"remote_state_number", int32(resp.State),
-					"stored_state", apply.State)
+				logger.Warn("remote gRPC progress returned unmapped apply state; operator will retry without changing stored state",
+					append(apply.MutableLogAttrs(),
+						"remote_state", resp.State.String(),
+						"remote_state_number", int32(resp.State))...)
 				c.logApplyWarning(ctx, apply, message)
 				return fmt.Errorf("poll remote gRPC apply %s: unmapped remote state %s", apply.ApplyIdentifier, remoteApplyStateDescription(resp.State))
 			}
@@ -3584,24 +3570,14 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 					stoppedAfterStartDeadline = now.Add(grpcStoppedAfterStartGracePeriod)
 				}
 				if !loggedStoppedAfterStart {
-					slog.Info("remote gRPC apply still stopped after start accepted; operator will keep polling",
-						"apply_id", apply.ApplyIdentifier,
-						"external_id", apply.ExternalID,
-						"database", apply.Database,
-						"environment", apply.Environment,
-						"stored_state", apply.State,
-						"deadline", stoppedAfterStartDeadline)
+					logger.Info("remote gRPC apply still stopped after start accepted; operator will keep polling",
+						append(apply.MutableLogAttrs(), "deadline", stoppedAfterStartDeadline)...)
 					loggedStoppedAfterStart = true
 				}
 				if !now.Before(stoppedAfterStartDeadline) {
 					message := fmt.Sprintf("remote apply %s remained stopped after start grace period %s", apply.ExternalID, grpcStoppedAfterStartGracePeriod)
-					slog.Warn("remote gRPC apply remained stopped after start grace period; storing stopped state",
-						"apply_id", apply.ApplyIdentifier,
-						"external_id", apply.ExternalID,
-						"database", apply.Database,
-						"environment", apply.Environment,
-						"stored_state", apply.State,
-						"grace_period", grpcStoppedAfterStartGracePeriod)
+					logger.Warn("remote gRPC apply remained stopped after start grace period; storing stopped state",
+						append(apply.MutableLogAttrs(), "grace_period", grpcStoppedAfterStartGracePeriod)...)
 					c.logApplyWarning(ctx, apply, message)
 					apply.State = state.Apply.Stopped
 					apply.ErrorMessage = message
@@ -3617,20 +3593,15 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			}
 			newState = applyStateFromRemoteProgress(apply.State, remoteApplyState, allowStoppedAfterStart)
 			if !state.IsState(newState, remoteApplyState) {
-				slog.Debug("keeping stored gRPC apply state because remote progress reported earlier state",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"stored_state", apply.State,
-					"remote_state", remoteApplyState)
+				logger.Debug("keeping stored gRPC apply state because remote progress reported earlier state",
+					append(apply.MutableLogAttrs(), "remote_state", remoteApplyState)...)
 			}
 			apply.State = newState
 			apply.ErrorMessage = remoteProgressErrorMessage(apply.State, resp.ErrorMessage, apply.ErrorMessage)
 			apply.UpdatedAt = now
-			if mirrorRemoteVolume(apply, resp.Volume) {
-				slog.Info("mirrored remote volume level onto control-plane apply options",
-					append(apply.LogAttrs(), "volume", resp.Volume)...)
+			if mirrorRemoteVolume(logger, apply, resp.Volume) {
+				logger.Info("mirrored remote volume level onto control-plane apply options",
+					append(apply.MutableLogAttrs(), "volume", resp.Volume)...)
 			}
 
 			terminal := isTerminalProtoState(resp.State)
@@ -3658,13 +3629,8 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			// the operation row at waiting_for_cutover and frees it for the
 			// deployment-ordered cutover claim to pick up.
 			if releaseAtCutoverBarrier && state.IsState(apply.State, state.Apply.WaitingForCutover) {
-				slog.Info("operation parked at cutover barrier; exiting remote copy drive",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"deployment", apply.Deployment,
-					"operation_state", apply.State)
+				logger.Info("operation parked at cutover barrier; exiting remote copy drive",
+					apply.MutableLogAttrs()...)
 				return nil
 			}
 		}
