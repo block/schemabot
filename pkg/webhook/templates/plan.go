@@ -208,14 +208,14 @@ func RenderPlanComment(data PlanCommentData) string {
 		if data.Tenant != "" {
 			applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 		}
-		writeApplyHint(&sb, applyCmd)
+		writeApplyInstruction(&sb, applyCmd)
 	}
 
 	return sb.String()
 }
 
-// writeApplyHint writes the ▶️ apply instruction with the given command.
-func writeApplyHint(sb *strings.Builder, command string) {
+// writeApplyInstruction writes the ▶️ apply instruction with the given command.
+func writeApplyInstruction(sb *strings.Builder, command string) {
 	sb.WriteString("▶️ **To apply** all schema changes from this PR, comment:\n")
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
 }
