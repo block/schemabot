@@ -288,6 +288,31 @@ const (
 	ExecutionModeDirect = "direct"
 )
 
+// Engine metadata keys carrying the direct execution policy from config
+// surfaces (server config, embedder assemblers) to an engine via request
+// credentials. Exported so producers and consumers share one spelling and
+// cannot drift on the key strings.
+const (
+	// MetadataDirectExecution enables direct execution ("true") for ALTER
+	// statements the engine deterministically refuses. Absent or "false"
+	// leaves refused statements blocked.
+	MetadataDirectExecution = "direct_execution"
+
+	// MetadataDirectExecutionMaxTableRows bounds direct execution by the
+	// target table's row count. Required (a positive integer) when direct
+	// execution is enabled, so a native table rebuild can never run
+	// unbounded: above the bound — or when the size cannot be determined —
+	// the statement stays blocked.
+	MetadataDirectExecutionMaxTableRows = "direct_execution_max_table_rows"
+
+	// MetadataDirectExecutionLockAcquisitionTimeoutSeconds bounds, in whole
+	// seconds, how long each direct statement waits to acquire its locks
+	// before failing with a retryable busy-table error instead of queueing
+	// on the table's lock indefinitely. Optional; engines apply their
+	// default when the key is absent.
+	MetadataDirectExecutionLockAcquisitionTimeoutSeconds = "direct_execution_lock_acquisition_timeout_seconds"
+)
+
 // ApplyRequest contains the input for starting a schema change.
 // On first apply, set the resume context to group related DDL.
 // On resume after restart, pass the full ResumeState from storage.

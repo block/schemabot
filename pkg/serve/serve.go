@@ -665,12 +665,9 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysq
 	if err != nil {
 		return nil, fmt.Errorf("resolve DSN for %s/%s: %w", dbName, env, err)
 	}
-	var metadata map[string]string
-	if envConfig.DirectExecution != nil && envConfig.DirectExecution.Enabled {
-		metadata = map[string]string{
-			"direct_execution":                "true",
-			"direct_execution_max_table_rows": strconv.FormatInt(envConfig.DirectExecution.MaxTableRows, 10),
-		}
+	metadata, err := envConfig.DirectExecution.EngineMetadata()
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct_execution metadata for %s/%s: %w", dbName, env, err)
 	}
 	client, err := grpcLocalClientFactory(config, wake, engineFactories)(tern.LocalConfig{
 		Database:  dbName,
