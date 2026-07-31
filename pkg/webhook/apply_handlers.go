@@ -275,6 +275,20 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 		return false, nil
 	}
 
+	// Direct-verdict changes reject the apply for a different reason: the
+	// statement could run as native MySQL DDL, but doing so blocks writes to
+	// the table and is not revertible, so it requires operator consent the
+	// apply commands do not collect. Letting the apply start would run the
+	// plan's other statements first and then fail at the engine's refusal,
+	// leaving the schema half-applied.
+	if len(planResp.DirectChanges()) > 0 {
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+		h.logger.Info("apply rejected: plan routes changes to direct execution",
+			"repo", repo, "pr", pr, "database", database, "environment", environment)
+		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
+		return false, nil
+	}
+
 	// Block unsafe changes unless --allow-unsafe was specified
 	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)

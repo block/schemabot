@@ -122,6 +122,19 @@ func (h *Handler) executeApply(
 		return
 	}
 
+	// Direct-verdict changes reject the apply for a different reason: running
+	// native MySQL DDL blocks writes to the table and is not revertible, so
+	// it requires operator consent the apply commands do not collect. Release
+	// the lock — retrying the same command cannot succeed either.
+	if len(planResp.DirectChanges()) > 0 {
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+		h.logger.Info("apply rejected: re-plan routes changes to direct execution",
+			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
+		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "direct execution changes rejection")
+		return
+	}
+
 	// Automatic apply DDL drift check: if the re-plan DDL differs from the stored auto-plan,
 	// downgrade to manual confirmation so the user reviews the new plan.
 	if storedPlan != nil && !ddlMatchesStoredPlan(planResp, storedPlan) {

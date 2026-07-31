@@ -9,7 +9,6 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/ddl"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -654,10 +653,12 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 	return out
 }
 
-// engineBlocked reports whether the planner's execution-mode verdict says the
-// engine will refuse this change at apply time.
-func engineBlocked(t *apitypes.TableChangeResponse) bool {
-	return t != nil && t.ExecutionMode == ddl.ExecutionModeBlocked
+// rendersAsBlocked reports whether a planned change belongs in the ⛔ blocked
+// view: the engine refuses it outright, or the plan routes it to direct
+// execution — which the apply commands reject the same way, because running
+// native DDL requires operator consent the PR command flow does not collect.
+func rendersAsBlocked(t *apitypes.TableChangeResponse) bool {
+	return t.EngineBlocked() || t.DirectExecution()
 }
 
 // shardedBlockedChanges collects blocked per-shard changes, grouped by (table,
@@ -676,7 +677,7 @@ func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.Blo
 			continue
 		}
 		for _, t := range sp.Changes {
-			if !engineBlocked(t) {
+			if !rendersAsBlocked(t) {
 				continue
 			}
 			k := key{table: t.TableName, reason: t.ModeReason}
@@ -779,7 +780,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		}
 	}
 
-	// Blocked changes — the engine will refuse these at apply time. Like the
+	// Blocked changes — the apply commands will reject these. Like the
 	// unsafe view, a sharded plan derives them per shard so a blocked change
 	// confined to one shard names the shard it applies to.
 	if blocked := shardedBlockedChanges(planResp.Shards); len(blocked) > 0 {
@@ -790,7 +791,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 				continue
 			}
 			for _, t := range sc.TableChanges {
-				if !engineBlocked(t) {
+				if !rendersAsBlocked(t) {
 					continue
 				}
 				data.BlockedChanges = append(data.BlockedChanges, templates.BlockedChangeData{

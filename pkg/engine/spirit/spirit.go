@@ -311,6 +311,19 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, err
 	}
 
+	// The direct execution policy resolves refused statements to a direct or
+	// blocked verdict below. A malformed policy fails the plan: silently
+	// treating it as disabled would record blocked verdicts the apply-time
+	// routing might not agree with.
+	policy, err := directPolicyFromMetadata(req.Credentials.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct execution policy: %w", err)
+	}
+	// Row estimates for the policy bound connect lazily so plans without
+	// refused statements never open the extra connection.
+	target := &lazyTargetDB{dsn: req.Credentials.DSN}
+	defer target.close()
+
 	if !plan.HasChanges() {
 		return &engine.PlanResult{
 			PlanID:    fmt.Sprintf("plan-%d", time.Now().UnixNano()),
@@ -343,20 +356,28 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		}
 
 		// Execution-mode verdict: surface statements Spirit deterministically
-		// refuses so the operator learns at plan time that the apply will fail.
-		// Only ALTERs can be refused, and gating here keeps the verdict — an
-		// informational field — from ever failing the plan on a statement type
-		// the verdict's own parser doesn't accept.
+		// refuses so the operator learns at plan time how the apply will
+		// behave — routed to direct execution when the policy permits, or
+		// guaranteed to fail when it doesn't. Only ALTERs can be refused, and
+		// gating here keeps the verdict — an informational field — from ever
+		// failing the plan on a statement type the verdict's own parser
+		// doesn't accept.
 		if stmtType == statement.StatementAlterTable {
 			reason, refused, err := ddl.EngineRefusalReason(pc.Statement)
 			if err != nil {
 				return nil, fmt.Errorf("execution verdict for table %q: %w", pc.TableName, err)
 			}
 			if refused {
-				change.ExecutionMode = ddl.ExecutionModeBlocked
-				change.ModeReason = reason
-				e.logger.Info("plan contains a statement the engine will refuse at apply time",
-					"database", database, "table", pc.TableName, "reason", reason)
+				decision := e.resolveRefusedMode(ctx, target, policy, database, pc.TableName, reason)
+				change.ExecutionMode = decision.mode
+				change.ModeReason = decision.modeReason
+				if decision.mode == engine.ExecutionModeDirect {
+					e.logger.Info("plan routes a statement the engine refuses to direct execution",
+						"database", database, "table", pc.TableName, "reason", reason, "estimated_rows", decision.rows)
+				} else {
+					e.logger.Info("plan contains a statement the engine will refuse at apply time",
+						"database", database, "table", pc.TableName, "reason", decision.modeReason)
+				}
 			}
 		}
 
