@@ -41,6 +41,27 @@ func dropTablesOnCleanup(t *testing.T, db *sql.DB, tables ...string) {
 	})
 }
 
+// pkColumns returns the table's primary-key column names in ordinal order, so
+// tests can assert a PK reshape actually landed on the target.
+func pkColumns(t *testing.T, database, tableName string) []string {
+	t.Helper()
+	_, db := setupTestMySQL(t)
+	rows, err := db.QueryContext(t.Context(), `
+		SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'
+		ORDER BY ORDINAL_POSITION`, database, tableName)
+	require.NoError(t, err, "query PK columns")
+	defer func() { _ = rows.Close() }()
+	var cols []string
+	for rows.Next() {
+		var col string
+		require.NoError(t, rows.Scan(&col))
+		cols = append(cols, col)
+	}
+	require.NoError(t, rows.Err())
+	return cols
+}
+
 // With the direct execution policy enabled and the table within the size
 // bound, the plan resolves a statement the engine refuses to the direct
 // verdict, with the reason carrying the refusal and the measured row count —
@@ -258,4 +279,327 @@ func TestExactRowCountWithin(t *testing.T) {
 
 	_, err = exactRowCountWithin(t.Context(), db, "testdb", "exact_count_absent", 10)
 	require.Error(t, err, "a missing table is an error, never a zero count")
+}
+
+// With the policy enabled, an apply routes a statement the engine refuses —
+// a primary-key reshape — to direct execution and drives it to completion:
+// the PK actually changes on the target, the schema change ends completed,
+// and progress reports the statement as a completed direct entry.
+func TestEngine_ExecuteAlterPhase_DirectApply(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "direct_apply")
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE direct_apply (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create direct_apply table")
+	for i := range 10 {
+		_, err := db.ExecContext(t.Context(), `INSERT INTO direct_apply (tenant_id) VALUES (?)`, i)
+		require.NoError(t, err, "insert data")
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	ddlStatements := []string{
+		"ALTER TABLE `direct_apply` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+	}
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{
+		database: database,
+		tables:   []string{"direct_apply"},
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	}
+	eng.mu.Unlock()
+
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false,
+		directPolicy{Enabled: true, MaxTableRows: 100000})
+
+	eng.mu.Lock()
+	finalState := eng.runningSchemaChange.state
+	eng.mu.Unlock()
+	require.Equal(t, engine.StateCompleted, finalState)
+
+	assert.Equal(t, []string{"id", "tenant_id"}, pkColumns(t, database, "direct_apply"),
+		"the reshaped primary key landed on the target")
+
+	var rowCount int
+	require.NoError(t, db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM direct_apply`).Scan(&rowCount))
+	assert.Equal(t, 10, rowCount, "data survives the native rebuild")
+
+	progress, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+	require.NoError(t, err, "Progress()")
+	var directEntry *engine.TableProgress
+	for i, tp := range progress.Tables {
+		if tp.ProgressDetail == "direct execution (native MySQL DDL)" {
+			directEntry = &progress.Tables[i]
+		}
+	}
+	require.NotNil(t, directEntry, "progress reports the direct statement")
+	assert.Equal(t, "direct_apply", directEntry.Table)
+	assert.Equal(t, "completed", directEntry.State)
+	assert.NotNil(t, directEntry.CompletedAt)
+}
+
+// A single apply carrying both a refused reshape and an ordinary
+// engine-driven statement routes each to its own path: the reshape runs as
+// native DDL, the engine applies the rest, and both land on the target.
+func TestEngine_ExecuteAlterPhase_MixedRouting(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "mixed_direct", "mixed_spirit")
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE mixed_direct (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create mixed_direct table")
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE mixed_spirit (
+		id INT NOT NULL AUTO_INCREMENT,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create mixed_spirit table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	ddlStatements := []string{
+		"ALTER TABLE `mixed_direct` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+		"ALTER TABLE `mixed_spirit` ADD COLUMN `email` varchar(255) NULL",
+	}
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{
+		database: database,
+		tables:   []string{"mixed_direct", "mixed_spirit"},
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	}
+	eng.mu.Unlock()
+
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false,
+		directPolicy{Enabled: true, MaxTableRows: 100000})
+
+	eng.mu.Lock()
+	finalState := eng.runningSchemaChange.state
+	eng.mu.Unlock()
+	require.Equal(t, engine.StateCompleted, finalState)
+
+	assert.Equal(t, []string{"id", "tenant_id"}, pkColumns(t, database, "mixed_direct"),
+		"the direct-routed reshape landed")
+
+	var columnCount int
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		SELECT COUNT(*) FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'mixed_spirit' AND COLUMN_NAME = 'email'`,
+		database).Scan(&columnCount))
+	assert.Equal(t, 1, columnCount, "the engine-driven ADD COLUMN landed")
+}
+
+// Without the policy, an apply carrying a refused statement fails fast before
+// any engine work starts: the schema change ends failed with a reason naming
+// the table and pointing at the disabled policy, and the target is untouched.
+func TestEngine_ExecuteAlterPhase_PolicyOffFailsFast(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "direct_off")
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE direct_off (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create direct_off table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	eng := New(Config{Logger: logger})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	ddlStatements := []string{
+		"ALTER TABLE `direct_off` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+	}
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{
+		database: database,
+		tables:   []string{"direct_off"},
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	}
+	eng.mu.Unlock()
+
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, directPolicy{})
+
+	eng.mu.Lock()
+	finalState := eng.runningSchemaChange.state
+	errorMessage := eng.runningSchemaChange.errorMessage
+	eng.mu.Unlock()
+
+	assert.Equal(t, engine.StateFailed, finalState)
+	assert.Contains(t, errorMessage, "direct_off")
+	assert.Contains(t, errorMessage, "direct execution is not enabled")
+
+	assert.Equal(t, []string{"id"}, pkColumns(t, database, "direct_off"), "the target is untouched")
+}
+
+// An apply whose refused statement exceeds the size bound fails fast at
+// routing time, re-evaluating the plan-time predicate so a table that grew
+// past the bound between plan and apply never rebuilds natively.
+func TestEngine_ExecuteAlterPhase_AboveBoundFailsFast(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "direct_grew")
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE direct_grew (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create direct_grew table")
+
+	var inserts strings.Builder
+	inserts.WriteString("INSERT INTO direct_grew (tenant_id) VALUES (1)")
+	for range 1999 {
+		inserts.WriteString(",(1)")
+	}
+	_, err = db.ExecContext(t.Context(), inserts.String())
+	require.NoError(t, err, "seed rows")
+	_, err = db.ExecContext(t.Context(), "ANALYZE TABLE `direct_grew`")
+	require.NoError(t, err, "analyze table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	eng := New(Config{Logger: logger})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	ddlStatements := []string{
+		"ALTER TABLE `direct_grew` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+	}
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{
+		database: database,
+		tables:   []string{"direct_grew"},
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	}
+	eng.mu.Unlock()
+
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false,
+		directPolicy{Enabled: true, MaxTableRows: 10})
+
+	eng.mu.Lock()
+	finalState := eng.runningSchemaChange.state
+	errorMessage := eng.runningSchemaChange.errorMessage
+	eng.mu.Unlock()
+
+	assert.Equal(t, engine.StateFailed, finalState)
+	assert.Contains(t, errorMessage, "above the configured limit of 10")
+	assert.Equal(t, []string{"id"}, pkColumns(t, database, "direct_grew"), "the target is untouched")
+}
+
+// A direct statement never stalls behind a busy table: when an open
+// transaction holds the table's metadata lock, the session's bounded lock
+// wait expires and the apply fails fast with an operator-actionable
+// busy-table error — instead of queueing on the lock indefinitely with all
+// new table traffic queueing behind the DDL. The bound comes from the
+// policy's configured lock wait, and the failure message reports that
+// configured value.
+func TestEngine_ExecuteAlterPhase_BusyTableFailsFast(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "direct_busy")
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE direct_busy (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create direct_busy table")
+	_, err = db.ExecContext(t.Context(), `INSERT INTO direct_busy (tenant_id) VALUES (1)`)
+	require.NoError(t, err, "insert data")
+
+	// Hold the table's metadata lock: a transaction that has read the table
+	// keeps its shared MDL until the transaction ends, so the ALTER's
+	// exclusive MDL request queues behind it for as long as it stays open.
+	holder, err := db.BeginTx(t.Context(), nil)
+	require.NoError(t, err, "begin lock-holding transaction")
+	defer func() { _ = holder.Rollback() }()
+	var id int
+	require.NoError(t, holder.QueryRowContext(t.Context(),
+		"SELECT `id` FROM `direct_busy` LIMIT 1 FOR UPDATE").Scan(&id), "acquire the metadata lock")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	eng := New(Config{Logger: logger})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	ddlStatements := []string{
+		"ALTER TABLE `direct_busy` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+	}
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{
+		database: database,
+		tables:   []string{"direct_busy"},
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	}
+	eng.mu.Unlock()
+
+	// The bounded session lock wait must fail the statement well inside this
+	// deadline; if it expires instead, the schema change ends stopped rather
+	// than failed and the assertions below diagnose the stall.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	const lockWaitSeconds = 2
+	eng.executeSchemaChange(ctx, host, username, password, database, ddlStatements, false,
+		directPolicy{Enabled: true, MaxTableRows: 100000, LockAcquisitionTimeoutSeconds: lockWaitSeconds})
+
+	eng.mu.Lock()
+	finalState := eng.runningSchemaChange.state
+	errorMessage := eng.runningSchemaChange.errorMessage
+	eng.mu.Unlock()
+
+	assert.Equal(t, engine.StateFailed, finalState)
+	assert.Contains(t, errorMessage, `table "direct_busy" is busy`)
+	assert.Contains(t, errorMessage, fmt.Sprintf("could not acquire the metadata lock within %ds", lockWaitSeconds))
+	assert.Contains(t, errorMessage, "retry when long-running transactions on the table have finished")
+
+	require.NoError(t, holder.Rollback(), "release the metadata lock")
+	assert.Equal(t, []string{"id"}, pkColumns(t, database, "direct_busy"), "the target is untouched")
+}
+
+// A refused statement whose table size cannot be estimated is blocked: an
+// unestimated table must never rebuild natively, so routing fails with the
+// unavailable-estimate reason instead of running the statement.
+func TestEngine_RouteAlterStatements_UnknownSizeBlocked(t *testing.T) {
+	dsn, _ := setupTestMySQL(t)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	eng := New(Config{Logger: logger})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	target := &lazyTargetDB{dsn: targetDSN(host, username, password, database)}
+	defer target.close()
+
+	_, err = eng.routeAlterStatements(t.Context(), target, database,
+		[]string{"ALTER TABLE `direct_missing` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)"},
+		directPolicy{Enabled: true, MaxTableRows: 100000})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "direct_missing")
+	assert.Contains(t, err.Error(), "row count is unavailable")
 }

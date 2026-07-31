@@ -91,6 +91,13 @@ type runningSchemaChange struct {
 	deferCutover            bool // Whether to defer cutover until manual trigger
 	volumeRestartInProgress bool // Set while stored stopped state should still be exposed as running progress.
 
+	// directPolicy is the direct execution policy snapshotted at Apply, so a
+	// resumed schema change routes with the same policy the apply started
+	// with. directStatements tracks each direct-routed statement's lifecycle
+	// for progress reporting.
+	directPolicy     directPolicy
+	directStatements []*directStatementProgress
+
 	// Spirit copy settings for this schema change. Initialized from the
 	// engine's configured defaults and retuned by Volume for this change only;
 	// they end with the change, so the next schema change starts from the
@@ -467,6 +474,14 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		}, nil
 	}
 
+	// Resolve the direct execution policy up front so a malformed policy
+	// rejects the apply before any state is created, and snapshot it on the
+	// running change below so resume routes with the same policy.
+	directExecPolicy, err := directPolicyFromMetadata(req.Credentials.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct execution policy: %w", err)
+	}
+
 	// Parse DSN to extract connection info (DSN is the source of truth for actual database)
 	host, username, password, database, err := parseDSN(req.Credentials.DSN)
 	if err != nil {
@@ -509,6 +524,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		state:           engine.StateRunning,
 		started:         time.Now(),
 		deferCutover:    deferCutover,
+		directPolicy:    directExecPolicy,
 		host:            host,
 		username:        username,
 		password:        password,
@@ -531,7 +547,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			e.runningSchemaChange.cancelFunc = cancel
 		}
 		e.mu.Unlock()
-		e.executeSchemaChange(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover)
+		e.executeSchemaChange(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover, directExecPolicy)
 	})
 
 	return &engine.ApplyResult{
@@ -602,6 +618,29 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 			}
 			tableProgress = append(tableProgress, tp)
 		}
+	}
+
+	// Direct-routed statements run outside the Spirit runner, so they report
+	// their own explicit lifecycle entries: no row counts or ETA, just the
+	// per-statement state transitions the executor recorded.
+	for _, ds := range rm.directStatements {
+		tp := engine.TableProgress{
+			Namespace:      rm.tableNamespace[ds.table],
+			Table:          ds.table,
+			DDL:            ds.ddl,
+			State:          ds.state,
+			ProgressDetail: "direct execution (native MySQL DDL)",
+		}
+		started := ds.startedAt
+		tp.StartedAt = &started
+		if ds.completedAt != nil {
+			completed := *ds.completedAt
+			tp.CompletedAt = &completed
+		}
+		if ds.state == directStateCompleted {
+			tp.Progress = 100
+		}
+		tableProgress = append(tableProgress, tp)
 	}
 
 	state := progressState(rm, spiritState)

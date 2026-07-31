@@ -371,7 +371,9 @@ deterministically refused by the engine — for example dropping a primary key o
 adding a foreign key, which its online copy cannot preserve. By default those
 statements block the apply. The per-database-environment `direct_execution`
 policy lets a refused statement instead run verbatim as native MySQL DDL when
-the target table is small enough:
+the target table is small enough. See
+[Direct Execution](direct-execution.md) for how routing works and what other
+engines need to adopt it:
 
 ```yaml
 databases:
@@ -388,13 +390,14 @@ databases:
 
 A direct statement is synchronous, blocks writes to the table while it runs,
 and cannot be reverted — `max_table_rows` is the fail-closed blast-radius
-bound. A refused statement runs directly only when the table's estimated row
-count (`information_schema` `TABLE_ROWS`) is at or below the bound; larger
-tables, and tables whose size cannot be determined, stay blocked. The estimate
-is the InnoDB optimizer's, so it can be off by a meaningful factor — set the
-bound with margin below your real tolerance. The bound is re-evaluated when
-the apply executes, so a table that grew past it after planning is blocked,
-not run.
+bound. A refused statement runs directly only when the table's size is within
+the bound; larger tables, and tables whose size cannot be determined, stay
+blocked. The size gate trusts the InnoDB optimizer's estimate
+(`information_schema` `TABLE_ROWS`) only to block, and corroborates a verdict
+for direct execution with an exact row count whose scan is capped just past
+the bound — a stale estimate can never approve a large table. The bound is
+re-evaluated when the apply executes, so a table that grew past it after
+planning is blocked, not run.
 
 `lock_acquisition_timeout` bounds how long each direct statement waits to
 acquire its locks. Each engine maps it to its native session lock timeout —
