@@ -3157,7 +3157,7 @@ func TestLocalClient_RevertWindowDuration(t *testing.T) {
 				logger: slog.New(captureHandler{records: &records}),
 			}
 
-			got := client.revertWindowDuration()
+			got := client.revertWindowDuration(client.logger.With("database", client.config.Database))
 			assert.Equal(t, tc.want, got)
 
 			var warnings []capturedLog

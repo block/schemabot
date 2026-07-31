@@ -494,6 +494,8 @@ func deriveApplyPhase(event engine.ApplyEvent) string {
 // Skips the write if the state hasn't changed. On DB write failure, rolls back
 // the in-memory state so the next event with the same NewState retries.
 // Returns the new state if a transition occurred, or empty string if skipped.
+// The logger is expected to carry the apply's identity attributes already
+// bound, so the failure line appends only the mutable snapshot.
 func applyEventStateTransition(apply *storage.Apply, event engine.ApplyEvent, updateFn func(*storage.Apply) error, logger *slog.Logger) string {
 	oldState := apply.State
 	newState := deriveApplyPhase(event)
@@ -503,7 +505,7 @@ func applyEventStateTransition(apply *storage.Apply, event engine.ApplyEvent, up
 	apply.State = newState
 	apply.UpdatedAt = time.Now()
 	if err := updateFn(apply); err != nil {
-		logger.Error("failed to update apply phase", append(apply.LogAttrs(), "error", err)...)
+		logger.Error("failed to update apply phase", append(apply.MutableLogAttrs(), "error", err)...)
 		apply.State = oldState
 		return ""
 	}

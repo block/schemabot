@@ -7,6 +7,7 @@ import (
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // driveLoggerTestApply returns an apply carrying the full identity set so
@@ -97,4 +98,46 @@ func TestFailApplyWithTasks_TerminalLogCarriesApplyIdentity(t *testing.T) {
 		"the log must snapshot the stored terminal state at emission time")
 	assert.Equal(t, state.Apply.Cancelled, running.State,
 		"the in-memory apply must adopt the stored terminal state")
+}
+
+// Grouped aggregate projection keeps an ambiguous task-set warning tied to the
+// apply whose state cannot safely be derived.
+func TestDeriveAggregateApplyState_AmbiguousTasksLogCarriesApplyIdentity(t *testing.T) {
+	var records []capturedLog
+	client := &LocalClient{
+		logger: slog.New(captureHandler{records: &records}),
+	}
+	firstOperationID := int64(11)
+	secondOperationID := int64(12)
+	tasks := []*storage.Task{
+		{ApplyOperationID: &firstOperationID, State: state.Task.Completed},
+		{ApplyOperationID: &secondOperationID, State: state.Task.Completed},
+	}
+
+	derived, ok := client.deriveAggregateApplyState(t.Context(), driveLoggerTestApply(state.Apply.Running), tasks)
+
+	require.False(t, ok)
+	require.Empty(t, derived)
+	line := requireCapturedLog(t, records, "cannot determine aggregate apply state: task set is not scoped to one apply operation")
+	assertLogCarriesApplyIdentity(t, line)
+	assert.Error(t, line.attrs["error"].(error))
+}
+
+// Grouped aggregate projection identifies the apply when no sibling operation
+// rows are available and the non-terminal task state remains the safe fallback.
+func TestDeriveAggregateApplyState_MissingOperationRowsLogCarriesApplyIdentity(t *testing.T) {
+	var records []capturedLog
+	client := &LocalClient{
+		storage: &mockStorage{},
+		logger:  slog.New(captureHandler{records: &records}),
+	}
+	operationID := int64(11)
+	tasks := []*storage.Task{{ApplyOperationID: &operationID, State: state.Task.Running}}
+
+	derived, ok := client.deriveAggregateApplyState(t.Context(), driveLoggerTestApply(state.Apply.Running), tasks)
+
+	require.True(t, ok)
+	require.Equal(t, state.Apply.Running, derived)
+	line := requireCapturedLog(t, records, "cannot determine aggregate apply state: tasks reference an apply operation but no operation rows were found")
+	assertLogCarriesApplyIdentity(t, line)
 }

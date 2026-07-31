@@ -13,12 +13,13 @@ import (
 // Shared preview error messages — used by both PR comment and CLI preview functions
 // to keep failure scenarios consistent across output formats.
 const (
-	PreviewErrorFirstFailed  = "Error 1061: Duplicate key name 'idx_user_id'"
-	PreviewErrorMiddleFailed = "lock wait timeout exceeded; try restarting transaction"
-	previewRepository        = "block/schemabot"
-	previewHeadSHA           = "abcdef1234567890abcdef1234567890abcdef12"
-	previewStaleSHA          = "0123456789abcdef0123456789abcdef01234567"
-	previewRequestedBy       = "jackjackbits"
+	PreviewErrorFirstFailed     = "Error 1061: Duplicate key name 'idx_user_id'"
+	PreviewErrorMiddleFailed    = "lock wait timeout exceeded; try restarting transaction"
+	PreviewErrorPreflightFailed = "preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end"
+	previewRepository           = "block/schemabot"
+	previewHeadSHA              = "abcdef1234567890abcdef1234567890abcdef12"
+	previewStaleSHA             = "0123456789abcdef0123456789abcdef01234567"
+	previewRequestedBy          = "jackjackbits"
 )
 
 func previewSupportChannel() SupportChannelData {
@@ -1232,6 +1233,23 @@ func PreviewCommentApplyFailed() string {
 	tables[2].Status = state.Task.Cancelled
 	data := sampleApplyData(state.Apply.Failed, tables)
 	data.ErrorMessage = PreviewErrorMiddleFailed
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyFailedBeforeRowCopy renders an apply comment where the
+// first table was rejected by an engine preflight check before any rows were
+// copied: the row renders without a progress bar and carries its own error
+// detail, while the apply-level failure reason holds the table-qualified form
+// promoted from the failed task.
+func PreviewCommentApplyFailedBeforeRowCopy() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Failed
+	tables[0].DDL = "ALTER TABLE `orders` MODIFY COLUMN `status` ENUM('NEW','PENDING','SHIPPED','DELIVERED') NOT NULL"
+	tables[0].ErrorMessage = PreviewErrorPreflightFailed
+	tables[1].Status = state.Task.Cancelled
+	tables[2].Status = state.Task.Cancelled
+	data := sampleApplyData(state.Apply.Failed, tables)
+	data.ErrorMessage = fmt.Sprintf("table %s failed: %s", tables[0].TableName, PreviewErrorPreflightFailed)
 	return RenderApplyStatusComment(data)
 }
 
