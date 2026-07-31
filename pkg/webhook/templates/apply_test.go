@@ -919,6 +919,56 @@ func TestTerminalStatusAndSummaryCommentTitlesAreDistinct(t *testing.T) {
 	assert.Equal(t, "## ❌ Schema Change Failed — Staging", summaryTitle)
 }
 
+// A failed table surfaces its own error below its row when that error adds
+// detail beyond the apply-level error block, so an operator reading a
+// multi-table failure can attribute each failure to its table. A table whose
+// error is identical to the apply-level message is not repeated below the row
+// — the block above the table list already carries it.
+func TestRenderApplyStatusComment_FailedTableErrorLine(t *testing.T) {
+	render := func(applyError, tableError string, percentComplete int) string {
+		return RenderApplyStatusComment(ApplyStatusCommentData{
+			Database:     "testapp",
+			Environment:  "staging",
+			State:        state.Apply.Failed,
+			Engine:       "Spirit",
+			ApplyID:      "apply-abc123",
+			ErrorMessage: applyError,
+			Tables: []TableProgressData{{
+				TableName:       "users",
+				DDL:             "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+				Status:          state.Task.Failed,
+				PercentComplete: percentComplete,
+				ErrorMessage:    tableError,
+			}},
+		})
+	}
+
+	t.Run("table error distinct from apply error renders below the row", func(t *testing.T) {
+		result := render("1 of 2 tables failed", "preflight enumReorder check failed", 35)
+		assert.Contains(t, result, "> ⚠️ **Error:** 1 of 2 tables failed")
+		assert.Contains(t, result, "> ⚠️ Last error: preflight enumReorder check failed")
+	})
+
+	t.Run("table error identical to apply error is not repeated", func(t *testing.T) {
+		result := render("preflight enumReorder check failed", "preflight enumReorder check failed", 35)
+		assert.Contains(t, result, "> ⚠️ **Error:** preflight enumReorder check failed")
+		assert.NotContains(t, result, "> ⚠️ Last error:")
+		assert.Equal(t, 1, strings.Count(result, "preflight enumReorder check failed"))
+	})
+
+	t.Run("table without an error renders no error line", func(t *testing.T) {
+		result := render("apply-level failure", "", 35)
+		assert.NotContains(t, result, "> ⚠️ Last error:")
+	})
+
+	t.Run("pre-copy failure renders error line without a progress bar", func(t *testing.T) {
+		result := render("1 of 2 tables failed", "preflight enumReorder check failed", 0)
+		assert.Contains(t, result, "**`users`**: ❌ Failed (before row copy started)")
+		assert.Contains(t, result, "> ⚠️ Last error: preflight enumReorder check failed")
+		assert.NotContains(t, result, "0%")
+	})
+}
+
 // A retryable failure is operator-recovery state, not a user-facing outcome:
 // the comment keeps the in-progress headline, surfaces the retry and its last
 // error on the affected table, and tells the user SchemaBot retries
