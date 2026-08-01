@@ -151,6 +151,15 @@ containing direct-execution changes never does:
   statements only, and the disclosure says so. A rejection at confirm time
   preserves the pending confirmation, so re-running `apply-confirm` without
   the flag executes the confirmed plan.
+- `schemabot rollback` follows the same consent model. A rollback plan whose
+  reverse DDL the policy routes to direct execution carries the ⚙️ disclosure
+  on the rollback plan comment, and `schemabot rollback-confirm` is the
+  consent against it — including the all-direct `--defer-cutover` rejection,
+  which preserves the pending rollback. A reverse plan that resolves to
+  blocked (e.g. the table grew past the size bound since the apply) is
+  rejected before anything is pinned for confirmation: a blocked change
+  guarantees the rollback would fail, so the target must be reconciled with a
+  follow-up schema change instead.
 
 ## Observability
 

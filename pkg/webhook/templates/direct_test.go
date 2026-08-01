@@ -69,7 +69,6 @@ func TestDirectConsentCopy_KeyedByDatabaseType(t *testing.T) {
 	assert.Equal(t, "native DDL", otherHeader)
 	assert.Contains(t, otherFooter, "each table is unavailable while its statement runs")
 	assert.Contains(t, otherFooter, "**not revertible**")
-	assert.Contains(t, otherFooter, "Confirming the apply consents to this.")
 }
 
 // A multi-environment plan renders each environment's own direct section,

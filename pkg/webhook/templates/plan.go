@@ -169,7 +169,7 @@ func RenderPlanComment(data PlanCommentData) string {
 	// operator's consent to their blocking, non-revertible semantics, so the
 	// disclosure must sit on the comment the confirmation acts on.
 	if len(data.DirectChanges) > 0 {
-		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL)
+		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL, directApplyConsent)
 	}
 
 	// Unsafe changes warning — shown on the plan comment for review, omitted on
@@ -588,32 +588,41 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	sb.WriteString("\nAn apply will fail on these statements. Rewrite them as a supported schema change, or contact your SchemaBot operators for help.\n\n")
 }
 
-// directConsentCopy returns the header noun and consent footer for the
-// direct-execution disclosure, keyed by database type. The footer is the
-// sentence the operator consents to by confirming the apply, and what a
-// direct statement does to the table while it runs is engine-specific — an
-// engine that adopts direct execution adds its own copy here rather than
-// inheriting another engine's semantics.
+// Consent sentences appended to the direct-execution disclosure: the
+// engine-specific footer discloses the semantics, and this sentence names the
+// command whose confirmation consents to them.
+const (
+	directApplyConsent    = "Confirming the apply consents to this."
+	directRollbackConsent = "Confirming the rollback consents to this."
+)
+
+// directConsentCopy returns the header noun and semantics footer for the
+// direct-execution disclosure, keyed by database type. The footer is what
+// the operator consents to by confirming, and what a direct statement does to
+// the table while it runs is engine-specific — an engine that adopts direct
+// execution adds its own copy here rather than inheriting another engine's
+// semantics.
 func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, footer string) {
 	// Strata is sharded MySQL: a direct statement there is the same native
 	// MySQL DDL, executed per shard.
 	databaseType = strings.TrimSpace(databaseType)
 	if databaseType == storage.DatabaseTypeMySQL || databaseType == storage.DatabaseTypeStrata || isMySQL {
 		return "native MySQL DDL",
-			"These statements run synchronously outside the schema-change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
+			"These statements run synchronously outside the schema-change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it."
 	}
 	// Deliberately conservative fallback for an engine that emits direct
 	// verdicts without registering its own copy above: disclose the broadest
 	// impact rather than understate what the operator is consenting to.
 	return "native DDL",
-		"These statements run synchronously outside the schema-change engine: each table is unavailable while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
+		"These statements run synchronously outside the schema-change engine: each table is unavailable while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it."
 }
 
 // writeDirectChanges writes the section for statements the direct execution
 // policy routes to native DDL, naming each table and the planner's reason
 // (which carries the row estimate). The fixed footer discloses the semantics
-// the operator consents to by confirming the apply.
-func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databaseType string, isMySQL bool) {
+// the operator consents to, closed by the consent sentence naming the
+// confirming command (apply-confirm or rollback-confirm).
+func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databaseType string, isMySQL bool, consent string) {
 	headerNoun, footer := directConsentCopy(databaseType, isMySQL)
 	n := len(changes)
 	fmt.Fprintf(sb, "⚙️ **Direct execution**: **%d** %s will run as %s\n", n, pluralize("change", n), headerNoun)
@@ -628,7 +637,7 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 			fmt.Fprintf(sb, "- %s\n", table)
 		}
 	}
-	sb.WriteString("\n" + footer + "\n\n")
+	sb.WriteString("\n" + footer + " " + consent + "\n\n")
 }
 
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
@@ -940,7 +949,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 	// Direct-execution changes — each environment's section discloses its own,
 	// since the policy is configured per environment.
 	if len(plan.DirectChanges) > 0 {
-		writeDirectChanges(sb, plan.DirectChanges, plan.DatabaseType, plan.IsMySQL)
+		writeDirectChanges(sb, plan.DirectChanges, plan.DatabaseType, plan.IsMySQL, directApplyConsent)
 	}
 
 	// Unsafe changes warning

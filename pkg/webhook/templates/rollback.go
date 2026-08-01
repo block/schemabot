@@ -30,6 +30,14 @@ func RenderRollbackPlanComment(data PlanCommentData) string {
 	// Detailed changes
 	writeKeyspaceChanges(&sb, data)
 
+	// Direct-execution changes — statements the policy routes to native DDL.
+	// rollback-confirm is the operator's consent to their blocking,
+	// non-revertible semantics, so the disclosure must sit on the comment the
+	// confirmation acts on.
+	if len(data.DirectChanges) > 0 {
+		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL, directRollbackConsent)
+	}
+
 	// Unsafe warning — rollback typically produces DROP operations
 	sb.WriteString("> **Warning**: Rollback may include destructive changes (e.g., DROP INDEX, DROP COLUMN). These will be applied automatically.\n\n")
 

@@ -665,6 +665,13 @@ const msgDeferCutoverAllDirect = "`--defer-cutover` has no effect on this plan: 
 // The format verb takes the environment for the coached command.
 const msgDeferCutoverAllDirectConfirm = "`--defer-cutover` has no effect on this plan: every change runs directly as native DDL, which has no cutover to defer. The pending confirmation is preserved — re-run `schemabot apply-confirm -e %s` without the flag."
 
+// msgDeferCutoverAllDirectRollbackConfirm rejects --defer-cutover at rollback
+// confirmation on an all-direct rollback plan. The rejection preserves the
+// pending rollback — the lock still pins the plan the operator confirmed
+// against — so the recovery is re-running rollback-confirm without the flag.
+// The format verb takes the environment for the coached command.
+const msgDeferCutoverAllDirectRollbackConfirm = "`--defer-cutover` has no effect on this rollback: every change runs directly as native DDL, which has no cutover to defer. The pending rollback is preserved — re-run `schemabot rollback-confirm -e %s` without the flag."
+
 // shardedDirectChanges collects direct-execution per-shard changes, grouped by
 // (table, reason) so a change present on several shards lists them together
 // rather than repeating. Returns nil when the plan carries no per-shard
@@ -733,6 +740,57 @@ func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.Blo
 	out := make([]templates.BlockedChangeData, 0, len(order))
 	for _, k := range order {
 		out = append(out, *byKey[k])
+	}
+	return out
+}
+
+// blockedChangesData collects a plan's engine-blocked changes for rendering —
+// the apply commands will reject these. Like the unsafe view, a sharded plan
+// derives them per shard so a blocked change confined to one shard names the
+// shard it applies to; otherwise the namespace-level view is used.
+func blockedChangesData(planResp *apitypes.PlanResponse) []templates.BlockedChangeData {
+	if blocked := shardedBlockedChanges(planResp.Shards); len(blocked) > 0 {
+		return blocked
+	}
+	var out []templates.BlockedChangeData
+	for _, sc := range planResp.Changes {
+		if sc == nil {
+			continue
+		}
+		for _, t := range sc.TableChanges {
+			if !t.EngineBlocked() {
+				continue
+			}
+			out = append(out, templates.BlockedChangeData{
+				Table:  t.TableName,
+				Reason: t.ModeReason,
+			})
+		}
+	}
+	return out
+}
+
+// directChangesData collects a plan's direct-execution changes for rendering —
+// the policy routes these to native MySQL DDL. Derived the same way as the
+// blocked view.
+func directChangesData(planResp *apitypes.PlanResponse) []templates.DirectChangeData {
+	if direct := shardedDirectChanges(planResp.Shards); len(direct) > 0 {
+		return direct
+	}
+	var out []templates.DirectChangeData
+	for _, sc := range planResp.Changes {
+		if sc == nil {
+			continue
+		}
+		for _, t := range sc.TableChanges {
+			if !t.DirectExecution() {
+				continue
+			}
+			out = append(out, templates.DirectChangeData{
+				Table:  t.TableName,
+				Reason: t.ModeReason,
+			})
+		}
 	}
 	return out
 }
@@ -820,48 +878,8 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		}
 	}
 
-	// Blocked changes — the apply commands will reject these. Like the
-	// unsafe view, a sharded plan derives them per shard so a blocked change
-	// confined to one shard names the shard it applies to.
-	if blocked := shardedBlockedChanges(planResp.Shards); len(blocked) > 0 {
-		data.BlockedChanges = blocked
-	} else {
-		for _, sc := range planResp.Changes {
-			if sc == nil {
-				continue
-			}
-			for _, t := range sc.TableChanges {
-				if !t.EngineBlocked() {
-					continue
-				}
-				data.BlockedChanges = append(data.BlockedChanges, templates.BlockedChangeData{
-					Table:  t.TableName,
-					Reason: t.ModeReason,
-				})
-			}
-		}
-	}
-
-	// Direct-execution changes — the policy routes these to native MySQL DDL,
-	// derived the same way as the blocked view.
-	if direct := shardedDirectChanges(planResp.Shards); len(direct) > 0 {
-		data.DirectChanges = direct
-	} else {
-		for _, sc := range planResp.Changes {
-			if sc == nil {
-				continue
-			}
-			for _, t := range sc.TableChanges {
-				if !t.DirectExecution() {
-					continue
-				}
-				data.DirectChanges = append(data.DirectChanges, templates.DirectChangeData{
-					Table:  t.TableName,
-					Reason: t.ModeReason,
-				})
-			}
-		}
-	}
+	data.BlockedChanges = blockedChangesData(planResp)
+	data.DirectChanges = directChangesData(planResp)
 
 	// Add lint violations (error-severity results are shown via UnsafeChanges instead)
 	for _, w := range planResp.LintNonErrors() {

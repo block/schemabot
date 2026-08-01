@@ -157,11 +157,27 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 // through, so the comment carries no retry instructions — the guidance is to
 // rewrite the change or contact the operators.
 func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
+	return renderBlockedChangesRejected(data, "Schema Change Plan", "Apply rejected",
+		"Rewrite these statements as a supported schema change, or contact your SchemaBot operators for help.")
+}
+
+// RenderBlockedChangesRollbackRejected renders the rejection comment for a
+// rollback whose reverse plan contains statements the schema-change engine
+// refuses. A blocked change guarantees the rollback apply would fail, so the
+// rollback is rejected before a plan is pinned for confirmation — there is
+// nothing to confirm, and the target must be reconciled another way.
+func RenderBlockedChangesRollbackRejected(data PlanCommentData) string {
+	return renderBlockedChangesRejected(data, "Schema Rollback Plan", "Rollback rejected",
+		"Reconcile the target schema with a follow-up schema change PR instead, or contact your SchemaBot operators for help.")
+}
+
+// renderBlockedChangesRejected renders the full plan (DDL, summary) so the
+// user can see what was planned — but without a lock or confirm footer — then
+// the engine-blocked changes that reject the command outright.
+func renderBlockedChangesRejected(data PlanCommentData, title, rejection, guidance string) string {
 	var sb strings.Builder
 
-	// Render the full plan first (DDL, summary) so the user can see what was
-	// planned — but without a lock or confirm footer.
-	writeEnvironmentTitle(&sb, "Schema Change Plan", data.Environment)
+	writeEnvironmentTitle(&sb, title, data.Environment)
 
 	writePlanMetadata(&sb, data)
 	writePlanAttribution(&sb, data)
@@ -176,7 +192,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 
 	sb.WriteString("---\n\n")
 	n := len(data.BlockedChanges)
-	fmt.Fprintf(&sb, "**⛔ Apply rejected**: **%d** planned %s not supported by the schema-change engine\n", n, pluralize("change", n))
+	fmt.Fprintf(&sb, "**⛔ %s**: **%d** planned %s not supported by the schema-change engine\n", rejection, n, pluralize("change", n))
 	for _, c := range data.BlockedChanges {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -188,7 +204,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 			fmt.Fprintf(&sb, "- %s\n", table)
 		}
 	}
-	sb.WriteString("\nRewrite these statements as a supported schema change, or contact your SchemaBot operators for help.\n")
+	fmt.Fprintf(&sb, "\n%s\n", guidance)
 
 	return sb.String()
 }

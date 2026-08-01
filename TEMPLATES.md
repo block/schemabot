@@ -4415,6 +4415,72 @@ ALTER TABLE `users` DROP INDEX `idx_email`;
 ```
 
 </details>
+
+</details>
+
+<details>
+<summary><a name="rollback-plan-directexecution-change"></a><strong>Rollback Plan (Direct-execution Change)</strong></summary>
+
+
+## Schema Rollback Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+```sql
+ALTER TABLE `users`
+    DROP PRIMARY KEY,
+    ADD PRIMARY KEY(`id`);
+```
+
+⚙️ **Direct execution**: **1** change will run as native MySQL DDL
+- `users`: dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows
+
+These statements run synchronously outside the schema-change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the rollback consents to this.
+
+> **Warning**: Rollback may include destructive changes (e.g., DROP INDEX, DROP COLUMN). These will be applied automatically.
+
+📋 **Plan**: **1** table to alter
+
+---
+
+To confirm this rollback, comment:
+```
+schemabot rollback-confirm -e staging
+```
+
+To cancel, comment:
+```
+schemabot unlock
+```
+
+</details>
+
+<details>
+<summary><a name="rollback-rejected-engineblocked-changes"></a><strong>Rollback Rejected (Engine-blocked Changes)</strong></summary>
+
+
+## Schema Rollback Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+```sql
+ALTER TABLE `users`
+    DROP PRIMARY KEY,
+    ADD PRIMARY KEY(`id`);
+```
+
+📋 **Plan**: **1** table to alter
+
+---
+
+**⛔ Rollback rejected**: **1** planned change not supported by the schema-change engine
+- `users`: dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000
+
+Reconcile the target schema with a follow-up schema change PR instead, or contact your SchemaBot operators for help.
 </details>
 
 ### CLI Output

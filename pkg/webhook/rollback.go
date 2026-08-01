@@ -19,6 +19,17 @@ const (
 	vSchemaArtifactName       = "vschema.json"
 )
 
+// msgRollbackConfirmBlockedPlan rejects rollback-confirm when the pinned
+// rollback plan carries engine-blocked changes: the rollback apply is
+// guaranteed to fail, so there is nothing that can be confirmed. The format
+// verb takes the environment for the coached command.
+const msgRollbackConfirmBlockedPlan = "The pinned rollback plan contains changes the schema-change engine does not support, so this rollback cannot execute. The lock has been released — re-run `schemabot rollback <apply-id> -e %s` to generate a fresh plan, or contact your SchemaBot operators for help."
+
+// msgRollbackConfirmBlockedPlanLockHeld is the variant posted when the lock
+// release itself failed: the operator must unlock before anything else can
+// run on the database.
+const msgRollbackConfirmBlockedPlanLockHeld = "The pinned rollback plan contains changes the schema-change engine does not support, so this rollback cannot execute. SchemaBot failed to release the database lock — release it with `schemabot unlock`, then re-run `schemabot rollback <apply-id> -e %s` to generate a fresh plan, or contact your SchemaBot operators for help."
+
 // handleRollbackCommand handles the "schemabot rollback <apply-id> -e <env>" PR comment command.
 // It looks up the specified apply, generates a rollback plan from its original schema files,
 // acquires a lock, and posts the plan for confirmation.
@@ -199,23 +210,6 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		return
 	}
 
-	lock := &storage.Lock{
-		DatabaseName:  database,
-		DatabaseType:  dbType,
-		Owner:         lockOwner,
-		Repository:    repo,
-		PullRequest:   pr,
-		PendingPlanID: rollbackPendingPlanID(planResp.PlanID),
-	}
-	if err := lockStore.Acquire(ctx, lock); err != nil {
-		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
-		h.logger.Error("failed to pin rollback plan on lock", "repo", repo, "pr", pr,
-			"database", database, "database_type", dbType, "environment", environment,
-			"plan_id", planResp.PlanID, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, "Failed to pin rollback plan on lock: "+err.Error())
-		return
-	}
-
 	// Build comment data. The source apply ID stays in the comment metadata for
 	// auditability, but rollback-confirm loads the lock-pinned rollback plan so
 	// the user does not need to repeat the apply ID.
@@ -250,6 +244,40 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		})
 	}
 	commentData.Errors = planResp.Errors
+	commentData.BlockedChanges = blockedChangesData(planResp)
+	commentData.DirectChanges = directChangesData(planResp)
+
+	// A rollback plan can carry statements the engine refuses that the direct
+	// execution policy does not route (e.g. re-reshaping a primary key back on
+	// a table that grew past the policy's size bound). A blocked change
+	// guarantees the rollback apply fails, so reject it before pinning a plan
+	// that could never be confirmed.
+	if planResp.HasBlockedChanges() {
+		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
+		h.logger.Warn("rollback rejected: plan contains engine-blocked changes",
+			"repo", repo, "pr", pr, "apply_id", applyID,
+			"database", database, "database_type", dbType,
+			"environment", environment, "plan_id", planResp.PlanID)
+		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesRollbackRejected(commentData))
+		return
+	}
+
+	lock := &storage.Lock{
+		DatabaseName:  database,
+		DatabaseType:  dbType,
+		Owner:         lockOwner,
+		Repository:    repo,
+		PullRequest:   pr,
+		PendingPlanID: rollbackPendingPlanID(planResp.PlanID),
+	}
+	if err := lockStore.Acquire(ctx, lock); err != nil {
+		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
+		h.logger.Error("failed to pin rollback plan on lock", "repo", repo, "pr", pr,
+			"database", database, "database_type", dbType, "environment", environment,
+			"plan_id", planResp.PlanID, "error", err)
+		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, "Failed to pin rollback plan on lock: "+err.Error())
+		return
+	}
 
 	h.postComment(repo, pr, installationID, templates.RenderRollbackPlanComment(commentData))
 }
@@ -365,6 +393,43 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 		}
 		h.postComment(repo, pr, installationID,
 			templates.RenderRollbackAlreadyRolledBack(database, environment))
+		return
+	}
+
+	// A pinned rollback plan with engine-blocked changes can never execute —
+	// the rollback command rejects such plans before pinning, so reaching one
+	// here means the pin predates the gate or storage changed out of band. No
+	// retry of rollback-confirm can succeed, so release the lock: re-running
+	// the rollback command re-plans through the up-front gate.
+	if storedPlanHasBlockedChanges(rollbackPlan) {
+		h.logger.Warn("rollback-confirm rejected: pinned rollback plan contains engine-blocked changes",
+			"repo", repo, "pr", pr, "database", database,
+			"database_type", dbType, "environment", environment,
+			"plan_id", rollbackPlan.PlanIdentifier)
+		msg := fmt.Sprintf(msgRollbackConfirmBlockedPlan, environment)
+		if err := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner); err != nil {
+			h.logger.Error("rollback-confirm rejected a blocked rollback plan but failed to release the database lock; applies on this database will be blocked until the lock is released manually",
+				"repo", repo, "pr", pr, "database", database,
+				"database_type", dbType, "environment", environment,
+				"lock_owner", lockOwner, "plan_id", rollbackPlan.PlanIdentifier, "error", err)
+			msg = fmt.Sprintf(msgRollbackConfirmBlockedPlanLockHeld, environment)
+		}
+		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, msg)
+		return
+	}
+
+	// --defer-cutover only affects engine-driven statements; an all-direct
+	// rollback plan has no cutover to defer, so reject the flag instead of
+	// silently ignoring it. Keep the lock: it still pins the rollback plan the
+	// operator confirmed against, and re-running rollback-confirm without the
+	// flag executes it.
+	if result.DeferCutover && storedPlanAllChangesDirect(rollbackPlan) {
+		h.logger.Info("rollback-confirm rejected: --defer-cutover on an all-direct rollback plan; the pending rollback is preserved",
+			"repo", repo, "pr", pr, "database", database,
+			"database_type", dbType, "environment", environment,
+			"plan_id", rollbackPlan.PlanIdentifier)
+		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy,
+			fmt.Sprintf(msgDeferCutoverAllDirectRollbackConfirm, environment))
 		return
 	}
 
@@ -594,4 +659,46 @@ func planHasChanges(plan *storage.Plan) bool {
 		}
 	}
 	return false
+}
+
+// storedPlanHasBlockedChanges reports whether any stored change carries the
+// blocked execution-mode verdict. A blocked change guarantees the apply
+// fails, so confirm-time gates reject the plan instead of executing it.
+func storedPlanHasBlockedChanges(plan *storage.Plan) bool {
+	if plan == nil {
+		return false
+	}
+	for _, tc := range plan.FlatDDLChanges() {
+		if tc.EngineBlocked() {
+			return true
+		}
+	}
+	return false
+}
+
+// storedPlanAllChangesDirect reports whether every stored change is a
+// direct-execution change (and at least one exists). Options that only affect
+// engine-driven statements — like a deferred cutover — have nothing to act on
+// in such a plan, so their commands are rejected rather than silently
+// ignored. A VSchema artifact is an engine-driven change, so its presence
+// makes the plan mixed.
+func storedPlanAllChangesDirect(plan *storage.Plan) bool {
+	if plan == nil {
+		return false
+	}
+	changes := plan.FlatDDLChanges()
+	if len(changes) == 0 {
+		return false
+	}
+	for _, tc := range changes {
+		if !tc.DirectExecution() {
+			return false
+		}
+	}
+	for _, nsData := range plan.Namespaces {
+		if nsData != nil && nsData.Artifacts[vSchemaArtifactName] != "" {
+			return false
+		}
+	}
+	return true
 }
