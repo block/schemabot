@@ -193,6 +193,26 @@ func TestUserFacingSchemaRequestError(t *testing.T) {
 		assert.Equal(t, err.Error(), got)
 	})
 
+	t.Run("no schema files found renders its message", func(t *testing.T) {
+		err := &ghclient.NoSchemaFilesError{SchemaRoot: "schema/orders", Environment: "staging"}
+
+		got := userFacingSchemaRequestError(err, "ab12cd34")
+
+		assert.Equal(t, `no schema files found under schema/orders for environment "staging"`, got)
+	})
+
+	t.Run("no schema files found names the ignored namespaces that were excluded", func(t *testing.T) {
+		err := &ghclient.NoSchemaFilesError{
+			SchemaRoot:        "schema/orders",
+			Environment:       "staging",
+			IgnoredNamespaces: []string{"fixtures_staging"},
+		}
+
+		got := userFacingSchemaRequestError(err, "ab12cd34")
+
+		assert.Equal(t, `no schema files found under schema/orders for environment "staging" after excluding ignored namespaces [fixtures_staging]`, got)
+	})
+
 	t.Run("config sentinels render their message", func(t *testing.T) {
 		err := fmt.Errorf("discover schema configs: %w", ghclient.ErrNoConfig)
 

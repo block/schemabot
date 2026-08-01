@@ -147,6 +147,10 @@ func isUserMeaningfulSchemaRequestError(err error) bool {
 	if errors.As(err, &dbNotFoundErr) {
 		return true
 	}
+	var noSchemaFilesErr *ghclient.NoSchemaFilesError
+	if errors.As(err, &noSchemaFilesErr) {
+		return true
+	}
 	return errors.Is(err, ghclient.ErrNoConfig) ||
 		errors.Is(err, ghclient.ErrInvalidConfig) ||
 		errors.Is(err, ghclient.ErrMultipleConfigs) ||
