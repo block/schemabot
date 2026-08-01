@@ -129,6 +129,13 @@ reshaping any shared surface:
 - **The verdict vocabulary** — `ExecutionModeDirect` / `ExecutionModeBlocked`
   and the human-readable `ModeReason` on a planned table change — lives in
   `pkg/engine` as plain strings, alongside `TableChange.ExecutionMode`.
+- **The policy and the verdict resolver** live in `pkg/engine/direct`: policy
+  parsing from engine metadata and the resolver that turns a refused
+  statement into a direct or blocked decision, including the two-step size
+  gate, the fail-closed handling of every uncertainty, and the
+  stop-vs-verdict distinction for a cancelled gate. An adopting engine plugs
+  in a size estimator and gets the same decision semantics, mode reasons, and
+  blocked-outcome metric labels the MySQL engine reports.
 - **The policy transport** is the engine interface's generic metadata channel.
   Each engine interprets its own policy keys; no engine is forced to read
   them.
@@ -141,14 +148,16 @@ reshaping any shared surface:
 
 An engine that adopts direct execution owns three pieces: its **refusal
 detector** (which statements it deterministically cannot run), its **size
-estimator** (for MySQL, `TABLE_ROWS`; a PostgreSQL engine would use its
-catalog's row estimate), and its **executor**. Everything else — policy
-schema, verdicts, metrics, and the PR consent flow — is shared. Two contract
-requirements come with those pieces:
+estimator** (the `pkg/engine/direct` estimator contract — for MySQL,
+`TABLE_ROWS`; a PostgreSQL engine would use its catalog's row estimate), and
+its **executor**. Everything else — policy schema, verdict resolution,
+metrics, and the PR consent flow — is shared. Two contract requirements come
+with those pieces:
 
-- The estimator must map an unknown **or negative** estimate to blocked — a
-  negative value is a "no real estimate" sentinel, not a count (PostgreSQL's
-  `pg_class.reltuples` reports `-1` for a never-analyzed table).
+- The estimator must return an unknown **or negative** estimate as an error —
+  a negative value is a "no real estimate" sentinel, not a count
+  (PostgreSQL's `pg_class.reltuples` reports `-1` for a never-analyzed
+  table). The shared resolver blocks on any estimator error.
 - The executor must bound lock acquisition and fail fast on a busy table, the
   way the MySQL engine bounds `lock_wait_timeout`. On PostgreSQL that is
   `lock_timeout`, and it matters even more there: a DDL queued on a lock

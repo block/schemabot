@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/engine/direct"
 	"github.com/block/schemabot/pkg/pendingdrops"
 )
 
@@ -62,7 +63,7 @@ func runDDLApply(t *testing.T, eng *Engine, dsn string, ddlStatements []string) 
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, directPolicy{})
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, direct.Policy{})
 
 	eng.mu.Lock()
 	defer eng.mu.Unlock()

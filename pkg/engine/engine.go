@@ -429,13 +429,17 @@ const (
 
 // TableProgress tracks progress for a single table.
 type TableProgress struct {
-	Namespace  string // Schema/keyspace name when the engine can distinguish it
-	Table      string // Table name
-	State      string // "pending", "copying", "ready", "complete", "failed"
-	Progress   int    // 0-100 percent
-	RowsCopied int64  // Actual rows copied
-	RowsTotal  int64  // Total rows to copy
-	ETASeconds int64  // Estimated seconds remaining
+	Namespace string // Schema/keyspace name when the engine can distinguish it
+	Table     string // Table name
+	// State is the engine-reported state for this table. Engines report their
+	// own phase vocabulary here (e.g. Vitess migration states); direct-routed
+	// statements report the State lifecycle values (running, completed,
+	// failed, stopped).
+	State      string
+	Progress   int   // 0-100 percent
+	RowsCopied int64 // Actual rows copied
+	RowsTotal  int64 // Total rows to copy
+	ETASeconds int64 // Estimated seconds remaining
 	// Checksum phase progress: rows verified so far and the total to verify.
 	// Populated while the table is checksumming (verifying copied data), 0 otherwise.
 	ChecksumRowsChecked int64

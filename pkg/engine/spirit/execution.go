@@ -14,6 +14,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/engine/direct"
 	"github.com/block/schemabot/pkg/mysqlconn"
 )
 
@@ -110,7 +111,7 @@ func (e *Engine) gtidChangeSourceSupported(ctx context.Context, host, username, 
 // credentials DSN; it may carry connection parameters (e.g. TLS) that the
 // parsed-out parts don't, so paths that open their own target connection use
 // it rather than rebuilding a DSN from the parts.
-func (e *Engine) executeSchemaChange(ctx context.Context, dsn, host, username, password, database string, ddlStatements []string, deferCutover bool, policy directPolicy) {
+func (e *Engine) executeSchemaChange(ctx context.Context, dsn, host, username, password, database string, ddlStatements []string, deferCutover bool, policy direct.Policy) {
 	phases, err := classifyDDLPhases(ddlStatements)
 	if err != nil {
 		e.logger.Error("failed to classify statement", "error", err)
@@ -163,7 +164,7 @@ func (e *Engine) executeSchemaChange(ctx context.Context, dsn, host, username, p
 // phase, so once an ALTER has started they are already applied; only the DROP
 // phase remains and must run after the resumed ALTER completes. When no ALTER was
 // in flight, the whole plan is run from the start.
-func (e *Engine) resumeSchemaChange(ctx context.Context, dsn, host, username, password, database string, originalDDLs []string, combinedStatement string, deferCutover bool, policy directPolicy) {
+func (e *Engine) resumeSchemaChange(ctx context.Context, dsn, host, username, password, database string, originalDDLs []string, combinedStatement string, deferCutover bool, policy direct.Policy) {
 	if combinedStatement == "" {
 		e.executeSchemaChange(ctx, dsn, host, username, password, database, originalDDLs, deferCutover, policy)
 		return
@@ -278,7 +279,7 @@ func (e *Engine) executeCreateStatements(ctx context.Context, host, username, pa
 // already set StateFailed). A stop cancels the context but may return true;
 // the caller's later ctx.Err() checks then keep the state Stopped without
 // running further phases.
-func (e *Engine) executeAlterPhase(ctx context.Context, dsn, host, username, password, database string, alters []string, deferCutover bool, policy directPolicy) bool {
+func (e *Engine) executeAlterPhase(ctx context.Context, dsn, host, username, password, database string, alters []string, deferCutover bool, policy direct.Policy) bool {
 	// The size gate and direct executor connect with the verbatim credentials
 	// DSN — the same connection Plan's gate used — so DSN parameters (e.g.
 	// TLS) survive to apply time instead of being dropped by a rebuild from

@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/engine/direct"
 )
 
 // directPolicyMetadata is the engine metadata an enabled direct execution
@@ -205,12 +206,12 @@ func TestResolveRefusedMode_UnreachableTargetBlocks(t *testing.T) {
 	target := &lazyTargetDB{dsn: "root:nopass@tcp(127.0.0.1:1)/absent"}
 	defer target.close()
 
-	policy := directPolicy{Enabled: true, MaxTableRows: 1000}
+	policy := direct.Policy{Enabled: true, MaxTableRows: 1000}
 	decision, err := eng.resolveRefusedMode(ctx, target, policy, "absent", "users", "dropping primary key is not supported")
 	require.NoError(t, err, "an unreachable target is a verdict, not an error")
-	assert.Equal(t, engine.ExecutionModeBlocked, decision.mode)
-	assert.Contains(t, decision.modeReason, "dropping primary key is not supported")
-	assert.Contains(t, decision.modeReason, "row count is unavailable")
+	assert.Equal(t, engine.ExecutionModeBlocked, decision.Mode)
+	assert.Contains(t, decision.ModeReason, "dropping primary key is not supported")
+	assert.Contains(t, decision.ModeReason, "row count is unavailable")
 }
 
 // A context cancelled while the size gate runs is an operator stop, not an
@@ -226,7 +227,7 @@ func TestResolveRefusedMode_CancelledContextIsAnErrorNotAVerdict(t *testing.T) {
 	target := &lazyTargetDB{dsn: "root:nopass@tcp(127.0.0.1:1)/absent"}
 	defer target.close()
 
-	policy := directPolicy{Enabled: true, MaxTableRows: 1000}
+	policy := direct.Policy{Enabled: true, MaxTableRows: 1000}
 	_, err := eng.resolveRefusedMode(ctx, target, policy, "absent", "users", "dropping primary key is not supported")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, context.Canceled)
@@ -341,7 +342,7 @@ func TestEngine_ExecuteAlterPhase_DirectApply(t *testing.T) {
 	eng.mu.Unlock()
 
 	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false,
-		directPolicy{Enabled: true, MaxTableRows: 100000})
+		direct.Policy{Enabled: true, MaxTableRows: 100000})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -412,7 +413,7 @@ func TestEngine_ExecuteAlterPhase_MixedRouting(t *testing.T) {
 	eng.mu.Unlock()
 
 	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false,
-		directPolicy{Enabled: true, MaxTableRows: 100000})
+		direct.Policy{Enabled: true, MaxTableRows: 100000})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -463,7 +464,7 @@ func TestEngine_ExecuteAlterPhase_PolicyOffFailsFast(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, directPolicy{})
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, direct.Policy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -521,7 +522,7 @@ func TestEngine_ExecuteAlterPhase_AboveBoundFailsFast(t *testing.T) {
 	eng.mu.Unlock()
 
 	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false,
-		directPolicy{Enabled: true, MaxTableRows: 10})
+		direct.Policy{Enabled: true, MaxTableRows: 10})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -589,7 +590,7 @@ func TestEngine_ExecuteAlterPhase_BusyTableFailsFast(t *testing.T) {
 	defer cancel()
 	const lockWaitSeconds = 2
 	eng.executeSchemaChange(ctx, dsn, host, username, password, database, ddlStatements, false,
-		directPolicy{Enabled: true, MaxTableRows: 100000, LockAcquisitionTimeoutSeconds: lockWaitSeconds})
+		direct.Policy{Enabled: true, MaxTableRows: 100000, LockAcquisitionTimeoutSeconds: lockWaitSeconds})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -622,7 +623,7 @@ func TestEngine_RouteAlterStatements_UnknownSizeBlocked(t *testing.T) {
 
 	_, err = eng.routeAlterStatements(t.Context(), target, database,
 		[]string{"ALTER TABLE `direct_missing` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)"},
-		directPolicy{Enabled: true, MaxTableRows: 100000})
+		direct.Policy{Enabled: true, MaxTableRows: 100000})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "direct_missing")
 	assert.Contains(t, err.Error(), "row count is unavailable")
@@ -693,7 +694,7 @@ func TestEngine_DirectStatements_StopMidStatementThenResumeFailsClosed(t *testin
 	// The lock bound must outlast the stop below; if the stop machinery fails,
 	// the bounded wait fails the statement instead and the state assertions
 	// diagnose it.
-	policy := directPolicy{Enabled: true, MaxTableRows: 100000, LockAcquisitionTimeoutSeconds: 25}
+	policy := direct.Policy{Enabled: true, MaxTableRows: 100000, LockAcquisitionTimeoutSeconds: 25}
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -782,7 +783,7 @@ func TestEngine_DirectStatements_ResumeSkipsCompletedStatement(t *testing.T) {
 	require.NoError(t, err, "parseDSN")
 
 	ddlStatements := []string{"ALTER TABLE `direct_resume_skip` DROP PRIMARY KEY"}
-	policy := directPolicy{Enabled: true, MaxTableRows: 100000}
+	policy := direct.Policy{Enabled: true, MaxTableRows: 100000}
 
 	eng.mu.Lock()
 	eng.runningSchemaChange = &runningSchemaChange{
@@ -859,7 +860,7 @@ func TestEngine_DirectStatements_PartialFailureMarksEachStatement(t *testing.T) 
 	eng.mu.Unlock()
 
 	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false,
-		directPolicy{Enabled: true, MaxTableRows: 100000})
+		direct.Policy{Enabled: true, MaxTableRows: 100000})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -919,7 +920,7 @@ func TestEngine_DirectStatements_StopDuringRoutingKeepsStopped(t *testing.T) {
 	cancel()
 	eng.executeSchemaChange(ctx, dsn, host, username, password, database,
 		[]string{"ALTER TABLE `direct_stop_routing` DROP PRIMARY KEY"}, false,
-		directPolicy{Enabled: true, MaxTableRows: 100000})
+		direct.Policy{Enabled: true, MaxTableRows: 100000})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -963,7 +964,7 @@ func TestEngine_ResumeSchemaChange_RoutesWithSnapshottedPolicy(t *testing.T) {
 	// resume runs the whole plan from the start with the snapshotted policy.
 	eng.resumeSchemaChange(t.Context(), dsn, host, username, password, database,
 		[]string{"ALTER TABLE `direct_resume_policy` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)"},
-		"", false, directPolicy{Enabled: true, MaxTableRows: 100000})
+		"", false, direct.Policy{Enabled: true, MaxTableRows: 100000})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state

@@ -25,6 +25,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/engine/direct"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
@@ -1151,7 +1152,7 @@ func TestEngine_ExecuteMigration_AddColumn(t *testing.T) {
 	eng.mu.Unlock()
 
 	// Execute the schema change synchronously for testing
-	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, directPolicy{})
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, direct.Policy{})
 
 	// Check that schema change completed
 	eng.mu.Lock()
@@ -1216,7 +1217,7 @@ func TestEngine_ExecuteMigration_ModifyColumn(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, directPolicy{})
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, direct.Policy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -1272,7 +1273,7 @@ func TestEngine_ExecuteMigration_DropColumn(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, directPolicy{})
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, direct.Policy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -1329,7 +1330,7 @@ func TestEngine_ExecuteMigration_AddIndex(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, directPolicy{})
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, direct.Policy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -1378,7 +1379,7 @@ func TestEngine_ExecuteMigration_InvalidSQL(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, directPolicy{})
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, direct.Policy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -1420,7 +1421,7 @@ func TestEngine_Progress_FailingApplyNeverReportsCompleted(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		eng.executeSchemaChange(ctx, dsn, host, username, password, database, ddlStatements, false, directPolicy{})
+		eng.executeSchemaChange(ctx, dsn, host, username, password, database, ddlStatements, false, direct.Policy{})
 	}()
 
 	deadline := time.NewTimer(30 * time.Second)
@@ -1497,7 +1498,7 @@ func TestEngine_ExecuteMigration_MultipleStatements(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, directPolicy{})
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, direct.Policy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -1583,7 +1584,7 @@ func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T
 		}
 		eng.mu.Unlock()
 
-		eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, []string{createDDL}, false, directPolicy{})
+		eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, []string{createDDL}, false, direct.Policy{})
 
 		eng.mu.Lock()
 		createState := eng.runningSchemaChange.state
@@ -1608,7 +1609,7 @@ func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T
 		}
 		eng.mu.Unlock()
 
-		eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, []string{dropDDL}, false, directPolicy{})
+		eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, []string{dropDDL}, false, direct.Policy{})
 
 		eng.mu.Lock()
 		dropState := eng.runningSchemaChange.state
@@ -1674,7 +1675,7 @@ func TestEngine_ExecuteSchemaChange_SingleStatementRoutesSpiritLogs(t *testing.T
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, []string{createDDL}, false, directPolicy{})
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, []string{createDDL}, false, direct.Policy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -2032,7 +2033,7 @@ func TestEngine_ExecuteMigration_CancelledContextKeepsStoppedState(t *testing.T)
 		"DROP TABLE `stop_pending_drop`",
 	}
 
-	eng.executeSchemaChange(ctx, dsn, host, username, password, database, ddlStatements, false, directPolicy{})
+	eng.executeSchemaChange(ctx, dsn, host, username, password, database, ddlStatements, false, direct.Policy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state

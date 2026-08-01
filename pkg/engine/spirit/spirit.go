@@ -28,6 +28,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/engine/direct"
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/mysqlconn"
 )
@@ -95,7 +96,7 @@ type runningSchemaChange struct {
 	// resumed schema change routes with the same policy the apply started
 	// with. directStatements tracks each direct-routed statement's lifecycle
 	// for progress reporting.
-	directPolicy     directPolicy
+	directPolicy     direct.Policy
 	directStatements []*directStatementProgress
 
 	// Spirit copy settings for this schema change. Initialized from the
@@ -325,7 +326,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	// blocked verdict below. A malformed policy fails the plan: silently
 	// treating it as disabled would record blocked verdicts the apply-time
 	// routing might not agree with.
-	policy, err := directPolicyFromMetadata(req.Credentials.Metadata)
+	policy, err := direct.PolicyFromMetadata(req.Credentials.Metadata)
 	if err != nil {
 		return nil, fmt.Errorf("resolve direct execution policy: %w", err)
 	}
@@ -382,14 +383,14 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 				if err != nil {
 					return nil, fmt.Errorf("execution verdict for table %q: %w", pc.TableName, err)
 				}
-				change.ExecutionMode = decision.mode
-				change.ModeReason = decision.modeReason
-				if decision.mode == engine.ExecutionModeDirect {
+				change.ExecutionMode = decision.Mode
+				change.ModeReason = decision.ModeReason
+				if decision.Mode == engine.ExecutionModeDirect {
 					e.logger.Info("plan routes a statement the engine refuses to direct execution",
-						"database", database, "table", pc.TableName, "reason", reason, "estimated_rows", decision.rows)
+						"database", database, "table", pc.TableName, "reason", reason, "estimated_rows", decision.Rows)
 				} else {
 					e.logger.Info("plan contains a statement the engine will refuse at apply time",
-						"database", database, "table", pc.TableName, "reason", decision.modeReason)
+						"database", database, "table", pc.TableName, "reason", decision.ModeReason)
 				}
 			}
 		}
@@ -483,7 +484,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// Resolve the direct execution policy up front so a malformed policy
 	// rejects the apply before any state is created, and snapshot it on the
 	// running change below so resume routes with the same policy.
-	directExecPolicy, err := directPolicyFromMetadata(req.Credentials.Metadata)
+	directExecPolicy, err := direct.PolicyFromMetadata(req.Credentials.Metadata)
 	if err != nil {
 		return nil, fmt.Errorf("resolve direct execution policy: %w", err)
 	}
@@ -635,7 +636,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 			Namespace:      rm.tableNamespace[ds.table],
 			Table:          ds.table,
 			DDL:            ds.ddl,
-			State:          ds.state,
+			State:          string(ds.state),
 			ProgressDetail: "direct execution (native MySQL DDL)",
 		}
 		started := ds.startedAt
@@ -644,7 +645,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 			completed := *ds.completedAt
 			tp.CompletedAt = &completed
 		}
-		if ds.state == directStateCompleted {
+		if ds.state == engine.StateCompleted {
 			tp.Progress = 100
 		}
 		tableProgress = append(tableProgress, tp)

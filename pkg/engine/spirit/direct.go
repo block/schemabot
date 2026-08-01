@@ -1,9 +1,10 @@
 // direct.go implements direct execution: routing ALTER statements Spirit
 // deterministically refuses to native MySQL DDL when the database's policy
 // permits it. The policy arrives as engine metadata, the plan-time verdict
-// and the apply-time routing evaluate the same predicate, and everything
-// fails closed — a refused statement never runs directly unless the policy
-// is enabled and the table's measured size is within the configured bound.
+// and the apply-time routing evaluate the same predicate through the shared
+// resolver (pkg/engine/direct), and everything fails closed — a refused
+// statement never runs directly unless the policy is enabled and the table's
+// measured size is within the configured bound.
 package spirit
 
 import (
@@ -12,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"time"
 
 	"github.com/block/spirit/pkg/statement"
@@ -21,72 +21,10 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/engine/direct"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
-	"github.com/block/schemabot/pkg/ui"
 )
-
-// directPolicy is the resolved direct execution policy for a target database.
-// The zero value is the fail-closed default: refused statements are blocked.
-type directPolicy struct {
-	Enabled      bool
-	MaxTableRows int64
-	// LockAcquisitionTimeoutSeconds bounds each direct statement's lock acquisition.
-	// Zero means the policy did not set one; read the effective value through
-	// lockAcquisitionTimeoutSeconds(), which applies the engine default.
-	LockAcquisitionTimeoutSeconds int64
-}
-
-// lockAcquisitionTimeoutSeconds returns the effective lock-acquisition bound for
-// direct statements: the policy's configured value, or the engine default
-// when the policy leaves it unset.
-func (p directPolicy) lockAcquisitionTimeoutSeconds() int64 {
-	if p.LockAcquisitionTimeoutSeconds > 0 {
-		return p.LockAcquisitionTimeoutSeconds
-	}
-	return defaultDirectLockAcquisitionTimeoutSeconds
-}
-
-// directPolicyFromMetadata parses the direct execution policy from engine
-// metadata. Malformed values are errors rather than a silent fallback to
-// disabled, so a misconfigured policy is surfaced instead of quietly turning
-// planned direct changes into apply-time failures.
-func directPolicyFromMetadata(md map[string]string) (directPolicy, error) {
-	rawEnabled := md[engine.MetadataDirectExecution]
-	if rawEnabled == "" {
-		return directPolicy{}, nil
-	}
-	enabled, err := strconv.ParseBool(rawEnabled)
-	if err != nil {
-		return directPolicy{}, fmt.Errorf("invalid %s metadata value %q: %w", engine.MetadataDirectExecution, rawEnabled, err)
-	}
-	if !enabled {
-		return directPolicy{}, nil
-	}
-	raw := md[engine.MetadataDirectExecutionMaxTableRows]
-	if raw == "" {
-		return directPolicy{}, fmt.Errorf("%s is enabled but %s is not set: the row bound is required so direct execution fails closed on large tables", engine.MetadataDirectExecution, engine.MetadataDirectExecutionMaxTableRows)
-	}
-	maxRows, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return directPolicy{}, fmt.Errorf("parse %s metadata value %q: %w", engine.MetadataDirectExecutionMaxTableRows, raw, err)
-	}
-	if maxRows <= 0 {
-		return directPolicy{}, fmt.Errorf("%s must be positive, got %d", engine.MetadataDirectExecutionMaxTableRows, maxRows)
-	}
-	policy := directPolicy{Enabled: true, MaxTableRows: maxRows}
-	if raw := md[engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds]; raw != "" {
-		lockWait, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil {
-			return directPolicy{}, fmt.Errorf("parse %s metadata value %q: %w", engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds, raw, err)
-		}
-		if lockWait <= 0 {
-			return directPolicy{}, fmt.Errorf("%s must be positive, got %d", engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds, lockWait)
-		}
-		policy.LockAcquisitionTimeoutSeconds = lockWait
-	}
-	return policy, nil
-}
 
 // estimatedTableRows returns MySQL's estimated row count for the table from
 // information_schema statistics. The read happens on a dedicated connection
@@ -142,125 +80,44 @@ func exactRowCountWithin(ctx context.Context, db *sql.DB, schema, tableName stri
 	return count, nil
 }
 
-// refusedModeDecision is how a statement the engine refuses will execute
-// under the direct execution policy. The plan records mode and modeReason on
-// the table change as an operator-facing preview; apply-time routing
-// re-resolves the decision against live policy and table state rather than
-// trusting the stored verdict.
-type refusedModeDecision struct {
-	mode       string // engine.ExecutionModeDirect or engine.ExecutionModeBlocked
-	modeReason string // operator-facing reason, including row-count context
-	outcome    string // metric outcome label when the decision blocks
-	rows       int64  // measured rows when the size gate ran: exact for a direct verdict, the estimate when the estimate alone blocked
+// mysqlTableSizer implements the shared resolver's size-estimator contract
+// against the target database: the optimizer's statistics estimate first,
+// then an exact bounded count. It connects lazily through the shared target
+// handle so verdicts that never reach the size gate never open a connection.
+type mysqlTableSizer struct {
+	target *lazyTargetDB
+	schema string
 }
 
-// blockedSizeUnknownReason is the mode-reason suffix when the size gate could
-// not be evaluated at all: no target connection, no statistics row, or a
-// failed count. Every such uncertainty blocks.
-const blockedSizeUnknownReason = "; direct execution is enabled but the table's row count is unavailable"
-
-// resolveRefusedMode decides whether the policy routes a refused statement to
-// direct execution. Every uncertainty blocks: policy disabled, a size gate
-// that cannot be evaluated, or a table above the configured bound. The size
-// gate runs in two steps — the optimizer's estimate first, then an exact
-// bounded row count — because the estimate can lag reality in both
-// directions, so it is trusted to block but never to approve on its own.
-// The above-bound reason names only the configured limit, not the measured
-// count, so identical verdicts on different shards collapse into one row in
-// PR-facing summaries.
-//
-// A non-nil error means the caller's context was cancelled while the size gate
-// ran: the gate never finished, so there is no verdict to record. Reporting a
-// cancellation as a blocked verdict would misdiagnose an operator stop as an
-// unmeasurable table, so the two are kept distinct.
-func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, policy directPolicy, database, tableName, refusalReason string) (refusedModeDecision, error) {
-	if !policy.Enabled {
-		return refusedModeDecision{
-			mode:       engine.ExecutionModeBlocked,
-			modeReason: refusalReason,
-			outcome:    "blocked_policy_disabled",
-		}, nil
-	}
-	db, err := target.get(ctx)
+func (s *mysqlTableSizer) EstimatedRows(ctx context.Context, table string) (int64, error) {
+	db, err := s.target.get(ctx)
 	if err != nil {
-		if ctx.Err() != nil {
-			return refusedModeDecision{}, fmt.Errorf("size gate for table %q interrupted while connecting to the target: %w", tableName, err)
-		}
-		// Fail closed: without a connection there is no size gate, and an
-		// unmeasured table must never rebuild natively.
-		e.logger.Warn("direct execution blocked: cannot connect to target for the size gate",
-			"database", database, "table", tableName, "error", err)
-		return refusedModeDecision{
-			mode:       engine.ExecutionModeBlocked,
-			modeReason: refusalReason + blockedSizeUnknownReason,
-			outcome:    "blocked_size_unknown",
-		}, nil
+		return 0, fmt.Errorf("connect to the target for the size gate of `%s`.`%s`: %w", s.schema, table, err)
 	}
-	rows, err := estimatedTableRows(ctx, db, database, tableName)
-	if err != nil {
-		if ctx.Err() != nil {
-			return refusedModeDecision{}, fmt.Errorf("size gate for table %q interrupted during the row estimate: %w", tableName, err)
-		}
-		// Fail closed: a table whose size cannot be measured must never
-		// rebuild natively — block it and surface why in the mode reason.
-		e.logger.Warn("direct execution blocked: estimated row count unavailable",
-			"database", database, "table", tableName, "error", err)
-		return refusedModeDecision{
-			mode:       engine.ExecutionModeBlocked,
-			modeReason: refusalReason + blockedSizeUnknownReason,
-			outcome:    "blocked_size_unknown",
-		}, nil
-	}
-	aboveBoundReason := fmt.Sprintf("%s; direct execution is enabled but the table is above the configured limit of %s rows",
-		refusalReason, ui.FormatNumber(policy.MaxTableRows))
-	if rows > policy.MaxTableRows {
-		e.logger.Info("direct execution blocked: estimated row count above the policy bound",
-			"database", database, "table", tableName, "estimated_rows", rows, "max_table_rows", policy.MaxTableRows)
-		return refusedModeDecision{
-			mode:       engine.ExecutionModeBlocked,
-			modeReason: aboveBoundReason,
-			outcome:    "blocked_size_limit",
-			rows:       rows,
-		}, nil
-	}
-	count, err := exactRowCountWithin(ctx, db, database, tableName, policy.MaxTableRows)
-	if err != nil {
-		if ctx.Err() != nil {
-			return refusedModeDecision{}, fmt.Errorf("size gate for table %q interrupted during the exact row count: %w", tableName, err)
-		}
-		e.logger.Warn("direct execution blocked: exact row count unavailable",
-			"database", database, "table", tableName, "error", err)
-		return refusedModeDecision{
-			mode:       engine.ExecutionModeBlocked,
-			modeReason: refusalReason + blockedSizeUnknownReason,
-			outcome:    "blocked_size_unknown",
-		}, nil
-	}
-	if count > policy.MaxTableRows {
-		e.logger.Info("direct execution blocked: exact row count above the policy bound despite a smaller estimate",
-			"database", database, "table", tableName, "estimated_rows", rows, "max_table_rows", policy.MaxTableRows)
-		return refusedModeDecision{
-			mode:       engine.ExecutionModeBlocked,
-			modeReason: aboveBoundReason,
-			outcome:    "blocked_size_limit",
-		}, nil
-	}
-	return refusedModeDecision{
-		mode: engine.ExecutionModeDirect,
-		modeReason: fmt.Sprintf("%s; runs as native MySQL DDL on a table with ~%s rows",
-			refusalReason, ui.FormatNumber(count)),
-		rows: count,
-	}, nil
+	return estimatedTableRows(ctx, db, s.schema, table)
 }
 
-// Lifecycle states for a direct-routed statement's TableProgress entries.
-// "completed" matches the literal Spirit-runner table progress already uses.
-const (
-	directStateRunning   = "running"
-	directStateCompleted = "completed"
-	directStateFailed    = "failed"
-	directStateStopped   = "stopped"
-)
+func (s *mysqlTableSizer) ExactRowsWithin(ctx context.Context, table string, limit int64) (int64, error) {
+	db, err := s.target.get(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("connect to the target for the size gate of `%s`.`%s`: %w", s.schema, table, err)
+	}
+	return exactRowCountWithin(ctx, db, s.schema, table, limit)
+}
+
+// resolveRefusedMode resolves a refused statement's execution-mode verdict
+// through the shared resolver, measuring the table against the target
+// database. See direct.Resolver.ResolveRefusedMode for the decision
+// semantics; a non-nil error means the context was cancelled mid-gate, not a
+// blocked verdict.
+func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, policy direct.Policy, database, tableName, refusalReason string) (direct.Decision, error) {
+	resolver := direct.Resolver{
+		Logger:    e.logger,
+		Estimator: &mysqlTableSizer{target: target, schema: database},
+		RunsAs:    "native MySQL DDL",
+	}
+	return resolver.ResolveRefusedMode(ctx, policy, database, tableName, refusalReason)
+}
 
 // defaultDirectLockAcquisitionTimeoutSeconds bounds how long a direct statement
 // waits to acquire its locks when the policy does not configure a bound.
@@ -290,7 +147,7 @@ func isLockWaitTimeout(err error) bool {
 type directStatementProgress struct {
 	table       string
 	ddl         string
-	state       string
+	state       engine.State
 	startedAt   time.Time
 	completedAt *time.Time
 }
@@ -322,7 +179,7 @@ type alterRouting struct {
 // Spirit accepts run through Spirit, refused statements run directly only
 // when the policy permits, and anything else fails the apply before any
 // statement executes.
-func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB, database string, alters []string, policy directPolicy) (alterRouting, error) {
+func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB, database string, alters []string, policy direct.Policy) (alterRouting, error) {
 	var routing alterRouting
 	for _, stmt := range alters {
 		parsed, err := statement.New(stmt)
@@ -348,14 +205,14 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 		if err != nil {
 			return alterRouting{}, fmt.Errorf("route ALTER statement for table %q: %w", table, err)
 		}
-		if decision.mode != engine.ExecutionModeDirect {
-			metrics.RecordDirectExecution(ctx, database, decision.outcome)
+		if decision.Mode != engine.ExecutionModeDirect {
+			metrics.RecordDirectExecution(ctx, database, decision.Outcome)
 			if !policy.Enabled {
 				return alterRouting{}, fmt.Errorf("statement on table %q is not supported by the schema-change engine and direct execution is not enabled for this database: %s", table, reason)
 			}
-			return alterRouting{}, fmt.Errorf("statement on table %q cannot run directly: %s", table, decision.modeReason)
+			return alterRouting{}, fmt.Errorf("statement on table %q cannot run directly: %s", table, decision.ModeReason)
 		}
-		routing.direct = append(routing.direct, directRouted{stmt: stmt, table: table, reason: reason, rows: decision.rows})
+		routing.direct = append(routing.direct, directRouted{stmt: stmt, table: table, reason: reason, rows: decision.Rows})
 	}
 	return routing, nil
 }
@@ -368,8 +225,8 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 // counts. It returns false when execution must stop: a cancelled context
 // leaves the engine state Stopped, a genuine failure transitions to
 // StateFailed.
-func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTargetDB, database string, stmts []directRouted, policy directPolicy) bool {
-	lockWaitSeconds := policy.lockAcquisitionTimeoutSeconds()
+func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTargetDB, database string, stmts []directRouted, policy direct.Policy) bool {
+	lockWaitSeconds := policy.EffectiveLockAcquisitionTimeoutSeconds(defaultDirectLockAcquisitionTimeoutSeconds)
 	db, err := target.get(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -444,13 +301,13 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 				// A cancelled context closes the connection, but MySQL may
 				// finish the DDL server-side — the statement's outcome is
 				// indeterminate until an operator inspects the table.
-				e.setDirectStatementState(progress, directStateStopped)
+				e.setDirectStatementState(progress, engine.StateStopped)
 				metrics.RecordDirectExecution(ctx, database, "stopped")
 				e.logger.Info("schema change stopped during direct execution; the in-flight statement may still complete server-side",
 					"database", database, "table", ds.table, "reason", ctx.Err())
 				return false
 			}
-			e.setDirectStatementState(progress, directStateFailed)
+			e.setDirectStatementState(progress, engine.StateFailed)
 			metrics.RecordDirectExecution(ctx, database, "failed")
 			if isLockWaitTimeout(err) {
 				e.logger.Error("direct execution failed: statement could not acquire the table's metadata lock within the bounded wait",
@@ -464,7 +321,7 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 			e.setSchemaChangeFailed(fmt.Errorf("direct execution of ALTER on table %q failed: %w", ds.table, err))
 			return false
 		}
-		e.setDirectStatementState(progress, directStateCompleted)
+		e.setDirectStatementState(progress, engine.StateCompleted)
 		metrics.RecordDirectExecution(ctx, database, "completed")
 		e.logger.Info("direct execution completed", "database", database, "table", ds.table)
 		e.emitTableLog(ds.table, "statement completed as native MySQL DDL")
@@ -511,17 +368,17 @@ func (e *Engine) claimDirectStatement(table, ddlStmt string) (*directStatementPr
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.runningSchemaChange == nil {
-		return &directStatementProgress{table: table, ddl: ddlStmt, state: directStateRunning, startedAt: time.Now()}, directClaimRun
+		return &directStatementProgress{table: table, ddl: ddlStmt, state: engine.StateRunning, startedAt: time.Now()}, directClaimRun
 	}
 	for _, p := range e.runningSchemaChange.directStatements {
 		if p.table != table || p.ddl != ddlStmt {
 			continue
 		}
 		switch p.state {
-		case directStateCompleted:
+		case engine.StateCompleted:
 			return p, directClaimSkipCompleted
-		case directStateFailed:
-			p.state = directStateRunning
+		case engine.StateFailed:
+			p.state = engine.StateRunning
 			p.startedAt = time.Now()
 			p.completedAt = nil
 			return p, directClaimRun
@@ -531,7 +388,7 @@ func (e *Engine) claimDirectStatement(table, ddlStmt string) (*directStatementPr
 			return p, directClaimOutcomeUnknown
 		}
 	}
-	p := &directStatementProgress{table: table, ddl: ddlStmt, state: directStateRunning, startedAt: time.Now()}
+	p := &directStatementProgress{table: table, ddl: ddlStmt, state: engine.StateRunning, startedAt: time.Now()}
 	e.runningSchemaChange.directStatements = append(e.runningSchemaChange.directStatements, p)
 	return p, directClaimRun
 }
@@ -539,11 +396,11 @@ func (e *Engine) claimDirectStatement(table, ddlStmt string) (*directStatementPr
 // setDirectStatementState records a direct statement's transition. Completed
 // and failed are terminal for the statement; stopped leaves no completion
 // time because the statement's server-side outcome is indeterminate.
-func (e *Engine) setDirectStatementState(p *directStatementProgress, state string) {
+func (e *Engine) setDirectStatementState(p *directStatementProgress, state engine.State) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	p.state = state
-	if state == directStateCompleted || state == directStateFailed {
+	if state == engine.StateCompleted || state == engine.StateFailed {
 		now := time.Now()
 		p.completedAt = &now
 	}
