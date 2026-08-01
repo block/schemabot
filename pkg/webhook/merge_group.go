@@ -215,9 +215,9 @@ func (h *Handler) processDurableMergeGroup(ctx context.Context, event *storage.W
 		return false, fmt.Errorf("durable merge_group delivery %s missing repo or head SHA", event.DeliveryID)
 	}
 
-	installationID := h.durableInstallationID(ctx, event, payload.Installation.ID)
-	if installationID == 0 {
-		return false, fmt.Errorf("durable merge_group delivery %s missing installation ID", event.DeliveryID)
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		return false, err
 	}
 
 	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {

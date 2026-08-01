@@ -380,9 +380,12 @@ func (s *exactProgressTaskStore) GetShardProgressByApplyOperationID(_ context.Co
 type fakeControlEngine struct {
 	engine.Engine
 	stopCount               int
+	stopErr                 error
 	cancelCount             int
+	cancelErr               error
 	startCount              int
 	cutoverCount            int
+	volumeCount             int
 	cutoverResult           *engine.ControlResult
 	cutoverErr              error
 	progressReq             *engine.ProgressRequest
@@ -427,11 +430,17 @@ func (e *fakeControlEngine) Progress(_ context.Context, req *engine.ProgressRequ
 
 func (e *fakeControlEngine) Stop(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.stopCount++
+	if e.stopErr != nil {
+		return nil, e.stopErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
 func (e *fakeControlEngine) Cancel(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.cancelCount++
+	if e.cancelErr != nil {
+		return nil, e.cancelErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
@@ -457,6 +466,7 @@ func (e *fakeControlEngine) SkipRevert(context.Context, *engine.ControlRequest) 
 }
 
 func (e *fakeControlEngine) Volume(context.Context, *engine.VolumeRequest) (*engine.VolumeResult, error) {
+	e.volumeCount++
 	return &engine.VolumeResult{Accepted: true}, nil
 }
 
@@ -1238,6 +1248,135 @@ func TestLocalClient_ProcessPendingCancelControlRequest(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Cancel requested: 1 tasks cancelled, 0 skipped (caller: cli:alice)"))
+}
+
+// A pending cancel can be consumed after the engine's schema change has
+// already reached its completed terminal state — the change landed before the
+// cancel arrived. The engine rejects the cancel as already-completed, and the
+// drive must settle the apply and its tasks to completed (the authoritative
+// engine outcome) and complete the durable cancel request. Leaving the request
+// pending would have the operator re-claim the apply and re-run the doomed
+// cancel on every poll forever.
+func TestLocalClient_ProcessPendingCancelSettlesCompletedEngineChange(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              321,
+		ApplyIdentifier: "apply-cancel-completed",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.ValidatingDeployRequest,
+	}
+	task := &storage.Task{
+		ID:             654,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cancel-completed",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForDeploy,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "github:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{
+		cancelErr: engine.NewAlreadyCompletedError("cancel deploy request #121 rejected: the deploy request completed before the cancel arrived"),
+	}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, 1, fakeEngine.cancelCount)
+	assert.Equal(t, state.Task.Completed, task.State, "the task must adopt the engine's completed outcome, not cancelled")
+	assert.Equal(t, 100, task.ProgressPercent, "a completed task reports full progress")
+	require.NotNil(t, task.CompletedAt)
+	assert.Equal(t, state.Apply.Completed, apply.State, "the apply must adopt the engine's completed outcome, not cancelled")
+	require.NotNil(t, apply.CompletedAt)
+	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq, "the durable cancel request must complete so the operator stops re-running the cancel")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Cancel arrived after the schema change completed on the engine; apply recorded as completed (1 tasks completed, 0 already terminal) (caller: github:alice)"))
+}
+
+// The stop counterpart: a pending stop consumed after the engine's schema
+// change already completed settles the apply and its tasks to completed and
+// completes the durable stop request, instead of recording a landed change as
+// stopped or retrying a rejection that can never succeed.
+func TestLocalClient_ProcessPendingStopSettlesCompletedEngineChange(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              322,
+		ApplyIdentifier: "apply-stop-completed",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.ValidatingDeployRequest,
+	}
+	task := &storage.Task{
+		ID:             655,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-stop-completed",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForDeploy,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "github:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{
+		stopErr: engine.NewAlreadyCompletedError("cancel deploy request #121 rejected: the deploy request completed before the cancel arrived"),
+	}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, 1, fakeEngine.stopCount)
+	assert.Equal(t, state.Task.Completed, task.State, "the task must adopt the engine's completed outcome, not stopped")
+	assert.Equal(t, 100, task.ProgressPercent, "a completed task reports full progress")
+	require.NotNil(t, task.CompletedAt)
+	assert.Equal(t, state.Apply.Completed, apply.State, "the apply must adopt the engine's completed outcome, not stopped")
+	require.NotNil(t, apply.CompletedAt)
+	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq, "the durable stop request must complete so the operator stops re-running the stop")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Stop arrived after the schema change completed on the engine; apply recorded as completed (1 tasks completed, 0 already terminal) (caller: github:alice)"))
 }
 
 func TestLocalClient_ProcessPendingStopControlRequestContinuesToQueuedStart(t *testing.T) {
@@ -2946,15 +3085,20 @@ type capturedLog struct {
 }
 
 // captureHandler is a minimal slog.Handler that records every emitted record so
-// tests can assert on level, message, and attributes.
+// tests can assert on level, message, and attributes — including attrs bound
+// with Logger.With, so tests can prove bound-logger inheritance.
 type captureHandler struct {
 	records *[]capturedLog
+	bound   []slog.Attr
 }
 
 func (h captureHandler) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
-	attrs := make(map[string]any, r.NumAttrs())
+	attrs := make(map[string]any, len(h.bound)+r.NumAttrs())
+	for _, a := range h.bound {
+		attrs[a.Key] = a.Value.Any()
+	}
 	r.Attrs(func(a slog.Attr) bool {
 		attrs[a.Key] = a.Value.Any()
 		return true
@@ -2963,8 +3107,24 @@ func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 
-func (h captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
-func (h captureHandler) WithGroup(string) slog.Handler      { return h }
+func (h captureHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	h.bound = append(slices.Clip(h.bound), attrs...)
+	return h
+}
+func (h captureHandler) WithGroup(string) slog.Handler { return h }
+
+// requireCapturedLog returns the first captured record with the given message,
+// failing the test when none exists.
+func requireCapturedLog(t *testing.T, records []capturedLog, msg string) capturedLog {
+	t.Helper()
+	for _, rec := range records {
+		if rec.msg == msg {
+			return rec
+		}
+	}
+	t.Fatalf("expected a log record with message %q; got %d records", msg, len(records))
+	return capturedLog{}
+}
 
 // A canonical, positive revert_window_duration in metadata is honored, while an
 // empty value falls back to the engine default. A malformed or non-positive
@@ -2997,7 +3157,7 @@ func TestLocalClient_RevertWindowDuration(t *testing.T) {
 				logger: slog.New(captureHandler{records: &records}),
 			}
 
-			got := client.revertWindowDuration()
+			got := client.revertWindowDuration(client.logger.With("database", client.config.Database))
 			assert.Equal(t, tc.want, got)
 
 			var warnings []capturedLog
@@ -3547,4 +3707,63 @@ func TestLocalClient_ProgressRendersNonShardedTableFromStoredTask(t *testing.T) 
 	assert.Equal(t, int64(10), tp.ChecksumRowsChecked)
 	assert.Equal(t, int64(1000), tp.ChecksumRowsTotal)
 	assert.Empty(t, tp.Shards, "a non-sharded table has no per-shard breakdown")
+}
+
+// Progress serves each table's own failure reason from its stored task row, so
+// a multi-table apply where one table failed (for example an engine preflight
+// rejection) reports the error on exactly that table — the control plane and
+// the PR comment can attribute the failure to the right table instead of
+// showing a bare failed row.
+func TestLocalClient_ProgressCarriesPerTableErrorMessage(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              43,
+		ApplyIdentifier: "apply-table-error",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Failed,
+	}
+	failedTask := &storage.Task{
+		ID:             8,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-users",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		TableName:      "users",
+		State:          state.Task.Failed,
+		DDLAction:      "alter",
+		ErrorMessage:   "engine preflight: enumReorder check failed for table users",
+	}
+	completedTask := &storage.Task{
+		ID:             9,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-orders",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		TableName:      "orders",
+		State:          state.Task.Completed,
+		DDLAction:      "alter",
+	}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{failedTask, completedTask}},
+		},
+		logger: slog.Default(),
+	}
+
+	progress, err := client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: apply.ApplyIdentifier, Environment: "staging"})
+	require.NoError(t, err)
+	require.Len(t, progress.Tables, 2)
+
+	byTable := make(map[string]*ternv1.TableProgress, len(progress.Tables))
+	for _, tp := range progress.Tables {
+		byTable[tp.TableName] = tp
+	}
+	require.Contains(t, byTable, "users")
+	require.Contains(t, byTable, "orders")
+	assert.Equal(t, "engine preflight: enumReorder check failed for table users", byTable["users"].ErrorMessage)
+	assert.Empty(t, byTable["orders"].ErrorMessage, "a table that did not fail carries no error")
 }

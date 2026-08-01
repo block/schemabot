@@ -496,6 +496,94 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 	return result
 }
 
+// HasBlockedChanges reports whether any planned change carries the blocked
+// execution-mode verdict, across namespace-level and per-shard changes. A
+// blocked change guarantees the apply fails, so gates use this to reject the
+// apply before it starts.
+func (r *PlanResponse) HasBlockedChanges() bool {
+	if r == nil {
+		return false
+	}
+	for _, t := range r.FlatTables() {
+		if t.EngineBlocked() {
+			return true
+		}
+	}
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if t.EngineBlocked() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// DirectChanges returns all table changes the planner routed to direct
+// execution, across namespace-level and per-shard changes.
+func (r *PlanResponse) DirectChanges() []*TableChangeResponse {
+	if r == nil {
+		return nil
+	}
+	var result []*TableChangeResponse
+	for _, t := range r.FlatTables() {
+		if t.DirectExecution() {
+			result = append(result, t)
+		}
+	}
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if t.DirectExecution() {
+				result = append(result, t)
+			}
+		}
+	}
+	return result
+}
+
+// AllChangesDirect reports whether every planned change is a direct-execution
+// change (and at least one exists). Options that only affect engine-driven
+// statements — like a deferred cutover — have nothing to act on in such a
+// plan, so their commands are rejected rather than silently ignored.
+func (r *PlanResponse) AllChangesDirect() bool {
+	if r == nil {
+		return false
+	}
+	total := 0
+	for _, sc := range r.Changes {
+		if sc == nil {
+			continue
+		}
+		if sc.HasVSchemaChange() {
+			return false
+		}
+		total += len(sc.TableChanges)
+		for _, t := range sc.TableChanges {
+			if !t.DirectExecution() {
+				return false
+			}
+		}
+	}
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		total += len(sp.Changes)
+		for _, t := range sp.Changes {
+			if !t.DirectExecution() {
+				return false
+			}
+		}
+	}
+	return total > 0
+}
+
 // LintWarnings returns lint results with warning severity.
 func (r *PlanResponse) LintWarnings() []LintViolationResponse {
 	var result []LintViolationResponse
@@ -579,13 +667,38 @@ type TableChangeResponse struct {
 	UnsafeReason string `json:"unsafe_reason,omitempty"`
 	// ExecutionMode is the planner's execution-mode verdict. Empty means the
 	// engine's default path; "blocked" means the engine deterministically
-	// refuses the statement and the apply will fail.
+	// refuses the statement and the apply will fail; "direct" means the
+	// database's direct execution policy routes the refused statement to
+	// native DDL on the target instead.
 	ExecutionMode string `json:"execution_mode,omitempty"`
-	ModeReason    string `json:"mode_reason,omitempty"`
+	// ModeReason is the engine's reason for any non-empty ExecutionMode
+	// verdict.
+	ModeReason string `json:"mode_reason,omitempty"`
 }
+
+// Execution-mode verdicts a planner records on a table change. These mirror
+// the engine-side constants (pkg/engine); apitypes keeps its own copies so
+// this package stays dependency-free.
+const (
+	executionModeBlocked = "blocked"
+	executionModeDirect  = "direct"
+)
 
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
 func (t *TableChangeResponse) GetTableName() string { return t.TableName }
+
+// EngineBlocked reports whether the planner's execution-mode verdict says the
+// engine deterministically refuses this change: an apply will fail on it.
+func (t *TableChangeResponse) EngineBlocked() bool {
+	return t != nil && strings.EqualFold(t.ExecutionMode, executionModeBlocked)
+}
+
+// DirectExecution reports whether the planner's execution-mode verdict routes
+// this change to direct execution: it runs as native MySQL DDL — synchronous,
+// blocking writes to the table while it runs, and not revertible.
+func (t *TableChangeResponse) DirectExecution() bool {
+	return t != nil && strings.EqualFold(t.ExecutionMode, executionModeDirect)
+}
 
 // UnsafeChange returns the unsafe-change view for table changes that require
 // explicit operator opt-in. Engines should mark unsafe table changes directly;
@@ -813,10 +926,20 @@ type ActiveApplyResponse struct {
 
 // StatusResponse is the HTTP response for GET /api/status.
 type StatusResponse struct {
-	ActiveCount  int                    `json:"active_count"`
-	Limit        int                    `json:"limit,omitempty"`
-	MaxLimit     int                    `json:"max_limit,omitempty"`
-	HasMore      bool                   `json:"has_more,omitempty"`
-	FailuresOnly bool                   `json:"failures_only,omitempty"`
-	Applies      []*ActiveApplyResponse `json:"applies"`
+	ActiveCount  int  `json:"active_count"`
+	Limit        int  `json:"limit,omitempty"`
+	MaxLimit     int  `json:"max_limit,omitempty"`
+	HasMore      bool `json:"has_more,omitempty"`
+	FailuresOnly bool `json:"failures_only,omitempty"`
+	// Last echoes the window bounding the list to applies updated within it;
+	// empty means the list is bounded by limit alone.
+	Last string `json:"last,omitempty"`
+	// State echoes the canonical form of the state filter restricting the
+	// list; empty means no state filter.
+	State string `json:"state,omitempty"`
+	// StateCounts tallies every apply matching the request's filters by state,
+	// unbounded by limit — the applies list may be a truncated page, but these
+	// counts never are.
+	StateCounts map[string]int         `json:"state_counts,omitempty"`
+	Applies     []*ActiveApplyResponse `json:"applies"`
 }

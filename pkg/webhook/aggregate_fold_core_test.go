@@ -27,6 +27,7 @@ type foldCheckStore struct {
 	getErr      error
 	upsertErr   error
 	upsertCalls int
+	upserted    []*storage.Check
 }
 
 func (s *foldCheckStore) GetByPR(_ context.Context, _ string, _ int) ([]*storage.Check, error) {
@@ -37,8 +38,9 @@ func (s *foldCheckStore) Get(_ context.Context, _ string, _ int, _, _, _ string)
 	return s.get, s.getErr
 }
 
-func (s *foldCheckStore) Upsert(_ context.Context, _ *storage.Check) error {
+func (s *foldCheckStore) Upsert(_ context.Context, check *storage.Check) error {
 	s.upsertCalls++
+	s.upserted = append(s.upserted, check)
 	return s.upsertErr
 }
 
@@ -256,7 +258,7 @@ func TestUpdateAggregateCheckOnceFollowUpContract(t *testing.T) {
 		assert.Equal(t, 1, store.upsertCalls)
 	})
 
-	t.Run("a per-environment upsert failure still attempts every environment and joins the errors", func(t *testing.T) {
+	t.Run("a per-environment upsert failure still attempts every environment, joins the errors, and schedules a re-fold", func(t *testing.T) {
 		cfg := &api.ServerConfig{
 			AllowedEnvironments: []string{"staging", "production"},
 			Repos:               map[string]api.RepoConfig{"octocat/hello-world": {}},
@@ -274,8 +276,29 @@ func TestUpdateAggregateCheckOnceFollowUpContract(t *testing.T) {
 
 		followUp, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "abc123")
 
-		assert.Equal(t, aggregateFoldClearParticipantRefoldBudget, followUp)
+		assert.Equal(t, aggregateFoldScheduleParticipantRefold, followUp,
+			"a failed aggregate publish must arm the bounded re-fold, not clear the budget: the fire-and-forget callers have no retry of their own")
 		assert.Error(t, err)
 		assert.Equal(t, 2, store.upsertCalls, "a failed environment write must not skip the remaining environments")
+	})
+
+	t.Run("a failed Check Run create schedules a re-fold and returns an error", func(t *testing.T) {
+		store := &foldCheckStore{
+			byPR: []*storage.Check{
+				{Repository: "octocat/hello-world", PullRequest: 1, HeadSHA: "abc123", Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders", Status: checkStatusInProgress},
+			},
+		}
+		h, mux, client := newFoldHandler(t, nonAggregateConfig(), store)
+		serveHeadSHA(t, mux, "abc123")
+		mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		})
+
+		followUp, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "abc123")
+
+		assert.Equal(t, aggregateFoldScheduleParticipantRefold, followUp,
+			"a failed Check Run write must arm the bounded re-fold so the gate converges without waiting for an external event")
+		assert.Error(t, err)
+		assert.Empty(t, store.upserted, "no stored state may record a Check Run that was never created")
 	})
 }

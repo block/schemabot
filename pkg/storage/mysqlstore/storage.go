@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -31,7 +32,7 @@ func New(db *sql.DB) *Storage {
 		db:              db,
 		locks:           &lockStore{db: db},
 		plans:           &planStore{db: db, identity: MySQLDialect{}},
-		applies:         &applyStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}},
+		applies:         &applyStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}, locker: namedlock.MySQL{}},
 		tasks:           &taskStore{db: db, identity: MySQLDialect{}},
 		applyLogs:       &applyLogStore{db: db, identity: MySQLDialect{}},
 		controlRequests: &controlRequestStore{db: db, identity: MySQLDialect{}},

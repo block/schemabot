@@ -14,6 +14,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path"
+	"strconv"
 	"testing"
 	"time"
 
@@ -32,7 +34,7 @@ import (
 func newE2EHandlerWithConfigDirHints(t *testing.T, svc *api.Service, client *gh.Client) *Handler {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	installClient := ghclient.NewInstallationClient(client, logger)
+	installClient := ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")
 	installClient.SetConfigDirHints(svc.Config())
 	factory := &fakeClientFactory{client: installClient}
 	return NewHandler(svc, factory, nil, logger)
@@ -182,22 +184,30 @@ func setupFakeGitHubForPlanOnTruncatedRepoWithPRState(t *testing.T, mux *http.Se
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
 	})
+	checkRunState := &fakeCheckRunStore{}
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		result.checkRuns <- body
+		id := checkRunState.create(body)
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
 	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		result.checkRuns <- body
+		id, err := strconv.ParseInt(path.Base(r.URL.Path), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid check run id", http.StatusBadRequest)
+			return
+		}
+		checkRunState.update(id, body)
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
 
-	registerCheckStatusRESTHandlersForAnyRef(mux, func() []checkStatusNode { return nil })
+	registerCheckStatusRESTHandlersForAnyRef(mux, func() []checkStatusNode { return nil }, checkRunState)
 
 	return result
 }

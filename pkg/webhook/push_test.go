@@ -57,7 +57,7 @@ func TestWebhookPushPostsPassingChecksOnDefaultBranch(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "default-branch checks posted")
 
-	got := map[string]createdCheckRun{}
+	got := map[string]checkRunCapture{}
 	for range []int{0, 1} {
 		select {
 		case c := <-created:

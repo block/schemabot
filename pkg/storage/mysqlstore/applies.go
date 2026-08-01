@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
@@ -56,10 +57,15 @@ type applyStore struct {
 	db       *sql.DB
 	dialect  Dialect
 	identity identityInserter
+	// locker serializes concurrent applies against the same target with a
+	// session-scoped advisory lock held on the pinned apply connection. It must
+	// match the storage database's family.
+	locker namedlock.Locker
 }
 
 type applyWriteTx struct {
 	tx             *sql.Tx
+	locker         namedlock.Locker
 	targetLockConn *sql.Conn
 	targetLockName string
 }
@@ -169,17 +175,18 @@ func beginApplyWriteTx(ctx context.Context, beginner txBeginner, operation strin
 	return &applyWriteTx{tx: tx}, nil
 }
 
-func beginApplyTargetWriteTx(ctx context.Context, db *sql.DB, operation, database, dbType, environment string) (*applyWriteTx, error) {
-	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, database, dbType, environment)
+func beginApplyTargetWriteTx(ctx context.Context, db *sql.DB, locker namedlock.Locker, operation, database, dbType, environment string) (*applyWriteTx, error) {
+	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, locker, database, dbType, environment)
 	if err != nil {
 		return nil, err
 	}
 
 	writeTx, err := beginApplyWriteTx(ctx, conn, operation)
 	if err != nil {
-		releaseApplyTargetLockConn(ctx, conn, lockName, operation)
+		releaseApplyTargetLockConn(ctx, locker, conn, lockName, operation)
 		return nil, err
 	}
+	writeTx.locker = locker
 	writeTx.targetLockConn = conn
 	writeTx.targetLockName = lockName
 	return writeTx, nil
@@ -193,7 +200,7 @@ func (w *applyWriteTx) close(ctx context.Context, operation string) {
 		rollbackTx(ctx, w.tx, operation)
 	}
 	if w.targetLockConn != nil {
-		releaseApplyTargetLockConn(ctx, w.targetLockConn, w.targetLockName, operation)
+		releaseApplyTargetLockConn(ctx, w.locker, w.targetLockConn, w.targetLockName, operation)
 		w.targetLockConn = nil
 	}
 }
@@ -209,9 +216,12 @@ func applyTargetLockName(database, dbType, environment string) string {
 	return "schemabot_apply_" + hex.EncodeToString(sum[:16])
 }
 
-func acquireApplyTargetLockConn(ctx context.Context, db *sql.DB, database, dbType, environment string) (*sql.Conn, string, error) {
+func acquireApplyTargetLockConn(ctx context.Context, db *sql.DB, locker namedlock.Locker, database, dbType, environment string) (*sql.Conn, string, error) {
 	if !hasApplyTarget(database, dbType, environment) {
 		return nil, "", fmt.Errorf("active apply target is required for %s/%s/%s", database, dbType, environment)
+	}
+	if locker == nil {
+		return nil, "", fmt.Errorf("apply target lock for %s/%s/%s requires an advisory locker; applies cannot serialize across instances without one", database, dbType, environment)
 	}
 
 	conn, err := db.Conn(ctx)
@@ -220,8 +230,7 @@ func acquireApplyTargetLockConn(ctx context.Context, db *sql.DB, database, dbTyp
 	}
 
 	lockName := applyTargetLockName(database, dbType, environment)
-	var result sql.NullInt64
-	err = conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, int(applyTargetLockWait.Seconds())).Scan(&result)
+	acquired, err := locker.Acquire(ctx, conn, lockName, applyTargetLockWait)
 	if err != nil {
 		slog.WarnContext(ctx, "failed to acquire apply target lock",
 			"database", database,
@@ -233,21 +242,20 @@ func acquireApplyTargetLockConn(ctx context.Context, db *sql.DB, database, dbTyp
 		closeApplyTargetLockConn(ctx, conn, lockName, "acquire apply target lock")
 		return nil, "", fmt.Errorf("acquire apply target lock for %s/%s/%s: %w", database, dbType, environment, err)
 	}
-	if !result.Valid || result.Int64 != 1 {
+	if !acquired {
 		slog.WarnContext(ctx, "timed out waiting for apply target lock",
 			"database", database,
 			"database_type", dbType,
 			"environment", environment,
 			"lock", lockName,
-			"wait", applyTargetLockWait,
-			"result", result)
+			"wait", applyTargetLockWait)
 		closeApplyTargetLockConn(ctx, conn, lockName, "acquire apply target lock")
 		return nil, "", fmt.Errorf("timed out waiting for apply target lock for %s/%s/%s", database, dbType, environment)
 	}
 	return conn, lockName, nil
 }
 
-func releaseApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, operation string) {
+func releaseApplyTargetLockConn(ctx context.Context, locker namedlock.Locker, conn *sql.Conn, lockName, operation string) {
 	if conn == nil {
 		return
 	}
@@ -255,23 +263,34 @@ func releaseApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, o
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), applyTargetLockReleaseTimeout)
 	defer cancel()
 
-	var result sql.NullInt64
-	err := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(?)", lockName).Scan(&result)
-	if err != nil || !result.Valid || result.Int64 != 1 {
+	released, err := locker.Release(releaseCtx, conn, lockName)
+	switch {
+	case err != nil:
 		slog.WarnContext(releaseCtx, "failed to release apply target lock; discarding connection",
 			"operation", operation,
 			"lock", lockName,
-			"result", result,
 			"error", err)
-		if rawErr := conn.Raw(func(any) error { return driver.ErrBadConn }); rawErr != nil && !errors.Is(rawErr, driver.ErrBadConn) {
-			slog.WarnContext(releaseCtx, "failed to discard apply target lock connection",
-				"operation", operation,
-				"lock", lockName,
-				"error", rawErr)
-		}
+		discardApplyTargetLockConn(releaseCtx, conn, lockName, operation)
+	case !released:
+		slog.WarnContext(releaseCtx, "apply target lock was not held by this session; discarding connection",
+			"operation", operation,
+			"lock", lockName)
+		discardApplyTargetLockConn(releaseCtx, conn, lockName, operation)
 	}
 
 	closeApplyTargetLockConn(releaseCtx, conn, lockName, operation)
+}
+
+// discardApplyTargetLockConn marks the pinned connection as bad so the pool
+// destroys it instead of reusing a session whose advisory-lock state is
+// uncertain.
+func discardApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, operation string) {
+	if rawErr := conn.Raw(func(any) error { return driver.ErrBadConn }); rawErr != nil && !errors.Is(rawErr, driver.ErrBadConn) {
+		slog.WarnContext(ctx, "failed to discard apply target lock connection",
+			"operation", operation,
+			"lock", lockName,
+			"error", rawErr)
+	}
 }
 
 func closeApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, operation string) {
@@ -486,7 +505,7 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	var writeTx *applyWriteTx
 	var err error
 	if lockTarget {
-		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, "create apply", apply.Database, apply.DatabaseType, apply.Environment)
+		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, s.locker, "create apply", apply.Database, apply.DatabaseType, apply.Environment)
 		if err != nil {
 			return 0, err
 		}
@@ -580,7 +599,7 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 	var writeTx *applyWriteTx
 	var err error
 	if lockTarget {
-		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, opName, apply.Database, apply.DatabaseType, apply.Environment)
+		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, s.locker, opName, apply.Database, apply.DatabaseType, apply.Environment)
 		if err != nil {
 			return 0, err
 		}
@@ -878,7 +897,7 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 	shouldLockTarget := lockTarget && hasApplyTarget(database, dbType, environment)
 	var writeTx *applyWriteTx
 	if shouldLockTarget {
-		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, "update apply", database, dbType, environment)
+		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, s.locker, "update apply", database, dbType, environment)
 		if err != nil {
 			return err
 		}
@@ -1135,14 +1154,12 @@ func (s *applyStore) FindStuckPendingApplies(ctx context.Context, olderThan time
 	return scanApplies(rows)
 }
 
-// GetRecent returns the most recent applies across all databases, ordered by creation time desc.
-func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentAppliesFilter) ([]*storage.Apply, error) {
-	query := `
-		SELECT ` + applyColumns + `
-		FROM applies
-	`
-	var args []any
+// recentAppliesWhere builds the WHERE predicates and args shared by the
+// recent-apply list and count queries, so both views agree on which applies a
+// filter selects.
+func recentAppliesWhere(filter storage.RecentAppliesFilter) ([]string, []any) {
 	var where []string
+	var args []any
 	if filter.Environment != "" {
 		where = append(where, "environment = ?")
 		args = append(args, filter.Environment)
@@ -1159,6 +1176,20 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 		where = append(where, fmt.Sprintf("state IN (%s)", placeholders(len(filter.States))))
 		args = append(args, stringArgs(filter.States)...)
 	}
+	if !filter.UpdatedSince.IsZero() {
+		where = append(where, "updated_at >= ?")
+		args = append(args, filter.UpdatedSince)
+	}
+	return where, args
+}
+
+// GetRecent returns the most recent applies across all databases, ordered by creation time desc.
+func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentAppliesFilter) ([]*storage.Apply, error) {
+	query := `
+		SELECT ` + applyColumns + `
+		FROM applies
+	`
+	where, args := recentAppliesWhere(filter)
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -1172,6 +1203,38 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 	defer utils.CloseAndLog(rows)
 
 	return scanApplies(rows)
+}
+
+// CountRecentByState returns how many applies match the filter, grouped by
+// state. The filter's Limit is ignored: counts cover every matching row, so a
+// summary over a window is not truncated by list pagination.
+func (s *applyStore) CountRecentByState(ctx context.Context, filter storage.RecentAppliesFilter) (map[string]int, error) {
+	query := "SELECT state, COUNT(*) FROM applies"
+	where, args := recentAppliesWhere(filter)
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY state"
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("count recent applies by state: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	counts := map[string]int{}
+	for rows.Next() {
+		var applyState string
+		var count int
+		if err := rows.Scan(&applyState, &count); err != nil {
+			return nil, fmt.Errorf("scan recent apply state count: %w", err)
+		}
+		counts[applyState] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate recent apply state counts: %w", err)
+	}
+	return counts, nil
 }
 
 // FindNextApply atomically claims the next apply that needs attention.
@@ -1277,7 +1340,7 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 		return nil, fmt.Errorf("query next claimable apply: %w", err)
 	}
 
-	outcome, err := persistApplyClaim(ctx, s.db, tx, apply, owner)
+	outcome, err := persistApplyClaim(ctx, s.db, s.locker, tx, apply, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -1385,7 +1448,7 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 		return nil, fmt.Errorf("query claimable apply %d: %w", applyID, err)
 	}
 
-	outcome, err := persistApplyClaim(ctx, s.db, tx, apply, owner)
+	outcome, err := persistApplyClaim(ctx, s.db, s.locker, tx, apply, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -1488,7 +1551,7 @@ func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, own
 	// stopped apply reaches this path — terminal states are excluded above — so
 	// claimAcquiredCommitted, the stopped-only outcome, cannot occur and the
 	// caller always commits an acquired claim).
-	outcome, err := persistApplyClaim(ctx, s.db, tx, apply, owner)
+	outcome, err := persistApplyClaim(ctx, s.db, s.locker, tx, apply, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -1546,7 +1609,7 @@ func (o claimOutcome) claimedAndComplete() bool {
 // window between the re-check and the commit. When another active apply owns the
 // target the claim is refused and the pending start control request is failed so
 // the operator sees why.
-func persistApplyClaim(ctx context.Context, db *sql.DB, tx *sql.Tx, apply *storage.Apply, owner string) (claimOutcome, error) {
+func persistApplyClaim(ctx context.Context, db *sql.DB, locker namedlock.Locker, tx *sql.Tx, apply *storage.Apply, owner string) (claimOutcome, error) {
 	leaseToken := uuid.NewString()
 	leaseAcquiredAt := time.Now()
 	apply.LeaseOwner = owner
@@ -1554,7 +1617,7 @@ func persistApplyClaim(ctx context.Context, db *sql.DB, tx *sql.Tx, apply *stora
 	apply.LeaseAcquiredAt = &leaseAcquiredAt
 
 	if state.IsState(apply.State, state.Apply.Stopped) {
-		return claimStoppedApplyUnderTargetLock(ctx, db, tx, apply, owner, leaseToken)
+		return claimStoppedApplyUnderTargetLock(ctx, db, locker, tx, apply, owner, leaseToken)
 	}
 
 	if isStartingClaim(apply.State) {
@@ -1584,7 +1647,7 @@ func persistApplyClaim(ctx context.Context, db *sql.DB, tx *sql.Tx, apply *stora
 // invariant, then either transition+commit or refuse+commit. It commits inside
 // the lock so a concurrent create cannot add a second active apply between the
 // re-check and the commit. The lock is released only after the commit.
-func claimStoppedApplyUnderTargetLock(ctx context.Context, db *sql.DB, tx *sql.Tx, apply *storage.Apply, owner, leaseToken string) (claimOutcome, error) {
+func claimStoppedApplyUnderTargetLock(ctx context.Context, db *sql.DB, locker namedlock.Locker, tx *sql.Tx, apply *storage.Apply, owner, leaseToken string) (claimOutcome, error) {
 	database, dbType, environment, deployment, err := applyTargetForUpdate(ctx, tx, apply)
 	if err != nil {
 		return claimLostRace, err
@@ -1593,11 +1656,11 @@ func claimStoppedApplyUnderTargetLock(ctx context.Context, db *sql.DB, tx *sql.T
 		return claimLostRace, fmt.Errorf("stopped apply %d (%s) is missing target metadata for claim re-check", apply.ID, apply.ApplyIdentifier)
 	}
 
-	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, database, dbType, environment)
+	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, locker, database, dbType, environment)
 	if err != nil {
 		return claimLostRace, err
 	}
-	defer releaseApplyTargetLockConn(ctx, conn, lockName, "claim stopped apply")
+	defer releaseApplyTargetLockConn(ctx, locker, conn, lockName, "claim stopped apply")
 
 	deployments, err := operationDeploymentsForApply(ctx, tx, apply.ID)
 	if err != nil {
@@ -1929,11 +1992,11 @@ func (s *applyStore) ReapplyFailed(ctx context.Context, applyID int64) (*storage
 		return nil, fmt.Errorf("apply %s is missing target metadata for reapply: %w", apply.ApplyIdentifier, storage.ErrApplyNotReappliable)
 	}
 
-	conn, lockName, err := acquireApplyTargetLockConn(ctx, s.db, database, dbType, environment)
+	conn, lockName, err := acquireApplyTargetLockConn(ctx, s.db, s.locker, database, dbType, environment)
 	if err != nil {
 		return nil, err
 	}
-	defer releaseApplyTargetLockConn(ctx, conn, lockName, "reapply failed apply")
+	defer releaseApplyTargetLockConn(ctx, s.locker, conn, lockName, "reapply failed apply")
 
 	deployments, err := operationDeploymentsForApply(ctx, tx, apply.ID)
 	if err != nil {

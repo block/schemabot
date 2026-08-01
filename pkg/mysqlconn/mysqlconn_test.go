@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
@@ -73,6 +74,48 @@ func TestConnectionDSN(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestConnectionDSN_WithConnectTimeout(t *testing.T) {
+	t.Run("sets timeout on a plain DSN", func(t *testing.T) {
+		got, err := ConnectionDSN(
+			"root:secret@tcp(localhost:3306)/app?parseTime=true",
+			WithConnectTimeout(4*time.Second),
+		)
+		require.NoError(t, err)
+
+		cfg, err := mysql.ParseDSN(got)
+		require.NoError(t, err)
+		assert.Equal(t, 4*time.Second, cfg.Timeout)
+		// Existing params survive.
+		assert.True(t, cfg.ParseTime)
+	})
+
+	t.Run("layers timeout on top of injected RDS TLS", func(t *testing.T) {
+		got, err := ConnectionDSN(
+			"spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?parseTime=true",
+			WithConnectTimeout(7*time.Second),
+		)
+		require.NoError(t, err)
+
+		cfg, err := mysql.ParseDSN(got)
+		require.NoError(t, err)
+		assert.Equal(t, 7*time.Second, cfg.Timeout)
+		// RDS TLS enhancement is preserved alongside the timeout.
+		assert.Equal(t, "rds", cfg.TLSConfig)
+	})
+
+	t.Run("non-positive timeout leaves the driver default", func(t *testing.T) {
+		got, err := ConnectionDSN(
+			"root:secret@tcp(localhost:3306)/app?parseTime=true",
+			WithConnectTimeout(0),
+		)
+		require.NoError(t, err)
+
+		cfg, err := mysql.ParseDSN(got)
+		require.NoError(t, err)
+		assert.Equal(t, time.Duration(0), cfg.Timeout)
+	})
 }
 
 func TestOpenNormalizesRDSDSNBeforeOpening(t *testing.T) {

@@ -208,7 +208,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			"pr", pr,
 			"head_sha", headSHA,
 			"delivery_id", deliveryID,
-			"message", message,
+			"outcome", message,
 		)
 	})
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan started"})
@@ -271,9 +271,9 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 			return true
 		}
 		var prior *storage.PlanComment
-		for i := len(comments) - 1; i >= 0; i-- {
-			if comments[i].EnvironmentScope == expectedScope {
-				prior = comments[i]
+		for _, v := range slices.Backward(comments) {
+			if v.EnvironmentScope == expectedScope {
+				prior = v
 				break
 			}
 		}

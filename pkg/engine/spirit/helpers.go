@@ -12,6 +12,23 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 )
 
+// uniqueTableList joins table names into a comma-separated list, dropping
+// duplicates while preserving order. A combined ALTER statement can carry
+// several statements against the same table; the runner logger's table attr
+// should name each table once.
+func uniqueTableList(tables []string) string {
+	seen := make(map[string]bool, len(tables))
+	unique := make([]string, 0, len(tables))
+	for _, t := range tables {
+		if seen[t] {
+			continue
+		}
+		seen[t] = true
+		unique = append(unique, t)
+	}
+	return strings.Join(unique, ", ")
+}
+
 // parseDSN extracts connection info from a MySQL DSN using the mysql driver's parser.
 func parseDSN(dsn string) (host, username, password, database string, err error) {
 	cfg, err := mysql.ParseDSN(dsn)

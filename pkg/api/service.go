@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"strings"
@@ -405,6 +406,7 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 	client, err := tern.NewGRPCClient(tern.Config{
 		Address: address,
 		Storage: s.storage,
+		Logger:  s.logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create tern client for %s: %w", key, err)
@@ -570,6 +572,16 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 	if !s.config.PendingDropsEnabled() {
 		metadata["pending_drops"] = "false"
 	}
+	spiritMetadata, err := s.config.SpiritMetadata()
+	if err != nil {
+		return nil, fmt.Errorf("resolve spirit config for %s: %w", key, err)
+	}
+	maps.Copy(metadata, spiritMetadata)
+	directMetadata, err := envConfig.DirectExecution.EngineMetadata()
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct_execution metadata for %s: %w", key, err)
+	}
+	maps.Copy(metadata, directMetadata)
 	client, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:        database,
 		Type:            dbType,

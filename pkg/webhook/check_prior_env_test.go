@@ -20,7 +20,97 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-func TestCheckPriorEnvViaLocalFailsClosedOnStorageError(t *testing.T) {
+// TestPromotionGateEnvironments covers per-database promotion order
+// resolution in the apply gate: on a scoped instance each database's
+// environment_order override determines which prior environments gate an
+// apply, so databases with disjoint promotion sequences coexist on one
+// instance without gating each other on environments they do not have.
+func TestPromotionGateEnvironments(t *testing.T) {
+	scoped := &api.ServerConfig{
+		AllowedEnvironments: []string{"qa", "staging", "load", "sandbox"},
+		EnvironmentOrder:    []string{"qa", "staging", "load", "production"},
+		Databases: map[string]api.DatabaseConfig{
+			"bureau": {
+				EnvironmentOrder: []string{"qa", "sandbox", "production"},
+				Environments:     map[string]api.EnvironmentConfig{"qa": {}, "sandbox": {}},
+			},
+			"orders": {
+				Environments: map[string]api.EnvironmentConfig{"qa": {}, "staging": {}, "load": {}},
+			},
+		},
+	}
+
+	t.Run("override gates a sandbox apply on qa only", func(t *testing.T) {
+		got := promotionGateEnvironments(scoped, "bureau", "sandbox", []string{"qa", "sandbox"})
+
+		assert.Equal(t, []string{"qa", "sandbox", "production"}, got)
+	})
+
+	t.Run("database without an override keeps the server order", func(t *testing.T) {
+		got := promotionGateEnvironments(scoped, "orders", "staging", []string{"qa", "staging", "load"})
+
+		assert.Equal(t, []string{"qa", "staging", "load", "production"}, got)
+	})
+
+	t.Run("unscoped instance orders enabled environments by the override", func(t *testing.T) {
+		unscoped := &api.ServerConfig{
+			EnvironmentOrder: []string{"qa", "staging", "production"},
+			Databases: map[string]api.DatabaseConfig{
+				"bureau": {
+					EnvironmentOrder: []string{"qa", "sandbox", "production"},
+					Environments:     map[string]api.EnvironmentConfig{"qa": {}, "sandbox": {}},
+				},
+			},
+		}
+
+		got := promotionGateEnvironments(unscoped, "bureau", "sandbox", []string{"sandbox", "qa"})
+
+		assert.Equal(t, []string{"qa", "sandbox"}, got)
+	})
+
+	t.Run("nil config passes environments through", func(t *testing.T) {
+		got := promotionGateEnvironments(nil, "bureau", "staging", []string{"staging", "qa"})
+
+		assert.Equal(t, []string{"staging", "qa"}, got)
+	})
+}
+
+// TestScopedTargetMissingFromPromotionOrder verifies the fail-closed guard
+// resolves the promotion order per database: an environment in one database's
+// override is a valid target for that database, while a database whose
+// effective order omits the target environment stays blocked.
+func TestScopedTargetMissingFromPromotionOrder(t *testing.T) {
+	cfg := &api.ServerConfig{
+		AllowedEnvironments: []string{"qa", "staging", "sandbox"},
+		EnvironmentOrder:    []string{"qa", "staging", "production"},
+		Databases: map[string]api.DatabaseConfig{
+			"bureau": {
+				EnvironmentOrder: []string{"qa", "sandbox", "production"},
+				Environments:     map[string]api.EnvironmentConfig{"qa": {}, "sandbox": {}},
+			},
+		},
+	}
+
+	t.Run("override target is listed for its database", func(t *testing.T) {
+		assert.False(t, scopedTargetMissingFromPromotionOrder(cfg, "bureau", "sandbox"))
+	})
+
+	t.Run("same target fails closed for a database without it", func(t *testing.T) {
+		assert.True(t, scopedTargetMissingFromPromotionOrder(cfg, "orders", "sandbox"))
+	})
+
+	t.Run("override omitting a server-order environment fails closed", func(t *testing.T) {
+		assert.True(t, scopedTargetMissingFromPromotionOrder(cfg, "bureau", "staging"))
+	})
+
+	t.Run("unscoped instance never fails closed here", func(t *testing.T) {
+		unscoped := &api.ServerConfig{EnvironmentOrder: []string{"qa", "production"}}
+
+		assert.False(t, scopedTargetMissingFromPromotionOrder(unscoped, "bureau", "sandbox"))
+	})
+}
+
+func TestCheckPriorEnvViaLocalReturnsStorageError(t *testing.T) {
 	const (
 		repo = "octocat/hello-world"
 		pr   = 1
@@ -50,14 +140,17 @@ func TestCheckPriorEnvViaLocalFailsClosedOnStorageError(t *testing.T) {
 		priorEnvCheckRetryInterval: time.Nanosecond,
 	}
 
-	blocked := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "orders", "mysql", "production", "staging", 12345)
-	assert.True(t, blocked, "storage read failure should block apply")
+	blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "orders", "mysql", "production", "staging", 12345)
+	require.Error(t, err)
+	assert.False(t, blocked)
 
 	select {
 	case body := <-comments:
 		assert.Contains(t, body, "Apply Blocked")
 		assert.Contains(t, body, "Could not verify staging status")
-		assert.Contains(t, body, "storage read failed")
+		assert.Contains(t, body, "_See server logs for details._")
+		assert.NotContains(t, body, "storage read failed",
+			"raw error text must never render in PR markdown")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for fail-closed comment")
 	}
@@ -98,7 +191,8 @@ func TestCheckPriorEnvViaLocalMissingCheckBlocksWithActionableGuidance(t *testin
 		priorEnvCheckRetryInterval: time.Nanosecond,
 	}
 
-	blocked := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "orders", "mysql", "production", "staging", 12345)
+	blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "orders", "mysql", "production", "staging", 12345)
+	require.NoError(t, err)
 	assert.True(t, blocked, "missing prior check should block apply")
 
 	select {
@@ -152,7 +246,8 @@ func TestCheckPriorEnvViaLocalRetriesBeforeFailClosed(t *testing.T) {
 		priorEnvCheckRetryInterval: time.Nanosecond,
 	}
 
-	blocked := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "orders", "mysql", "production", "staging", 12345)
+	blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "orders", "mysql", "production", "staging", 12345)
+	require.NoError(t, err)
 	assert.False(t, blocked, "retry should observe the prior environment success and allow apply")
 	assert.Equal(t, 2, checks.calls)
 
@@ -223,8 +318,9 @@ func TestCheckPriorEnvironmentsWithProductionOnlyServerConfigChecksStaging(t *te
 		priorEnvCheckRetryInterval: time.Nanosecond,
 	}
 
-	blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
+	blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr,
 		"orders", "mysql", "production", []string{"staging", "production"}, 12345)
+	require.NoError(t, err)
 	assert.True(t, blocked, "production blocks when the environment list includes staging before production")
 
 	select {
@@ -243,8 +339,9 @@ func TestCheckPriorEnvironmentsWithProductionOnlyServerConfigChecksStaging(t *te
 	require.NoError(t, h.attachServerEnvironments(schemaResult, "production"))
 	assert.Equal(t, []string{"production"}, schemaResult.Environments)
 
-	blocked = h.checkPriorEnvironments(t.Context(), repo, pr,
+	blocked, err = h.checkPriorEnvironments(t.Context(), repo, pr,
 		"orders", "mysql", "production", schemaResult.Environments, 12345)
+	require.NoError(t, err)
 	assert.True(t, blocked, "production blocks on staging even when this server only has a production target for the database")
 
 	select {
@@ -257,6 +354,131 @@ func TestCheckPriorEnvironmentsWithProductionOnlyServerConfigChecksStaging(t *te
 		assert.Contains(t, body, "staging")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for staging block comment")
+	}
+}
+
+// TestCheckPriorEnvironmentsWithDatabaseOverrideGatesOnOverrideOrder covers a
+// production-owning scoped deployment whose database overrides the server-wide
+// promotion order (qa → sandbox → production instead of qa → staging →
+// production): a production apply must verify the override's prior
+// environments through peer aggregate Check Runs — blocking on sandbox even
+// while the server order's staging check is green — and an apply targeting an
+// environment absent from the override must fail closed with the override
+// order in the comment so the operator sees which list gated the apply.
+func TestCheckPriorEnvironmentsWithDatabaseOverrideGatesOnOverrideOrder(t *testing.T) {
+	const (
+		repo    = "octocat/hello-world"
+		pr      = 1
+		headSHA = "abc123"
+	)
+
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"head": map[string]any{"sha": headSHA, "ref": "feature"},
+			"base": map[string]any{"sha": "base123", "ref": "main"},
+			"user": map[string]any{"login": "testuser"},
+		})
+	})
+	// Real GitHub filters check runs server-side by the check_name query
+	// param; the gate depends on that filter, so the mock must honor it.
+	checkRunsByName := map[string]map[string]any{
+		"SchemaBot (qa)":      {"id": 1, "name": "SchemaBot (qa)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
+		"SchemaBot (staging)": {"id": 2, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
+		"SchemaBot (sandbox)": {"id": 3, "name": "SchemaBot (sandbox)", "status": "completed", "conclusion": "action_required", "app": map[string]any{"slug": "schemabot"}},
+	}
+	checkRunLookups := make(chan string, 10)
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Query().Get("check_name")
+		checkRunLookups <- name
+		runs := []map[string]any{}
+		if run, ok := checkRunsByName[name]; ok {
+			runs = append(runs, run)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"total_count": len(runs),
+			"check_runs":  runs,
+		})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+
+	installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
+	service := api.New(&emptyStorage{}, &api.ServerConfig{
+		AllowedEnvironments: []string{"production"},
+		EnvironmentOrder:    []string{"qa", "staging", "production"},
+		Databases: map[string]api.DatabaseConfig{
+			"bureau": {
+				Type:             "mysql",
+				EnvironmentOrder: []string{"qa", "sandbox", "production"},
+				Environments: map[string]api.EnvironmentConfig{
+					"production": {Deployment: "default", Target: "bureau"},
+				},
+			},
+		},
+	}, nil, testLogger())
+	t.Cleanup(func() { utils.CloseAndLog(service) })
+
+	h := &Handler{
+		service:                    service,
+		ghClients:                  ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:                     testLogger(),
+		priorEnvCheckMaxAttempts:   1,
+		priorEnvCheckRetryInterval: time.Nanosecond,
+	}
+
+	// A production apply walks the override's prior environments: qa passes,
+	// sandbox blocks — the server order's green staging check must not
+	// satisfy the gate.
+	blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr,
+		"bureau", "mysql", "production", []string{"production"}, 12345)
+	require.NoError(t, err)
+	assert.True(t, blocked, "sandbox action_required must block production despite a green staging check")
+
+	for _, checkName := range []string{"SchemaBot (qa)", "SchemaBot (sandbox)"} {
+		select {
+		case name := <-checkRunLookups:
+			assert.Equal(t, checkName, name, "gate must look up the override's prior environment check")
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected GitHub check lookup for %s", checkName)
+		}
+	}
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "sandbox")
+		assert.Contains(t, body, "Apply sandbox first")
+		assert.NotContains(t, body, "staging")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for sandbox block comment")
+	}
+
+	// An apply targeting an environment absent from the override fails closed
+	// with the database's effective order rendered in the comment.
+	blocked, err = h.checkPriorEnvironments(t.Context(), repo, pr,
+		"bureau", "mysql", "staging", []string{"production"}, 12345)
+	require.NoError(t, err)
+	assert.True(t, blocked, "environment absent from the database override must fail closed")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "`staging` is not in the configured promotion order")
+		assert.Contains(t, body, "Configured promotion order: `qa` → `sandbox` → `production`")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for unlisted-environment block comment")
+	}
+	select {
+	case name := <-checkRunLookups:
+		t.Fatalf("unlisted-environment guard must fail closed before any GitHub check lookup, got lookup for %s", name)
+	default:
 	}
 }
 
@@ -342,9 +564,10 @@ func TestCheckPriorEnvironmentsCrossDeploymentAppTrust(t *testing.T) {
 		h, comments := setup(t, installClient)
 		registerGitHubEndpoints(t, mux, comments)
 
-		blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
+		blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr,
 			"orders", "mysql", "production", []string{"production"}, 12345)
 
+		require.NoError(t, err)
 		assert.False(t, blocked, "a passing staging aggregate check from the trusted staging deployment App must allow production apply")
 		select {
 		case body := <-comments:
@@ -359,9 +582,10 @@ func TestCheckPriorEnvironmentsCrossDeploymentAppTrust(t *testing.T) {
 		h, comments := setup(t, installClient)
 		registerGitHubEndpoints(t, mux, comments)
 
-		blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
+		blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr,
 			"orders", "mysql", "production", []string{"production"}, 12345)
 
+		require.NoError(t, err)
 		assert.True(t, blocked, "a staging aggregate check from an unconfigured App must not satisfy the promotion gate")
 		select {
 		case body := <-comments:
@@ -434,8 +658,9 @@ func TestCheckPriorEnvironmentsScopedTargetMissingFromOrderFailsClosed(t *testin
 		priorEnvCheckRetryInterval: time.Nanosecond,
 	}
 
-	blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
+	blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr,
 		"orders", "mysql", "canary", []string{"canary"}, 12345)
+	require.NoError(t, err)
 	assert.True(t, blocked, "scoped instance must fail closed when an allowed target environment is absent from the promotion order")
 
 	select {
@@ -551,8 +776,9 @@ func TestCheckPriorEnvironmentsScopedTargetInOrderAllowsApply(t *testing.T) {
 		priorEnvCheckRetryInterval: time.Nanosecond,
 	}
 
-	blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
+	blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr,
 		"orders", "mysql", "production", []string{"production"}, 12345)
+	require.NoError(t, err)
 	assert.False(t, blocked, "in-order target with a passing prior environment check should be allowed")
 
 	select {
@@ -596,9 +822,20 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 		})
 
 		mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, r *http.Request) {
+			// GitHub applies the check_name query parameter server-side; the
+			// gate depends on that filter, so the mock must honor it too.
+			matched := checkRuns
+			if name := r.URL.Query().Get("check_name"); name != "" {
+				matched = nil
+				for _, run := range checkRuns {
+					if run["name"] == name {
+						matched = append(matched, run)
+					}
+				}
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"total_count": len(checkRuns),
-				"check_runs":  checkRuns,
+				"total_count": len(matched),
+				"check_runs":  matched,
 			})
 		})
 
@@ -627,7 +864,8 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
 		})
 
-		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		blocked, err := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		require.NoError(t, err)
 		assert.False(t, blocked)
 
 		select {
@@ -642,7 +880,8 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			{"id": 1, "name": "SchemaBot X (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
 		}, &api.ServerConfig{GitHub: api.GitHubConfig{CheckName: "SchemaBot X"}})
 
-		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		blocked, err := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		require.NoError(t, err)
 		assert.False(t, blocked)
 
 		select {
@@ -652,19 +891,63 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 		}
 	})
 
+	// Several scoped deployments can promote from one shared prior-environment
+	// deployment that publishes its aggregate Check Run under a different base
+	// name. The promotion-check-name override points the gate at that
+	// deployment's Check Run instead of this deployment's own base, so the
+	// shared prior environment's passing check unblocks the apply.
+	t.Run("promotion check name override queries the shared deployment's check", func(t *testing.T) {
+		h, comments := setupCheckRunServer(t, []map[string]any{
+			{"id": 1, "name": "SchemaBot Shared (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
+		}, &api.ServerConfig{GitHub: api.GitHubConfig{
+			CheckName:            "SchemaBot X",
+			PromotionCheckName:   "SchemaBot Shared",
+			TrustedCheckAppSlugs: []string{"schemabot"},
+		}})
+
+		blocked, err := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		require.NoError(t, err)
+		assert.False(t, blocked)
+
+		select {
+		case body := <-comments:
+			t.Fatalf("unexpected comment posted: %s", body)
+		default:
+		}
+	})
+
+	// With the override configured the gate queries only the overridden name:
+	// a passing check under this deployment's own base is not the shared prior
+	// environment's aggregate and must not satisfy the gate.
+	t.Run("override redirects the gate away from the deployment's own check name", func(t *testing.T) {
+		h, _ := setupCheckRunServer(t, []map[string]any{
+			{"id": 1, "name": "SchemaBot X (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
+		}, &api.ServerConfig{GitHub: api.GitHubConfig{
+			CheckName:            "SchemaBot X",
+			PromotionCheckName:   "SchemaBot Shared",
+			TrustedCheckAppSlugs: []string{"schemabot"},
+		}})
+
+		blocked, err := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		require.NoError(t, err)
+		assert.True(t, blocked, "the gate must query only the overridden check name")
+	})
+
 	t.Run("staging check pending blocks apply", func(t *testing.T) {
 		h, _ := setupCheckRunServer(t, []map[string]any{
 			{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "action_required", "app": map[string]any{"slug": "schemabot"}},
 		})
 
-		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		blocked, err := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		require.NoError(t, err)
 		assert.True(t, blocked)
 	})
 
 	t.Run("no staging check blocks apply", func(t *testing.T) {
 		h, comments := setupCheckRunServer(t, []map[string]any{})
 
-		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		blocked, err := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		require.NoError(t, err)
 		assert.True(t, blocked)
 
 		select {
@@ -683,7 +966,8 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			{"id": 1, "name": "SchemaBot (staging)", "status": "in_progress", "conclusion": "", "app": map[string]any{"slug": "schemabot"}},
 		})
 
-		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		blocked, err := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		require.NoError(t, err)
 		assert.True(t, blocked)
 	})
 
@@ -698,7 +982,8 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "github-actions"}},
 		})
 
-		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		blocked, err := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		require.NoError(t, err)
 		assert.True(t, blocked, "a foreign-app check run must not satisfy the promotion gate")
 
 		select {
@@ -715,9 +1000,9 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 	})
 
 	// When SchemaBot does not know its own GitHub App slug it cannot verify
-	// which app created the staging Check Run, so the promotion gate blocks the
-	// production apply even though a same-named passing run exists.
-	t.Run("unknown own app slug blocks apply", func(t *testing.T) {
+	// which app created the staging Check Run, so the promotion gate returns an
+	// error even though a same-named passing run exists.
+	t.Run("unknown own app slug returns error", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := make(chan string, 10)
 
@@ -756,8 +1041,9 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			priorEnvCheckRetryInterval: time.Nanosecond,
 		}
 
-		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
-		assert.True(t, blocked, "unverifiable check run ownership must block the promotion gate")
+		blocked, err := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		require.Error(t, err)
+		assert.False(t, blocked)
 
 		select {
 		case body := <-comments:
@@ -817,7 +1103,8 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			priorEnvCheckRetryInterval: time.Nanosecond,
 		}
 
-		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		blocked, err := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		require.NoError(t, err)
 		assert.False(t, blocked, "retry should observe the prior environment success and allow apply")
 		assert.Equal(t, 2, checkCalls)
 
@@ -828,7 +1115,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 		}
 	})
 
-	t.Run("GitHub API failure blocks apply (fail-closed)", func(t *testing.T) {
+	t.Run("GitHub API failure returns error", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := make(chan string, 10)
 
@@ -866,8 +1153,9 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			priorEnvCheckRetryInterval: time.Nanosecond,
 		}
 
-		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
-		assert.True(t, blocked, "GitHub API failure should block apply")
+		blocked, err := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		require.Error(t, err)
+		assert.False(t, blocked)
 
 		select {
 		case body := <-comments:

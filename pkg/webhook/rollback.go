@@ -28,6 +28,14 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 
 	applyID := result.ApplyID
 	if applyID == "" {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping missing-apply-id reply for unscoped fan-out rollback; the leader posts it once",
+				"repo", repo,
+				"pr", pr,
+				"environment", result.Environment,
+				"requested_by", requestedBy)
+			return
+		}
 		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.deploymentTenant()))
 		return
 	}
@@ -94,7 +102,11 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	if blocked {
 		return
 	}
-	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.Rollback); blocked {
+	// The rollback handler is not a durable core, so an authorization
+	// evaluation failure and a merit denial both stop the command here; the
+	// gate has already logged and posted the distinction.
+	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.Rollback)
+	if authErr != nil || blocked {
 		return
 	}
 
@@ -332,7 +344,11 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 	// must be an authorized admin/operator before any lock is released or acted
 	// on. The database comes from the lock-pinned rollback plan instead of
 	// current PR files so confirmation follows the reviewed rollback artifact.
-	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.RollbackConfirm); blocked {
+	// The rollback-confirm handler is not a durable core, so an authorization
+	// evaluation failure and a merit denial both stop the command here; the
+	// gate has already logged and posted the distinction.
+	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.RollbackConfirm)
+	if authErr != nil || blocked {
 		return
 	}
 
@@ -434,21 +450,19 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 		h.logger.Error("failed to load rollback apply after accepted rollback",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", dbType, "environment", environment,
-			"apply_id", applyID, "error", err)
+			"apply_id", applyResp.ApplyID, "error", err)
 		return
 	}
 	if apply == nil {
 		h.logger.Error("rollback apply missing after accepted apply",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", dbType, "environment", environment,
-			"apply_id", applyID)
+			"apply_id", applyResp.ApplyID)
 		return
 	}
-	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID); err != nil {
+	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply); err != nil {
 		h.logger.Error("failed to mark check in_progress for rollback",
-			"repo", repo, "pr", pr, "database", database,
-			"database_type", dbType, "environment", environment,
-			"apply_id", applyID, "error", err)
+			append(apply.LogAttrs(), "error", err)...)
 		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, "Rollback was accepted, but SchemaBot could not update the required status check: "+err.Error())
 		return
 	}

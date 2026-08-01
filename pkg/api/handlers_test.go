@@ -257,6 +257,25 @@ func (s *recentApplyStore) GetRecent(_ context.Context, filter storage.RecentApp
 	if s.err != nil {
 		return nil, s.err
 	}
+	applies := s.matching(filter)
+	if filter.Limit > 0 && len(applies) > filter.Limit {
+		return applies[:filter.Limit], nil
+	}
+	return applies, nil
+}
+
+func (s *recentApplyStore) CountRecentByState(_ context.Context, filter storage.RecentAppliesFilter) (map[string]int, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	counts := map[string]int{}
+	for _, apply := range s.matching(filter) {
+		counts[apply.State]++
+	}
+	return counts, nil
+}
+
+func (s *recentApplyStore) matching(filter storage.RecentAppliesFilter) []*storage.Apply {
 	applies := make([]*storage.Apply, 0, len(s.applies))
 	for _, apply := range s.applies {
 		if filter.Environment != "" && apply.Environment != filter.Environment {
@@ -270,10 +289,7 @@ func (s *recentApplyStore) GetRecent(_ context.Context, filter storage.RecentApp
 		}
 		applies = append(applies, apply)
 	}
-	if filter.Limit > 0 && len(applies) > filter.Limit {
-		return applies[:filter.Limit], nil
-	}
-	return applies, nil
+	return applies
 }
 
 type memoryControlRequestStore struct {
@@ -2483,6 +2499,46 @@ func TestDatabaseListSanitizesConfigAndReportsTopology(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Empty(t, resp.Databases)
 
+	// A name filter is a case-insensitive substring match, so a family
+	// prefix selects every shard-style database that contains it.
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?name=ORD", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 1)
+	assert.Equal(t, "orders", resp.Databases[0].Database)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?name=count", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 1)
+	assert.Equal(t, "accounts", resp.Databases[0].Database)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=mysql&name=accounts", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Empty(t, resp.Databases)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=mysql&name=orders", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 1)
+	assert.Equal(t, "orders", resp.Databases[0].Database)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?name=nomatch", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Empty(t, resp.Databases)
+
 	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=cockroach", nil)
 	w = httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
@@ -2500,7 +2556,7 @@ func TestDatabaseListRejectsInvalidDeploymentTopology(t *testing.T) {
 				},
 			},
 		},
-	}, "")
+	}, "", "")
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `database "orders" environment "production" deployments map is empty`)
@@ -3390,6 +3446,11 @@ func TestHandleStatusLimitAndEnvironment(t *testing.T) {
 	assert.True(t, resp.HasMore)
 	assert.False(t, resp.FailuresOnly)
 	assert.Equal(t, 1, resp.ActiveCount)
+	assert.Equal(t, map[string]int{
+		state.Apply.Completed: 2,
+		state.Apply.Running:   1,
+		state.Apply.Failed:    1,
+	}, resp.StateCounts, "state counts cover every matching apply, not just the truncated page")
 	require.Len(t, resp.Applies, 2)
 	assert.Equal(t, "apply-one", resp.Applies[0].ApplyID)
 	assert.Equal(t, "external-one", resp.Applies[0].ExternalID)
@@ -3604,6 +3665,129 @@ func TestParseStatusLimit(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestParseStatusLast(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		target    string
+		want      time.Duration
+		wantError bool
+	}{
+		{name: "default", target: "/api/status"},
+		{name: "hours", target: "/api/status?last=24h", want: 24 * time.Hour},
+		{name: "minutes", target: "/api/status?last=30m", want: 30 * time.Minute},
+		{name: "zero", target: "/api/status?last=0s", wantError: true},
+		{name: "negative", target: "/api/status?last=-1h", wantError: true},
+		{name: "not a duration", target: "/api/status?last=yesterday", wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tt.target, nil)
+			got, err := parseStatusLast(req)
+			if tt.wantError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestHandleStatusLastWindowBoundsFilter verifies that the `last` query
+// parameter becomes an UpdatedSince bound on the storage filter and is echoed
+// back in the response, and that an invalid window is rejected rather than
+// silently ignored.
+func TestHandleStatusLastWindowBoundsFilter(t *testing.T) {
+	applies := &recentApplyStore{}
+	stor := &mockStorageWithApplyStores{applies: applies}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(stor, testServerConfig(), nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?last=24h", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp apitypes.StatusResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "24h0m0s", resp.Last)
+
+	require.Len(t, applies.filters, 1)
+	assert.WithinDuration(t, time.Now().Add(-24*time.Hour), applies.filters[0].UpdatedSince, time.Minute)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?last=yesterday", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	require.Len(t, applies.filters, 1, "an invalid window must not reach storage")
+}
+
+// TestHandleStatusStateFilter verifies that the `state` query parameter
+// normalizes to the canonical apply state and restricts the storage filter,
+// that a typo'd state is rejected rather than returning a silently empty
+// list, and that `state` cannot be combined with `failed`.
+func TestHandleStatusStateFilter(t *testing.T) {
+	now := time.Now().UTC()
+	applies := &recentApplyStore{
+		applies: []*storage.Apply{
+			{
+				ApplyIdentifier: "apply-running",
+				Database:        "orders",
+				Environment:     "staging",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Running,
+				Caller:          "cli",
+				CreatedAt:       now,
+				UpdatedAt:       now,
+			},
+			{
+				ApplyIdentifier: "apply-completed",
+				Database:        "payments",
+				Environment:     "staging",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Completed,
+				Caller:          "cli",
+				CreatedAt:       now.Add(-time.Minute),
+				UpdatedAt:       now.Add(-time.Minute),
+			},
+		},
+	}
+	stor := &mockStorageWithApplyStores{applies: applies}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(stor, testServerConfig(), nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?state=RUNNING", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.StatusResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, state.Apply.Running, resp.State, "the state filter echoes in canonical form")
+	require.Len(t, resp.Applies, 1)
+	assert.Equal(t, "apply-running", resp.Applies[0].ApplyID)
+	assert.Equal(t, map[string]int{state.Apply.Running: 1}, resp.StateCounts)
+	require.Len(t, applies.filters, 1)
+	assert.Equal(t, []string{state.Apply.Running}, applies.filters[0].States)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?state=comleted", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "unknown state")
+	require.Len(t, applies.filters, 1, "an unknown state must not reach storage")
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?state=running&failed=true", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "state cannot be combined with failed")
+	require.Len(t, applies.filters, 1, "conflicting filters must not reach storage")
 }
 
 func TestParseStatusFailuresOnly(t *testing.T) {

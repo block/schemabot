@@ -762,12 +762,21 @@ func (m *mockApplyStore) CheckLease(context.Context, storage.ApplyLease) error {
 type mockTaskStore struct {
 	storage.TaskStore
 	tasks               []*storage.Task
+	getTask             *storage.Task
+	getErr              error
 	getByApplyIDErr     error
 	getByOperationIDErr error
 	updateErr           error
 	lastOperationID     int64
 	upsertedShards      []*storage.Task
 	upsertShardErr      error
+}
+
+func (m *mockTaskStore) Get(context.Context, string) (*storage.Task, error) {
+	if m.getErr != nil {
+		return nil, m.getErr
+	}
+	return m.getTask, nil
 }
 
 func (m *mockTaskStore) GetByApplyID(context.Context, int64) ([]*storage.Task, error) {
@@ -3223,6 +3232,8 @@ func TestGRPCClient_ResumeApplyPersistsRemoteFailureMessage(t *testing.T) {
 	assert.Equal(t, state.Apply.Failed, apply.State)
 	assert.Equal(t, "failed to connect to target database", apply.ErrorMessage)
 	assert.Equal(t, state.Task.Failed, task.State)
+	assert.Equal(t, "failed to connect to target database", task.ErrorMessage,
+		"failed task without its own error must adopt the remote apply's failure reason")
 	progressReq := server.getProgressRequest()
 	require.NotNil(t, progressReq)
 	assert.Equal(t, "remote-failed-123", progressReq.ApplyId)
@@ -3561,31 +3572,31 @@ func TestGRPCClient_PollForCompletionMirrorsRemoteVolume(t *testing.T) {
 func TestMirrorRemoteVolume(t *testing.T) {
 	t.Run("reported level lands on the apply options", func(t *testing.T) {
 		apply := &storage.Apply{ApplyIdentifier: "apply-x"}
-		require.True(t, mirrorRemoteVolume(apply, 5))
+		require.True(t, mirrorRemoteVolume(slog.Default(), apply, 5))
 		assert.Equal(t, 5, apply.GetOptions().Volume)
 	})
 
 	t.Run("level change overwrites the stored level", func(t *testing.T) {
 		apply := &storage.Apply{ApplyIdentifier: "apply-x", Options: storage.MarshalApplyOptions(storage.ApplyOptions{Volume: 3})}
-		require.True(t, mirrorRemoteVolume(apply, 5))
+		require.True(t, mirrorRemoteVolume(slog.Default(), apply, 5))
 		assert.Equal(t, 5, apply.GetOptions().Volume)
 	})
 
 	t.Run("unchanged level reports no transition", func(t *testing.T) {
 		apply := &storage.Apply{ApplyIdentifier: "apply-x", Options: storage.MarshalApplyOptions(storage.ApplyOptions{Volume: 5})}
-		assert.False(t, mirrorRemoteVolume(apply, 5))
+		assert.False(t, mirrorRemoteVolume(slog.Default(), apply, 5))
 		assert.Equal(t, 5, apply.GetOptions().Volume)
 	})
 
 	t.Run("zero level mirrors nothing", func(t *testing.T) {
 		apply := &storage.Apply{ApplyIdentifier: "apply-x", Options: storage.MarshalApplyOptions(storage.ApplyOptions{Volume: 3})}
-		assert.False(t, mirrorRemoteVolume(apply, 0))
+		assert.False(t, mirrorRemoteVolume(slog.Default(), apply, 0))
 		assert.Equal(t, 3, apply.GetOptions().Volume)
 	})
 
 	t.Run("out-of-range level keeps the stored level", func(t *testing.T) {
 		apply := &storage.Apply{ApplyIdentifier: "apply-x", Options: storage.MarshalApplyOptions(storage.ApplyOptions{Volume: 3})}
-		assert.False(t, mirrorRemoteVolume(apply, 12))
+		assert.False(t, mirrorRemoteVolume(slog.Default(), apply, 12))
 		assert.Equal(t, 3, apply.GetOptions().Volume)
 	})
 }
@@ -3871,6 +3882,163 @@ func TestGRPCClient_SyncStoredTasksFromRemoteTasksUsesRemoteTaskState(t *testing
 			assert.Equal(t, tc.wantProgress, storedTask.ProgressPercent)
 			assert.Equal(t, tc.wantCompletedAt, storedTask.CompletedAt != nil)
 			assert.True(t, hasLogMessageContaining(logs.logs, "Remote task users changed state: running -> "+tc.wantStoredTaskState))
+		})
+	}
+}
+
+func TestGRPCClient_StampRemoteApplyErrorOnFailedTasks(t *testing.T) {
+	// A remote TableProgress snapshot carries no per-table error text, so a
+	// failed task mirrored from remote progress has no error of its own. The
+	// terminal reconcile falls back to the remote apply's failure reason on
+	// exactly those tasks, so the operation row derived from them carries an
+	// actionable message. Tasks with their own error, and tasks that did not
+	// fail, must be left untouched.
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	remoteErr := "engine preflight: enumReorder check failed for table users"
+	testCases := []struct {
+		name             string
+		remoteApplyState string
+		remoteApplyError string
+		taskState        string
+		taskError        string
+		wantTaskError    string
+	}{
+		{
+			name:             "failed task without error adopts remote apply error",
+			remoteApplyState: state.Apply.Failed,
+			remoteApplyError: remoteErr,
+			taskState:        state.Task.Failed,
+			wantTaskError:    remoteErr,
+		},
+		{
+			name:             "failed task keeps its own more specific error",
+			remoteApplyState: state.Apply.Failed,
+			remoteApplyError: remoteErr,
+			taskState:        state.Task.Failed,
+			taskError:        "table-specific failure",
+			wantTaskError:    "table-specific failure",
+		},
+		{
+			name:             "cancelled task is not stamped",
+			remoteApplyState: state.Apply.Failed,
+			remoteApplyError: remoteErr,
+			taskState:        state.Task.Cancelled,
+		},
+		{
+			name:             "completed task is not stamped",
+			remoteApplyState: state.Apply.Failed,
+			remoteApplyError: remoteErr,
+			taskState:        state.Task.Completed,
+		},
+		{
+			name:             "non-failed remote apply stamps nothing",
+			remoteApplyState: state.Apply.Stopped,
+			remoteApplyError: remoteErr,
+			taskState:        state.Task.Failed,
+		},
+		{
+			name:             "failed remote apply without message stamps nothing",
+			remoteApplyState: state.Apply.Failed,
+			taskState:        state.Task.Failed,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			storedApply := &storage.Apply{
+				ID:              31,
+				ApplyIdentifier: "apply-error-stamp",
+				State:           tc.remoteApplyState,
+			}
+			remoteApply := &storage.Apply{
+				ApplyIdentifier: "apply-error-stamp",
+				State:           tc.remoteApplyState,
+				ErrorMessage:    tc.remoteApplyError,
+			}
+			storedTask := &storage.Task{
+				ID:             33,
+				TaskIdentifier: "task-error-stamp",
+				ApplyID:        storedApply.ID,
+				TableName:      "users",
+				State:          tc.taskState,
+				ErrorMessage:   tc.taskError,
+			}
+			client := &GRPCClient{
+				storage: &mockStorage{
+					tasks: &mockTaskStore{tasks: []*storage.Task{storedTask}},
+					logs:  &mockApplyLogStore{},
+				},
+			}
+
+			err := client.stampRemoteApplyErrorOnFailedTasks(t.Context(), storedApply, remoteApply, []*storage.Task{storedTask}, now)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantTaskError, storedTask.ErrorMessage)
+		})
+	}
+}
+
+func TestGRPCClient_SyncStoredTasksFromRemoteTasksMirrorsPerTableError(t *testing.T) {
+	// A remote TableProgress row carries the table's own failure reason. The
+	// control plane mirrors it onto the stored task row so the operation — and
+	// the PR comment — can attribute the failure to the right table. An empty
+	// remote error never clears a stored one: an older data plane omits the
+	// field, and the stored message may already carry the apply-level error.
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	testCases := []struct {
+		name            string
+		remoteTaskError string
+		storedTaskError string
+		wantTaskError   string
+	}{
+		{
+			name:            "remote per-table error is mirrored onto the stored task",
+			remoteTaskError: "engine preflight: enumReorder check failed for table users",
+			wantTaskError:   "engine preflight: enumReorder check failed for table users",
+		},
+		{
+			name:            "remote error replaces an older stored error",
+			remoteTaskError: "engine preflight: enumReorder check failed for table users",
+			storedTaskError: "previous attempt error",
+			wantTaskError:   "engine preflight: enumReorder check failed for table users",
+		},
+		{
+			name:            "empty remote error keeps the stored error",
+			storedTaskError: "stamped from the apply-level failure reason",
+			wantTaskError:   "stamped from the apply-level failure reason",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			storedApply := &storage.Apply{
+				ID:              19,
+				ApplyIdentifier: "apply-table-error-mirror",
+				State:           state.Apply.Running,
+			}
+			storedTask := &storage.Task{
+				ID:             23,
+				TaskIdentifier: "task-table-error-mirror",
+				ApplyID:        storedApply.ID,
+				TableName:      "users",
+				State:          state.Task.Running,
+				ErrorMessage:   tc.storedTaskError,
+			}
+			client := &GRPCClient{
+				storage: &mockStorage{
+					tasks: &mockTaskStore{tasks: []*storage.Task{storedTask}},
+					logs:  &mockApplyLogStore{},
+				},
+			}
+
+			err := client.syncStoredTasksFromRemoteTasks(t.Context(), storedApply, []*storage.Task{storedTask}, []*ternv1.TableProgress{{
+				TableName:    "users",
+				Status:       state.Task.Failed,
+				ErrorMessage: tc.remoteTaskError,
+			}}, now)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.wantTaskError, storedTask.ErrorMessage)
+			assert.Equal(t, state.Task.Failed, storedTask.State)
 		})
 	}
 }

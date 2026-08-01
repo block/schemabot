@@ -804,6 +804,103 @@ func TestRenderApplyStatusComment_Failed(t *testing.T) {
 	assert.Contains(t, result, "schemabot apply -e staging")
 }
 
+// A schema change the engine rejected before copying a single row (e.g. a
+// failed preflight check) must not render a progress bar: a red 0% bar reads
+// as a copy that started and stalled, when in fact nothing ran. The row reads
+// as a failed check instead.
+func TestRenderApplyStatusComment_FailedBeforeRowCopyHasNoProgressBar(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "qa",
+		State:       state.Apply.Failed,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{
+				TableName: "profiles",
+				DDL:       "ALTER TABLE `profiles` MODIFY COLUMN `consent_version` enum('V1','V2') NULL",
+				Status:    state.Task.Failed,
+			},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "**`profiles`**: ❌ Failed (before row copy started)")
+	assert.NotContains(t, result, "🟥", "no red bar segments for a copy that never started")
+	assert.NotContains(t, result, "⬜", "no empty bar segments for a copy that never started")
+}
+
+// An instant DDL change has no row copy phase, so its failure renders a plain
+// failed label — no progress bar, and no mention of row copy.
+func TestRenderApplyStatusComment_FailedInstantDDLHasPlainLabel(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "qa",
+		State:       state.Apply.Failed,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{
+				TableName: "profiles",
+				DDL:       "ALTER TABLE `profiles` ADD COLUMN `nickname` VARCHAR(64) NULL",
+				Status:    state.Task.Failed,
+				IsInstant: true,
+			},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "**`profiles`**: ❌ Failed\n")
+	assert.NotContains(t, result, "(before row copy started)", "instant DDL has no row copy phase to reference")
+	assert.NotContains(t, result, "🟥")
+	assert.NotContains(t, result, "⬜")
+}
+
+// A failure after row copy made progress keeps the red progress bar: the bar
+// truthfully shows how far the copy got before the engine gave up.
+func TestRenderApplyStatusComment_FailedAfterCopyProgressKeepsBar(t *testing.T) {
+	tests := []struct {
+		name  string
+		table TableProgressData
+	}{
+		{
+			name: "percent reported",
+			table: TableProgressData{
+				TableName:       "users",
+				Status:          state.Task.Failed,
+				PercentComplete: 30,
+				RowsCopied:      300,
+				RowsTotal:       1000,
+			},
+		},
+		{
+			name: "rows copied but percent still zero",
+			table: TableProgressData{
+				TableName:  "users",
+				Status:     state.Task.Failed,
+				RowsCopied: 42,
+				RowsTotal:  1000000,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := ApplyStatusCommentData{
+				Database:    "testapp",
+				Environment: "staging",
+				State:       state.Apply.Failed,
+				Tables:      []TableProgressData{tt.table},
+			}
+
+			result := RenderApplyStatusComment(data)
+
+			assert.Contains(t, result, "❌ Failed")
+			assert.NotContains(t, result, "(before row copy started)")
+			assert.Contains(t, result, "🟥", "failed bar shows the progress the copy actually made")
+		})
+	}
+}
+
 func TestTerminalStatusAndSummaryCommentTitlesAreDistinct(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:     "testapp",
@@ -820,6 +917,66 @@ func TestTerminalStatusAndSummaryCommentTitlesAreDistinct(t *testing.T) {
 
 	assert.Equal(t, "## Schema Change Status — Staging", statusTitle)
 	assert.Equal(t, "## ❌ Schema Change Failed — Staging", summaryTitle)
+}
+
+// A failed table surfaces its own error below its row when that error adds
+// detail beyond the apply-level error block, so an operator reading a
+// multi-table failure can attribute each failure to its table. A table whose
+// error is identical to the apply-level message is not repeated below the row
+// — the block above the table list already carries it.
+func TestRenderApplyStatusComment_FailedTableErrorLine(t *testing.T) {
+	render := func(applyError, tableError string, percentComplete int) string {
+		return RenderApplyStatusComment(ApplyStatusCommentData{
+			Database:     "testapp",
+			Environment:  "staging",
+			State:        state.Apply.Failed,
+			Engine:       "Spirit",
+			ApplyID:      "apply-abc123",
+			ErrorMessage: applyError,
+			Tables: []TableProgressData{{
+				TableName:       "users",
+				DDL:             "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+				Status:          state.Task.Failed,
+				PercentComplete: percentComplete,
+				ErrorMessage:    tableError,
+			}},
+		})
+	}
+
+	t.Run("table error distinct from apply error renders below the row", func(t *testing.T) {
+		result := render("1 of 2 tables failed", "preflight enumReorder check failed", 35)
+		assert.Contains(t, result, "> ⚠️ **Error:** 1 of 2 tables failed")
+		assert.Contains(t, result, "> ⚠️ Last error: preflight enumReorder check failed")
+	})
+
+	t.Run("table error identical to apply error is not repeated", func(t *testing.T) {
+		result := render("preflight enumReorder check failed", "preflight enumReorder check failed", 35)
+		assert.Contains(t, result, "> ⚠️ **Error:** preflight enumReorder check failed")
+		assert.NotContains(t, result, "> ⚠️ Last error:")
+		assert.Equal(t, 1, strings.Count(result, "preflight enumReorder check failed"))
+	})
+
+	t.Run("table without an error renders no error line", func(t *testing.T) {
+		result := render("apply-level failure", "", 35)
+		assert.NotContains(t, result, "> ⚠️ Last error:")
+	})
+
+	t.Run("table error differing only by whitespace is not repeated", func(t *testing.T) {
+		result := render("preflight enumReorder check failed", "preflight enumReorder check failed\n", 35)
+		assert.NotContains(t, result, "> ⚠️ Last error:")
+	})
+
+	t.Run("all-whitespace table error renders no error line", func(t *testing.T) {
+		result := render("apply-level failure", "  \n", 35)
+		assert.NotContains(t, result, "> ⚠️ Last error:")
+	})
+
+	t.Run("pre-copy failure renders error line without a progress bar", func(t *testing.T) {
+		result := render("1 of 2 tables failed", "preflight enumReorder check failed", 0)
+		assert.Contains(t, result, "**`users`**: ❌ Failed (before row copy started)")
+		assert.Contains(t, result, "> ⚠️ Last error: preflight enumReorder check failed")
+		assert.NotContains(t, result, "0%")
+	})
 }
 
 // A retryable failure is operator-recovery state, not a user-facing outcome:
@@ -1665,16 +1822,17 @@ func TestRenderApplyBlockedByNonPassingChecks_EmptyList(t *testing.T) {
 }
 
 func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
-	t.Run("generic error is shown verbatim with retry block", func(t *testing.T) {
+	t.Run("generic error posts sanitized copy with retry block", func(t *testing.T) {
 		err := errors.New("get combined commit status: 500 Internal Server Error")
 
 		result := RenderApplyBlockedByCheckStatusError("staging", err, nil)
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "— Staging")
-		assert.Contains(t, result, "Unable to verify PR check statuses")
-		assert.Contains(t, result, "get combined commit status: 500 Internal Server Error")
-		assert.Contains(t, result, "Resolve the issue and retry:\n```\nschemabot apply -e staging\n```",
+		assert.Contains(t, result, "Unable to verify PR check statuses; see server logs for details.")
+		assert.NotContains(t, result, "500 Internal Server Error",
+			"raw error text must never render in PR markdown")
+		assert.Contains(t, result, "Retry:\n```\nschemabot apply -e staging\n```",
 			"retry command must be inside a fenced code block immediately after the retry copy")
 	})
 
@@ -1715,56 +1873,37 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 		assert.NotContains(t, result, "Grant or accept those permissions")
 	})
 
-	t.Run("nil error skips empty fence and uses concise retry copy", func(t *testing.T) {
+	t.Run("nil error renders the same sanitized copy", func(t *testing.T) {
 		result := RenderApplyBlockedByCheckStatusError("staging", nil, nil)
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "— Staging")
-		assert.Contains(t, result, "Unable to verify PR check statuses.")
+		assert.Contains(t, result, "Unable to verify PR check statuses; see server logs for details.")
 		assert.Contains(t, result, "Retry:\n```\nschemabot apply -e staging\n```",
 			"retry command must be inside a fenced code block immediately after the retry copy")
-		assert.NotContains(t, result, "```\n```",
-			"nil-error branch should not emit an empty fenced code block")
-		assert.NotContains(t, result, "Resolve the issue and retry:",
-			"nil-error branch should not reference an issue that was not surfaced")
 	})
 }
 
 func TestRenderApplyBlockedByPriorEnvCheckError(t *testing.T) {
-	t.Run("renders reason and wrapped error verbatim", func(t *testing.T) {
-		err := errors.New("404 Not Found")
-
-		result := RenderApplyBlockedByPriorEnvCheckError("staging", "fetch PR details", err)
+	t.Run("renders reason with sanitized detail", func(t *testing.T) {
+		result := RenderApplyBlockedByPriorEnvCheckError("staging", "fetch PR details")
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "Could not verify staging status: failed to fetch PR details. Retry the apply command.")
-		assert.Contains(t, result, "_Error: 404 Not Found_")
+		assert.Contains(t, result, "_See server logs for details._")
 	})
 
 	t.Run("each reason variant produces matching body", func(t *testing.T) {
-		err := errors.New("boom")
-
 		for _, reason := range []string{"create GitHub client", "fetch PR details", "query check runs"} {
-			result := RenderApplyBlockedByPriorEnvCheckError("production", reason, err)
+			result := RenderApplyBlockedByPriorEnvCheckError("production", reason)
 			assert.Contains(t, result, "Could not verify production status: failed to "+reason+". Retry the apply command.")
 		}
 	})
 
-	t.Run("nil error renders <nil>", func(t *testing.T) {
-		result := RenderApplyBlockedByPriorEnvCheckError("staging", "query check runs", nil)
+	t.Run("full body is stable", func(t *testing.T) {
+		expected := "## ❌ Apply Blocked\n\nCould not verify staging status: failed to create GitHub client. Retry the apply command.\n\n_See server logs for details._\n" + supportChannelOfferMarker + "\n"
 
-		assert.Contains(t, result, "## ❌ Apply Blocked")
-		assert.Contains(t, result, "_Error: <nil>_")
-	})
-
-	t.Run("output matches prior inline rendering byte-for-byte", func(t *testing.T) {
-		err := errors.New("rate limited")
-		priorEnv := "staging"
-		reason := "create GitHub client"
-
-		expected := "## ❌ Apply Blocked\n\nCould not verify " + priorEnv + " status: failed to " + reason + ". Retry the apply command.\n\n_Error: " + err.Error() + "_"
-
-		assert.Equal(t, expected, RenderApplyBlockedByPriorEnvCheckError(priorEnv, reason, err))
+		assert.Equal(t, expected, RenderApplyBlockedByPriorEnvCheckError("staging", "create GitHub client"))
 	})
 }
 

@@ -13,12 +13,13 @@ import (
 // Shared preview error messages — used by both PR comment and CLI preview functions
 // to keep failure scenarios consistent across output formats.
 const (
-	PreviewErrorFirstFailed  = "Error 1061: Duplicate key name 'idx_user_id'"
-	PreviewErrorMiddleFailed = "lock wait timeout exceeded; try restarting transaction"
-	previewRepository        = "block/schemabot"
-	previewHeadSHA           = "abcdef1234567890abcdef1234567890abcdef12"
-	previewStaleSHA          = "0123456789abcdef0123456789abcdef01234567"
-	previewRequestedBy       = "jackjackbits"
+	PreviewErrorFirstFailed     = "Error 1061: Duplicate key name 'idx_user_id'"
+	PreviewErrorMiddleFailed    = "lock wait timeout exceeded; try restarting transaction"
+	PreviewErrorPreflightFailed = "preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end"
+	previewRepository           = "block/schemabot"
+	previewHeadSHA              = "abcdef1234567890abcdef1234567890abcdef12"
+	previewStaleSHA             = "0123456789abcdef0123456789abcdef01234567"
+	previewRequestedBy          = "jackjackbits"
 )
 
 func previewSupportChannel() SupportChannelData {
@@ -49,6 +50,92 @@ func PreviewCommentPlan() string {
 			},
 		},
 		LintViolations: sampleLintWarnings(),
+	})
+}
+
+// PreviewCommentPlanBlocked renders a sample plan containing a statement the
+// engine deterministically refuses (execution-mode verdict "blocked").
+func PreviewCommentPlanBlocked() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+					"ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)",
+					"ALTER TABLE `orders` ADD COLUMN `notes` TEXT",
+				},
+			},
+		},
+		BlockedChanges: []BlockedChangeData{
+			{Table: "users", Reason: "dropping primary key is not supported"},
+			{Table: "orders", Reason: "adding foreign key constraints is not supported"},
+		},
+	})
+}
+
+// PreviewCommentPlanDirect renders a sample locked apply-confirmation comment
+// for a plan whose refused statement the direct execution policy routes to
+// native MySQL DDL (execution-mode verdict "direct"), showing the disclosure
+// the operator consents to by confirming.
+func PreviewCommentPlanDirect() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+					"ALTER TABLE `orders` ADD COLUMN `notes` TEXT",
+				},
+			},
+		},
+		DirectChanges: []DirectChangeData{
+			{Table: "users", Reason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows"},
+		},
+		AutoConfirmDowngradeReason: "Plan contains direct-execution changes — review the disclosure and confirm manually",
+	})
+}
+
+// PreviewCommentApplyBlockedRejected renders a sample apply rejection for a
+// plan containing statements the engine refuses.
+func PreviewCommentApplyBlockedRejected() string {
+	return RenderBlockedChangesApplyRejected(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+					"ALTER TABLE `orders` ADD COLUMN `notes` TEXT",
+				},
+			},
+		},
+		BlockedChanges: []BlockedChangeData{
+			{Table: "users", Reason: "dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000"},
+		},
 	})
 }
 
@@ -343,7 +430,7 @@ func PreviewCommentReviewGateError() string {
 		RequestedBy: previewRequestedBy,
 		Environment: "staging",
 		CommandName: action.Apply,
-		ErrorDetail: "Review gate check failed: expand team @acme/schema-reviewers: team membership cannot be read. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
+		ErrorDetail: "Review gate check failed; see server logs for details. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
 	})
 }
 
@@ -409,8 +496,7 @@ func PreviewCommentApplyBlockedByCheckStatusError() string {
 // PreviewCommentApplyBlockedByPriorEnvCheckError renders a sample fail-closed
 // block for a prior-environment check that could not be read.
 func PreviewCommentApplyBlockedByPriorEnvCheckError() string {
-	return RenderApplyBlockedByPriorEnvCheckError("staging", "query check runs",
-		fmt.Errorf("list check runs for ref: 502 Bad Gateway"))
+	return RenderApplyBlockedByPriorEnvCheckError("staging", "query check runs")
 }
 
 // PreviewCommentApplyBlockedByMissingPriorEnvCheck renders a sample block for
@@ -1179,6 +1265,23 @@ func PreviewCommentApplyFailed() string {
 	tables[2].Status = state.Task.Cancelled
 	data := sampleApplyData(state.Apply.Failed, tables)
 	data.ErrorMessage = PreviewErrorMiddleFailed
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyFailedBeforeRowCopy renders an apply comment where the
+// first table was rejected by an engine preflight check before any rows were
+// copied: the row renders without a progress bar and carries its own error
+// detail, while the apply-level failure reason holds the table-qualified form
+// promoted from the failed task.
+func PreviewCommentApplyFailedBeforeRowCopy() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Failed
+	tables[0].DDL = "ALTER TABLE `orders` MODIFY COLUMN `status` ENUM('NEW','PENDING','SHIPPED','DELIVERED') NOT NULL"
+	tables[0].ErrorMessage = PreviewErrorPreflightFailed
+	tables[1].Status = state.Task.Cancelled
+	tables[2].Status = state.Task.Cancelled
+	data := sampleApplyData(state.Apply.Failed, tables)
+	data.ErrorMessage = fmt.Sprintf("table %s failed: %s", tables[0].TableName, PreviewErrorPreflightFailed)
 	return RenderApplyStatusComment(data)
 }
 

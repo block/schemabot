@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -1023,13 +1024,13 @@ func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 	// Hold the same target lock that the create path must acquire. The creates
 	// below use the public store API; a result before release means active
 	// apply writes are not serialized by the per-target lock.
-	guardConn, guardLockName, err := acquireApplyTargetLockConn(ctx, testDB, "testdb", "mysql", "staging")
+	guardConn, guardLockName, err := acquireApplyTargetLockConn(ctx, testDB, namedlock.MySQL{}, "testdb", "mysql", "staging")
 	require.NoError(t, err)
 	releaseGuard := func() {
 		if guardConn == nil {
 			return
 		}
-		releaseApplyTargetLockConn(ctx, guardConn, guardLockName, "test active apply guard")
+		releaseApplyTargetLockConn(ctx, namedlock.MySQL{}, guardConn, guardLockName, "test active apply guard")
 		guardConn = nil
 	}
 	t.Cleanup(releaseGuard)
@@ -1388,6 +1389,83 @@ func TestApplyStore_GetRecentLimitAndEnvironment(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
 	assert.Equal(t, "apply_recent_staging_failed", applies[0].ApplyIdentifier)
+}
+
+// TestApplyStore_GetRecentUpdatedSince verifies the status window bound: only
+// applies whose updated_at falls at or after the bound are returned, so an
+// apply that last changed before the window drops out while fresh activity
+// stays visible.
+func TestApplyStore_GetRecentUpdatedSince(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "windowdb", "mysql", "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_window_stale", 220, state.Apply.Completed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_window_fresh", 221, state.Apply.Completed, "staging")
+
+	_, err := testDB.ExecContext(ctx,
+		"UPDATE `applies` SET updated_at = ? WHERE apply_identifier = ?",
+		time.Now().Add(-2*time.Hour), "apply_window_stale")
+	require.NoError(t, err)
+
+	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit:        10,
+		Environment:  "staging",
+		UpdatedSince: time.Now().Add(-time.Hour),
+	})
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, "apply_window_fresh", applies[0].ApplyIdentifier)
+
+	applies, err = store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit:        10,
+		Environment:  "staging",
+		UpdatedSince: time.Now().Add(-3 * time.Hour),
+	})
+	require.NoError(t, err)
+	require.Len(t, applies, 2)
+}
+
+// A status summary must tally every apply matching the filters — unbounded by
+// the list limit, scoped by environment, and windowed by UpdatedSince — so an
+// operator reading a truncated status page still sees truthful totals.
+func TestApplyStore_CountRecentByState(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "countdb", "mysql", "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_completed_one", 230, state.Apply.Completed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_completed_two", 231, state.Apply.Completed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_failed", 232, state.Apply.Failed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_other_env", 233, state.Apply.Completed, "production")
+
+	counts, err := store.Applies().CountRecentByState(ctx, storage.RecentAppliesFilter{
+		Limit:       1,
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{
+		state.Apply.Completed: 2,
+		state.Apply.Failed:    1,
+	}, counts, "counts cover every matching row even when the list limit is 1")
+
+	_, err = testDB.ExecContext(ctx,
+		"UPDATE `applies` SET updated_at = ? WHERE apply_identifier = ?",
+		time.Now().Add(-2*time.Hour), "apply_count_completed_one")
+	require.NoError(t, err)
+
+	counts, err = store.Applies().CountRecentByState(ctx, storage.RecentAppliesFilter{
+		Limit:        10,
+		Environment:  "staging",
+		UpdatedSince: time.Now().Add(-time.Hour),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{
+		state.Apply.Completed: 1,
+		state.Apply.Failed:    1,
+	}, counts)
 }
 
 func TestApplyStore_GetRecentDeploymentFilterMatchesParentAndOperation(t *testing.T) {
