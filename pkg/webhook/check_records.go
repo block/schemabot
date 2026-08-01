@@ -352,7 +352,7 @@ func (h *Handler) reconcileStaleChecks(ctx context.Context, client *ghclient.Ins
 					"repo", repo, "pr", pr,
 					"database", check.DatabaseName, "database_type", check.DatabaseType,
 					"environment", check.Environment,
-					"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
+					"apply_id", apply.ApplyIdentifier,
 					"apply_state", apply.State, "check_apply_id", check.ApplyID,
 					"check_head_sha", check.HeadSHA)
 			}
@@ -363,7 +363,7 @@ func (h *Handler) reconcileStaleChecks(ctx context.Context, client *ghclient.Ins
 			"repo", repo, "pr", pr,
 			"database", check.DatabaseName, "database_type", check.DatabaseType,
 			"environment", check.Environment,
-			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
+			"apply_id", apply.ApplyIdentifier,
 			"apply_state", apply.State, "check_apply_id", check.ApplyID,
 			"check_status", check.Status, "check_conclusion", check.Conclusion,
 			"check_head_sha", check.HeadSHA)
@@ -473,7 +473,7 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 		h.logger.Info("apply stopped; leaving check in_progress so a resume can complete it",
 			"repo", repo, "pr", pr, "database", apply.Database,
 			"database_type", apply.DatabaseType, "environment", apply.Environment,
-			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
+			"apply_id", apply.ApplyIdentifier,
 			"check_status", check.Status)
 		return false, nil
 	}
@@ -535,7 +535,7 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 		h.logger.Warn(msg,
 			"repo", repo, "pr", pr, "database", apply.Database,
 			"database_type", apply.DatabaseType, "environment", apply.Environment,
-			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
+			"apply_id", apply.ApplyIdentifier,
 			"apply_state", apply.State, "check_apply_id", check.ApplyID,
 			"check_status", check.Status, "check_head_sha", check.HeadSHA)
 		return false, nil
@@ -544,7 +544,7 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 	h.logger.Info("stored check state updated after apply",
 		"repo", repo, "pr", pr, "database", apply.Database,
 		"database_type", apply.DatabaseType, "environment", apply.Environment,
-		"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
+		"apply_id", apply.ApplyIdentifier,
 		"apply_state", apply.State, "conclusion", check.Conclusion,
 		"blocking_reason", check.BlockingReason)
 	recordOutcome("success")

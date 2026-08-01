@@ -255,7 +255,7 @@ func (s *Service) logControlOperationForApply(ctx context.Context, apply *storag
 		Source:    storage.LogSourceSchemaBot,
 		Message:   logMessage,
 	}); err != nil {
-		s.logger.Error("failed to append control operation log", "apply_id", apply.ID, "event", eventType, "error", err)
+		s.logger.Error("failed to append control operation log", "apply_id", apply.ApplyIdentifier, "event", eventType, "error", err)
 	}
 }
 
