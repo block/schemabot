@@ -170,8 +170,9 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 
 	// Handle help command
 	if result.IsHelp {
-		if result.Tenant == "" && h.service != nil && !h.service.Config().ShouldRespondToUnscoped() {
-			h.logger.Debug("skipping help command (respond_to_unscoped is false)", "repo", repo, "pr", pr)
+		if result.Tenant == "" && !h.answersUnscopedUsageErrors(repo) {
+			h.logger.Info("skipping help reply; respond_to_unscoped is false and this deployment is not the aggregate leader, so the designated responder posts it",
+				"repo", repo, "pr", pr)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
 			return
 		}
@@ -192,8 +193,8 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
 			return
 		}
-		if result.Tenant == "" && h.service != nil && !h.service.Config().ShouldRespondToUnscoped() {
-			h.logger.Debug("skipping invalid environment response (respond_to_unscoped is false)",
+		if result.Tenant == "" && !h.answersUnscopedUsageErrors(repo) {
+			h.logger.Info("skipping invalid environment reply; respond_to_unscoped is false and this deployment is not the aggregate leader, so the designated responder posts it",
 				"repo", repo, "pr", pr, "action", result.Action)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
 			return
@@ -234,8 +235,8 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
 			return
 		}
-		if result.Tenant == "" && h.service != nil && !h.service.Config().ShouldRespondToUnscoped() {
-			h.logger.Debug("skipping missing environment response (respond_to_unscoped is false)",
+		if result.Tenant == "" && !h.answersUnscopedUsageErrors(repo) {
+			h.logger.Info("skipping missing environment reply; respond_to_unscoped is false and this deployment is not the aggregate leader, so the designated responder posts it",
 				"repo", repo, "pr", pr, "action", result.Action)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
 			return
@@ -276,8 +277,8 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 				h.writeJSON(w, http.StatusOK, map[string]string{"message": "environment deferred to sibling deployments"})
 				return
 			}
-			if result.Tenant == "" && !h.service.Config().ShouldRespondToUnscoped() {
-				h.logger.Debug("skipping unknown environment response (respond_to_unscoped is false)",
+			if result.Tenant == "" && !h.answersUnscopedUsageErrors(repo) {
+				h.logger.Info("skipping unknown environment reply; respond_to_unscoped is false and this deployment is not the aggregate leader, so the designated responder posts it",
 					"repo", repo, "pr", pr, "environment", result.Environment, "action", result.Action)
 				h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
 				return
@@ -312,8 +313,9 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 
 	// Handle invalid command (schemabot mentioned but command not recognized)
 	if !result.Found {
-		if result.Tenant == "" && h.service != nil && !h.service.Config().ShouldRespondToUnscoped() {
-			h.logger.Debug("skipping invalid command response (respond_to_unscoped is false)", "repo", repo, "pr", pr)
+		if result.Tenant == "" && !h.answersUnscopedUsageErrors(repo) {
+			h.logger.Info("skipping invalid command reply; respond_to_unscoped is false and this deployment is not the aggregate leader, so the designated responder posts it",
+				"repo", repo, "pr", pr)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
 			return
 		}

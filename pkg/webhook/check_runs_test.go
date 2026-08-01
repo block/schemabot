@@ -737,6 +737,101 @@ func TestRespondToUnscoped(t *testing.T) {
 	})
 }
 
+// On an aggregate repo, participants defer unscoped usage-error replies to the
+// leader, and fleets set respond_to_unscoped to false on every deployment to
+// prevent duplicate replies. The leader is the designated responder by role,
+// so it must answer those usage errors and help anyway — otherwise no
+// deployment replies and the operator's command dies silently with no
+// PR-visible feedback.
+func TestAggregateLeaderAnswersUsageErrorsDespiteUnscopedPolicy(t *testing.T) {
+	falseVal := false
+	for _, tc := range []struct {
+		name         string
+		comment      string
+		message      string
+		bodyContains string
+	}{
+		{
+			name:         "missing environment",
+			comment:      "schemabot apply",
+			message:      "missing environment flag",
+			bodyContains: "-e",
+		},
+		{
+			name:         "unknown environment",
+			comment:      "schemabot apply -e prod",
+			message:      "unknown environment",
+			bodyContains: "staging",
+		},
+		{
+			name:         "malformed environment",
+			comment:      "schemabot apply -e production--allow-unsafe",
+			message:      "invalid environment value",
+			bodyContains: "staging",
+		},
+		{
+			name:    "help",
+			comment: "schemabot help",
+			message: "help posted",
+		},
+		{
+			name:    "invalid command",
+			comment: "schemabot foobar",
+			message: "invalid command",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			var postedComment string
+			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+				var payload struct {
+					Body string `json:"body"`
+				}
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+				postedComment = payload.Body
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+			})
+			mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+			})
+
+			installClient := ghclient.NewInstallationClient(client, testLogger())
+			factory := &fakeClientFactory{client: installClient}
+
+			service := api.New(nil, &api.ServerConfig{
+				RespondToUnscoped:   &falseVal,
+				AllowedEnvironments: []string{"staging"},
+				Repos: map[string]api.RepoConfig{
+					"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleLeader}},
+				},
+			}, nil, testLogger())
+
+			h := &Handler{
+				service:   service,
+				ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+				logger:    testLogger(),
+			}
+
+			req := buildWebhookRequest(t, webhookPayloadOpts{
+				comment: tc.comment,
+				isPR:    true,
+			}, nil)
+
+			rr := httpResponseRecorder()
+			h.ServeHTTP(rr, req)
+
+			require.Equal(t, http.StatusOK, rr.Code)
+			assert.Contains(t, rr.Body.String(), tc.message)
+			if tc.bodyContains != "" {
+				assert.Contains(t, postedComment, tc.bodyContains,
+					"the leader's reply should tell the operator the registered environments")
+			}
+		})
+	}
+}
+
 // httpResponseRecorder creates an httptest.ResponseRecorder.
 func httpResponseRecorder() *httptest.ResponseRecorder {
 	return httptest.NewRecorder()

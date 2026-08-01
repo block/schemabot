@@ -88,6 +88,23 @@ func (h *Handler) silentUsageErrorOnUnscopedFanOut(repo, tenant string) bool {
 	return config.AggregateRoleForRepo(repo) == api.AggregateRoleParticipant
 }
 
+// answersUnscopedUsageErrors reports whether this deployment posts the reply
+// to an unscoped (no -t) usage error or help request on repo. On an aggregate
+// repo the leader is the designated responder: participants defer these
+// replies to it by role (silentUsageErrorOnUnscopedFanOut), so the leader
+// answers even when respond_to_unscoped is false — that policy picks one
+// responder among undifferentiated instances, and letting it silence the
+// deployment every participant deferred to would turn the exactly-once reply
+// into no reply at all. On repos without an aggregate role the
+// respond_to_unscoped policy alone picks the single responder.
+func (h *Handler) answersUnscopedUsageErrors(repo string) bool {
+	config, ok := h.serverConfig()
+	if !ok {
+		return true
+	}
+	return config.IsAggregateLeaderForRepo(repo) || config.ShouldRespondToUnscoped()
+}
+
 // silentUnknownEnvOnAggregateFanOut reports whether an unknown-environment
 // rejection should be a logged silent skip on this deployment. An aggregate
 // participant's config holds only its own slice of the fleet's environments,
