@@ -1187,6 +1187,12 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 		task.ProgressPercent = int(tp.PercentComplete)
 		task.ChecksumRowsChecked = tp.ChecksumRowsChecked
 		task.ChecksumRowsTotal = tp.ChecksumRowsTotal
+		// Mirror the table's own engine error so the PR comment / CLI can tell
+		// which table caused a failure. An empty remote error never wipes a
+		// stored one: a stale progress snapshot must not erase a durable error.
+		if tp.ErrorMessage != "" {
+			task.ErrorMessage = tp.ErrorMessage
+		}
 		task.UpdatedAt = now
 		if err := s.storage.Tasks().Update(ctx, task); err != nil {
 			s.logger.Error("sync task failed", append(task.LogAttrs(), "error", err)...)
