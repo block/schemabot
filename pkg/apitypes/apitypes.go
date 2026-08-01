@@ -547,6 +547,43 @@ func (r *PlanResponse) DirectChanges() []*TableChangeResponse {
 	return result
 }
 
+// AllChangesDirect reports whether every planned change is a direct-execution
+// change (and at least one exists). Options that only affect engine-driven
+// statements — like a deferred cutover — have nothing to act on in such a
+// plan, so their commands are rejected rather than silently ignored.
+func (r *PlanResponse) AllChangesDirect() bool {
+	if r == nil {
+		return false
+	}
+	total := 0
+	for _, sc := range r.Changes {
+		if sc == nil {
+			continue
+		}
+		if sc.HasVSchemaChange() {
+			return false
+		}
+		total += len(sc.TableChanges)
+		for _, t := range sc.TableChanges {
+			if !t.DirectExecution() {
+				return false
+			}
+		}
+	}
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		total += len(sp.Changes)
+		for _, t := range sp.Changes {
+			if !t.DirectExecution() {
+				return false
+			}
+		}
+	}
+	return total > 0
+}
+
 // LintWarnings returns lint results with warning severity.
 func (r *PlanResponse) LintWarnings() []LintViolationResponse {
 	var result []LintViolationResponse
