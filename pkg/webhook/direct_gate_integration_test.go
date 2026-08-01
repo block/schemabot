@@ -50,7 +50,9 @@ func appPrimaryKeyColumns(t *testing.T, dbName, tableName string) []string {
 // the change so the reshaped primary key actually lands on the target. The
 // primary-key reshape is also an unsafe operation, so both commands carry
 // --allow-unsafe; the direct downgrade layers on top of the unsafe gate
-// rather than replacing it.
+// rather than replacing it. An apply-confirm that carries --defer-cutover is
+// rejected (an all-direct plan has no cutover to defer) but preserves the
+// pending confirmation, so a re-run without the flag still executes.
 func TestE2EDirectPlanDowngradesToConfirmThenApplies(t *testing.T) {
 	dbName := "webhook_direct_confirm"
 	svc := setupE2EServiceOpts(t, dbName, e2eServiceOpts{
@@ -100,6 +102,37 @@ func TestE2EDirectPlanDowngradesToConfirmThenApplies(t *testing.T) {
 
 	assert.Equal(t, []string{"id"}, appPrimaryKeyColumns(t, dbName, "users"),
 		"the paused apply must not have touched the target")
+
+	// --defer-cutover has nothing to defer on this all-direct plan, so the
+	// confirm is rejected — but the rejection must not discard the pending
+	// confirmation: the lock keeps pinning the disclosed plan so a bare
+	// re-run of apply-confirm still executes it.
+	flaggedConfirmReq := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging --allow-unsafe --defer-cutover",
+		isPR:    true,
+	}, nil)
+
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, flaggedConfirmReq)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "`--defer-cutover` has no effect on this plan")
+		assert.Contains(t, body, "The pending confirmation is preserved")
+		assert.Contains(t, body, "schemabot apply-confirm -e staging")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the defer-cutover rejection comment")
+	}
+
+	preserved, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, preserved, "the rejected confirm must keep the pending confirmation locked")
+	assert.Equal(t, lock.Owner, preserved.Owner)
+	assert.Equal(t, lock.PendingPlanID, preserved.PendingPlanID,
+		"the lock must still pin the plan the operator confirmed against")
+	assert.Equal(t, []string{"id"}, appPrimaryKeyColumns(t, dbName, "users"),
+		"the rejected confirm must not have executed the direct change")
 
 	confirmReq := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot apply-confirm -e staging --allow-unsafe",
