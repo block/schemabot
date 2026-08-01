@@ -4136,6 +4136,46 @@ func TestVolumeHandler(t *testing.T) {
 		assert.Equal(t, int32(11), mock.volumeReq.Volume)
 	})
 
+	// A remote deployment knows the apply only by its own data-plane id, so
+	// its rejection copy names an identifier the operator cannot resolve on
+	// the control plane. The relay must rewrite it to the apply identifier the
+	// operator addressed, so the reply is about the schema change they asked
+	// about and no internal identifier reaches PR-facing markdown.
+	t.Run("rejection names the operator apply id, not the remote id", func(t *testing.T) {
+		mock := &mockTernClient{
+			volumeResp: &ternv1.VolumeResponse{
+				Accepted:     false,
+				ErrorMessage: "Schema change apply-remote999 is completed; volume can only be adjusted while it is running",
+			},
+		}
+		apply := activeTestApply("apply-vol123")
+		apply.ExternalID = "apply-remote999"
+		svc := newControlTestService(mock, apply)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-vol123", "volume": 5}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/volume", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		var resp map[string]any
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err, "failed to decode response")
+
+		assert.Equal(t, false, resp["accepted"])
+		errMsg, _ := resp["error_message"].(string)
+		assert.Contains(t, errMsg, "apply-vol123")
+		assert.NotContains(t, errMsg, "apply-remote999")
+		assert.Contains(t, errMsg, "volume can only be adjusted while it is running")
+
+		require.NotNil(t, mock.volumeReq, "expected volume request to be captured")
+		assert.Equal(t, "apply-remote999", mock.volumeReq.ApplyId, "the data plane is still addressed by its own id")
+	})
+
 	t.Run("invalid volume range", func(t *testing.T) {
 		svc := newControlTestService(&mockTernClient{}, activeTestApply("apply-vol123"))
 		mux := http.NewServeMux()
