@@ -15,6 +15,7 @@ import (
 	"time"
 
 	spiritmigration "github.com/block/spirit/pkg/migration"
+	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/docker/go-connections/nat"
@@ -23,7 +24,6 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/schema"
@@ -269,19 +269,23 @@ func TestEngine_Plan_DropTable(t *testing.T) {
 	require.NoError(t, err, "drop table")
 }
 
-// A desired schema that swaps a table's primary key diffs to a DROP PRIMARY
-// KEY, and one that introduces a referential constraint diffs to an ADD
-// FOREIGN KEY — both statements Spirit deterministically refuses at apply
-// time. The plan carries the execution-mode verdict on those changes — mode
-// "blocked" with the engine's reason — so the operator learns at plan time
-// that the apply will fail, while an ordinary change in the same plan stays
-// on the engine's default path.
+// A desired schema that swaps a table's primary key diffs to a DROP PRIMARY KEY,
+// one that introduces a referential constraint diffs to an ADD FOREIGN KEY, and
+// one that reorders an ENUM's values diffs to a MODIFY COLUMN — all statements
+// Spirit deterministically refuses at apply time. The plan carries the
+// execution-mode verdict on those changes — mode "blocked" with the engine's
+// reason — so the operator learns at plan time that the apply will fail, while
+// an ordinary change in the same plan stays on the engine's default path.
+//
+// The ENUM case is the one the engine can only judge against the table's current
+// column types, so it also proves the plan supplies the engine with the current
+// definition, not just the statement.
 func TestEngine_Plan_ExecutionVerdictBlocked(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
 	cleanupCtx := context.WithoutCancel(t.Context())
 	t.Cleanup(func() {
-		for _, table := range []string{"orders", "accounts", "notes"} {
+		for _, table := range []string{"orders", "accounts", "notes", "shipments"} {
 			_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `"+table+"`")
 			assert.NoError(t, err, "drop table %s", table)
 		}
@@ -304,6 +308,12 @@ func TestEngine_Plan_ExecutionVerdictBlocked(t *testing.T) {
 		PRIMARY KEY (id)
 	)`)
 	require.NoError(t, err, "create orders table")
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE shipments (
+		id INT NOT NULL AUTO_INCREMENT,
+		status ENUM('new','shipped','done') NOT NULL DEFAULT 'new',
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create shipments table")
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{Logger: logger})
@@ -326,6 +336,11 @@ func TestEngine_Plan_ExecutionVerdictBlocked(t *testing.T) {
 				note_id INT NOT NULL,
 				PRIMARY KEY (id),
 				CONSTRAINT fk_orders_note FOREIGN KEY (note_id) REFERENCES notes (id)
+			)`,
+			"shipments.sql": `CREATE TABLE shipments (
+				id INT NOT NULL AUTO_INCREMENT,
+				status ENUM('shipped','new','done') NOT NULL DEFAULT 'new',
+				PRIMARY KEY (id)
 			)`,
 		}),
 		Credentials: &engine.Credentials{
@@ -358,16 +373,23 @@ func TestEngine_Plan_ExecutionVerdictBlocked(t *testing.T) {
 	assert.Contains(t, orders.DDL, "fk_orders_note")
 	assert.Equal(t, "blocked", orders.ExecutionMode, "adding a foreign key carries the blocked verdict")
 	assert.Equal(t, "adding foreign key constraints is not supported", orders.ModeReason)
+
+	shipments, ok := verdicts["shipments"]
+	require.True(t, ok, "plan carries the shipments change")
+	assert.Contains(t, shipments.DDL, "MODIFY COLUMN")
+	assert.Contains(t, shipments.DDL, "status")
+	assert.Equal(t, "blocked", shipments.ExecutionMode, "reordering ENUM values carries the blocked verdict")
+	assert.Contains(t, shipments.ModeReason, `unsafe ENUM value reorder on column "status"`)
 }
 
-// The execution-mode verdict mirrors refusal checks that live inside the
-// engine, so this test proves the mirror against the engine itself: every
-// statement shape the verdict classifies as blocked is handed to a real
-// Spirit schema change, which must refuse it with the very reason the verdict
-// recorded. An engine upgrade that relaxes one of these checks — or rewords
-// its refusal — fails this test, signaling that ddl.EngineRefusalReason must
-// change in the same bump so the verdict never claims an apply will fail when
-// it can succeed.
+// The execution-mode verdict asks the engine which statements it refuses, so
+// this test proves the answer against the engine itself: every statement shape
+// the verdict classifies as blocked is handed to a real Spirit schema change,
+// which must refuse it with the very reason the verdict recorded. The engine
+// attempts MySQL's native DDL before its refusal checks run, so a shape the
+// native DDL can complete is not a refusal at all — an engine upgrade that
+// relaxes one of these checks, or moves it behind the native DDL, fails this
+// test rather than letting the plan claim an apply will fail when it succeeds.
 func TestEngine_SpiritRefusesVerdictBlockedStatements(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
@@ -388,9 +410,18 @@ func TestEngine_SpiritRefusesVerdictBlockedStatements(t *testing.T) {
 		id INT NOT NULL AUTO_INCREMENT,
 		tenant_id INT NOT NULL,
 		ref_id INT NOT NULL,
+		status ENUM('new','shipped','done') NOT NULL DEFAULT 'new',
+		perms SET('read','write','execute') DEFAULT NULL,
 		PRIMARY KEY (id)
 	)`)
 	require.NoError(t, err, "create verdict_orders table")
+
+	// The engine's ENUM/SET refusals compare the statement against the table's
+	// current column types, which the plan and the apply-time routing both read
+	// from the target.
+	var tableName, currentCreateTable string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SHOW CREATE TABLE `verdict_orders`").Scan(&tableName, &currentCreateTable),
+		"show create table verdict_orders")
 
 	host, username, password, database, err := parseDSN(dsn)
 	require.NoError(t, err, "parseDSN")
@@ -415,11 +446,31 @@ func TestEngine_SpiritRefusesVerdictBlockedStatements(t *testing.T) {
 			name: "explicit lock clause",
 			stmt: "ALTER TABLE `verdict_orders` ADD COLUMN `note` VARCHAR(64), LOCK=NONE",
 		},
+		{
+			name: "enum value reorder",
+			stmt: "ALTER TABLE `verdict_orders` MODIFY COLUMN `status` ENUM('shipped','new','done') NOT NULL DEFAULT 'new'",
+		},
+		{
+			name: "enum value inserted in the middle",
+			stmt: "ALTER TABLE `verdict_orders` MODIFY COLUMN `status` ENUM('new','pending','shipped','done') NOT NULL DEFAULT 'new'",
+		},
+		{
+			name: "set member reorder",
+			stmt: "ALTER TABLE `verdict_orders` MODIFY COLUMN `perms` SET('write','read','execute')",
+		},
+		{
+			name: "enum to numeric conversion",
+			stmt: "ALTER TABLE `verdict_orders` MODIFY COLUMN `status` INT NOT NULL DEFAULT 0",
+		},
+		{
+			name: "set to enum conversion",
+			stmt: "ALTER TABLE `verdict_orders` MODIFY COLUMN `perms` ENUM('read','write','execute')",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reason, refused, err := ddl.EngineRefusalReason(tt.stmt)
-			require.NoError(t, err, "EngineRefusalReason")
+			reason, refused, err := check.StatementRefusal(t.Context(), tt.stmt, currentCreateTable, slog.New(slog.DiscardHandler))
+			require.NoError(t, err, "StatementRefusal")
 			require.True(t, refused, "the verdict must classify this statement as blocked")
 			require.NotEmpty(t, reason)
 
@@ -439,6 +490,80 @@ func TestEngine_SpiritRefusesVerdictBlockedStatements(t *testing.T) {
 			require.Error(t, runErr, "the engine must refuse a statement the verdict marked blocked")
 			assert.Contains(t, runErr.Error(), reason,
 				"the engine's refusal must carry the reason the verdict recorded")
+		})
+	}
+}
+
+// Statements the engine's own preflight checks refuse, but that MySQL's native
+// DDL — which the engine attempts first — can complete. The verdict must stay
+// silent on these: routing them to direct execution, or reporting that the apply
+// will fail, would both be wrong for a schema change the engine applies cleanly.
+func TestEngine_VerdictSilentOnNativeDDLStatements(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupCtx := context.WithoutCancel(t.Context())
+	t.Cleanup(func() {
+		_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `verdict_fastpath`")
+		assert.NoError(t, err, "drop table verdict_fastpath")
+	})
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE verdict_fastpath (
+		id INT NOT NULL AUTO_INCREMENT,
+		email VARCHAR(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create verdict_fastpath table")
+
+	var tableName, currentCreateTable string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SHOW CREATE TABLE `verdict_fastpath`").Scan(&tableName, &currentCreateTable),
+		"show create table verdict_fastpath")
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	tests := []struct {
+		name string
+		stmt string
+	}{
+		{
+			name: "drop and re-add the same column",
+			stmt: "ALTER TABLE `verdict_fastpath` DROP COLUMN `email`, ADD COLUMN `email` VARCHAR(255) NOT NULL",
+		},
+		{
+			name: "rename a column onto a freed name",
+			stmt: "ALTER TABLE `verdict_fastpath` RENAME COLUMN `email` TO `contact_email`, ADD COLUMN `email` VARCHAR(255) NOT NULL",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reason, refused, err := check.StatementRefusal(t.Context(), tt.stmt, currentCreateTable, slog.New(slog.DiscardHandler))
+			require.NoError(t, err, "StatementRefusal")
+			assert.False(t, refused, "the verdict must not claim a refusal the native DDL path completes")
+			assert.Empty(t, reason)
+
+			runner, err := spiritmigration.NewRunner(&spiritmigration.Migration{
+				Host:      host,
+				Username:  username,
+				Password:  &password,
+				Database:  database,
+				Statement: tt.stmt,
+			})
+			require.NoError(t, err, "NewRunner")
+			defer utils.CloseAndLog(runner)
+
+			runCtx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			require.NoError(t, runner.Run(runCtx), "the engine must apply a statement the verdict left silent")
+
+			// Restore the starting shape so the next case sees the same table.
+			_, err = db.ExecContext(t.Context(), "DROP TABLE `verdict_fastpath`")
+			require.NoError(t, err, "drop verdict_fastpath")
+			_, err = db.ExecContext(t.Context(), `CREATE TABLE verdict_fastpath (
+				id INT NOT NULL AUTO_INCREMENT,
+				email VARCHAR(255) NOT NULL,
+				PRIMARY KEY (id)
+			)`)
+			require.NoError(t, err, "recreate verdict_fastpath")
 		})
 	}
 }

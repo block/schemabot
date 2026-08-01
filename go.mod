@@ -18,7 +18,7 @@ require (
 	github.com/docker/docker v28.5.1+incompatible
 	github.com/docker/go-connections v0.6.0
 	github.com/go-jose/go-jose/v4 v4.1.4
-	github.com/go-mysql-org/go-mysql v1.15.1-0.20260526024741-088eb1fbf0ea
+	github.com/go-mysql-org/go-mysql v1.16.1-0.20260731133054-6f853f178dc3
 	github.com/go-mysql/hotswap-dsn-driver v1.0.1
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/gofri/go-github-ratelimit/v2 v2.0.2
@@ -274,3 +274,8 @@ replace github.com/pingcap/tidb/pkg/parser => github.com/block/tidb/pkg/parser v
 // type-preserving JSON binlog decoding. Revert to upstream go-mysql once
 // the new flag lands. See https://github.com/morgo/go-mysql/tree/mysql-text-json-rendering.
 replace github.com/go-mysql-org/go-mysql => github.com/morgo/go-mysql v1.16.1-0.20260723231236-3aced1dddcf4
+
+// Pinned to a fork with the in-flight check.StatementRefusal entry point, which
+// this repo uses to classify statements Spirit refuses. Revert to upstream
+// spirit once it lands. See https://github.com/block/spirit/pull/1108.
+replace github.com/block/spirit => github.com/morgo/spirit v0.0.0-20260802121703-50dab2ba1c3d
