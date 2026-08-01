@@ -71,6 +71,7 @@ func (e *Engine) newSpiritMigration(ctx context.Context, host, username, passwor
 // Spirit's pre-cutover checksum turns a missed change into a failed apply,
 // never silent divergence.
 func (e *Engine) gtidChangeSourceSupported(ctx context.Context, host, username, password, database string) bool {
+	logger := e.changeLogger()
 	cfg := mysql.NewConfig()
 	cfg.User = username
 	cfg.Passwd = password
@@ -79,14 +80,14 @@ func (e *Engine) gtidChangeSourceSupported(ctx context.Context, host, username, 
 	cfg.DBName = database
 	db, err := mysqlconn.Open(cfg.FormatDSN())
 	if err != nil {
-		e.logger.Warn("failed to probe target GTID support, using the binlog file+position change source",
+		logger.Warn("failed to probe target GTID support, using the binlog file+position change source",
 			"target_host", host, "database", database, "error", err)
 		return false
 	}
 	defer utils.CloseAndLog(db)
 
 	if err := db.PingContext(ctx); err != nil {
-		e.logger.Warn("failed to connect to target for GTID support probe, using the binlog file+position change source",
+		logger.Warn("failed to connect to target for GTID support probe, using the binlog file+position change source",
 			"target_host", host, "database", database, "error", err)
 		return false
 	}
@@ -94,17 +95,17 @@ func (e *Engine) gtidChangeSourceSupported(ctx context.Context, host, username, 
 	var gtidMode, enforceConsistency string
 	if err := db.QueryRowContext(ctx,
 		`SELECT @@global.gtid_mode, @@global.enforce_gtid_consistency`).Scan(&gtidMode, &enforceConsistency); err != nil {
-		e.logger.Warn("failed to probe target GTID support, using the binlog file+position change source",
+		logger.Warn("failed to probe target GTID support, using the binlog file+position change source",
 			"target_host", host, "database", database, "error", err)
 		return false
 	}
 	if gtidMode != "ON" || enforceConsistency != "ON" {
-		e.logger.Info("target does not support GTID, using the binlog file+position change source",
+		logger.Info("target does not support GTID, using the binlog file+position change source",
 			"target_host", host, "database", database,
 			"gtid_mode", gtidMode, "enforce_gtid_consistency", enforceConsistency)
 		return false
 	}
-	e.logger.Info("target supports GTID, using the GTID change source",
+	logger.Info("target supports GTID, using the GTID change source",
 		"target_host", host, "database", database)
 	return true
 }
@@ -115,9 +116,10 @@ func (e *Engine) gtidChangeSourceSupported(ctx context.Context, host, username, 
 // ALTERs Spirit refuses run as native MySQL DDL when the direct execution
 // policy permits, and fail the schema change otherwise.
 func (e *Engine) executeSchemaChange(ctx context.Context, host, username, password, database string, ddlStatements []string, deferCutover bool, policy directPolicy) {
+	logger := e.changeLogger()
 	phases, err := classifyDDLPhases(ddlStatements)
 	if err != nil {
-		e.logger.Error("failed to classify statement", "error", err)
+		logger.Error("failed to classify statement", "error", err)
 		e.setSchemaChangeFailed(err)
 		return
 	}
@@ -145,7 +147,7 @@ func (e *Engine) executeSchemaChange(ctx context.Context, host, username, passwo
 	// A cancelled context means the operator stopped the change; engine state
 	// must remain Stopped, so do not overwrite it with StateCompleted.
 	if ctx.Err() != nil {
-		e.logger.Info("schema change stopped before completion",
+		logger.Info("schema change stopped before completion",
 			"database", database,
 			"reason", ctx.Err(),
 		)
@@ -168,6 +170,7 @@ func (e *Engine) executeSchemaChange(ctx context.Context, host, username, passwo
 // phase remains and must run after the resumed ALTER completes. When no ALTER was
 // in flight, the whole plan is run from the start.
 func (e *Engine) resumeSchemaChange(ctx context.Context, host, username, password, database string, originalDDLs []string, combinedStatement string, deferCutover bool, policy directPolicy) {
+	logger := e.changeLogger()
 	if combinedStatement == "" {
 		e.executeSchemaChange(ctx, host, username, password, database, originalDDLs, deferCutover, policy)
 		return
@@ -180,7 +183,7 @@ func (e *Engine) resumeSchemaChange(ctx context.Context, host, username, passwor
 	// A stop during the resumed ALTER cancels the context; leave the state
 	// Stopped and do not run the pending DROP phase.
 	if ctx.Err() != nil {
-		e.logger.Info("schema change stopped during resumed ALTER",
+		logger.Info("schema change stopped during resumed ALTER",
 			"database", database,
 			"reason", ctx.Err(),
 		)
@@ -189,7 +192,7 @@ func (e *Engine) resumeSchemaChange(ctx context.Context, host, username, passwor
 
 	phases, err := classifyDDLPhases(originalDDLs)
 	if err != nil {
-		e.logger.Error("failed to classify statements on resume", "database", database, "error", err)
+		logger.Error("failed to classify statements on resume", "database", database, "error", err)
 		e.setSchemaChangeFailed(err)
 		return
 	}
@@ -199,7 +202,7 @@ func (e *Engine) resumeSchemaChange(ctx context.Context, host, username, passwor
 	}
 
 	if ctx.Err() != nil {
-		e.logger.Info("schema change stopped before completion",
+		logger.Info("schema change stopped before completion",
 			"database", database,
 			"reason", ctx.Err(),
 		)
@@ -246,16 +249,17 @@ func classifyDDLPhases(ddlStatements []string) (ddlPhases, error) {
 // keeps its distinct "phase" wording in failure messages). It returns false when
 // the caller must not run later phases.
 func (e *Engine) runStatementPhase(ctx context.Context, database, stopLabel, failLabel string, statements []string, run func(context.Context, string) error) bool {
+	logger := e.changeLogger()
 	for _, stmt := range statements {
 		if err := run(ctx, stmt); err != nil {
 			if ctx.Err() != nil {
-				e.logger.Info("schema change stopped during "+stopLabel,
+				logger.Info("schema change stopped during "+stopLabel,
 					"database", database,
 					"reason", ctx.Err(),
 				)
 				return false
 			}
-			e.logger.Error(failLabel+" failed", "database", database, "error", err)
+			logger.Error(failLabel+" failed", "database", database, "error", err)
 			e.setSchemaChangeFailed(fmt.Errorf("%s failed: %w", failLabel, err))
 			return false
 		}
@@ -286,9 +290,10 @@ func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password
 	target := &lazyTargetDB{dsn: targetDSN(host, username, password, database)}
 	defer target.close()
 
+	logger := e.changeLogger()
 	routing, err := e.routeAlterStatements(ctx, target, database, alters, policy)
 	if err != nil {
-		e.logger.Error("ALTER routing failed", "database", database, "error", err)
+		logger.Error("ALTER routing failed", "database", database, "error", err)
 		e.setSchemaChangeFailed(err)
 		return false
 	}
@@ -305,7 +310,7 @@ func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password
 
 	combinedStatement := strings.Join(routing.spiritAlters, "; ")
 
-	e.logger.Info("executing ALTER via Spirit",
+	logger.Info("executing ALTER via Spirit",
 		"database", database,
 		"tables", routing.spiritTables,
 		"ddl_count", len(routing.spiritAlters),
@@ -363,7 +368,7 @@ func (e *Engine) executeSingleStatement(ctx context.Context, host, username, pas
 	}
 	// Note: Spirit doesn't expose IsDropTable/IsRenameTable but handles them
 
-	e.logger.Info("executing single DDL through Spirit",
+	e.changeLogger().Info("executing single DDL through Spirit",
 		"database", database,
 		"table", parsed[0].Table,
 		"type", stmtType,
@@ -379,7 +384,7 @@ func (e *Engine) executeSingleStatement(ctx context.Context, host, username, pas
 	// respect the runtime debug-log filter, same as the ALTER path. The table
 	// attr gives every routed line its table context so multi-table applies
 	// stay attributable in the apply log stream.
-	runner.SetLogger(e.spiritLogger.With("database", database, "table", parsed[0].Table))
+	runner.SetLogger(e.changeSpiritLogger().With("database", database, "table", parsed[0].Table))
 	// Run opens the runner's connection pool and background routines; they are
 	// only released by Close. Close on every return path so each single DDL
 	// statement leaves no leaked connections or goroutines behind.
@@ -394,10 +399,11 @@ func (e *Engine) executeSingleStatement(ctx context.Context, host, username, pas
 
 // executeSpiritMigration runs Spirit for ALTER statements.
 func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, password, database, combinedStatement string, deferCutover bool) error {
+	logger := e.changeLogger()
 	// Parse statements to extract table names
 	parsed, err := statement.New(combinedStatement)
 	if err != nil {
-		e.logger.Error("failed to parse combined statement", "error", err)
+		logger.Error("failed to parse combined statement", "error", err)
 		e.setSchemaChangeFailed(fmt.Errorf("failed to parse combined statement: %w", err))
 		return err
 	}
@@ -414,7 +420,7 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 
 	runner, err := spiritmigration.NewRunner(migration)
 	if err != nil {
-		e.logger.Error("failed to create Spirit runner",
+		logger.Error("failed to create Spirit runner",
 			"error", err,
 			"statement", combinedStatement,
 		)
@@ -425,7 +431,7 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 	// Use spiritLogger which filters noisy debug logs unless DebugLogs is
 	// enabled. The table attr gives every routed line its table context so
 	// multi-table applies stay attributable in the apply log stream.
-	spiritLogger := e.spiritLogger.With("database", database, "table", uniqueTableList(tables))
+	spiritLogger := e.changeSpiritLogger().With("database", database, "table", uniqueTableList(tables))
 	runner.SetLogger(spiritLogger)
 
 	// Track schema change state
@@ -441,7 +447,7 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 	}
 	e.mu.Unlock()
 
-	e.logger.Info("starting Spirit runner",
+	logger.Info("starting Spirit runner",
 		"database", database,
 		"tables", tables,
 		"defer_cutover", deferCutover,
@@ -455,14 +461,14 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 	if err := runner.Run(ctx); err != nil {
 		// Check if this was a cancellation (stop) vs a real failure
 		if ctx.Err() != nil {
-			e.logger.Info("schema change stopped",
+			logger.Info("schema change stopped",
 				"reason", ctx.Err(),
 			)
 			// Don't change state - Stop() already set it to StateStopped
 			utils.CloseAndLog(runner)
 			return nil
 		}
-		e.logger.Error("schema change failed",
+		logger.Error("schema change failed",
 			"error", err,
 		)
 		e.setSchemaChangeFailed(fmt.Errorf("schema change failed: %w", err))
@@ -471,7 +477,7 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 	}
 
 	utils.CloseAndLog(runner)
-	e.logger.Info("ALTER phase completed", "database", database, "tables", tables)
+	logger.Info("ALTER phase completed", "database", database, "tables", tables)
 	return nil
 }
 

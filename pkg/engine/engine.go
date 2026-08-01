@@ -12,6 +12,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"time"
 
 	"github.com/block/spirit/pkg/statement"
@@ -325,6 +326,13 @@ type ApplyRequest struct {
 	Options      map[string]string  // Options like "defer_cutover", "skip_revert"
 	ResumeState  *ResumeState       // Fresh context or full resume state after restart
 	Credentials  *Credentials       // Resolved credentials (from discovery)
+
+	// Logger is an optional schema-change-scoped logger, already bound with
+	// the caller's triage identity (apply id, repo, PR, environment). Engines
+	// use it for every log line about this schema change so engine lines stay
+	// filterable by the same identity as the drive logs. Nil falls back to
+	// the engine's configured logger.
+	Logger *slog.Logger
 
 	// OnStateChange is called by the engine to persist ResumeState at key milestones
 	// during Apply (e.g., after branch creation, after deploy request creation).
