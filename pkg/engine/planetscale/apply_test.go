@@ -223,7 +223,7 @@ func TestDeployDeployRequest_RetriesWhileStillValidating(t *testing.T) {
 // forever: past the bounded wait the deploy fails with an error naming how
 // long SchemaBot waited.
 func TestDeployDeployRequest_ValidationPastDeadlineFails(t *testing.T) {
-	compressDeployValidationWait(t, 20*time.Millisecond, 5*time.Millisecond)
+	compressDeployValidationWait(t, 100*time.Millisecond, 5*time.Millisecond)
 	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 	client := &deployRejectionClient{rejectErr: errors.New(stillValidatingMessage), rejections: 1_000_000}
 
