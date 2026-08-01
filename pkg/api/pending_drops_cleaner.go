@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -135,7 +136,11 @@ func (s *Service) hasPendingDropsLocalTargets() bool {
 }
 
 // pendingDropsTargets resolves the local-mode MySQL databases the cleaner
-// inspects. Databases without a local DSN are executed by a remote deployment,
+// inspects. The mysql type filter is a deliberate capability boundary, not an
+// incidental selection: the pending-drops quarantine is implemented with the
+// Go MySQL driver and MySQL-specific discovery, advisory locking, and DROP
+// statements, so targets of any other database family must never reach the
+// cleaner. Databases without a local DSN are executed by a remote deployment,
 // which owns quarantine cleanup for its own targets.
 func (s *Service) pendingDropsTargets(ctx context.Context) ([]pendingdrops.Target, int) {
 	var targets []pendingdrops.Target
@@ -163,6 +168,7 @@ func (s *Service) pendingDropsTargets(ctx context.Context) ([]pendingdrops.Targe
 				Database:    dbName,
 				Environment: envName,
 				DSN:         dsn,
+				Locker:      namedlock.MySQL{},
 			})
 		}
 	}

@@ -20,7 +20,6 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
@@ -101,9 +100,9 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Type != "" {
 		switch req.Type {
-		case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata:
+		case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
 		default:
-			s.writeError(w, http.StatusBadRequest, "type must be "+storage.DatabaseTypeMySQL+", "+storage.DatabaseTypeVitess+", or "+storage.DatabaseTypeStrata)
+			s.writeError(w, http.StatusBadRequest, "type must be "+storage.DatabaseTypeMySQL+", "+storage.DatabaseTypeVitess+", "+storage.DatabaseTypeStrata+", or "+storage.DatabaseTypePostgres)
 			return
 		}
 	}
@@ -339,6 +338,10 @@ type ApplyRequest struct {
 	Options        map[string]string `json:"options,omitempty"`
 	Caller         string            `json:"caller,omitempty"`          // Identity of the caller (e.g., "cli:user@host")
 	InstallationID int64             `json:"installation_id,omitempty"` // GitHub App installation ID (for PR comment tracking)
+	// ExpectedLockOwner and ExpectedPendingPlanID are internal webhook guards;
+	// direct API callers cannot assert a lock intent through JSON.
+	ExpectedLockOwner     string `json:"-"`
+	ExpectedPendingPlanID string `json:"-"`
 }
 
 // handlePlan handles POST /api/plan requests.
@@ -360,9 +363,9 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch req.Type {
-	case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata:
+	case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
 	default:
-		s.writeError(w, http.StatusBadRequest, "type must be "+storage.DatabaseTypeMySQL+", "+storage.DatabaseTypeVitess+", or "+storage.DatabaseTypeStrata)
+		s.writeError(w, http.StatusBadRequest, "type must be "+storage.DatabaseTypeMySQL+", "+storage.DatabaseTypeVitess+", "+storage.DatabaseTypeStrata+", or "+storage.DatabaseTypePostgres)
 		return
 	}
 	if warning, err := validateSchemaFiles(req.SchemaFiles); err != nil {
@@ -391,6 +394,18 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 // and returns the plan response. This is the shared implementation used by both
 // the HTTP handler and the webhook handler.
 func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.PlanResponse, error) {
+	_, resp, err := s.ExecutePlanProto(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// ExecutePlanProto runs a plan and returns both the reviewed primary plan proto
+// and its API projection. The proto is the reviewed baseline the review-time
+// drift rollup compares deployments against, so it is exposed alongside the API
+// response rather than reconstructed from storage.
+func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv1.PlanResponse, *apitypes.PlanResponse, error) {
 	ctx, span := otel.Tracer("schemabot").Start(ctx, "ExecutePlan",
 		trace.WithAttributes(
 			attribute.String("database", req.Database),
@@ -403,7 +418,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 	if warning, err := validateSchemaFiles(req.SchemaFiles); err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "invalid schema files")
-		return nil, err
+		return nil, nil, err
 	} else if warning != "" {
 		s.logger.Warn("plan request has empty schema files", "warning", warning, "database", req.Database)
 	}
@@ -417,7 +432,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		span.SetStatus(otelcodes.Error, "resolve target")
 		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
-		return nil, fmt.Errorf("resolve target for %s/%s: %w", req.Database, req.Environment, err)
+		return nil, nil, fmt.Errorf("resolve target for %s/%s: %w", req.Database, req.Environment, err)
 	}
 	deployment = resolvedTarget.Deployment
 	if req.Type != resolvedTarget.DatabaseType {
@@ -426,7 +441,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		span.SetStatus(otelcodes.Error, "type mismatch")
 		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
-		return nil, typeErr
+		return nil, nil, typeErr
 	}
 
 	prInt := 0
@@ -467,7 +482,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 				"schema_path", req.SchemaPath,
 				"reason", reason,
 				"error", err)
-			return nil, fmt.Errorf("source policy: %w", err)
+			return nil, nil, fmt.Errorf("source policy: %w", err)
 		}
 	}
 
@@ -477,7 +492,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		span.SetStatus(otelcodes.Error, "tern client")
 		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
-		return nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
+		return nil, nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
 	}
 
 	ternReq := &ternv1.PlanRequest{
@@ -524,13 +539,13 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 			"error", err,
 		)
 		if client.IsRemote() && grpcstatus.Code(err) == grpccodes.Unavailable {
-			return nil, &RemoteDeploymentUnavailableError{
+			return nil, nil, &RemoteDeploymentUnavailableError{
 				Deployment: deployment,
 				Target:     resolvedTarget.Target,
 				Err:        err,
 			}
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	span.SetAttributes(attribute.String("plan_id", resp.PlanId), attribute.Int("change_count", len(resp.Changes)))
 	metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "success")
@@ -556,10 +571,15 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		Target:       resolvedTarget.Target,
 	}
 	if err := s.storePlanResponse(ctx, req, resp, route); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return planResponseFromProto(resp), nil
+	planResp := planResponseFromProto(resp)
+	// Record the primary deployment this plan was created against so the
+	// review-time drift rollup can verify the baseline still maps to the primary
+	// at rollup time.
+	planResp.Deployment = deployment
+	return resp, planResp, nil
 }
 
 type storedPlanRoute struct {
@@ -941,32 +961,28 @@ func (s *Service) createStoredApply(
 	}
 
 	// Attribute the apply to the authenticated caller when the request carried a
-	// real identity (API auth enabled). This makes a direct-API/CLI apply
-	// auditable to the verified user rather than a client-supplied Caller string.
-	// With auth disabled, or on the PR-comment path (no authenticated user), the
-	// request's Caller is used unchanged.
-	caller := req.Caller
-	if subject, ok := auth.AuthenticatedSubject(ctx); ok {
-		caller = subject
-	}
+	// real identity (API auth enabled); see resolveCaller.
+	caller := resolveCaller(ctx, req.Caller)
 
 	apply := &storage.Apply{
-		ApplyIdentifier: applyIdentifier,
-		LockID:          lockID,
-		PlanID:          plan.ID,
-		Database:        plan.Database,
-		DatabaseType:    plan.DatabaseType,
-		Repository:      plan.Repository,
-		PullRequest:     plan.PullRequest,
-		Environment:     req.Environment,
-		Deployment:      targets[0].Deployment,
-		Caller:          caller,
-		InstallationID:  req.InstallationID,
-		Engine:          storage.EngineForType(plan.DatabaseType),
-		State:           state.Apply.Pending,
-		Options:         storage.MarshalApplyOptions(applyOpts),
-		CreatedAt:       now,
-		UpdatedAt:       now,
+		ApplyIdentifier:       applyIdentifier,
+		LockID:                lockID,
+		ExpectedLockOwner:     req.ExpectedLockOwner,
+		ExpectedPendingPlanID: req.ExpectedPendingPlanID,
+		PlanID:                plan.ID,
+		Database:              plan.Database,
+		DatabaseType:          plan.DatabaseType,
+		Repository:            plan.Repository,
+		PullRequest:           plan.PullRequest,
+		Environment:           req.Environment,
+		Deployment:            targets[0].Deployment,
+		Caller:                caller,
+		InstallationID:        req.InstallationID,
+		Engine:                storage.EngineForType(plan.DatabaseType),
+		State:                 state.Apply.Pending,
+		Options:               storage.MarshalApplyOptions(applyOpts),
+		CreatedAt:             now,
+		UpdatedAt:             now,
 	}
 
 	taskChanges := applyTaskChanges(plan)
@@ -1120,7 +1136,7 @@ func buildShardedApplyOperationGroups(
 					if err := validateShardOperationKeyParts(namespace, shard.Shard, ddlChange.Table); err != nil {
 						return nil, err
 					}
-					operationKey := shardOperationKey(namespace, shard.Shard, ddlChange.Table)
+					operationKey := storage.ShardOperationKey(namespace, shard.Shard, ddlChange.Table)
 					if len(operationKey) > applyOperationKeyMaxLen {
 						return nil, fmt.Errorf("operation key for namespace %q shard %q table %q exceeds %d characters", namespace, shard.Shard, ddlChange.Table, applyOperationKeyMaxLen)
 					}
@@ -1213,10 +1229,6 @@ func changingShardsByNamespace(shards []storage.ShardPlan) map[string][]storage.
 		})
 	}
 	return shardsByNamespace
-}
-
-func shardOperationKey(namespace, shard, table string) string {
-	return namespace + "/" + shard + "/" + table
 }
 
 func finalizerOperationKey(namespace string) string {

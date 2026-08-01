@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"testing"
@@ -206,6 +207,173 @@ func TestConflictCheckIsPerShard(t *testing.T) {
 	// The same shard still conflicts.
 	assert.Equal(t, "task-shard-neg40", client.findBlockingTask(t.Context(), tasks, plan, "-40"),
 		"an active task on shard -40 must block another apply on shard -40")
+}
+
+// A pending task whose apply already reached a terminal state is orphaned: the
+// apply will never be claimed again, so the task can never start, and pending
+// means no engine work or checkpoint exists. The conflict check cancels it so
+// it stops blocking the database, and the new apply is admitted.
+func TestConflictCheckCancelsOrphanedPendingTask(t *testing.T) {
+	for _, applyState := range []string{
+		state.Apply.Completed,
+		state.Apply.Failed,
+		state.Apply.Cancelled,
+	} {
+		t.Run(applyState, func(t *testing.T) {
+			orphan := &storage.Task{
+				ID:             6,
+				ApplyID:        61,
+				TaskIdentifier: "task-orphan",
+				Database:       "testdb",
+				DatabaseType:   storage.DatabaseTypeMySQL,
+				TableName:      "users",
+				Shard:          "-80",
+				State:          state.Task.Pending,
+			}
+			client := newNoActiveChangeClient("testdb", []*storage.Task{orphan})
+			client.storage.(*exactProgressStorage).applies = &mockApplyStore{apply: &storage.Apply{
+				ID: 61, ApplyIdentifier: "apply-terminal", Database: "testdb",
+				DatabaseType: storage.DatabaseTypeMySQL, State: applyState,
+			}}
+
+			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+			err := client.checkActiveTaskConflict(t.Context(), plan, "")
+			require.NoError(t, err, "an orphaned pending task must not refuse a new apply")
+			assert.Equal(t, state.Task.Cancelled, orphan.State, "the orphaned task must be cancelled")
+			assert.Contains(t, orphan.ErrorMessage, "orphaned")
+			assert.NotNil(t, orphan.CompletedAt)
+		})
+	}
+}
+
+// A pending task whose apply is still active is normal queued work — the drive
+// that owns it will start it. The conflict check must leave it pending and
+// refuse the new apply.
+func TestConflictCheckPreservesPendingTaskOfActiveApply(t *testing.T) {
+	pending := &storage.Task{
+		ID:             7,
+		ApplyID:        71,
+		TaskIdentifier: "task-pending-active",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.Pending,
+	}
+	client := newNoActiveChangeClient("testdb", []*storage.Task{pending})
+	client.storage.(*exactProgressStorage).applies = &mockApplyStore{apply: &storage.Apply{
+		ID: 71, ApplyIdentifier: "apply-active", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeMySQL, State: state.Apply.Running,
+	}}
+
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+	err := client.checkActiveTaskConflict(t.Context(), plan, "")
+	require.Error(t, err, "a pending task of an active apply must refuse a new apply")
+	assert.Contains(t, err.Error(), "schema change already in progress")
+	assert.Equal(t, state.Task.Pending, pending.State, "the pending task must be left untouched")
+	assert.Empty(t, pending.ErrorMessage)
+	assert.Nil(t, pending.CompletedAt)
+}
+
+// When the pending task's apply cannot be loaded — a storage failure or a
+// missing row — the ownership question is unresolved, so the task keeps
+// blocking rather than being cancelled on uncertainty.
+func TestConflictCheckKeepsPendingTaskOnApplyLookupUncertainty(t *testing.T) {
+	t.Run("apply row missing", func(t *testing.T) {
+		pending := &storage.Task{
+			ID:             8,
+			ApplyID:        81,
+			TaskIdentifier: "task-pending-no-apply",
+			Database:       "testdb",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			TableName:      "users",
+			State:          state.Task.Pending,
+		}
+		client := newNoActiveChangeClient("testdb", []*storage.Task{pending})
+		client.storage.(*exactProgressStorage).applies = &mockApplyStore{apply: nil}
+
+		plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+		err := client.checkActiveTaskConflict(t.Context(), plan, "")
+		require.Error(t, err, "a pending task with a missing apply row must keep blocking")
+		assert.Equal(t, state.Task.Pending, pending.State)
+		assert.Nil(t, pending.CompletedAt)
+	})
+
+	t.Run("apply load error", func(t *testing.T) {
+		pending := &storage.Task{
+			ID:             9,
+			ApplyID:        91,
+			TaskIdentifier: "task-pending-load-error",
+			Database:       "testdb",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			TableName:      "users",
+			State:          state.Task.Pending,
+		}
+		client := newNoActiveChangeClient("testdb", []*storage.Task{pending})
+		client.storage.(*exactProgressStorage).applies = &erroringApplyStore{err: errors.New("storage down")}
+
+		plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+		err := client.checkActiveTaskConflict(t.Context(), plan, "")
+		require.Error(t, err, "a pending task must keep blocking when its apply cannot be loaded")
+		assert.Equal(t, state.Task.Pending, pending.State)
+		assert.Nil(t, pending.CompletedAt)
+	})
+}
+
+// erroringApplyStore fails every load, standing in for storage that is
+// unavailable while the conflict check runs.
+type erroringApplyStore struct {
+	storage.ApplyStore
+	err error
+}
+
+func (s *erroringApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	return nil, s.err
+}
+
+// An orphan only stops blocking once its cancellation is durably written. If
+// the write fails, the task must keep blocking — reporting it resolved would
+// admit the new apply while storage still records the orphan as active work —
+// and the task must be left pending so a later conflict check retries the
+// cancellation cleanly.
+func TestConflictCheckKeepsOrphanWhenCancellationWriteFails(t *testing.T) {
+	orphan := &storage.Task{
+		ID:             10,
+		ApplyID:        101,
+		TaskIdentifier: "task-orphan-write-fails",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.Pending,
+	}
+	client := newNoActiveChangeClient("testdb", []*storage.Task{orphan})
+	stor := client.storage.(*exactProgressStorage)
+	stor.tasks = &updateFailingTaskStore{
+		exactProgressTaskStore: stor.tasks.(*exactProgressTaskStore),
+		updateErr:              errors.New("storage down"),
+	}
+	stor.applies = &mockApplyStore{apply: &storage.Apply{
+		ID: 101, ApplyIdentifier: "apply-terminal", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeMySQL, State: state.Apply.Completed,
+	}}
+
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+	err := client.checkActiveTaskConflict(t.Context(), plan, "")
+	require.Error(t, err, "the orphan must keep blocking when its cancellation cannot be written")
+	assert.Contains(t, err.Error(), "schema change already in progress")
+	assert.Equal(t, state.Task.Pending, orphan.State, "the task must be restored to pending for a clean retry")
+	assert.Empty(t, orphan.ErrorMessage)
+	assert.Nil(t, orphan.CompletedAt)
+}
+
+// updateFailingTaskStore serves tasks normally but fails every state write,
+// standing in for storage that becomes unavailable mid-conflict-check.
+type updateFailingTaskStore struct {
+	*exactProgressTaskStore
+	updateErr error
+}
+
+func (s *updateFailingTaskStore) Update(context.Context, *storage.Task) error {
+	return s.updateErr
 }
 
 // Once an abandoned in-flight task has been failed, it no longer blocks the

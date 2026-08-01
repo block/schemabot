@@ -71,7 +71,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -147,6 +150,33 @@ func TestMain(m *testing.M) {
 // setupE2EService creates a real api.Service with a LocalClient for the given database.
 func setupE2EService(t *testing.T, appDBName string) *api.Service {
 	t.Helper()
+	return setupE2EServiceWithStorage(t, appDBName, nil)
+}
+
+// setupE2EServiceWithStorage is setupE2EService with a storage decorator hook.
+// A non-nil wrapStorage wraps the service's storage so a test can observe every
+// storage write the handler and observers perform (e.g. record stored check
+// state transitions).
+func setupE2EServiceWithStorage(t *testing.T, appDBName string, wrapStorage func(storage.Storage) storage.Storage) *api.Service {
+	t.Helper()
+	return setupE2EServiceOpts(t, appDBName, e2eServiceOpts{wrapStorage: wrapStorage})
+}
+
+// e2eServiceOpts customizes setupE2EServiceOpts beyond the defaults.
+type e2eServiceOpts struct {
+	// wrapStorage wraps the service's storage so a test can observe every
+	// storage write the handler and observers perform.
+	wrapStorage func(storage.Storage) storage.Storage
+	// engineMetadata is forwarded to the LocalClient, enabling per-database
+	// engine policies (e.g. direct execution) for the test's plans and
+	// applies.
+	engineMetadata map[string]string
+}
+
+// setupE2EServiceOpts creates a real api.Service with a LocalClient for the
+// given database, customized by opts.
+func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *api.Service {
+	t.Helper()
 	ctx := t.Context()
 
 	// Create the app database on the target
@@ -171,7 +201,10 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = schemabotDB.Close() })
 
-	st := mysqlstore.New(schemabotDB)
+	st := storage.Storage(mysqlstore.New(schemabotDB))
+	if opts.wrapStorage != nil {
+		st = opts.wrapStorage(st)
+	}
 
 	// Clean up any stale data from previous test runs (shared storage DB)
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE database_name = ?", appDBName)
@@ -188,6 +221,7 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 		Database:  appDBName,
 		Type:      "mysql",
 		TargetDSN: appDSN,
+		Metadata:  opts.engineMetadata,
 	}, st, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = localClient.Close() })
@@ -264,7 +298,7 @@ func seedCheck(t *testing.T, svc *api.Service, dbName, env, conclusion string) {
 func newE2EHandler(t *testing.T, svc *api.Service, client *gh.Client) *Handler {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	installClient := ghclient.NewInstallationClient(client, logger)
+	installClient := ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")
 	factory := &fakeClientFactory{client: installClient}
 	return NewHandler(svc, factory, nil, logger)
 }
@@ -286,6 +320,16 @@ type planFlowResult struct {
 	HeadSHAs    []string
 	headSHACall atomic.Int64
 
+	// PRState overrides the lifecycle state served by /pulls/1. Empty (the
+	// default) serves "open"; tests exercising the closed-PR command gate set
+	// "closed" before issuing the webhook request.
+	PRState atomic.Pointer[string]
+
+	// PRMerged marks the PR served by /pulls/1 as merged. GitHub reports a
+	// merged PR with state "closed" and merged true, so tests exercising the
+	// merged-PR rejection copy set this together with PRState "closed".
+	PRMerged atomic.Bool
+
 	// CheckStatusNodes optionally overrides the default passing-checks REST
 	// responses installed by setupFakeGitHubForPlan. Tests that need to drive
 	// different check-gate responses across consecutive calls (e.g. PASS at the
@@ -293,6 +337,22 @@ type planFlowResult struct {
 	// before issuing the webhook request. Nil preserves the default
 	// "no checks → passing" behavior.
 	CheckStatusNodes atomic.Pointer[func() []checkStatusNode]
+
+	// FailPRFilesAfterFirstFetch makes /pulls/1/files serve only its first
+	// request and answer every later one with a 503. Config discovery fetches
+	// the changed files exactly once, so this simulates GitHub becoming
+	// unavailable between a successful discovery and the dispatched command's
+	// own re-fetch. False (the default) always serves the files.
+	FailPRFilesAfterFirstFetch atomic.Bool
+	prFilesRequests            atomic.Int64
+
+	// BaseTip overrides the commit SHA that /git/ref/heads/main resolves to.
+	// Nil (the default) serves "def456" — the same commit /pulls/1 reports as
+	// the PR base, so the base branch appears unmoved and the base-schema
+	// freshness gate lets applies proceed. Tests that simulate the base
+	// branch advancing after the PR diverged install a provider returning
+	// the moved tip and register comparison fixtures for it.
+	BaseTip atomic.Pointer[func() string]
 }
 
 func (p *planFlowResult) nextHeadSHA() string {
@@ -306,14 +366,6 @@ func (p *planFlowResult) nextHeadSHA() string {
 	return p.HeadSHAs[idx]
 }
 
-type checkRunCapture struct {
-	Name       string                   `json:"name"`
-	HeadSHA    string                   `json:"head_sha"`
-	Status     string                   `json:"status"`
-	Conclusion string                   `json:"conclusion"`
-	Output     *ghclient.CheckRunOutput `json:"output"`
-}
-
 // registerPassingChecks adds mock REST endpoints for PR check statuses that
 // return no checks. This prevents enforcePassingChecks from blocking apply
 // commands in e2e tests.
@@ -321,14 +373,101 @@ func registerPassingChecks(mux *http.ServeMux) {
 	registerCheckStatusRESTHandlers(mux, nil)
 }
 
-func registerCheckStatusRESTHandlersForAnyRef(mux *http.ServeMux, nodes func() []checkStatusNode) {
+// fakeCheckRunStore records every Check Run a fake GitHub server accepts so
+// the commit check-runs list can serve the same runs the real API would: each
+// run's latest state, attributed to the trusted "schemabot" App. The
+// aggregate fold resolves its reuse/rewind decision from that list, so a
+// harness whose handler can fold the same head more than once must list the
+// runs its own create and update calls produced.
+type fakeCheckRunStore struct {
+	mu   sync.Mutex
+	next int64
+	runs []*fakeCheckRunRecord
+}
+
+type fakeCheckRunRecord struct {
+	id         int64
+	name       string
+	headSHA    string
+	status     string
+	conclusion string
+}
+
+// create records a created Check Run and returns its assigned ID.
+func (s *fakeCheckRunStore) create(body checkRunCapture) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.next++
+	s.runs = append(s.runs, &fakeCheckRunRecord{
+		id:         s.next,
+		name:       body.Name,
+		headSHA:    body.HeadSHA,
+		status:     body.Status,
+		conclusion: body.Conclusion,
+	})
+	return s.next
+}
+
+// update records an update to an existing run. Update payloads carry no head
+// SHA, so an update to an ID the store never saw created (for example a
+// seeded stored CheckRunID) is recorded without one and stays invisible to
+// every commit's list — like a run that lives on some other commit.
+func (s *fakeCheckRunStore) update(id int64, body checkRunCapture) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, run := range s.runs {
+		if run.id != id {
+			continue
+		}
+		run.status = body.Status
+		run.conclusion = body.Conclusion
+		return
+	}
+	s.runs = append(s.runs, &fakeCheckRunRecord{
+		id:         id,
+		name:       body.Name,
+		status:     body.Status,
+		conclusion: body.Conclusion,
+	})
+}
+
+// serveList writes GitHub's list-check-runs response for the recorded runs on
+// headSHA whose name matches checkName, each attributed to the trusted
+// "schemabot" App.
+func (s *fakeCheckRunStore) serveList(w http.ResponseWriter, headSHA, checkName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]map[string]any, 0, len(s.runs))
+	for _, run := range s.runs {
+		if run.headSHA != headSHA || run.name != checkName {
+			continue
+		}
+		out = append(out, map[string]any{
+			"id":         run.id,
+			"name":       run.name,
+			"status":     run.status,
+			"conclusion": run.conclusion,
+			"app":        map[string]any{"slug": "schemabot"},
+		})
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"total_count": len(out), "check_runs": out})
+}
+
+func registerCheckStatusRESTHandlersForAnyRef(mux *http.ServeMux, nodes func() []checkStatusNode, checkRuns *fakeCheckRunStore) {
 	prefix := "/repos/octocat/hello-world/commits/"
 	mux.HandleFunc("GET "+prefix, func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, prefix)
+		reqPath := strings.TrimPrefix(r.URL.Path, prefix)
 		switch {
-		case strings.HasSuffix(path, "/status"):
+		case strings.HasSuffix(reqPath, "/status"):
 			writeCommitStatusResponse(w, nodes())
-		case strings.HasSuffix(path, "/check-runs"):
+		case strings.HasSuffix(reqPath, "/check-runs"):
+			// A name-filtered list is the aggregate fold resolving the newest
+			// run for its check name; the unfiltered list is the apply gate
+			// reading the PR's checks.
+			if name := r.URL.Query().Get("check_name"); name != "" && checkRuns != nil {
+				checkRuns.serveList(w, strings.TrimSuffix(reqPath, "/check-runs"), name)
+				return
+			}
 			writeCheckRunsResponse(w, nodes())
 		default:
 			http.NotFound(w, r)
@@ -356,7 +495,14 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	// preserves the historical "abc123" for every existing test).
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
 		sha := result.nextHeadSHA()
+		prState := "open"
+		if override := result.PRState.Load(); override != nil {
+			prState = *override
+		}
+		merged := result.PRMerged.Load()
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			State:  &prState,
+			Merged: &merged,
 			Head: &gh.PullRequestBranch{
 				Ref: new("feature-branch"),
 				SHA: &sha,
@@ -369,8 +515,28 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		})
 	})
 
+	// Base-branch freshness endpoints. By default the base ref still points
+	// at the PR's base commit, which is therefore also the merge base of the
+	// default head — the schema tree cannot differ from itself, so the
+	// base-schema freshness gate lets applies proceed.
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+		tip := "def456"
+		if provider := result.BaseTip.Load(); provider != nil {
+			tip = (*provider)()
+		}
+		_ = json.NewEncoder(w).Encode(gh.Reference{
+			Ref:    new("refs/heads/main"),
+			Object: &gh.GitObject{Type: new("commit"), SHA: &tip},
+		})
+	})
+	registerFreshBaseComparison(t, mux, "abc123")
+
 	// PR changed files — report schema files changed (in namespace subdir)
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, r *http.Request) {
+		if result.FailPRFilesAfterFirstFetch.Load() && result.prFilesRequests.Add(1) > 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		if prFiles != nil {
 			_ = json.NewEncoder(w).Encode(prFiles)
 			return
@@ -431,6 +597,20 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, r *http.Request) {
 		sha := r.URL.Path[len("/repos/octocat/hello-world/git/trees/"):]
+		if sha == "def456" {
+			// The base commit's shallow root tree. The base-schema freshness
+			// gate walks this level looking for the managed "schema"
+			// directory entry; serving it as a real tree entry exercises the
+			// gate's path resolution rather than the path-absent shortcut.
+			_ = json.NewEncoder(w).Encode(gh.Tree{
+				SHA: &sha,
+				Entries: []*gh.TreeEntry{
+					{Path: new("schema"), Type: new("tree"), SHA: new("schema-tree-base")},
+				},
+				Truncated: new(false),
+			})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(gh.Tree{
 			SHA:       &sha,
 			Entries:   treeEntries,
@@ -487,24 +667,32 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
 	})
 
-	// Capture check run creates (incrementing IDs so aggregate can distinguish create vs update)
-	var checkRunIDCounter atomic.Int64
+	// Capture check run creates and updates. Every write is also recorded in
+	// checkRunState (with incrementing IDs) so the commit's check-runs list
+	// serves the runs this server actually accepted — the aggregate fold
+	// resolves its reuse/rewind decision from that list.
+	checkRunState := &fakeCheckRunStore{}
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		result.checkRuns <- body
-		id := checkRunIDCounter.Add(1)
+		id := checkRunState.create(body)
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
 
-	// Capture check run updates (PATCH)
 	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		result.checkRuns <- body
+		id, err := strconv.ParseInt(path.Base(r.URL.Path), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid check run id", http.StatusBadRequest)
+			return
+		}
+		checkRunState.update(id, body)
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
 
 	// PR check statuses for enforcePassingChecks. Defaults to all passing
@@ -516,16 +704,29 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 			return (*provider)()
 		}
 		return nil
-	})
+	}, checkRunState)
 
 	return result
+}
+
+// registerFreshBaseComparison serves the merge-base comparison for a head
+// whose merge base is the unmoved base tip "def456", so the base-schema
+// freshness gate sees no base-branch schema change for that head. Tests that
+// serve a head other than the default "abc123" register their head here.
+func registerFreshBaseComparison(t *testing.T, mux *http.ServeMux, headSHA string) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/def456..."+headSHA, func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
+			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("def456")},
+		}))
+	})
 }
 
 func registerCompareFiles(t *testing.T, mux *http.ServeMux, baseSHA, headSHA string, files []*gh.CommitFile) {
 	t.Helper()
 
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/"+baseSHA+"..."+headSHA, func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{Files: files}))
+		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{Status: new("ahead"), Files: files}))
 	})
 }
 

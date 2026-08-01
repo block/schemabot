@@ -13,11 +13,13 @@ import (
 // Shared preview error messages — used by both PR comment and CLI preview functions
 // to keep failure scenarios consistent across output formats.
 const (
-	PreviewErrorFirstFailed  = "Error 1061: Duplicate key name 'idx_user_id'"
-	PreviewErrorMiddleFailed = "lock wait timeout exceeded; try restarting transaction"
-	previewRepository        = "block/schemabot"
-	previewHeadSHA           = "abcdef1234567890abcdef1234567890abcdef12"
-	previewRequestedBy       = "jackjackbits"
+	PreviewErrorFirstFailed     = "Error 1061: Duplicate key name 'idx_user_id'"
+	PreviewErrorMiddleFailed    = "lock wait timeout exceeded; try restarting transaction"
+	PreviewErrorPreflightFailed = "preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end"
+	previewRepository           = "block/schemabot"
+	previewHeadSHA              = "abcdef1234567890abcdef1234567890abcdef12"
+	previewStaleSHA             = "0123456789abcdef0123456789abcdef01234567"
+	previewRequestedBy          = "jackjackbits"
 )
 
 func previewSupportChannel() SupportChannelData {
@@ -47,9 +49,92 @@ func PreviewCommentPlan() string {
 				},
 			},
 		},
-		LintViolations: []LintViolationData{
-			{Message: "New column uses floating-point data type", Table: "orders", LinterName: "has_float"},
-			{Message: "Column added without DEFAULT value", Table: "users", LinterName: "no_default"},
+		LintViolations: sampleLintWarnings(),
+	})
+}
+
+// PreviewCommentPlanBlocked renders a sample plan containing a statement the
+// engine deterministically refuses (execution-mode verdict "blocked").
+func PreviewCommentPlanBlocked() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+					"ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)",
+					"ALTER TABLE `orders` ADD COLUMN `notes` TEXT",
+				},
+			},
+		},
+		BlockedChanges: []BlockedChangeData{
+			{Table: "users", Reason: "dropping primary key is not supported"},
+			{Table: "orders", Reason: "adding foreign key constraints is not supported"},
+		},
+	})
+}
+
+// PreviewCommentPlanDirect renders a sample locked apply-confirmation comment
+// for a plan whose refused statement the direct execution policy routes to
+// native MySQL DDL (execution-mode verdict "direct"), showing the disclosure
+// the operator consents to by confirming.
+func PreviewCommentPlanDirect() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+					"ALTER TABLE `orders` ADD COLUMN `notes` TEXT",
+				},
+			},
+		},
+		DirectChanges: []DirectChangeData{
+			{Table: "users", Reason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows"},
+		},
+		AutoConfirmDowngradeReason: "Plan contains direct-execution changes — review the disclosure and confirm manually",
+	})
+}
+
+// PreviewCommentApplyBlockedRejected renders a sample apply rejection for a
+// plan containing statements the engine refuses.
+func PreviewCommentApplyBlockedRejected() string {
+	return RenderBlockedChangesApplyRejected(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+					"ALTER TABLE `orders` ADD COLUMN `notes` TEXT",
+				},
+			},
+		},
+		BlockedChanges: []BlockedChangeData{
+			{Table: "users", Reason: "dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000"},
 		},
 	})
 }
@@ -91,6 +176,29 @@ func PreviewCommentNoManagedSchemaChanges() string {
 		Timestamp:   "2026-03-15 14:30:00",
 		Environment: "staging",
 		CommandName: action.Plan,
+	})
+}
+
+// PreviewCommentNoManagedSchemaChangesChecksRefreshed renders the plan-command
+// outcome for a PR with no managed schema changes and no apply-owned state:
+// the SchemaBot checks were recreated as passing on the current head.
+func PreviewCommentNoManagedSchemaChangesChecksRefreshed() string {
+	return RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-03-15 14:30:00",
+		HeadSHA:     previewHeadSHA,
+	})
+}
+
+// PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants renders
+// the aggregate-leader variant of the checks-refreshed comment: the refreshed
+// check gates on tenant deployments' own checks for the touched schema paths.
+func PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants() string {
+	return RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
+		RequestedBy:    previewRequestedBy,
+		Timestamp:      "2026-03-15 14:30:00",
+		HeadSHA:        previewHeadSHA,
+		GatedOnTenants: true,
 	})
 }
 
@@ -197,6 +305,18 @@ func PreviewCommentErrorGeneric() string {
 	})
 }
 
+// PreviewCommentErrorGenericAutoPlan renders the plan failure error comment
+// for a system-triggered auto-plan: no requesting user and no single target
+// environment, so the header shows the deployment's environment scope.
+func PreviewCommentErrorGenericAutoPlan() string {
+	return RenderGenericError(SchemaErrorData{
+		Timestamp:    "2026-01-15 14:30:00",
+		Environments: []string{"staging"},
+		CommandName:  action.Plan,
+		ErrorDetail:  "failed to fetch repository contents: API rate limit exceeded",
+	})
+}
+
 // PreviewCommentMissingEnv renders the "missing -e flag" error comment.
 func PreviewCommentMissingEnv() string {
 	return RenderMissingEnv(action.Plan)
@@ -265,9 +385,32 @@ func PreviewCommentApplyInProgress() string {
 	})
 }
 
+// PreviewCommentApplyBlockedClosedPR renders a sample apply rejection for a
+// closed-but-unmerged PR.
+func PreviewCommentApplyBlockedClosedPR() string {
+	return RenderApplyBlockedClosedPR("staging", previewRequestedBy, false)
+}
+
+// PreviewCommentApplyBlockedMergedPR renders a sample apply rejection for a
+// merged PR.
+func PreviewCommentApplyBlockedMergedPR() string {
+	return RenderApplyBlockedClosedPR("staging", previewRequestedBy, true)
+}
+
 // PreviewCommentApplyConfirmNoLock renders a sample "no lock found" comment.
 func PreviewCommentApplyConfirmNoLock() string {
 	return RenderApplyConfirmNoLock("testapp", "staging")
+}
+
+// PreviewCommentBaseSchemaFreshnessRejected renders a sample path-scoped base
+// freshness rejection for a PR that must merge or rebase before applying.
+func PreviewCommentBaseSchemaFreshnessRejected() string {
+	return RenderBaseSchemaFreshnessRejection(BaseSchemaFreshnessRejectionData{
+		RequestedBy: previewRequestedBy,
+		Database:    "testapp",
+		Environment: "production",
+		SchemaPath:  "schema/testapp",
+	})
 }
 
 // PreviewCommentReviewRequired renders a sample "review required" comment.
@@ -287,7 +430,7 @@ func PreviewCommentReviewGateError() string {
 		RequestedBy: previewRequestedBy,
 		Environment: "staging",
 		CommandName: action.Apply,
-		ErrorDetail: "Review gate check failed: expand team @acme/schema-reviewers: team membership cannot be read. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
+		ErrorDetail: "Review gate check failed; see server logs for details. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
 	})
 }
 
@@ -338,6 +481,67 @@ func PreviewCommentApplyBlockedByPriorEnvInProgress() string {
 	return RenderApplyBlockedByPriorEnvInProgress("testapp", "production", "staging")
 }
 
+// PreviewCommentApplyBlockedByCheckStatusError renders a sample fail-closed
+// block for a check-status read that failed because the GitHub App
+// installation is missing permissions.
+func PreviewCommentApplyBlockedByCheckStatusError() string {
+	return RenderApplyBlockedByCheckStatusError("staging",
+		fmt.Errorf("list check runs for ref: Resource not accessible by integration"),
+		&CheckStatusAccessDetails{
+			GitHubApp:          "schemabot-app",
+			MissingPermissions: []string{"Checks: Read", "Commit statuses: Read"},
+		})
+}
+
+// PreviewCommentApplyBlockedByPriorEnvCheckError renders a sample fail-closed
+// block for a prior-environment check that could not be read.
+func PreviewCommentApplyBlockedByPriorEnvCheckError() string {
+	return RenderApplyBlockedByPriorEnvCheckError("staging", "query check runs")
+}
+
+// PreviewCommentApplyBlockedByMissingPriorEnvCheck renders a sample block for
+// a prior environment with no completed SchemaBot check on the PR.
+func PreviewCommentApplyBlockedByMissingPriorEnvCheck() string {
+	return RenderApplyBlockedByMissingPriorEnvCheck("staging")
+}
+
+// PreviewCommentApplyBlockedByUntrustedPriorEnvCheck renders a sample block
+// for a prior-environment check created only by untrusted GitHub Apps.
+func PreviewCommentApplyBlockedByUntrustedPriorEnvCheck() string {
+	return RenderApplyBlockedByUntrustedPriorEnvCheck("staging", "SchemaBot (staging)", []string{"acme-automation"})
+}
+
+// PreviewCommentApplyBlockedByUnlistedEnvironment renders a sample block for a
+// target environment missing from the configured promotion order.
+func PreviewCommentApplyBlockedByUnlistedEnvironment() string {
+	return RenderApplyBlockedByUnlistedEnvironment("development", []string{"staging", "production"})
+}
+
+// PreviewCommentStaleSchemaRejected renders a sample rejection for schema
+// files loaded at an older commit than the current PR HEAD.
+func PreviewCommentStaleSchemaRejected() string {
+	return RenderStaleSchemaRejection(StaleSchemaRejectionData{
+		RequestedBy:  previewRequestedBy,
+		Database:     "testapp",
+		Environment:  "staging",
+		DiscoverySHA: previewStaleSHA,
+		CurrentSHA:   previewHeadSHA,
+		Action:       "apply",
+	})
+}
+
+// PreviewCommentStalePlanRejected renders a sample rejection for a confirmed
+// plan rendered against a commit that is no longer the PR HEAD.
+func PreviewCommentStalePlanRejected() string {
+	return RenderStalePlanRejection(StalePlanRejectionData{
+		RequestedBy: previewRequestedBy,
+		Database:    "testapp",
+		Environment: "staging",
+		PlanSHA:     previewStaleSHA,
+		CurrentSHA:  previewHeadSHA,
+	})
+}
+
 // sampleTime returns a fixed time for preview rendering consistency.
 func sampleTime() time.Time {
 	return time.Date(2026, 3, 15, 14, 30, 0, 0, time.UTC)
@@ -354,6 +558,15 @@ func samplePlanChanges() []KeyspaceChangeData {
 				"ALTER TABLE `products` ADD INDEX `idx_category_price` (`category`, `price`);",
 			},
 		},
+	}
+}
+
+// sampleLintWarnings returns warning-severity lint findings that match the
+// statements in samplePlanChanges, in the message format Spirit's linters emit.
+func sampleLintWarnings() []LintViolationData {
+	return []LintViolationData{
+		{Message: `Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.`, Table: "users", LinterName: "has_timestamp"},
+		{Message: `Index 'idx_category' on columns (category) is redundant - covered by index 'idx_category_price' on columns (category, price)`, Table: "products", LinterName: "redundant_indexes"},
 	}
 }
 
@@ -438,6 +651,35 @@ func PreviewCommentDropIndexBlocked() string {
 				Table:  "customers",
 				Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`",
 			},
+		},
+	})
+}
+
+// PreviewCommentLintErrorsBlocked renders a sample plan where error-severity
+// schema lint violations block the apply. The reasons carry the raw
+// "[ERROR] linter:" prefixes engines report; the renderer strips them.
+func PreviewCommentLintErrorsBlocked() string {
+	return RenderUnsafeChangesBlocked(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` MODIFY COLUMN `id` int NOT NULL AUTO_INCREMENT;",
+					"ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;",
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "orders", Reason: `[ERROR] primary_key: Primary key column "id" has type "int"`},
+			{Table: "users", Reason: `[ERROR] rename_column: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled`},
 		},
 	})
 }
@@ -683,10 +925,7 @@ func PreviewCommentMultiEnvPlan() string {
 // with lint violations included in each environment's plan.
 func PreviewCommentMultiEnvPlanLint() string {
 	changes := samplePlanChanges()
-	lintViolations := []LintViolationData{
-		{Message: "Primary key uses signed integer type (should be UNSIGNED)", Table: "orders", LinterName: "primary_key"},
-		{Message: "Column uses utf8 charset (should be utf8mb4)", Table: "users", LinterName: "allow_charset"},
-	}
+	lintViolations := sampleLintWarnings()
 	return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database:     "testapp",
 		SchemaName:   "testapp",
@@ -1029,6 +1268,40 @@ func PreviewCommentApplyFailed() string {
 	return RenderApplyStatusComment(data)
 }
 
+// PreviewCommentApplyFailedBeforeRowCopy renders an apply comment where the
+// first table was rejected by an engine preflight check before any rows were
+// copied: the row renders without a progress bar and carries its own error
+// detail, while the apply-level failure reason holds the table-qualified form
+// promoted from the failed task.
+func PreviewCommentApplyFailedBeforeRowCopy() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Failed
+	tables[0].DDL = "ALTER TABLE `orders` MODIFY COLUMN `status` ENUM('NEW','PENDING','SHIPPED','DELIVERED') NOT NULL"
+	tables[0].ErrorMessage = PreviewErrorPreflightFailed
+	tables[1].Status = state.Task.Cancelled
+	tables[2].Status = state.Task.Cancelled
+	data := sampleApplyData(state.Apply.Failed, tables)
+	data.ErrorMessage = fmt.Sprintf("table %s failed: %s", tables[0].TableName, PreviewErrorPreflightFailed)
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyRetrying renders an apply comment where the middle table
+// was interrupted by a retryable failure and the driver is redispatching it,
+// with the attempt counter showing how much of the retry budget is used.
+func PreviewCommentApplyRetrying() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.FailedRetryable
+	tables[1].RowsCopied = 439870
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 30
+	tables[1].ErrorMessage = PreviewErrorMiddleFailed
+	tables[2].Status = state.Task.Pending
+	data := sampleApplyData(state.Apply.FailedRetryable, tables)
+	data.Attempt = 1
+	return RenderApplyStatusComment(data)
+}
+
 // PreviewCommentApplyStopped renders a sample apply-stopped comment.
 func PreviewCommentApplyStopped() string {
 	tables := sampleApplyTables()[:2]
@@ -1069,11 +1342,29 @@ func PreviewCommentApplyCancelled() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Cancelled, tables))
 }
 
-// PreviewCommentApplyWaitingForCutover renders a sample waiting-for-cutover comment.
+// PreviewCommentApplyWaitingForCutover renders a sample waiting-for-cutover
+// comment for a deferred apply, where cutover waits on an explicit operator
+// trigger and the footer offers the pasteable cutover command.
 func PreviewCommentApplyWaitingForCutover() string {
 	tables := sampleApplyTables()
 	for i := range tables {
 		tables[i].Status = state.Task.WaitingForCutover
+		tables[i].ReadyToComplete = TaskStatusReadyForCutover(tables[i].Status)
+	}
+	data := sampleApplyData(state.Apply.WaitingForCutover, tables)
+	data.DeferCutover = true
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyWaitingForCutoverAutomatic renders a sample
+// waiting-for-cutover comment for a non-deferred apply, where the drive
+// triggers cutover automatically and the footer tells the operator no action
+// is needed.
+func PreviewCommentApplyWaitingForCutoverAutomatic() string {
+	tables := sampleApplyTables()
+	for i := range tables {
+		tables[i].Status = state.Task.WaitingForCutover
+		tables[i].ReadyToComplete = true
 	}
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.WaitingForCutover, tables))
 }
@@ -1167,6 +1458,7 @@ func PreviewCommentMultiDeploymentApplyInProgress() string {
 	euTables := sampleApplyTables()
 	for i := range euTables {
 		euTables[i].Status = state.Task.WaitingForCutover
+		euTables[i].ReadyToComplete = TaskStatusReadyForCutover(euTables[i].Status)
 	}
 
 	usTables := sampleApplyTables()
@@ -1369,6 +1661,134 @@ func PreviewCommentApplySingleProgress() string {
 	return RenderApplyStatusComment(sampleSingleApplyData(state.Apply.Running, table))
 }
 
+// PreviewCommentApplySingleProgressVolume renders a single-table apply in
+// progress with a tuned volume level shown on the status line.
+func PreviewCommentApplySingleProgressVolume() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.Running
+	table.RowsCopied = 3500000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 48
+	table.ETASeconds = 330
+	data := sampleSingleApplyData(state.Apply.Running, table)
+	data.Volume = 8
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentVolumeSupersededProgress renders an old progress comment after
+// a volume change froze it: the final pre-change progress collapses into a
+// details block under a pointer to the fresh comment now tracking the apply.
+func PreviewCommentVolumeSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.Running
+	table.RowsCopied = 2300000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 32
+	table.ETASeconds = 780
+	data := sampleSingleApplyData(state.Apply.Running, table)
+	data.Volume = 3
+	return RenderVolumeSupersededProgressComment(VolumeSupersededProgressData{
+		Volume:       8,
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
+// PreviewCommentResumeSupersededProgress renders an old progress comment after
+// a resume froze it: the final pre-stop progress collapses into a details
+// block under a pointer to the fresh comment now tracking the apply.
+func PreviewCommentResumeSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.Stopped
+	table.RowsCopied = 2300000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 32
+	data := sampleSingleApplyData(state.Apply.Stopped, table)
+	return RenderResumeSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
+// PreviewCommentRevertSupersededProgress renders an old progress comment after
+// a user revert froze it: the final revert-window rendering collapses into a
+// details block under a pointer to the fresh comment now tracking the revert.
+func PreviewCommentRevertSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.RevertWindow
+	table.RowsCopied = 7200000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 100
+	data := sampleSingleApplyData(state.Apply.RevertWindow, table)
+	return RenderRevertSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
+// PreviewCommentSkipRevertSupersededProgress renders an old progress comment
+// after a skip-revert froze it: the final revert-window rendering collapses
+// into a details block under a pointer to the fresh comment now tracking the
+// finalizing schema change.
+func PreviewCommentSkipRevertSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.RevertWindow
+	table.RowsCopied = 7200000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 100
+	data := sampleSingleApplyData(state.Apply.RevertWindow, table)
+	return RenderSkipRevertSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
+// PreviewCommentCutoverSuperseded renders a spent cutover prompt after a
+// deferred cutover completed into a still-active apply: the prompt collapses
+// into a details block under a pointer to the fresh comment now tracking the
+// post-cutover phase.
+func PreviewCommentCutoverSuperseded() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.WaitingForCutover
+	table.RowsCopied = 7200000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 100
+	data := sampleSingleApplyData(state.Apply.WaitingForCutover, table)
+	return RenderCutoverSupersededComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
+// PreviewCommentSupersededProgress renders an old progress comment after a
+// freeze retry folded it without knowing which rotation superseded it: the
+// final progress collapses into a details block under a pointer to the fresh
+// comment now tracking the apply.
+func PreviewCommentSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.Stopped
+	table.RowsCopied = 2300000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 32
+	data := sampleSingleApplyData(state.Apply.Stopped, table)
+	return RenderSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
 // PreviewCommentApplySingleCompleted renders a single-table apply completed.
 func PreviewCommentApplySingleCompleted() string {
 	table := sampleSingleTable()
@@ -1422,6 +1842,40 @@ func PreviewCommentSummaryCompleted() string {
 	return RenderApplySummaryComment(sampleSummaryData(state.Apply.Completed, tables))
 }
 
+// sampleRollbackTables returns reverse-DDL table rows for rollback previews.
+func sampleRollbackTables(status string) []TableProgressData {
+	return []TableProgressData{
+		{
+			Namespace: "testapp",
+			TableName: "users",
+			DDL:       "ALTER TABLE `users` DROP INDEX `idx_email`",
+			Status:    status,
+		},
+	}
+}
+
+// PreviewCommentRollbackStatus renders the in-place status comment for a
+// running rollback apply — the headline carries rollback vocabulary for the
+// apply's whole lifetime.
+func PreviewCommentRollbackStatus() string {
+	tables := sampleRollbackTables(state.Task.Running)
+	tables[0].RowsCopied = 45000
+	tables[0].RowsTotal = 100000
+	tables[0].PercentComplete = 45
+	data := sampleApplyData(state.Apply.Running, tables)
+	data.Rollback = true
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentRollbackSummaryCompleted renders the terminal summary for a
+// completed rollback apply — announced as a rollback, never as an applied
+// schema change.
+func PreviewCommentRollbackSummaryCompleted() string {
+	data := sampleSummaryData(state.Apply.Completed, sampleRollbackTables(state.Task.Completed))
+	data.Rollback = true
+	return RenderApplySummaryComment(data)
+}
+
 // PreviewCommentSummaryCompletedVitessDDLWithVSchema renders a completed Vitess
 // summary where the schema change included both table work and VSchema updates.
 func PreviewCommentSummaryCompletedVitessDDLWithVSchema() string {
@@ -1451,7 +1905,8 @@ func PreviewCommentSummaryCompletedVitessVSchemaOnly() string {
 	return RenderApplySummaryComment(data)
 }
 
-// PreviewCommentSummaryFailed renders a sample failed summary comment.
+// PreviewCommentSummaryFailed renders a sample failed summary comment,
+// including the collapsed recent-logs section every failed summary carries.
 func PreviewCommentSummaryFailed() string {
 	tables := sampleApplyTables()
 	tables[0].Status = state.Task.Completed
@@ -1463,7 +1918,8 @@ func PreviewCommentSummaryFailed() string {
 	tables[2].Status = state.Task.Cancelled
 	data := sampleSummaryData(state.Apply.Failed, tables)
 	data.ErrorMessage = "table users failed: schema change failed: unsafe warning: Field 'name' doesn't have a default value"
-	return RenderApplySummaryComment(data)
+	return RenderApplySummaryComment(data) +
+		RenderRecentFailureLogs(sampleFailureLogEntries("users", "unsafe warning: Field 'name' doesn't have a default value"), GitHubIssueCommentMaxChars, false)
 }
 
 // PreviewCommentSummaryStopped renders a sample stopped summary comment.
@@ -1518,7 +1974,8 @@ func PreviewCommentSummaryFailedLarge() string {
 	}
 	data := sampleSummaryDataWithDuration(state.Apply.Failed, tables, 3*time.Hour+30*time.Minute)
 	data.ErrorMessage = "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"
-	return RenderApplySummaryComment(data)
+	return RenderApplySummaryComment(data) +
+		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"), GitHubIssueCommentMaxChars, false)
 }
 
 // PreviewCommentSummaryMultiNamespaceFailed renders a failed summary with tables from multiple namespaces.
@@ -1532,7 +1989,8 @@ func PreviewCommentSummaryMultiNamespaceFailed() string {
 	}
 	data := sampleSummaryData(state.Apply.Failed, tables)
 	data.ErrorMessage = "table customers.addresses failed: Error 1205: Lock wait timeout exceeded"
-	return RenderApplySummaryComment(data)
+	return RenderApplySummaryComment(data) +
+		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1205: Lock wait timeout exceeded"), GitHubIssueCommentMaxChars, false)
 }
 
 // PreviewCommentSummaryMultiNamespaceCompleted renders a completed summary with tables from multiple namespaces.

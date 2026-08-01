@@ -15,6 +15,7 @@ type spiritLogFilter struct {
 	handler  slog.Handler
 	debugRef *bool                                      // Pointer to engine's debugLogs setting for runtime toggle
 	onLogRef *func(level slog.Level, table, msg string) // Pointer to engine's onLog callback (with table context)
+	table    string                                     // Table attr attached via Logger.With, used when a record carries none
 }
 
 func (f *spiritLogFilter) Enabled(ctx context.Context, level slog.Level) bool {
@@ -31,8 +32,11 @@ func (f *spiritLogFilter) Handle(ctx context.Context, r slog.Record) error {
 
 	// Route INFO+ logs to ApplyLogStore
 	if f.onLogRef != nil && *f.onLogRef != nil && r.Level >= slog.LevelInfo {
-		// Extract table name and error/reason from slog attributes
-		tableName := ""
+		// Extract table name and error/reason from slog attributes. Record
+		// attrs (call-site) take precedence over the logger-level table attr
+		// captured in WithAttrs — slog routes Logger.With attrs through the
+		// handler, so r.Attrs never sees them.
+		tableName := f.table
 		errorMsg := ""
 		r.Attrs(func(a slog.Attr) bool {
 			switch a.Key {
@@ -55,9 +59,15 @@ func (f *spiritLogFilter) Handle(ctx context.Context, r slog.Record) error {
 }
 
 func (f *spiritLogFilter) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &spiritLogFilter{handler: f.handler.WithAttrs(attrs), debugRef: f.debugRef, onLogRef: f.onLogRef}
+	table := f.table
+	for _, a := range attrs {
+		if a.Key == "table" {
+			table = a.Value.String()
+		}
+	}
+	return &spiritLogFilter{handler: f.handler.WithAttrs(attrs), debugRef: f.debugRef, onLogRef: f.onLogRef, table: table}
 }
 
 func (f *spiritLogFilter) WithGroup(name string) slog.Handler {
-	return &spiritLogFilter{handler: f.handler.WithGroup(name), debugRef: f.debugRef, onLogRef: f.onLogRef}
+	return &spiritLogFilter{handler: f.handler.WithGroup(name), debugRef: f.debugRef, onLogRef: f.onLogRef, table: f.table}
 }

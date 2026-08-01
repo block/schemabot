@@ -6,6 +6,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 )
@@ -45,13 +46,36 @@ type DeploymentPlanDiff struct {
 // spurious primary-vs-primary mismatch.
 //
 // Per-deployment failures are captured in each result's Err so one unreachable
-// deployment neither hides the others nor aborts the rollup; only a
-// request-level failure (target resolution) returns an error. Results are
+// deployment neither hides the others nor aborts the rollup. Results are
 // returned in rollout order, primary first.
-func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse) ([]DeploymentPlanDiff, error) {
-	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
-	if err != nil {
-		return nil, fmt.Errorf("resolve deployment targets for %s/%s: %w", req.Database, req.Environment, err)
+//
+// targets is the resolved deployment set in rollout order (primary first),
+// supplied by the caller so a database/environment is resolved once per rollup
+// rather than re-resolved here. It must be non-empty.
+//
+// primaryDeployment is the deployment the reviewed primaryPlan was created
+// against (rollout index 0 at plan time). When a primaryPlan is reused, it is
+// checked against targets[0] here so a deployment-order change between plan and
+// rollup — which would map the reviewed baseline onto a different deployment —
+// fails closed rather than being compared against the wrong live schema.
+func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryDeployment string, targets []routing.ExecutionTarget) ([]DeploymentPlanDiff, error) {
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("no deployment targets for %s/%s", req.Database, req.Environment)
+	}
+
+	// Reusing primaryPlan for the primary member assumes it was created against
+	// the deployment now at rollout index 0. Verify that against the plan's
+	// recorded origin deployment (captured at plan time) and fail closed on a
+	// mismatch — e.g. deployment_order changed between plan and rollup — rather
+	// than comparing deployments against a baseline built for a different
+	// deployment.
+	if primaryPlan != nil {
+		if primaryDeployment == "" {
+			return nil, fmt.Errorf("plan diff for %s/%s: reviewed plan has no origin deployment to verify the primary against", req.Database, req.Environment)
+		}
+		if targets[0].Deployment != primaryDeployment {
+			return nil, fmt.Errorf("primary invariant violated for %s/%s: rollout index 0 is %q but the reviewed plan was created against %q", req.Database, req.Environment, targets[0].Deployment, primaryDeployment)
+		}
 	}
 
 	results := make([]DeploymentPlanDiff, len(targets))
@@ -65,9 +89,10 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			Target:       target.Target,
 		}
 
-		// Rollout index 0 is the primary. When its reviewed plan is provided,
-		// reuse it so the rollup's primary member is exactly what was reviewed and
-		// no redundant live-schema read runs.
+		// Rollout index 0 is the primary (ResolveDatabaseTargets returns targets
+		// primary-first; the guard above enforces it). When its reviewed plan is
+		// provided, reuse it so the rollup's primary member is exactly what was
+		// reviewed and no redundant live-schema read runs.
 		if i == 0 && primaryPlan != nil {
 			results[i].Engine = primaryPlan.Engine
 			results[i].Changes = primaryPlan.Changes
@@ -82,7 +107,6 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			continue
 		}
 
-		i, target := i, target
 		g.Go(func() error {
 			resp, err := s.planDeploymentDiff(gctx, req, target)
 			if err != nil {
@@ -92,6 +116,7 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 					"deployment", target.Deployment,
 					"target", target.Target,
 					"error", err)
+				metrics.RecordDeploymentDiff(gctx, req.Database, target.Deployment, req.Environment, "errored")
 				results[i].Err = err
 				return nil
 			}
@@ -110,8 +135,11 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 					"deployment", target.Deployment,
 					"target", target.Target,
 					"error", diffErr)
+				metrics.RecordDeploymentDiff(gctx, req.Database, target.Deployment, req.Environment, "errored")
 				results[i].Err = diffErr
+				return nil
 			}
+			metrics.RecordDeploymentDiff(gctx, req.Database, target.Deployment, req.Environment, "ok")
 			return nil
 		})
 	}

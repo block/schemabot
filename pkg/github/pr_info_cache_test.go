@@ -34,7 +34,7 @@ func TestFetchPullRequest_CacheCollapsesDuplicateCallsWithinScope(t *testing.T) 
 
 	ctx := WithPRInfoCache(t.Context())
 
-	want := &PullRequestInfo{HeadRef: "feature", HeadSHA: "abc123", BaseRef: "main", BaseSHA: "def456", User: "octocat"}
+	want := &PullRequestInfo{HeadRef: "feature", HeadSHA: "abc123", BaseRef: "main", User: "octocat"}
 
 	got, err := ic1.FetchPullRequest(ctx, "octo/repo", 42)
 	require.NoError(t, err)

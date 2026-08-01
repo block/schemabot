@@ -19,4 +19,6 @@ storage:
 scrape_configs:
   - job_name: schemabot
     static_configs:
-      - targets: ["schemabot:8080"]
+      # The dedicated metrics listener (metrics_port, default 9102) — /metrics
+      # is not served on the API port.
+      - targets: ["schemabot:9102"]

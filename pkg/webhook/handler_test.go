@@ -230,6 +230,63 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 
 		assert.NotContains(t, body, "Support:")
 	})
+
+	t.Run("appends to unsafe-changes apply refusals", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment(templates.PreviewCommentUnsafeBlocked())
+
+		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
+	})
+
+	t.Run("appends to unmanaged schema change notices", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment(templates.RenderUnmanagedSchemaConfigsNotice([]templates.UnmanagedSchemaConfigNoticeData{
+			{SchemaPath: "services/orders/schema", Database: "orders"},
+		}))
+
+		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
+	})
+
+	t.Run("does not append to plan comments with unsafe-change advisories", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment(templates.RenderPlanComment(templates.PlanCommentData{
+			Database:    "orders",
+			SchemaName:  "orders",
+			Environment: "staging",
+			IsMySQL:     true,
+			Changes: []templates.KeyspaceChangeData{{
+				Keyspace:   "orders",
+				Statements: []string{"ALTER TABLE `users` DROP INDEX `idx_email`;"},
+			}},
+			HasUnsafeChanges: true,
+			UnsafeChanges: []templates.UnsafeChangeData{
+				{Table: "users", Reason: "DROP INDEX idx_email"},
+			},
+		}))
+
+		assert.NotContains(t, body, "Support:")
+	})
 }
 
 func TestHandleSchemaRequestErrorRendersConfigNotAuthorized(t *testing.T) {
@@ -420,6 +477,104 @@ func TestWebhookMissingEnvForApply(t *testing.T) {
 	}
 }
 
+// A malformed -e value — typically a flag glued onto the environment by a
+// missing space — can never match any instance's allowed environments, so the
+// command is rejected with a usage comment and an eyes acknowledgment rather
+// than left unanswered.
+func TestWebhookInvalidEnvValue(t *testing.T) {
+	h, comments, reactions := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e production--allow-unsafe",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "invalid environment value")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Invalid Environment")
+		assert.Contains(t, body, "**Available environments**: `production`, `staging`")
+		assert.Contains(t, body, "schemabot apply -e <environment>")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the invalid environment comment")
+	}
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the acknowledgment reaction")
+	}
+}
+
+// In an environment-isolated deployment, an environment no instance handles
+// is rejected with an eyes acknowledgment and an invalid-environment comment
+// listing the configured environments, instead of every instance silently
+// deferring to a peer that does not exist.
+func TestWebhookUnknownEnvironmentRejected(t *testing.T) {
+	h, comments, reactions := newTestHandler(t)
+	h.service.Config().AllowedEnvironments = []string{"staging"}
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e prodction",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "unknown environment")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Invalid Environment")
+		assert.Contains(t, body, "`staging`")
+		assert.Contains(t, body, "`production`")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the invalid environment comment")
+	}
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the acknowledgment reaction")
+	}
+}
+
+// An environment owned by a peer instance stays silent here: the peer
+// processes the command from its own webhook delivery, and a reaction or
+// comment from this instance would be noise next to the peer's real response.
+func TestWebhookPeerEnvironmentStaysSilent(t *testing.T) {
+	h, comments, reactions := newTestHandler(t)
+	h.service.Config().AllowedEnvironments = []string{"staging"}
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e production",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "environment handled by another instance")
+
+	select {
+	case body := <-comments:
+		t.Fatalf("unexpected comment posted for a peer-owned environment: %s", body)
+	case reaction := <-reactions:
+		t.Fatalf("unexpected reaction for a peer-owned environment: %s", reaction)
+	default:
+	}
+}
+
 func TestWebhookYesFlagRejectedOnNonApply(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 
@@ -460,6 +615,8 @@ func TestWebhookControlCommandMissingApplyID(t *testing.T) {
 		{name: "cancel", comment: "schemabot cancel -e staging", action: "cancel"},
 		{name: "start", comment: "schemabot start -e staging", action: "start"},
 		{name: "cutover", comment: "schemabot cutover -e staging", action: "cutover"},
+		{name: "volume", comment: "schemabot volume -e staging -v 8", action: "volume"},
+		{name: "volume without level", comment: "schemabot volume -e staging", action: "volume"},
 	}
 
 	for _, tt := range tests {
@@ -483,6 +640,48 @@ func TestWebhookControlCommandMissingApplyID(t *testing.T) {
 				assert.Contains(t, body, "schemabot "+tt.action+" <apply-id> -e <environment>")
 			case <-time.After(2 * time.Second):
 				t.Fatal("timed out waiting for missing apply ID comment")
+			}
+		})
+	}
+}
+
+// TestWebhookVolumeCommandInvalidLevel verifies that a volume command with a
+// missing, non-numeric, or out-of-range -v level posts a usage comment naming
+// the valid range and exact syntax instead of silently dropping the command.
+func TestWebhookVolumeCommandInvalidLevel(t *testing.T) {
+	tests := []struct {
+		name    string
+		comment string
+	}{
+		{name: "missing -v flag", comment: "schemabot volume apply_abc123 -e staging"},
+		{name: "-v without value", comment: "schemabot volume apply_abc123 -e staging -v"},
+		{name: "non-numeric level", comment: "schemabot volume apply_abc123 -e staging -v fast"},
+		{name: "level below range", comment: "schemabot volume apply_abc123 -e staging -v 0"},
+		{name: "level above range", comment: "schemabot volume apply_abc123 -e staging -v 12"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, comments, _ := newTestHandler(t)
+
+			req := buildWebhookRequest(t, webhookPayloadOpts{
+				comment: tt.comment,
+				isPR:    true,
+			}, nil)
+
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+
+			require.Equal(t, http.StatusOK, rr.Code)
+			assert.Contains(t, rr.Body.String(), "volume started")
+
+			select {
+			case body := <-comments:
+				assert.Contains(t, body, "Missing or Invalid Volume Level")
+				assert.Contains(t, body, "schemabot volume <apply-id> -e <environment> -v <level>")
+				assert.Contains(t, body, "between 1 (slowest) and 11 (fastest)")
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for invalid volume level comment")
 			}
 		})
 	}
@@ -581,11 +780,12 @@ func TestWebhookIgnoresSchemaBotProse(t *testing.T) {
 	}
 }
 
-func TestWebhookEyesReaction(t *testing.T) {
+// On a repo with no aggregate role this deployment is the only SchemaBot, so
+// the acknowledgment fires at dispatch — the user sees the eyes reaction
+// immediately, before schema discovery runs.
+func TestWebhookEyesReactionAtDispatchForSingleDeploymentRepo(t *testing.T) {
 	h, _, reactions := newTestHandler(t)
 
-	// Use an env-scoped command that reaches the reaction point (after all
-	// skip/filter checks). Help returns before the reaction fires.
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot plan -e staging",
 		isPR:    true,
@@ -600,7 +800,64 @@ func TestWebhookEyesReaction(t *testing.T) {
 	case reaction := <-reactions:
 		assert.Equal(t, "eyes", reaction)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for eyes reaction")
+		t.Fatal("timed out waiting for the dispatch acknowledgment reaction")
+	}
+}
+
+// A bare "schemabot plan" (no -e) fans out to every configured environment,
+// but the acknowledgment contract is the same as its scoped siblings: on a
+// repo with no aggregate role this deployment is the only SchemaBot, so the
+// eyes reaction fires at dispatch, before any discovery runs.
+func TestWebhookEyesReactionAtDispatchForBareMultiEnvPlan(t *testing.T) {
+	h, _, reactions := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the bare-plan dispatch acknowledgment")
+	}
+}
+
+// A -t-scoped command names its actor, so the addressed tenant acknowledges
+// at dispatch — instantly, before any schema discovery — even on an
+// aggregate-role repo.
+func TestWebhookEyesReactionAtDispatchForTenantScopedCommand(t *testing.T) {
+	h, _, reactions := newTestHandler(t)
+	cfg := h.service.Config()
+	cfg.Tenant = "tenant-b"
+	repoCfg := cfg.Repos["octocat/hello-world"]
+	repoCfg.Aggregate = &api.AggregateConfig{Role: api.AggregateRoleParticipant}
+	if cfg.Repos == nil {
+		cfg.Repos = map[string]api.RepoConfig{}
+	}
+	cfg.Repos["octocat/hello-world"] = repoCfg
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging -t tenant-b",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the scoped-command dispatch acknowledgment")
 	}
 }
 

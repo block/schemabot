@@ -35,6 +35,7 @@ const (
 	PreviewLockReleased      PreviewType = "lock_released"
 	PreviewLocksList         PreviewType = "locks_list"
 	PreviewNoLockFound       PreviewType = "no_lock_found"
+	PreviewLockOtherType     PreviewType = "lock_other_type"
 	PreviewUnlockNotOwned    PreviewType = "unlock_not_owned"
 	PreviewAll               PreviewType = "all"
 
@@ -109,35 +110,44 @@ const (
 	PreviewExitAll          PreviewType = "exit_all"           // Show all exit context previews
 
 	// Comment template previews (GitHub PR comments)
-	PreviewCommentPlan                  PreviewType = "comment_plan"                    // Plan comment with DDL changes + lint violations
-	PreviewCommentPlanTenant            PreviewType = "comment_plan_tenant"             // Tenant-targeted plan comment
-	PreviewCommentPlanEmpty             PreviewType = "comment_plan_empty"              // Plan comment with no changes
-	PreviewCommentNoManagedSchema       PreviewType = "comment_no_managed_schema"       // No managed schema changes in current PR
-	PreviewCommentReconcileInProgress   PreviewType = "comment_reconcile_in_progress"   // Empty diff with in-progress apply-owned state
-	PreviewCommentReconcileCompleted    PreviewType = "comment_reconcile_completed"     // Empty diff with completed apply-owned state
-	PreviewCommentMultiEnv              PreviewType = "comment_multi_env"               // Multi-env plan (identical, deduplicated)
-	PreviewCommentMultiEnvDiff          PreviewType = "comment_multi_env_diff"          // Multi-env plan (different per env)
-	PreviewCommentMultiEnvLint          PreviewType = "comment_multi_env_lint"          // Multi-env plan with lint violations
-	PreviewCommentVitessPlan            PreviewType = "comment_vitess_plan"             // Vitess plan with keyspaces + VSchema
-	PreviewCommentVitessApplyPlan       PreviewType = "comment_vitess_apply_plan"       // Locked Vitess apply-plan with options
-	PreviewCommentMySQLMultiSchema      PreviewType = "comment_mysql_multi_schema"      // MySQL plan with multiple schema names
-	PreviewCommentHelp                  PreviewType = "comment_help"                    // Help command reference comment
-	PreviewCommentSupportChannel        PreviewType = "comment_support_channel"         // Comment with support-channel footer
-	PreviewCommentErrors                PreviewType = "comment_errors"                  // All error comment templates
-	PreviewCommentUnsafeBlocked         PreviewType = "comment_unsafe_blocked"          // Unsafe changes blocked (no --allow-unsafe)
-	PreviewCommentDropColumnBlocked     PreviewType = "comment_drop_column_blocked"     // Drop column blocked with destructive-drop guidance
-	PreviewCommentDropIndexBlocked      PreviewType = "comment_drop_index_blocked"      // Drop index blocked with destructive-drop guidance
-	PreviewCommentApplyPlan             PreviewType = "comment_apply_plan"              // Locked apply-plan comment
-	PreviewCommentApplyPlanOptions      PreviewType = "comment_apply_plan_options"      // Locked apply-plan with options
-	PreviewCommentApplyPlanUnsafe       PreviewType = "comment_apply_plan_unsafe"       // Locked apply-plan with unsafe warning
-	PreviewCommentApplyPlanDowngraded   PreviewType = "comment_apply_plan_downgraded"   // Locked apply-plan downgraded to manual confirmation
-	PreviewCommentApplyProgress         PreviewType = "comment_apply_progress"          // Apply in progress (1 done, 1 running, 1 pending)
-	PreviewCommentApplyEstimateExceeded PreviewType = "comment_apply_estimate_exceeded" // Apply in progress after row estimate was exceeded
-	PreviewCommentApplyCompleted        PreviewType = "comment_apply_completed"         // Apply completed (all tables done)
-	PreviewCommentApplyFailed           PreviewType = "comment_apply_failed"            // Apply failed (1 done, 1 failed, 1 cancelled)
-	PreviewCommentApplyStopped          PreviewType = "comment_apply_stopped"           // Apply stopped (1 done, 1 stopped)
-	PreviewCommentApplyWaitingCutover   PreviewType = "comment_apply_waiting_cutover"   // Waiting for cutover
-	PreviewCommentApplyCuttingOver      PreviewType = "comment_apply_cutting_over"      // Cutting over
+	PreviewCommentPlan                         PreviewType = "comment_plan"                            // Plan comment with DDL changes + lint violations
+	PreviewCommentPlanBlocked                  PreviewType = "comment_plan_blocked"                    // Plan with a statement the engine refuses (blocked verdict)
+	PreviewCommentPlanDirect                   PreviewType = "comment_plan_direct"                     // Locked plan with a statement routed to direct execution (direct verdict)
+	PreviewCommentApplyBlockedRejected         PreviewType = "comment_apply_blocked_rejected"          // Apply rejected: plan contains engine-blocked statements
+	PreviewCommentPlanTenant                   PreviewType = "comment_plan_tenant"                     // Tenant-targeted plan comment
+	PreviewCommentPlanEmpty                    PreviewType = "comment_plan_empty"                      // Plan comment with no changes
+	PreviewCommentNoManagedSchema              PreviewType = "comment_no_managed_schema"               // No managed schema changes in current PR
+	PreviewCommentChecksRefreshed              PreviewType = "comment_checks_refreshed"                // Plan on no-schema-changes PR recreated passing checks
+	PreviewCommentChecksRefreshedTenant        PreviewType = "comment_checks_refreshed_tenant"         // Checks refreshed but gated on tenant deployments
+	PreviewCommentReconcileInProgress          PreviewType = "comment_reconcile_in_progress"           // Empty diff with in-progress apply-owned state
+	PreviewCommentReconcileCompleted           PreviewType = "comment_reconcile_completed"             // Empty diff with completed apply-owned state
+	PreviewCommentMultiEnv                     PreviewType = "comment_multi_env"                       // Multi-env plan (identical, deduplicated)
+	PreviewCommentMultiEnvDiff                 PreviewType = "comment_multi_env_diff"                  // Multi-env plan (different per env)
+	PreviewCommentMultiEnvLint                 PreviewType = "comment_multi_env_lint"                  // Multi-env plan with lint violations
+	PreviewCommentVitessPlan                   PreviewType = "comment_vitess_plan"                     // Vitess plan with keyspaces + VSchema
+	PreviewCommentVitessApplyPlan              PreviewType = "comment_vitess_apply_plan"               // Locked Vitess apply-plan with options
+	PreviewCommentMySQLMultiSchema             PreviewType = "comment_mysql_multi_schema"              // MySQL plan with multiple schema names
+	PreviewCommentHelp                         PreviewType = "comment_help"                            // Help command reference comment
+	PreviewCommentSupportChannel               PreviewType = "comment_support_channel"                 // Comment with support-channel footer
+	PreviewCommentErrors                       PreviewType = "comment_errors"                          // All error comment templates
+	PreviewCommentUnsafeBlocked                PreviewType = "comment_unsafe_blocked"                  // Unsafe changes blocked (no --allow-unsafe)
+	PreviewCommentDropColumnBlocked            PreviewType = "comment_drop_column_blocked"             // Drop column blocked with destructive-drop guidance
+	PreviewCommentDropIndexBlocked             PreviewType = "comment_drop_index_blocked"              // Drop index blocked with destructive-drop guidance
+	PreviewCommentLintErrorsBlocked            PreviewType = "comment_lint_errors_blocked"             // Error-severity schema lint violations block apply
+	PreviewCommentApplyPlan                    PreviewType = "comment_apply_plan"                      // Locked apply-plan comment
+	PreviewCommentApplyPlanOptions             PreviewType = "comment_apply_plan_options"              // Locked apply-plan with options
+	PreviewCommentApplyPlanUnsafe              PreviewType = "comment_apply_plan_unsafe"               // Locked apply-plan with unsafe warning
+	PreviewCommentApplyPlanDowngraded          PreviewType = "comment_apply_plan_downgraded"           // Locked apply-plan downgraded to manual confirmation
+	PreviewCommentApplyProgress                PreviewType = "comment_apply_progress"                  // Apply in progress (1 done, 1 running, 1 pending)
+	PreviewCommentApplyEstimateExceeded        PreviewType = "comment_apply_estimate_exceeded"         // Apply in progress after row estimate was exceeded
+	PreviewCommentApplyCompleted               PreviewType = "comment_apply_completed"                 // Apply completed (all tables done)
+	PreviewCommentApplyFailed                  PreviewType = "comment_apply_failed"                    // Apply failed (1 done, 1 failed, 1 cancelled)
+	PreviewCommentApplyFailedBeforeRowCopy     PreviewType = "comment_apply_failed_before_row_copy"    // Apply failed before row copy (preflight rejection, per-table error)
+	PreviewCommentApplyRetrying                PreviewType = "comment_apply_retrying"                  // Apply interrupted, retrying automatically (attempt counter)
+	PreviewCommentApplyStopped                 PreviewType = "comment_apply_stopped"                   // Apply stopped (1 done, 1 stopped)
+	PreviewCommentApplyWaitingCutover          PreviewType = "comment_apply_waiting_cutover"           // Waiting for cutover (deferred, operator triggers)
+	PreviewCommentApplyWaitingCutoverAutomatic PreviewType = "comment_apply_waiting_cutover_automatic" // Waiting for cutover (non-deferred, drive triggers)
+	PreviewCommentApplyCuttingOver             PreviewType = "comment_apply_cutting_over"              // Cutting over
 
 	// Multi-deployment apply comment previews (one apply fanned out across deployments)
 	PreviewCommentMultiDeployInProgress PreviewType = "comment_multi_deploy_in_progress" // Barrier rollout mid-flight
@@ -175,6 +185,7 @@ const (
 	PreviewCommentApplyBlockedCLI       PreviewType = "comment_apply_blocked_cli"            // Apply blocked by CLI session
 	PreviewCommentApplyActive           PreviewType = "comment_apply_active"                 // Apply already in progress
 	PreviewCommentApplyNoLock           PreviewType = "comment_apply_no_lock"                // No lock found
+	PreviewCommentBaseSchemaStale       PreviewType = "comment_base_schema_stale"            // Base schema changed after PR divergence
 	PreviewCommentBlockedByPriorEnv     PreviewType = "comment_blocked_prior_env"            // Blocked by staging (pending)
 	PreviewCommentBlockedByPriorFailed  PreviewType = "comment_blocked_prior_env_failed"     // Blocked by staging (failed)
 	PreviewCommentBlockedByPriorInProg  PreviewType = "comment_blocked_prior_env_inprogress" // Blocked by staging (in progress)
@@ -189,5 +200,6 @@ const (
 	PreviewCommentStartPending          PreviewType = "comment_start_pending"                // Start command when start is already pending
 	PreviewCommentCutoverAccepted       PreviewType = "comment_cutover_accepted"             // Cutover command accepted
 	PreviewCommentCutoverActive         PreviewType = "comment_cutover_active"               // Cutover command when cutover is already in progress
-	PreviewCommentApplyAllType          PreviewType = "comment_apply_all"                    // Show all apply comment previews
+	PreviewCommentVolumeAccepted        PreviewType = "comment_volume_accepted"              // Volume command accepted
+	PreviewCommentVolumeInvalid         PreviewType = "comment_volume_invalid"               // Volume command with a missing or invalid level
 )

@@ -19,7 +19,12 @@
 #                             predecessor land (OC-5), the healthy sibling parks
 #                             at waiting_for_cutover and the scenario is expected
 #                             to fail.
-# Both use cutover_policy: barrier and deployment_order [eu, us].
+#   - production-pause     -> on_failure: pause: a failed deployment holds the
+#                             rollout in the non-terminal paused state until an
+#                             operator releases it (`schemabot release`) so the
+#                             remaining deployments proceed, or aborts it with
+#                             `schemabot stop`.
+# All use cutover_policy: barrier and deployment_order [eu, us].
 
 # SchemaBot's own storage database
 storage:
@@ -50,12 +55,25 @@ databases:
             target: testapp
           us:
             target: testapp
+      production-pause:
+        cutover_policy: barrier
+        on_failure: pause
+        deployment_order:
+          - eu
+          - us
+        deployments:
+          eu:
+            target: testapp
+          us:
+            target: testapp
 
-# Per-deployment Tern gRPC endpoints. Both environments reuse the same Terns.
+# Per-deployment Tern gRPC endpoints. All environments reuse the same Terns.
 tern_deployments:
   eu:
     production: "tern-eu:9090"
     production-continue: "tern-eu:9090"
+    production-pause: "tern-eu:9090"
   us:
     production: "tern-us:9090"
     production-continue: "tern-us:9090"
+    production-pause: "tern-us:9090"

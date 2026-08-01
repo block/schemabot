@@ -13,6 +13,10 @@ var (
 	// ErrLockNotOwned is returned when attempting to release a lock not owned by caller.
 	ErrLockNotOwned = errors.New("lock not owned by caller")
 
+	// ErrLockIntentChanged is returned when an apply's captured lock owner or
+	// pending plan no longer matches at durable apply creation time.
+	ErrLockIntentChanged = errors.New("lock intent changed")
+
 	// ErrCheckNotFound is returned when a check does not exist.
 	ErrCheckNotFound = errors.New("check not found")
 
@@ -58,4 +62,10 @@ var (
 
 	// ErrEngineResumeStateNotFound is returned when no opaque engine resume state exists for an operation.
 	ErrEngineResumeStateNotFound = errors.New("engine resume state not found")
+
+	// ErrWebhookEventNotFound is returned when a durable webhook event does not exist.
+	ErrWebhookEventNotFound = errors.New("webhook event not found")
+
+	// ErrWebhookEventLeaseLost is returned when a driver no longer owns a durable webhook event.
+	ErrWebhookEventLeaseLost = errors.New("webhook event lease lost")
 )

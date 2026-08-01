@@ -58,13 +58,15 @@ type SecretRefCredentialResolver struct {
 
 var _ CredentialResolver = SecretRefCredentialResolver{}
 
-// ResolveCredentials resolves the password reference fresh on every call.
-func (r SecretRefCredentialResolver) ResolveCredentials(_ context.Context, req Request, _ map[string]string) (*Credentials, error) {
+// ResolveCredentials resolves the password reference fresh on every call. The
+// resolution is bounded by ctx, so a per-request secret fetch honors the
+// caller's deadline.
+func (r SecretRefCredentialResolver) ResolveCredentials(ctx context.Context, req Request, _ map[string]string) (*Credentials, error) {
 	if r.PasswordRef == "" {
 		return nil, fmt.Errorf("password reference is required for target %q", req.Target)
 	}
 	ref := strings.ReplaceAll(r.PasswordRef, "{target}", req.Target)
-	password, err := secrets.Resolve(ref, "")
+	password, err := secrets.ResolveContext(ctx, ref, "")
 	if err != nil {
 		return nil, fmt.Errorf("resolve password for target %q: %w", req.Target, err)
 	}

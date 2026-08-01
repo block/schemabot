@@ -27,7 +27,6 @@ CREATE TABLE `tasks` (
   `checksum_rows_total` bigint DEFAULT '0',
   `cutover_attempts` int NOT NULL DEFAULT '0',
   `is_instant` tinyint(1) DEFAULT '0',
-  `ready_to_complete` tinyint(1) DEFAULT '0',
   `engine_migration_id` varchar(255) DEFAULT NULL,
   `started_at` datetime DEFAULT NULL,
   `completed_at` datetime DEFAULT NULL,

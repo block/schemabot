@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,7 +16,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
@@ -33,6 +36,7 @@ func TestServerConfig_OnFailure(t *testing.T) {
 					"unset":    {Target: "payments", Deployment: "payments-a"},
 					"halt":     {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, OnFailure: storage.OnFailureHalt},
 					"continue": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, OnFailure: storage.OnFailureContinue},
+					"pause":    {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, OnFailure: storage.OnFailurePause},
 				},
 			},
 		},
@@ -41,6 +45,7 @@ func TestServerConfig_OnFailure(t *testing.T) {
 	assert.Equal(t, storage.OnFailureHalt, cfg.OnFailure("payments", "unset"), "unset defaults to halting")
 	assert.Equal(t, storage.OnFailureHalt, cfg.OnFailure("payments", "halt"), "explicit halt halts")
 	assert.Equal(t, storage.OnFailureContinue, cfg.OnFailure("payments", "continue"), "explicit continue does not halt")
+	assert.Equal(t, storage.OnFailurePause, cfg.OnFailure("payments", "pause"), "explicit pause resolves to pause")
 	assert.Equal(t, storage.OnFailureHalt, cfg.OnFailure("payments", "missing-env"), "unconfigured env defaults to halting")
 	assert.Equal(t, storage.OnFailureHalt, cfg.OnFailure("missing-db", "continue"), "unconfigured database defaults to halting")
 }
@@ -160,6 +165,33 @@ databases:
 	assert.Equal(t, "endpoints.primary.port", targetDSNFrom.ConfigPaths.Port)
 	assert.Equal(t, "endpoints.primary.database", targetDSNFrom.ConfigPaths.Database)
 	assert.Equal(t, map[string]string{"parseTime": "true"}, targetDSNFrom.Params)
+}
+
+func TestLoadServerConfigFromFile_StaticTargetDSNFrom(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	content := `
+storage:
+  dsn: env:MYSQL_DSN
+target_resolver:
+  targets:
+    example-target:
+      type: mysql
+      dsn_from:
+        config_ref: secretsmanager:/example/schemabot/target-credentials
+        password_ref: secretsmanager:/example/schemabot/target-credentials#password
+        username: schemabot
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644), "write config file")
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+	target := cfg.TargetResolver.Targets["example-target"]
+	assert.Equal(t, "mysql", target.DatabaseType)
+	require.NotNil(t, target.DSNFrom)
+	assert.Equal(t, "schemabot", target.DSNFrom.Username)
+	assert.Equal(t, "secretsmanager:/example/schemabot/target-credentials", target.DSNFrom.ConfigRef)
+	assert.Equal(t, "secretsmanager:/example/schemabot/target-credentials#password", target.DSNFrom.PasswordRef)
 }
 
 func TestLoadServerConfigFromFile_NotFound(t *testing.T) {
@@ -592,6 +624,30 @@ func TestServerConfig_Validate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "postgres database type is valid",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         storage.DatabaseTypePostgres,
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "postgres://localhost/mydb"}},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "unknown database type is rejected",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "cockroach",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
 			name:    "missing databases",
 			cfg:     ServerConfig{},
 			wantErr: true,
@@ -693,6 +749,37 @@ func TestServerConfig_ValidateRejectsLocalRemoteRouteCollision(t *testing.T) {
 // A non-empty but unparseable revert_window_duration is a startup config error
 // so a typo (e.g. "30 minutes") fails closed instead of silently reverting to
 // the engine default window.
+// MetricsListenPort defaults to DefaultMetricsPort and honors an explicit
+// metrics_port override.
+func TestServerConfig_MetricsListenPort(t *testing.T) {
+	cfg := ServerConfig{}
+	assert.Equal(t, DefaultMetricsPort, cfg.MetricsListenPort(), "unset metrics_port defaults")
+
+	cfg.MetricsPort = 9464
+	assert.Equal(t, 9464, cfg.MetricsListenPort(), "explicit metrics_port wins")
+}
+
+// A metrics_port outside the TCP port range fails closed at config load.
+func TestServerConfig_ValidateRejectsInvalidMetricsPort(t *testing.T) {
+	for _, port := range []int{-1, 65536} {
+		cfg := ServerConfig{
+			MetricsPort: port,
+			Databases: map[string]DatabaseConfig{
+				"mydb": {
+					Type: "vitess",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root@tcp(localhost)/mydb"},
+					},
+				},
+			},
+		}
+
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "metrics_port")
+	}
+}
+
 func TestServerConfig_ValidateRejectsInvalidRevertWindowDuration(t *testing.T) {
 	cfg := ServerConfig{
 		Databases: map[string]DatabaseConfig{
@@ -732,6 +819,118 @@ func TestServerConfig_ValidateRejectsNonPositiveRevertWindowDuration(t *testing.
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), `database "mydb" environment "staging" revert_window_duration "`+value+`"`)
 			assert.Contains(t, err.Error(), "must be positive")
+		})
+	}
+}
+
+// Enabling direct_execution without a positive max_table_rows bound is a
+// startup config error: the size gate must never be accidentally unbounded.
+func TestServerConfig_ValidateRejectsDirectExecutionWithoutBound(t *testing.T) {
+	for name, direct := range map[string]*DirectExecutionConfig{
+		"missing bound":  {Enabled: true},
+		"zero bound":     {Enabled: true, MaxTableRows: 0},
+		"negative bound": {Enabled: true, MaxTableRows: -1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" enables direct_execution`)
+			assert.Contains(t, err.Error(), "a positive bound is required")
+		})
+	}
+}
+
+// direct_execution on a non-MySQL database is a startup config error rather
+// than a silently ignored grant: config that looks like it permits direct
+// execution must either take effect or fail loudly.
+func TestServerConfig_ValidateRejectsDirectExecutionOnNonMySQL(t *testing.T) {
+	cfg := ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: "vitess",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {
+						DSN:             "root@tcp(localhost)/mydb",
+						DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 1000},
+					},
+				},
+			},
+		},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `database "mydb" environment "staging" sets direct_execution`)
+	assert.Contains(t, err.Error(), "only supported for mysql databases")
+}
+
+// A malformed direct_execution lock_acquisition_timeout is a startup config error —
+// even on a disabled block — so a bad bound is never silently carried until
+// the policy is enabled. MySQL lock timeouts have second granularity, so the
+// value must be a whole number of seconds of at least 1s.
+func TestServerConfig_ValidateRejectsBadDirectExecutionLockAcquisitionTimeout(t *testing.T) {
+	for name, tc := range map[string]struct {
+		direct  *DirectExecutionConfig
+		wantErr string
+	}{
+		"not a duration":           {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "ten"}, "is not a valid duration"},
+		"sub-second":               {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "500ms"}, "must be at least 1s"},
+		"negative":                 {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "-5s"}, "must be at least 1s"},
+		"fractional seconds":       {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "1.5s"}, "must be a whole number of seconds"},
+		"malformed while disabled": {&DirectExecutionConfig{Enabled: false, LockAcquisitionTimeout: "bogus"}, "is not a valid duration"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: tc.direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" direct_execution`)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// A well-formed direct_execution policy on a MySQL database validates, and a
+// disabled block (even without a bound) is accepted as the fail-closed default.
+func TestServerConfig_ValidateAcceptsDirectExecution(t *testing.T) {
+	for name, direct := range map[string]*DirectExecutionConfig{
+		"enabled with bound":        {Enabled: true, MaxTableRows: 500000},
+		"enabled with lock timeout": {Enabled: true, MaxTableRows: 500000, LockAcquisitionTimeout: "5s"},
+		"disabled":                  {Enabled: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			require.NoError(t, cfg.Validate())
 		})
 	}
 }
@@ -1731,15 +1930,14 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			wantErrSub: `invalid on_failure "warp-speed"`,
 		},
 		{
-			name: "on_failure pause is rejected as not yet supported",
+			name: "on_failure pause with a deployments map is accepted",
 			envConfig: EnvironmentConfig{
 				Deployments: map[string]DeploymentTarget{
 					"payments-a": {Target: "payments"},
 				},
 				OnFailure: storage.OnFailurePause,
 			},
-			tern:       baseTern,
-			wantErrSub: `sets on_failure "pause" which is not yet supported`,
+			tern: baseTern,
 		},
 	}
 
@@ -1857,6 +2055,172 @@ func TestServerConfig_OrderedEnvironments(t *testing.T) {
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "duplicate")
+	})
+}
+
+// TestServerConfig_PromotionOrderForDatabase covers per-database promotion
+// order resolution: a database's environment_order override replaces the
+// server-wide order for that database only, databases without an override
+// inherit the server order, and databases sharing an instance can promote
+// through disjoint environment sequences.
+func TestServerConfig_PromotionOrderForDatabase(t *testing.T) {
+	t.Run("no override inherits the server order", func(t *testing.T) {
+		cfg := ServerConfig{
+			EnvironmentOrder: []string{"qa", "staging", "production"},
+			Databases: map[string]DatabaseConfig{
+				"payments": {Environments: map[string]EnvironmentConfig{"qa": {}}},
+			},
+		}
+
+		assert.Equal(t, []string{"qa", "staging", "production"}, cfg.PromotionOrderForDatabase("payments"))
+	})
+
+	t.Run("override replaces the server order for that database only", func(t *testing.T) {
+		cfg := ServerConfig{
+			EnvironmentOrder: []string{"qa", "staging", "production"},
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					EnvironmentOrder: []string{"qa", "sandbox", "production"},
+					Environments:     map[string]EnvironmentConfig{"qa": {}, "sandbox": {}},
+				},
+				"orders": {Environments: map[string]EnvironmentConfig{"qa": {}}},
+			},
+		}
+
+		assert.Equal(t, []string{"qa", "sandbox", "production"}, cfg.PromotionOrderForDatabase("payments"))
+		assert.Equal(t, []string{"qa", "staging", "production"}, cfg.PromotionOrderForDatabase("orders"))
+	})
+
+	t.Run("unknown database inherits the server order", func(t *testing.T) {
+		cfg := ServerConfig{EnvironmentOrder: []string{"qa", "production"}}
+
+		assert.Equal(t, []string{"qa", "production"}, cfg.PromotionOrderForDatabase("missing"))
+	})
+
+	t.Run("nil config uses the default order", func(t *testing.T) {
+		var cfg *ServerConfig
+
+		assert.Equal(t, []string{"staging", "production"}, cfg.PromotionOrderForDatabase("payments"))
+	})
+}
+
+func TestServerConfig_OrderedEnvironmentsForDatabase(t *testing.T) {
+	cfg := ServerConfig{
+		EnvironmentOrder: []string{"qa", "staging", "production"},
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				EnvironmentOrder: []string{"qa", "sandbox", "production"},
+				Environments:     map[string]EnvironmentConfig{"qa": {}, "sandbox": {}},
+			},
+		},
+	}
+
+	t.Run("override orders the enabled environments", func(t *testing.T) {
+		got := cfg.OrderedEnvironmentsForDatabase("payments", []string{"sandbox", "qa"})
+
+		assert.Equal(t, []string{"qa", "sandbox"}, got)
+	})
+
+	t.Run("no override falls back to the server order", func(t *testing.T) {
+		got := cfg.OrderedEnvironmentsForDatabase("orders", []string{"production", "staging"})
+
+		assert.Equal(t, []string{"staging", "production"}, got)
+	})
+}
+
+// TestServerConfig_DatabaseEnvironmentsWithOverride verifies that a database's
+// configured environments are returned in its own promotion order, not the
+// server-wide order, when an environment_order override is set.
+func TestServerConfig_DatabaseEnvironmentsWithOverride(t *testing.T) {
+	cfg := ServerConfig{
+		EnvironmentOrder: []string{"sandbox", "qa", "production"},
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				EnvironmentOrder: []string{"qa", "sandbox", "production"},
+				Environments:     map[string]EnvironmentConfig{"sandbox": {}, "qa": {}},
+			},
+		},
+	}
+
+	got, err := cfg.DatabaseEnvironments("payments")
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"qa", "sandbox"}, got)
+}
+
+// TestValidateDatabaseEnvironmentOrder covers the fail-fast startup validation
+// of a database's environment_order override: each mismatch between the
+// override and the database's configured environments would otherwise
+// silently block applies at runtime.
+func TestValidateDatabaseEnvironmentOrder(t *testing.T) {
+	base := func() ServerConfig {
+		return ServerConfig{
+			AllowedEnvironments: []string{"qa", "sandbox"},
+			EnvironmentOrder:    []string{"qa", "staging", "production"},
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					Type:             "mysql",
+					EnvironmentOrder: []string{"qa", "sandbox", "production"},
+					Environments: map[string]EnvironmentConfig{
+						"qa":      {DSN: "root@tcp(localhost)/payments"},
+						"sandbox": {DSN: "root@tcp(localhost)/payments"},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("valid override with a remote-owned trailing environment", func(t *testing.T) {
+		cfg := base()
+
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("rejects duplicate environments in the override", func(t *testing.T) {
+		cfg := base()
+		db := cfg.Databases["payments"]
+		db.EnvironmentOrder = []string{"qa", "qa", "production"}
+		db.Environments = map[string]EnvironmentConfig{"qa": {DSN: "root@tcp(localhost)/payments"}}
+		cfg.Databases["payments"] = db
+
+		err := cfg.Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `database "payments" environment_order contains duplicate value "qa"`)
+	})
+
+	t.Run("rejects a configured environment missing from the override", func(t *testing.T) {
+		cfg := base()
+		db := cfg.Databases["payments"]
+		db.EnvironmentOrder = []string{"qa", "production"}
+		cfg.Databases["payments"] = db
+
+		err := cfg.Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `database "payments" environment "sandbox" is configured but missing from the database environment_order`)
+	})
+
+	t.Run("rejects a locally-owned override environment that is not configured", func(t *testing.T) {
+		cfg := base()
+		db := cfg.Databases["payments"]
+		db.Environments = map[string]EnvironmentConfig{"qa": {DSN: "root@tcp(localhost)/payments"}}
+		cfg.Databases["payments"] = db
+
+		err := cfg.Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `database "payments" environment_order lists "sandbox" but the database does not configure it`)
+	})
+
+	t.Run("unscoped instance must configure every override environment", func(t *testing.T) {
+		cfg := base()
+		cfg.AllowedEnvironments = nil
+
+		err := cfg.Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `database "payments" environment_order lists "production" but the database does not configure it`)
 	})
 }
 
@@ -2978,6 +3342,92 @@ func TestServerConfig_GitHubCheckNameBaseForRepo(t *testing.T) {
 	})
 }
 
+func TestServerConfig_PromotionCheckNameBaseForRepo(t *testing.T) {
+	t.Run("defaults to the app's own check-name base", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{CheckName: "SchemaBot X"}}
+		assert.Equal(t, "SchemaBot X", cfg.PromotionCheckNameBaseForRepo("any/repo"))
+	})
+
+	t.Run("legacy single-app override trims configured name", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{
+			CheckName:          "SchemaBot X",
+			PromotionCheckName: "  SchemaBot Shared  ",
+		}}
+		assert.Equal(t, "SchemaBot Shared", cfg.PromotionCheckNameBaseForRepo("any/repo"))
+	})
+
+	t.Run("multi-app uses the owning app's override", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {CheckName: "SchemaBot X", PromotionCheckName: "SchemaBot Shared"},
+				"app-b": {CheckName: "SchemaBot Y"},
+			},
+			Repos: map[string]RepoConfig{
+				"org-a/repo-x": {GitHubApp: "app-a"},
+				"org-b/repo-y": {GitHubApp: "app-b"},
+			},
+		}
+
+		assert.Equal(t, "SchemaBot Shared", cfg.PromotionCheckNameBaseForRepo("org-a/repo-x"))
+		assert.Equal(t, "SchemaBot Y", cfg.PromotionCheckNameBaseForRepo("org-b/repo-y"))
+	})
+
+	t.Run("multi-app falls back for unknown repository", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps:  map[string]GitHubAppConfig{"app-a": {PromotionCheckName: "SchemaBot Shared"}},
+			Repos: map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+		}
+		assert.Equal(t, DefaultGitHubCheckName, cfg.PromotionCheckNameBaseForRepo("org/unknown"))
+	})
+}
+
+// A promotion-check-name that differs from the App's own check-name can only
+// be satisfied by another deployment's Check Run, so configuring it without
+// trusting any sibling App would block every apply. Config load must reject
+// that combination instead of shipping a gate that always fails closed.
+func TestValidatePromotionCheckName(t *testing.T) {
+	t.Run("override without trusted slugs is rejected", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{
+			CheckName:          "SchemaBot X",
+			PromotionCheckName: "SchemaBot Shared",
+		}}
+		err := cfg.validateGitHubAppsConfig()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "promotion-check-name")
+		assert.Contains(t, err.Error(), "trusted-check-app-slugs")
+	})
+
+	t.Run("override with trusted slugs is accepted", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{
+			CheckName:            "SchemaBot X",
+			PromotionCheckName:   "SchemaBot Shared",
+			TrustedCheckAppSlugs: []string{"schemabot-shared-staging"},
+		}}
+		require.NoError(t, cfg.validateGitHubAppsConfig())
+	})
+
+	t.Run("override equal to own base needs no trusted slugs", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{
+			CheckName:          "SchemaBot X",
+			PromotionCheckName: "SchemaBot X",
+		}}
+		require.NoError(t, cfg.validateGitHubAppsConfig())
+	})
+
+	t.Run("multi-app override without trusted slugs is rejected", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {AppID: "1001", PrivateKey: "x", WebhookSecret: "y", PromotionCheckName: "SchemaBot Shared"},
+			},
+			Repos: map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+		}
+		err := cfg.validateGitHubAppsConfig()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `app "app-a"`)
+		assert.Contains(t, err.Error(), "promotion-check-name")
+	})
+}
+
 func TestServerConfig_ResolveGitHubAppsByID(t *testing.T) {
 	t.Run("multi-app config resolves each entry's app-id", func(t *testing.T) {
 		cfg := &ServerConfig{
@@ -3246,6 +3696,20 @@ func TestSupportChannelConfig(t *testing.T) {
 		err := cfg.Validate()
 		assert.ErrorContains(t, err, "support_channel.url contains characters that are unsafe in Markdown links")
 	})
+
+	t.Run("name must fit the comment footer reservation", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SupportChannel = SupportChannelConfig{Name: strings.Repeat("a", maxSupportChannelNameChars+1), URL: "https://example.com/schema-help"}
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "support_channel.name must be at most")
+	})
+
+	t.Run("url must fit the comment footer reservation", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SupportChannel = SupportChannelConfig{Name: "#schema-help", URL: "https://example.com/" + strings.Repeat("a", maxSupportChannelURLChars)}
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "support_channel.url must be at most")
+	})
 }
 
 func TestPendingDropsTargetsResolveEachPass(t *testing.T) {
@@ -3273,5 +3737,215 @@ func TestPendingDropsTargetsResolveEachPass(t *testing.T) {
 	targets, unresolved = svc.pendingDropsTargets(t.Context())
 	require.Len(t, targets, 1)
 	assert.Equal(t, 0, unresolved)
-	assert.Equal(t, pendingdrops.Target{Database: "mydb", Environment: "staging", DSN: dsn}, targets[0])
+	assert.Equal(t, pendingdrops.Target{Database: "mydb", Environment: "staging", DSN: dsn, Locker: namedlock.MySQL{}}, targets[0])
+}
+
+func TestSchemaDirHintsForRepo(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"widgets": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"apps/widgets/schema", "apps/widgets/legacy/"},
+			},
+			"payments": {
+				AllowedRepos: []string{"octocat/other-repo"},
+				AllowedDirs:  []string{"payments/schema"},
+			},
+			"anyrepo": {
+				AllowedDirs: []string{"shared/schema", "apps/widgets/schema"},
+			},
+			"unbounded": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"*", "", " ", "."},
+			},
+		},
+	}
+
+	hints, exhaustive := cfg.SchemaDirHintsForRepo("octocat/hello-world")
+
+	assert.Equal(t, []string{"apps/widgets/legacy", "apps/widgets/schema", "shared/schema"}, hints)
+	assert.False(t, exhaustive, "the unbounded database accepts configs outside every probe-able directory")
+}
+
+func TestSchemaDirHintsForRepoExhaustiveWhenAllDirsLiteral(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"widgets": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"apps/widgets/schema"},
+			},
+			"payments": {
+				AllowedRepos: []string{"octocat/other-repo"},
+			},
+		},
+	}
+
+	hints, exhaustive := cfg.SchemaDirHintsForRepo("octocat/hello-world")
+
+	assert.Equal(t, []string{"apps/widgets/schema"}, hints)
+	assert.True(t, exhaustive, "every repo-eligible database restricts configs to literal directories")
+}
+
+func TestSchemaDirHintsForRepoNotExhaustiveWhenDatabaseHasNoAllowedDirs(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"widgets": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"apps/widgets/schema"},
+			},
+			"open": {
+				AllowedRepos: []string{"octocat/hello-world"},
+			},
+		},
+	}
+
+	hints, exhaustive := cfg.SchemaDirHintsForRepo("octocat/hello-world")
+
+	assert.Equal(t, []string{"apps/widgets/schema"}, hints)
+	assert.False(t, exhaustive, "a database without allowed_dirs accepts a config anywhere in the repo")
+}
+
+func TestSchemaDirHintsForDatabase(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"widgets": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"apps/widgets/schema", "apps/widgets/legacy/"},
+			},
+			"open": {
+				AllowedRepos: []string{"octocat/hello-world"},
+			},
+			"wild": {
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"apps/wild/schema", "*"},
+			},
+			"payments": {
+				AllowedRepos: []string{"octocat/other-repo"},
+				AllowedDirs:  []string{"payments/schema"},
+			},
+		},
+	}
+
+	dirs, exhaustive := cfg.SchemaDirHintsForDatabase("octocat/hello-world", "widgets")
+	assert.Equal(t, []string{"apps/widgets/legacy", "apps/widgets/schema"}, dirs)
+	assert.True(t, exhaustive, "every allowed dir is a literal directory")
+
+	dirs, exhaustive = cfg.SchemaDirHintsForDatabase("octocat/hello-world", "open")
+	assert.Empty(t, dirs)
+	assert.False(t, exhaustive, "a database without allowed_dirs accepts a config anywhere")
+
+	dirs, exhaustive = cfg.SchemaDirHintsForDatabase("octocat/hello-world", "wild")
+	assert.Equal(t, []string{"apps/wild/schema"}, dirs)
+	assert.False(t, exhaustive, "a wildcard entry accepts configs outside every probe-able directory")
+
+	dirs, exhaustive = cfg.SchemaDirHintsForDatabase("octocat/hello-world", "payments")
+	assert.Empty(t, dirs)
+	assert.True(t, exhaustive, "a database that does not accept the repo has no policy-valid config location in it")
+
+	dirs, exhaustive = cfg.SchemaDirHintsForDatabase("octocat/hello-world", "unknown")
+	assert.Empty(t, dirs)
+	assert.True(t, exhaustive, "an unconfigured database has no policy-valid config location")
+}
+
+func TestSchemaDirHintsForRepoNoMatches(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				AllowedRepos: []string{"octocat/other-repo"},
+				AllowedDirs:  []string{"payments/schema"},
+			},
+		},
+	}
+
+	hints, exhaustive := cfg.SchemaDirHintsForRepo("octocat/hello-world")
+	assert.Empty(t, hints)
+	assert.True(t, exhaustive, "no repo-eligible database means no policy-valid config location exists")
+}
+
+func TestKnownEnvironments(t *testing.T) {
+	t.Run("defaults to the promotion order", func(t *testing.T) {
+		cfg := &ServerConfig{}
+		assert.Equal(t, []string{"production", "staging"}, cfg.KnownEnvironments())
+		assert.True(t, cfg.IsEnvironmentKnown("staging"))
+		assert.True(t, cfg.IsEnvironmentKnown("production"))
+		assert.False(t, cfg.IsEnvironmentKnown("prodction"))
+	})
+
+	t.Run("unions allowed environments, environment order, and database routing environments", func(t *testing.T) {
+		cfg := &ServerConfig{
+			AllowedEnvironments: []string{"qa"},
+			EnvironmentOrder:    []string{"staging", "production"},
+			Databases: map[string]DatabaseConfig{
+				"payments": {Environments: map[string]EnvironmentConfig{"load": {}}},
+			},
+		}
+		assert.Equal(t, []string{"load", "production", "qa", "staging"}, cfg.KnownEnvironments())
+		assert.True(t, cfg.IsEnvironmentKnown("load"))
+		assert.True(t, cfg.IsEnvironmentKnown("qa"))
+		assert.False(t, cfg.IsEnvironmentKnown("dev"))
+	})
+
+	t.Run("includes database environment_order overrides", func(t *testing.T) {
+		cfg := &ServerConfig{
+			AllowedEnvironments: []string{"qa"},
+			EnvironmentOrder:    []string{"staging", "production"},
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					EnvironmentOrder: []string{"qa", "sandbox", "production"},
+					Environments:     map[string]EnvironmentConfig{"qa": {}},
+				},
+			},
+		}
+		assert.Equal(t, []string{"production", "qa", "sandbox", "staging"}, cfg.KnownEnvironments())
+		assert.True(t, cfg.IsEnvironmentKnown("sandbox"))
+	})
+
+	t.Run("nil config knows no environments", func(t *testing.T) {
+		var cfg *ServerConfig
+		assert.Nil(t, cfg.KnownEnvironments())
+		assert.False(t, cfg.IsEnvironmentKnown("staging"))
+	})
+}
+
+// TestServerConfig_SpiritMetadata verifies that the spirit block translates
+// into engine metadata overrides: an absent block produces no entries (the
+// engine defaults apply), configured values carry through, and a
+// misconfigured duration fails instead of silently running applies with the
+// defaults.
+func TestServerConfig_SpiritMetadata(t *testing.T) {
+	t.Run("absent block produces no overrides", func(t *testing.T) {
+		var cfg ServerConfig
+		metadata, err := cfg.SpiritMetadata()
+		require.NoError(t, err)
+		assert.Empty(t, metadata)
+	})
+
+	t.Run("configured values translate to metadata keys", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte(`
+spirit:
+  enable_experimental_autoscaling: false
+  checkpoint_max_age: 24h
+  checksum_yield_timeout: 6h
+`), &cfg))
+		metadata, err := cfg.SpiritMetadata()
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{
+			spirit.MetadataEnableExperimentalAutoscaling: "false",
+			spirit.MetadataCheckpointMaxAge:              "24h",
+			spirit.MetadataChecksumYieldTimeout:          "6h",
+		}, metadata)
+	})
+
+	t.Run("invalid duration errors", func(t *testing.T) {
+		cfg := ServerConfig{Spirit: SpiritConfig{CheckpointMaxAge: "3 days"}}
+		_, err := cfg.SpiritMetadata()
+		require.ErrorContains(t, err, "checkpoint_max_age")
+	})
+
+	t.Run("non-positive duration errors", func(t *testing.T) {
+		cfg := ServerConfig{Spirit: SpiritConfig{ChecksumYieldTimeout: "-1h"}}
+		_, err := cfg.SpiritMetadata()
+		require.ErrorContains(t, err, "must be positive")
+	})
 }

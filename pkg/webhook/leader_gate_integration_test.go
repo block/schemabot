@@ -11,6 +11,7 @@
 package webhook
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -68,17 +70,30 @@ func newLeaderHandler(t *testing.T, svc *api.Service, client *gh.Client) *Handle
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClientWithSlug(client, logger, leaderOwnAppSlug, trustedTenantAppSlug)
 	factory := &fakeClientFactory{client: installClient}
-	return NewHandler(svc, factory, nil, logger)
+	h := NewHandler(svc, factory, nil, logger)
+	// A fold that leaves participants unresolved arms a self-scheduled re-fold;
+	// keep those timers from firing inside the test process (pending timers at
+	// process exit are inert). Tests that exercise re-fold convergence lower
+	// this after construction.
+	h.participantRefoldDelayOverride = time.Hour
+	return h
 }
 
-// mockLeaderPRHead serves the PR head SHA so the leader's head-SHA freshness
-// check passes for headSHA.
+// mockLeaderPRHead serves an open PR with the given head SHA so the leader's
+// head-SHA freshness check passes for headSHA.
 func mockLeaderPRHead(mux *http.ServeMux, headSHA string) {
+	mockLeaderPRHeadWithState(mux, headSHA, "open")
+}
+
+// mockLeaderPRHeadWithState serves the PR with the given head SHA and
+// lifecycle state ("open" or "closed").
+func mockLeaderPRHeadWithState(mux *http.ServeMux, headSHA, state string) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
-			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: &headSHA},
-			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
-			User: &gh.User{Login: new("testuser")},
+			State: &state,
+			Head:  &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: &headSHA},
+			Base:  &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			User:  &gh.User{Login: new("testuser")},
 		})
 	})
 }
@@ -225,8 +240,9 @@ func TestE2ELeaderPassesOnTrustedSuccessfulParticipant(t *testing.T) {
 
 // When an expected participant has not reported its Check Run on the head
 // commit, the leader has no evidence the participant's schema is safe. It fails
-// closed: the aggregate blocks (action_required) rather than passing on the
-// participant's silence.
+// closed: the aggregate blocks as in_progress (a self-scheduled re-fold will
+// re-read the participant shortly) rather than passing on the participant's
+// silence.
 func TestE2ELeaderBlocksOnMissingParticipantCheck(t *testing.T) {
 	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
 
@@ -255,8 +271,8 @@ func TestE2ELeaderBlocksOnMissingParticipantCheck(t *testing.T) {
 	cr := collectAggregate(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", "production"))
 	assert.Equal(t, headSHA, cr.HeadSHA)
 	assert.NotEqual(t, checkConclusionSuccess, cr.Conclusion, "missing participant must not pass the aggregate")
-	assert.Equal(t, checkStatusCompleted, cr.Status)
-	assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
+	assert.Equal(t, checkStatusInProgress, cr.Status)
+	assert.Empty(t, cr.Conclusion, "the wait for a participant re-read blocks without a conclusion")
 }
 
 // While the participant's Check Run is still in progress, the leader's
@@ -458,15 +474,120 @@ func TestE2ELeaderNonSchemaPRTouchingParticipantPathBlocks(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "aggregate folds expected participants")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
 	for _, env := range []string{"staging", "production"} {
 		cr := collectAggregate(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", env))
 		assert.Equal(t, headSHA, cr.HeadSHA)
-		assert.Equal(t, checkStatusCompleted, cr.Status)
-		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion,
-			"aggregate for %s must fail closed while the expected participant is silent", env)
+		assert.Equal(t, checkStatusInProgress, cr.Status,
+			"aggregate for %s must block while the expected participant is silent", env)
+		assert.Empty(t, cr.Conclusion)
 	}
+}
+
+// A participant with no schema work publishes its Check Run moments after the
+// leader's first fold and never comments, so no nudge will ever arrive. The
+// leader must converge on its own: the first fold blocks fail-closed on the
+// unreported participant and arms a delayed re-fold, and the re-fold reads the
+// now-present successful participant check and publishes a passing aggregate.
+func TestE2ELeaderRefoldsWhenParticipantReportsAfterFirstFold(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	const headSHA = "abc123"
+	mockLeaderPRHead(mux, headSHA)
+	mockLeaderPRFilesTouchTenantB(mux)
+	mockLeaderEmptyTree(mux, headSHA)
+
+	// The first fold reads one participant check per environment and sees
+	// nothing — the participant has not published yet. Every later read finds
+	// the completed, successful, trusted run, exactly like a participant that
+	// publishes its check just after the leader's first fold.
+	prodCheckName := aggregateCheckNameForEnv(tenantBCheckName, "production")
+	stagingCheckName := aggregateCheckNameForEnv(tenantBCheckName, "staging")
+	runsByName := map[string]map[string]any{
+		prodCheckName: {
+			"id": 7001, "name": prodCheckName, "status": "completed", "conclusion": "success",
+			"app": map[string]any{"slug": trustedTenantAppSlug},
+		},
+		stagingCheckName: {
+			"id": 7002, "name": stagingCheckName, "status": "completed", "conclusion": "success",
+			"app": map[string]any{"slug": trustedTenantAppSlug},
+		},
+	}
+	var checkRunReads atomic.Int64
+	firstFoldReads := int64(len(leaderRepoConfig().AllowedEnvironments))
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/", func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/check-runs") {
+			http.NotFound(w, r)
+			return
+		}
+		if checkRunReads.Add(1) <= firstFoldReads {
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "check_runs": []any{}})
+			return
+		}
+		run, ok := runsByName[r.URL.Query().Get("check_name")]
+		if !ok {
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "check_runs": []any{}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 1, "check_runs": []map[string]any{run}})
+	})
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	h.participantRefoldDelayOverride = 10 * time.Millisecond
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: headSHA,
+		headRef: "feature-branch",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// The first fold blocks fail-closed, then the self-scheduled re-fold
+	// converges to success without any comment, commit, or webhook.
+	sawBlocked := false
+	deadline := time.After(webhookIntegrationCheckRunDeadline)
+	for {
+		var cr checkRunCapture
+		select {
+		case cr = <-checkRuns:
+		case <-deadline:
+			t.Fatalf("timed out waiting for the production aggregate to converge (saw blocked first: %v)", sawBlocked)
+		}
+		if cr.Name != aggregateCheckNameForEnv("SchemaBot", "production") {
+			continue
+		}
+		if cr.Status == checkStatusInProgress {
+			// The blocked aggregate is created fresh on the head commit; the
+			// converged pass below updates that run in place, so head_sha only
+			// appears on this create.
+			assert.Equal(t, headSHA, cr.HeadSHA)
+			assert.Empty(t, cr.Conclusion, "the wait for the participant re-read blocks without a conclusion")
+			sawBlocked = true
+			continue
+		}
+		assert.True(t, sawBlocked, "the first fold must block before the re-fold converges")
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
+		break
+	}
+
+	// The converged fold resets the re-fold budget for the PR.
+	require.Eventually(t, func() bool {
+		h.participantRefoldMu.Lock()
+		defer h.participantRefoldMu.Unlock()
+		_, pending := h.participantRefoldAttempts[participantRefoldKey("octocat/hello-world", 1)]
+		return !pending
+	}, webhookIntegrationCheckRunDeadline, 10*time.Millisecond, "a fold that resolves every participant must clear the re-fold budget")
 }
 
 // The expected-tenant set is path-filtered: a leader's non-schema PR touching
@@ -501,7 +622,7 @@ func TestE2ELeaderNonSchemaPROutsideParticipantPathsPasses(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "no schema files in PR")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 	assert.NotContains(t, rr.Body.String(), "aggregate folds expected participants")
 
 	for _, env := range []string{"staging", "production"} {
@@ -510,5 +631,150 @@ func TestE2ELeaderNonSchemaPROutsideParticipantPathsPasses(t *testing.T) {
 		assert.Equal(t, checkStatusCompleted, cr.Status)
 		assert.Equal(t, checkConclusionSuccess, cr.Conclusion,
 			"aggregate for %s keeps passing on a PR outside all participant paths", env)
+	}
+}
+
+// participantRefoldAttemptCount reads the leader's re-fold budget entry for the
+// PR, reporting the consumed attempts and whether an entry exists at all.
+func participantRefoldAttemptCount(h *Handler, repo string, pr int) (int, bool) {
+	h.participantRefoldMu.Lock()
+	defer h.participantRefoldMu.Unlock()
+	n, ok := h.participantRefoldAttempts[participantRefoldKey(repo, pr)]
+	return n, ok
+}
+
+// A re-fold pass that cannot read the PR head must not end the retry chain:
+// the aggregate is rendering unresolved participants as in_progress on the
+// promise of a coming re-read, so the leader arms another bounded attempt
+// instead of stranding the wait until an external event happens to re-fold.
+func TestE2ELeaderBrokenRefoldArmsAnotherAttempt(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// No PR endpoint is registered, so the re-fold's head fetch fails.
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	h.refoldAggregateForPR("octocat/hello-world", 1, 12345, "unresolved participant delayed re-fold")
+
+	attempts, armed := participantRefoldAttemptCount(h, "octocat/hello-world", 1)
+	assert.True(t, armed, "a broken re-fold pass must arm another bounded attempt")
+	assert.Equal(t, 1, attempts)
+
+	select {
+	case cr := <-checkRuns:
+		t.Fatalf("a re-fold that cannot read the PR head must not publish an aggregate: %+v", cr)
+	default:
+	}
+}
+
+// An armed re-fold can fire after its PR closes. The leader publishes nothing
+// on the closed PR and arms no further attempts; it drops the PR's re-fold
+// budget entry so the in-memory map does not retain closed PRs.
+func TestE2ELeaderRefoldSkipsClosedPR(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	mockLeaderPRHeadWithState(mux, "abc123", "closed")
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	// The chain was armed while the PR was open, so a budget entry exists when
+	// the timer fires.
+	h.scheduleParticipantRefold(t.Context(), "octocat/hello-world", 1, 12345)
+	_, armed := participantRefoldAttemptCount(h, "octocat/hello-world", 1)
+	require.True(t, armed)
+
+	h.refoldAggregateForPR("octocat/hello-world", 1, 12345, "unresolved participant delayed re-fold")
+
+	_, armed = participantRefoldAttemptCount(h, "octocat/hello-world", 1)
+	assert.False(t, armed, "a closed PR's re-fold budget entry must be dropped")
+
+	select {
+	case cr := <-checkRuns:
+		t.Fatalf("a re-fold must not publish an aggregate on a closed PR: %+v", cr)
+	default:
+	}
+}
+
+// A PR that changes an expected participant's schema, where the participant's
+// own schemabot.yaml is discoverable in the repo tree, is still the
+// participant's work: the leader registers no database for the repo, so the
+// discovered config belongs to the participant deployment. The leader routes
+// through the fail-closed aggregate fold — blocking until the participant
+// reports — rather than planning the participant's database itself, which
+// would turn routine fan-out into a failing aggregate and an error comment.
+func TestE2ELeaderParticipantSchemaWithDiscoverableConfigFoldsInsteadOfPlanning(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	const headSHA = "abc123"
+	mockLeaderPRHead(mux, headSHA)
+	mockLeaderPRFilesTouchTenantB(mux)
+	mockLeaderEmptyTree(mux, headSHA)
+	// The participant's schema root carries a discoverable schemabot.yaml for a
+	// database only tenant-b's deployment registers.
+	var configFetches atomic.Int64
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/"+tenantBSchemaDir+"/schemabot.yaml", func(w http.ResponseWriter, _ *http.Request) {
+		configFetches.Add(1)
+		content := base64.StdEncoding.EncodeToString([]byte("database: tenant-b-db\ntype: mysql\n"))
+		_ = json.NewEncoder(w).Encode(gh.RepositoryContent{
+			Type:     new("file"),
+			Encoding: new("base64"),
+			Content:  &content,
+			Name:     new("schemabot.yaml"),
+			Path:     new(tenantBSchemaDir + "/schemabot.yaml"),
+		})
+	})
+	// The participant has posted no Check Run on the head commit yet.
+	mockParticipantCheckRuns(mux, nil)
+	checkRuns := captureLeaderCheckRuns(mux)
+	comments := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	h := newLeaderHandler(t, svc, client)
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: headSHA,
+		headRef: "feature-branch",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	for _, env := range []string{"staging", "production"} {
+		cr := collectAggregate(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", env))
+		assert.Equal(t, headSHA, cr.HeadSHA)
+		assert.Equal(t, checkStatusInProgress, cr.Status,
+			"aggregate for %s must block on the unreported participant, not fail on a database the leader cannot plan", env)
+		assert.Empty(t, cr.Conclusion)
+	}
+
+	// The silence must come from the leader dropping the discovered config,
+	// not from discovery never running at all.
+	require.Positive(t, configFetches.Load(), "the participant's schemabot.yaml was never fetched, so config discovery did not run")
+
+	select {
+	case body := <-comments:
+		t.Fatalf("leader posted a comment for participant-owned schema: %s", body)
+	case <-time.After(500 * time.Millisecond):
 	}
 }

@@ -167,15 +167,6 @@ render_paired_section "Apply Flow"     "comment_apply_flow_all" "cli_apply_all"
 # === PR-only sections ===
 {
     echo ""
-    echo "## Apply Gates"
-    echo ""
-    echo "### PR Comments"
-    echo ""
-    "$BINARY" preview "comment_apply_all" 2>&1 | wrap_sections
-} >> "$SNAPSHOT"
-
-{
-    echo ""
     echo "## Multi-Deployment Apply"
     echo ""
     echo "### PR Comments"

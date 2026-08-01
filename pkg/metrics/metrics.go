@@ -11,6 +11,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	otelmetric "go.opentelemetry.io/otel/metric"
+
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // Meter name used for all SchemaBot metrics.
@@ -36,6 +38,24 @@ func addCounter(ctx context.Context, name, description, unit string, attrs ...at
 		return
 	}
 	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
+}
+
+// addCounterN increments a named Int64Counter by n with the given attributes,
+// logging and skipping if the instrument cannot be created. n <= 0 is a no-op.
+func addCounterN(ctx context.Context, n int64, name, description, unit string, attrs ...attribute.KeyValue) {
+	if n <= 0 {
+		return
+	}
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter(name,
+		otelmetric.WithDescription(description),
+		otelmetric.WithUnit(unit),
+	)
+	if err != nil {
+		slog.Warn("failed to create counter", "metric", name, "error", err)
+		return
+	}
+	counter.Add(ctx, n, otelmetric.WithAttributes(attrs...))
 }
 
 // addUpDownCounter adjusts a named Int64UpDownCounter by delta with the given
@@ -118,11 +138,43 @@ func RecordPlan(ctx context.Context, repo, database, deployment, environment, st
 	)
 }
 
+// RecordPlanCommentMinimize counts the outcome of retiring one superseded plan
+// comment. Outcomes: "minimized" (hidden on GitHub and marked in storage),
+// "apply_owned" (kept expanded because an apply owns the plan's head),
+// "guard_error" (apply-ownership lookup failed, comment kept expanded fail
+// closed — investigate storage), "minimize_error" (GitHub minimize call
+// failed; retried on the next supersede — investigate GitHub API health),
+// "mark_error" (hidden on GitHub but the storage mark failed; the next
+// supersede re-minimizes it idempotently — investigate storage).
+func RecordPlanCommentMinimize(ctx context.Context, repo, outcome string) {
+	addCounter(ctx, "schemabot.plan_comment_minimize.total",
+		"Total number of superseded plan-comment minimize attempts by outcome", "{comment}",
+		attribute.String("repository", repo),
+		attribute.String("outcome", outcome),
+	)
+}
+
 // RecordPlanDuration records the duration of a plan operation.
 func RecordPlanDuration(ctx context.Context, duration time.Duration, repo, database, deployment, environment, status string) {
 	recordHistogram(ctx, "schemabot.plan.duration_seconds", duration.Seconds(),
 		"Duration of plan operations", "s",
 		attribute.String("repository", repo),
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("status", status),
+	)
+}
+
+// RecordDeploymentDiff counts one deployment's review-time desired-vs-live diff
+// outcome. status is "ok" when the diff was computed and reported no planning
+// errors, or "errored" when the PlanDiff RPC failed or the diff itself reported
+// errors — the branch that makes a deployment block the review-time drift rollup
+// closed. Alert on the errored count so an unreachable or un-diffable deployment
+// gating merges is investigable without waiting on the rollup layer.
+func RecordDeploymentDiff(ctx context.Context, database, deployment, environment, status string) {
+	addCounter(ctx, "schemabot.deployment_diff.total",
+		"Total number of review-time per-deployment plan diffs by outcome", "{diff}",
 		attribute.String("database", database),
 		DeploymentAttribute(deployment),
 		EnvironmentAttribute(environment),
@@ -140,6 +192,22 @@ func RecordApply(ctx context.Context, repo, database, deployment, environment, s
 		DeploymentAttribute(deployment),
 		EnvironmentAttribute(environment),
 		attribute.String("status", status),
+	)
+}
+
+// RecordAutoCutoverFailure increments the counter for a drive auto-cutover
+// attempt the engine backend rejected with a hard error (not a self-clearing
+// not-ready rejection). The drive is the sole cutover actor, so a spike means
+// applies are pinned at waiting_for_cutover with the drive unable to complete
+// them — investigate the engine backend's cutover permissions and API health
+// for the database. The drive settles the apply (failed, or paused for
+// operator retry) after repeated consecutive failures.
+func RecordAutoCutoverFailure(ctx context.Context, database, deployment, environment string) {
+	addCounter(ctx, "schemabot.apply.auto_cutover_failure.total",
+		"Drive auto-cutover attempts rejected by the engine backend with a hard error", "{failure}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
 	)
 }
 
@@ -249,6 +317,21 @@ func RecordStalePlanRejected(ctx context.Context, environment string) {
 	)
 }
 
+// RecordBaseSchemaFreshnessRejected increments the counter for apply commands
+// rejected by the path-scoped base freshness gate. outcome distinguishes a
+// confirmed stale schema directory from GitHub uncertainty that failed closed.
+func RecordBaseSchemaFreshnessRejected(ctx context.Context, action, environment, outcome string) {
+	if !knownSchemaFreshnessActions[action] {
+		action = "unknown"
+	}
+	addCounter(ctx, "schemabot.command.rejected_base_schema_freshness.total",
+		"Apply rejected because the base branch schema path changed after divergence or could not be verified", "{rejection}",
+		attribute.String("action", action),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
 // RecordTransientPlanRetry increments the counter for webhook plan retries
 // after transient remote deployment unavailability. A spike with
 // outcome="exhausted" for one environment means the network path to that
@@ -260,6 +343,35 @@ func RecordTransientPlanRetry(ctx context.Context, database, environment, outcom
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
 		attribute.String("outcome", outcome),
+	)
+}
+
+var knownReviewDriftClassifications = map[string]bool{
+	"match":    true,
+	"diverged": true,
+	"errored":  true,
+}
+
+// RecordReviewDrift increments the counter for a deployment's review-time drift
+// classification against the reviewed primary plan. A spike with
+// classification="diverged" means a deployment's live schema no longer matches
+// what was reviewed — an operator must reconcile that deployment before the PR
+// can apply. classification="errored" means the deployment could not be diffed
+// or compared and is failing the check closed; investigate connectivity to that
+// deployment or the plan input.
+func RecordReviewDrift(ctx context.Context, database, environment, deployment, classification string) {
+	if !knownReviewDriftClassifications[classification] {
+		// An unrecognized classification is a coding gap, not a drift signal.
+		// Coercing it to "errored" would inflate the blocking-failure count, so
+		// bucket it as "unknown" and keep the real failure classes accurate.
+		classification = "unknown"
+	}
+	addCounter(ctx, "schemabot.review_drift.total",
+		"review-time per-deployment drift classifications against the reviewed primary plan", "{deployment}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("deployment", deployment),
+		attribute.String("classification", classification),
 	)
 }
 
@@ -294,6 +406,22 @@ func RecordSourcePolicyBlock(ctx context.Context, operation, database, environme
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
 		attribute.String("reason", reason),
+	)
+}
+
+// RecordStorageSchemaDestructiveRefusal increments the counter for destructive
+// storage-schema DDL statements EnsureSchema refused to execute at startup.
+// A nonzero rate means a starting binary's embedded schema no longer declares
+// a table or column that exists in the storage database — expected briefly
+// from older pods during a rolling deploy or rollback. Operator action: if the
+// removal is intended and every pod runs a binary without the table or column,
+// set storage.allow_destructive_schema_changes to true for one deploy;
+// otherwise investigate which binary is starting against newer storage state.
+func RecordStorageSchemaDestructiveRefusal(ctx context.Context, table, operation string) {
+	addCounter(ctx, "schemabot.storage_schema.destructive_refusals_total",
+		"Total destructive storage-schema DDL statements refused by EnsureSchema", "{statement}",
+		attribute.String("table", table),
+		attribute.String("operation", operation),
 	)
 }
 
@@ -360,8 +488,9 @@ func RecordPRCommandActorAuthorization(ctx context.Context, command, database, e
 }
 
 // RecordAuthDecision increments the counter for API auth decisions on the
-// direct (OIDC) request path. Labels are inherently low-cardinality: tier is
-// read/plan/write, decision is allow/deny, reason is a fixed set.
+// direct request path (the OIDC and forward-auth authorizers). Labels are
+// inherently low-cardinality: tier is read/write, decision is allow/deny,
+// reason is a fixed set.
 func RecordAuthDecision(ctx context.Context, tier, decision, reason string) {
 	addCounter(ctx, "schemabot.auth_decisions.total",
 		"Total API auth decisions on the OIDC request path", "{decision}",
@@ -438,8 +567,12 @@ const (
 	// completed, and successful — it does not block the aggregate.
 	LeaderParticipantGateSuccess = "success"
 	// LeaderParticipantGateFailure: the participant's Check Run completed with a
-	// non-success conclusion — the aggregate fails.
+	// failing conclusion — the aggregate fails.
 	LeaderParticipantGateFailure = "failure"
+	// LeaderParticipantGatePending: the participant's Check Run completed with
+	// action_required — the participant has pending work (typically an apply
+	// awaiting an operator) and the aggregate blocks as pending.
+	LeaderParticipantGatePending = "pending"
 	// LeaderParticipantGateInProgress: the participant's Check Run is not yet
 	// terminal — the aggregate stays in progress.
 	LeaderParticipantGateInProgress = "in_progress"
@@ -476,8 +609,10 @@ func RecordLeaderParticipantGate(ctx context.Context, repository, environment, t
 // promotion order on a scoped SchemaBot instance. This fires only on operator
 // misconfiguration: the gate cannot identify the target's prior environments,
 // so it fails closed. A non-zero count means an operator must add the
-// environment to environment_order; the matching warn log carries the
-// promotion_order so they can see what is configured.
+// environment to the database's effective promotion order (its
+// environment_order override when set, otherwise the server-wide
+// environment_order); the matching warn log carries the promotion_order so
+// they can see what is configured.
 func RecordPromotionConfigErrorBlock(ctx context.Context, repository, database, environment string) {
 	addCounter(ctx, "schemabot.promotion.config_error_blocks_total",
 		"Total applies blocked because the target environment is absent from the configured promotion order", "{block}",
@@ -502,6 +637,7 @@ func AdjustActiveApplies(ctx context.Context, delta int64, database, deployment,
 var knownControlOperations = map[string]bool{
 	"cutover":       true,
 	"stop":          true,
+	"cancel":        true,
 	"start":         true,
 	"volume":        true,
 	"revert":        true,
@@ -523,6 +659,64 @@ func RecordControlOperation(ctx context.Context, operation, database, deployment
 		DeploymentAttribute(deployment),
 		EnvironmentAttribute(environment),
 		attribute.String("status", status),
+	)
+}
+
+// RecordRemoteControlRequestStale counts retransmissions of a durable
+// stop/cancel control request that the data plane accepted but has not
+// consumed within the stale threshold. A non-zero rate means an accepted
+// operator command is not taking effect on the remote apply — the data plane's
+// own driver is failing to consume it (its logs carry the failing consume
+// error) — and the apply will not converge until that is resolved.
+func RecordRemoteControlRequestStale(ctx context.Context, operation, database, deployment, environment string) {
+	if !knownControlOperations[operation] {
+		operation = "unknown"
+	}
+	addCounter(ctx, "schemabot.remote_control_requests.stale_resends_total",
+		"Total retransmissions of remote control requests still unconsumed by the data plane past the stale threshold", "{resend}",
+		attribute.String("operation", operation),
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+	)
+}
+
+// RecordEngineTerminalTruthReconcile counts drive claims that read the
+// engine's authoritative state before consuming a pending stop/cancel control
+// request. Outcomes:
+//   - "adopted_completed" / "adopted_failed" / "adopted_cancelled" /
+//     "adopted_reverted": the engine's change was already terminal, so the
+//     drive settled stored state to that outcome and mooted the pending
+//     command instead of running it. A sustained rate means operator commands
+//     are routinely losing the race with the engine — check why commands are
+//     queued so late (e.g. webhook delivery lag, slow claim turnaround).
+//   - "progress_error": the authoritative read failed and the drive fell back
+//     to consuming the pending command as before. A sustained rate means the
+//     drive cannot see the engine's backend — check engine API connectivity
+//     and the persisted engine resume state for the apply in the drive logs.
+func RecordEngineTerminalTruthReconcile(ctx context.Context, database, deployment, environment, outcome string) {
+	addCounter(ctx, "schemabot.operator.engine_terminal_truth_reconciles_total",
+		"Total drive claims that read the engine's authoritative state before consuming a pending stop/cancel command", "{reconcile}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
+// RecordPlanetScaleUnclassifiedCancelRejection counts PlanetScale cancel
+// rejections whose live deployment state has no explicit classification. Every
+// known deployment state is classified explicitly; a hit here means PlanetScale
+// introduced a new deployment state (or returned one SchemaBot has never
+// mapped), and the rejection fell back to a plain retryable error. Add an
+// explicit classification for the state — until then the durable stop/cancel
+// request may be retried against a rejection that can never succeed, and only
+// the drive's terminal-truth reconcile can converge it.
+func RecordPlanetScaleUnclassifiedCancelRejection(ctx context.Context, database, deploymentState string) {
+	addCounter(ctx, "schemabot.engine.planetscale.unclassified_cancel_rejections_total",
+		"Total PlanetScale cancel rejections observed in a deployment state with no explicit classification", "{rejection}",
+		attribute.String("database", database),
+		attribute.String("deployment_state", deploymentState),
 	)
 }
 
@@ -690,20 +884,47 @@ var knownOperatorTerminalSummaryFailureReasons = map[string]bool{
 	"callback_error":               true,
 }
 
-// RecordOperatorTerminalSummaryFailure increments the counter for a
-// multi-operation apply whose aggregate terminal summary failed to publish after
-// the projection CAS already terminalized the parent. A spike means terminal PR
-// summaries / check refreshes are being dropped; the parent state itself is
-// already durable, so the expected operator action is to check the GitHub
-// side-effect path (App client, check state) and rely on summary reconciliation.
+// RecordOperatorTerminalSummaryFailure increments the counter for an apply
+// whose aggregate terminal summary failed to publish after the projection CAS
+// already terminalized the parent. A spike means terminal PR summaries / check
+// refreshes are being dropped; the parent state itself is already durable, so
+// the expected operator action is to check the GitHub side-effect path (App
+// client, check state) and rely on summary reconciliation.
 func RecordOperatorTerminalSummaryFailure(ctx context.Context, reason string) {
 	if !knownOperatorTerminalSummaryFailureReasons[reason] {
 		reason = "unknown"
 	}
 	addOperatorCounter(ctx, "terminal_summary_publish_failures_total",
-		"Total number of multi-operation aggregate terminal summary publishes that failed", "{apply}",
+		"Total number of aggregate terminal summary publishes that failed", "{apply}",
 		EnvironmentAttribute(""),
 		attribute.String("reason", reason),
+	)
+}
+
+// knownRecoveredPanicOperations limits metric cardinality to the panic
+// containment boundaries that exist in the codebase.
+var knownRecoveredPanicOperations = map[string]bool{
+	"apply_drive":            true,
+	"operator_tick":          true,
+	"summary_reconciliation": true,
+	"observer_poll":          true,
+}
+
+// RecordRecoveredPanic increments the recovered-panic counter for a background
+// operation whose panic was contained instead of crashing the process. Any
+// non-zero rate means a code or data bug is being converted into degraded work
+// (a failed apply, a stopped poller, a skipped reconciliation pass). The paired
+// error log carries the panic value, stack, and work identifiers, so the
+// operator action is to find that log, fix the underlying fault, and reconcile
+// the affected work.
+func RecordRecoveredPanic(ctx context.Context, operation string) {
+	if !knownRecoveredPanicOperations[operation] {
+		operation = "unknown"
+	}
+	addCounter(ctx, "schemabot.panic.recovered_total",
+		"Total number of panics recovered at background-work boundaries", "{panic}",
+		EnvironmentAttribute(""),
+		attribute.String("operation", operation),
 	)
 }
 
@@ -760,6 +981,7 @@ var knownWebhookActions = map[string]bool{
 	"ready_for_review":       true,
 	"reopened":               true,
 	"requested":              true,
+	"rerequested":            true,
 	"review_request_removed": true,
 	"review_requested":       true,
 	"submitted":              true,
@@ -801,6 +1023,7 @@ const (
 	GitHubOperationFetchPullRequest              = "fetch_pull_request"
 	GitHubOperationGetCombinedStatus             = "get_combined_status"
 	GitHubOperationGetTeamMembership             = "get_team_membership"
+	GitHubOperationGraphQLMinimizeComment        = "graphql_minimize_comment"
 	GitHubOperationGraphQLStatusCheckRollup      = "graphql_status_check_rollup"
 	GitHubOperationListCheckRunsForRef           = "list_check_runs_for_ref"
 	GitHubOperationListPRFiles                   = "list_pr_files"
@@ -972,6 +1195,7 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationFetchPullRequest,
 		GitHubOperationGetCombinedStatus,
 		GitHubOperationGetTeamMembership,
+		GitHubOperationGraphQLMinimizeComment,
 		GitHubOperationGraphQLStatusCheckRollup,
 		GitHubOperationListCheckRunsForRef,
 		GitHubOperationListPRFiles,
@@ -1075,7 +1299,7 @@ func logUnknownWebhookMetricLabel(label, value, appName, repo, status string) {
 		"value", value,
 		"app_name", appName,
 		"repo", repo,
-		"status", status)
+		"event_status", status)
 }
 
 // RecordUnregisteredRepositoryWebhook increments the counter for webhook events
@@ -1109,6 +1333,105 @@ func RecordUnregisteredRepositoryWebhook(ctx context.Context, appName, eventType
 		attrs...)
 }
 
+// knownWebhookInboxStates allowlists the canonical durable webhook inbox states
+// so the depth gauge's cardinality stays bounded. It is derived from the
+// storage state list so the two cannot drift; an unrecognized value is folded to
+// "unknown".
+var knownWebhookInboxStates = func() map[string]bool {
+	states := make(map[string]bool, len(storage.WebhookEventStatesAll))
+	for _, state := range storage.WebhookEventStatesAll {
+		states[state] = true
+	}
+	return states
+}()
+
+// RecordWebhookInboxDepth records the number of durable webhook inbox rows in a
+// given state. A rising pending/processing depth means dispatch is falling
+// behind ingestion; a rising failed_retryable depth means deliveries are
+// retrying; a rising completed/failed depth means terminal rows are accumulating
+// and retention has not reclaimed them.
+func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
+	if !knownWebhookInboxStates[state] {
+		state = "unknown"
+	}
+	recordGauge(ctx, "schemabot.webhook.inbox_depth", count,
+		"Number of durable webhook inbox rows by state", "{row}",
+		EnvironmentAttribute(""),
+		attribute.String("state", state),
+	)
+}
+
+// RecordWebhookInboxOldestClaimableAge records how long the oldest
+// ready-to-claim-but-unclaimed inbox row has been waiting, in seconds. It is the
+// inbox's backlog latency: a value climbing past the dispatch cadence means work
+// is acked but not being picked up.
+func RecordWebhookInboxOldestClaimableAge(ctx context.Context, age time.Duration) {
+	recordGauge(ctx, "schemabot.webhook.inbox_oldest_claimable_age_seconds", int64(age.Seconds()),
+		"Age in seconds of the oldest ready-to-claim durable webhook inbox row", "s",
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordWebhookInboxStuckProcessing records the number of inbox rows wedged in
+// processing with an expired lease at the attempt cap — deliveries no driver can
+// reclaim. A nonzero value means auto-plans are being lost to crashes
+// mid-processing until the reconciler terminalizes them.
+func RecordWebhookInboxStuckProcessing(ctx context.Context, count int64) {
+	recordGauge(ctx, "schemabot.webhook.inbox_stuck_processing", count,
+		"Number of durable webhook inbox rows stuck in processing past the attempt cap", "{row}",
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordWebhookInboxStatsCollectionFailure counts failed inbox snapshots. The
+// inbox depth/backlog gauges are last-value instruments, so a failed snapshot
+// leaves them frozen at their last-good values — indistinguishable from a
+// healthy inbox. This counter is the liveness signal for the gauges: a nonzero
+// rate means the depth/backlog/stuck values are stale and must not be trusted.
+func RecordWebhookInboxStatsCollectionFailure(ctx context.Context) {
+	addCounter(ctx, "schemabot.webhook.inbox_stats_collection_failures",
+		"Total number of failed durable webhook inbox metric snapshots", "{failure}",
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordSummaryCommentRepaired counts terminal summary comments posted by
+// startup reconciliation because no publisher had posted one — the driver's
+// observer lost its lease or crashed, or a claimed publish died before
+// posting. A nonzero rate means terminal summaries are being missed at apply
+// time; investigate the terminal-publish paths (observer lease churn, stop
+// reconciliation, aggregate CAS publisher) for the apply state on the label.
+func RecordSummaryCommentRepaired(ctx context.Context, repo string, applyState string) {
+	addCounter(ctx, "schemabot.webhook.summary_comments_repaired_total",
+		"Total number of missing terminal summary comments posted by startup reconciliation", "{comment}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo),
+		attribute.String("apply_state", applyState))
+}
+
+// RecordWebhookReconcileMissingEvent counts open PR heads the webhook
+// reconciler found with no corresponding inbox delivery. A nonzero rate means
+// deliveries are being lost upstream of the inbox (edge auth, GitHub send
+// failures) — the divergence signal that report-only reconciliation exists to
+// surface.
+func RecordWebhookReconcileMissingEvent(ctx context.Context, repo string) {
+	addCounter(ctx, "schemabot.webhook.reconcile_missing_events_total",
+		"Total number of open PR heads found without a webhook inbox delivery", "{event}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo))
+}
+
+// RecordWebhookReconcileStuckTerminated counts webhook inbox rows the
+// reconciler terminated because they were parked in processing with an expired
+// lease at the attempt cap — a driver hard-killed on its final attempt. A
+// nonzero rate means deliveries are being lost to crashes mid-processing; each
+// terminated row emits as a failure and becomes eligible for redelivery.
+func RecordWebhookReconcileStuckTerminated(ctx context.Context, count int64) {
+	addCounterN(ctx, count, "schemabot.webhook.reconcile_stuck_terminated_total",
+		"Total number of stuck processing webhook inbox rows terminated by the reconciler", "{event}",
+		EnvironmentAttribute(""))
+}
+
 var knownStatusCheckOperations = map[string]bool{
 	"plan_check_recorded":                  true,
 	"apply_started":                        true,
@@ -1124,15 +1447,22 @@ var knownStatusCheckOperations = map[string]bool{
 	"managed_dir_missing_config":           true,
 	"aggregate_participant_skip":           true,
 	"aggregate_participant_fanout":         true,
+	"participant_comment_nudge":            true,
+	"participant_refold":                   true,
+	"merge_group_check":                    true,
+	"default_branch_check":                 true,
 }
 
 var knownStatusCheckStatuses = map[string]bool{
-	"success": true,
-	"error":   true,
-	"skipped": true,
-	"stale":   true,
-	"noop":    true,
-	"blocked": true,
+	"success":   true,
+	"error":     true,
+	"skipped":   true,
+	"stale":     true,
+	"noop":      true,
+	"blocked":   true,
+	"scheduled": true,
+	"exhausted": true,
+	"recreated": true,
 }
 
 // StatusCheckOperation describes one status-check storage or GitHub operation.
@@ -1179,6 +1509,39 @@ func RecordPendingDropMoved(ctx context.Context, database string) {
 	addCounter(ctx, "schemabot.pending_drops.tables_moved_total",
 		"Total number of dropped tables quarantined into the pending drops database", "{table}",
 		attribute.String("database", database),
+		EnvironmentAttribute(""),
+	)
+}
+
+// knownDirectExecutionOutcomes limits metric cardinality to the outcomes the
+// direct execution path can produce. Executed statements terminate as
+// completed, failed, or stopped; refused statements the policy does not route
+// directly are blocked with the reason encoded in the outcome.
+var knownDirectExecutionOutcomes = map[string]bool{
+	"completed":               true,
+	"failed":                  true,
+	"stopped":                 true,
+	"blocked_policy_disabled": true,
+	"blocked_size_limit":      true,
+	"blocked_size_unknown":    true,
+}
+
+// RecordDirectExecution increments the counter for a statement the
+// schema-change engine refused and the direct execution policy resolved — to a
+// native MySQL DDL execution (completed/failed/stopped) or to a block
+// (blocked_*). Direct executions are rare, operator-consented events: a spike
+// in failed means native DDL is erroring on the target (check the apply logs
+// for the statement and MySQL error), and a spike in blocked_size_unknown
+// means row estimates are unavailable (check target connectivity and
+// information_schema access).
+func RecordDirectExecution(ctx context.Context, database, outcome string) {
+	if !knownDirectExecutionOutcomes[outcome] {
+		outcome = "unknown"
+	}
+	addCounter(ctx, "schemabot.direct_execution.statements_total",
+		"Total number of engine-refused statements resolved by the direct execution policy", "{statement}",
+		attribute.String("database", database),
+		attribute.String("outcome", outcome),
 		EnvironmentAttribute(""),
 	)
 }

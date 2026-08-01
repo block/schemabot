@@ -262,7 +262,7 @@ func TestWatchModel_EstimateExceededUsesActivityLabel(t *testing.T) {
 
 	view := m.View()
 
-	assert.Contains(t, view, ui.ProgressBarActivity()+" Active ⠹")
+	assert.Contains(t, view, ui.ProgressBarActivity()+" Finalizing copy ⠹")
 	assert.Contains(t, view, "Rows copied: 145,000 so far")
 	assert.Contains(t, view, "More rows than initially estimated, copying is still active and will continue")
 	assert.NotContains(t, view, "145%")
