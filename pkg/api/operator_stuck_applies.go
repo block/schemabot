@@ -115,6 +115,14 @@ func (s *Service) CollectOperatorStuckPendingMetrics(ctx context.Context) {
 
 	stuck, err := s.storage.Applies().FindStuckPendingApplies(scanCtx, OperatorStuckPendingApplyThreshold, operatorStuckPendingSampleLimit)
 	if err != nil {
+		// A shutdown that lands mid-scan cancels the monitor context and fails
+		// the query with a cancellation error. That is orderly teardown, not a
+		// stale gauge: the failure counter is documented as "the gauge must not
+		// be trusted", and a routine deploy must not be able to tick it.
+		if ctx.Err() != nil {
+			s.logger.Debug("operator stuck-pending scan aborted because context is done", "error", err)
+			return
+		}
 		// The gauge is a last-value instrument: leaving it untouched here
 		// re-exports the last-good value with a fresh timestamp, which reads as a
 		// healthy operator. The failure counter is the liveness signal that tells

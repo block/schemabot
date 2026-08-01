@@ -21,13 +21,17 @@ import (
 // ApplyStore method is unused by the stuck-pending monitor.
 type fakeStuckApplyStore struct {
 	storage.ApplyStore
-	stuck []*storage.Apply
-	err   error
-	calls int
+	stuck  []*storage.Apply
+	err    error
+	calls  int
+	onScan func()
 }
 
 func (f *fakeStuckApplyStore) FindStuckPendingApplies(context.Context, time.Duration, int) ([]*storage.Apply, error) {
 	f.calls++
+	if f.onScan != nil {
+		f.onScan()
+	}
 	return f.stuck, f.err
 }
 
@@ -141,6 +145,26 @@ func TestCollectOperatorStuckPendingMetricsCountsFailureOnStoreError(t *testing.
 	names := metricNames(t, reader)
 	assert.NotContains(t, names, "schemabot.operator.stuck_pending_applies", "the gauge must not be re-emitted on error")
 	assert.Contains(t, names, "schemabot.operator.stuck_pending_scan_failures", "a failed scan must increment the failure counter")
+}
+
+// A shutdown that lands mid-scan cancels the monitor context and fails the
+// query with a cancellation error. That is orderly teardown, not a stale gauge:
+// a routine deploy must not tick the scan-failure counter (the "gauge must not
+// be trusted" liveness signal) or log the failure WARN.
+func TestCollectOperatorStuckPendingMetricsIgnoresShutdownMidScan(t *testing.T) {
+	reader := newStuckPendingMetricReader(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	store := &fakeStuckApplyStore{err: context.Canceled, onScan: cancel}
+	svc := newStuckPendingTestService(t, store)
+
+	svc.CollectOperatorStuckPendingMetrics(ctx)
+
+	names := metricNames(t, reader)
+	assert.NotContains(t, names, "schemabot.operator.stuck_pending_applies", "the gauge must not be re-emitted on error")
+	assert.NotContains(t, names, "schemabot.operator.stuck_pending_scan_failures",
+		"a scan aborted by shutdown must not count as a scan failure")
+	assert.Equal(t, 1, store.calls)
 }
 
 // The monitor is a no-op when apply storage is unavailable: there is nothing to
