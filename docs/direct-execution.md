@@ -141,12 +141,16 @@ containing direct-execution changes never does:
   disclosure and asks for `schemabot apply-confirm` — nothing executes, and
   the comment the operator confirms against is the one that spells out the
   consequences.
-- The stop-and-confirm applies again on the pre-execution re-plan, so a plan
-  that gains direct changes between the confirm being requested and the apply
-  executing still stops instead of running unconsented.
+- `schemabot apply-confirm` verifies the PR head still matches the plan the
+  operator confirmed against and re-plans against the live target before
+  executing; a re-plan that resolves to blocked is rejected. On the automatic
+  path, a re-plan that gains direct changes downgrades to manual confirmation
+  instead of executing.
 - `--defer-cutover` is rejected on an all-direct plan — a direct statement has
   no cutover to defer. On a mixed plan it applies to the engine-driven
-  statements only, and the disclosure says so.
+  statements only, and the disclosure says so. A rejection at confirm time
+  preserves the pending confirmation, so re-running `apply-confirm` without
+  the flag executes the confirmed plan.
 
 ## Observability
 
