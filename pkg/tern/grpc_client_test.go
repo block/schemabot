@@ -2067,6 +2067,61 @@ func TestGRPCClient_ProcessPendingCancelMootedByRemoteCompletionWritesEvent(t *t
 	assert.Contains(t, mootEvent.Message, "(caller: cli:alice)")
 }
 
+// A stopped remote is not a cancel outcome: stopped remotes remain
+// cancellable, so a pending cancel observed against stopped remote progress
+// must stay durably pending for the remote driver or the next drive — and no
+// did-not-take-effect disclosure belongs in the history, because the cancel
+// can still act.
+func TestGRPCClient_ProcessPendingCancelKeepsRequestOnStoppedRemote(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "users",
+			Status:    state.Task.Stopped,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-cancel-stopped",
+		ExternalID:      "remote-grpc-cancel-stopped",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	storedApply := *apply
+	applyStore := &mockApplyStore{apply: &storedApply}
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+
+	_, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.NoError(t, err)
+	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.NotNil(t, cancelReq, "a stopped remote remains cancellable; the durable cancel request must stay pending")
+	for _, entry := range logs.logs {
+		assert.NotContains(t, entry.Message, "Cancel did not take effect",
+			"no mooted-cancel disclosure belongs in the history while the cancel can still act")
+	}
+}
+
 func TestGRPCClient_ProcessPendingCancelOperationLeavesApplyCancelPending(t *testing.T) {
 	// A multi-deployment apply has one durable cancel request shared by every
 	// deployment. One operation reaching a terminal remote state must not
