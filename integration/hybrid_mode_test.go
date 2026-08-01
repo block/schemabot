@@ -407,10 +407,11 @@ func startTernGRPCForDB(t *testing.T, appDSN, dbName string) (string, error) {
 	t.Cleanup(func() { utils.CloseAndLog(localClient) })
 
 	// A dispatch queues the apply in Tern storage for the data plane's own
-	// operator; without this loop a dispatched apply would sit pending forever.
-	registerRemoteTern(dbName, localClient)
-	stopOperator := startRemoteTernOperator(storage, logger, "remote-tern-"+dbName)
-	t.Cleanup(stopOperator)
+	// operator; the shared remote-tern operator (started at package setup)
+	// claims it and routes the drive to this client by deployment.
+	if err := registerRemoteTern(storage, logger, dbName, localClient); err != nil {
+		return "", fmt.Errorf("register remote tern %s: %w", dbName, err)
+	}
 
 	// Wrap in gRPC server
 	grpcSrv := grpc.NewServer()

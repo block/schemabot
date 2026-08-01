@@ -129,9 +129,10 @@ type ServerConfig struct {
 	//
 	// Operator note: a deployment that never sets this key claims at the
 	// operation level. This is behavior-preserving while every apply owns one
-	// operation. A data-plane gRPC tern is the exception: it drives applies
-	// inline via LocalClient and does not own the apply_operations lifecycle, so
-	// when this key is unset it defaults to apply-level claiming at startup.
+	// operation. A data-plane gRPC tern is the exception: the serve Run path
+	// defaults it to apply-level claiming at startup when this key is unset —
+	// the mode production data planes run — so operation-level claiming on a
+	// data plane is an explicit opt-in.
 	OperatorClaimOperations *bool `yaml:"operator_claim_operations,omitempty"`
 
 	// RequirePassingChecks blocks apply when non-SchemaBot PR checks are not

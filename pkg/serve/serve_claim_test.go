@@ -9,10 +9,9 @@ import (
 )
 
 // TestApplyDataPlaneClaimDefault verifies that a data-plane tern process
-// (serving the Tern proto over gRPC) defaults operator claiming to the apply
-// level, because it drives applies inline via LocalClient and does not maintain
-// apply_operations rows. The control plane keeps operation-level claiming, and
-// an explicit setting is always honored.
+// (serving the Tern proto over gRPC) keeps the conservative apply-level claim
+// default when the mode is unset. The control plane keeps operation-level
+// claiming, and an explicit setting is always honored.
 func TestApplyDataPlaneClaimDefault(t *testing.T) {
 	enabled := true
 	disabled := false
