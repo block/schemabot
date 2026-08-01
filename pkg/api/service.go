@@ -161,6 +161,11 @@ type Service struct {
 	webhookInboxWg       sync.WaitGroup
 	webhookInboxInterval time.Duration
 
+	// Operator stuck-pending apply monitor loop management.
+	stuckPendingMu     sync.Mutex
+	stuckPendingCancel context.CancelFunc
+	stuckPendingWg     sync.WaitGroup
+
 	// Pending drops cleaner loop management.
 	pendingDropsMu     sync.Mutex
 	pendingDropsCancel context.CancelFunc
@@ -767,6 +772,7 @@ func (s *Service) Close() error {
 	s.StopOperator()
 	s.StopRemoteDeploymentHealthMonitor()
 	s.StopWebhookInboxMonitor()
+	s.StopOperatorStuckPendingMonitor()
 
 	s.ternMu.Lock()
 	var errs []error

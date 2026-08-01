@@ -263,10 +263,27 @@ jobs:
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Test"
         run: make test-e2e-mysql test-e2e-grpc
-      - name: "Container logs on failure"
+      - name: "Capture container logs on failure"
         if: failure()
         run: |
-          docker compose -f deploy/e2e/docker-compose.yml logs --tail=300 schemabot localscale 2>/dev/null || true
+          mkdir -p e2e-logs
+          # test-e2e-mysql (test-e2e-local) leaves its stack up, so capture it here.
+          docker compose -f deploy/e2e/docker-compose.yml logs --no-color --timestamps > e2e-logs/mysql-containers.log 2>&1 || true
+          echo "=== tail of MySQL container logs (full logs in the uploaded e2e-mysql-logs artifact) ==="
+          tail -n 200 e2e-logs/mysql-containers.log || true
+          # test-e2e-grpc tears its own stack down, so it captures grpc-containers.log itself.
+          if [ -f e2e-logs/grpc-containers.log ]; then
+            echo "=== tail of gRPC container logs ==="
+            tail -n 200 e2e-logs/grpc-containers.log || true
+          fi
+      - name: "Upload container logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4.6.2
+        with:
+          name: e2e-mysql-logs
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
 
   e2e-grpc-multideploy:
     name: "E2E gRPC Multi-Deployment Tests (${{ matrix.shard }})"
@@ -299,10 +316,22 @@ jobs:
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Test"
         run: make test-e2e-grpc-multideploy E2E_GRPC_MD_RUN='${{ matrix.run }}'
-      - name: "Container logs on failure"
+      - name: "Show captured container logs on failure"
         if: failure()
         run: |
-          docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs --tail=300 2>/dev/null || true
+          # test-e2e-grpc-multideploy tears its own stack down, so it captures
+          # grpc-multideploy-containers.log itself before teardown; the stack is
+          # already gone by the time this step runs.
+          echo "=== tail of container logs (full logs in the uploaded e2e-grpc-md-logs-shard-${{ matrix.shard }} artifact) ==="
+          tail -n 200 e2e-logs/grpc-multideploy-containers.log 2>/dev/null || echo "no container logs captured (stack failed before tests ran; see the job log above)"
+      - name: "Upload container logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4.6.2
+        with:
+          name: e2e-grpc-md-logs-shard-${{ matrix.shard }}
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
 
   e2e-vitess-matrix:
     name: "E2E Vitess Matrix"
@@ -379,10 +408,21 @@ jobs:
         run: |
           echo "Vitess e2e shard ${{ matrix.shard }}: ${{ matrix.run_filter }}"
           make test-e2e-local RUN="${{ matrix.run_filter }}" E2E_TEST_TIMEOUT=8m E2E_TEST_FLAGS=-v
-      - name: "Container logs on failure"
+      - name: "Capture container logs on failure"
         if: failure()
         run: |
-          docker compose -f deploy/e2e/docker-compose.yml logs --tail=300 schemabot localscale 2>/dev/null || true
+          mkdir -p e2e-logs
+          docker compose -f deploy/e2e/docker-compose.yml logs --no-color --timestamps > e2e-logs/containers.log 2>&1 || true
+          echo "=== tail of container logs (full logs in the uploaded e2e-vitess-logs-shard-${{ matrix.shard }} artifact) ==="
+          tail -n 200 e2e-logs/containers.log || true
+      - name: "Upload container logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4.6.2
+        with:
+          name: e2e-vitess-logs-shard-${{ matrix.shard }}
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
   e2e-k8s:
     name: "E2E K8s Tests"
     needs: changes
