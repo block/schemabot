@@ -168,16 +168,24 @@ const blockedSizeUnknownReason = "; direct execution is enabled but the table's 
 // The above-bound reason names only the configured limit, not the measured
 // count, so identical verdicts on different shards collapse into one row in
 // PR-facing summaries.
-func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, policy directPolicy, database, tableName, refusalReason string) refusedModeDecision {
+//
+// A non-nil error means the caller's context was cancelled while the size gate
+// ran: the gate never finished, so there is no verdict to record. Reporting a
+// cancellation as a blocked verdict would misdiagnose an operator stop as an
+// unmeasurable table, so the two are kept distinct.
+func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, policy directPolicy, database, tableName, refusalReason string) (refusedModeDecision, error) {
 	if !policy.Enabled {
 		return refusedModeDecision{
 			mode:       engine.ExecutionModeBlocked,
 			modeReason: refusalReason,
 			outcome:    "blocked_policy_disabled",
-		}
+		}, nil
 	}
 	db, err := target.get(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return refusedModeDecision{}, fmt.Errorf("size gate for table %q interrupted while connecting to the target: %w", tableName, err)
+		}
 		// Fail closed: without a connection there is no size gate, and an
 		// unmeasured table must never rebuild natively.
 		e.logger.Warn("direct execution blocked: cannot connect to target for the size gate",
@@ -186,10 +194,13 @@ func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, p
 			mode:       engine.ExecutionModeBlocked,
 			modeReason: refusalReason + blockedSizeUnknownReason,
 			outcome:    "blocked_size_unknown",
-		}
+		}, nil
 	}
 	rows, err := estimatedTableRows(ctx, db, database, tableName)
 	if err != nil {
+		if ctx.Err() != nil {
+			return refusedModeDecision{}, fmt.Errorf("size gate for table %q interrupted during the row estimate: %w", tableName, err)
+		}
 		// Fail closed: a table whose size cannot be measured must never
 		// rebuild natively — block it and surface why in the mode reason.
 		e.logger.Warn("direct execution blocked: estimated row count unavailable",
@@ -198,7 +209,7 @@ func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, p
 			mode:       engine.ExecutionModeBlocked,
 			modeReason: refusalReason + blockedSizeUnknownReason,
 			outcome:    "blocked_size_unknown",
-		}
+		}, nil
 	}
 	aboveBoundReason := fmt.Sprintf("%s; direct execution is enabled but the table is above the configured limit of %s rows",
 		refusalReason, ui.FormatNumber(policy.MaxTableRows))
@@ -210,17 +221,20 @@ func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, p
 			modeReason: aboveBoundReason,
 			outcome:    "blocked_size_limit",
 			rows:       rows,
-		}
+		}, nil
 	}
 	count, err := exactRowCountWithin(ctx, db, database, tableName, policy.MaxTableRows)
 	if err != nil {
+		if ctx.Err() != nil {
+			return refusedModeDecision{}, fmt.Errorf("size gate for table %q interrupted during the exact row count: %w", tableName, err)
+		}
 		e.logger.Warn("direct execution blocked: exact row count unavailable",
 			"database", database, "table", tableName, "error", err)
 		return refusedModeDecision{
 			mode:       engine.ExecutionModeBlocked,
 			modeReason: refusalReason + blockedSizeUnknownReason,
 			outcome:    "blocked_size_unknown",
-		}
+		}, nil
 	}
 	if count > policy.MaxTableRows {
 		e.logger.Info("direct execution blocked: exact row count above the policy bound despite a smaller estimate",
@@ -229,14 +243,14 @@ func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, p
 			mode:       engine.ExecutionModeBlocked,
 			modeReason: aboveBoundReason,
 			outcome:    "blocked_size_limit",
-		}
+		}, nil
 	}
 	return refusedModeDecision{
 		mode: engine.ExecutionModeDirect,
 		modeReason: fmt.Sprintf("%s; runs as native MySQL DDL on a table with ~%s rows",
 			refusalReason, ui.FormatNumber(count)),
 		rows: count,
-	}
+	}, nil
 }
 
 // Lifecycle states for a direct-routed statement's TableProgress entries.
@@ -330,7 +344,10 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 			continue
 		}
 
-		decision := e.resolveRefusedMode(ctx, target, policy, database, table, reason)
+		decision, err := e.resolveRefusedMode(ctx, target, policy, database, table, reason)
+		if err != nil {
+			return alterRouting{}, fmt.Errorf("route ALTER statement for table %q: %w", table, err)
+		}
 		if decision.mode != engine.ExecutionModeDirect {
 			metrics.RecordDirectExecution(ctx, database, decision.outcome)
 			if !policy.Enabled {
@@ -355,6 +372,11 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 	lockWaitSeconds := policy.lockAcquisitionTimeoutSeconds()
 	db, err := target.get(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			e.logger.Info("schema change stopped before direct execution connected to the target",
+				"database", database, "reason", ctx.Err())
+			return false
+		}
 		e.logger.Error("direct execution failed: cannot connect to target",
 			"database", database, "error", err)
 		e.setSchemaChangeFailed(fmt.Errorf("connect for direct execution: %w", err))
@@ -365,6 +387,11 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 	// reliably apply to the DDL if both went through the pool.
 	conn, err := db.Conn(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			e.logger.Info("schema change stopped before direct execution acquired its dedicated connection",
+				"database", database, "reason", ctx.Err())
+			return false
+		}
 		e.logger.Error("direct execution failed: cannot acquire a dedicated connection",
 			"database", database, "error", err)
 		e.setSchemaChangeFailed(fmt.Errorf("acquire dedicated connection for direct execution: %w", err))
@@ -373,13 +400,42 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 	defer utils.CloseAndLog(conn)
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION lock_wait_timeout = %d, innodb_lock_wait_timeout = %d",
 		lockWaitSeconds, lockWaitSeconds)); err != nil {
+		if ctx.Err() != nil {
+			e.logger.Info("schema change stopped before direct execution bounded its session lock waits",
+				"database", database, "reason", ctx.Err())
+			return false
+		}
 		e.logger.Error("direct execution failed: cannot bound the session lock wait timeouts",
 			"database", database, "error", err)
 		e.setSchemaChangeFailed(fmt.Errorf("bound session lock wait timeouts for direct execution: %w", err))
 		return false
 	}
 	for _, ds := range stmts {
-		progress := e.trackDirectStatement(ds.table, ds.stmt)
+		progress, claim := e.claimDirectStatement(ds.table, ds.stmt)
+		switch claim {
+		case directClaimSkipCompleted:
+			// The statement already ran to completion on an earlier run of this
+			// schema change (a resume re-enters this loop from the top).
+			// Native DDL is not revertible, so a completed statement must
+			// never execute twice.
+			metrics.RecordDirectExecution(ctx, database, "skipped_completed")
+			e.logger.Info("direct statement already completed on an earlier run; skipping",
+				"database", database, "table", ds.table)
+			e.emitTableLog(ds.table, "statement already completed as native MySQL DDL on an earlier run; skipping")
+			continue
+		case directClaimOutcomeUnknown:
+			// An earlier run was interrupted mid-statement: the connection
+			// dropped but MySQL may have finished the DDL server-side, so
+			// whether the statement took effect is unknown. Re-executing
+			// non-revertible DDL against an unknown outcome can silently
+			// duplicate it (an unnamed FOREIGN KEY re-runs successfully as a
+			// second constraint), so this fails closed instead.
+			metrics.RecordDirectExecution(ctx, database, "blocked_outcome_unknown")
+			e.logger.Error("direct execution failed: an earlier run left the statement's outcome unknown",
+				"database", database, "table", ds.table)
+			e.setSchemaChangeFailed(fmt.Errorf("direct statement on table %q was interrupted on an earlier run and its outcome is unknown — the DDL may have completed server-side; inspect the table and run a fresh plan to reconcile", ds.table))
+			return false
+		}
 		e.logger.Info("executing statement directly as native MySQL DDL",
 			"database", database, "table", ds.table, "reason", ds.reason, "estimated_rows", ds.rows)
 		e.emitTableLog(ds.table, "executing statement as native MySQL DDL: writes to the table block while it runs; not revertible")
@@ -427,16 +483,57 @@ func (e *Engine) emitTableLog(table, msg string) {
 	}
 }
 
-// trackDirectStatement registers a direct-routed statement on the running
-// schema change so progress polls report its lifecycle.
-func (e *Engine) trackDirectStatement(table, ddlStmt string) *directStatementProgress {
-	p := &directStatementProgress{table: table, ddl: ddlStmt, state: directStateRunning, startedAt: time.Now()}
+// directClaim is how the executor should handle a direct-routed statement,
+// resolved against any lifecycle an earlier run of this schema change already
+// recorded for it.
+type directClaim int
+
+const (
+	// directClaimRun executes the statement. Its progress entry is fresh, or a
+	// reused failed entry — a failed MySQL DDL statement is atomic and left no
+	// effect, so re-executing it on a resume is safe.
+	directClaimRun directClaim = iota
+	// directClaimSkipCompleted skips the statement: it already ran to
+	// completion on an earlier run, and native DDL must never execute twice.
+	directClaimSkipCompleted
+	// directClaimOutcomeUnknown fails the schema change: an earlier run was
+	// interrupted mid-statement, so whether the DDL took effect is unknown and
+	// re-executing it could silently duplicate a non-revertible change.
+	directClaimOutcomeUnknown
+)
+
+// claimDirectStatement resolves how a direct-routed statement should run given
+// the lifecycle already recorded for it on this schema change. Each statement
+// keeps a single progress entry across resumes — a re-run reuses the recorded
+// entry instead of appending a duplicate, so a progress poll never lists the
+// same statement twice.
+func (e *Engine) claimDirectStatement(table, ddlStmt string) (*directStatementProgress, directClaim) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.runningSchemaChange != nil {
-		e.runningSchemaChange.directStatements = append(e.runningSchemaChange.directStatements, p)
+	if e.runningSchemaChange == nil {
+		return &directStatementProgress{table: table, ddl: ddlStmt, state: directStateRunning, startedAt: time.Now()}, directClaimRun
 	}
-	return p
+	for _, p := range e.runningSchemaChange.directStatements {
+		if p.table != table || p.ddl != ddlStmt {
+			continue
+		}
+		switch p.state {
+		case directStateCompleted:
+			return p, directClaimSkipCompleted
+		case directStateFailed:
+			p.state = directStateRunning
+			p.startedAt = time.Now()
+			p.completedAt = nil
+			return p, directClaimRun
+		default:
+			// Stopped, or running with no recorded outcome: the earlier run was
+			// interrupted before the statement's result was known.
+			return p, directClaimOutcomeUnknown
+		}
+	}
+	p := &directStatementProgress{table: table, ddl: ddlStmt, state: directStateRunning, startedAt: time.Now()}
+	e.runningSchemaChange.directStatements = append(e.runningSchemaChange.directStatements, p)
+	return p, directClaimRun
 }
 
 // setDirectStatementState records a direct statement's transition. Completed

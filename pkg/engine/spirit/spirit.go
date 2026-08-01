@@ -107,8 +107,11 @@ type runningSchemaChange struct {
 	lockWaitTimeout time.Duration
 	volume          int32 // Explicit volume set via Volume for this change (0 = never set)
 
-	// For resume support
+	// For resume support. dsn is the verbatim credentials DSN from Apply — it
+	// can carry connection parameters (e.g. TLS) the parsed parts below don't,
+	// so paths that open their own target connection use it directly.
 	cancelFunc context.CancelFunc
+	dsn        string
 	host       string
 	username   string
 	password   string
@@ -375,7 +378,10 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 				return nil, fmt.Errorf("execution verdict for table %q: %w", pc.TableName, err)
 			}
 			if refused {
-				decision := e.resolveRefusedMode(ctx, target, policy, database, pc.TableName, reason)
+				decision, err := e.resolveRefusedMode(ctx, target, policy, database, pc.TableName, reason)
+				if err != nil {
+					return nil, fmt.Errorf("execution verdict for table %q: %w", pc.TableName, err)
+				}
 				change.ExecutionMode = decision.mode
 				change.ModeReason = decision.modeReason
 				if decision.mode == engine.ExecutionModeDirect {
@@ -525,6 +531,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		started:         time.Now(),
 		deferCutover:    deferCutover,
 		directPolicy:    directExecPolicy,
+		dsn:             req.Credentials.DSN,
 		host:            host,
 		username:        username,
 		password:        password,
@@ -547,7 +554,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			e.runningSchemaChange.cancelFunc = cancel
 		}
 		e.mu.Unlock()
-		e.executeSchemaChange(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover, directExecPolicy)
+		e.executeSchemaChange(bgCtx, req.Credentials.DSN, host, username, password, database, req.FlatDDL(), deferCutover, directExecPolicy)
 	})
 
 	return &engine.ApplyResult{

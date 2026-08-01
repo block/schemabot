@@ -204,6 +204,7 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 		return nil, fmt.Errorf("no schema change to resume - use Apply to start a new one")
 	}
 	state := rm.state
+	dsn := rm.dsn
 	host := rm.host
 	username := rm.username
 	password := rm.password
@@ -248,7 +249,7 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 			e.runningSchemaChange.cancelFunc = cancel
 		}
 		e.mu.Unlock()
-		e.resumeSchemaChange(bgCtx, host, username, password, database, originalDDLs, combinedStatement, deferCutover, directExecPolicy)
+		e.resumeSchemaChange(bgCtx, dsn, host, username, password, database, originalDDLs, combinedStatement, deferCutover, directExecPolicy)
 	})
 
 	return &engine.ControlResult{

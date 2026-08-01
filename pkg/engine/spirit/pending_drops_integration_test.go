@@ -62,7 +62,7 @@ func runDDLApply(t *testing.T, eng *Engine, dsn string, ddlStatements []string) 
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, directPolicy{})
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, directPolicy{})
 
 	eng.mu.Lock()
 	defer eng.mu.Unlock()
