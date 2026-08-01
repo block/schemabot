@@ -469,10 +469,12 @@ func TestGRPC_TaskStateUpdatedOnCompletion(t *testing.T) {
 func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	ctx := t.Context()
 
-	// Create a unique target database for this test
+	// Create a unique target database for this test. The close cleanup is
+	// registered before the drop cleanup so it runs after it (cleanups run
+	// LIFO): the drop still has a live handle.
 	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db")
-	defer utils.CloseAndLog(targetDB)
+	t.Cleanup(func() { utils.CloseAndLog(targetDB) })
 	require.NoError(t, targetDB.PingContext(ctx), "ping target db")
 
 	appDBName := fmt.Sprintf("tblerr_%d", time.Now().UnixNano()%100000)
@@ -480,7 +482,9 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	require.NoError(t, err, "create app database")
 	t.Cleanup(func() {
 		// Cleanup runs after the test context is cancelled, so it needs its own context.
-		if _, err := targetDB.ExecContext(t.Context(), "DROP DATABASE IF EXISTS "+quoteIdentifier(appDBName)); err != nil {
+		dropCtx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		if _, err := targetDB.ExecContext(dropCtx, "DROP DATABASE IF EXISTS "+quoteIdentifier(appDBName)); err != nil {
 			t.Logf("cleanup: drop database %s: %v", appDBName, err)
 		}
 	})
