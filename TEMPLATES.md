@@ -43,8 +43,8 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
 ⚠️ **Lint Warnings**:
-- [orders] New column uses floating-point data type
-- [users] Column added without DEFAULT value
+- [users] Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
+- [products] Index 'idx_category' on columns (category) is redundant - covered by index 'idx_category_price' on columns (category, price)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -55,6 +55,117 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 schemabot apply -e staging
 ```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-engineblocked-change"></a><strong>MySQL Plan (Engine-blocked Change)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `users`
+    DROP PRIMARY KEY,
+    ADD PRIMARY KEY(`id`, `tenant_id`);
+
+ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`);
+
+ALTER TABLE `orders` ADD COLUMN `notes` text;
+```
+
+⛔ **Cannot apply**: **2** changes not supported by the schema-change engine
+- `users`: dropping primary key is not supported
+- `orders`: adding foreign key constraints is not supported
+
+An apply will fail on these statements. Rewrite them as a supported schema change, or contact your SchemaBot operators for help.
+
+📋 **Plan**: **3** tables to alter
+
+
+---
+
+💡 **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-directexecution-change"></a><strong>MySQL Plan (Direct-execution Change)</strong></summary>
+
+
+## Schema Change Apply — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
+
+```sql
+ALTER TABLE `users`
+    DROP PRIMARY KEY,
+    ADD PRIMARY KEY(`id`, `tenant_id`);
+
+ALTER TABLE `orders` ADD COLUMN `notes` text;
+```
+
+⚙️ **Direct execution**: **1** change will run as native MySQL DDL
+- `users`: dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows
+
+These statements run synchronously outside the schema-change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this.
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+⚠️ **Automatic apply paused**: Plan contains direct-execution changes — review the disclosure and confirm manually
+
+Review the plan above, then confirm manually:
+```
+schemabot apply-confirm -e staging
+```
+
+🔓 To discard this plan and unlock, comment:
+```
+schemabot unlock
+```
+
+</details>
+
+<details>
+<summary><a name="apply-rejected-engineblocked-changes"></a><strong>Apply Rejected (Engine-blocked Changes)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `users`
+    DROP PRIMARY KEY,
+    ADD PRIMARY KEY(`id`, `tenant_id`);
+
+ALTER TABLE `orders` ADD COLUMN `notes` text;
+```
+
+📋 **Plan**: **2** tables to alter
+
+---
+
+**⛔ Apply rejected**: **1** planned change not supported by the schema-change engine
+- `users`: dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000
+
+Rewrite these statements as a supported schema change, or contact your SchemaBot operators for help.
 
 </details>
 
@@ -134,6 +245,30 @@ This PR does not contain schema changes managed by SchemaBot. SchemaBot did not 
 </details>
 
 <details>
+<summary><a name="no-managed-schema-changes-checks-refreshed"></a><strong>No Managed Schema Changes (Checks Refreshed)</strong></summary>
+
+
+## ✅ No Managed Schema Changes
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
+
+This PR does not contain schema changes managed by SchemaBot. The SchemaBot checks were refreshed as passing on `abcdef1234567890abcdef1234567890abcdef12`.
+
+</details>
+
+<details>
+<summary><a name="no-managed-schema-changes-gated-on-tenants"></a><strong>No Managed Schema Changes (Gated On Tenants)</strong></summary>
+
+
+## ✅ No Managed Schema Changes
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
+
+This PR does not contain schema changes managed by this SchemaBot deployment, but it touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on `abcdef1234567890abcdef1234567890abcdef12` and will pass once every tenant deployment's own check succeeds.
+
+</details>
+
+<details>
 <summary><a name="reconciliation-required-in-progress"></a><strong>Reconciliation Required (In Progress)</strong></summary>
 
 
@@ -166,6 +301,7 @@ The live database operation was already started and may continue independently o
      schemabot rollback apply-09f8ba28fb67492e -e staging
      ```
      After rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan.
+<!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
 </details>
@@ -201,6 +337,7 @@ Choose one:
      schemabot rollback apply-09f8ba28fb67492e -e staging
      ```
    - after rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan
+<!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
 </details>
@@ -437,6 +574,9 @@ schemabot apply -e staging
 
 ### Staging & Production
 
+<details>
+<summary>Show SQL (3 statements)</summary>
+
 ```sql
 CREATE TABLE `users` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -461,6 +601,8 @@ CREATE TABLE `orders` (
 
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+</details>
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -494,6 +636,9 @@ schemabot apply -e production
 
 ### Production
 
+<details>
+<summary>Show SQL (3 statements)</summary>
+
 ```sql
 CREATE TABLE `users` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -518,6 +663,8 @@ CREATE TABLE `orders` (
 
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+</details>
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -542,6 +689,9 @@ schemabot apply -e production
 
 ### Staging
 
+<details>
+<summary>Show SQL (3 statements)</summary>
+
 ```sql
 CREATE TABLE `users` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -566,6 +716,8 @@ CREATE TABLE `orders` (
 
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+</details>
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -600,6 +752,9 @@ schemabot plan -e production
 
 ### Staging & Production
 
+<details>
+<summary>Show SQL (3 statements)</summary>
+
 ```sql
 CREATE TABLE `users` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -625,9 +780,11 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+</details>
+
 ⚠️ **Lint Warnings**:
-- [orders] Primary key uses signed integer type (should be UNSIGNED)
-- [users] Column uses utf8 charset (should be utf8mb4)
+- [users] Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
+- [products] Index 'idx_category' on columns (category) is redundant - covered by index 'idx_category_price' on columns (category, price)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -663,7 +820,7 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 
 ---
 
-**⛔ Unsafe Changes Detected:**
+**⛔ 1 Unsafe Change Detected:**
 - `customers`: Unsafe operation detected: DROP COLUMN `nickname`
 
 **Destructive drop guidance:**
@@ -674,6 +831,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 ```
 schemabot apply -e staging --allow-unsafe
 ```
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -695,7 +853,7 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 
 ---
 
-**⛔ Unsafe Changes Detected:**
+**⛔ 1 Unsafe Change Detected:**
 - `customers`: Unsafe operation detected: DROP INDEX `idx_customers_email`
 
 **Destructive drop guidance:**
@@ -706,6 +864,39 @@ Before dropping an index in MySQL, first make the dropped index invisible and ve
 ```
 schemabot apply -e staging --allow-unsafe
 ```
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="schema-lint-errors-blocked"></a><strong>Schema Lint Errors Blocked</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` MODIFY COLUMN `id` int NOT NULL AUTO_INCREMENT;
+
+ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
+```
+
+📋 **Plan**: **2** tables to alter
+
+---
+
+**⛔ 2 Unsafe Changes Detected:**
+- `orders`: Primary key column "id" has type "int"
+- `users`: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
+
+**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
+```
+schemabot apply -e staging --allow-unsafe
+```
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -726,12 +917,14 @@ schemabot apply -e staging --allow-unsafe
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
-| `schemabot rollback <apply-id> -e <env>` | Generate a rollback plan |
-| `schemabot rollback-confirm -e <env>` | Execute a rollback |
+| `schemabot volume <apply-id> -e <env> -v <level>` | Adjust schema change speed (1=slowest, 11=fastest) |
+| `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
+| `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
 **Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
 
 **Quick start**: `plan` → `apply`
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -756,12 +949,14 @@ That command wasn't recognized. Available commands:
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
-| `schemabot rollback <apply-id> -e <env>` | Generate a rollback plan |
-| `schemabot rollback-confirm -e <env>` | Execute a rollback |
+| `schemabot volume <apply-id> -e <env> -v <level>` | Adjust schema change speed (1=slowest, 11=fastest) |
+| `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
+| `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
 **Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
 
 **Quick start**: `plan` → `apply`
+<!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
 
@@ -774,6 +969,7 @@ That command wasn't recognized. Available commands:
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **Status**: Failed
+<!-- schemabot:offer-support-channel -->
 
 📊 1/3 complete · 1 failed · 1 cancelled
 
@@ -785,7 +981,7 @@ That command wasn't recognized. Available commands:
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -862,6 +1058,8 @@ Use the `-d` flag:
 ```
 schemabot plan -e staging -d <database-name>
 ```
+<!-- schemabot:offer-support-channel -->
+
 </details>
 
 <details>
@@ -877,6 +1075,8 @@ schemabot plan -e staging -d <database-name>
 No `schemabot.yaml` configuration with `database: nonexistent-db` was found in this repository.
 
 Check that your `schemabot.yaml` file has the correct `database` field matching the `-d` flag value.
+<!-- schemabot:offer-support-channel -->
+
 </details>
 
 <details>
@@ -898,6 +1098,26 @@ type: mysql
 
 - **database** (required): The database name
 - **type** (required): `vitess` or `mysql`
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="unmanaged-schema-configs-notice"></a><strong>Unmanaged Schema Configs Notice</strong></summary>
+
+
+## ⚠️ Schema Changes Not Managed by SchemaBot
+
+This PR changes schema under the following path(s), which this SchemaBot instance is not configured to manage:
+
+- `services/inventory/schema` — declares database `inventory`
+
+These schema changes will **not** be planned or applied, and the SchemaBot checks on this PR do not cover them.
+
+If SchemaBot should manage them, ask a SchemaBot operator to add the directory to the database's `allowed_dirs` in the server config; otherwise remove these schema changes from this PR.
+<!-- schemabot:offer-support-channel -->
+
+> 💬 Support: [#schema-help](https://chat.example.com/schema-help).
 </details>
 
 <details>
@@ -913,6 +1133,25 @@ type: mysql
 ### Error
 
 > failed to fetch repository contents: API rate limit exceeded
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="autoplan-generic-error"></a><strong>Auto-plan: Generic Error</strong></summary>
+
+
+## ❌ Plan Failed
+
+**Environment**: `staging`
+
+*Triggered automatically by a pull request update at 2026-01-15 14:30:00 UTC*
+
+### Error
+
+> failed to fetch repository contents: API rate limit exceeded
+<!-- schemabot:offer-support-channel -->
+
 </details>
 
 <details>
@@ -929,6 +1168,8 @@ You'll need to specify which environment to target with the `-e` flag.
 ```
 schemabot plan -e staging
 ```
+<!-- schemabot:offer-support-channel -->
+
 </details>
 
 <details>
@@ -950,12 +1191,14 @@ That command wasn't recognized. Available commands:
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
-| `schemabot rollback <apply-id> -e <env>` | Generate a rollback plan |
-| `schemabot rollback-confirm -e <env>` | Execute a rollback |
+| `schemabot volume <apply-id> -e <env> -v <level>` | Adjust schema change speed (1=slowest, 11=fastest) |
+| `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
+| `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
 **Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
 
 **Quick start**: `plan` → `apply`
+<!-- schemabot:offer-support-channel -->
 </details>
 
 ### CLI Output
@@ -1232,47 +1475,6 @@ Apply in progress
 ### PR Comments
 
 <details>
-<summary><a name="apply-blocked-by-other-pr"></a><strong>Apply Blocked By Other PR</strong></summary>
-
-
-## 🔒 Apply Blocked — Staging
-
-**Database**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-Another PR currently holds the lock for this database.
-
-**Locked by**: [block/myapp#42](https://github.com/block/myapp/pull/42)
-**Since**: 2026-03-15 12:30:00 UTC
-
-Wait for the other PR to complete or ask the lock holder to run `schemabot unlock`.
-
-</details>
-
-<details>
-<summary><a name="apply-blocked-by-cli"></a><strong>Apply Blocked By CLI</strong></summary>
-
-
-## 🔒 Apply Blocked — Staging
-
-**Database**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-A CLI session currently holds the lock for this database.
-
-**Locked by**: `cli:jackjackbits@macbook.local`
-**Since**: 2026-03-15 14:00:00 UTC
-
-Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock with:
-```
-schemabot unlock -d testapp --force
-```
-
-</details>
-
-<details>
 <summary><a name="unlock-success"></a><strong>Unlock Success</strong></summary>
 
 
@@ -1283,22 +1485,6 @@ schemabot unlock -d testapp --force
 *Released by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 The database is now available for schema changes.
-
-</details>
-
-<details>
-<summary><a name="apply-already-in-progress"></a><strong>Apply Already In Progress</strong></summary>
-
-
-## ⚠️ Apply Already In Progress — Staging
-
-**Database**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-An apply is already running for this PR (apply ID: `apply-a1b2c3d4e5f6`, state: `running`).
-
-Wait for it to complete or stop it first.
 
 </details>
 
@@ -1315,93 +1501,6 @@ No apply lock is held for this database. Run `apply` first to generate a plan an
 ```
 schemabot apply -e staging
 ```
-
-</details>
-
-<details>
-<summary><a name="blocked-by-prior-env-pending"></a><strong>Blocked By Prior Env (Pending)</strong></summary>
-
-
-## ❌ Apply Blocked — Production
-
-**Database**: `testapp`
-
-Staging has pending changes. Apply staging first before applying to production.
-
-```
-schemabot apply -e staging
-```
-
-</details>
-
-<details>
-<summary><a name="blocked-by-prior-env-failed"></a><strong>Blocked By Prior Env (Failed)</strong></summary>
-
-
-## ❌ Apply Blocked — Production
-
-**Database**: `testapp`
-
-Staging failed. Fix the issue and re-apply staging before applying to production.
-
-```
-schemabot apply -e staging
-```
-
-</details>
-
-<details>
-<summary><a name="blocked-by-prior-env-in-progress"></a><strong>Blocked By Prior Env (In Progress)</strong></summary>
-
-
-## ⏳ Apply Blocked — Production
-
-**Database**: `testapp`
-
-Staging is currently in progress. Wait for it to complete before applying to production.
-
-Once staging completes, retry:
-```
-schemabot apply -e production
-```
-
-</details>
-
-<details>
-<summary><a name="review-required"></a><strong>Review Required</strong></summary>
-
-
-## Review Required
-
-**Database**: `testapp` | **Environment**: `staging`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-Schema changes require approval from an authorized reviewer before applying.
-
-**Authorized reviewers**:
-- @acme/schema-reviewers
-- @jdoe
-
-### Next steps
-1. Request a review from an authorized reviewer above
-2. Once approved, run `schemabot apply -e staging` again
-
-</details>
-
-<details>
-<summary><a name="review-gate-error-failclosed"></a><strong>Review Gate Error (Fail-closed)</strong></summary>
-
-
-## ❌ Apply Failed
-
-**Environment**: `staging`
-
-*Requested by @jackjackbits at  UTC*
-
-### Error
-
-> Review gate check failed: expand team @acme/schema-reviewers: team membership cannot be read. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
 </details>
 
 ### CLI Output
@@ -1494,6 +1593,17 @@ Options:
 ```
 
 No lock found for testapp (mysql)
+
+```
+</details>
+
+<details>
+<summary><a name="lock-exists-under-other-type"></a><strong>Lock Exists Under Other Type</strong></summary>
+
+```
+
+No lock found for testapp (mysql), but a vitess lock exists for this database.
+Release it with: schemabot unlock -d testapp -t vitess
 
 ```
 </details>
@@ -1806,6 +1916,419 @@ Schema changes are being applied. This comment will be updated with progress.
 </details>
 
 <details>
+<summary><a name="apply-blocked-by-other-pr"></a><strong>Apply Blocked By Other PR</strong></summary>
+
+
+## 🔒 Apply Blocked — Staging
+
+**Database**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+Another PR currently holds the lock for this database.
+
+**Locked by**: [block/myapp#42](https://github.com/block/myapp/pull/42)
+**Since**: 2026-03-15 12:30:00 UTC
+
+Wait for the other PR to complete or ask the lock holder to run `schemabot unlock`.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-by-cli"></a><strong>Apply Blocked By CLI</strong></summary>
+
+
+## 🔒 Apply Blocked — Staging
+
+**Database**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+A CLI session currently holds the lock for this database.
+
+**Locked by**: `cli:jackjackbits@macbook.local`
+**Since**: 2026-03-15 14:00:00 UTC
+
+Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock with:
+```
+schemabot unlock -d testapp --force
+```
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-already-in-progress"></a><strong>Apply Blocked: Already In Progress</strong></summary>
+
+
+## ⚠️ Apply Already In Progress — Staging
+
+**Database**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+An apply is already running for this PR (apply ID: `apply-a1b2c3d4e5f6`, state: `running`).
+
+Wait for it to complete or stop it first.
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-pr-closed"></a><strong>Apply Blocked: PR Closed</strong></summary>
+
+
+## ⛔ Apply Blocked: PR Is Closed — Staging
+
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+This PR is closed, so its schema changes can never merge. SchemaBot only applies schema changes from open PRs.
+
+Reopen this PR, or open a new PR with the schema change, and apply from there.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-pr-merged"></a><strong>Apply Blocked: PR Merged</strong></summary>
+
+
+## ⛔ Apply Blocked: PR Is Merged — Staging
+
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+This PR is already merged, so applies can no longer run from it. SchemaBot only applies schema changes from open PRs.
+
+If the schema change still needs to be applied, open a new PR with it and apply from there.
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-base-schema-changed-since-pr-diverged"></a><strong>Apply Blocked: Base Schema Changed Since PR Diverged</strong></summary>
+
+
+## ⚠️ Apply rejected — base schema is newer — Production
+
+**Database**: `testapp`
+
+The base branch contains newer changes to the schema directory `schema/testapp` that are not included in this PR. Applying this branch could revert those changes.
+
+Merge or rebase the current base branch into this PR, review the updated plan, then run `apply` again.
+
+_Requested by @jackjackbits_
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-schema-stale-new-commits"></a><strong>Apply Blocked: Schema Stale (New Commits)</strong></summary>
+
+
+## ⚠️ Rejected — new commits since discovery — Staging
+
+**Database**: `testapp`
+
+Schema files were loaded at `0123456789abcdef0123456789abcdef01234567`, but the current PR HEAD is `abcdef1234567890abcdef1234567890abcdef12`. These files no longer match what is on the branch.
+
+Re-run the command to use the current HEAD:
+
+```
+schemabot apply -e staging
+```
+
+_Requested by @jackjackbits_
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-confirmed-plan-stale"></a><strong>Apply Blocked: Confirmed Plan Stale</strong></summary>
+
+
+## ⚠️ Rejected — the plan you confirmed is stale — Staging
+
+**Database**: `testapp`
+
+The confirmation plan was rendered at `0123456789abcdef0123456789abcdef01234567`, but the current PR HEAD is `abcdef1234567890abcdef1234567890abcdef12`. New commits have landed since the plan was posted, so the DDL you reviewed no longer matches what is on the branch.
+
+Re-run `apply` to generate a fresh plan against the current HEAD:
+
+```
+schemabot apply -e staging
+```
+
+_Requested by @jackjackbits_
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-by-prior-env-pending"></a><strong>Apply Blocked By Prior Env (Pending)</strong></summary>
+
+
+## ❌ Apply Blocked — Production
+
+**Database**: `testapp`
+
+Staging has pending changes. Apply staging first before applying to production.
+
+```
+schemabot apply -e staging
+```
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-by-prior-env-failed"></a><strong>Apply Blocked By Prior Env (Failed)</strong></summary>
+
+
+## ❌ Apply Blocked — Production
+
+**Database**: `testapp`
+
+Staging failed. Fix the issue and re-apply staging before applying to production.
+
+```
+schemabot apply -e staging
+```
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-by-prior-env-in-progress"></a><strong>Apply Blocked By Prior Env (In Progress)</strong></summary>
+
+
+## ⏳ Apply Blocked — Production
+
+**Database**: `testapp`
+
+Staging is currently in progress. Wait for it to complete before applying to production.
+
+Once staging completes, retry:
+```
+schemabot apply -e production
+```
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-prior-env-check-missing"></a><strong>Apply Blocked: Prior Env Check Missing</strong></summary>
+
+
+## ❌ Apply Blocked
+
+SchemaBot could not find a completed `staging` check for this PR.
+
+SchemaBot must verify `staging` before applying a later environment. Create the missing `staging` status with:
+```
+schemabot plan -e staging
+```
+
+If the plan finds changes, apply `staging` and wait for the SchemaBot check to succeed. Then retry this apply.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-prior-env-check-read-error"></a><strong>Apply Blocked: Prior Env Check Read Error</strong></summary>
+
+
+## ❌ Apply Blocked
+
+Could not verify staging status: failed to query check runs. Retry the apply command.
+
+_See server logs for details._
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-prior-env-check-untrusted"></a><strong>Apply Blocked: Prior Env Check Untrusted</strong></summary>
+
+
+## ❌ Apply Blocked
+
+A `staging` check named `SchemaBot (staging)` exists on this PR, but it was created by a GitHub App this SchemaBot deployment does not trust:
+
+- `acme-automation`
+
+SchemaBot only verifies `staging` through check runs created by trusted SchemaBot deployment Apps.
+
+### Next steps
+- If the App above is the SchemaBot deployment that owns `staging`, an operator must add its slug to `github.trusted-check-app-slugs` in this deployment's server config.
+- If you do not recognize the App, do not trust it — the check may be impersonating SchemaBot.
+
+Re-running `schemabot plan -e staging` will not resolve this.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-environment-not-in-promotion-order"></a><strong>Apply Blocked: Environment Not In Promotion Order</strong></summary>
+
+
+## ❌ Apply Blocked — Development
+
+`development` is not in the configured promotion order, so SchemaBot cannot determine which environments must be applied before it and cannot enforce staging-first ordering.
+
+Configured promotion order: `staging` → `production`
+
+Add `development` to `environment_order` (the server-wide list, or this database's override when it has one) so SchemaBot knows where it sits in the promotion sequence, then retry the apply.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-review-required"></a><strong>Apply Blocked: Review Required</strong></summary>
+
+
+## Review Required
+
+**Database**: `testapp` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+Schema changes require approval from an authorized reviewer before applying.
+
+**Authorized reviewers**:
+- @acme/schema-reviewers
+- @jdoe
+
+### Next steps
+1. Request a review from an authorized reviewer above
+2. Once approved, run `schemabot apply -e staging` again
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-review-gate-error-failclosed"></a><strong>Apply Blocked: Review Gate Error (Fail-closed)</strong></summary>
+
+
+## ❌ Apply Failed
+
+**Environment**: `staging`
+
+*Requested by @jackjackbits at  UTC*
+
+### Error
+
+> Review gate check failed; see server logs for details. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-checks-not-passing"></a><strong>Apply Blocked: Checks Not Passing</strong></summary>
+
+
+## ❌ Apply Blocked — Staging
+
+Cannot apply while PR checks are not passing:
+
+| Check | Status |
+|-------|--------|
+| `CI / unit-tests` | failure |
+| `CI / lint` | timed_out |
+
+Get the checks passing — fix failures and re-run cancelled or stale checks — then retry:
+```
+schemabot apply -e staging
+```
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-checks-in-progress"></a><strong>Apply Blocked: Checks In Progress</strong></summary>
+
+
+## ⏳ Apply Blocked — Staging
+
+Cannot apply while PR checks are still running:
+
+| Check | Status |
+|-------|--------|
+| `CI / unit-tests` | in_progress |
+| `CI / integration-tests` | queued |
+
+Wait for checks to complete and retry:
+```
+schemabot apply -e staging
+```
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-check-status-read-error"></a><strong>Apply Blocked: Check Status Read Error</strong></summary>
+
+
+## ❌ Apply Blocked — Staging
+
+The SchemaBot GitHub App `schemabot-app` cannot read PR check statuses for this repository.
+
+The diagnostic REST probes indicate the installation is missing or has not accepted:
+- **Checks: Read**
+- **Commit statuses: Read**
+
+Grant or accept those permissions, then retry:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-actor-not-authorized"></a><strong>Apply Blocked: Actor Not Authorized</strong></summary>
+
+
+## SchemaBot Command Not Authorized
+
+**Database**: `orders` | **Environment**: `staging`
+
+@mona is not authorized to run `schemabot apply` for this database.
+
+A configured SchemaBot admin/database operator must run this command.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="actor-authorization-unavailable"></a><strong>Actor Authorization: Unavailable</strong></summary>
+
+
+## SchemaBot Authorization Check Failed
+
+**Database**: `orders` | **Environment**: `production`
+**Requested by**: @mona
+
+SchemaBot could not verify authorization for `schemabot apply-confirm`. No schema change was started.
+
+If access is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
+
+A configured SchemaBot admin/database operator should inspect SchemaBot authorization logs before retrying.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="actor-authorization-database-not-configured"></a><strong>Actor Authorization: Database Not Configured</strong></summary>
+
+
+## SchemaBot Command Not Authorized
+
+**Database**: `payments`
+
+`schemabot unlock` cannot run because database `payments` is not configured on this SchemaBot instance.
+
+Verify the database name, or run the command against the SchemaBot instance that manages this database.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="single-table-running"></a><strong>Single Table: Running</strong></summary>
 
 
@@ -1816,6 +2339,37 @@ Schema changes are being applied. This comment will be updated with progress.
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **Status**: In Progress
+
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="single-table-running-volume-tuned"></a><strong>Single Table: Running (Volume Tuned)</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress | Volume: 8/11
 
 **`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
 
@@ -1848,7 +2402,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Status**: Applied
 
-**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
@@ -1868,6 +2422,7 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **Status**: Failed
+<!-- schemabot:offer-support-channel -->
 
 **`users`**: 🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
 
@@ -2038,7 +2593,7 @@ Rows: 914,707 / 1,466,232 · ETA: 3m 15s
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -2068,11 +2623,11 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Status**: In Progress
 
-📊 1/3 complete · 1 running (Active) · 1 queued
+📊 1/3 complete · 1 running (finalizing copy) · 1 queued
 
 **Schema `testapp`**
 
-**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Active
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Finalizing copy
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
@@ -2086,7 +2641,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -2133,7 +2688,7 @@ Rows verified: 321,450 / 1,466,232
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -2174,13 +2729,13 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 Rows: 87,231 / 523,140 · ETA: 7m 0s
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
@@ -2282,19 +2837,19 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Schema `testapp`**
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -2349,7 +2904,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 Deploy request: https://app.planetscale.com/acme/myapp/deploy-requests/42
 
-**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
@@ -2415,6 +2970,53 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="middle-table-retrying"></a><strong>Middle Table Retrying</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Retrying
+
+📊 1/3 complete · 1 queued · 1 retrying
+
+**Schema `testapp`**
+
+**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔄 Interrupted — retrying automatically (attempt 2/10)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+> ⚠️ Last error: lock wait timeout exceeded; try restarting transaction
+
+**`products`**: ⏳ Queued
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+---
+
+An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="first-table-failed"></a><strong>First Table Failed</strong></summary>
 
 
@@ -2425,6 +3027,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **Status**: Failed
+<!-- schemabot:offer-support-channel -->
 
 📊 1 failed · 2 cancelled
 
@@ -2471,6 +3074,7 @@ schemabot apply -e staging
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **Status**: Failed
+<!-- schemabot:offer-support-channel -->
 
 📊 1/3 complete · 1 failed · 1 cancelled
 
@@ -2482,7 +3086,7 @@ schemabot apply -e staging
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -2496,6 +3100,54 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 
 > ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
+
+---
+
+To retry:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="failed-before-row-copy-preflight"></a><strong>Failed Before Row Copy (Preflight)</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Failed
+<!-- schemabot:offer-support-channel -->
+
+📊 1 failed · 2 cancelled
+
+**Schema `testapp`**
+
+**`orders`**: ❌ Failed (before row copy started)
+
+```sql
+ALTER TABLE `orders` MODIFY COLUMN `status` enum('NEW','PENDING','SHIPPED','DELIVERED') NOT NULL;
+```
+> ⚠️ Last error: preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end
+
+**`users`**: ⊘ Cancelled (not started)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: ⊘ Cancelled (not started)
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+> ⚠️ **Error:** table orders failed: preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end
 
 ---
 
@@ -2529,7 +3181,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 Rows: 1,055,687 / 1,466,232
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -2565,7 +3217,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -2592,7 +3244,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Schema `testapp`**
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -2623,25 +3275,25 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
 **Status**: Waiting for Cutover
 
-**0/3** table(s) ready for cutover — waiting on 3
+**3/3** table(s) ready for cutover
 
-📊 3 waiting for cutover
+📊 3 ready for cutover
 
 **Schema `testapp`**
 
-**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✅ Ready for cutover
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✅ Ready for cutover
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✅ Ready for cutover
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -2660,6 +3312,51 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="waiting-for-cutover-automatic"></a><strong>Waiting For Cutover (Automatic)</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Waiting for Cutover
+
+**3/3** table(s) ready for cutover
+
+📊 3 ready for cutover
+
+**Schema `testapp`**
+
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✅ Ready for cutover
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✅ Ready for cutover
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✅ Ready for cutover
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+---
+
+SchemaBot triggers cutover automatically — no action needed.
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="cutting-over"></a><strong>Cutting Over</strong></summary>
 
 
@@ -2670,8 +3367,6 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **Status**: Cutting Over
-
-**0/3** table(s) ready for cutover — waiting on 3
 
 📊 3 cutting over
 
@@ -2720,19 +3415,19 @@ Deploy request: https://app.planetscale.com/acme/myapp/deploy-requests/42
 
 **Keyspace `testapp`**
 
-**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -2771,19 +3466,19 @@ Deploy request: https://app.planetscale.com/acme/myapp/deploy-requests/42
 
 **Keyspace `testapp`**
 
-**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -2898,6 +3593,282 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 </details>
 
 <details>
+<summary><a name="volume-command-accepted"></a><strong>Volume Command Accepted</strong></summary>
+
+
+## Volume Request Accepted
+
+**Apply**: `apply-a1b2c3d4e5f67890`
+**Environment**: `staging`
+**Requested by**: @alice
+
+Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly; once the new level takes effect, a fresh progress comment will track the schema change at the new volume.
+
+</details>
+
+<details>
+<summary><a name="volume-command-invalid-level"></a><strong>Volume Command Invalid Level</strong></summary>
+
+
+## Missing or Invalid Volume Level
+
+Usage: `schemabot volume <apply-id> -e <environment> -v <level>`
+
+The `-v` flag is required and must be a number between 1 (slowest) and 11 (fastest).
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="volume-command-missing-apply-id"></a><strong>Volume Command Missing Apply ID</strong></summary>
+
+
+## Missing Apply ID
+
+Usage: `schemabot volume <apply-id> -e <environment> -v <1-11>`
+
+Use `schemabot status -e <environment>` to find the apply ID.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="volume-changed-superseded-progress-comment"></a><strong>Volume Changed: Superseded Progress Comment</strong></summary>
+
+
+⏩ Volume changed to **8/11** — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the volume change</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress | Volume: 3/11
+
+**`users`**: 🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 32%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+Rows: 2,300,000 / 7,200,000 · ETA: 13m 0s
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
+</details>
+
+<details>
+<summary><a name="resumed-superseded-progress-comment"></a><strong>Resumed: Superseded Progress Comment</strong></summary>
+
+
+▶️ Schema change resumed — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the stop</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Stopped
+
+**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 32%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+Rows: 2,300,000 / 7,200,000
+
+
+---
+
+Paused — to resume from where it stopped:
+```
+schemabot start apply-a1b2c3d4e5f6 -e staging
+```
+
+
+</details>
+
+</details>
+
+<details>
+<summary><a name="revert-superseded-progress-comment"></a><strong>Revert: Superseded Progress Comment</strong></summary>
+
+
+Schema change reverting — the revert is tracked in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the revert</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Revert Window
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+
+
+---
+
+To skip revert and keep changes:
+```
+schemabot skip-revert apply-a1b2c3d4e5f6 -e staging
+```
+
+To revert:
+```
+schemabot revert apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
+</details>
+
+<details>
+<summary><a name="skip-revert-superseded-progress-comment"></a><strong>Skip Revert: Superseded Progress Comment</strong></summary>
+
+
+Revert skipped — the schema change is finalizing in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the revert was skipped</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Revert Window
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+
+
+---
+
+To skip revert and keep changes:
+```
+schemabot skip-revert apply-a1b2c3d4e5f6 -e staging
+```
+
+To revert:
+```
+schemabot revert apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
+</details>
+
+<details>
+<summary><a name="cutover-complete-superseded-cutover-prompt"></a><strong>Cutover Complete: Superseded Cutover Prompt</strong></summary>
+
+
+Cutover complete — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Cutover prompt</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Waiting for Cutover
+
+**0/1** table(s) ready for cutover — waiting on 1
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+
+
+---
+
+SchemaBot triggers cutover automatically — no action needed.
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
+</details>
+
+<details>
+<summary><a name="retry-superseded-progress-comment-generic"></a><strong>Retry: Superseded Progress Comment (Generic)</strong></summary>
+
+
+⏭️ Progress comment superseded — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Earlier progress</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Stopped
+
+**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 32%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+Rows: 2,300,000 / 7,200,000
+
+
+---
+
+Paused — to resume from where it stopped:
+```
+schemabot start apply-a1b2c3d4e5f6 -e staging
+```
+
+
+</details>
+
+</details>
+
+<details>
 <summary><a name="summary-completed"></a><strong>Summary: Completed</strong></summary>
 
 
@@ -2938,6 +3909,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ## ❌ Schema Change Failed — Staging
 
+<!-- schemabot:offer-support-channel -->
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
 
 *Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
@@ -2976,6 +3948,19 @@ To retry:
 ```
 schemabot apply -e staging
 ```
+
+<details>
+<summary>Show logs (5 entries)</summary>
+
+```text
+2026-03-15 14:22:00 UTC [INF] Apply claimed by driver [queued -> running]
+2026-03-15 14:22:15 UTC [INF] Task started: schema change on `users`
+2026-03-15 14:25:00 UTC [WRN] Copy throttled by replication lag (1.2s)
+2026-03-15 14:28:00 UTC [ERR] Task failed: unsafe warning: Field 'name' doesn't have a default value
+2026-03-15 14:29:00 UTC [ERR] Apply failed [running -> failed]
+```
+
+</details>
 
 </details>
 
@@ -3173,6 +4158,7 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 
 ## ❌ Schema Change Failed — Staging
 
+<!-- schemabot:offer-support-channel -->
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 3h 30m
 
 *Applied by @jackjackbits at 2026-03-15 11:00:00 UTC*
@@ -3229,6 +4215,19 @@ To retry:
 schemabot apply -e staging
 ```
 
+<details>
+<summary>Show logs (5 entries)</summary>
+
+```text
+2026-03-15 14:22:00 UTC [INF] Apply claimed by driver [queued -> running]
+2026-03-15 14:22:15 UTC [INF] Task started: schema change on `addresses`
+2026-03-15 14:25:00 UTC [WRN] Copy throttled by replication lag (1.2s)
+2026-03-15 14:28:00 UTC [ERR] Task failed: Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'
+2026-03-15 14:29:00 UTC [ERR] Apply failed [running -> failed]
+```
+
+</details>
+
 </details>
 
 <details>
@@ -3237,6 +4236,7 @@ schemabot apply -e staging
 
 ## ❌ Schema Change Failed — Staging
 
+<!-- schemabot:offer-support-channel -->
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
 
 *Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
@@ -3285,6 +4285,19 @@ To retry:
 ```
 schemabot apply -e staging
 ```
+
+<details>
+<summary>Show logs (5 entries)</summary>
+
+```text
+2026-03-15 14:22:00 UTC [INF] Apply claimed by driver [queued -> running]
+2026-03-15 14:22:15 UTC [INF] Task started: schema change on `addresses`
+2026-03-15 14:25:00 UTC [WRN] Copy throttled by replication lag (1.2s)
+2026-03-15 14:28:00 UTC [ERR] Task failed: Error 1205: Lock wait timeout exceeded
+2026-03-15 14:29:00 UTC [ERR] Apply failed [running -> failed]
+```
+
+</details>
 
 </details>
 
@@ -3341,6 +4354,64 @@ ALTER TABLE `addresses` ADD INDEX `idx_zip`(`zip_code`);
 **`events`**
 ```sql
 ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+</details>
+
+</details>
+
+<details>
+<summary><a name="rollback-status-running"></a><strong>Rollback Status: Running</strong></summary>
+
+
+## Rollback Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
+
+**Schema `testapp`**
+
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 45%
+
+```sql
+ALTER TABLE `users` DROP INDEX `idx_email`;
+```
+Rows: 45,000 / 100,000
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="summary-rollback-complete"></a><strong>Summary: Rollback Complete</strong></summary>
+
+
+## ⏪ Rollback Complete — Staging
+
+**Database**: `testapp`
+
+
+> Rolled back successfully — the schema change has been reverted.
+
+<details><summary>Apply details (1 table)</summary>
+
+_Apply ID: `apply-a1b2c3d4e5f6`_
+
+
+**`users`**
+```sql
+ALTER TABLE `users` DROP INDEX `idx_email`;
 ```
 
 </details>
@@ -4593,7 +5664,7 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
 
   ── myapp_sharded ──
 
-     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
        ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
 
 
@@ -4870,514 +5941,6 @@ No schema changes found for database 'new-db'
 </details>
 
 
-## Apply Gates
-
-### PR Comments
-
-<details>
-<summary><a name="apply-gate-schema-change-apply-automatic"></a><strong>Apply Gate: Schema Change Apply (Automatic)</strong></summary>
-
-
-## Schema Change Apply — Staging
-
-**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
-
-🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
-
-```sql
-CREATE TABLE `users` (
-    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-    `email` varchar(255) NOT NULL,
-    `created_at` timestamp DEFAULT current_timestamp(),
-    PRIMARY KEY(`id`),
-    INDEX `idx_email`(`email`)
-) ENGINE InnoDB,
-  CHARSET utf8mb4,
-  COLLATE utf8mb4_0900_ai_ci;
-
-CREATE TABLE `orders` (
-    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-    `user_id` bigint NOT NULL,
-    `total_cents` bigint NOT NULL,
-    `status` varchar(50) NOT NULL DEFAULT 'pending',
-    PRIMARY KEY(`id`),
-    INDEX `idx_user_id`(`user_id`)
-) ENGINE InnoDB,
-  CHARSET utf8mb4,
-  COLLATE utf8mb4_0900_ai_ci;
-
-ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
-```
-
-📋 **Plan**: **2** tables to create, **1** table to alter
-
-
----
-
-**Applying automatically**
-
-
-</details>
-
-<details>
-<summary><a name="apply-gate-schema-change-apply-with-options"></a><strong>Apply Gate: Schema Change Apply (With Options)</strong></summary>
-
-
-## Schema Change Apply — Staging
-
-**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
-
-🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
-
-```sql
-CREATE TABLE `users` (
-    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-    `email` varchar(255) NOT NULL,
-    `created_at` timestamp DEFAULT current_timestamp(),
-    PRIMARY KEY(`id`),
-    INDEX `idx_email`(`email`)
-) ENGINE InnoDB,
-  CHARSET utf8mb4,
-  COLLATE utf8mb4_0900_ai_ci;
-
-CREATE TABLE `orders` (
-    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-    `user_id` bigint NOT NULL,
-    `total_cents` bigint NOT NULL,
-    `status` varchar(50) NOT NULL DEFAULT 'pending',
-    PRIMARY KEY(`id`),
-    INDEX `idx_user_id`(`user_id`)
-) ENGINE InnoDB,
-  CHARSET utf8mb4,
-  COLLATE utf8mb4_0900_ai_ci;
-
-ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
-```
-
-📋 **Plan**: **2** tables to create, **1** table to alter
-
-
-**Options**: ⏸️ Defer Cutover | ⏩ Skip Revert
-
----
-
-**Applying automatically**
-
-
-</details>
-
-<details>
-<summary><a name="apply-gate-schema-change-apply-downgraded"></a><strong>Apply Gate: Schema Change Apply (Downgraded)</strong></summary>
-
-
-## Schema Change Apply — Staging
-
-**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
-
-🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
-
-```sql
-CREATE TABLE `users` (
-    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-    `email` varchar(255) NOT NULL,
-    `created_at` timestamp DEFAULT current_timestamp(),
-    PRIMARY KEY(`id`),
-    INDEX `idx_email`(`email`)
-) ENGINE InnoDB,
-  CHARSET utf8mb4,
-  COLLATE utf8mb4_0900_ai_ci;
-
-CREATE TABLE `orders` (
-    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-    `user_id` bigint NOT NULL,
-    `total_cents` bigint NOT NULL,
-    `status` varchar(50) NOT NULL DEFAULT 'pending',
-    PRIMARY KEY(`id`),
-    INDEX `idx_user_id`(`user_id`)
-) ENGINE InnoDB,
-  CHARSET utf8mb4,
-  COLLATE utf8mb4_0900_ai_ci;
-
-ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
-```
-
-📋 **Plan**: **2** tables to create, **1** table to alter
-
-
----
-
-⚠️ **Automatic apply paused**: Schema changes differ from auto-plan — review and confirm manually
-
-Review the plan above, then confirm manually:
-```
-schemabot apply-confirm -e staging
-```
-
-🔓 To discard this plan and unlock, comment:
-```
-schemabot unlock
-```
-
-
-</details>
-
-<details>
-<summary><a name="apply-started"></a><strong>Apply Started</strong></summary>
-
-
-## Schema Change Status — Staging
-
-**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-Schema changes are being applied. This comment will be updated with progress.
-
-
-</details>
-
-<details>
-<summary><a name="unlock-success"></a><strong>Unlock Success</strong></summary>
-
-
-## 🔓 Lock Released — Staging
-
-**Database**: `testapp`
-
-*Released by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-The database is now available for schema changes.
-
-
-</details>
-
-<details>
-<summary><a name="apply-blocked-by-other-pr"></a><strong>Apply Blocked By Other PR</strong></summary>
-
-
-## 🔒 Apply Blocked — Staging
-
-**Database**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-Another PR currently holds the lock for this database.
-
-**Locked by**: [block/myapp#42](https://github.com/block/myapp/pull/42)
-**Since**: 2026-03-15 12:30:00 UTC
-
-Wait for the other PR to complete or ask the lock holder to run `schemabot unlock`.
-
-
-</details>
-
-<details>
-<summary><a name="apply-blocked-by-cli"></a><strong>Apply Blocked By CLI</strong></summary>
-
-
-## 🔒 Apply Blocked — Staging
-
-**Database**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-A CLI session currently holds the lock for this database.
-
-**Locked by**: `cli:jackjackbits@macbook.local`
-**Since**: 2026-03-15 14:00:00 UTC
-
-Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock with:
-```
-schemabot unlock -d testapp --force
-```
-
-
-</details>
-
-<details>
-<summary><a name="apply-already-in-progress"></a><strong>Apply Already In Progress</strong></summary>
-
-
-## ⚠️ Apply Already In Progress — Staging
-
-**Database**: `testapp`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-An apply is already running for this PR (apply ID: `apply-a1b2c3d4e5f6`, state: `running`).
-
-Wait for it to complete or stop it first.
-
-
-</details>
-
-<details>
-<summary><a name="no-lock-found"></a><strong>No Lock Found</strong></summary>
-
-
-## 🔒 No Lock Found — Staging
-
-**Database**: `testapp`
-
-No apply lock is held for this database. Run `apply` first to generate a plan and acquire the lock.
-
-```
-schemabot apply -e staging
-```
-
-
-</details>
-
-<details>
-<summary><a name="blocked-by-prior-env-pending"></a><strong>Blocked By Prior Env (Pending)</strong></summary>
-
-
-## ❌ Apply Blocked — Production
-
-**Database**: `testapp`
-
-Staging has pending changes. Apply staging first before applying to production.
-
-```
-schemabot apply -e staging
-```
-
-
-</details>
-
-<details>
-<summary><a name="blocked-by-prior-env-failed"></a><strong>Blocked By Prior Env (Failed)</strong></summary>
-
-
-## ❌ Apply Blocked — Production
-
-**Database**: `testapp`
-
-Staging failed. Fix the issue and re-apply staging before applying to production.
-
-```
-schemabot apply -e staging
-```
-
-
-</details>
-
-<details>
-<summary><a name="blocked-by-prior-env-in-progress"></a><strong>Blocked By Prior Env (In Progress)</strong></summary>
-
-
-## ⏳ Apply Blocked — Production
-
-**Database**: `testapp`
-
-Staging is currently in progress. Wait for it to complete before applying to production.
-
-Once staging completes, retry:
-```
-schemabot apply -e production
-```
-
-
-</details>
-
-<details>
-<summary><a name="review-required"></a><strong>Review Required</strong></summary>
-
-
-## Review Required
-
-**Database**: `testapp` | **Environment**: `staging`
-
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-Schema changes require approval from an authorized reviewer before applying.
-
-**Authorized reviewers**:
-- @acme/schema-reviewers
-- @jdoe
-
-### Next steps
-1. Request a review from an authorized reviewer above
-2. Once approved, run `schemabot apply -e staging` again
-
-
-</details>
-
-<details>
-<summary><a name="review-gate-error-failclosed"></a><strong>Review Gate Error (Fail-closed)</strong></summary>
-
-
-## ❌ Apply Failed
-
-**Environment**: `staging`
-
-*Requested by @jackjackbits at  UTC*
-
-### Error
-
-> Review gate check failed: expand team @acme/schema-reviewers: team membership cannot be read. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
-
-</details>
-
-<details>
-<summary><a name="actor-authorization-not-authorized"></a><strong>Actor Authorization: Not Authorized</strong></summary>
-
-
-## SchemaBot Command Not Authorized
-
-**Database**: `orders` | **Environment**: `staging`
-
-@mona is not authorized to run `schemabot apply` for this database.
-
-A configured SchemaBot admin/database operator must run this command.
-
-
-</details>
-
-<details>
-<summary><a name="actor-authorization-unavailable"></a><strong>Actor Authorization: Unavailable</strong></summary>
-
-
-## SchemaBot Authorization Check Failed
-
-**Database**: `orders` | **Environment**: `production`
-**Requested by**: @mona
-
-SchemaBot could not verify authorization for `schemabot apply-confirm`. No schema change was started.
-
-If access is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
-
-A configured SchemaBot admin/database operator should inspect SchemaBot authorization logs before retrying.
-
-
-</details>
-
-<details>
-<summary><a name="actor-authorization-database-not-configured"></a><strong>Actor Authorization: Database Not Configured</strong></summary>
-
-
-## SchemaBot Command Not Authorized
-
-**Database**: `payments`
-
-`schemabot unlock` cannot run because database `payments` is not configured on this SchemaBot instance.
-
-Verify the database name, or run the command against the SchemaBot instance that manages this database.
-
-
-</details>
-
-<details>
-<summary><a name="start-command-accepted"></a><strong>Start Command Accepted</strong></summary>
-
-
-## Start Request Accepted
-
-**Apply**: `apply-a1b2c3d4e5f67890`
-**Environment**: `staging`
-**Requested by**: @alice
-
-Start request accepted. SchemaBot will resume this schema change; status remains available from the PR progress comment or CLI.
-
-**Tasks selected for start**: 1 started, 0 skipped.
-
-
-</details>
-
-<details>
-<summary><a name="start-command-already-pending"></a><strong>Start Command Already Pending</strong></summary>
-
-
-## Start Request Accepted
-
-**Apply**: `apply-a1b2c3d4e5f67890`
-**Environment**: `staging`
-**Requested by**: @alice
-
-Start was already requested. SchemaBot will keep the existing start request pending until the operator owner finishes it.
-
-**Tasks selected for start**: 1 started, 0 skipped.
-
-
-</details>
-
-<details>
-<summary><a name="cutover-command-accepted"></a><strong>Cutover Command Accepted</strong></summary>
-
-
-## Cutover Request Accepted
-
-**Apply**: `apply-a1b2c3d4e5f67890`
-**Environment**: `staging`
-**Requested by**: @alice
-
-Cutover request accepted. SchemaBot will complete this schema change; status remains available from the PR progress comment or CLI.
-
-
-</details>
-
-<details>
-<summary><a name="cutover-command-already-in-progress"></a><strong>Cutover Command Already In Progress</strong></summary>
-
-
-## Cutover Request Accepted
-
-**Apply**: `apply-a1b2c3d4e5f67890`
-**Environment**: `staging`
-**Requested by**: @alice
-
-Cutover is already in progress. SchemaBot will keep reporting progress from the existing apply.
-
-
-</details>
-
-<details>
-<summary><a name="checks-gate-not-passing"></a><strong>Checks Gate: Not Passing</strong></summary>
-
-
-## ❌ Apply Blocked — Staging
-
-Cannot apply while PR checks are not passing:
-
-| Check | Status |
-|-------|--------|
-| `CI / unit-tests` | failure |
-| `CI / lint` | timed_out |
-
-Get the checks passing — fix failures and re-run cancelled or stale checks — then retry:
-```
-schemabot apply -e staging
-```
-
-
-</details>
-
-<details>
-<summary><a name="checks-gate-in-progress"></a><strong>Checks Gate: In Progress</strong></summary>
-
-
-## ⏳ Apply Blocked — Staging
-
-Cannot apply while PR checks are still running:
-
-| Check | Status |
-|-------|--------|
-| `CI / unit-tests` | in_progress |
-| `CI / integration-tests` | queued |
-
-Wait for checks to complete and retry:
-```
-schemabot apply -e staging
-```
-
-</details>
-
 ## Multi-Deployment Apply
 
 ### PR Comments
@@ -5409,33 +5972,31 @@ schemabot cutover apply-a1b2c3d4e5f6 -e production
 <details open>
 <summary>🟢 eu — ready for cutover — next in order</summary>
 
-## Schema Change Status — Production
-
 **Database**: `payments_eu` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
 **Status**: Waiting for Cutover
 
-**0/3** table(s) ready for cutover — waiting on 3
+**3/3** table(s) ready for cutover
 
-📊 3 waiting for cutover
+📊 3 ready for cutover
 
 **Schema `testapp`**
 
-**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✅ Ready for cutover
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✅ Ready for cutover
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✅ Ready for cutover
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -5444,17 +6005,12 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-To proceed with cutover:
-```
-schemabot cutover apply-a1b2c3d4e5f6 -e production
-```
+SchemaBot triggers cutover automatically — no action needed.
 
 </details>
 
 <details open>
 <summary>🔄 us — running table copy</summary>
-
-## Schema Change Status — Production
 
 **Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
@@ -5479,7 +6035,7 @@ Rows: 914,707 / 1,466,232 · ETA: 3m 15s
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -5542,8 +6098,6 @@ schemabot apply -e production
 <details>
 <summary>✅ eu — completed</summary>
 
-## Schema Change Status — Production
-
 **Database**: `payments_eu` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
@@ -5554,19 +6108,19 @@ schemabot apply -e production
 
 **Schema `testapp`**
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -5578,13 +6132,12 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <details open>
 <summary>❌ us — failed</summary>
 
-## Schema Change Status — Production
-
 **Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
 **Status**: Failed
+<!-- schemabot:offer-support-channel -->
 
 📊 1/3 complete · 1 failed · 1 cancelled
 
@@ -5596,7 +6149,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -5655,8 +6208,6 @@ _No details available yet._
 <details>
 <summary>✅ eu — completed</summary>
 
-## Schema Change Status — Production
-
 **Database**: `payments_eu` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
@@ -5667,19 +6218,19 @@ _No details available yet._
 
 **Schema `testapp`**
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -5691,8 +6242,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <details>
 <summary>✅ us — completed</summary>
 
-## Schema Change Status — Production
-
 **Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
@@ -5703,19 +6252,19 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 **Schema `testapp`**
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -5727,8 +6276,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <details>
 <summary>✅ au — completed</summary>
 
-## Schema Change Status — Production
-
 **Database**: `payments_au` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
@@ -5739,19 +6286,19 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 **Schema `testapp`**
 
-**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+**`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -5780,8 +6327,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 <details>
 <summary>✅ eu — completed</summary>
-
-## ✅ Schema Change Applied — Production
 
 **Database**: `payments_eu`
 
@@ -5817,8 +6362,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <details>
 <summary>✅ us — completed</summary>
 
-## ✅ Schema Change Applied — Production
-
 **Database**: `payments_us`
 
 
@@ -5852,8 +6395,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 <details>
 <summary>✅ au — completed</summary>
-
-## ✅ Schema Change Applied — Production
 
 **Database**: `payments_au`
 
@@ -5894,6 +6435,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ## ❌ Schema Change Failed — Production
 
+<!-- schemabot:offer-support-channel -->
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
@@ -5916,8 +6458,6 @@ schemabot apply -e production
 
 <details>
 <summary>✅ eu — completed</summary>
-
-## ✅ Schema Change Applied — Production
 
 **Database**: `payments_eu`
 
@@ -5953,8 +6493,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <details open>
 <summary>❌ us — failed</summary>
 
-## ❌ Schema Change Failed — Production
-
+<!-- schemabot:offer-support-channel -->
 **Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-03-15 14:22:00 UTC*
@@ -6110,7 +6649,7 @@ ALTER TABLE `mutes`
     DROP COLUMN `legacy_reason`;
 ```
 
-**⛔ Unsafe Changes Detected:**
+⚠️ **Issues**: **1** unsafe change detected
 - `mutes` (shard `40-80`): DROP COLUMN removes data and is irreversible
 
 **Destructive drop guidance:**
@@ -6846,7 +7385,7 @@ The following changes will permanently delete data:
 ```
 ⣾ Running...
 
-     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Active ⠋
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Finalizing copy ⠋
        ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
        • Rows copied: 145,250,000 so far
        • ℹ️ More rows than initially estimated, copying is still active and will continue

@@ -4,13 +4,16 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"path"
 	"sort"
 	"strings"
@@ -59,6 +62,13 @@ type Client struct {
 	// configuration set at construction; never mutated afterwards.
 	trustedCheckAppSlugs []string
 
+	// configDirHints supplies the configured schema directories used by
+	// config discovery as probe targets when GitHub truncates the repository
+	// tree and a whole-repo scan is impossible. Static configuration set at
+	// construction; never mutated afterwards. Nil when the embedder has no
+	// directory configuration to offer.
+	configDirHints ConfigDirHints
+
 	// slugFetchMu serialises slug-fetch attempts so concurrent
 	// ForInstallation callers do not thundering-herd retry on startup
 	// failure. lastSlugAttempt is read+written only under this mutex.
@@ -104,6 +114,34 @@ type ClientOption func(*Client)
 func WithTrustedCheckAppSlugs(slugs []string) ClientOption {
 	return func(c *Client) {
 		c.trustedCheckAppSlugs = slugs
+	}
+}
+
+// ConfigDirHints supplies the server-configured schema directories that
+// config discovery probes when GitHub truncates the repository tree (repos
+// beyond the Trees API response cap), where a whole-repo scan is impossible.
+// Both methods report whether the returned directories provably cover every
+// policy-valid config location for their scope; non-exhaustive hints are
+// never probed, keeping discovery fail-closed.
+type ConfigDirHints interface {
+	// SchemaDirHintsForRepo returns the directories of every database that
+	// accepts changes from repo.
+	SchemaDirHintsForRepo(repo string) (dirs []string, exhaustive bool)
+	// SchemaDirHintsForDatabase returns only the named database's
+	// directories, for database-scoped lookups that need not pay a scan of
+	// every configured directory. exhaustive is true with no directories
+	// when the database does not serve the repo at all — an empty probe
+	// result is then authoritative.
+	SchemaDirHintsForDatabase(repo, database string) (dirs []string, exhaustive bool)
+}
+
+// WithConfigDirHints provides the configured schema directories that may serve
+// a given repo. Config discovery probes these directories for schemabot.yaml
+// files when GitHub truncates the repository tree, where a whole-repo scan is
+// impossible.
+func WithConfigDirHints(hints ConfigDirHints) ClientOption {
+	return func(c *Client) {
+		c.configDirHints = hints
 	}
 }
 
@@ -242,6 +280,7 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 		logger:                  c.logger,
 		installationID:          installationID,
 		trustedCheckAppSlugs:    c.trustedCheckAppSlugs,
+		configDirHints:          c.configDirHints,
 		checkStatusSingleflight: c.checkStatusSingleflight,
 	}
 	ic.storeAppSlug(slug)
@@ -330,6 +369,12 @@ type InstallationClient struct {
 	// configuration copied from the parent Client; never mutated.
 	trustedCheckAppSlugs []string
 
+	// configDirHints supplies the configured schema directories used by
+	// config discovery as probe targets when GitHub truncates the repository
+	// tree. Copied from the parent Client; nil when the embedder has no
+	// directory configuration to offer.
+	configDirHints ConfigDirHints
+
 	// checkStatusSingleflight is owned by the parent Client factory and
 	// shared across every InstallationClient it produces so concurrent
 	// fetches collapse across the short-lived InstallationClients
@@ -340,6 +385,21 @@ type InstallationClient struct {
 	// Optional: when nil, GetPRCheckStatuses bypasses the coalescer
 	// (e.g. tests).
 	checkStatusSingleflight *CheckStatusSingleflight
+}
+
+// InstallationID returns the GitHub App installation this client is scoped
+// to, so callers can schedule follow-up work (e.g. a delayed aggregate
+// re-fold) that must resolve a client for the same installation later.
+func (ic *InstallationClient) InstallationID() int64 {
+	return ic.installationID
+}
+
+// SetConfigDirHints provides the configured schema directories that may serve
+// a repo, used by config discovery when GitHub truncates the repository tree.
+// Production clients receive this from the parent Client (WithConfigDirHints);
+// this setter exists for directly-constructed clients (tests, library use).
+func (ic *InstallationClient) SetConfigDirHints(hints ConfigDirHints) {
+	ic.configDirHints = hints
 }
 
 // loadAppSlug returns the current app slug, or empty if not yet set.
@@ -357,15 +417,43 @@ func (ic *InstallationClient) storeAppSlug(slug string) {
 
 const githubSecondaryRateLimitMaxSleep = 5 * time.Second
 
+// NewRateLimitedTransport wraps base with GitHub secondary-rate-limit
+// handling (bounded sleep on a 403 secondary limit), matching the transport
+// every InstallationClient uses. Exposed for App-level clients built outside
+// this package that must issue GitHub calls at volume without tripping the
+// secondary limit.
+func NewRateLimitedTransport(base http.RoundTripper) http.RoundTripper {
+	return newGitHubRateLimitTransport(base)
+}
+
 func newGitHubRateLimitTransport(base http.RoundTripper) http.RoundTripper {
 	return github_ratelimit.New(base,
 		github_secondary_ratelimit.WithSingleSleepLimit(githubSecondaryRateLimitMaxSleep, nil),
 	)
 }
 
-const githubUnavailableReadRetryMaxAttempts = 3
+// GitHub read retries are deliberately generous: transient edge failures
+// (5xx, empty-body 400s, dropped connections, short rate-limit windows) can
+// last several seconds, and a failed read on a webhook path surfaces to the
+// user as a ❌ comment on the PR. The exponential schedule waits roughly
+// fifteen seconds end to end; the caller's context deadline still bounds the
+// total wait, so a short-deadline caller gives up sooner.
+const (
+	githubUnavailableReadRetryMaxAttempts = 6
+	githubUnavailableReadRetryMaxDelay    = 20 * time.Second
+)
 
-var githubUnavailableReadRetryDelay = 200 * time.Millisecond
+var githubUnavailableReadRetryDelay = 500 * time.Millisecond
+
+// SetUnavailableReadRetryDelayForTest shrinks the read-retry backoff base so
+// tests that simulate GitHub failures do not wait out the production
+// schedule. It returns a restore function; a test-binary init may discard it
+// to keep the override for the whole run.
+func SetUnavailableReadRetryDelayForTest(delay time.Duration) (restore func()) {
+	original := githubUnavailableReadRetryDelay
+	githubUnavailableReadRetryDelay = delay
+	return func() { githubUnavailableReadRetryDelay = original }
+}
 
 func retryGitHubUnavailableRead[T any](ctx context.Context, logger *slog.Logger, operation string, logAttrs []any, read func(context.Context) (T, error)) (T, error) {
 	var zero T
@@ -381,7 +469,7 @@ func retryGitHubUnavailableRead[T any](ctx context.Context, logger *slog.Logger,
 		if !IsUnavailableError(err) || attempt == githubUnavailableReadRetryMaxAttempts || ctx.Err() != nil {
 			return zero, err
 		}
-		delay := githubUnavailableReadRetryDelay * time.Duration(attempt)
+		delay := githubReadRetryDelay(attempt, err)
 		if logger != nil {
 			logger.Warn("retrying unavailable GitHub read",
 				append(logAttrs, "operation", operation, "attempt", attempt, "max_attempts", githubUnavailableReadRetryMaxAttempts, "delay", delay, "error", err)...)
@@ -395,6 +483,29 @@ func retryGitHubUnavailableRead[T any](ctx context.Context, logger *slog.Logger,
 		}
 	}
 	return zero, fmt.Errorf("retry GitHub read %s: exhausted attempts", operation)
+}
+
+// githubReadRetryDelay picks the wait before the next read attempt:
+// exponential backoff from the base delay, raised to any rate-limit
+// retry-after hint carried by the error, and capped so a long rate-limit
+// window cannot stall the caller far past what its context deadline would
+// allow anyway.
+func githubReadRetryDelay(attempt int, err error) time.Duration {
+	delay := githubUnavailableReadRetryDelay << (attempt - 1)
+	if hint, ok := githubRateLimitRetryAfter(err); ok && hint > delay {
+		delay = hint
+	}
+	return min(delay, githubUnavailableReadRetryMaxDelay)
+}
+
+// githubRateLimitRetryAfter extracts the Retry-After wait a GitHub
+// secondary rate limit carries, when present.
+func githubRateLimitRetryAfter(err error) (time.Duration, bool) {
+	var abuseErr *gh.AbuseRateLimitError
+	if errors.As(err, &abuseErr) && abuseErr.RetryAfter != nil {
+		return *abuseErr.RetryAfter, true
+	}
+	return 0, false
 }
 
 // AppSlug returns the GitHub App slug associated with this installation
@@ -453,11 +564,13 @@ func isGitHubUnavailable(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
+	if isGitHubSecondaryRateLimited(err) {
+		return true
+	}
 
 	var ghErr *gh.ErrorResponse
 	if errors.As(err, &ghErr) && ghErr.Response != nil {
-		status := ghErr.Response.StatusCode
-		return status >= http.StatusInternalServerError
+		return isTransientGitHubStatus(ghErr)
 	}
 
 	var netErr net.Error
@@ -466,6 +579,39 @@ func isGitHubUnavailable(err error) bool {
 	}
 	var opErr *net.OpError
 	return errors.As(err, &opErr)
+}
+
+// isGitHubSecondaryRateLimited reports whether the error is a GitHub
+// secondary (abuse) rate limit. Secondary limits clear within seconds, so
+// they count as availability failures; the retry delay honors the server's
+// Retry-After hint via githubRateLimitRetryAfter. A primary rate limit
+// (*gh.RateLimitError) is deliberately not retried here: it means the
+// installation's hourly budget is exhausted, the reset is typically far
+// beyond any read's context deadline, and callers with durable retry
+// (webhook deliveries) recover on their own schedule instead.
+func isGitHubSecondaryRateLimited(err error) bool {
+	var abuseErr *gh.AbuseRateLimitError
+	return errors.As(err, &abuseErr)
+}
+
+// isTransientGitHubStatus classifies an HTTP error status from the GitHub
+// API as an availability failure (worth retrying) or a semantic answer
+// about the request (not). 5xx and 429 are availability failures. A 400
+// whose body carries no error message or details is GitHub's edge
+// intermittently rejecting a valid read — a real client error always says
+// what was wrong with the request. 404 stays semantic: config discovery
+// depends on it meaning "this path does not exist".
+func isTransientGitHubStatus(ghErr *gh.ErrorResponse) bool {
+	switch status := ghErr.Response.StatusCode; {
+	case status >= http.StatusInternalServerError:
+		return true
+	case status == http.StatusTooManyRequests:
+		return true
+	case status == http.StatusBadRequest && ghErr.Message == "" && len(ghErr.Errors) == 0:
+		return true
+	default:
+		return false
+	}
 }
 
 // splitRepo splits "owner/repo" into owner and repo parts.
@@ -477,16 +623,34 @@ func splitRepo(repo string) (owner, repoName string) {
 	return repo, ""
 }
 
-// CreateIssueComment posts a comment on a PR/issue.
-func (ic *InstallationClient) CreateIssueComment(ctx context.Context, repo string, pr int, body string) (int64, error) {
+// CreateIssueComment posts a comment on a PR/issue. It returns the REST
+// comment ID (used for edits) and the GraphQL node ID (used to minimize the
+// comment when a newer one supersedes it).
+func (ic *InstallationClient) CreateIssueComment(ctx context.Context, repo string, pr int, body string) (int64, string, error) {
 	owner, repoName := splitRepo(repo)
 	comment, _, err := ic.client.Issues.CreateComment(ctx, owner, repoName, pr, &gh.IssueComment{
 		Body: new(body),
 	})
 	if err != nil {
-		return 0, fmt.Errorf("create issue comment: %w", err)
+		return 0, "", fmt.Errorf("create issue comment: %w", err)
 	}
-	return comment.GetID(), nil
+	return comment.GetID(), comment.GetNodeID(), nil
+}
+
+// GetIssueComment returns the current body of an existing PR/issue comment.
+func (ic *InstallationClient) GetIssueComment(ctx context.Context, repo string, commentID int64) (string, error) {
+	owner, repoName := splitRepo(repo)
+	comment, err := retryGitHubUnavailableRead(ctx, ic.logger, "get issue comment", []any{"repo", repo, "comment_id", commentID}, func(ctx context.Context) (*gh.IssueComment, error) {
+		c, _, callErr := ic.client.Issues.GetComment(ctx, owner, repoName, commentID)
+		if callErr != nil {
+			return nil, classifyGitHubAPIError(callErr)
+		}
+		return c, nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("get issue comment %d: %w", commentID, err)
+	}
+	return comment.GetBody(), nil
 }
 
 // EditIssueComment edits an existing PR/issue comment.
@@ -501,6 +665,75 @@ func (ic *InstallationClient) EditIssueComment(ctx context.Context, repo string,
 	return nil
 }
 
+// MinimizeComment collapses a PR comment in the GitHub timeline as outdated.
+// The comment stays expandable — minimizing hides it from the default view
+// without editing or deleting the record. GitHub exposes this only through
+// the GraphQL API, so this posts a minimizeComment mutation using the node ID
+// returned when the comment was created.
+func (ic *InstallationClient) MinimizeComment(ctx context.Context, repo, nodeID string) error {
+	payload, err := json.Marshal(map[string]any{
+		"query":     `mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { minimizedComment { isMinimized } } }`,
+		"variables": map[string]string{"id": nodeID},
+	})
+	if err != nil {
+		return fmt.Errorf("minimize comment %s: marshal GraphQL request: %w", nodeID, err)
+	}
+
+	ctx = withGitHubRateLimitContext(ctx, metrics.GitHubOperationGraphQLMinimizeComment, repo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ic.graphQLURL(), bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("minimize comment %s: build GraphQL request: %w", nodeID, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := ic.client.Client().Do(req)
+	if err != nil {
+		return fmt.Errorf("minimize comment %s: %w", nodeID, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("minimize comment %s: GraphQL endpoint returned %s", nodeID, resp.Status)
+	}
+
+	// GraphQL reports failures as a 200 with an errors array; a response that
+	// carries neither an error nor isMinimized=true did not minimize anything.
+	var result struct {
+		Data struct {
+			MinimizeComment struct {
+				MinimizedComment struct {
+					IsMinimized bool `json:"isMinimized"`
+				} `json:"minimizedComment"`
+			} `json:"minimizeComment"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("minimize comment %s: decode GraphQL response: %w", nodeID, err)
+	}
+	if len(result.Errors) > 0 {
+		return fmt.Errorf("minimize comment %s: GraphQL error: %s", nodeID, result.Errors[0].Message)
+	}
+	if !result.Data.MinimizeComment.MinimizedComment.IsMinimized {
+		return fmt.Errorf("minimize comment %s: GitHub did not report the comment as minimized", nodeID)
+	}
+	return nil
+}
+
+// graphQLURL derives the GraphQL endpoint from the configured REST base URL.
+// github.com serves GraphQL at /graphql on the API host, while GitHub
+// Enterprise Server serves REST under /api/v3/ and GraphQL at /api/graphql on
+// the same host.
+func (ic *InstallationClient) graphQLURL() string {
+	base := ic.client.BaseURL
+	u := url.URL{Scheme: base.Scheme, Host: base.Host, Path: "/graphql"}
+	if strings.HasSuffix(base.Path, "/api/v3/") {
+		u.Path = strings.TrimSuffix(base.Path, "v3/") + "graphql"
+	}
+	return u.String()
+}
+
 // AddReactionToComment adds a reaction emoji to a comment.
 func (ic *InstallationClient) AddReactionToComment(ctx context.Context, repo string, commentID int64, reaction string) error {
 	owner, repoName := splitRepo(repo)
@@ -511,13 +744,114 @@ func (ic *InstallationClient) AddReactionToComment(ctx context.Context, repo str
 	return nil
 }
 
-// PullRequestInfo holds relevant PR metadata.
+// PullRequestInfo holds relevant PR metadata. The base branch is carried by
+// ref only: GitHub's pull.base.sha is a snapshot from PR creation, not the
+// branch tip, so callers that need the current base commit must resolve
+// BaseRef themselves.
 type PullRequestInfo struct {
 	HeadRef string
 	HeadSHA string
 	BaseRef string
-	BaseSHA string
 	User    string
+	// State is the PR's lifecycle state as GitHub reports it: "open" or
+	// "closed" (a merged PR reads as closed).
+	State string
+	// Merged reports whether the PR was merged. GitHub folds merged PRs into
+	// State "closed", so callers that message operators differently for a
+	// merged PR versus an abandoned one must consult this alongside IsClosed.
+	Merged bool
+}
+
+// OpenPullRequest holds the PR metadata needed for operator scans.
+type OpenPullRequest struct {
+	Number  int
+	Title   string
+	HeadRef string
+	HeadSHA string
+	BaseRef string
+	User    string
+	// UpdatedAt is the PR's last-activity time. The listing orders by it
+	// (newest first), so a caller sweeping a time window can stop paging once
+	// a page crosses the window start.
+	UpdatedAt time.Time
+}
+
+// ListOpenPullRequestsPage lists one page of open pull requests in a
+// repository, newest updated first. page is 1-based (0 selects the first
+// page). nextPage is 0 when no further pages exist. lastPage is the final
+// page number GitHub reports for the listing (0 when this page is the last),
+// letting callers derive the repository's total open-PR count for progress
+// denominators. Fetching one bounded page per call lets operator scans run as
+// many short requests instead of one long one.
+func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo string, page, perPage int) (prs []OpenPullRequest, nextPage, lastPage int, err error) {
+	owner, repoName := splitRepo(repo)
+	if page <= 0 {
+		page = 1
+	}
+	// GitHub caps page size at 100; clamp so a caller's 0/negative/oversized
+	// value behaves predictably.
+	if perPage <= 0 || perPage > 100 {
+		perPage = 100
+	}
+	opts := &gh.PullRequestListOptions{
+		State:     "open",
+		Sort:      "updated",
+		Direction: "desc",
+		ListOptions: gh.ListOptions{
+			PerPage: perPage,
+			Page:    page,
+		},
+	}
+	var resp *gh.Response
+	ghPRs, err := retryGitHubUnavailableRead(ctx, ic.logger, "list open pull requests", []any{"repo", repo, "page", page}, func(ctx context.Context) ([]*gh.PullRequest, error) {
+		list, listResp, listErr := ic.client.PullRequests.List(ctx, owner, repoName, opts)
+		if listErr != nil {
+			return nil, classifyGitHubAPIError(listErr)
+		}
+		resp = listResp
+		return list, nil
+	})
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("list open pull requests for %s page %d: %w", repo, page, err)
+	}
+	for _, pr := range ghPRs {
+		prs = append(prs, OpenPullRequest{
+			Number:    pr.GetNumber(),
+			Title:     pr.GetTitle(),
+			HeadRef:   pr.GetHead().GetRef(),
+			HeadSHA:   pr.GetHead().GetSHA(),
+			BaseRef:   pr.GetBase().GetRef(),
+			User:      pr.GetUser().GetLogin(),
+			UpdatedAt: pr.GetUpdatedAt().Time,
+		})
+	}
+	if resp != nil {
+		nextPage = resp.NextPage
+		lastPage = resp.LastPage
+	}
+	return prs, nextPage, lastPage, nil
+}
+
+// CoreRateLimit reports the installation's remaining core REST budget. The
+// /rate_limit endpoint does not consume the budget it reports, so pacing
+// checks are free. resetAt is when GitHub replenishes the budget.
+func (ic *InstallationClient) CoreRateLimit(ctx context.Context) (remaining, limit int, resetAt time.Time, err error) {
+	limits, _, err := ic.client.RateLimit.Get(ctx)
+	if err != nil {
+		return 0, 0, time.Time{}, fmt.Errorf("get GitHub core rate limit: %w", err)
+	}
+	core := limits.GetCore()
+	if core == nil {
+		return 0, 0, time.Time{}, fmt.Errorf("get GitHub core rate limit: response carried no core bucket")
+	}
+	return core.Remaining, core.Limit, core.Reset.Time, nil
+}
+
+// IsClosed reports whether the PR is closed (merged or unmerged). Callers that
+// act on a PR asynchronously — timers, reconciliation — use this to stop work
+// that only makes sense on an open PR.
+func (pri *PullRequestInfo) IsClosed() bool {
+	return pri.State == "closed"
 }
 
 // FetchPullRequest is the dedupe-friendly variant. It honours the
@@ -588,8 +922,9 @@ func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string,
 		HeadRef: ghPR.GetHead().GetRef(),
 		HeadSHA: ghPR.GetHead().GetSHA(),
 		BaseRef: ghPR.GetBase().GetRef(),
-		BaseSHA: ghPR.GetBase().GetSHA(),
 		User:    ghPR.GetUser().GetLogin(),
+		State:   ghPR.GetState(),
+		Merged:  ghPR.GetMerged(),
 	}, nil
 }
 
@@ -668,6 +1003,10 @@ func (ic *InstallationClient) FetchChangedFilesBetween(ctx context.Context, repo
 	if err != nil {
 		return nil, err
 	}
+	status := readResult.GetStatus()
+	if status != "ahead" && status != "identical" {
+		return nil, fmt.Errorf("compare commits %s...%s for %s cannot prove linear history: status %q", base, head, repo, status)
+	}
 
 	files := make([]PRFile, 0, len(readResult.Files))
 	for _, f := range readResult.Files {
@@ -681,6 +1020,72 @@ func (ic *InstallationClient) FetchChangedFilesBetween(ctx context.Context, repo
 		return nil, fmt.Errorf("compare commits %s...%s for %s reached GitHub API file limit: %w", base, head, repo, ErrPRFilesIncomplete)
 	}
 	return files, nil
+}
+
+// SchemaPathsChangedSinceMergeBase reports whether any schema path has a
+// different Git object on the current tip of the PR's base branch than it had
+// at the PR's merge base. Paths may name directories or symlinks. Comparing
+// object IDs keeps the guard scoped to schema inputs: commits elsewhere in a
+// busy repository do not make the PR stale.
+//
+// The base branch is identified by ref, never by the PR object's base SHA:
+// GitHub snapshots pull.base.sha when the PR is created and does not advance
+// it as the base branch moves, so the snapshot typically equals the merge base
+// and can never observe commits that landed after the PR diverged. The ref is
+// resolved to a pinned tip SHA up front — returned for operator logs — so a
+// base branch advancing mid-check cannot make the merge-base lookup and the
+// tree reads observe different commits.
+func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Context, repo, baseRef, headSHA string, schemaPaths []string) (changed bool, baseTipSHA string, err error) {
+	owner, repoName := splitRepo(repo)
+	tip, err := retryGitHubUnavailableRead(ctx, ic.logger, "resolve base branch tip", []any{"repo", repo, "base_ref", baseRef}, func(ctx context.Context) (*gh.Reference, error) {
+		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+baseRef)
+		if err != nil {
+			return nil, fmt.Errorf("get ref heads/%s: %w", baseRef, classifyGitHubAPIError(err))
+		}
+		return ref, nil
+	})
+	if err != nil {
+		return false, "", err
+	}
+	baseTipSHA = tip.GetObject().GetSHA()
+	if baseTipSHA == "" {
+		return false, "", fmt.Errorf("ref heads/%s for %s resolved to no commit", baseRef, repo)
+	}
+
+	comparison, err := retryGitHubUnavailableRead(ctx, ic.logger, "find pull request merge base", []any{"repo", repo, "base_ref", baseRef, "base_tip_sha", baseTipSHA, "head_sha", headSHA}, func(ctx context.Context) (*gh.CommitsComparison, error) {
+		comparison, _, err := ic.client.Repositories.CompareCommits(ctx, owner, repoName, baseTipSHA, headSHA, nil)
+		if err != nil {
+			return nil, fmt.Errorf("compare commits %s...%s: %w", baseTipSHA, headSHA, classifyGitHubAPIError(err))
+		}
+		return comparison, nil
+	})
+	if err != nil {
+		return false, baseTipSHA, err
+	}
+	mergeBaseSHA := comparison.GetMergeBaseCommit().GetSHA()
+	if mergeBaseSHA == "" {
+		return false, baseTipSHA, fmt.Errorf("compare commits %s...%s for %s returned no merge base", baseTipSHA, headSHA, repo)
+	}
+
+	levelCache := make(map[string][]TreeEntry)
+	for _, schemaPath := range schemaPaths {
+		mergeBaseObjectSHA, mergeBaseObjectType, mergeBaseFound, err := ic.resolveGitObjectSHA(ctx, repo, mergeBaseSHA, schemaPath, levelCache)
+		if err != nil {
+			return false, baseTipSHA, fmt.Errorf("resolve schema path %s at merge base %s: %w", schemaPath, mergeBaseSHA, err)
+		}
+		baseObjectSHA, baseObjectType, baseFound, err := ic.resolveGitObjectSHA(ctx, repo, baseTipSHA, schemaPath, levelCache)
+		if err != nil {
+			return false, baseTipSHA, fmt.Errorf("resolve schema path %s at base tip %s: %w", schemaPath, baseTipSHA, err)
+		}
+
+		if mergeBaseFound != baseFound {
+			return true, baseTipSHA, nil
+		}
+		if mergeBaseFound && (mergeBaseObjectSHA != baseObjectSHA || mergeBaseObjectType != baseObjectType) {
+			return true, baseTipSHA, nil
+		}
+	}
+	return false, baseTipSHA, nil
 }
 
 // CheckRunOptions contains options for creating or updating a GitHub Check Run.
@@ -792,6 +1197,10 @@ type CheckRunResult struct {
 	Name       string
 	Status     string // "queued", "in_progress", "completed"
 	Conclusion string // "success", "failure", "neutral", "action_required"
+	// StartedAt is when the Check Run was started; zero when GitHub did not
+	// report a start time. Lets callers judge how long a run that never
+	// completed has been sitting.
+	StartedAt time.Time
 }
 
 // FindCheckRunByName searches for a check run on a specific commit by name.
@@ -827,7 +1236,15 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 	var untrustedApps []string
 	seenUntrusted := make(map[string]struct{})
 	for {
-		result, resp, err := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, headSHA, opts)
+		var resp *gh.Response
+		result, err := retryGitHubUnavailableRead(ctx, ic.logger, "list check runs by name", []any{"repo", repo, "head_sha", headSHA, "check_name", checkName}, func(ctx context.Context) (*gh.ListCheckRunsResults, error) {
+			res, listResp, listErr := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, headSHA, opts)
+			if listErr != nil {
+				return nil, classifyGitHubAPIError(listErr)
+			}
+			resp = listResp
+			return res, nil
+		})
 		if err != nil {
 			return nil, nil, fmt.Errorf("list check runs named %q on %s@%s: %w", checkName, repo, headSHA, err)
 		}
@@ -850,6 +1267,7 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 						Name:       run.GetName(),
 						Status:     run.GetStatus(),
 						Conclusion: run.GetConclusion(),
+						StartedAt:  run.GetStartedAt().Time,
 					}
 				}
 			}
@@ -1033,7 +1451,15 @@ func (ic *InstallationClient) fetchCommitStatusRows(ctx context.Context, owner, 
 	opts := &gh.ListOptions{PerPage: 100}
 	var out []CheckStatusRow
 	for {
-		combined, resp, err := ic.client.Repositories.GetCombinedStatus(ctx, owner, repoName, ref, opts)
+		var resp *gh.Response
+		combined, err := retryGitHubUnavailableRead(ctx, ic.logger, "get combined commit status", []any{"repo", repo, "ref", ref}, func(ctx context.Context) (*gh.CombinedStatus, error) {
+			res, statusResp, statusErr := ic.client.Repositories.GetCombinedStatus(ctx, owner, repoName, ref, opts)
+			if statusErr != nil {
+				return nil, classifyGitHubAPIError(statusErr)
+			}
+			resp = statusResp
+			return res, nil
+		})
 		if err != nil {
 			return nil, fmt.Errorf("get combined commit status for %s@%s: %w", repo, ref, err)
 		}
@@ -1061,7 +1487,15 @@ func (ic *InstallationClient) fetchCheckRunRows(ctx context.Context, owner, repo
 	opts := &gh.ListCheckRunsOptions{Filter: &filter, ListOptions: gh.ListOptions{PerPage: 100}}
 	var out []CheckStatusRow
 	for {
-		result, resp, err := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, ref, opts)
+		var resp *gh.Response
+		result, err := retryGitHubUnavailableRead(ctx, ic.logger, "list check runs", []any{"repo", repo, "ref", ref}, func(ctx context.Context) (*gh.ListCheckRunsResults, error) {
+			res, listResp, listErr := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, ref, opts)
+			if listErr != nil {
+				return nil, classifyGitHubAPIError(listErr)
+			}
+			resp = listResp
+			return res, nil
+		})
 		if err != nil {
 			return nil, fmt.Errorf("list check runs for %s@%s: %w", repo, ref, err)
 		}
@@ -1161,6 +1595,136 @@ func (ic *InstallationClient) FetchGitTree(ctx context.Context, repo, treeSHA st
 		}
 	}
 	return entries, ghTree.GetTruncated(), nil
+}
+
+// fetchGitTreeShallow fetches a single tree level without recursing. One
+// level stays far below the Trees API caps that truncate whole-repo recursive
+// listings, so it can resolve paths inside repositories whose full tree is
+// truncated. If GitHub ever truncates even a single level, this fails rather
+// than let the caller act on an incomplete listing.
+func (ic *InstallationClient) fetchGitTreeShallow(ctx context.Context, repo, treeSHA string) ([]TreeEntry, string, error) {
+	owner, repoName := splitRepo(repo)
+	ghTree, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch git tree level", []any{"repo", repo, "tree_sha", treeSHA}, func(ctx context.Context) (*gh.Tree, error) {
+		ghTree, _, err := ic.client.Git.GetTree(ctx, owner, repoName, treeSHA, false)
+		if err != nil {
+			return nil, fmt.Errorf("fetch git tree level: %w", classifyGitHubAPIError(err))
+		}
+		return ghTree, nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	if ghTree.GetTruncated() {
+		return nil, "", fmt.Errorf("fetch git tree level %s in repo %s: %w", treeSHA, repo, ErrGitTreeTruncated)
+	}
+
+	entries := make([]TreeEntry, len(ghTree.Entries))
+	for i, entry := range ghTree.Entries {
+		entries[i] = TreeEntry{
+			Path: entry.GetPath(),
+			Mode: entry.GetMode(),
+			Type: entry.GetType(),
+			SHA:  entry.GetSHA(),
+			Size: entry.GetSize(),
+		}
+	}
+	return entries, ghTree.GetSHA(), nil
+}
+
+// FetchGitSubtree fetches the recursive tree of the directory dir at ref.
+// It resolves dir one path segment at a time with shallow tree fetches, so
+// resolution works even when the repository's full recursive listing is
+// truncated; only the directory's own subtree must fit under the Trees API
+// cap. Entry paths are relative to dir. found is false when dir does not
+// exist (or is not a directory) at ref. The error wraps ErrGitTreeTruncated
+// when the subtree itself is too large to list completely.
+func (ic *InstallationClient) FetchGitSubtree(ctx context.Context, repo, ref, dir string) (entries []TreeEntry, found bool, err error) {
+	return ic.fetchGitSubtreeCached(ctx, repo, ref, dir, nil)
+}
+
+// fetchGitSubtreeCached is FetchGitSubtree with an optional memo for the
+// shallow per-level fetches, keyed by tree SHA. Callers resolving several
+// directories at the same ref pass one map so shared path-prefix levels (and
+// the root tree) cost a single API call per scan; nil disables memoization.
+func (ic *InstallationClient) fetchGitSubtreeCached(ctx context.Context, repo, ref, dir string, levelCache map[string][]TreeEntry) (entries []TreeEntry, found bool, err error) {
+	treeSHA, found, err := ic.resolveGitTreeSHA(ctx, repo, ref, dir, levelCache)
+	if err != nil || !found {
+		return nil, found, err
+	}
+
+	entries, truncated, err := ic.FetchGitTree(ctx, repo, treeSHA)
+	if err != nil {
+		return nil, false, fmt.Errorf("fetch subtree %s in repo %s ref %s: %w", dir, repo, ref, err)
+	}
+	if truncated {
+		return nil, false, fmt.Errorf("fetch subtree %s in repo %s ref %s: %w", dir, repo, ref, ErrGitTreeTruncated)
+	}
+	return entries, true, nil
+}
+
+// resolveGitTreeSHA resolves dir to its tree object without listing that
+// directory recursively. The ref itself is the root tree when dir is repo
+// root. found is false when any path segment is absent or is not a tree.
+func (ic *InstallationClient) resolveGitTreeSHA(ctx context.Context, repo, ref, dir string, levelCache map[string][]TreeEntry) (treeSHA string, found bool, err error) {
+	objectSHA, objectType, found, err := ic.resolveGitObjectSHA(ctx, repo, ref, dir, levelCache)
+	if err != nil || !found {
+		return "", found, err
+	}
+	if objectType != "tree" {
+		return "", false, nil
+	}
+	return objectSHA, true, nil
+}
+
+func (ic *InstallationClient) resolveGitObjectSHA(ctx context.Context, repo, ref, objectPath string, levelCache map[string][]TreeEntry) (objectSHA, objectType string, found bool, err error) {
+	cleanPath := path.Clean(objectPath)
+	if cleanPath == "." {
+		_, rootTreeSHA, err := ic.fetchGitTreeShallow(ctx, repo, ref)
+		if err != nil {
+			return "", "", false, fmt.Errorf("resolve repo root in repo %s ref %s: %w", repo, ref, err)
+		}
+		if rootTreeSHA == "" {
+			return "", "", false, fmt.Errorf("resolve repo root in repo %s ref %s: GitHub returned no tree SHA", repo, ref)
+		}
+		return rootTreeSHA, "tree", true, nil
+	}
+	if path.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
+		return "", "", false, fmt.Errorf("schema path %q is not repo-relative", objectPath)
+	}
+
+	treeSHA := ref
+	segments := strings.Split(cleanPath, "/")
+	for i, segment := range segments {
+		levelEntries, cached := levelCache[treeSHA]
+		if !cached {
+			levelEntries, _, err = ic.fetchGitTreeShallow(ctx, repo, treeSHA)
+			if err != nil {
+				return "", "", false, fmt.Errorf("resolve %s under %s in repo %s ref %s: %w", segment, objectPath, repo, ref, err)
+			}
+			if levelCache != nil {
+				levelCache[treeSHA] = levelEntries
+			}
+		}
+		var matched *TreeEntry
+		for _, entry := range levelEntries {
+			if entry.Path == segment {
+				entryCopy := entry
+				matched = &entryCopy
+				break
+			}
+		}
+		if matched == nil {
+			return "", "", false, nil
+		}
+		if i == len(segments)-1 {
+			return matched.SHA, matched.Type, true, nil
+		}
+		if matched.Type != "tree" {
+			return "", "", false, nil
+		}
+		treeSHA = matched.SHA
+	}
+	return "", "", false, nil
 }
 
 // FetchBlobContent fetches file content using the Git Blob API.
@@ -1362,16 +1926,39 @@ func (ic *InstallationClient) FetchSchemaFilesOptimized(ctx context.Context, rep
 }
 
 func (ic *InstallationClient) fetchSchemaFilesFromTree(ctx context.Context, repo string, headSHA, schemaPath string) ([]GitHubFile, error) {
+	schemaPathPrefix := schemaPath + "/"
 	entries, truncated, err := ic.FetchGitTree(ctx, repo, headSHA)
 	if err != nil {
 		return nil, fmt.Errorf("fetch git tree: %w", err)
 	}
 	if truncated {
-		return nil, fmt.Errorf("fetch schema files from %s in repo %s ref %s: %w", schemaPath, repo, headSHA, ErrGitTreeTruncated)
+		// A repo-root schema path cannot be recovered by a subtree fetch —
+		// the root tree IS the truncated listing — so keep the truncation
+		// error rather than misreport "no schema files".
+		if schemaPath == "" || schemaPath == "." {
+			return nil, fmt.Errorf("fetch schema files from repo root of %s ref %s: %w", repo, headSHA, ErrGitTreeTruncated)
+		}
+		// The whole-repo listing exceeds the Trees API cap, but the schema
+		// directory's own subtree can still be listed completely. Prefix the
+		// subtree's relative paths back to repo-relative so the filtering
+		// below sees the same shape as the full-tree listing.
+		subtreeEntries, found, subtreeErr := ic.FetchGitSubtree(ctx, repo, headSHA, schemaPath)
+		if subtreeErr != nil {
+			return nil, fmt.Errorf("fetch schema files from %s in repo %s ref %s: %w", schemaPath, repo, headSHA, subtreeErr)
+		}
+		if !found {
+			ic.logger.Debug("schema path does not exist at ref; no schema files to fetch",
+				"repo", repo, "ref", headSHA, "schema_path", schemaPath)
+			return nil, nil
+		}
+		entries = make([]TreeEntry, len(subtreeEntries))
+		for i, entry := range subtreeEntries {
+			entry.Path = schemaPathPrefix + entry.Path
+			entries[i] = entry
+		}
 	}
 
 	var filesToFetch []TreeEntry
-	schemaPathPrefix := schemaPath + "/"
 	for _, entry := range entries {
 		if entry.Type != "blob" {
 			continue

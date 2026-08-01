@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -18,9 +19,11 @@ type Storage struct {
 	applyLogs       *applyLogStore
 	controlRequests *controlRequestStore
 	applyComments   *applyCommentStore
+	planComments    *planCommentStore
 	applyOperations *applyOperationStore
 	checks          *checkStore
 	settings        *settingsStore
+	webhookEvents   *webhookEventStore
 }
 
 // New creates a new MySQL storage instance.
@@ -28,15 +31,17 @@ func New(db *sql.DB) *Storage {
 	return &Storage{
 		db:              db,
 		locks:           &lockStore{db: db},
-		plans:           &planStore{db: db},
-		applies:         &applyStore{db: db},
-		tasks:           &taskStore{db: db},
-		applyLogs:       &applyLogStore{db: db},
-		controlRequests: &controlRequestStore{db: db},
-		applyComments:   &applyCommentStore{db: db},
-		applyOperations: &applyOperationStore{db: db},
-		checks:          &checkStore{db: db},
-		settings:        &settingsStore{db: db},
+		plans:           &planStore{db: db, identity: MySQLDialect{}},
+		applies:         &applyStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}, locker: namedlock.MySQL{}},
+		tasks:           &taskStore{db: db, identity: MySQLDialect{}},
+		applyLogs:       &applyLogStore{db: db, identity: MySQLDialect{}},
+		controlRequests: &controlRequestStore{db: db, identity: MySQLDialect{}},
+		applyComments:   &applyCommentStore{db: db, dialect: MySQLDialect{}},
+		planComments:    &planCommentStore{db: db, identity: MySQLDialect{}},
+		applyOperations: &applyOperationStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}},
+		checks:          &checkStore{db: db, dialect: MySQLDialect{}},
+		settings:        &settingsStore{db: db, dialect: MySQLDialect{}},
+		webhookEvents:   &webhookEventStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}},
 	}
 }
 
@@ -75,6 +80,11 @@ func (s *Storage) ApplyComments() storage.ApplyCommentStore {
 	return s.applyComments
 }
 
+// PlanComments returns the plan comment store.
+func (s *Storage) PlanComments() storage.PlanCommentStore {
+	return s.planComments
+}
+
 // ApplyOperations returns the apply-operations store.
 func (s *Storage) ApplyOperations() storage.ApplyOperationStore {
 	return s.applyOperations
@@ -88,6 +98,11 @@ func (s *Storage) Checks() storage.CheckStore {
 // Settings returns the settings store.
 func (s *Storage) Settings() storage.SettingsStore {
 	return s.settings
+}
+
+// WebhookEvents returns the durable webhook event inbox store.
+func (s *Storage) WebhookEvents() storage.WebhookEventStore {
+	return s.webhookEvents
 }
 
 // Ping verifies the database connection is alive.

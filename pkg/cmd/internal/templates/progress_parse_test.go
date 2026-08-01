@@ -81,3 +81,44 @@ func TestParseProgressResponseWithoutOperationsKeepsDeploymentEmpty(t *testing.T
 	assert.Equal(t, "users", data.Tables[0].TableName)
 	assert.Equal(t, state.Task.Completed, data.Tables[0].Status)
 }
+
+// A table's headline figures — including its ETA and any per-shard ETAs —
+// survive the JSON-response-to-render-data mapping, so a renderer's decision
+// to show or hide an ETA is a status-gating choice, never a lost value.
+func TestParseProgressResponseCarriesTableAndShardETA(t *testing.T) {
+	result := &apitypes.ProgressResponse{
+		State: state.Apply.Running,
+		Tables: []*apitypes.TableProgressResponse{
+			{
+				TableName:       "users",
+				Keyspace:        "testdb",
+				ChangeType:      "alter",
+				Status:          state.Task.Running,
+				RowsCopied:      250000,
+				RowsTotal:       500000,
+				PercentComplete: 50,
+				ETASeconds:      540,
+				Shards: []*apitypes.ShardProgressResponse{
+					{
+						Shard:      "-80",
+						Status:     state.Task.Running,
+						RowsCopied: 125000,
+						RowsTotal:  250000,
+						ETASeconds: 480,
+					},
+				},
+			},
+		},
+	}
+
+	data := ParseProgressResponse(result)
+
+	require.Len(t, data.Tables, 1)
+	assert.Equal(t, int64(250000), data.Tables[0].RowsCopied)
+	assert.Equal(t, int64(500000), data.Tables[0].RowsTotal)
+	assert.Equal(t, 50, data.Tables[0].PercentComplete)
+	assert.Equal(t, int64(540), data.Tables[0].ETASeconds)
+	require.Len(t, data.Tables[0].Shards, 1)
+	assert.Equal(t, "-80", data.Tables[0].Shards[0].Shard)
+	assert.Equal(t, int64(480), data.Tables[0].Shards[0].ETASeconds)
+}

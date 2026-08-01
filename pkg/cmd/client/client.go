@@ -55,18 +55,59 @@ func GetEnvironments(endpoint, database string) ([]string, error) {
 // ListDatabasesOptions controls database list request fields.
 type ListDatabasesOptions struct {
 	Type string
+	// Name keeps only databases whose name contains it, case-insensitively.
+	Name string
 }
 
 // ListDatabases fetches the configured databases known to the server.
 func ListDatabases(endpoint string, opts ListDatabasesOptions) (*apitypes.DatabaseListResponse, error) {
 	requestPath := "/api/databases"
+	values := url.Values{}
 	if opts.Type != "" {
-		values := url.Values{}
 		values.Set("type", opts.Type)
-		requestPath += "?" + values.Encode()
+	}
+	if opts.Name != "" {
+		values.Set("name", opts.Name)
+	}
+	if encoded := values.Encode(); encoded != "" {
+		requestPath += "?" + encoded
 	}
 	var result apitypes.DatabaseListResponse
 	if err := doGetInto(endpoint, requestPath, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func RedriveWebhooks(ctx context.Context, endpoint string, req apitypes.WebhookRedriveRequest) (*apitypes.WebhookRedriveResponse, error) {
+	var result apitypes.WebhookRedriveResponse
+	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/webhooks/redrive", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func ChecksScan(ctx context.Context, endpoint string, req apitypes.ChecksScanRequest) (*apitypes.ChecksScanResponse, error) {
+	var result apitypes.ChecksScanResponse
+	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/checks/scan", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func ChecksSynthesize(ctx context.Context, endpoint string, req apitypes.ChecksSynthesizeRequest) (*apitypes.ChecksSynthesizeResponse, error) {
+	var result apitypes.ChecksSynthesizeResponse
+	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/checks/synthesize", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// ChecksRepos lists the repositories declared in the server's repos config —
+// the inventory a fleet-wide checks scan iterates.
+func ChecksRepos(ctx context.Context, endpoint string) (*apitypes.ChecksReposResponse, error) {
+	var result apitypes.ChecksReposResponse
+	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/checks/repos", struct{}{}, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -531,7 +572,12 @@ type StatusOptions struct {
 	Limit       int
 	Environment string
 	Deployment  string
-	Failed      bool
+	// State restricts the list to one apply state; empty means all states.
+	State  string
+	Failed bool
+	// Last bounds the list to applies updated within this window; zero means
+	// unbounded.
+	Last time.Duration
 }
 
 // GetStatus fetches recent schema changes.
@@ -549,8 +595,14 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 		if opts[0].Deployment != "" {
 			values.Set("deployment", opts[0].Deployment)
 		}
+		if opts[0].State != "" {
+			values.Set("state", opts[0].State)
+		}
 		if opts[0].Failed {
 			values.Set("failed", "true")
+		}
+		if opts[0].Last > 0 {
+			values.Set("last", opts[0].Last.String())
 		}
 		if encoded := values.Encode(); encoded != "" {
 			requestPath += "?" + encoded
@@ -562,18 +614,7 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 	return &result, nil
 }
 
-// LogEntry represents a single log entry from the apply logs.
-type LogEntry struct {
-	ID        int64     `json:"id"`
-	ApplyID   string    `json:"apply_id"`
-	TaskID    *int64    `json:"task_id,omitempty"`
-	Level     string    `json:"level"`
-	EventType string    `json:"event_type"`
-	Message   string    `json:"message"`
-	OldState  string    `json:"old_state,omitempty"`
-	NewState  string    `json:"new_state,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-}
+type LogEntry = apitypes.LogEntry
 
 // GetLogs retrieves apply logs for a database.
 // If applyID is provided, it fetches logs for that specific apply.
@@ -583,19 +624,23 @@ func GetLogs(endpoint, database, environment, applyID string, limit int) ([]*Log
 		return nil, fmt.Errorf("database or apply_id is required")
 	}
 
-	var path string
-	if database == "" && applyID != "" {
-		path = fmt.Sprintf("/api/logs?apply_id=%s", applyID)
-	} else {
-		path = fmt.Sprintf("/api/logs/%s?", database)
-		if applyID != "" {
-			path += fmt.Sprintf("apply_id=%s", applyID)
-		} else if environment != "" {
-			path += fmt.Sprintf("environment=%s", environment)
-		}
+	values := url.Values{}
+	if applyID != "" {
+		values.Set("apply_id", applyID)
+	} else if environment != "" {
+		values.Set("environment", environment)
 	}
 	if limit > 0 {
-		path += fmt.Sprintf("&limit=%d", limit)
+		values.Set("limit", strconv.Itoa(limit))
+	}
+	var path string
+	if database == "" && applyID != "" {
+		path = "/api/logs"
+	} else {
+		path = "/api/logs/" + url.PathEscape(database)
+	}
+	if encoded := values.Encode(); encoded != "" {
+		path += "?" + encoded
 	}
 
 	var result struct {
@@ -605,6 +650,20 @@ func GetLogs(endpoint, database, environment, applyID string, limit int) ([]*Log
 		return nil, err
 	}
 	return result.Logs, nil
+}
+
+func GetDeploymentLogs(endpoint, applyID, deployment string, limit int) (*apitypes.DeploymentLogsResponse, error) {
+	values := url.Values{}
+	values.Set("apply_id", applyID)
+	values.Set("deployment", deployment)
+	if limit > 0 {
+		values.Set("limit", strconv.Itoa(limit))
+	}
+	var result apitypes.DeploymentLogsResponse
+	if err := doGetInto(endpoint, "/api/logs?"+values.Encode(), &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 // Setting represents a key-value setting.

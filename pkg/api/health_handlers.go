@@ -9,6 +9,13 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 )
 
+// handleHealth reports whether this instance can serve requests right now: it
+// pings the storage database and returns 503 when storage is unreachable. It
+// backs the readiness probe, which routes traffic away from the instance until
+// storage recovers. It must not back a liveness probe — a restart cannot fix an
+// unreachable database, and killing the process would abort in-flight drives
+// whose target-database work is unaffected by a storage outage. Liveness uses
+// handleLivez.
 func (s *Service) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if err := s.storage.Ping(r.Context()); err != nil {
 		s.logger.Error("health check failed", "error", err)
@@ -16,6 +23,16 @@ func (s *Service) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleLivez reports whether the process itself is alive and able to answer
+// HTTP. It deliberately checks no dependencies: liveness failure causes a
+// restart, and a restart only fixes process-level faults (a wedged runtime, a
+// deadlocked listener). Dependency health — the storage database — is readiness
+// (handleHealth), where the correct reaction is to stop routing traffic and
+// wait, not to kill the process.
+func (s *Service) handleLivez(w http.ResponseWriter, _ *http.Request) {
+	s.writeJSON(w, http.StatusOK, map[string]string{"status": "alive"})
 }
 
 func (s *Service) handleTernHealth(w http.ResponseWriter, r *http.Request) {

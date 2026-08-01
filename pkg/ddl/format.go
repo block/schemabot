@@ -1,11 +1,9 @@
 package ddl
 
 import (
-	"fmt"
 	"regexp"
 	"strings"
 
-	"github.com/block/spirit/pkg/statement"
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/format"
@@ -359,28 +357,13 @@ func isClauseKeyword(s string) bool {
 		strings.HasPrefix(upper, "ORDER ")
 }
 
-// Canonicalize converts a DDL statement to canonical format using Spirit's parser.
-// For ALTER TABLE statements, this normalizes the SQL with proper quoting and formatting.
-// For CREATE TABLE and DROP TABLE, uses TiDB's Restore to canonicalize.
+// Canonicalize converts a DDL statement to canonical format.
+// It delegates to the package's default StatementParser (the TiDB/Spirit
+// implementation): ALTER TABLE statements are normalized with proper quoting
+// and formatting, while CREATE TABLE and DROP TABLE use TiDB's Restore.
 // Returns the original statement if parsing fails.
 func Canonicalize(ddl string) string {
-	stmts, err := statement.New(ddl)
-	if err != nil || len(stmts) == 0 {
-		return ddl
-	}
-
-	stmt := stmts[0]
-
-	// For ALTER TABLE, reconstruct from the normalized Alter field
-	if stmt.Alter != "" {
-		if stmt.Schema != "" {
-			return fmt.Sprintf("ALTER TABLE `%s`.`%s` %s", stmt.Schema, stmt.Table, stmt.Alter)
-		}
-		return fmt.Sprintf("ALTER TABLE `%s` %s", stmt.Table, stmt.Alter)
-	}
-
-	// For CREATE TABLE and DROP TABLE, use TiDB's Restore for canonical format
-	return restoreCanonical(ddl)
+	return defaultParser.Canonicalize(ddl)
 }
 
 // restoreCanonical uses TiDB parser to restore a statement in canonical format.

@@ -17,11 +17,15 @@ const checkColumns = `id, repository, pull_request, head_sha,
 	check_run_id, apply_id, has_changes, status, conclusion,
 	blocking_reason, error_message, change_summary, created_at, updated_at`
 
-const checkStatusInProgress = "in_progress"
+const (
+	checkStatusInProgress  = "in_progress"
+	checkConclusionSuccess = "success"
+)
 
 // checkStore implements storage.CheckStore using MySQL.
 type checkStore struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect Dialect
 }
 
 // Upsert creates or updates stored check state.
@@ -38,6 +42,20 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 
 	op := fmt.Sprintf("upsert check result for %s#%d %s/%s/%s",
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	upsert := s.dialect.UpsertClause(
+		[]string{"repository", "pull_request", "environment", "database_type", "database_name"},
+		[]UpsertAssignment{
+			{Column: "head_sha"},
+			{Column: "check_run_id"},
+			{Column: "apply_id"},
+			{Column: "has_changes"},
+			{Column: "status"},
+			{Column: "conclusion"},
+			{Column: "blocking_reason"},
+			{Column: "error_message"},
+			{Column: "change_summary", Expr: "COALESCE(NULLIF(" + s.dialect.ExcludedValue("change_summary") + ", ''), change_summary)"},
+		},
+	)
 	return withLockRetry(ctx, op, func() error {
 		_, err := s.db.ExecContext(ctx, `
 			INSERT INTO checks (
@@ -45,17 +63,7 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 				environment, database_type, database_name,
 				check_run_id, apply_id, has_changes, status, conclusion, blocking_reason, error_message, change_summary
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON DUPLICATE KEY UPDATE
-				head_sha = VALUES(head_sha),
-				check_run_id = VALUES(check_run_id),
-				apply_id = VALUES(apply_id),
-				has_changes = VALUES(has_changes),
-				status = VALUES(status),
-				conclusion = VALUES(conclusion),
-				blocking_reason = VALUES(blocking_reason),
-				error_message = VALUES(error_message),
-				change_summary = COALESCE(NULLIF(VALUES(change_summary), ''), change_summary)
-		`, check.Repository, check.PullRequest, check.HeadSHA,
+			`+upsert, check.Repository, check.PullRequest, check.HeadSHA,
 			check.Environment, check.DatabaseType, check.DatabaseName,
 			checkRunID, applyID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, nullString(check.ChangeSummary))
 		return err
@@ -64,7 +72,13 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 
 // UpsertPlanResult stores plan-derived check state without overwriting
 // in-progress apply-owned state for the same PR/environment/database.
-func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check) error {
+//
+// drift declares whether this write evaluated review-time deployment drift. A
+// not-evaluated write (an apply-time plan) must not silently clear a stored
+// drift block: the block depends on live deployment state, not PR content, so
+// only a write that re-ran the rollup and found the deployments clean may clear
+// it. See storage.PlanDriftState.
+func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check, drift storage.PlanDriftState) error {
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
@@ -99,6 +113,40 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check)
 		// recovery path releases it. A plan result — even from a newer PR commit that
 		// diffs cleanly against the mid-apply database — must not take ownership or
 		// convert the row into a passing check.
+		//
+		// A not-evaluated write additionally preserves the full gating state of an
+		// existing review-time drift block: it may refresh the head SHA and check
+		// run id so the current-head aggregate stays aligned, but it must not clear
+		// the block's conclusion, blocking reason, or summary. Only a write that
+		// re-ran the rollup (clean or blocked) rewrites those columns.
+		if drift == storage.PlanDriftNotEvaluated {
+			_, err = s.db.ExecContext(ctx, `
+				UPDATE checks
+				SET head_sha = ?,
+				    check_run_id = ?,
+				    apply_id     = CASE WHEN COALESCE(blocking_reason, '') = ? THEN apply_id     ELSE NULL END,
+				    has_changes  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN has_changes  ELSE ?    END,
+				    status       = CASE WHEN COALESCE(blocking_reason, '') = ? THEN status       ELSE ?    END,
+				    conclusion   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN conclusion   ELSE ?    END,
+				    blocking_reason = CASE WHEN COALESCE(blocking_reason, '') = ? THEN blocking_reason ELSE ? END,
+				    error_message   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN error_message   ELSE ? END,
+				    change_summary  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN change_summary  ELSE ? END
+				WHERE repository = ? AND pull_request = ?
+				  AND environment = ? AND database_type = ? AND database_name = ?
+				  AND NOT (status = ? AND apply_id IS NOT NULL)
+			`, check.HeadSHA, checkRunID,
+				storage.ReviewTimeDeploymentDriftBlockingReason,
+				storage.ReviewTimeDeploymentDriftBlockingReason, check.HasChanges,
+				storage.ReviewTimeDeploymentDriftBlockingReason, check.Status,
+				storage.ReviewTimeDeploymentDriftBlockingReason, check.Conclusion,
+				storage.ReviewTimeDeploymentDriftBlockingReason, check.BlockingReason,
+				storage.ReviewTimeDeploymentDriftBlockingReason, check.ErrorMessage,
+				storage.ReviewTimeDeploymentDriftBlockingReason, nullString(check.ChangeSummary),
+				check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+				checkStatusInProgress)
+			return err
+		}
+
 		_, err = s.db.ExecContext(ctx, `
 			UPDATE checks
 			SET head_sha = ?,
@@ -162,7 +210,7 @@ func (s *checkStore) RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, che
 func successfulNoOpPlanResult(check *storage.Check) bool {
 	return check != nil &&
 		check.Status == "completed" &&
-		check.Conclusion == "success" &&
+		check.Conclusion == checkConclusionSuccess &&
 		!check.HasChanges
 }
 
@@ -174,6 +222,11 @@ func successfulNoOpPlanResult(check *storage.Check) bool {
 // database. Returns true when the row is in the plan-only successful state after
 // this call (whether this call wrote it or it already was), and false only when a
 // started apply still owns it.
+//
+// This deliberately clears a review-time deployment drift block too: once a later
+// commit removes the database from the PR and no apply has started, the reviewed
+// plan is no longer part of the merge gate, so the plan-only drift block should
+// stop blocking. A started apply still owns the row and is left untouched.
 func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check) (bool, error) {
 	var checkRunID any
 	if check.CheckRunID != 0 {
@@ -227,12 +280,40 @@ func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage
 	return isPlanOnlySuccessful(current), nil
 }
 
+// ClearAggregateBlock clears the blocking reason on stored aggregate check
+// state. The WHERE clause pins the head SHA and blocking reason the caller
+// read, making the clear an optimistic-concurrency write: a block recorded
+// concurrently (a different reason, or the same reason re-recorded on a newer
+// commit) does not match and is preserved. Returns true when the row was
+// cleared.
+func (s *checkStore) ClearAggregateBlock(ctx context.Context, check *storage.Check) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE checks
+		SET blocking_reason = '',
+		    error_message = ''
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+		  AND head_sha = ? AND blocking_reason = ?
+	`, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		check.HeadSHA, check.BlockingReason)
+	if err != nil {
+		return false, fmt.Errorf("clear aggregate blocking reason %q for %s#%d %s (head %s): %w",
+			check.BlockingReason, check.Repository, check.PullRequest, check.Environment, check.HeadSHA, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("rows affected clearing aggregate blocking reason %q for %s#%d %s: %w",
+			check.BlockingReason, check.Repository, check.PullRequest, check.Environment, err)
+	}
+	return rows > 0, nil
+}
+
 // isPlanOnlySuccessful reports whether stored check state is already in the
 // plan-only successful state stale cleanup converges to: a completed, successful
 // check with no started apply and no pending schema change.
 func isPlanOnlySuccessful(check *storage.Check) bool {
 	return check.Status == "completed" &&
-		check.Conclusion == "success" &&
+		check.Conclusion == checkConclusionSuccess &&
 		check.ApplyID == 0 &&
 		!check.HasChanges
 }
@@ -302,8 +383,13 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 }
 
 // MarkActionRequiredForApply marks stored check state action_required after a
-// rollback only if it still belongs to that rollback apply and no newer apply
-// exists for the same PR/environment/database.
+// rollback only if no apply newer than the rollback exists for the same
+// PR/environment/database. Unlike CompleteForApply, the write does not require
+// the row to be owned by the rollback apply: a rollback that never claimed the
+// row (its claim failed or the driver crashed before it landed) must still be
+// able to block a stale successful check left over from the apply it reverted.
+// Rows owned by an older apply or with no owner qualify; the newer-apply guard
+// is what protects a re-apply that started after the rollback.
 func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
 	var checkRunID any
 	if check.CheckRunID != 0 {
@@ -337,7 +423,7 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 		    change_summary = COALESCE(NULLIF(?, ''), change_summary)
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
-		  AND apply_id = ?
+		  AND (apply_id IS NULL OR apply_id <= ?)
 		  AND NOT EXISTS (
 		    SELECT 1
 		    FROM applies newer
@@ -432,18 +518,57 @@ func (s *checkStore) Delete(ctx context.Context, id int64) error {
 	return checkRowsAffected(result, storage.ErrCheckNotFound)
 }
 
-// DeleteByPRExcludingApplyOwned removes stored check state for a PR, except
-// rows owned by an in-flight apply. A row with apply_id set and status
-// in_progress must keep blocking until the apply reaches a terminal state,
-// even when PR-close cleanup found no non-terminal apply in the applies table.
-func (s *checkStore) DeleteByPRExcludingApplyOwned(ctx context.Context, repo string, pr int) error {
+// DeleteByPRRetainingBlockingApplyOwned removes stored check state for a
+// closed PR, retaining apply-owned rows the close must not unblock. Once an
+// apply has started, its stored check state is authoritative until an
+// operator reconciles the target environment — closing and reopening the PR
+// must not convert it into a passing aggregate.
+//
+// Plan-only rows (apply_id unset) are always deleted: no apply ever reached
+// the live database for them, so a reopened PR starts clean.
+//
+// On a merged close, an apply-owned row is retained when it is either:
+//
+//   - in_progress: the apply may still be changing the live database, even
+//     when PR-close cleanup found no non-terminal apply in the applies
+//     table; or
+//   - concluded as anything but success (action_required, failure, or
+//     unset): the apply reached the live database and the row records that
+//     operator attention is still required, e.g. the schema change was
+//     removed from the PR after the apply started or a rollback completed.
+//
+// Apply-owned rows whose conclusion is success are deleted on a merged
+// close: the apply finished cleanly and the merged PR carries the applied
+// schema, so nothing remains for the row to block.
+//
+// On an unmerged close, every apply-owned row is retained, including rows
+// whose conclusion is success. A stored success only proves the database
+// matched the PR when the row was last written — a commit that removed the
+// applied change may close the PR before stale cleanup converts the row to
+// action_required, and the unmerged branch means the change never landed.
+// Reopen-time stale cleanup converges the retained row: it converts it to
+// action_required when the schema change is gone from the PR, or a fresh
+// plan result replaces it when the change is still present.
+func (s *checkStore) DeleteByPRRetainingBlockingApplyOwned(ctx context.Context, repo string, pr int, merged bool) error {
+	if merged {
+		_, err := s.db.ExecContext(ctx, `
+			DELETE FROM checks
+			WHERE repository = ? AND pull_request = ?
+			  AND (apply_id IS NULL OR (status != ? AND conclusion = ?))
+		`, repo, pr, checkStatusInProgress, checkConclusionSuccess)
+		if err != nil {
+			return fmt.Errorf("delete checks for merged closed PR %s#%d: %w", repo, pr, err)
+		}
+		return nil
+	}
+
 	_, err := s.db.ExecContext(ctx, `
 		DELETE FROM checks
 		WHERE repository = ? AND pull_request = ?
-		  AND NOT (apply_id IS NOT NULL AND status = ?)
-	`, repo, pr, checkStatusInProgress)
+		  AND apply_id IS NULL
+	`, repo, pr)
 	if err != nil {
-		return fmt.Errorf("delete checks for closed PR %s#%d: %w", repo, pr, err)
+		return fmt.Errorf("delete plan-only checks for unmerged closed PR %s#%d: %w", repo, pr, err)
 	}
 	return nil
 }

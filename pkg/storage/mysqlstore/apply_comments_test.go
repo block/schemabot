@@ -21,10 +21,14 @@ func TestApplyCommentStore_Upsert(t *testing.T) {
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_comment_upsert", 1)
 
+	postedVolume := 3
+	noPhase := ""
 	comment := &storage.ApplyComment{
 		ApplyID:         apply.ID,
 		CommentState:    state.Comment.Progress,
 		GitHubCommentID: 111222333,
+		PostedVolume:    &postedVolume,
+		PostedPhase:     &noPhase,
 	}
 
 	// Insert
@@ -37,19 +41,46 @@ func TestApplyCommentStore_Upsert(t *testing.T) {
 	assert.Equal(t, apply.ID, retrieved.ApplyID)
 	assert.Equal(t, state.Comment.Progress, retrieved.CommentState)
 	assert.Equal(t, int64(111222333), retrieved.GitHubCommentID)
+	require.NotNil(t, retrieved.PostedVolume)
+	assert.Equal(t, 3, *retrieved.PostedVolume)
+	require.NotNil(t, retrieved.PostedPhase)
+	assert.Empty(t, *retrieved.PostedPhase)
 	assert.NotZero(t, retrieved.ID)
 	assert.NotZero(t, retrieved.CreatedAt)
 	assert.NotZero(t, retrieved.UpdatedAt)
 
-	// Upsert with new comment ID (simulates Start/resume)
+	// Upsert with new comment ID, level, and control phase (simulates a
+	// rotation to a fresh comment)
 	comment.GitHubCommentID = 444555666
+	newVolume := 5
+	comment.PostedVolume = &newVolume
+	reverting := state.Apply.Reverting
+	comment.PostedPhase = &reverting
 	require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
 
-	// Verify upsert updated the comment ID
+	// Verify upsert updated the comment ID and recorded level and phase
 	retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
 	require.NoError(t, err)
 	require.NotNil(t, retrieved)
 	assert.Equal(t, int64(444555666), retrieved.GitHubCommentID)
+	require.NotNil(t, retrieved.PostedVolume)
+	assert.Equal(t, 5, *retrieved.PostedVolume)
+	require.NotNil(t, retrieved.PostedPhase)
+	assert.Equal(t, state.Apply.Reverting, *retrieved.PostedPhase)
+
+	// A summary comment carries no level or control phase; the columns stay
+	// NULL and read back nil.
+	summary := &storage.ApplyComment{
+		ApplyID:         apply.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 777888999,
+	}
+	require.NoError(t, store.ApplyComments().Upsert(ctx, summary))
+	retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Nil(t, retrieved.PostedVolume)
+	assert.Nil(t, retrieved.PostedPhase)
 }
 
 func TestApplyCommentStore_Get(t *testing.T) {
@@ -217,6 +248,58 @@ func TestApplyCommentStore_Supersede(t *testing.T) {
 	require.NoError(t, store.ApplyComments().Supersede(ctx, 99999, state.Comment.Progress))
 }
 
+func TestApplyCommentStore_PendingFreeze(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_comment_pending_freeze", 1)
+
+	// A volume-change rotation records the freeze owed to the superseded
+	// comment in the same write that tracks its successor.
+	postedVolume := 5
+	supersededID := int64(100)
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:                apply.ID,
+		CommentState:           state.Comment.Progress,
+		GitHubCommentID:        200,
+		PostedVolume:           &postedVolume,
+		PendingFreezeCommentID: &supersededID,
+	}))
+
+	retrieved, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, int64(200), retrieved.GitHubCommentID)
+	require.NotNil(t, retrieved.PendingFreezeCommentID)
+	assert.Equal(t, supersededID, *retrieved.PendingFreezeCommentID)
+
+	// Once the frozen rendering lands on GitHub, the marker is cleared; the
+	// rest of the row is untouched.
+	require.NoError(t, store.ApplyComments().ClearPendingFreeze(ctx, apply.ID, state.Comment.Progress))
+	retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Nil(t, retrieved.PendingFreezeCommentID)
+	assert.Equal(t, int64(200), retrieved.GitHubCommentID)
+	require.NotNil(t, retrieved.PostedVolume)
+	assert.Equal(t, 5, *retrieved.PostedVolume)
+
+	// Clearing an already-clear marker or a missing row is a no-op, not an error.
+	require.NoError(t, store.ApplyComments().ClearPendingFreeze(ctx, apply.ID, state.Comment.Progress))
+	require.NoError(t, store.ApplyComments().ClearPendingFreeze(ctx, 99999, state.Comment.Progress))
+
+	// A post that supersedes nothing leaves the marker NULL.
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 300,
+	}))
+	summary, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Nil(t, summary.PendingFreezeCommentID)
+}
+
 func TestApplyCommentStore_UniqueConstraint(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -295,6 +378,24 @@ func TestApplyCommentStore_LeaseGuardsWrites(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, retrieved)
 	assert.Equal(t, 1, retrieved.EditCount)
+
+	// ClearPendingFreeze is a lease-guarded write like the others: a stale
+	// lease fails closed, the current lease clears the marker.
+	pendingFreezeID := int64(50)
+	comment.PendingFreezeCommentID = &pendingFreezeID
+	require.NoError(t, store.ApplyComments().Upsert(currentCtx, comment))
+	require.ErrorIs(t, store.ApplyComments().ClearPendingFreeze(staleCtx, apply.ID, state.Comment.Progress), storage.ErrApplyLeaseLost)
+
+	retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.NotNil(t, retrieved.PendingFreezeCommentID, "a stale lease must not clear the marker")
+
+	require.NoError(t, store.ApplyComments().ClearPendingFreeze(currentCtx, apply.ID, state.Comment.Progress))
+	retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Nil(t, retrieved.PendingFreezeCommentID)
 }
 
 // DB error tests
@@ -339,4 +440,168 @@ func TestApplyCommentStore_DeleteByApply_DBError(t *testing.T) {
 	store := New(db)
 	err = store.ApplyComments().DeleteByApply(t.Context(), 1)
 	require.Error(t, err)
+}
+
+// TestApplyCommentStore_ClaimSummaryComment verifies the atomic summary-marker
+// claim is first-writer-wins: the first claim inserts the sentinel
+// (github_comment_id = 0) and wins, every later claim for the same apply loses,
+// and a summary marker that already records a real comment also blocks the
+// claim. A superseded marker — a stop's summary consumed by a resume rotation —
+// does not block: it converts back into a claim sentinel exactly once, so the
+// apply's next terminal state still gets its summary. Claims for different
+// applies are independent.
+func TestApplyCommentStore_ClaimSummaryComment(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_comment_claim", 1)
+	otherLock := createTestLock(t, store, "testdb_other", "mysql", "staging")
+	other := createTestApply(t, store, otherLock, "apply_comment_claim_other", 2)
+
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.True(t, won, "first claim must win")
+
+	claimed, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, int64(0), claimed.GitHubCommentID, "won claim is the sentinel form of the marker")
+
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, won, "second claim for the same apply must lose")
+
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, other.ID)
+	require.NoError(t, err)
+	assert.True(t, won, "claims for different applies are independent")
+
+	// A recorded real comment blocks the claim the same way a sentinel does.
+	require.NoError(t, store.ApplyComments().ReleaseSummaryClaim(ctx, apply.ID))
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9001,
+	}))
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, won, "a posted summary must block the claim")
+
+	// A superseded summary — a stop's summary marker consumed by a resume
+	// rotation — no longer describes the current terminal state, so it must not
+	// block the claim: the row converts back into a claim sentinel.
+	require.NoError(t, store.ApplyComments().Supersede(ctx, apply.ID, state.Comment.Summary))
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.True(t, won, "a superseded summary marker must be reclaimable")
+
+	claimed, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, int64(0), claimed.GitHubCommentID, "reclaimed marker is the sentinel form")
+	assert.Nil(t, claimed.SupersededAt, "reclaimed marker is active again")
+
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, won, "exactly one claimant reclaims a superseded summary")
+
+	// A superseded claim sentinel belongs to a publish that is still in flight
+	// or crashed mid-publish — converting it back into an active sentinel would
+	// hand two writers the same claim. It is recovered by the stale-claim
+	// machinery (ReclaimStaleSummaryClaim), never by a competing claim.
+	require.NoError(t, store.ApplyComments().Supersede(ctx, apply.ID, state.Comment.Summary))
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, won, "a superseded claim sentinel is not reclaimable")
+}
+
+// TestApplyCommentStore_ReclaimStaleSummaryClaim verifies crashed-publisher
+// takeover: a claim sentinel older than the stale window transfers to the
+// reclaimer (bumping updated_at so a second reclaimer loses), while a fresh
+// sentinel, a missing marker, and a recorded real comment are all not
+// reclaimable.
+func TestApplyCommentStore_ReclaimStaleSummaryClaim(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_comment_reclaim", 1)
+
+	reclaimed, err := store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "missing marker is not reclaimable")
+
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "fresh sentinel is an in-flight publish, not reclaimable")
+
+	// Backdate the sentinel past the stale window to simulate a publisher that
+	// crashed between claiming and posting.
+	backdateSummaryClaim(t, apply.ID)
+
+	reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.True(t, reclaimed, "stale sentinel transfers to the reclaimer")
+
+	reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "a just-reclaimed sentinel is fresh again; a second reclaimer loses")
+
+	// A recorded real comment is never reclaimable, however old.
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9001,
+	}))
+	backdateSummaryClaim(t, apply.ID)
+	reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "a posted summary must never be reclaimed")
+}
+
+// TestApplyCommentStore_ReleaseSummaryClaim verifies release deletes only the
+// sentinel form of the summary marker: a released claim can be re-won, a
+// missing marker releases without error, and a marker recording a real posted
+// comment survives release untouched.
+func TestApplyCommentStore_ReleaseSummaryClaim(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_comment_release", 1)
+
+	require.NoError(t, store.ApplyComments().ReleaseSummaryClaim(ctx, apply.ID), "releasing a missing claim is not an error")
+
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	require.True(t, won)
+	require.NoError(t, store.ApplyComments().ReleaseSummaryClaim(ctx, apply.ID))
+
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.True(t, won, "a released claim must be re-winnable")
+
+	// Convert the claim to a posted summary; release must not delete it.
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9001,
+	}))
+	require.NoError(t, store.ApplyComments().ReleaseSummaryClaim(ctx, apply.ID))
+	posted, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, posted, "a recorded posted summary must survive release")
+	assert.Equal(t, int64(9001), posted.GitHubCommentID)
+}
+
+// backdateSummaryClaim pushes an apply's summary marker updated_at past the
+// stale-claim window, simulating a publisher that crashed after claiming.
+func backdateSummaryClaim(t *testing.T, applyID int64) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(), `
+		UPDATE apply_comments SET updated_at = NOW() - INTERVAL ? SECOND
+		WHERE apply_id = ? AND comment_state = ?
+	`, int64(storage.SummaryClaimStaleAfter.Seconds())+1, applyID, state.Comment.Summary)
+	require.NoError(t, err)
 }

@@ -25,28 +25,23 @@ const applyOperationColumns = `id, apply_id, deployment, operation_key, operatio
 
 // applyOperationStore implements storage.ApplyOperationStore using MySQL.
 type applyOperationStore struct {
-	db *sql.DB
+	db       *sql.DB
+	dialect  Dialect
+	identity identityInserter
 }
 
 // Insert stores a new apply_operations row and returns its ID.
 // Translates a unique-key conflict on (apply_id, deployment, operation_key) into
 // storage.ErrApplyOperationExists so callers can branch cleanly.
 func (s *applyOperationStore) Insert(ctx context.Context, ad *storage.ApplyOperation) (int64, error) {
-	return insertApplyOperation(ctx, s.db, ad)
-}
-
-// sqlExecer is the subset of *sql.DB / *sql.Tx used by insertApplyOperation.
-// Defined locally so the helper can run against either the pool or an
-// in-flight transaction (for atomic apply-create dual-writes).
-type sqlExecer interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	return insertApplyOperation(ctx, s.db, s.identity, ad)
 }
 
 // insertApplyOperation inserts one apply_operations row using the supplied
 // executer (pool or transaction). On success the row's ID and State fields
 // are set. A duplicate-key violation on (apply_id, deployment, operation_key)
 // is translated to storage.ErrApplyOperationExists for callers to branch on.
-func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.ApplyOperation) (int64, error) {
+func insertApplyOperation(ctx context.Context, exec queryExecer, identity identityInserter, ad *storage.ApplyOperation) (int64, error) {
 	stateVal := ad.State
 	if stateVal == "" {
 		stateVal = state.ApplyOperation.Pending
@@ -74,7 +69,7 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 		operationKind = storage.ApplyOperationKindWork
 	}
 
-	result, err := exec.ExecContext(ctx, `
+	id, err := identity.InsertID(ctx, exec, `
 		INSERT INTO apply_operations (
 			apply_id, deployment, operation_key, operation_kind, target, external_id, external_operation_id, state, error_message, cutover_policy, on_failure,
 			started_at, completed_at, engine_resume_context, engine_resume_metadata
@@ -88,11 +83,6 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 			return 0, storage.ErrApplyOperationExists
 		}
 		return 0, fmt.Errorf("insert apply_operations (apply=%d, deployment=%s, operation_key=%s): %w", ad.ApplyID, ad.Deployment, ad.OperationKey, err)
-	}
-
-	id, err := result.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("last insert id: %w", err)
 	}
 	ad.ID = id
 	ad.State = stateVal
@@ -575,11 +565,6 @@ func (s *applyOperationStore) GetEngineResumeState(ctx context.Context, operatio
 	}, nil
 }
 
-// applyOperationHeartbeatStaleness is the lease window after which a claimed
-// apply_operations row may be re-claimed by another driver. Mirrors the apply
-// heartbeat staleness in applies.go.
-const applyOperationHeartbeatStaleness = "1 MINUTE"
-
 // releasedFailureExemptionSQL stops a terminal-failed earlier sibling from
 // blocking a later deployment's claim once the rollout policy says to keep
 // going: on_failure='continue', or on_failure='pause' after a release control
@@ -817,6 +802,8 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// and lock every matching row before LIMIT applies, and concurrent
 	// drivers would skip each other's entire candidate set instead of
 	// claiming distinct rows in parallel.
+	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
@@ -868,7 +855,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 			)
 			OR (
 				state IN (%s)
-				AND updated_at < NOW() - INTERVAL %s
+				AND updated_at < %s
 				AND NOT (
 					state = ?
 					AND cutover_policy IN (?, ?)
@@ -907,7 +894,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND (
 							apply_operations.lease_acquired_at IS NULL
 							OR apply_operations.lease_acquired_at < cr.updated_at
-							OR apply_operations.updated_at < NOW() - INTERVAL 1 MINUTE
+							OR apply_operations.updated_at < %s
 						)
 				)
 			)
@@ -921,11 +908,11 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 							(
 								a.state = ?
 								AND a.attempt < ?
-								AND a.updated_at >= NOW() - INTERVAL ? DAY
+								AND a.updated_at >= %s
 							)
 							OR (
 								a.state IN (%s)
-								AND a.updated_at < NOW() - INTERVAL %s
+								AND a.updated_at < %s
 							)
 						)
 				)
@@ -934,7 +921,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, activeStatePlaceholders, applyOperationHeartbeatStaleness, activeStatePlaceholders, activeStatePlaceholders, applyOperationHeartbeatStaleness), queryArgs...)
+	`, applyOperationColumns, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1184,6 +1171,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	// ORDER BY (created_at, id) walks idx_created_id so concurrent drivers
 	// stop at the first unlocked candidate instead of locking the whole
 	// candidate set; see FindNextApplyOperation.
+	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
@@ -1219,12 +1207,12 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 						AND cr.status = ?
 				)
 			)
-			OR (state IN (?, ?) AND updated_at < NOW() - INTERVAL %s)
+			OR (state IN (?, ?) AND updated_at < %s)
 		)
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, applyOperationHeartbeatStaleness), queryArgs...)
+	`, applyOperationColumns, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

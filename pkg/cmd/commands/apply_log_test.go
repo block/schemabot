@@ -280,7 +280,7 @@ func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
 		assert.Contains(t, plain, "progress=100%")
 	})
 
-	t.Run("estimate exceeded shows active progress", func(t *testing.T) {
+	t.Run("estimate exceeded shows finalizing copy progress", func(t *testing.T) {
 		e := &logEmitter{}
 		ts := &tableLogState{}
 		tbl := &apitypes.TableProgressResponse{
@@ -295,7 +295,7 @@ func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
 		})
 		plain := stripANSI(output)
 
-		assert.Contains(t, plain, "progress=Active")
+		assert.Contains(t, plain, "progress=\"Finalizing copy\"")
 		assert.Contains(t, plain, "rows_copied=\"145,000 so far\"")
 		assert.NotContains(t, plain, "145%")
 		assert.NotContains(t, plain, "100%")

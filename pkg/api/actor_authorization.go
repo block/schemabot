@@ -9,6 +9,8 @@ const (
 	ActorAuthReasonDisabled              = "disabled"
 	ActorAuthReasonAllowedAdminTeam      = "allowed_admin_team"
 	ActorAuthReasonAllowedAdminUser      = "allowed_admin_user"
+	ActorAuthReasonAllowedRepoAdminTeam  = "allowed_repo_admin_team"
+	ActorAuthReasonAllowedRepoAdminUser  = "allowed_repo_admin_user"
 	ActorAuthReasonAllowedOperatorTeam   = "allowed_operator_team"
 	ActorAuthReasonAllowedOperatorUser   = "allowed_operator_user"
 	ActorAuthReasonMissingActor          = "missing_actor"
@@ -91,6 +93,16 @@ func validateDatabaseActorAuthorization(database string, dbConfig DatabaseConfig
 	return nil
 }
 
+func validateRepoActorAuthorization(repo string, repoConfig RepoConfig) error {
+	if err := validateGitHubTeamPrincipals("repos."+repo+".admin_teams", repoConfig.AdminTeams); err != nil {
+		return err
+	}
+	if err := validateGitHubUsers("repos."+repo+".admin_users", repoConfig.AdminUsers); err != nil {
+		return err
+	}
+	return nil
+}
+
 func validateGitHubTeamPrincipals(field string, teams []string) error {
 	seen := make(map[string]struct{}, len(teams))
 	for _, team := range teams {
@@ -126,4 +138,41 @@ func validateGitHubUsers(field string, users []string) error {
 		seen[key] = struct{}{}
 	}
 	return nil
+}
+
+// PRCommandAuthorizedPrincipals returns the GitHub principals (teams as
+// "org/team", plain user logins) allowed to run mutating PR commands for
+// database via repo, in the order the authorizer consults them: the
+// deployment-wide admin teams/users, the repository's admin teams/users, then
+// the database's operator teams/users. Rejection comments surface this list so
+// a blocked user knows who to ask instead of guessing.
+func (c *ServerConfig) PRCommandAuthorizedPrincipals(repo, database string) []string {
+	if c == nil {
+		return nil
+	}
+	var principals []string
+	seen := map[string]bool{}
+	add := func(items []string) {
+		for _, item := range items {
+			// GitHub logins and team slugs are case-insensitive, and operators
+			// sometimes configure them with a leading "@" — normalize both so
+			// the rendered list never repeats one principal in two spellings.
+			display := strings.TrimPrefix(strings.TrimSpace(item), "@")
+			if display == "" || seen[strings.ToLower(display)] {
+				continue
+			}
+			seen[strings.ToLower(display)] = true
+			principals = append(principals, display)
+		}
+	}
+	add(c.PRCommandAuthorization.AdminTeams)
+	add(c.PRCommandAuthorization.AdminUsers)
+	repoAdminTeams, repoAdminUsers := c.RepoAdmins(repo)
+	add(repoAdminTeams)
+	add(repoAdminUsers)
+	if db, ok := c.Databases[database]; ok {
+		add(db.OperatorTeams)
+		add(db.OperatorUsers)
+	}
+	return principals
 }

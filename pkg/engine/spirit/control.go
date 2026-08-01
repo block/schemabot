@@ -31,8 +31,11 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	e.mu.Lock()
 	rm := e.runningSchemaChange
 	if rm == nil {
+		// Spirit tracks the change in-process, so with nothing tracked there is
+		// no change this instance could ever stop — retrying cannot make one
+		// appear.
 		e.mu.Unlock()
-		return nil, fmt.Errorf("no active schema change to stop")
+		return nil, engine.NewPermanentError("no active schema change to stop")
 	}
 	state := rm.state
 	runners := rm.runners
@@ -45,6 +48,12 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 			Accepted: true,
 			Message:  "Already stopped",
 		}, nil
+	}
+	if state == engine.StateCompleted {
+		// The change landed before the stop arrived. Recording it as stopped
+		// would misrepresent the target; the typed rejection has the caller
+		// reconcile to the completed outcome instead.
+		return nil, engine.NewAlreadyCompletedError("stop rejected: the schema change on database %s completed before the stop arrived", database)
 	}
 
 	// Force a checkpoint BEFORE canceling the context.
@@ -95,8 +104,19 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 	e.mu.Lock()
 	rm := e.runningSchemaChange
 	if rm == nil {
+		// Spirit tracks the change in-process, so with nothing tracked there is
+		// no change this instance could ever cancel — retrying cannot make one
+		// appear.
 		e.mu.Unlock()
-		return nil, fmt.Errorf("no active schema change to cancel")
+		return nil, engine.NewPermanentError("no active schema change to cancel")
+	}
+	if rm.state == engine.StateCompleted {
+		// The change landed before the cancel arrived. Marking it cancelled and
+		// dropping its artifacts would misrepresent the target; the typed
+		// rejection has the caller reconcile to the completed outcome instead.
+		database := rm.database
+		e.mu.Unlock()
+		return nil, engine.NewAlreadyCompletedError("cancel rejected: the schema change on database %s completed before the cancel arrived", database)
 	}
 	database := rm.database
 	tables := rm.tables
@@ -192,6 +212,7 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 	originalDDLs := rm.originalDDLs
 	combinedStatement := rm.combinedStatement
 	deferCutover := rm.deferCutover
+	directExecPolicy := rm.directPolicy
 	e.mu.Unlock()
 
 	if state == engine.StateRunning {
@@ -227,13 +248,30 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 			e.runningSchemaChange.cancelFunc = cancel
 		}
 		e.mu.Unlock()
-		e.resumeSchemaChange(bgCtx, host, username, password, database, originalDDLs, combinedStatement, deferCutover)
+		e.resumeSchemaChange(bgCtx, host, username, password, database, originalDDLs, combinedStatement, deferCutover, directExecPolicy)
 	})
 
 	return &engine.ControlResult{
 		Accepted: true,
 		Message:  "Resumed from checkpoint",
 	}, nil
+}
+
+// statelessControlDatabase resolves the schema a stateless control operation
+// (cutover or sentinel lookup without an in-memory schema change) addresses.
+// The DSN's database wins: it carries the physical schema name, which can
+// differ from the request's logical database name when the target maps
+// namespaces to per-deployment physical schemas. The request database is only
+// a fallback for DSNs without a schema.
+func statelessControlDatabase(dsn, requestDatabase string) (string, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return "", err
+	}
+	if cfg.DBName != "" {
+		return cfg.DBName, nil
+	}
+	return requestDatabase, nil
 }
 
 // Cutover triggers the final table swap.
@@ -249,7 +287,7 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 
 	e.mu.Lock()
 	rm := e.runningSchemaChange
-	database := req.Database
+	database := ""
 	if rm != nil {
 		if !rm.deferCutover {
 			e.mu.Unlock()
@@ -258,18 +296,19 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 				Message:  "schema change was not started with defer_cutover",
 			}, nil
 		}
-		if rm.database != "" {
-			database = rm.database
-		}
+		database = rm.database
 	}
 	e.mu.Unlock()
 
+	// Stateless cutover — no in-memory schema change, or one without a
+	// recorded database (e.g. after a restart) — addresses the schema the
+	// DSN connects to.
 	if database == "" {
-		cfg, err := mysql.ParseDSN(req.Credentials.DSN)
+		var err error
+		database, err = statelessControlDatabase(req.Credentials.DSN, req.Database)
 		if err != nil {
 			return nil, fmt.Errorf("parse DSN for cutover database: %w", err)
 		}
-		database = cfg.DBName
 	}
 	if database == "" {
 		return nil, fmt.Errorf("database is required for cutover")
@@ -312,13 +351,10 @@ func (e *Engine) DeferredCutoverSignalExists(ctx context.Context, req *engine.De
 		return false, fmt.Errorf("DSN credentials required for deferred cutover signal lookup")
 	}
 
-	database := req.Database
-	if database == "" {
-		cfg, err := mysql.ParseDSN(req.Credentials.DSN)
-		if err != nil {
-			return false, fmt.Errorf("parse DSN for deferred cutover signal database: %w", err)
-		}
-		database = cfg.DBName
+	// The sentinel lives in the schema the DSN connects to.
+	database, err := statelessControlDatabase(req.Credentials.DSN, req.Database)
+	if err != nil {
+		return false, fmt.Errorf("parse DSN for deferred cutover signal database: %w", err)
 	}
 	if database == "" {
 		return false, fmt.Errorf("database is required for deferred cutover signal lookup")
@@ -361,30 +397,44 @@ func (e *Engine) SkipRevert(ctx context.Context, req *engine.ControlRequest) (*e
 
 // Volume adjusts the schema change speed by stopping, reconfiguring, and restarting.
 // Spirit doesn't support dynamic volume changes, so we stop the schema change,
-// update the settings, and restart from checkpoint.
+// update its settings, and restart from checkpoint. The adjustment is scoped to
+// the running schema change: the engine's configured defaults stay untouched,
+// so the next schema change starts from the defaults again.
 func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine.VolumeResult, error) {
 	e.mu.Lock()
 	rm := e.runningSchemaChange
-	e.mu.Unlock()
-
 	if rm == nil {
+		e.mu.Unlock()
 		return nil, fmt.Errorf("no active schema change to adjust volume")
 	}
+	cpuHint := e.cpuHint
+	database := rm.database
+	previousVolume := rm.volume
+	if previousVolume == 0 {
+		// No explicit volume was set for this schema change; report the
+		// closest level for the settings it started with.
+		previousVolume = settingsToVolume(rm.threads, rm.targetChunkTime)
+	}
+	currentThreads := rm.threads
+	currentChunkTime := rm.targetChunkTime
+	currentLockTimeout := rm.lockWaitTimeout
+	e.mu.Unlock()
 
 	// Calculate settings from volume level (1-11)
-	previousVolume := settingsToVolume(e.threads, e.targetChunkTime)
-	newThreads, newChunkTime, newLockTimeout := volumeToSpiritSettings(req.Volume, e.cpuHint)
+	newThreads, newChunkTime, newLockTimeout := volumeToSpiritSettings(req.Volume, cpuHint)
 
 	e.logger.Info("adjusting volume",
-		"database", rm.database,
+		"database", database,
 		"volume", req.Volume,
 		"previous_volume", previousVolume,
 		"new_threads", newThreads,
 		"new_chunk_time", newChunkTime,
 	)
 
-	// If volume is the same, no need to restart
-	if req.Volume == previousVolume {
+	// When the requested volume maps to the settings the change is already
+	// running with, record the explicit volume and skip the restart.
+	if newThreads == currentThreads && newChunkTime == currentChunkTime && newLockTimeout == currentLockTimeout {
+		e.setSchemaChangeVolume(rm, req.Volume, newThreads, newChunkTime, newLockTimeout)
 		return &engine.VolumeResult{
 			Accepted:       true,
 			PreviousVolume: previousVolume,
@@ -416,10 +466,9 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 	// Log checkpoint state AFTER stopping (should be same as before)
 	e.logCheckpointState(rm, "after_stop", nil)
 
-	// Update engine configuration
-	e.threads = newThreads
-	e.targetChunkTime = newChunkTime
-	e.lockWaitTimeout = newLockTimeout
+	// Retune the running schema change; the engine's configured defaults stay
+	// untouched so the next schema change starts from the defaults.
+	e.setSchemaChangeVolume(rm, req.Volume, newThreads, newChunkTime, newLockTimeout)
 
 	// Restart the schema change
 	_, err = e.Start(ctx, &engine.ControlRequest{
@@ -446,6 +495,27 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 		NewVolume:      req.Volume,
 		Message:        fmt.Sprintf("Volume changed: %d -> %d (%d threads, %v chunks)", previousVolume, req.Volume, newThreads, newChunkTime),
 	}, nil
+}
+
+// setSchemaChangeVolume records the explicit volume and its derived Spirit copy
+// settings on the tracked schema change. The settings end with the change, so a
+// volume set during one schema change never carries into a later one.
+func (e *Engine) setSchemaChangeVolume(rm *runningSchemaChange, volume int32, threads int, chunkTime, lockTimeout time.Duration) {
+	e.mu.Lock()
+	tracked := e.runningSchemaChange == rm
+	if tracked {
+		rm.volume = volume
+		rm.threads = threads
+		rm.targetChunkTime = chunkTime
+		rm.lockWaitTimeout = lockTimeout
+	}
+	e.mu.Unlock()
+	if !tracked {
+		e.logger.Warn("volume adjustment target is no longer the tracked schema change; settings not applied",
+			"database", rm.database,
+			"volume", volume,
+		)
+	}
 }
 
 func (e *Engine) setVolumeRestartInProgress(rm *runningSchemaChange, inProgress bool) {
@@ -511,7 +581,11 @@ func cpuScaledThreads(cpuHint, divisor, fallback int) int {
 	return threads
 }
 
-// settingsToVolume converts current Spirit settings back to approximate volume level.
+// settingsToVolume approximates the volume level for a schema change that was
+// never given an explicit volume, mapping its starting Spirit copy settings to
+// the closest level. Volume levels that share derived settings map to the
+// lowest such level. Once an operator sets a volume, the explicit value is
+// stored on the running schema change and this approximation is not used.
 func settingsToVolume(threads int, chunkTime time.Duration) int32 {
 	switch {
 	case threads <= 1:

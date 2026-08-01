@@ -33,6 +33,15 @@ func grpcSchemabotURL(t *testing.T) string {
 	return url
 }
 
+// grpcSchemabotMetricsURL is the base URL of the dedicated metrics listener,
+// which serves /metrics on its own port separate from the API.
+func grpcSchemabotMetricsURL(t *testing.T) string {
+	t.Helper()
+	url := os.Getenv("E2E_SCHEMABOT_METRICS_URL")
+	require.NotEmpty(t, url, "E2E_SCHEMABOT_METRICS_URL environment variable not set")
+	return url
+}
+
 func grpcSchemabotMySQLDSN(t *testing.T) string {
 	t.Helper()
 	dsn := os.Getenv("E2E_SCHEMABOT_MYSQL_DSN")
@@ -281,7 +290,12 @@ func grpcApplyLogs(t *testing.T, applyID string, limit int) []grpcApplyLogEntry 
 // exposition text.
 func grpcMetrics(t *testing.T) string {
 	t.Helper()
-	resp := grpcGet(t, "/metrics")
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, grpcSchemabotMetricsURL(t)+"/metrics", nil)
+	require.NoError(t, err, "create request")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err, "GET /metrics")
 	require.Equalf(t, http.StatusOK, resp.StatusCode, "GET /metrics status")
 	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
@@ -379,7 +393,7 @@ func grpcClearSchemabotState(t *testing.T) {
 	}
 	defer utils.CloseAndLog(db)
 
-	rows, err := db.QueryContext(context.Background(), "SHOW TABLES") //nolint:usetesting // cleanup utility
+	rows, err := db.QueryContext(t.Context(), "SHOW TABLES")
 	if err != nil {
 		return
 	}
@@ -393,7 +407,7 @@ func grpcClearSchemabotState(t *testing.T) {
 	}
 
 	for _, table := range tables {
-		_, _ = db.ExecContext(context.Background(), "DELETE FROM `"+table+"`") //nolint:usetesting // cleanup utility
+		_, _ = db.ExecContext(t.Context(), "DELETE FROM `"+table+"`")
 	}
 }
 
@@ -412,7 +426,7 @@ func grpcClearTernStorage(t *testing.T, env string) {
 	}
 	defer utils.CloseAndLog(db)
 
-	rows, err := db.QueryContext(context.Background(), "SHOW TABLES") //nolint:usetesting // cleanup utility
+	rows, err := db.QueryContext(t.Context(), "SHOW TABLES")
 	if err != nil {
 		return
 	}
@@ -426,7 +440,7 @@ func grpcClearTernStorage(t *testing.T, env string) {
 	}
 
 	for _, table := range tables {
-		_, _ = db.ExecContext(context.Background(), "DELETE FROM `"+table+"`") //nolint:usetesting // cleanup utility
+		_, _ = db.ExecContext(t.Context(), "DELETE FROM `"+table+"`")
 	}
 }
 
@@ -452,12 +466,14 @@ func grpcCreateTestTable(t *testing.T, env, tableName, ddl string) {
 			return
 		}
 		defer utils.CloseAndLog(db2)
+		ctx, cancel := testutil.CleanupContext(30 * time.Second)
+		defer cancel()
 		for _, suffix := range []string{"_new", "_old", "_chkpnt", ""} {
 			name := tableName
 			if suffix != "" {
 				name = "_" + tableName + suffix
 			}
-			_, _ = db2.ExecContext(context.Background(), "DROP TABLE IF EXISTS `"+name+"`") //nolint:usetesting // cleanup
+			_, _ = db2.ExecContext(ctx, "DROP TABLE IF EXISTS `"+name+"`")
 		}
 	})
 }

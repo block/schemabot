@@ -21,7 +21,11 @@ type SchemaRequestResult struct {
 	Repository   string
 	PullRequest  int
 	SchemaPath   string
-	HeadSHA      string // Commit SHA used to fetch schema files
+	// SchemaLinkPath is the logical environment path when SchemaPath was
+	// resolved through a symlink. Base-freshness checks compare both the link
+	// object and its target so retargeting the environment cannot go unnoticed.
+	SchemaLinkPath string
+	HeadSHA        string // Commit SHA used to fetch schema files
 }
 
 // EnvironmentValidator verifies that a discovered database can be used with
@@ -46,6 +50,14 @@ func (ic *InstallationClient) CreateSchemaRequestFromPR(ctx context.Context, rep
 	if err != nil {
 		return nil, err
 	}
+	return ic.CreateSchemaRequestForConfig(ctx, repo, pr, environment, config, configDir, validateEnvironment)
+}
+
+// CreateSchemaRequestForConfig fetches schema files and builds a plan request
+// for a config the caller has already discovered and selected — for example
+// after filtering a multi-config discovery result down to the one config this
+// deployment manages.
+func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, repo string, pr int, environment string, config *SchemabotConfig, configDir string, validateEnvironment EnvironmentValidator) (*SchemaRequestResult, error) {
 	if validateEnvironment != nil {
 		if err := validateEnvironment(config.Database, environment); err != nil {
 			return nil, err
@@ -57,7 +69,7 @@ func (ic *InstallationClient) CreateSchemaRequestFromPR(ctx context.Context, rep
 	if err != nil {
 		return nil, fmt.Errorf("fetch PR info: %w", err)
 	}
-	schemaRoot, err := ic.resolveSchemaRootForEnvironment(ctx, repo, prInfo.HeadSHA, configDir, environment)
+	schemaRoot, schemaLinkPath, err := ic.resolveSchemaRootForEnvironment(ctx, repo, prInfo.HeadSHA, configDir, environment)
 	if err != nil {
 		return nil, err
 	}
@@ -78,51 +90,52 @@ func (ic *InstallationClient) CreateSchemaRequestFromPR(ctx context.Context, rep
 	}
 
 	return &SchemaRequestResult{
-		Database:    config.Database,
-		Type:        string(config.GetType()),
-		SchemaFiles: schemaFiles,
-		Repository:  repo,
-		PullRequest: pr,
-		SchemaPath:  schemaRoot,
-		HeadSHA:     prInfo.HeadSHA,
+		Database:       config.Database,
+		Type:           string(config.GetType()),
+		SchemaFiles:    schemaFiles,
+		Repository:     repo,
+		PullRequest:    pr,
+		SchemaPath:     schemaRoot,
+		SchemaLinkPath: schemaLinkPath,
+		HeadSHA:        prInfo.HeadSHA,
 	}, nil
 }
 
-func (ic *InstallationClient) resolveSchemaRootForEnvironment(ctx context.Context, repo, ref, configDir, environment string) (string, error) {
+func (ic *InstallationClient) resolveSchemaRootForEnvironment(ctx context.Context, repo, ref, configDir, environment string) (schemaRoot, schemaLinkPath string, err error) {
 	if environment == "" {
-		return configDir, nil
+		return configDir, "", nil
 	}
 	if err := validateEnvironmentPathSegment(environment); err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	candidate := path.Join(configDir, environment)
 	content, directoryContent, err := ic.fetchRepositoryContents(ctx, repo, candidate, ref)
 	if err != nil {
 		if IsNotFoundError(err) {
-			return configDir, nil
+			return configDir, "", nil
 		}
-		return "", fmt.Errorf("resolve schema root for environment %s at %s: %w", environment, candidate, err)
+		return "", "", fmt.Errorf("resolve schema root for environment %s at %s: %w", environment, candidate, err)
 	}
 	if directoryContent != nil {
-		return candidate, nil
+		return candidate, "", nil
 	}
 	if content == nil || content.GetType() != "symlink" {
-		return "", fmt.Errorf("environment schema root %s in repo %s ref %s is not a directory or symlink", candidate, repo, ref)
+		return "", "", fmt.Errorf("environment schema root %s in repo %s ref %s is not a directory or symlink", candidate, repo, ref)
 	}
 
 	resolved, err := resolveSchemaRootSymlinkTarget(configDir, candidate, content.GetTarget())
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	resolvedContent, resolvedDirectoryContent, err := ic.fetchRepositoryContents(ctx, repo, resolved, ref)
 	if err != nil {
-		return "", fmt.Errorf("resolve environment schema root symlink %s target %s: %w", candidate, resolved, err)
+		return "", "", fmt.Errorf("resolve environment schema root symlink %s target %s: %w", candidate, resolved, err)
 	}
 	if resolvedContent != nil || resolvedDirectoryContent == nil {
-		return "", fmt.Errorf("environment schema root symlink %s points to non-directory path %s", candidate, resolved)
+		return "", "", fmt.Errorf("environment schema root symlink %s points to non-directory path %s", candidate, resolved)
 	}
-	return resolved, nil
+	return resolved, candidate, nil
 }
 
 func validateEnvironmentPathSegment(environment string) error {

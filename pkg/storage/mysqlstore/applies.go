@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
@@ -35,9 +36,9 @@ const applyColumnsForApplyAlias = `a.id, a.apply_identifier, a.lock_id, a.plan_i
 	a.created_at, a.started_at, a.completed_at, a.updated_at, a.revert_skipped_at`
 
 const (
-	// maxRecoveryAttempts is the retry budget for failed_retryable applies. The
-	// original apply attempt is separate; this counts operator redispatches.
-	maxRecoveryAttempts = 10
+	// maxRecoveryAttempts is the retry budget for failed_retryable applies,
+	// shared with operator-facing progress rendering via the exported constant.
+	maxRecoveryAttempts = storage.MaxRecoveryAttempts
 
 	// retryableRecoveryFreshnessDays prevents old retryable failures from
 	// being redispatched unexpectedly after retry policy or attempt budgets
@@ -53,11 +54,18 @@ const (
 
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
-	db *sql.DB
+	db       *sql.DB
+	dialect  Dialect
+	identity identityInserter
+	// locker serializes concurrent applies against the same target with a
+	// session-scoped advisory lock held on the pinned apply connection. It must
+	// match the storage database's family.
+	locker namedlock.Locker
 }
 
 type applyWriteTx struct {
 	tx             *sql.Tx
+	locker         namedlock.Locker
 	targetLockConn *sql.Conn
 	targetLockName string
 }
@@ -88,6 +96,20 @@ type txBeginner interface {
 // holds while waiting for the data plane to leave stopped after a start. A
 // stale heartbeat there means the driver died mid-resume, and recovery must be
 // able to reclaim and finish driving it to a terminal state.
+//
+// The revert-phase states (reverting, skipping_revert) are included because an
+// apply can dwell in them while the engine works: a driver killed by routine
+// pod churn mid-revert must not strand the apply non-terminal forever. Recovery
+// re-attaches to the engine (the deploy request keeps reverting or finalizing
+// server-side) and drives the apply to its terminal state. The durable
+// revert/skip-revert signals mean a re-claim normally does not re-issue the
+// command; a crash between the engine accepting the command and the durable
+// write can cause a harmless re-issue, which the engine treats as idempotent.
+//
+// Every non-terminal state an apply can dwell in must appear here (or have its
+// own claim arm, like pending and stopped-with-start): the stale-heartbeat
+// re-claim is the only recovery path after a driver dies, and a dwellable state
+// missing from this list is orphaned by any pod restart.
 func claimableApplyStates() []string {
 	return []string{
 		state.Apply.Running,
@@ -99,6 +121,8 @@ func claimableApplyStates() []string {
 		"recovering_cutover",
 		state.Apply.CuttingOver,
 		state.Apply.RevertWindow,
+		state.Apply.Reverting,
+		state.Apply.SkippingRevert,
 		state.Apply.PreparingBranch,
 		state.Apply.ApplyingBranchChanges,
 		state.Apply.ValidatingBranch,
@@ -151,17 +175,18 @@ func beginApplyWriteTx(ctx context.Context, beginner txBeginner, operation strin
 	return &applyWriteTx{tx: tx}, nil
 }
 
-func beginApplyTargetWriteTx(ctx context.Context, db *sql.DB, operation, database, dbType, environment string) (*applyWriteTx, error) {
-	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, database, dbType, environment)
+func beginApplyTargetWriteTx(ctx context.Context, db *sql.DB, locker namedlock.Locker, operation, database, dbType, environment string) (*applyWriteTx, error) {
+	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, locker, database, dbType, environment)
 	if err != nil {
 		return nil, err
 	}
 
 	writeTx, err := beginApplyWriteTx(ctx, conn, operation)
 	if err != nil {
-		releaseApplyTargetLockConn(ctx, conn, lockName, operation)
+		releaseApplyTargetLockConn(ctx, locker, conn, lockName, operation)
 		return nil, err
 	}
+	writeTx.locker = locker
 	writeTx.targetLockConn = conn
 	writeTx.targetLockName = lockName
 	return writeTx, nil
@@ -175,7 +200,7 @@ func (w *applyWriteTx) close(ctx context.Context, operation string) {
 		rollbackTx(ctx, w.tx, operation)
 	}
 	if w.targetLockConn != nil {
-		releaseApplyTargetLockConn(ctx, w.targetLockConn, w.targetLockName, operation)
+		releaseApplyTargetLockConn(ctx, w.locker, w.targetLockConn, w.targetLockName, operation)
 		w.targetLockConn = nil
 	}
 }
@@ -191,9 +216,12 @@ func applyTargetLockName(database, dbType, environment string) string {
 	return "schemabot_apply_" + hex.EncodeToString(sum[:16])
 }
 
-func acquireApplyTargetLockConn(ctx context.Context, db *sql.DB, database, dbType, environment string) (*sql.Conn, string, error) {
+func acquireApplyTargetLockConn(ctx context.Context, db *sql.DB, locker namedlock.Locker, database, dbType, environment string) (*sql.Conn, string, error) {
 	if !hasApplyTarget(database, dbType, environment) {
 		return nil, "", fmt.Errorf("active apply target is required for %s/%s/%s", database, dbType, environment)
+	}
+	if locker == nil {
+		return nil, "", fmt.Errorf("apply target lock for %s/%s/%s requires an advisory locker; applies cannot serialize across instances without one", database, dbType, environment)
 	}
 
 	conn, err := db.Conn(ctx)
@@ -202,8 +230,7 @@ func acquireApplyTargetLockConn(ctx context.Context, db *sql.DB, database, dbTyp
 	}
 
 	lockName := applyTargetLockName(database, dbType, environment)
-	var result sql.NullInt64
-	err = conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, int(applyTargetLockWait.Seconds())).Scan(&result)
+	acquired, err := locker.Acquire(ctx, conn, lockName, applyTargetLockWait)
 	if err != nil {
 		slog.WarnContext(ctx, "failed to acquire apply target lock",
 			"database", database,
@@ -215,21 +242,20 @@ func acquireApplyTargetLockConn(ctx context.Context, db *sql.DB, database, dbTyp
 		closeApplyTargetLockConn(ctx, conn, lockName, "acquire apply target lock")
 		return nil, "", fmt.Errorf("acquire apply target lock for %s/%s/%s: %w", database, dbType, environment, err)
 	}
-	if !result.Valid || result.Int64 != 1 {
+	if !acquired {
 		slog.WarnContext(ctx, "timed out waiting for apply target lock",
 			"database", database,
 			"database_type", dbType,
 			"environment", environment,
 			"lock", lockName,
-			"wait", applyTargetLockWait,
-			"result", result)
+			"wait", applyTargetLockWait)
 		closeApplyTargetLockConn(ctx, conn, lockName, "acquire apply target lock")
 		return nil, "", fmt.Errorf("timed out waiting for apply target lock for %s/%s/%s", database, dbType, environment)
 	}
 	return conn, lockName, nil
 }
 
-func releaseApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, operation string) {
+func releaseApplyTargetLockConn(ctx context.Context, locker namedlock.Locker, conn *sql.Conn, lockName, operation string) {
 	if conn == nil {
 		return
 	}
@@ -237,23 +263,34 @@ func releaseApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, o
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), applyTargetLockReleaseTimeout)
 	defer cancel()
 
-	var result sql.NullInt64
-	err := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(?)", lockName).Scan(&result)
-	if err != nil || !result.Valid || result.Int64 != 1 {
+	released, err := locker.Release(releaseCtx, conn, lockName)
+	switch {
+	case err != nil:
 		slog.WarnContext(releaseCtx, "failed to release apply target lock; discarding connection",
 			"operation", operation,
 			"lock", lockName,
-			"result", result,
 			"error", err)
-		if rawErr := conn.Raw(func(any) error { return driver.ErrBadConn }); rawErr != nil && !errors.Is(rawErr, driver.ErrBadConn) {
-			slog.WarnContext(releaseCtx, "failed to discard apply target lock connection",
-				"operation", operation,
-				"lock", lockName,
-				"error", rawErr)
-		}
+		discardApplyTargetLockConn(releaseCtx, conn, lockName, operation)
+	case !released:
+		slog.WarnContext(releaseCtx, "apply target lock was not held by this session; discarding connection",
+			"operation", operation,
+			"lock", lockName)
+		discardApplyTargetLockConn(releaseCtx, conn, lockName, operation)
 	}
 
 	closeApplyTargetLockConn(releaseCtx, conn, lockName, operation)
+}
+
+// discardApplyTargetLockConn marks the pinned connection as bad so the pool
+// destroys it instead of reusing a session whose advisory-lock state is
+// uncertain.
+func discardApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, operation string) {
+	if rawErr := conn.Raw(func(any) error { return driver.ErrBadConn }); rawErr != nil && !errors.Is(rawErr, driver.ErrBadConn) {
+		slog.WarnContext(ctx, "failed to discard apply target lock connection",
+			"operation", operation,
+			"lock", lockName,
+			"error", rawErr)
+	}
 }
 
 func closeApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, operation string) {
@@ -468,7 +505,7 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	var writeTx *applyWriteTx
 	var err error
 	if lockTarget {
-		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, "create apply", apply.Database, apply.DatabaseType, apply.Environment)
+		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, s.locker, "create apply", apply.Database, apply.DatabaseType, apply.Environment)
 		if err != nil {
 			return 0, err
 		}
@@ -479,6 +516,9 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 		}
 	}
 	defer writeTx.close(ctx, "create apply")
+	if err := verifyExpectedLockIntent(ctx, writeTx.tx, apply); err != nil {
+		return 0, err
+	}
 
 	if lockTarget {
 		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, []string{apply.Deployment}, 0); err != nil {
@@ -486,7 +526,7 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 		}
 	}
 
-	result, err := writeTx.tx.ExecContext(ctx, `
+	id, err := s.identity.InsertID(ctx, writeTx.tx, `
 		INSERT INTO applies (
 			apply_identifier, lock_id, plan_id, database_name, database_type,
 			repository, pull_request, environment, deployment, caller, installation_id, external_id, idempotency_key, engine,
@@ -502,11 +542,6 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 			return 0, fmt.Errorf("create apply %s: %w", apply.ApplyIdentifier, storage.ErrApplyIDExists)
 		}
 		return 0, fmt.Errorf("insert apply %s: %w", apply.ApplyIdentifier, err)
-	}
-
-	id, err := result.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("read inserted apply id for %s: %w", apply.ApplyIdentifier, err)
 	}
 
 	if err := writeTx.commit(); err != nil {
@@ -535,7 +570,7 @@ func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *st
 		deployments = append(deployments, op.Deployment)
 	}
 	return s.createWithRows(ctx, apply, opName, deployments, func(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64) error {
-		return insertApplyTasksAndOperations(ctx, tx, apply, applyID, tasks, operations)
+		return insertApplyTasksAndOperations(ctx, tx, s.identity, apply, applyID, tasks, operations)
 	})
 }
 
@@ -549,7 +584,7 @@ func (s *applyStore) CreateWithGroupedOperations(ctx context.Context, apply *sto
 		}
 	}
 	return s.createWithRows(ctx, apply, opName, deployments, func(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64) error {
-		return insertApplyGroupedOperations(ctx, tx, apply, applyID, groups)
+		return insertApplyGroupedOperations(ctx, tx, s.identity, apply, applyID, groups)
 	})
 }
 
@@ -564,7 +599,7 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 	var writeTx *applyWriteTx
 	var err error
 	if lockTarget {
-		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, opName, apply.Database, apply.DatabaseType, apply.Environment)
+		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, s.locker, opName, apply.Database, apply.DatabaseType, apply.Environment)
 		if err != nil {
 			return 0, err
 		}
@@ -575,6 +610,9 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 		}
 	}
 	defer writeTx.close(ctx, opName)
+	if err := verifyExpectedLockIntent(ctx, writeTx.tx, apply); err != nil {
+		return 0, err
+	}
 
 	if lockTarget {
 		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, newDeployments, 0); err != nil {
@@ -582,7 +620,7 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 		}
 	}
 
-	result, err := writeTx.tx.ExecContext(ctx, `
+	id, err := s.identity.InsertID(ctx, writeTx.tx, `
 		INSERT INTO applies (
 			apply_identifier, lock_id, plan_id, database_name, database_type,
 			repository, pull_request, environment, deployment, caller, installation_id, external_id, idempotency_key, engine,
@@ -600,11 +638,6 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 		return 0, fmt.Errorf("insert apply %s: %w", apply.ApplyIdentifier, err)
 	}
 
-	id, err := result.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("read inserted apply id for %s: %w", apply.ApplyIdentifier, err)
-	}
-
 	if err := writeRows(ctx, writeTx.tx, apply, id); err != nil {
 		return 0, err
 	}
@@ -616,7 +649,40 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 	return id, nil
 }
 
-func insertApplyTasksAndOperations(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64, tasks []*storage.Task, operations []*storage.ApplyOperation) error {
+// verifyExpectedLockIntent locks and validates the webhook apply intent in the
+// same transaction that inserts the apply. This closes the gap where a
+// same-owner rollback can replace pending_plan_id after freshness validation
+// but before the forward apply becomes durable.
+func verifyExpectedLockIntent(ctx context.Context, tx *sql.Tx, apply *storage.Apply) error {
+	if apply.ExpectedLockOwner == "" {
+		if apply.ExpectedPendingPlanID != "" {
+			return fmt.Errorf("verify lock intent for %s/%s: expected pending plan ID set without an expected lock owner", apply.Database, apply.DatabaseType)
+		}
+		return nil
+	}
+
+	// An empty ExpectedPendingPlanID is a real observed intent, not a missing
+	// one: it matches only a lock whose pending_plan_id is unset (the column is
+	// NOT NULL DEFAULT ''), so an unpinned lock that a rollback re-pins mid-flight
+	// still fails this check.
+	var lockID int64
+	err := tx.QueryRowContext(ctx, `
+		SELECT id
+		FROM locks
+		WHERE database_name = ? AND database_type = ? AND owner = ? AND pending_plan_id = ?
+		FOR UPDATE
+	`, apply.Database, apply.DatabaseType, apply.ExpectedLockOwner, apply.ExpectedPendingPlanID).Scan(&lockID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storage.ErrLockIntentChanged
+	}
+	if err != nil {
+		return fmt.Errorf("verify lock intent for %s/%s: %w", apply.Database, apply.DatabaseType, err)
+	}
+	apply.LockID = lockID
+	return nil
+}
+
+func insertApplyTasksAndOperations(ctx context.Context, tx *sql.Tx, identity identityInserter, apply *storage.Apply, applyID int64, tasks []*storage.Task, operations []*storage.ApplyOperation) error {
 	// Operations are inserted BEFORE tasks so each task can be persisted
 	// with the apply_operation_id of the operation it belongs to. Today
 	// the config layer hard-blocks multi-entry deployments so there is
@@ -626,7 +692,7 @@ func insertApplyTasksAndOperations(ctx context.Context, tx *sql.Tx, apply *stora
 	// by the caller (see the multi-op guard below).
 	for _, op := range operations {
 		op.ApplyID = applyID
-		if _, err := insertApplyOperation(ctx, tx, op); err != nil {
+		if _, err := insertApplyOperation(ctx, tx, identity, op); err != nil {
 			return fmt.Errorf("insert apply_operation (deployment=%s) for apply %s: %w", op.Deployment, apply.ApplyIdentifier, err)
 		}
 	}
@@ -683,7 +749,7 @@ func insertApplyTasksAndOperations(ctx context.Context, tx *sql.Tx, apply *stora
 
 	for _, task := range tasks {
 		task.ApplyID = applyID
-		taskID, err := insertTask(ctx, tx, task)
+		taskID, err := insertTask(ctx, tx, identity, task)
 		if err != nil {
 			return fmt.Errorf("insert task %s for apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
 		}
@@ -692,7 +758,7 @@ func insertApplyTasksAndOperations(ctx context.Context, tx *sql.Tx, apply *stora
 	return nil
 }
 
-func insertApplyGroupedOperations(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64, groups []*storage.ApplyOperationWithTasks) error {
+func insertApplyGroupedOperations(ctx context.Context, tx *sql.Tx, identity identityInserter, apply *storage.Apply, applyID int64, groups []*storage.ApplyOperationWithTasks) error {
 	if len(groups) == 0 {
 		return fmt.Errorf("create apply %s: grouped operations are empty", apply.ApplyIdentifier)
 	}
@@ -717,7 +783,7 @@ func insertApplyGroupedOperations(ctx context.Context, tx *sql.Tx, apply *storag
 		}
 
 		group.Operation.ApplyID = applyID
-		if _, err := insertApplyOperation(ctx, tx, group.Operation); err != nil {
+		if _, err := insertApplyOperation(ctx, tx, identity, group.Operation); err != nil {
 			return fmt.Errorf("insert apply_operation (deployment=%s) for apply %s: %w", group.Operation.Deployment, apply.ApplyIdentifier, err)
 		}
 		for _, task := range group.Tasks {
@@ -726,7 +792,7 @@ func insertApplyGroupedOperations(ctx context.Context, tx *sql.Tx, apply *storag
 			}
 			task.ApplyID = applyID
 			task.ApplyOperationID = &group.Operation.ID
-			taskID, err := insertTask(ctx, tx, task)
+			taskID, err := insertTask(ctx, tx, identity, task)
 			if err != nil {
 				return fmt.Errorf("insert task %s for apply %s deployment %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, group.Operation.Deployment, err)
 			}
@@ -831,7 +897,7 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 	shouldLockTarget := lockTarget && hasApplyTarget(database, dbType, environment)
 	var writeTx *applyWriteTx
 	if shouldLockTarget {
-		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, "update apply", database, dbType, environment)
+		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, s.locker, "update apply", database, dbType, environment)
 		if err != nil {
 			return err
 		}
@@ -1050,14 +1116,12 @@ func (s *applyStore) GetInProgress(ctx context.Context) ([]*storage.Apply, error
 	return scanApplies(rows)
 }
 
-// GetRecent returns the most recent applies across all databases, ordered by creation time desc.
-func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentAppliesFilter) ([]*storage.Apply, error) {
-	query := `
-		SELECT ` + applyColumns + `
-		FROM applies
-	`
-	var args []any
+// recentAppliesWhere builds the WHERE predicates and args shared by the
+// recent-apply list and count queries, so both views agree on which applies a
+// filter selects.
+func recentAppliesWhere(filter storage.RecentAppliesFilter) ([]string, []any) {
 	var where []string
+	var args []any
 	if filter.Environment != "" {
 		where = append(where, "environment = ?")
 		args = append(args, filter.Environment)
@@ -1074,6 +1138,20 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 		where = append(where, fmt.Sprintf("state IN (%s)", placeholders(len(filter.States))))
 		args = append(args, stringArgs(filter.States)...)
 	}
+	if !filter.UpdatedSince.IsZero() {
+		where = append(where, "updated_at >= ?")
+		args = append(args, filter.UpdatedSince)
+	}
+	return where, args
+}
+
+// GetRecent returns the most recent applies across all databases, ordered by creation time desc.
+func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentAppliesFilter) ([]*storage.Apply, error) {
+	query := `
+		SELECT ` + applyColumns + `
+		FROM applies
+	`
+	where, args := recentAppliesWhere(filter)
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -1089,6 +1167,38 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 	return scanApplies(rows)
 }
 
+// CountRecentByState returns how many applies match the filter, grouped by
+// state. The filter's Limit is ignored: counts cover every matching row, so a
+// summary over a window is not truncated by list pagination.
+func (s *applyStore) CountRecentByState(ctx context.Context, filter storage.RecentAppliesFilter) (map[string]int, error) {
+	query := "SELECT state, COUNT(*) FROM applies"
+	where, args := recentAppliesWhere(filter)
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY state"
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("count recent applies by state: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	counts := map[string]int{}
+	for rows.Next() {
+		var applyState string
+		var count int
+		if err := rows.Scan(&applyState, &count); err != nil {
+			return nil, fmt.Errorf("scan recent apply state count: %w", err)
+		}
+		counts[applyState] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate recent apply state counts: %w", err)
+	}
+	return counts, nil
+}
+
 // FindNextApply atomically claims the next apply that needs attention.
 // A claim selects one stale apply and refreshes its heartbeat in the same
 // transaction. That heartbeat is the operator's lease while it reloads state
@@ -1097,8 +1207,8 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 //
 // Matches queued pending applies with persisted tasks, pending, stopped, or
 // waiting-for-deploy applies with a pending start control request, stale active
-// applies where heartbeat expired > 1 minute, and recently failed_retryable
-// applies that still have retry budget.
+// applies whose heartbeat expired beyond the lease staleness window, and
+// recently failed_retryable applies that still have retry budget.
 // Apply creation/update enforces one active apply per database/type/environment,
 // so claims only need to lease one row and avoid driver races on that row.
 func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.Apply, error) {
@@ -1128,16 +1238,27 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 		state.Apply.WaitingForDeploy,
 		storage.ControlOperationStart, storage.ControlRequestPending)
 
+	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
+
 	// Apply creation/update enforces at most one active apply per
 	// database/type/environment. The claim query only needs to find stale work;
 	// FOR UPDATE SKIP LOCKED prevents concurrent drivers from claiming the same row.
+	//
+	// The pending clause requires child rows so a half-created apply is never
+	// claimed. Creation dual-writes tasks and the apply_operations row in one
+	// transaction, so either proves the create committed fully; a VSchema-only
+	// apply carries an operation row but no tasks, so tasks alone would strand it.
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM applies a
 		WHERE (
-				(a.state = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id))
-				OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL 1 MINUTE)
-				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= NOW() - INTERVAL ? DAY)
+				(a.state = ? AND (
+					EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id)
+					OR EXISTS (SELECT 1 FROM apply_operations ao WHERE ao.apply_id = a.id)
+				))
+				OR (a.state IN (%s) AND a.updated_at < %s)
+				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= %s)
 				OR (
 					a.state = ?
 					AND EXISTS (
@@ -1163,7 +1284,7 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 						AND (
 							a.lease_acquired_at IS NULL
 							OR a.lease_acquired_at < cr.updated_at
-							OR a.updated_at < NOW() - INTERVAL 1 MINUTE
+							OR a.updated_at < %s
 						)
 					)
 				)
@@ -1171,7 +1292,7 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 		ORDER BY a.created_at
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyColumns, activeStatePlaceholders), queryArgs...)
+	`, applyColumns, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, staleClaimCutoff), queryArgs...)
 
 	apply, err := scanApplyInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1181,7 +1302,7 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 		return nil, fmt.Errorf("query next claimable apply: %w", err)
 	}
 
-	outcome, err := persistApplyClaim(ctx, s.db, tx, apply, owner)
+	outcome, err := persistApplyClaim(ctx, s.db, s.locker, tx, apply, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -1233,14 +1354,20 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 		state.Apply.WaitingForDeploy,
 		storage.ControlOperationStart, storage.ControlRequestPending)
 
+	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
+
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM applies a
 		WHERE a.id = ?
 			AND (
-				(a.state = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id))
-				OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL 1 MINUTE)
-				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= NOW() - INTERVAL ? DAY)
+				(a.state = ? AND (
+					EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id)
+					OR EXISTS (SELECT 1 FROM apply_operations ao WHERE ao.apply_id = a.id)
+				))
+				OR (a.state IN (%s) AND a.updated_at < %s)
+				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= %s)
 				OR (
 					a.state = ?
 					AND EXISTS (
@@ -1266,14 +1393,14 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 						AND (
 							a.lease_acquired_at IS NULL
 							OR a.lease_acquired_at < cr.updated_at
-							OR a.updated_at < NOW() - INTERVAL 1 MINUTE
+							OR a.updated_at < %s
 						)
 					)
 				)
 			)
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyColumns, activeStatePlaceholders), queryArgs...)
+	`, applyColumns, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, staleClaimCutoff), queryArgs...)
 
 	apply, err := scanApplyInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1283,7 +1410,7 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 		return nil, fmt.Errorf("query claimable apply %d: %w", applyID, err)
 	}
 
-	outcome, err := persistApplyClaim(ctx, s.db, tx, apply, owner)
+	outcome, err := persistApplyClaim(ctx, s.db, s.locker, tx, apply, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -1386,7 +1513,7 @@ func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, own
 	// stopped apply reaches this path — terminal states are excluded above — so
 	// claimAcquiredCommitted, the stopped-only outcome, cannot occur and the
 	// caller always commits an acquired claim).
-	outcome, err := persistApplyClaim(ctx, s.db, tx, apply, owner)
+	outcome, err := persistApplyClaim(ctx, s.db, s.locker, tx, apply, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -1444,7 +1571,7 @@ func (o claimOutcome) claimedAndComplete() bool {
 // window between the re-check and the commit. When another active apply owns the
 // target the claim is refused and the pending start control request is failed so
 // the operator sees why.
-func persistApplyClaim(ctx context.Context, db *sql.DB, tx *sql.Tx, apply *storage.Apply, owner string) (claimOutcome, error) {
+func persistApplyClaim(ctx context.Context, db *sql.DB, locker namedlock.Locker, tx *sql.Tx, apply *storage.Apply, owner string) (claimOutcome, error) {
 	leaseToken := uuid.NewString()
 	leaseAcquiredAt := time.Now()
 	apply.LeaseOwner = owner
@@ -1452,7 +1579,7 @@ func persistApplyClaim(ctx context.Context, db *sql.DB, tx *sql.Tx, apply *stora
 	apply.LeaseAcquiredAt = &leaseAcquiredAt
 
 	if state.IsState(apply.State, state.Apply.Stopped) {
-		return claimStoppedApplyUnderTargetLock(ctx, db, tx, apply, owner, leaseToken)
+		return claimStoppedApplyUnderTargetLock(ctx, db, locker, tx, apply, owner, leaseToken)
 	}
 
 	if isStartingClaim(apply.State) {
@@ -1482,7 +1609,7 @@ func persistApplyClaim(ctx context.Context, db *sql.DB, tx *sql.Tx, apply *stora
 // invariant, then either transition+commit or refuse+commit. It commits inside
 // the lock so a concurrent create cannot add a second active apply between the
 // re-check and the commit. The lock is released only after the commit.
-func claimStoppedApplyUnderTargetLock(ctx context.Context, db *sql.DB, tx *sql.Tx, apply *storage.Apply, owner, leaseToken string) (claimOutcome, error) {
+func claimStoppedApplyUnderTargetLock(ctx context.Context, db *sql.DB, locker namedlock.Locker, tx *sql.Tx, apply *storage.Apply, owner, leaseToken string) (claimOutcome, error) {
 	database, dbType, environment, deployment, err := applyTargetForUpdate(ctx, tx, apply)
 	if err != nil {
 		return claimLostRace, err
@@ -1491,11 +1618,11 @@ func claimStoppedApplyUnderTargetLock(ctx context.Context, db *sql.DB, tx *sql.T
 		return claimLostRace, fmt.Errorf("stopped apply %d (%s) is missing target metadata for claim re-check", apply.ID, apply.ApplyIdentifier)
 	}
 
-	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, database, dbType, environment)
+	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, locker, database, dbType, environment)
 	if err != nil {
 		return claimLostRace, err
 	}
-	defer releaseApplyTargetLockConn(ctx, conn, lockName, "claim stopped apply")
+	defer releaseApplyTargetLockConn(ctx, locker, conn, lockName, "claim stopped apply")
 
 	deployments, err := operationDeploymentsForApply(ctx, tx, apply.ID)
 	if err != nil {
@@ -1685,7 +1812,7 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 		FROM applies
 		WHERE state = ? AND (
 			attempt >= ?
-			OR updated_at < NOW() - INTERVAL ? DAY
+			OR updated_at < `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)+`
 		)
 		FOR UPDATE
 	`, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
@@ -1712,6 +1839,22 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 			Apply:  apply,
 			Reason: retryableExpirationReason(apply),
 		})
+	}
+
+	// A pending task never started: it was blocked behind the failure that made
+	// the apply retryable, so expiring the apply cancels it — mirroring how a
+	// sequential drive resolves the tables queued behind a failed one. Marking
+	// it failed instead would misattribute the failure to a table that did no
+	// work.
+	cancelArgs := []any{state.Task.Cancelled, state.Task.Pending}
+	cancelArgs = append(cancelArgs, applyIDs...)
+	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE tasks t
+		SET t.state = ?, t.completed_at = COALESCE(t.completed_at, NOW()), t.updated_at = NOW()
+		WHERE t.state = ? AND t.apply_id IN (%s)
+	`, placeholders(len(applyIDs))), cancelArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("cancel pending tasks for expired retryable applies: %w", err)
 	}
 
 	taskArgs := []any{state.Task.Failed}
@@ -1811,11 +1954,11 @@ func (s *applyStore) ReapplyFailed(ctx context.Context, applyID int64) (*storage
 		return nil, fmt.Errorf("apply %s is missing target metadata for reapply: %w", apply.ApplyIdentifier, storage.ErrApplyNotReappliable)
 	}
 
-	conn, lockName, err := acquireApplyTargetLockConn(ctx, s.db, database, dbType, environment)
+	conn, lockName, err := acquireApplyTargetLockConn(ctx, s.db, s.locker, database, dbType, environment)
 	if err != nil {
 		return nil, err
 	}
-	defer releaseApplyTargetLockConn(ctx, conn, lockName, "reapply failed apply")
+	defer releaseApplyTargetLockConn(ctx, s.locker, conn, lockName, "reapply failed apply")
 
 	deployments, err := operationDeploymentsForApply(ctx, tx, apply.ID)
 	if err != nil {
@@ -1931,23 +2074,41 @@ func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, enviro
 	return scanApplies(rows)
 }
 
-// FindMissingSummaryComment returns GitHub-backed applies that should have a
-// terminal summary comment but only have a progress comment. Used to post missing
-// summaries after restart.
+// FindMissingSummaryComment returns GitHub-backed applies that reached a
+// terminal state recently but whose progress comment was never followed by a
+// summary comment. Used to post missing summaries after restart.
+//
+// Three forms of "missing" qualify: no summary marker at all (the publisher
+// never ran); a superseded marker (a stop's summary consumed by a resume
+// rotation, so the summary for the current terminal state was never posted);
+// and a summary claim sentinel (github_comment_id = 0) stale for longer than
+// storage.SummaryClaimStaleAfter (the publisher claimed, then crashed before
+// posting). A fresh sentinel is an in-flight publish and is left alone.
+//
+// Recency is judged per state family: most terminal states stamp completed_at,
+// but a stopped apply is resumable and keeps completed_at NULL, so it qualifies
+// by updated_at instead.
 func (s *applyStore) FindMissingSummaryComment(ctx context.Context) ([]*storage.Apply, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+applyColumnsForApplyAlias+`
 		FROM applies a
 		JOIN apply_comments acp ON acp.apply_id = a.id AND acp.comment_state = 'progress'
 		LEFT JOIN apply_comments acs ON acs.apply_id = a.id AND acs.comment_state = 'summary'
-		WHERE a.state IN (?, ?, ?, ?)
-		  AND a.repository != ''
+		WHERE a.repository != ''
 		  AND a.pull_request > 0
 		  AND a.installation_id > 0
-		  AND a.completed_at > NOW() - INTERVAL 1 HOUR
-		  AND acs.id IS NULL
-		ORDER BY a.completed_at DESC
-	`, state.Apply.Completed, state.Apply.Failed, state.Apply.Reverted, state.Apply.Cancelled)
+		  AND (
+			(a.state IN (?, ?, ?, ?) AND a.completed_at > `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(1), IntervalHour)+`)
+			OR (a.state = ? AND a.updated_at > `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(1), IntervalHour)+`)
+		  )
+		  AND (
+			acs.id IS NULL
+			OR acs.superseded_at IS NOT NULL
+			OR (acs.github_comment_id = 0 AND acs.updated_at < `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalSecond)+`)
+		  )
+		ORDER BY a.updated_at DESC
+	`, state.Apply.Completed, state.Apply.Failed, state.Apply.Reverted, state.Apply.Cancelled,
+		state.Apply.Stopped, int64(storage.SummaryClaimStaleAfter.Seconds()))
 	if err != nil {
 		return nil, err
 	}
@@ -1978,6 +2139,29 @@ func (s *applyStore) GetByPR(ctx context.Context, repo string, pr int) ([]*stora
 	defer utils.CloseAndLog(rows)
 
 	return scanApplies(rows)
+}
+
+// ExistsForDatabaseHead reports whether any apply for the PR and database was
+// created from a plan for headSHA. The LEFT JOIN keeps applies whose plan row
+// was deleted: without the plan there is no proof of which head the apply came
+// from, so it must count as matching any head rather than silently dropping
+// out of the result.
+func (s *applyStore) ExistsForDatabaseHead(ctx context.Context, repo string, pr int, database, databaseType, headSHA string) (bool, error) {
+	var exists bool
+	err := s.db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM applies a
+			LEFT JOIN plans p ON p.id = a.plan_id
+			WHERE a.repository = ? AND a.pull_request = ?
+				AND a.database_name = ? AND a.database_type = ?
+				AND (p.id IS NULL OR p.head_sha = ?)
+		)
+	`, repo, pr, database, databaseType, headSHA).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check applies for %s#%d database %s (%s) head %s: %w", repo, pr, database, databaseType, headSHA, err)
+	}
+	return exists, nil
 }
 
 // Delete removes an apply by ID, along with its per-deployment

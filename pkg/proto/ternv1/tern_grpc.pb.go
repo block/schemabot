@@ -24,6 +24,7 @@ const (
 	Tern_PlanDiff_FullMethodName   = "/tern.v1.Tern/PlanDiff"
 	Tern_Apply_FullMethodName      = "/tern.v1.Tern/Apply"
 	Tern_Progress_FullMethodName   = "/tern.v1.Tern/Progress"
+	Tern_Logs_FullMethodName       = "/tern.v1.Tern/Logs"
 	Tern_Cutover_FullMethodName    = "/tern.v1.Tern/Cutover"
 	Tern_Revert_FullMethodName     = "/tern.v1.Tern/Revert"
 	Tern_SkipRevert_FullMethodName = "/tern.v1.Tern/SkipRevert"
@@ -118,6 +119,8 @@ type TernClient interface {
 	//
 	// Unknown apply IDs return NOT_FOUND.
 	Progress(ctx context.Context, in *ProgressRequest, opts ...grpc.CallOption) (*ProgressResponse, error)
+	// Logs returns a bounded recent window of durable apply logs. It is read-only.
+	Logs(ctx context.Context, in *LogsRequest, opts ...grpc.CallOption) (*LogsResponse, error)
 	// Cutover triggers the table swap phase for a schema change that was started
 	// with defer_cutover=true. Only valid when state is waiting_for_cutover.
 	//
@@ -238,6 +241,16 @@ func (c *ternClient) Progress(ctx context.Context, in *ProgressRequest, opts ...
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ProgressResponse)
 	err := c.cc.Invoke(ctx, Tern_Progress_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *ternClient) Logs(ctx context.Context, in *LogsRequest, opts ...grpc.CallOption) (*LogsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LogsResponse)
+	err := c.cc.Invoke(ctx, Tern_Logs_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -408,6 +421,8 @@ type TernServer interface {
 	//
 	// Unknown apply IDs return NOT_FOUND.
 	Progress(context.Context, *ProgressRequest) (*ProgressResponse, error)
+	// Logs returns a bounded recent window of durable apply logs. It is read-only.
+	Logs(context.Context, *LogsRequest) (*LogsResponse, error)
 	// Cutover triggers the table swap phase for a schema change that was started
 	// with defer_cutover=true. Only valid when state is waiting_for_cutover.
 	//
@@ -497,6 +512,9 @@ func (UnimplementedTernServer) Apply(context.Context, *ApplyRequest) (*ApplyResp
 }
 func (UnimplementedTernServer) Progress(context.Context, *ProgressRequest) (*ProgressResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Progress not implemented")
+}
+func (UnimplementedTernServer) Logs(context.Context, *LogsRequest) (*LogsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Logs not implemented")
 }
 func (UnimplementedTernServer) Cutover(context.Context, *CutoverRequest) (*CutoverResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Cutover not implemented")
@@ -628,6 +646,24 @@ func _Tern_Progress_Handler(srv interface{}, ctx context.Context, dec func(inter
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(TernServer).Progress(ctx, req.(*ProgressRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Tern_Logs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LogsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TernServer).Logs(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tern_Logs_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TernServer).Logs(ctx, req.(*LogsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -802,6 +838,10 @@ var Tern_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Progress",
 			Handler:    _Tern_Progress_Handler,
+		},
+		{
+			MethodName: "Logs",
+			Handler:    _Tern_Logs_Handler,
 		},
 		{
 			MethodName: "Cutover",
