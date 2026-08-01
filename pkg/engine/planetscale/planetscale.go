@@ -136,9 +136,12 @@
 //  5. Start the deploy request
 //  6. Return — the tern layer polls Progress() to track to completion
 //
-// The deploy request runs inside Vitess. If SchemaBot crashes, the deploy continues.
-// On restart, the tern layer's operator calls Progress() and finds the deploy
-// still running — no special resume logic needed beyond polling.
+// The deploy request is created with PlanetScale's own auto-cutover disabled —
+// the drive is the sole cutover actor. The row copy runs inside Vitess, so it
+// continues if SchemaBot crashes, but the deploy request parks at
+// pending_cutover until a drive reclaims the apply and triggers cutover. On
+// restart, the tern layer's driver calls Progress() and resumes driving — no
+// special resume logic needed beyond polling.
 //
 // # Instant DDL
 //

@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -26,6 +27,142 @@ func TestApplyStore_Create(t *testing.T) {
 	created := createTestApply(t, store, lock, "apply_create_test", 1)
 
 	require.NotZero(t, created.ID)
+}
+
+func TestApplyStore_CreateRejectsChangedLockIntent(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+		DatabaseName:  "testdb",
+		DatabaseType:  storage.DatabaseTypeMySQL,
+		Repository:    "org/repo",
+		PullRequest:   123,
+		Owner:         "org/repo#123",
+		PendingPlanID: "rollback:replacement",
+	}))
+	lock, err := store.Locks().Get(ctx, "testdb", storage.DatabaseTypeMySQL)
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+
+	_, err = store.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier:       "apply_changed_lock_intent",
+		LockID:                lock.ID,
+		ExpectedLockOwner:     "org/repo#123",
+		ExpectedPendingPlanID: "apply-original",
+		PlanID:                1,
+		Database:              "testdb",
+		DatabaseType:          storage.DatabaseTypeMySQL,
+		Repository:            "org/repo",
+		PullRequest:           123,
+		Environment:           "staging",
+		Deployment:            "default",
+		Engine:                storage.EngineSpirit,
+		State:                 state.Apply.Pending,
+	})
+	require.ErrorIs(t, err, storage.ErrLockIntentChanged)
+
+	applies, err := store.Applies().GetByPR(ctx, "org/repo", 123)
+	require.NoError(t, err)
+	assert.Empty(t, applies)
+}
+
+func TestApplyStore_CreateRejectsPendingPlanIntentWithoutOwner(t *testing.T) {
+	clearTables(t)
+	store := New(testDB)
+
+	_, err := store.Applies().Create(t.Context(), &storage.Apply{
+		ApplyIdentifier:       "apply_plan_intent_without_owner",
+		ExpectedPendingPlanID: "plan-123",
+		Database:              "testdb",
+		DatabaseType:          storage.DatabaseTypeMySQL,
+		Environment:           "staging",
+		State:                 state.Apply.Completed,
+	})
+	require.ErrorContains(t, err, "expected pending plan ID set without an expected lock owner")
+}
+
+func TestApplyStore_CreateWithMatchingLockIntent(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	tests := []struct {
+		name          string
+		pendingPlanID string
+	}{
+		{name: "pinned lock", pendingPlanID: "plan-abc"},
+		{name: "unpinned lock", pendingPlanID: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearTables(t)
+			require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+				DatabaseName:  "testdb",
+				DatabaseType:  storage.DatabaseTypeMySQL,
+				Repository:    "org/repo",
+				PullRequest:   123,
+				Owner:         "org/repo#123",
+				PendingPlanID: tt.pendingPlanID,
+			}))
+			lock, err := store.Locks().Get(ctx, "testdb", storage.DatabaseTypeMySQL)
+			require.NoError(t, err)
+			require.NotNil(t, lock)
+
+			id, err := store.Applies().Create(ctx, &storage.Apply{
+				ApplyIdentifier:       "apply_matching_intent_" + strings.ReplaceAll(tt.name, " ", "_"),
+				ExpectedLockOwner:     "org/repo#123",
+				ExpectedPendingPlanID: tt.pendingPlanID,
+				PlanID:                1,
+				Database:              "testdb",
+				DatabaseType:          storage.DatabaseTypeMySQL,
+				Repository:            "org/repo",
+				PullRequest:           123,
+				Environment:           "staging",
+				Deployment:            "default",
+				Engine:                storage.EngineSpirit,
+				State:                 state.Apply.Pending,
+			})
+			require.NoError(t, err)
+			require.NotZero(t, id)
+
+			created, err := store.Applies().Get(ctx, id)
+			require.NoError(t, err)
+			require.NotNil(t, created)
+			assert.Equal(t, lock.ID, created.LockID)
+		})
+	}
+}
+
+func TestApplyStore_CreateRejectsIntentAgainstUnpinnedLock(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+		DatabaseName: "testdb",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		Repository:   "org/repo",
+		PullRequest:  123,
+		Owner:        "org/repo#123",
+	}))
+
+	_, err := store.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier:       "apply_pinned_intent_unpinned_lock",
+		ExpectedLockOwner:     "org/repo#123",
+		ExpectedPendingPlanID: "plan-abc",
+		PlanID:                1,
+		Database:              "testdb",
+		DatabaseType:          storage.DatabaseTypeMySQL,
+		Repository:            "org/repo",
+		PullRequest:           123,
+		Environment:           "staging",
+		Deployment:            "default",
+		Engine:                storage.EngineSpirit,
+		State:                 state.Apply.Pending,
+	})
+	require.ErrorIs(t, err, storage.ErrLockIntentChanged)
 }
 
 func TestApplyStore_CreateDuplicate(t *testing.T) {
@@ -886,13 +1023,13 @@ func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 	// Hold the same target lock that the create path must acquire. The creates
 	// below use the public store API; a result before release means active
 	// apply writes are not serialized by the per-target lock.
-	guardConn, guardLockName, err := acquireApplyTargetLockConn(ctx, testDB, "testdb", "mysql", "staging")
+	guardConn, guardLockName, err := acquireApplyTargetLockConn(ctx, testDB, namedlock.MySQL{}, "testdb", "mysql", "staging")
 	require.NoError(t, err)
 	releaseGuard := func() {
 		if guardConn == nil {
 			return
 		}
-		releaseApplyTargetLockConn(ctx, guardConn, guardLockName, "test active apply guard")
+		releaseApplyTargetLockConn(ctx, namedlock.MySQL{}, guardConn, guardLockName, "test active apply guard")
 		guardConn = nil
 	}
 	t.Cleanup(releaseGuard)
@@ -1251,6 +1388,83 @@ func TestApplyStore_GetRecentLimitAndEnvironment(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
 	assert.Equal(t, "apply_recent_staging_failed", applies[0].ApplyIdentifier)
+}
+
+// TestApplyStore_GetRecentUpdatedSince verifies the status window bound: only
+// applies whose updated_at falls at or after the bound are returned, so an
+// apply that last changed before the window drops out while fresh activity
+// stays visible.
+func TestApplyStore_GetRecentUpdatedSince(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "windowdb", "mysql", "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_window_stale", 220, state.Apply.Completed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_window_fresh", 221, state.Apply.Completed, "staging")
+
+	_, err := testDB.ExecContext(ctx,
+		"UPDATE `applies` SET updated_at = ? WHERE apply_identifier = ?",
+		time.Now().Add(-2*time.Hour), "apply_window_stale")
+	require.NoError(t, err)
+
+	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit:        10,
+		Environment:  "staging",
+		UpdatedSince: time.Now().Add(-time.Hour),
+	})
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, "apply_window_fresh", applies[0].ApplyIdentifier)
+
+	applies, err = store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit:        10,
+		Environment:  "staging",
+		UpdatedSince: time.Now().Add(-3 * time.Hour),
+	})
+	require.NoError(t, err)
+	require.Len(t, applies, 2)
+}
+
+// A status summary must tally every apply matching the filters — unbounded by
+// the list limit, scoped by environment, and windowed by UpdatedSince — so an
+// operator reading a truncated status page still sees truthful totals.
+func TestApplyStore_CountRecentByState(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "countdb", "mysql", "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_completed_one", 230, state.Apply.Completed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_completed_two", 231, state.Apply.Completed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_failed", 232, state.Apply.Failed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_other_env", 233, state.Apply.Completed, "production")
+
+	counts, err := store.Applies().CountRecentByState(ctx, storage.RecentAppliesFilter{
+		Limit:       1,
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{
+		state.Apply.Completed: 2,
+		state.Apply.Failed:    1,
+	}, counts, "counts cover every matching row even when the list limit is 1")
+
+	_, err = testDB.ExecContext(ctx,
+		"UPDATE `applies` SET updated_at = ? WHERE apply_identifier = ?",
+		time.Now().Add(-2*time.Hour), "apply_count_completed_one")
+	require.NoError(t, err)
+
+	counts, err = store.Applies().CountRecentByState(ctx, storage.RecentAppliesFilter{
+		Limit:        10,
+		Environment:  "staging",
+		UpdatedSince: time.Now().Add(-time.Hour),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{
+		state.Apply.Completed: 1,
+		state.Apply.Failed:    1,
+	}, counts)
 }
 
 func TestApplyStore_GetRecentDeploymentFilterMatchesParentAndOperation(t *testing.T) {
@@ -1881,6 +2095,100 @@ func TestApplyStore_ClaimApplyByIDClaimsStaleSetupPhase(t *testing.T) {
 	assert.NotEmpty(t, claimed.LeaseToken)
 }
 
+// An apply dwells in a revert-phase state (reverting, skipping_revert) while
+// the engine reverts or finalizes the deploy request. If the driver dies there
+// — routine pod churn is enough — a fresh driver must reclaim the apply once
+// the heartbeat goes stale and resume polling the engine to its terminal
+// state; otherwise the apply is stranded non-terminal forever with no driver.
+// While the original driver is alive its heartbeat stays fresh, so the apply
+// is never claimed out from under it.
+func TestApplyStore_FindNextApplyClaimsStaleRevertPhase(t *testing.T) {
+	for _, revertState := range []string{
+		state.Apply.Reverting,
+		state.Apply.SkippingRevert,
+	} {
+		t.Run(revertState, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := New(testDB)
+
+			lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
+			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_revert_"+revertState, 702, revertState, "staging")
+			require.Equal(t, storage.EnginePlanetScale, apply.Engine, "revert-phase states only occur for the PlanetScale engine")
+
+			fresh, err := store.Applies().FindNextApply(ctx, "operator-a")
+			require.NoError(t, err)
+			assert.Nil(t, fresh, "a revert-phase apply with a fresh heartbeat is owned by its active driver")
+
+			_, err = testDB.ExecContext(ctx, `
+				UPDATE applies
+				SET updated_at = NOW() - INTERVAL 2 MINUTE
+				WHERE id = ?
+			`, apply.ID)
+			require.NoError(t, err)
+
+			claimed, err := store.Applies().FindNextApply(ctx, "operator-a")
+			require.NoError(t, err)
+			require.NotNil(t, claimed, "a stale revert-phase apply must be reclaimable for recovery")
+			assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+			assert.Equal(t, revertState, claimed.State, "the caller sees the revert-phase state to resume from")
+			assert.Equal(t, "operator-a", claimed.LeaseOwner)
+			assert.NotEmpty(t, claimed.LeaseToken)
+		})
+	}
+}
+
+// The operation-level claim loop leases the orphaned apply_operations row
+// first and then needs the parent apply lease via ClaimApplyByID, so a stale
+// revert-phase parent must be reclaimable through it as well. The claim only
+// rotates the lease: the persisted state must stay the revert-phase state so
+// the resumed drive re-attaches to the in-flight engine revert instead of
+// restarting the apply.
+func TestApplyStore_ClaimApplyByIDClaimsStaleRevertPhase(t *testing.T) {
+	for _, revertState := range []string{
+		state.Apply.Reverting,
+		state.Apply.SkippingRevert,
+	} {
+		t.Run(revertState, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := New(testDB)
+
+			lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
+			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_revert_"+revertState, 703, revertState, "staging")
+			require.Equal(t, storage.EnginePlanetScale, apply.Engine, "revert-phase states only occur for the PlanetScale engine")
+
+			fresh, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+			require.NoError(t, err)
+			assert.Nil(t, fresh, "a fresh revert-phase apply is owned by its active driver")
+
+			_, err = testDB.ExecContext(ctx, `
+				UPDATE applies
+				SET updated_at = NOW() - INTERVAL 2 MINUTE
+				WHERE id = ?
+			`, apply.ID)
+			require.NoError(t, err)
+
+			claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+			require.NoError(t, err)
+			require.NotNil(t, claimed, "a stale revert-phase parent apply must be reclaimable")
+			assert.Equal(t, revertState, claimed.State)
+			assert.Equal(t, "operator-a", claimed.LeaseOwner)
+			assert.NotEmpty(t, claimed.LeaseToken)
+
+			persisted, err := store.Applies().Get(ctx, apply.ID)
+			require.NoError(t, err)
+			require.NotNil(t, persisted)
+			assert.Equal(t, revertState, persisted.State, "the claim rotates the lease without transitioning the revert-phase state")
+			assert.Equal(t, "operator-a", persisted.LeaseOwner)
+
+			again, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-b")
+			require.NoError(t, err)
+			assert.Nil(t, again, "the reclaimed apply's fresh lease is not stolen by a peer")
+		})
+	}
+}
+
 // ClaimApplyByID requires an owner so a lease can never be acquired without an
 // identity that lease-guarded writes can fail closed against.
 func TestApplyStore_ClaimApplyByIDRequiresOwner(t *testing.T) {
@@ -2069,6 +2377,51 @@ func TestApplyStore_FindNextApplyRequiresTasksForPendingApply(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, persisted)
 	assert.Equal(t, state.Apply.Running, persisted.State)
+}
+
+// A VSchema-only apply carries an apply_operations row but no tasks — the
+// VSchema application is the whole apply. Its dual-written operation row proves
+// the create committed fully, so the pending claim must accept it; gating the
+// claim on tasks alone would strand every queued VSchema-only apply pending
+// forever.
+func TestApplyStore_FindNextApplyClaimsTasklessPendingApplyWithOperation(t *testing.T) {
+	newTasklessApply := func(t *testing.T, store *Storage, database, applyID string) *storage.Apply {
+		t.Helper()
+		lock := createTestLock(t, store, database, storage.DatabaseTypeVitess, "staging")
+		apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, 503, state.Apply.Pending, "staging")
+		now := time.Now()
+		_, err := store.ApplyOperations().Insert(t.Context(), &storage.ApplyOperation{
+			ApplyID:    apply.ID,
+			Deployment: apply.Database,
+			State:      state.ApplyOperation.Pending,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		})
+		require.NoError(t, err)
+		return apply
+	}
+
+	t.Run("FindNextApply claims it", func(t *testing.T) {
+		clearTables(t)
+		store := New(testDB)
+		apply := newTasklessApply(t, store, "testdb", "apply_vschema_only")
+
+		claimed, err := store.Applies().FindNextApply(t.Context(), "test-owner")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "a task-less pending apply with an operation row must be claimable")
+		assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+	})
+
+	t.Run("ClaimApplyByID acquires the parent lease", func(t *testing.T) {
+		clearTables(t)
+		store := New(testDB)
+		apply := newTasklessApply(t, store, "testdb", "apply_vschema_only_byid")
+
+		claimed, err := store.Applies().ClaimApplyByID(t.Context(), apply.ID, "test-owner")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "the operation-claim path must acquire the parent lease for a task-less pending apply")
+		assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+	})
 }
 
 func TestApplyStore_FindNextApplyClaimsPendingControlRequestWithoutTasks(t *testing.T) {
@@ -2478,7 +2831,10 @@ func TestApplyStore_FindNextApplyConcurrentPendingClaims(t *testing.T) {
 
 // TestApplyStore_ExpireRetryable verifies retryable expiry at the storage
 // layer. A retryable apply that has used all attempts becomes failed, and
-// unfinished tasks are finalized as failed with completion timestamps.
+// unfinished tasks are finalized with completion timestamps: the task that
+// had started work is failed, while a pending task that never started is
+// cancelled — it was blocked behind the failure, and marking it failed would
+// misattribute the failure to a table that did no work.
 func TestApplyStore_ExpireRetryable(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -2543,7 +2899,7 @@ func TestApplyStore_ExpireRetryable(t *testing.T) {
 	pendingTask, err := store.Tasks().Get(ctx, "task_retryable_pending")
 	require.NoError(t, err)
 	require.NotNil(t, pendingTask)
-	assert.Equal(t, state.Task.Failed, pendingTask.State)
+	assert.Equal(t, state.Task.Cancelled, pendingTask.State, "a task that never started is cancelled, not failed")
 	assert.NotNil(t, pendingTask.CompletedAt)
 }
 
@@ -2868,6 +3224,133 @@ func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestin
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
 	assert.Equal(t, githubApply.ApplyIdentifier, applies[0].ApplyIdentifier)
+}
+
+// seedApplyMissingSummary creates a GitHub-backed apply in the given state with
+// a tracked progress comment and no summary marker — the shape
+// FindMissingSummaryComment exists to repair. Terminal states other than
+// stopped stamp completed_at; a stopped apply keeps it NULL (resumable) and
+// must qualify by recency of updated_at instead.
+func seedApplyMissingSummary(t *testing.T, store *Storage, name, applyState string, planID int64) *storage.Apply {
+	t.Helper()
+	ctx := t.Context()
+	lock := createTestLockWithPR(t, store, name+"_db", storage.DatabaseTypeMySQL, "staging", "org/repo", 123)
+	apply := &storage.Apply{
+		ApplyIdentifier: name,
+		LockID:          lock.ID,
+		PlanID:          planID,
+		Database:        lock.DatabaseName,
+		DatabaseType:    lock.DatabaseType,
+		Repository:      lock.Repository,
+		PullRequest:     lock.PullRequest,
+		Environment:     "staging",
+		Caller:          "org/repo#123",
+		InstallationID:  12345,
+		Engine:          storage.EngineSpirit,
+		State:           applyState,
+	}
+	applyID, err := store.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+	if applyState != state.Apply.Stopped {
+		now := time.Now()
+		apply.CompletedAt = &now
+		require.NoError(t, store.Applies().Update(ctx, apply))
+	}
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         apply.ID,
+		CommentState:    state.Comment.Progress,
+		GitHubCommentID: 1001,
+	}))
+	return apply
+}
+
+// TestApplyStore_FindMissingSummaryComment_IncludesRecentlyStoppedApplies
+// verifies stopped applies participate in summary reconciliation: a stop is
+// terminal for summary purposes even though it is resumable and never stamps
+// completed_at, so recency is judged by updated_at. A stopped apply whose last
+// update is older than the reconciliation lookback is left alone.
+func TestApplyStore_FindMissingSummaryComment_IncludesRecentlyStoppedApplies(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	recent := seedApplyMissingSummary(t, store, "apply_stopped_recent", state.Apply.Stopped, 700)
+	stale := seedApplyMissingSummary(t, store, "apply_stopped_stale", state.Apply.Stopped, 701)
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 2 HOUR WHERE id = ?`, stale.ID)
+	require.NoError(t, err)
+
+	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, recent.ApplyIdentifier, applies[0].ApplyIdentifier)
+	assert.Equal(t, state.Apply.Stopped, applies[0].State)
+}
+
+// TestApplyStore_FindMissingSummaryComment_SummaryClaimSentinels verifies the
+// claim-aware missing test: a fresh claim sentinel means a publisher is posting
+// right now, so the apply is not reported; a sentinel stale past
+// storage.SummaryClaimStaleAfter means that publisher crashed before posting,
+// so the apply is reported for repair; and a marker recording a real posted
+// comment never reports.
+func TestApplyStore_FindMissingSummaryComment_SummaryClaimSentinels(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	freshClaim := seedApplyMissingSummary(t, store, "apply_claim_fresh", state.Apply.Completed, 710)
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, freshClaim.ID)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	staleClaim := seedApplyMissingSummary(t, store, "apply_claim_stale", state.Apply.Completed, 711)
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, staleClaim.ID)
+	require.NoError(t, err)
+	require.True(t, won)
+	backdateSummaryClaim(t, staleClaim.ID)
+
+	posted := seedApplyMissingSummary(t, store, "apply_summary_posted", state.Apply.Completed, 712)
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         posted.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 2002,
+	}))
+
+	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, staleClaim.ApplyIdentifier, applies[0].ApplyIdentifier)
+}
+
+// TestApplyStore_FindMissingSummaryComment_SupersededSummaryMarker verifies a
+// superseded summary marker counts as missing: a stop's summary consumed by a
+// resume rotation belongs to an earlier terminal state, so once the apply
+// reaches its next terminal state, reconciliation must repair the summary
+// rather than treating the stale marker as posted.
+func TestApplyStore_FindMissingSummaryComment_SupersededSummaryMarker(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	superseded := seedApplyMissingSummary(t, store, "apply_summary_superseded", state.Apply.Completed, 720)
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         superseded.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 2003,
+	}))
+	require.NoError(t, store.ApplyComments().Supersede(ctx, superseded.ID, state.Comment.Summary))
+
+	live := seedApplyMissingSummary(t, store, "apply_summary_live", state.Apply.Completed, 721)
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         live.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 2004,
+	}))
+
+	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, superseded.ApplyIdentifier, applies[0].ApplyIdentifier)
 }
 
 func TestApplyStore_GetByPR(t *testing.T) {

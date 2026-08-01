@@ -348,7 +348,7 @@ func (m WatchModel) renderTables(b *strings.Builder, tables []tableProgress) {
 
 	activityBar := ui.ProgressBarActivity()
 	activityLabelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
-	activityLabel := activityLabelStyle.Render("Active " + activityLabelFrames[m.activityLabelFrame%len(activityLabelFrames)])
+	activityLabel := activityLabelStyle.Render("Finalizing copy " + activityLabelFrames[m.activityLabelFrame%len(activityLabelFrames)])
 	if hasNamespaces {
 		b.WriteString(templates.FormatNamespacedTablesWithActivity(tplTables, activityBar, activityLabel))
 	} else {

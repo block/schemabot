@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -40,6 +41,16 @@ func twoDeploymentService(t *testing.T, eu, us *mockTernClient) *Service {
 		"eu/production": eu,
 		"us/production": us,
 	}, logger)
+}
+
+// productionTargets resolves the testapp/production deployment set the producer
+// tests exercise, so each PlanDeploymentDiffs call is given the same resolved
+// targets the rollup would pass in.
+func productionTargets(t *testing.T, svc *Service) []routing.ExecutionTarget {
+	t.Helper()
+	targets, err := svc.config.ResolveDatabaseTargets("testapp", "production")
+	require.NoError(t, err)
+	return targets
 }
 
 func planDiffReq(t *testing.T) PlanRequest {
@@ -91,7 +102,7 @@ func TestPlanDeploymentDiffs_PrimaryReusesReviewedPlan(t *testing.T) {
 		}},
 	}
 
-	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan)
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "eu", productionTargets(t, svc))
 	require.NoError(t, err)
 	require.Len(t, results, 2)
 
@@ -115,7 +126,7 @@ func TestPlanDeploymentDiffs_DiffsAllDeploymentsWhenNoPrimary(t *testing.T) {
 	us := &mockTernClient{planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
 	svc := twoDeploymentService(t, eu, us)
 
-	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil)
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, "", productionTargets(t, svc))
 	require.NoError(t, err)
 	require.Len(t, results, 2)
 
@@ -133,7 +144,7 @@ func TestPlanDeploymentDiffs_PerDeploymentErrorIsCaptured(t *testing.T) {
 	us := &mockTernClient{planDiffErr: errors.New("deployment unreachable")}
 	svc := twoDeploymentService(t, eu, us)
 
-	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil)
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, "", productionTargets(t, svc))
 	require.NoError(t, err, "a single deployment failure must not abort the rollup")
 	require.Len(t, results, 2)
 
@@ -145,16 +156,113 @@ func TestPlanDeploymentDiffs_PerDeploymentErrorIsCaptured(t *testing.T) {
 	assert.Nil(t, results[1].Changes)
 }
 
-// A request-level failure (the database/environment resolves no deployments)
-// returns an error rather than a per-deployment result.
-func TestPlanDeploymentDiffs_UnresolvedTargetsError(t *testing.T) {
+// A deployment's PlanDiff can carry per-shard plans, and the deployment and
+// shard axes are orthogonal: the producer iterates deployments while each
+// deployment's single diff retains its full per-shard set. This guards that the
+// producer copies resp.Shards through, so per-shard drift within a deployment
+// stays visible to the rollup rather than being flattened away.
+func TestPlanDeploymentDiffs_PreservesShards(t *testing.T) {
+	usShards := &ternv1.PlanDiffResponse{
+		Engine: ternv1.Engine_ENGINE_SPIRIT,
+		Shards: []*ternv1.ShardPlan{
+			{
+				Shard:     "-80",
+				Namespace: "testapp",
+				Changes: []*ternv1.TableChange{{
+					TableName:  "users",
+					ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+					Ddl:        "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+					Namespace:  "testapp",
+				}},
+			},
+			{
+				Shard:     "80-",
+				Namespace: "testapp",
+				Changes: []*ternv1.TableChange{{
+					TableName:  "users",
+					ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+					Ddl:        "ALTER TABLE `users` ADD COLUMN `phone` varchar(32)",
+					Namespace:  "testapp",
+				}},
+			},
+		},
+	}
+	eu := &mockTernClient{}
+	us := &mockTernClient{planDiffResp: usShards}
+	svc := twoDeploymentService(t, eu, us)
+
+	primaryPlan := &ternv1.PlanResponse{
+		PlanId: "plan_eu",
+		Engine: ternv1.Engine_ENGINE_SPIRIT,
+		Shards: []*ternv1.ShardPlan{{
+			Shard:     "0",
+			Namespace: "testapp",
+			Changes: []*ternv1.TableChange{{
+				TableName:  "users",
+				ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+				Ddl:        "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+				Namespace:  "testapp",
+			}},
+		}},
+	}
+
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "eu", productionTargets(t, svc))
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+
+	// The primary reuses the reviewed plan's shard set verbatim.
+	require.NoError(t, results[0].Err)
+	assert.Equal(t, primaryPlan.Shards, results[0].Shards)
+
+	// The non-primary deployment's full two-shard set survives the producer.
+	require.NoError(t, results[1].Err)
+	require.Len(t, results[1].Shards, 2)
+	assert.Equal(t, "-80", results[1].Shards[0].Shard)
+	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", results[1].Shards[0].Changes[0].Ddl)
+	assert.Equal(t, "80-", results[1].Shards[1].Shard)
+	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `phone` varchar(32)", results[1].Shards[1].Changes[0].Ddl)
+}
+
+// If the reviewed plan's origin deployment no longer matches rollout index 0
+// (e.g. deployment_order changed between plan and rollup), reusing that plan as
+// the primary baseline would compare deployments against a plan built for a
+// different deployment. The producer must fail closed instead.
+func TestPlanDeploymentDiffs_PrimaryDeploymentMismatchFailsClosed(t *testing.T) {
+	eu := &mockTernClient{}
+	us := &mockTernClient{planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
+	svc := twoDeploymentService(t, eu, us)
+
+	primaryPlan := &ternv1.PlanResponse{PlanId: "plan_eu", Engine: ternv1.Engine_ENGINE_SPIRIT}
+
+	// targets[0] is "eu", but the reviewed plan was created against "us".
+	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "us", productionTargets(t, svc))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "primary invariant violated")
+	assert.Nil(t, eu.planDiffReq, "must fail before diffing any deployment")
+	assert.Nil(t, us.planDiffReq)
+}
+
+// A reviewed plan supplied without its origin deployment cannot be verified
+// against rollout index 0, so the producer fails closed rather than trusting
+// the positional assumption blindly.
+func TestPlanDeploymentDiffs_PrimaryPlanWithoutOriginFailsClosed(t *testing.T) {
+	eu := &mockTernClient{}
+	us := &mockTernClient{planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
+	svc := twoDeploymentService(t, eu, us)
+
+	primaryPlan := &ternv1.PlanResponse{PlanId: "plan_eu", Engine: ternv1.Engine_ENGINE_SPIRIT}
+
+	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "", productionTargets(t, svc))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no origin deployment")
+}
+
+// Called with no resolved targets the producer fails closed rather than
+// returning an empty result that a caller could mistake for agreement.
+func TestPlanDeploymentDiffs_NoTargetsError(t *testing.T) {
 	svc := twoDeploymentService(t, &mockTernClient{}, &mockTernClient{})
 
-	_, err := svc.PlanDeploymentDiffs(t.Context(), PlanRequest{
-		Database:    "testapp",
-		Environment: "staging", // not configured
-		Type:        storage.DatabaseTypeMySQL,
-	}, nil)
+	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, "", nil)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "resolve deployment targets")
+	assert.Contains(t, err.Error(), "no deployment targets")
 }

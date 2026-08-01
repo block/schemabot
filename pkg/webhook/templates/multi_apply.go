@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // MultiDeploymentApplyData is the input to the multi-deployment apply comment.
@@ -41,6 +42,17 @@ type MultiDeploymentApplyData struct {
 	// comment data (its tables, error, timing, database). Each deployment's
 	// <details> body is rendered from its entry via RenderApplyStatusComment.
 	Details map[string]ApplyStatusCommentData
+
+	// Tenant is the deployment's tenant identity, appended as --tenant to every
+	// pasteable command hint so copied commands address this deployment in
+	// tenant mode. Empty on single-tenant deployments, leaving hints unchanged.
+	Tenant string
+
+	// Rollback reports whether this apply reverts a previously applied schema
+	// change (the apply's durable rollback option). It switches the aggregate
+	// headline vocabulary from "apply" to "rollback", matching the
+	// single-deployment comment.
+	Rollback bool
 }
 
 // RenderMultiDeploymentApplyComment renders the PR comment for an apply that
@@ -58,7 +70,7 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 
 	// Aggregate header: the stable in-place status title, identical to the
 	// single-deployment comment so the headline vocabulary stays shared.
-	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment})
+	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeAggregateMetadata(&sb, data, renderedAt)
 	writeDeploymentCounts(&sb, data.Model.Counts)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
@@ -89,7 +101,7 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 func RenderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData) string {
 	var sb strings.Builder
 
-	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment})
+	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeAggregateMetadata(&sb, data, currentTimestamp())
 	writeDeploymentCounts(&sb, data.Model.Counts)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
@@ -168,14 +180,14 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 	case presentation.NextActionCutover:
 		writeFooterAction(sb,
 			fmt.Sprintf("To cut over `%s`:", na.Deployment),
-			fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment))
+			appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case presentation.NextActionResume:
-		writeFooterAction(sb, "Paused — to resume from where it stopped:", fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment))
+		writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case presentation.NextActionReviewFailure:
 		// revert applies only to a deployment still in its post-cutover revert
 		// window, not to a failure; the recovery path for a failed apply is a
 		// retry, matching the single-deployment failed footer.
-		writeFooterAction(sb, "To retry:", fmt.Sprintf("schemabot apply -e %s", data.Environment))
+		writeFooterAction(sb, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	case presentation.NextActionNone:
 		// No operator action is pending; nothing to render.
 	}
@@ -215,7 +227,9 @@ func writeDeploymentSummarySections(sb *strings.Builder, data MultiDeploymentApp
 // and problematic deployments default open; completed and queued ones default
 // collapsed (the model's Open flag). The per-deployment body keeps today's
 // single-deployment fidelity — per-table progress, errors, and DDL — scoped to
-// one deployment.
+// one deployment, minus the single-deployment headline: the aggregate header
+// already carries the title and the <summary> line names the deployment, so
+// repeating the headline inside every section is noise.
 func writeDeploymentDetailSections(sb *strings.Builder, data MultiDeploymentApplyData, renderDetail func(ApplyStatusCommentData) string) {
 	for _, d := range data.Model.Deployments {
 		openAttr := ""
@@ -224,12 +238,50 @@ func writeDeploymentDetailSections(sb *strings.Builder, data MultiDeploymentAppl
 		}
 		fmt.Fprintf(sb, "\n<details%s>\n<summary>%s — %s</summary>\n\n", openAttr, deploymentTag(d), html.EscapeString(d.Label))
 		if detail, ok := data.Details[d.Deployment]; ok {
-			sb.WriteString(renderDetail(detail))
+			detail.DerivedStatus = siblingDerivedStatus(d)
+			sb.WriteString(stripLeadingHeading(renderDetail(detail)))
 		} else {
 			sb.WriteString("_No details available yet._\n")
 		}
 		sb.WriteString("\n</details>\n")
 	}
+}
+
+// siblingDerivedStatus returns the <details> body status for a deployment whose
+// presentation is derived from its earlier siblings: queued, waiting, halted,
+// or paused. The raw operation state for all four is pending, which the
+// single-deployment renderer glosses as "Starting" — contradicting the
+// <summary> line for a deployment that is in fact held by an earlier failure.
+// Every other presentation returns "" and keeps the raw-state gloss.
+func siblingDerivedStatus(d presentation.Deployment) string {
+	switch d.Presentation {
+	case presentation.StateQueuedNext, presentation.StateWaiting, presentation.StateHalted, presentation.StatePaused:
+		// The label interpolates deployment names; escape it like the
+		// <summary> line does so a name cannot inject markup into the body.
+		label := html.EscapeString(ui.CapitalizeFirst(d.Label))
+		if d.Emoji == "" {
+			return label
+		}
+		return d.Emoji + " " + label
+	default:
+		return ""
+	}
+}
+
+// stripLeadingHeading removes the headline a single-deployment renderer writes
+// as its first line ("## <title>[ — <env>]") plus the blank lines that follow
+// it, so a body embedded in a per-deployment <details> section does not repeat
+// the aggregate comment's header. A body that does not start with a heading is
+// returned unchanged.
+func stripLeadingHeading(body string) string {
+	if !strings.HasPrefix(body, "## ") {
+		return body
+	}
+	_, rest, found := strings.Cut(body, "\n")
+	if !found {
+		return ""
+	}
+	return strings.TrimLeft(rest, "\n")
 }
 
 // deploymentTag renders the "<emoji> <deployment>" prefix, omitting the leading

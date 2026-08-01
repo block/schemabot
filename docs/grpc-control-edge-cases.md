@@ -147,10 +147,11 @@ behind the latest remote progress sample. A cutover request is forward progress,
 so it must be rejected while a stop request is pending.
 
 When an apply is not started with `--defer-cutover`, no later cutover control
-request is required. MySQL/Spirit proceeds through cutover as part of the apply,
-and Vitess/PlanetScale creates the deploy request with auto-cutover enabled.
-The durable cutover request path is for explicit operator cutover after a
-deferred apply has paused.
+request is required. MySQL/Spirit proceeds through cutover as part of the apply.
+Vitess/PlanetScale creates the deploy request with the backend's auto-cutover
+disabled — the drive is the sole cutover actor and triggers cutover itself once
+the deploy request reports cutover-ready. The durable cutover request path is
+for explicit operator cutover after a deferred apply has paused.
 
 ### Cutover request accepted and remote Cutover succeeds
 
@@ -178,7 +179,7 @@ than process-local memory.
 | --- | --- | --- | --- |
 | 1 | Operator / automation | Starts apply without `--defer-cutover` | No later cutover command is needed |
 | 2 | MySQL / Spirit | Runs the online schema change and proceeds through cutover without waiting on the sentinel | Progress advances to completed unless the apply fails or is stopped |
-| 3 | Vitess / PlanetScale | Creates a deploy request with auto-cutover enabled | Progress advances through deploy/cutover to completed or revert window |
+| 3 | Vitess / PlanetScale | Creates a deploy request with the backend's auto-cutover disabled; the drive triggers cutover once the deploy request reports cutover-ready | Progress advances through deploy/cutover to completed or revert window |
 | 4 | SchemaBot scheduler | Polls and stores progress | CLI watch / PR comment / check show the normal apply lifecycle |
 
 **End state:** the apply completes without a durable cutover request. If an
@@ -366,7 +367,7 @@ only after storage returns to `waiting_for_cutover`.
 | 12 | Cutover requested while stop is pending | Reject forward-progress control while stop intent is pending | Covered for current cutover path |
 | 13 | Remote cutover readiness is ahead of stored state | Check remote progress with `external_id`; never send SchemaBot `apply_identifier` to remote Tern | Covered for current cutover path |
 | 14 | Cutover RPC fails or times out | Keep the apply blocked, store error message, add warning apply log, fail the cutover request | Covered for current cutover path |
-| 15 | Apply was not started with `--defer-cutover` | Do not require a cutover request; MySQL/Spirit and Vitess/PlanetScale should auto-cutover through normal apply progress | Covered by engine behavior; keep explicit in reviews |
+| 15 | Apply was not started with `--defer-cutover` | Do not require a durable cutover request; MySQL/Spirit cuts over as part of the apply, and the drive auto-triggers Vitess/PlanetScale cutover once the deploy request reports cutover-ready | Covered by drive auto-trigger; keep explicit in reviews |
 | 16 | Remote reports `cutting_over` but stored apply is not `cutting_over` | Treat as remote cutover readiness and queue the durable request so scheduler reconciliation is preserved | Covered for current cutover path |
 | 17 | Cutover requested while stored apply is already `cutting_over` | Return accepted/idempotent with `status=already_in_progress`, log the caller, and do not queue another durable request | Covered for current cutover path |
 | 18 | MySQL/Spirit cutover RPC lands on a non-owner data-plane replica | After durable readiness checks, any replica can drop the sentinel table; the owner runner observes the DB-side signal | Covered by K8s e2e |

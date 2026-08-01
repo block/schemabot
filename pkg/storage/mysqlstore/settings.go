@@ -15,7 +15,8 @@ const settingColumns = `id, setting_key, setting_value, created_at, updated_at`
 
 // settingsStore implements storage.SettingsStore using MySQL.
 type settingsStore struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect Dialect
 }
 
 // Get returns a setting by key, or nil if not found.
@@ -39,12 +40,14 @@ func (s *settingsStore) Get(ctx context.Context, key string) (*storage.Setting, 
 
 // Set saves a setting. Creates if not exists, updates if exists.
 func (s *settingsStore) Set(ctx context.Context, key, value string) error {
+	upsert := s.dialect.UpsertClause(
+		[]string{"setting_key"},
+		[]UpsertAssignment{{Column: "setting_value"}},
+	)
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO settings (setting_key, setting_value)
 		VALUES (?, ?)
-		ON DUPLICATE KEY UPDATE
-			setting_value = VALUES(setting_value)
-	`, key, value)
+		`+upsert, key, value)
 	return err
 }
 

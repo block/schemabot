@@ -57,6 +57,7 @@ type routingRecordingClient struct {
 	applyReq                 *ternv1.ApplyRequest
 	applyErr                 error
 	progressReq              *ternv1.ProgressRequest
+	logsReq                  *ternv1.LogsRequest
 	resumeApply              *storage.Apply
 	resumeOperationID        int64
 	resumeCutoverOperationID int64
@@ -92,6 +93,10 @@ func (c *routingRecordingClient) Apply(_ context.Context, req *ternv1.ApplyReque
 func (c *routingRecordingClient) Progress(_ context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	c.progressReq = req
 	return &ternv1.ProgressResponse{ApplyId: req.ApplyId}, nil
+}
+func (c *routingRecordingClient) Logs(_ context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	c.logsReq = req
+	return &ternv1.LogsResponse{ApplyId: req.ApplyId}, nil
 }
 
 func (c *routingRecordingClient) ResumeApply(_ context.Context, apply *storage.Apply) error {
@@ -814,6 +819,27 @@ func TestRoutingClientResumeApplyOperationRejectsOperationApplyMismatch(t *testi
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "belongs to apply 100, not apply 42")
 	assert.Nil(t, clients["west/staging"].resumeApply)
+}
+
+func TestRoutingClientLogsPreservesExplicitOperationTarget(t *testing.T) {
+	selected := &routingRecordingClient{}
+	client := newTestRoutingClient(t, RoutingClientConfig{
+		Resolver: routingResolverFunc(func(context.Context, routing.Request) ([]routing.ExecutionTarget, error) {
+			return []routing.ExecutionTarget{{Deployment: "west", Target: "primary-target", DatabaseType: storage.DatabaseTypeMySQL}}, nil
+		}),
+		PlanLookup:  routingPlanLookup{},
+		ApplyLookup: routingApplyLookup{},
+		ClientForDeployment: testDeploymentClientFunc(map[string]*routingRecordingClient{
+			"west/staging": selected,
+		}),
+	})
+
+	_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "remote-apply", Database: "orders", Environment: "staging", Target: "operation-target", Type: storage.DatabaseTypeStrata})
+	require.NoError(t, err)
+	require.NotNil(t, selected.logsReq)
+	assert.Equal(t, "remote-apply", selected.logsReq.ApplyId)
+	assert.Equal(t, "operation-target", selected.logsReq.Target)
+	assert.Equal(t, storage.DatabaseTypeStrata, selected.logsReq.Type)
 }
 
 func newTestRoutingClient(t *testing.T, config RoutingClientConfig) *RoutingClient {

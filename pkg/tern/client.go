@@ -18,12 +18,29 @@ import (
 // callers can match it with errors.Is regardless of the transport.
 var ErrNoTasksForApplyOperation = errors.New("no tasks found for apply operation")
 
+// ErrApplyLeasePresumedLost is returned by a drive whose lease heartbeat
+// writes have been failing for the full storage.ApplyLeaseStaleAfter window.
+// The lease was never definitively reported lost — storage was unreachable —
+// but the row's heartbeat is now stale enough for a peer driver to reclaim
+// it, so the current owner must stop driving. Callers match it with errors.Is
+// to record the displacement once and release the claim without treating it
+// as an engine failure.
+var ErrApplyLeasePresumedLost = errors.New("apply lease presumed lost after heartbeat failures spanning the staleness window")
+
 // ErrApplyOperationRowMissing is returned by ResumeApplyOperation when tasks
 // scope to the operation but the apply_operation row itself is absent. It is a
 // distinct, more accurate cause than the no-tasks case, but wraps
 // ErrNoTasksForApplyOperation so the same fail-closed handling (errors.Is)
 // terminalizes the stale claim rather than retrying it forever.
 var ErrApplyOperationRowMissing = fmt.Errorf("apply_operation row missing: %w", ErrNoTasksForApplyOperation)
+
+// ErrApplyTasksNotLoaded is returned by a whole-apply drive that loaded zero
+// tasks for an apply that owns task rows. Such an apply is undriveable, not
+// done: completing it would report success for schema changes that never ran,
+// and the unreturned rows would keep blocking their database as active work.
+// The drive fails closed and the apply stays claimable, so the work stays
+// visibly stuck until the rows load or an operator intervenes.
+var ErrApplyTasksNotLoaded = errors.New("apply owns task rows the drive loader did not return")
 
 var (
 	// ErrPullSchemaUnsupportedType marks a pull request for a database type that
@@ -54,6 +71,9 @@ type Client interface {
 
 	// Progress returns detailed progress for an active schema change.
 	Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error)
+
+	// Logs returns a bounded recent window of durable apply logs.
+	Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error)
 
 	// Cutover triggers the cutover phase when defer_cutover was used.
 	Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error)

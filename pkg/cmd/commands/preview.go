@@ -40,7 +40,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 	// Lock types
 	case templates.PreviewLockAcquired, templates.PreviewLockConflict,
 		templates.PreviewLockConflictCLI, templates.PreviewNoLockFound,
-		templates.PreviewUnlockNotOwned,
+		templates.PreviewLockOtherType, templates.PreviewUnlockNotOwned,
 		templates.PreviewLockReleased, templates.PreviewLocksList:
 		templates.PreviewCLIOutput(previewType)
 	// Sequential mode types
@@ -70,7 +70,10 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewUnsafeAllowed, templates.PreviewLintAll:
 		templates.PreviewCLIOutput(previewType)
 	// Comment template types
-	case templates.PreviewCommentPlan, templates.PreviewCommentPlanTenant,
+	case templates.PreviewCommentPlan, templates.PreviewCommentPlanBlocked,
+		templates.PreviewCommentPlanDirect,
+		templates.PreviewCommentApplyBlockedRejected,
+		templates.PreviewCommentPlanTenant,
 		templates.PreviewCommentPlanEmpty,
 		templates.PreviewCommentNoManagedSchema,
 		templates.PreviewCommentReconcileInProgress,
@@ -82,11 +85,15 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentHelp, templates.PreviewCommentSupportChannel,
 		templates.PreviewCommentErrors, templates.PreviewCommentUnsafeBlocked,
 		templates.PreviewCommentDropColumnBlocked, templates.PreviewCommentDropIndexBlocked,
+		templates.PreviewCommentLintErrorsBlocked,
 		templates.PreviewCommentApplyPlan, templates.PreviewCommentApplyPlanOptions,
 		templates.PreviewCommentApplyPlanUnsafe,
 		templates.PreviewCommentApplyProgress, templates.PreviewCommentApplyCompleted,
 		templates.PreviewCommentApplyEstimateExceeded,
-		templates.PreviewCommentApplyFailed, templates.PreviewCommentApplyStopped,
+		templates.PreviewCommentApplyFailed,
+		templates.PreviewCommentApplyFailedBeforeRowCopy,
+		templates.PreviewCommentApplyRetrying,
+		templates.PreviewCommentApplyStopped,
 		templates.PreviewCommentApplyWaitingCutover, templates.PreviewCommentApplyCuttingOver,
 		templates.PreviewCommentMultiDeployInProgress, templates.PreviewCommentMultiDeployFailed,
 		templates.PreviewCommentMultiDeployCompleted, templates.PreviewCommentMultiDeployAll,
@@ -108,12 +115,13 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyWaiting, templates.PreviewCommentUnlock,
 		templates.PreviewCommentApplyBlocked, templates.PreviewCommentApplyBlockedCLI,
 		templates.PreviewCommentApplyActive,
-		templates.PreviewCommentApplyNoLock, templates.PreviewCommentApplyAllType,
+		templates.PreviewCommentApplyNoLock, templates.PreviewCommentBaseSchemaStale,
 		templates.PreviewCommentChecksGateNotPassing, templates.PreviewCommentChecksGateInProgress,
 		templates.PreviewCommentActorNotAuthorized, templates.PreviewCommentActorAuthUnavailable,
 		templates.PreviewCommentDatabaseNotConfigured,
 		templates.PreviewCommentStartAccepted, templates.PreviewCommentStartPending,
-		templates.PreviewCommentCutoverAccepted, templates.PreviewCommentCutoverActive:
+		templates.PreviewCommentCutoverAccepted, templates.PreviewCommentCutoverActive,
+		templates.PreviewCommentVolumeAccepted, templates.PreviewCommentVolumeInvalid:
 		templates.PreviewCLIOutput(previewType)
 	// Paired aggregate types (PR + CLI subsections)
 	case templates.PreviewCommentPlanAll, templates.PreviewCommentLockingAll,
@@ -174,6 +182,7 @@ Lock Types:
   lock_released         Show lock released messages
   locks_list            Show locks list output
   no_lock_found         Show no lock found message
+  lock_other_type       Show lock exists under another database type message
   unlock_not_owned      Show unlock not owned message
 
 Sequential Mode (multi-table, one at a time):
@@ -238,6 +247,9 @@ Interactive TUI:
 
 Comment Templates (GitHub PR comments):
   comment_plan                  Plan comment with DDL changes + lint violations
+  comment_plan_blocked          Plan with a statement the engine refuses (blocked verdict)
+  comment_plan_direct           Locked plan with a statement routed to direct execution
+  comment_apply_blocked_rejected Apply rejected: plan contains engine-blocked statements
   comment_plan_tenant           Tenant-targeted plan comment
   comment_plan_empty            Plan comment with no changes
   comment_no_managed_schema     No managed schema changes in current PR
@@ -252,6 +264,7 @@ Comment Templates (GitHub PR comments):
   comment_unsafe_blocked        Unsafe changes blocked (no --allow-unsafe)
   comment_drop_column_blocked   Drop column blocked with destructive-drop guidance
   comment_drop_index_blocked    Drop index blocked with destructive-drop guidance
+  comment_lint_errors_blocked   Error-severity schema lint violations block apply
   comment_single_progress       Single table: running (most common case)
   comment_single_complete       Single table: completed
   comment_single_failed         Single table: failed
@@ -260,8 +273,11 @@ Comment Templates (GitHub PR comments):
   comment_apply_estimate_exceeded Multi-table: running after MySQL row estimate was exceeded
   comment_apply_completed       Multi-table: completed (all tables done)
   comment_apply_failed          Multi-table: failed (with error and cancelled tables)
+  comment_apply_failed_before_row_copy Multi-table: failed before row copy (preflight rejection, per-table error)
+  comment_apply_retrying        Multi-table: interrupted, retrying automatically (attempt counter)
   comment_apply_stopped         Multi-table: stopped (partial progress)
-  comment_apply_waiting_cutover Waiting for cutover
+  comment_apply_waiting_cutover Waiting for cutover (deferred, operator triggers)
+  comment_apply_waiting_cutover_automatic Waiting for cutover (non-deferred, drive triggers)
   comment_apply_cutting_over    Cutting over
   cli_multi_deploy_in_progress  CLI multi-deployment apply in progress
   cli_multi_deploy_failed       CLI multi-deployment apply with one failed deployment
@@ -292,6 +308,7 @@ Apply Command Comments (GitHub PR apply commands):
   comment_apply_blocked_cli     Apply blocked by CLI session
   comment_apply_active          Apply already in progress
   comment_apply_no_lock         No lock found (need apply first)
+  comment_base_schema_stale     Base schema changed after PR divergence
   comment_actor_not_authorized  Actor authorization denied
   comment_actor_auth_unavailable Actor authorization fail-closed error
   comment_database_not_configured Actor authorization database missing from this instance
@@ -299,7 +316,8 @@ Apply Command Comments (GitHub PR apply commands):
   comment_start_pending         Start already pending
   comment_cutover_accepted      Cutover request accepted
   comment_cutover_active        Cutover already in progress
-  comment_apply_all             Show all apply command previews
+  comment_volume_accepted       Volume request accepted
+  comment_volume_invalid        Volume command with a missing or invalid level
 
 Aggregate Types (grouped PR + CLI pairs):
   comment_plan_all              PR plan & status comments

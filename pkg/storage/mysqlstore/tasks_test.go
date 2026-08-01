@@ -95,6 +95,61 @@ func TestTaskStore_OperationLeaseGuardsUpdate(t *testing.T) {
 	assert.Equal(t, state.Task.Completed, reloaded.State)
 }
 
+// CountByApplyID reports every task row an apply owns — unsharded drive rows
+// and shard-tagged rows alike, with no operation-key filtering — and never
+// another apply's rows. It is the predicate a drive uses to distinguish a
+// genuinely task-less apply (safe to complete as a no-op) from one whose rows
+// a filtered loader did not return (must fail closed).
+func TestTaskStore_CountByApplyID(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	applyWithTasks := createTestApply(t, store, lock, "apply_count_tasks", 1)
+	tasklessLock := createTestLock(t, store, "otherdb", "mysql", "staging")
+	applyTaskless := createTestApply(t, store, tasklessLock, "apply_count_taskless", 2)
+
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: applyWithTasks.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+
+	createTask := func(identifier, table, shard string) {
+		now := time.Now()
+		_, err := store.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier:   identifier,
+			ApplyID:          applyWithTasks.ID,
+			ApplyOperationID: &opID,
+			PlanID:           applyWithTasks.PlanID,
+			Database:         applyWithTasks.Database,
+			DatabaseType:     applyWithTasks.DatabaseType,
+			Engine:           storage.EngineSpirit,
+			Environment:      applyWithTasks.Environment,
+			State:            state.Task.Pending,
+			TableName:        table,
+			Shard:            shard,
+			DDL:              "ALTER TABLE `" + table + "` ADD COLUMN `email` varchar(255)",
+			DDLAction:        "ALTER",
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		})
+		require.NoError(t, err)
+	}
+
+	createTask("task_count_users", "users", "")
+	createTask("task_count_users_-80", "users", "-80")
+	createTask("task_count_users_80-", "users", "80-")
+
+	count, err := store.Tasks().CountByApplyID(ctx, applyWithTasks.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), count, "every row counts, shard-tagged or not")
+
+	count, err = store.Tasks().CountByApplyID(ctx, applyTaskless.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), count, "an apply with no rows counts zero, never a sibling apply's rows")
+}
+
 // TestTaskStore_GetByApplyOperationID verifies that tasks can be loaded for a
 // single apply_operation (one deployment) independently of its sibling
 // deployments under the same apply. This is the read primitive an operator
@@ -304,6 +359,91 @@ func TestTaskStore_GetByApplyOperationIDIncludesMatchingShardedWorkTask(t *testi
 	assert.Equal(t, "-80", tasks[0].Shard)
 }
 
+// GetByApplyID is the whole-apply drive loader — an operator claiming a queued
+// apply loads every task it must drive through it. A shard-tagged row loads
+// only when it is the drive task of a sharded work operation (the operation's
+// shard key names the row's namespace/shard/table); unsharded per-table rows
+// always load; reflected per-shard progress rows — shard rows whose operation's
+// key does not match — stay out of the drive pipeline.
+func TestTaskStore_GetByApplyIDIncludesShardScopedDriveTasks(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "resolute", storage.DatabaseTypeStrata, "staging")
+	apply := createTestApply(t, store, lock, "apply_shard_drive_tasks", 1)
+
+	// A sharded work operation: its shard-tagged row for the keyed shard is the
+	// drive task; a sibling shard's row under the same operation is not.
+	shardedOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:       apply.ID,
+		Deployment:    "region-a",
+		OperationKey:  "commerce/-80/users",
+		OperationKind: storage.ApplyOperationKindWork,
+		Target:        "resolute",
+	})
+	require.NoError(t, err)
+
+	// An unsharded operation: its per-table row drives; a shard-tagged row under
+	// it is reflected per-shard progress, not drive work.
+	unshardedOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    apply.ID,
+		Deployment: "region-b",
+		Target:     "resolute",
+	})
+	require.NoError(t, err)
+
+	// A work operation of a different apply with the same key. tasks has no
+	// foreign-key constraint on apply_operation_id, so a row mis-associated
+	// with another apply's operation must still be excluded from drive work.
+	otherLock := createTestLock(t, store, "resolute_other", storage.DatabaseTypeStrata, "staging")
+	otherApply := createTestApply(t, store, otherLock, "apply_other_shard_drive", 1)
+	foreignOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:       otherApply.ID,
+		Deployment:    "region-a",
+		OperationKey:  "commerce/-80/users",
+		OperationKind: storage.ApplyOperationKindWork,
+		Target:        "resolute_other",
+	})
+	require.NoError(t, err)
+
+	now := time.Now()
+	createTask := func(identifier string, opID int64, table, shard string) {
+		_, err := store.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier:   identifier,
+			ApplyID:          apply.ID,
+			ApplyOperationID: &opID,
+			PlanID:           apply.PlanID,
+			Database:         apply.Database,
+			DatabaseType:     apply.DatabaseType,
+			Engine:           storage.EngineStrata,
+			Environment:      apply.Environment,
+			State:            state.Task.Pending,
+			Namespace:        "commerce",
+			TableName:        table,
+			Shard:            shard,
+			DDL:              "ALTER TABLE `" + table + "` ADD COLUMN `email` varchar(255)",
+			DDLAction:        "ALTER",
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		})
+		require.NoError(t, err)
+	}
+	createTask("task_users_-80_drive", shardedOpID, "users", "-80")
+	createTask("task_users_80-_reflected", shardedOpID, "users", "80-")
+	createTask("task_orders_drive", unshardedOpID, "orders", "")
+	createTask("task_orders_-80_reflected", unshardedOpID, "orders", "-80")
+	createTask("task_users_-80_foreign_op", foreignOpID, "users", "-80")
+
+	tasks, err := store.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err)
+	identifiers := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		identifiers = append(identifiers, task.TaskIdentifier)
+	}
+	assert.ElementsMatch(t, []string{"task_users_-80_drive", "task_orders_drive"}, identifiers)
+}
+
 // An unsharded engine (MySQL/Spirit) uses the empty-string shard sentinel, which
 // preserves today's one-task-per-table behavior.
 func TestTaskStore_UnshardedTaskHasEmptyShard(t *testing.T) {
@@ -412,14 +552,12 @@ func TestTaskStore_UpsertShardProgress(t *testing.T) {
 	advanced.State = state.Task.Completed
 	advanced.ProgressPercent = 100
 	advanced.RowsCopied = 500000
-	advanced.ReadyToComplete = true
 	require.NoError(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), advanced))
 	got, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	require.Len(t, got, 1, "re-upserting the same shard must update in place, not insert a duplicate")
 	assert.Equal(t, state.Task.Completed, got[0].State)
 	assert.Equal(t, 100, got[0].ProgressPercent)
-	assert.True(t, got[0].ReadyToComplete)
 
 	// A stale operator must not overwrite an existing shard row (update path fails closed).
 	stale := shardTask("-80")

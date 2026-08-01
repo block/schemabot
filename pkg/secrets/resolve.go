@@ -77,7 +77,22 @@ func Unregister(prefix string) {
 //   - Direct value is returned as-is
 //
 // If value is empty, falls back to the fallbackEnvVar environment variable.
+//
+// Resolve uses a background context for the built-in AWS Secrets Manager lookup.
+// Callers on a request path that want that lookup bounded by the request deadline
+// should use ResolveContext. Custom resolvers never receive a context (see
+// ResolverFunc), so their I/O is not bounded either way.
 func Resolve(value string, fallbackEnvVar string) (string, error) {
+	return ResolveContext(context.Background(), value, fallbackEnvVar)
+}
+
+// ResolveContext is Resolve with a caller-supplied context. The context bounds
+// the built-in AWS Secrets Manager lookup so a per-request resolution is
+// cancelled by the caller's deadline instead of only a fixed background timeout.
+// The env:, file:, and literal paths do only local, non-cancellable work and
+// ignore the context. Custom resolvers may perform network I/O, but ResolverFunc
+// takes no context, so that I/O is not cancelled by ctx either.
+func ResolveContext(ctx context.Context, value string, fallbackEnvVar string) (string, error) {
 	if value == "" {
 		return os.Getenv(fallbackEnvVar), nil
 	}
@@ -105,7 +120,7 @@ func Resolve(value string, fallbackEnvVar string) (string, error) {
 
 	// Check for "secretsmanager:" prefix
 	if strings.HasPrefix(value, "secretsmanager:") {
-		return resolveSecretsManager(value[15:])
+		return resolveSecretsManager(ctx, value[15:])
 	}
 
 	return value, nil
@@ -123,12 +138,16 @@ func resolveFile(path string) (string, error) {
 
 // resolveSecretsManager fetches a secret from AWS Secrets Manager.
 // Format: "secret-name" or "secret-name#json-key"
-func resolveSecretsManager(ref string) (string, error) {
+//
+// The fetch is bounded by the caller's context and a 10s cap, whichever is
+// sooner, so a per-request resolution honors the request deadline instead of
+// always waiting the full background timeout.
+func resolveSecretsManager(ctx context.Context, ref string) (string, error) {
 	// Parse secret name and optional JSON key
 	secretName, jsonKey, _ := strings.Cut(ref, "#")
 
 	// Create AWS config (uses default credential chain: env vars, IAM role, etc.)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	cfg, err := config.LoadDefaultConfig(ctx)

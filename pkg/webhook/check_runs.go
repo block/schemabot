@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // maxCheckRunTextLength is the GitHub API limit for check run output text.
@@ -94,6 +95,17 @@ var configDiscoveryFailedBlock = checkBlockReason{
 var managedDirMissingConfigBlock = checkBlockReason{
 	blockingReason: "managed_dir_missing_config",
 	message:        "A schema change under a SchemaBot-managed directory has no schemabot.yaml config.",
+}
+
+// reviewTimeDeploymentDriftBlock is used when a review-time drift rollup finds a
+// configured deployment whose live schema no longer matches the reviewed plan,
+// or a deployment that could not be diffed or confirmed to match. The plan check
+// fails closed until an operator reconciles the deployment or replans against
+// matching schema. blockingReason is stored so the block survives later writes
+// (e.g. an apply-time plan) that did not re-evaluate drift.
+var reviewTimeDeploymentDriftBlock = checkBlockReason{
+	blockingReason: storage.ReviewTimeDeploymentDriftBlockingReason,
+	message:        "One or more deployments differ from the reviewed plan, or could not be confirmed to match it; reconcile the deployment drift or replan once the deployments match before this check can pass.",
 }
 
 // noAllowedConfiguredEnvironmentsBlock is used when schema files changed but

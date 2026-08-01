@@ -18,6 +18,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -68,6 +69,9 @@ const (
 	hookTargetTypeApp    = "integration"
 	hookTargetTypeRepo   = "repository"
 	maxWebhookBodyBytes  = 10 << 20
+
+	defaultDurableWebhookPollInterval  = 1 * time.Second
+	defaultDurableWebhookLeaseDuration = 1 * time.Minute
 )
 
 // Handler processes GitHub webhook events.
@@ -79,6 +83,24 @@ type Handler struct {
 	// request that failed with transient remote unavailability. Zero means
 	// the package default.
 	transientPlanRetryDelay time.Duration
+
+	// participantNudgeRefoldDelay overrides the pause before the second
+	// aggregate re-fold after a participant-comment nudge. Zero means the
+	// package default.
+	participantNudgeRefoldDelay time.Duration
+
+	// participantRefoldDelayOverride overrides the backoff before each
+	// self-scheduled aggregate re-fold armed while expected participants
+	// remain unresolved. Test-only: when set it applies to every attempt.
+	// Zero means the package backoff schedule.
+	participantRefoldDelayOverride time.Duration
+
+	// participantRefoldAttempts tracks, per repo#pr, how many self-scheduled
+	// aggregate re-folds have been armed while expected participants remain
+	// unresolved. Bounded by maxParticipantRefoldAttempts and cleared when a
+	// fold resolves every participant. Guarded by participantRefoldMu.
+	participantRefoldMu       sync.Mutex
+	participantRefoldAttempts map[string]int
 
 	// webhookSecretsByApp maps each configured App's logical name to its
 	// HMAC webhook secret. In legacy single-App mode there is exactly one
@@ -102,6 +124,55 @@ type Handler struct {
 	// (single- and multi-App) unchanged.
 	repoWebhookSecret []byte
 
+	durableWebhookDispatch      bool
+	durableWebhookDriverCount   int
+	durableWebhookPollInterval  time.Duration
+	durableWebhookLeaseDuration time.Duration
+	durableWebhookMu            sync.Mutex
+	durableWebhookStop          chan struct{}
+	durableWebhookCancel        context.CancelFunc
+	durableWebhookWake          chan struct{}
+	durableWebhookWg            sync.WaitGroup
+	// durableWebhookProcessOverride is a test seam that replaces
+	// processDurableWebhookEvent so driver finish-path behavior (for example
+	// refusing to complete a delivery after lease loss) can be exercised
+	// deterministically. Production code never sets it.
+	durableWebhookProcessOverride func(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error)
+
+	// inProcessWebhookCount tracks the detached goSafe goroutines that
+	// non-durable event paths (issue_comment, participant_nudge, check_run,
+	// push, and the legacy pull_request branches) launch after acking 200. The
+	// request handler returns immediately, so the HTTP server's own graceful
+	// shutdown does not wait for this work; DrainInProcessWebhookWork does, so a
+	// deploy drains already-acked work instead of dropping it.
+	//
+	// The drain is transitive over work chains: tracked work often spawns more
+	// goSafe work while it runs (for example handleMultiEnvPlan ->
+	// acknowledgeCommand -> goSafe(add eyes reaction)). Registration is allowed
+	// to continue during the drain as long as the count is provably nonzero — a
+	// child of tracked work always registers while its parent is still counted,
+	// so the drain waits for the whole chain. Only truly-fresh work that arrives
+	// when the count is zero (the delayed time.AfterFunc timer case, which can
+	// fire after the drain has already reached empty) runs untracked, which
+	// bounds the drain so late timers cannot keep it alive forever.
+	//
+	// inProcessWebhookMu guards the count, the draining flag, and the
+	// inProcessWebhookDrained signal so registration and the drain's
+	// zero-count check are mutually consistent.
+	inProcessWebhookMu       sync.Mutex
+	inProcessWebhookDraining bool
+	inProcessWebhookCount    int
+	// inProcessWebhookDrained is created by DrainInProcessWebhookWork when it
+	// begins waiting on in-flight work and closed by the goroutine that drops
+	// the count to zero. Nil when no drain is waiting.
+	inProcessWebhookDrained chan struct{}
+
+	webhookReconciler        bool
+	webhookReconcileInterval time.Duration
+	webhookReconcileLookback time.Duration
+	webhookReconcileGrace    time.Duration
+	webhookReconcileMaxPages int
+
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
 	priorEnvCheckRetryInterval time.Duration
@@ -119,6 +190,29 @@ func WithRepoWebhookSecret(secret []byte) HandlerOption {
 		if len(secret) > 0 {
 			h.repoWebhookSecret = secret
 		}
+	}
+}
+
+// WithDurableWebhookDispatch enables the durable webhook inbox path for events
+// that have been moved out of the request path. Unsupported events keep using
+// their existing synchronous or fire-and-forget handlers.
+func WithDurableWebhookDispatch() HandlerOption {
+	return func(h *Handler) {
+		h.durableWebhookDispatch = true
+	}
+}
+
+// WithWebhookReconciler enables the webhook reconciliation loop. It does two
+// things per pass: (1) an active stuck-processing sweep that terminalizes inbox
+// rows wedged past the attempt cap so they emit failures and become
+// redeliverable, and (2) a report-only scan of recently updated open PRs in
+// registered repositories that reports PR heads with no corresponding inbox
+// delivery (no rows are synthesized). Only the missing-delivery scan is
+// report-only. It takes effect alongside WithDurableWebhookDispatch, whose
+// lifecycle it shares.
+func WithWebhookReconciler() HandlerOption {
+	return func(h *Handler) {
+		h.webhookReconciler = true
 	}
 }
 
@@ -153,13 +247,19 @@ func NewHandlerWithClientSet(service *api.Service, ghClients github.ClientSet, w
 // for legacy single-secret behavior (used internally by NewHandler).
 func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, webhookSecretsByApp map[string][]byte, webhookAppByID map[int64]string, logger *slog.Logger, opts ...HandlerOption) *Handler {
 	h := &Handler{
-		service:                    service,
-		ghClients:                  ghClients,
-		webhookSecretsByApp:        maps.Clone(webhookSecretsByApp),
-		webhookAppByID:             maps.Clone(webhookAppByID),
-		logger:                     logger,
-		priorEnvCheckMaxAttempts:   defaultPriorEnvCheckMaxAttempts,
-		priorEnvCheckRetryInterval: defaultPriorEnvCheckRetryInterval,
+		service:                     service,
+		ghClients:                   ghClients,
+		webhookSecretsByApp:         maps.Clone(webhookSecretsByApp),
+		webhookAppByID:              maps.Clone(webhookAppByID),
+		logger:                      logger,
+		durableWebhookPollInterval:  defaultDurableWebhookPollInterval,
+		durableWebhookLeaseDuration: defaultDurableWebhookLeaseDuration,
+		webhookReconcileInterval:    defaultWebhookReconcileInterval,
+		webhookReconcileLookback:    defaultWebhookReconcileLookback,
+		webhookReconcileGrace:       defaultWebhookReconcileGrace,
+		webhookReconcileMaxPages:    defaultWebhookReconcileMaxPages,
+		priorEnvCheckMaxAttempts:    defaultPriorEnvCheckMaxAttempts,
+		priorEnvCheckRetryInterval:  defaultPriorEnvCheckRetryInterval,
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -195,6 +295,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 					ApplyID:        apply.ID,
 					ApplyLease:     apply.Lease(),
 					SupportChannel: h.supportChannel(),
+					Tenant:         h.deploymentTenant(),
 					Logger:         logger,
 					OnTerminalHook: func(a *storage.Apply) {
 						h.refreshChecksForTerminalApply(context.Background(), a, "recovered apply")
@@ -202,9 +303,12 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 				}))
 		}
 
-		// Register the aggregate terminal-summary callback. A multi-operation
-		// apply suppresses the per-driver observer, so its single terminal summary
-		// is published here by the operator that won the aggregate projection CAS.
+		// Register the aggregate terminal-summary callback, invoked by the
+		// operator that won the aggregate projection CAS. A multi-operation apply
+		// suppresses the per-driver observer, so this is its only summary
+		// publisher; a single-operation apply reaches it from paths with no live
+		// observer (stop reconciliation), where the summary-marker claim keeps
+		// the publish exactly-once against any observer still alive.
 		service.OnApplyTerminalSummary = func(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
 			if apply.Repository == "" || apply.PullRequest == 0 || apply.InstallationID == 0 {
 				logger.Debug("aggregate terminal summary skipped: apply has no GitHub destination",
@@ -218,7 +322,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 				return fmt.Errorf("resolve GitHub App client for aggregate terminal summary of apply %s repo %s pr %d: %w",
 					apply.ApplyIdentifier, apply.Repository, apply.PullRequest, err)
 			}
-			logger.Info("publishing aggregate terminal summary for multi-operation apply",
+			logger.Info("publishing aggregate terminal summary",
 				"apply_id", apply.ApplyIdentifier,
 				"repo", apply.Repository,
 				"pr", apply.PullRequest,
@@ -231,6 +335,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 				InstallationID: apply.InstallationID,
 				ApplyID:        apply.ID,
 				SupportChannel: h.supportChannel(),
+				Tenant:         h.deploymentTenant(),
 				Logger:         logger,
 				OnTerminalHook: func(a *storage.Apply) {
 					h.refreshChecksForTerminalApply(context.Background(), a, "aggregate terminal apply")
@@ -259,17 +364,6 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 			"environment", a.Environment,
 			"context", logCtx,
 		}
-	}
-	// A completed rollback reverted the PR's schema change, so its required check
-	// must land action_required, not success — otherwise the PR could merge with
-	// the change missing. The rollback command registers an observer that does
-	// this, but an operator-driven (multi-operation) or recovery terminal
-	// suppresses that per-driver observer and routes here instead, so the
-	// rollback intent must be honored from the durable apply.
-	if a.IsRollback() && state.IsState(a.State, state.Apply.Completed) {
-		h.logger.Info("refreshing check to action_required for completed rollback", checkFields()...)
-		h.setCheckActionRequired(a.Repository, a.PullRequest, a.InstallationID, a)
-		return
 	}
 	updated, err := h.updateCheckRecordForApplyResult(ctx, a.Repository, a.PullRequest, a)
 	if err != nil {
@@ -337,6 +431,18 @@ func (h *Handler) config() *api.ServerConfig {
 	return h.service.Config()
 }
 
+// deploymentTenant returns this deployment's own tenant, or "" when the
+// deployment is untenanted or the service is not wired. Command hints posted
+// back to the PR carry it so pasted commands address this deployment: in
+// tenant mode, commands without an explicit tenant target are ignored.
+func (h *Handler) deploymentTenant() string {
+	cfg := h.config()
+	if cfg == nil {
+		return ""
+	}
+	return cfg.Tenant
+}
+
 // clientForRepo returns an installation-scoped GitHub client for the App
 // that owns the given repository. Callers that already have a factory in
 // scope should use it directly; this is the convenience for the common
@@ -350,8 +456,12 @@ func (h *Handler) clientForRepo(repo string, installationID int64) (*github.Inst
 }
 
 // ReconcileMissingSummaryComments repairs the apply_comments outbox on startup.
-// It finds applies with a progress comment but no summary comment, then posts
-// the missing summary so the PR shows the final result after a restart.
+// It finds recently terminal applies (including stopped) with a progress
+// comment but no summary comment, then posts the missing summary so the PR
+// shows the final result after a restart. Each repair goes through the atomic
+// summary-marker claim, so a publisher racing this reconciler — or another
+// pod's reconciler — still yields exactly one summary; a claim sentinel left
+// by a publisher that crashed before posting is taken over once stale.
 func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 	if h.service == nil {
 		h.logger.Debug("skipping missing summary reconciliation without service")
@@ -360,7 +470,7 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 
 	applies, err := h.service.Storage().Applies().FindMissingSummaryComment(ctx)
 	if err != nil {
-		h.logger.Error("summary comment reconciliation skipped this startup; PRs with a finished apply may show no final summary until the next restart",
+		h.logger.Error("summary comment reconciliation skipped this startup; terminal applies (including stopped) missing a summary comment stay unrepaired until the next restart",
 			"error", err)
 		return
 	}
@@ -373,9 +483,14 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 	h.logger.Info("found applies missing summary comments", "count", len(applies))
 
 	for _, apply := range applies {
+		if !h.claimSummaryForReconciliation(ctx, apply) {
+			continue
+		}
+
 		tasks, err := h.service.Storage().Tasks().GetByApplyID(ctx, apply.ID)
 		if err != nil {
-			h.logger.Error("failed to load tasks for missing summary reconciliation", append(apply.LogAttrs(), "error", err)...)
+			h.logger.Error("failed to load tasks for missing summary reconciliation; releasing summary claim", append(apply.LogAttrs(), "error", err)...)
+			h.releaseSummaryClaim(ctx, apply)
 			continue
 		}
 
@@ -396,8 +511,83 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 			ops = nil
 		}
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
-		summaryBody := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil)
-		h.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID, state.Comment.Summary, summaryBody)
+		summaryBase := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, h.deploymentTenant())
+		summaryBody := summaryBase + failureLogsSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
+		h.postClaimedSummaryComment(ctx, apply, summaryBody)
+	}
+}
+
+// claimSummaryForReconciliation acquires the atomic summary-marker claim for a
+// reconciliation repair. A fresh claim wins when no marker exists; when the
+// marker is a claim sentinel left behind by a crashed publisher, the stale
+// takeover path transfers it instead. Losing both means another writer posted
+// or is actively posting the summary, so the repair is skipped.
+func (h *Handler) claimSummaryForReconciliation(ctx context.Context, apply *storage.Apply) bool {
+	won, err := h.service.Storage().ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	if err != nil {
+		h.logger.Error("failed to claim summary comment for reconciliation; apply skipped until next startup",
+			append(apply.LogAttrs(), "error", err)...)
+		return false
+	}
+	if won {
+		return true
+	}
+	reclaimed, err := h.service.Storage().ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	if err != nil {
+		h.logger.Error("failed to reclaim stale summary claim for reconciliation; apply skipped until next startup",
+			append(apply.LogAttrs(), "error", err)...)
+		return false
+	}
+	if !reclaimed {
+		h.logger.Info("summary comment already claimed or posted by another writer; skipping reconciliation for apply",
+			apply.LogAttrs()...)
+		return false
+	}
+	return true
+}
+
+// postClaimedSummaryComment posts a reconciled summary comment under a claim
+// this reconciler holds and records the posted comment ID. A failed post
+// releases the claim so the next startup can retry immediately; a post that
+// lands but fails to record leaves the sentinel to be reclaimed once stale
+// (bounding the duplicate to one).
+func (h *Handler) postClaimedSummaryComment(ctx context.Context, apply *storage.Apply, body string) {
+	client, err := h.clientForRepo(apply.Repository, apply.InstallationID)
+	if err != nil {
+		h.logger.Error("failed to create GitHub client for reconciled summary comment; releasing summary claim",
+			append(apply.LogAttrs(), "error", err)...)
+		h.releaseSummaryClaim(ctx, apply)
+		return
+	}
+
+	commentID, _, err := client.CreateIssueComment(ctx, apply.Repository, apply.PullRequest, h.renderPRComment(body))
+	if err != nil {
+		h.logger.Error("failed to post reconciled summary comment; releasing summary claim",
+			append(apply.LogAttrs(), "error", err)...)
+		h.releaseSummaryClaim(ctx, apply)
+		return
+	}
+
+	metrics.RecordSummaryCommentRepaired(ctx, apply.Repository, apply.State)
+
+	marker := &storage.ApplyComment{
+		ApplyID:         apply.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: commentID,
+	}
+	if err := h.service.Storage().ApplyComments().Upsert(ctx, marker); err != nil {
+		h.logger.Error("posted reconciled summary comment but failed to record its comment ID",
+			append(apply.LogAttrs(), "error", err, "comment_id", commentID)...)
+	}
+}
+
+// releaseSummaryClaim returns a won-but-unused summary claim so a later
+// publisher or the next startup's reconciliation can retry immediately instead
+// of waiting out the stale-claim window.
+func (h *Handler) releaseSummaryClaim(ctx context.Context, apply *storage.Apply) {
+	if err := h.service.Storage().ApplyComments().ReleaseSummaryClaim(ctx, apply.ID); err != nil {
+		h.logger.Error("failed to release summary claim; reconciliation will reclaim it once stale",
+			append(apply.LogAttrs(), "error", err)...)
 	}
 }
 
@@ -431,7 +621,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	appName, appID, authStatus, ok := h.authenticateWebhook(r, body)
 	if !ok {
 		h.logger.Warn("webhook rejected",
-			"status", authStatus,
+			"auth_status", authStatus,
 			"app_name", appName,
 			"app_id", appID,
 			"delivery_id", r.Header.Get(headerDeliveryID),
@@ -503,19 +693,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx = withResolvedInstallationID(ctx, installationID)
 	}
 
+	// Capture the handler's HTTP status so "processed" is only recorded when the
+	// delivery actually succeeded. A handler that fails closed with a 5xx has
+	// already emitted a specific failure status; recording "processed" too would
+	// double-count the same delivery under contradictory labels.
+	sw := &statusCapturingResponseWriter{ResponseWriter: w}
+	recordProcessed := func() {
+		if sw.statusCode() >= http.StatusInternalServerError {
+			return
+		}
+		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
+	}
 	switch eventType {
 	case "issue_comment":
-		h.handleIssueComment(ctx, metricApp, w, body)
-		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
+		h.handleIssueComment(ctx, metricApp, sw, body)
+		recordProcessed()
 	case "check_run":
-		h.handleCheckRun(ctx, w, body)
-		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
+		h.handleCheckRun(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
+		recordProcessed()
 	case "pull_request":
-		h.handlePullRequest(ctx, metricApp, w, body)
-		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
+		h.handlePullRequest(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
+		recordProcessed()
 	case "merge_group":
-		h.handleMergeGroup(ctx, metricApp, w, body)
-		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
+		h.handleMergeGroup(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
+		recordProcessed()
+	case "push":
+		h.handlePush(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
+		recordProcessed()
 	default:
 		h.logger.Info("webhook ignored",
 			"reason", "unsupported_event_type",
@@ -730,19 +934,108 @@ func verifyHMAC(signature string, body, secret []byte) bool {
 func (h *Handler) recoverPanic(repo string, pr int, installationID int64) {
 	if r := recover(); r != nil {
 		stack := debug.Stack()
-		h.logger.Error("goroutine panic", "error", r, "stack", string(stack))
+		h.logger.Error("goroutine panic", "repo", repo, "pr", pr, "installation_id", installationID, "error", r, "stack", string(stack))
 		h.postComment(repo, pr, installationID,
 			fmt.Sprintf("**Internal error: goroutine panic. This is a bug — please report it.**\n```\n%v\n```", r))
 	}
 }
 
 // goSafe launches fn in a goroutine with panic recovery that posts an error
-// comment on the PR so the user gets feedback instead of silence.
+// comment on the PR so the user gets feedback instead of silence. The goroutine
+// is counted on inProcessWebhookCount so DrainInProcessWebhookWork can wait for
+// already-acked work to finish on shutdown.
+//
+// Registration continues during the drain as long as the count is nonzero, so
+// work spawned by an in-flight tracked goroutine (a child of tracked work
+// always registers while its parent is still counted) is drained too. Only
+// truly-fresh work that arrives when the count is zero after the drain began
+// (the delayed time.AfterFunc timer case) runs untracked: the drain has
+// committed to a bounded wait and reached empty, so it will not wait for late
+// timers.
 func (h *Handler) goSafe(repo string, pr int, installationID int64, fn func()) {
-	go func() {
+	run := func() {
 		defer h.recoverPanic(repo, pr, installationID)
 		fn()
+	}
+
+	h.inProcessWebhookMu.Lock()
+	if h.inProcessWebhookDraining && h.inProcessWebhookCount == 0 {
+		h.inProcessWebhookMu.Unlock()
+		h.logger.Warn("webhook work started after shutdown drain reached empty; running untracked and will be dropped if shutdown completes before it finishes",
+			"repo", repo, "pr", pr, "installation_id", installationID)
+		go run()
+		return
+	}
+	h.inProcessWebhookCount++
+	h.inProcessWebhookMu.Unlock()
+
+	go func() {
+		defer h.finishInProcessWebhookWork()
+		run()
 	}()
+}
+
+// finishInProcessWebhookWork decrements the in-flight count and, when it reaches
+// zero while a drain is waiting, closes the drain's signal channel.
+func (h *Handler) finishInProcessWebhookWork() {
+	h.inProcessWebhookMu.Lock()
+	h.inProcessWebhookCount--
+	if h.inProcessWebhookCount == 0 && h.inProcessWebhookDrained != nil {
+		close(h.inProcessWebhookDrained)
+		h.inProcessWebhookDrained = nil
+	}
+	h.inProcessWebhookMu.Unlock()
+}
+
+// DrainInProcessWebhookWork waits for the detached goSafe goroutines to finish,
+// bounded by ctx. It flips the draining flag so fresh work arriving once the
+// count reaches zero runs untracked, then waits for the work in flight (and its
+// transitively-spawned children) to drop the count to zero. On timeout it
+// returns without waiting further; the already-acked work still running may be
+// dropped when the process exits.
+func (h *Handler) DrainInProcessWebhookWork(ctx context.Context) {
+	h.inProcessWebhookMu.Lock()
+	h.inProcessWebhookDraining = true
+	if h.inProcessWebhookCount == 0 {
+		h.inProcessWebhookMu.Unlock()
+		h.logger.Info("in-process webhook goroutines drained")
+		return
+	}
+	done := make(chan struct{})
+	h.inProcessWebhookDrained = done
+	h.inProcessWebhookMu.Unlock()
+
+	select {
+	case <-done:
+		h.logger.Info("in-process webhook goroutines drained")
+	case <-ctx.Done():
+		h.logger.Warn("timed out draining in-process webhook goroutines; already-acked webhook work still running will be dropped on exit",
+			"error", ctx.Err())
+	}
+}
+
+// statusCapturingResponseWriter records the HTTP status a handler wrote so the
+// dispatcher can tell a successful delivery from one that failed closed with a
+// 5xx. Without it the dispatcher records "processed" unconditionally, which
+// double-counts a failed delivery alongside the specific failure status the
+// handler already emitted (e.g. durable_enqueue_failed).
+type statusCapturingResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusCapturingResponseWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+// statusCode returns the status the handler wrote, defaulting to 200 for
+// handlers that write a body without an explicit WriteHeader.
+func (w *statusCapturingResponseWriter) statusCode() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
 }
 
 func (h *Handler) writeJSON(w http.ResponseWriter, status int, v any) {

@@ -231,7 +231,7 @@ func FormatNamespacedTables(tables []TableProgress) string {
 // FormatNamespacedTablesWithActivityBar returns tables grouped by keyspace using
 // the provided activity bar when row-copy progress has exceeded its estimate.
 func FormatNamespacedTablesWithActivityBar(tables []TableProgress, activityBar string) string {
-	return FormatNamespacedTablesWithActivity(tables, activityBar, "Active")
+	return FormatNamespacedTablesWithActivity(tables, activityBar, "Finalizing copy")
 }
 
 // FormatNamespacedTablesWithActivity returns tables grouped by keyspace using
@@ -411,7 +411,7 @@ func FormatTableProgress(t TableProgress) string {
 // FormatTableProgressWithActivityBar returns progress for a single table using
 // the provided activity bar when row-copy progress has exceeded its estimate.
 func FormatTableProgressWithActivityBar(t TableProgress, activityBar string) string {
-	return FormatTableProgressWithActivity(t, activityBar, "Active")
+	return FormatTableProgressWithActivity(t, activityBar, "Finalizing copy")
 }
 
 // FormatTableProgressWithActivity returns progress for a single table using the
@@ -545,7 +545,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		return b.String()
 	case state.Apply.RevertWindow:
 		bar := ui.ProgressBarWaitingCutover() // yellow — complete but revert available
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ✓ Complete (pending revert)\n", t.TableName, bar)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Complete (revert window open)\n", t.TableName, bar)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}
@@ -854,18 +854,76 @@ type StatusListData struct {
 	MaxLimit       int
 	HasMore        bool
 	FailuresOnly   bool
+	Last           string
+	StateFilter    string
+	StateCounts    map[string]int
 	ShowExternalID bool
 	Deployment     string
 	Applies        []ActiveApplyData
 }
 
+// statusWindowSuffix renders the active list filters (--state, --last) as a
+// header suffix, or empty when the list is unfiltered.
+func statusWindowSuffix(data StatusListData) string {
+	parts := statusFilterPhrases(data)
+	if len(parts) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" %s(%s)%s", ANSIDim, strings.Join(parts, ", "), ANSIReset)
+}
+
+// statusFilterPhrases returns one human-readable phrase per active list
+// filter, shared by the header suffix and the empty-state message.
+func statusFilterPhrases(data StatusListData) []string {
+	var parts []string
+	if data.StateFilter != "" {
+		parts = append(parts, fmt.Sprintf("in state %s", state.Label(data.StateFilter)))
+	}
+	if data.Last != "" {
+		parts = append(parts, fmt.Sprintf("updated in the last %s", data.Last))
+	}
+	return parts
+}
+
+// writeStatusStateSummary renders one line tallying every apply matching the
+// request's filters by state. The counts come from the server unbounded by
+// limit, so the line stays truthful when the table below it is a truncated
+// page. Ordered by count descending (ties by state name) so the dominant
+// outcome reads first.
+func writeStatusStateSummary(counts map[string]int) {
+	if len(counts) == 0 {
+		return
+	}
+	states := make([]string, 0, len(counts))
+	total := 0
+	for s, n := range counts {
+		states = append(states, s)
+		total += n
+	}
+	sort.Slice(states, func(i, j int) bool {
+		if counts[states[i]] != counts[states[j]] {
+			return counts[states[i]] > counts[states[j]]
+		}
+		return states[i] < states[j]
+	})
+	parts := make([]string, 0, len(states))
+	for _, s := range states {
+		parts = append(parts, fmt.Sprintf("%d %s", counts[s], state.Label(s)))
+	}
+	fmt.Printf("%s%d total: %s%s\n", ANSIDim, total, strings.Join(parts, " · "), ANSIReset)
+}
+
 // WriteStatusList writes the status list output.
 func WriteStatusList(data StatusListData) {
 	if len(data.Applies) == 0 {
+		filters := ""
+		if parts := statusFilterPhrases(data); len(parts) > 0 {
+			filters = " " + strings.Join(parts, ", ")
+		}
 		if data.FailuresOnly {
-			fmt.Printf("%sNo recent failed schema changes%s\n", ANSIDim, ANSIReset)
+			fmt.Printf("%sNo recent failed schema changes%s%s\n", ANSIDim, filters, ANSIReset)
 		} else {
-			fmt.Printf("%sNo recent schema changes%s\n", ANSIDim, ANSIReset)
+			fmt.Printf("%sNo recent schema changes%s%s\n", ANSIDim, filters, ANSIReset)
 		}
 		return
 	}
@@ -877,13 +935,14 @@ func WriteStatusList(data StatusListData) {
 	// Header
 	if data.ActiveCount > 0 {
 		if data.ActiveCount == 1 {
-			fmt.Printf("%s1 active schema change%s\n", ANSIBold, ANSIReset)
+			fmt.Printf("%s1 active schema change%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
 		} else {
-			fmt.Printf("%s%d active schema changes%s\n", ANSIBold, data.ActiveCount, ANSIReset)
+			fmt.Printf("%s%d active schema changes%s%s\n", ANSIBold, data.ActiveCount, ANSIReset, statusWindowSuffix(data))
 		}
 	} else {
-		fmt.Printf("%sRecent schema changes%s\n", ANSIBold, ANSIReset)
+		fmt.Printf("%sRecent schema changes%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
 	}
+	writeStatusStateSummary(data.StateCounts)
 	fmt.Println()
 
 	// Calculate column widths from data
@@ -1027,7 +1086,8 @@ func writeStatusListFooter(data StatusListData) {
 }
 
 func writeFailedStatusList(data StatusListData) {
-	fmt.Printf("%sRecent failed schema changes%s\n", ANSIBold, ANSIReset)
+	fmt.Printf("%sRecent failed schema changes%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
+	writeStatusStateSummary(data.StateCounts)
 	fmt.Println()
 
 	for i, a := range data.Applies {

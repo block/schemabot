@@ -114,6 +114,14 @@ service Tern {
     };
   }
 
+  // Logs returns a bounded recent window of durable apply logs. It is read-only.
+  rpc Logs(LogsRequest) returns (LogsResponse) {
+    option (google.api.http) = {
+      post: "/v1/logs"
+      body: "*"
+    };
+  }
+
   // Cutover triggers the table swap phase for a schema change that was started
   // with defer_cutover=true. Only valid when state is waiting_for_cutover.
   //
@@ -428,6 +436,11 @@ message TableChange {
   // Unsafe change tracking
   bool is_unsafe = 5;
   string unsafe_reason = 6;
+  // Execution-mode verdict: how the engine will run this statement at apply
+  // time. Empty means the engine's default path; "blocked" means the engine
+  // deterministically refuses the statement and the apply will fail.
+  string execution_mode = 7;
+  string mode_reason = 8;
 }
 
 // SchemaChange is a namespace-level bundle. A PlanResponse must include at most
@@ -547,6 +560,33 @@ message ProgressRequest {
   string environment = 2;
 }
 
+message LogsRequest {
+  string apply_id = 1;
+  string target = 2;
+  string database = 3;
+  string type = 4;
+  string environment = 5;
+  int32 limit = 6;
+}
+
+message ApplyLog {
+  int64 id = 1;
+  optional int64 task_id = 2;
+  string level = 3;
+  string event_type = 4;
+  string source = 5;
+  string message = 6;
+  string old_state = 7;
+  string new_state = 8;
+  bytes metadata_json = 9;
+  string created_at = 10;
+}
+
+message LogsResponse {
+  string apply_id = 1;
+  repeated ApplyLog logs = 2;
+}
+
 // ShardProgress contains progress information for a single Vitess shard.
 message ShardProgress {
   string shard = 1;
@@ -556,7 +596,8 @@ message ShardProgress {
   int64 eta_seconds = 5;
   int32 cutover_attempts = 6;
   string last_cutover_attempt = 7;
-  bool ready_to_complete = 8;
+  reserved 8;
+  reserved "ready_to_complete";
 }
 
 // TableProgress contains progress information for a single table.
@@ -578,6 +619,10 @@ message TableProgress {
   // Populated while the table is checksumming (verifying copied data), 0 otherwise.
   int64 checksum_rows_checked = 14;
   int64 checksum_rows_total = 15;
+  // The table's own failure reason (for example an engine preflight
+  // rejection), distinct from the apply-level error_message on
+  // ProgressResponse. Empty when the table has not failed.
+  string error_message = 16;
 }
 
 // ProgressResponse contains detailed progress information.

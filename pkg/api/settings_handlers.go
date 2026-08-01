@@ -78,7 +78,8 @@ func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.logger.Info("setting updated", "key", req.Key, "value", req.Value)
+	s.logger.Info("setting updated", "key", req.Key, "value", req.Value,
+		"caller", controlOperationCaller(resolveCaller(r.Context(), "")))
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"key":   req.Key,

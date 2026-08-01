@@ -1,0 +1,777 @@
+package webhook
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/webhook/action"
+)
+
+// aggregateLeaderConfig returns a server config where the test repo has the
+// aggregate leader role and the databases registry has no entry for the
+// participant-owned database "orders" — the shape of an untenanted leader
+// receiving unscoped fan-out commands for work another deployment owns.
+func aggregateLeaderConfig() *api.ServerConfig {
+	return &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{
+			"octocat/hello-world": {Aggregate: &api.AggregateConfig{
+				Role:            api.AggregateRoleLeader,
+				ExpectedTenants: []api.ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"tenant-b/schema"}, CheckName: "SchemaBot Tenant B"}},
+			}},
+		},
+	}
+}
+
+// nonAggregateConfig returns a server config where the test repo has no
+// aggregate role, so every "nothing to do" answer stays a visible PR comment.
+func nonAggregateConfig() *api.ServerConfig {
+	return &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{"octocat/hello-world": {}},
+	}
+}
+
+// aggregateParticipantConfig returns a server config where the test repo has
+// the aggregate participant role — the shape of a tenant deployment receiving
+// unscoped fan-out commands on a shared repo.
+func aggregateParticipantConfig() *api.ServerConfig {
+	return &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{
+			"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}},
+		},
+	}
+}
+
+// newFanOutSkipHandler builds a handler backed by a fake GitHub server and
+// empty storage, returning the handler, the GitHub mux for extra routes, and a
+// channel capturing posted PR comments. The handlers under test post comments
+// synchronously, so after a direct handler call the channel holds every
+// comment the command produced.
+func newFanOutSkipHandler(t *testing.T, cfg *api.ServerConfig) (*Handler, *http.ServeMux, chan string) {
+	t.Helper()
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	h := &Handler{
+		service:   api.New(&emptyStorage{}, cfg, nil, testLogger()),
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:    testLogger(),
+	}
+	return h, mux, comments
+}
+
+// serveSchemaConfigForDatabase registers the GitHub content routes config
+// discovery needs so the PR resolves to a schemabot.yaml for the given
+// database.
+func serveSchemaConfigForDatabase(t *testing.T, mux *http.ServeMux, database string) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"head": map[string]any{"sha": "abc123", "ref": "feature-branch"},
+			"base": map[string]any{"sha": "def456", "ref": "main"},
+			"user": map[string]any{"login": "testuser"},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode([]map[string]string{{
+			"filename": "schemabot.yaml",
+			"status":   "modified",
+		}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schemabot.yaml", func(w http.ResponseWriter, _ *http.Request) {
+		content := "database: " + database + "\ntype: mysql\n"
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
+			"type":     "file",
+			"encoding": "base64",
+			"content":  base64.StdEncoding.EncodeToString([]byte(content)),
+		}))
+	})
+}
+
+// On an aggregate repo, an unscoped `apply -e <env>` fans out to every
+// installed deployment. A deployment whose databases registry has no entry for
+// the database discovered from the PR's schemabot.yaml is not the owner under
+// the aggregate contract, so it stays silent instead of posting a "database is
+// not configured on this server" failure comment. A -t-scoped command and a
+// non-aggregate repo still surface the error.
+func TestUnscopedApplyOnUnregisteredDatabaseStaysSilent(t *testing.T) {
+	t.Run("unscoped apply on aggregate repo stays silent", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+
+		assert.Empty(t, comments, "non-owning deployment must not post a comment for an unscoped fan-out apply")
+	})
+
+	// A participant deployment receives the same fan-out for a PR touching
+	// only a database another deployment owns; the skip is role-agnostic, so
+	// it stays just as silent as a leader would.
+	t.Run("unscoped apply on participant deployment stays silent", func(t *testing.T) {
+		cfg := aggregateLeaderConfig()
+		repoCfg := cfg.Repos["octocat/hello-world"]
+		repoCfg.Aggregate = &api.AggregateConfig{Role: api.AggregateRoleParticipant}
+		cfg.Repos["octocat/hello-world"] = repoCfg
+		h, mux, comments := newFanOutSkipHandler(t, cfg)
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+
+		assert.Empty(t, comments, "a participant must not post Apply Failed for a database another deployment owns")
+	})
+
+	t.Run("tenant-scoped apply still reports the error", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply, Tenant: "tenant-b"})
+
+		body := requireComment(t, comments, "database-not-configured apply error")
+		assert.Contains(t, body, `database "orders" is not configured on this server`)
+	})
+
+	t.Run("non-aggregate repo still reports the error", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+
+		body := requireComment(t, comments, "database-not-configured apply error")
+		assert.Contains(t, body, `database "orders" is not configured on this server`)
+	})
+}
+
+// A bare `schemabot plan` (no -e) on an aggregate repo fans out to every
+// installed deployment just like its -e sibling. A deployment whose databases
+// registry has no entry for the database discovered from the PR's
+// schemabot.yaml is not the owner under the aggregate contract, so it stays
+// silent instead of posting a "database is not configured on this server"
+// failure comment next to the owning deployment's real plan. A -t-scoped
+// command and a non-aggregate repo still surface the error.
+func TestUnscopedMultiEnvPlanOnUnregisteredDatabaseStaysSilent(t *testing.T) {
+	barePlan := func(h *Handler, databaseName, tenant string) {
+		h.handleMultiEnvPlan("octocat/hello-world", 1, databaseName, tenant, 12345, "hubot", false, true, 0)
+	}
+
+	t.Run("bare plan on aggregate repo stays silent", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		barePlan(h, "", "")
+
+		assert.Empty(t, comments, "non-owning deployment must not post a comment for an unscoped fan-out plan")
+	})
+
+	t.Run("bare plan on participant deployment stays silent", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		barePlan(h, "", "")
+
+		assert.Empty(t, comments, "a participant must not post a plan failure for a database another deployment owns")
+	})
+
+	// Naming the database with -d does not name a deployment: the discovered
+	// config still belongs to whichever deployment registers the database, so a
+	// non-owner defers just as silently as it does for the unscoped form.
+	t.Run("database-scoped bare plan stays silent", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		barePlan(h, "orders", "")
+
+		assert.Empty(t, comments, "a -d-scoped fan-out plan on an unowned database must stay silent")
+	})
+
+	t.Run("tenant-scoped plan still reports the error", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		barePlan(h, "", "tenant-b")
+
+		body := requireComment(t, comments, "database-not-configured plan error")
+		assert.Contains(t, body, `database "orders" is not configured on this server`)
+	})
+
+	t.Run("non-aggregate repo still reports the error", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		barePlan(h, "", "")
+
+		body := requireComment(t, comments, "database-not-configured plan error")
+		assert.Contains(t, body, `database "orders" is not configured on this server`)
+	})
+}
+
+// On an aggregate repo, an unscoped `rollback <apply-id> -e <env>` fans out to
+// every deployment, but the apply lives in exactly one tenant's storage. A
+// deployment whose storage has no such apply stays silent so only the owning
+// deployment answers — it must not post "Apply Not Found" for another tenant's
+// apply. A -t-scoped rollback and a non-aggregate repo still get the comment.
+func TestUnscopedRollbackUnknownApplyStaysSilentOnAggregateRepo(t *testing.T) {
+	rollbackResult := func(tenant string) CommandResult {
+		return CommandResult{Action: action.Rollback, ApplyID: "apply_a1b2c3", Environment: "staging", Tenant: tenant}
+	}
+
+	t.Run("unscoped rollback on aggregate repo stays silent", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleRollbackCommand("octocat/hello-world", 1, 12345, "hubot", rollbackResult(""))
+
+		assert.Empty(t, comments, "deployment without the apply must not post Apply Not Found on an unscoped fan-out rollback")
+	})
+
+	t.Run("tenant-scoped rollback still posts apply not found", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleRollbackCommand("octocat/hello-world", 1, 12345, "hubot", rollbackResult("tenant-b"))
+
+		body := requireComment(t, comments, "apply-not-found rollback comment")
+		assert.Contains(t, body, "Apply Not Found")
+		assert.Contains(t, body, "`apply_a1b2c3`")
+	})
+
+	t.Run("non-aggregate repo still posts apply not found", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+
+		h.handleRollbackCommand("octocat/hello-world", 1, 12345, "hubot", rollbackResult(""))
+
+		body := requireComment(t, comments, "apply-not-found rollback comment")
+		assert.Contains(t, body, "Apply Not Found")
+		assert.Contains(t, body, "`apply_a1b2c3`")
+	})
+}
+
+// On an aggregate repo, an unscoped `rollback-confirm -e <env>` fans out to
+// every deployment, but only the deployment holding the pinned rollback lock
+// has anything to confirm. A deployment with no pending rollback stays silent
+// so only the owning deployment answers — it must not post "No Lock Found" for
+// another tenant's rollback. A -t-scoped rollback-confirm and a non-aggregate
+// repo still get the comment.
+func TestUnscopedRollbackConfirmNoLockStaysSilentOnAggregateRepo(t *testing.T) {
+	t.Run("unscoped rollback-confirm on aggregate repo stays silent", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", 12345, "hubot", CommandResult{Action: action.RollbackConfirm})
+
+		assert.Empty(t, comments, "deployment without a pending rollback must not post No Lock Found on an unscoped fan-out rollback-confirm")
+	})
+
+	t.Run("tenant-scoped rollback-confirm still posts no lock found", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", 12345, "hubot", CommandResult{Action: action.RollbackConfirm, Tenant: "tenant-b"})
+
+		body := requireComment(t, comments, "no-lock rollback-confirm comment")
+		assert.Contains(t, body, "No Lock Found")
+		assert.Contains(t, body, "`staging`")
+	})
+
+	t.Run("non-aggregate repo still posts no lock found", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+
+		h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", 12345, "hubot", CommandResult{Action: action.RollbackConfirm})
+
+		body := requireComment(t, comments, "no-lock rollback-confirm comment")
+		assert.Contains(t, body, "No Lock Found")
+		assert.Contains(t, body, "`staging`")
+	})
+}
+
+// On an aggregate repo, an unscoped `unlock` fans out to every deployment, but
+// locks live in each tenant's own storage. A deployment holding no locks for
+// the PR stays silent so only the deployment with locks to release answers —
+// it must not post "No Locks Found" next to another tenant's real release. A
+// -t-scoped unlock and a non-aggregate repo still get the comment.
+func TestUnscopedUnlockNoLocksStaysSilentOnAggregateRepo(t *testing.T) {
+	unlockResult := func(tenant string) CommandResult {
+		return CommandResult{Action: action.Unlock, Tenant: tenant}
+	}
+
+	t.Run("unscoped unlock on aggregate repo stays silent", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleUnlockCommand("octocat/hello-world", 1, 12345, "hubot", unlockResult(""))
+
+		assert.Empty(t, comments, "deployment without locks must not post No Locks Found on an unscoped fan-out unlock")
+	})
+
+	t.Run("unscoped unlock on participant deployment stays silent", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleUnlockCommand("octocat/hello-world", 1, 12345, "hubot", unlockResult(""))
+
+		assert.Empty(t, comments, "a participant without locks must not post No Locks Found on an unscoped fan-out unlock")
+	})
+
+	t.Run("tenant-scoped unlock still posts no locks found", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleUnlockCommand("octocat/hello-world", 1, 12345, "hubot", unlockResult("tenant-b"))
+
+		body := requireComment(t, comments, "no-locks unlock comment")
+		assert.Contains(t, body, "No Locks Found")
+	})
+
+	t.Run("non-aggregate repo still posts no locks found", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+
+		h.handleUnlockCommand("octocat/hello-world", 1, 12345, "hubot", unlockResult(""))
+
+		body := requireComment(t, comments, "no-locks unlock comment")
+		assert.Contains(t, body, "No Locks Found")
+	})
+}
+
+// On an aggregate repo, an unscoped lifecycle control command (stop, cancel,
+// cutover, ...) fans out to every deployment, but the target apply lives in
+// exactly one tenant's storage. A deployment whose storage has no such apply
+// stays silent so only the owning deployment answers — it must not post
+// "Apply not found" for another tenant's apply. A -t-scoped command and a
+// non-aggregate repo still get the comment.
+func TestUnscopedControlUnknownApplyStaysSilentOnAggregateRepo(t *testing.T) {
+	stopResult := func(tenant string) CommandResult {
+		return CommandResult{Action: action.Stop, ApplyID: "apply_a1b2c3", Environment: "staging", Tenant: tenant}
+	}
+
+	t.Run("unscoped stop on aggregate repo stays silent", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", stopResult(""))
+
+		assert.Empty(t, comments, "deployment without the apply must not post Apply not found on an unscoped fan-out control command")
+	})
+
+	t.Run("unscoped stop on participant deployment stays silent", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", stopResult(""))
+
+		assert.Empty(t, comments, "a participant without the apply must not post Apply not found on an unscoped fan-out control command")
+	})
+
+	t.Run("tenant-scoped stop still posts apply not found", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", stopResult("tenant-b"))
+
+		body := requireComment(t, comments, "apply-not-found control comment")
+		assert.Contains(t, body, "Apply not found")
+		assert.Contains(t, body, "apply_a1b2c3")
+	})
+
+	t.Run("non-aggregate repo still posts apply not found", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", stopResult(""))
+
+		body := requireComment(t, comments, "apply-not-found control comment")
+		assert.Contains(t, body, "Apply not found")
+		assert.Contains(t, body, "apply_a1b2c3")
+	})
+}
+
+// A control command without an apply ID is a usage error every deployment can
+// detect from the comment text alone, so on an unscoped fan-out participants
+// defer the reply to the leader, which posts it exactly once. A -t-scoped
+// command and a non-aggregate repo answer directly as the single addressee.
+func TestControlMissingApplyIDDefersToLeader(t *testing.T) {
+	missingID := func(tenant string) CommandResult {
+		return CommandResult{Action: action.Stop, Environment: "staging", Tenant: tenant}
+	}
+
+	t.Run("participant stays silent on the unscoped usage error", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", missingID(""))
+
+		assert.Empty(t, comments, "a participant must defer the missing-apply-id reply to the leader")
+	})
+
+	t.Run("leader posts the usage error once", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", missingID(""))
+
+		body := requireComment(t, comments, "missing-apply-id control comment")
+		assert.Contains(t, body, "Missing Apply ID")
+		assert.Contains(t, body, "schemabot stop <apply-id> -e <environment>")
+	})
+
+	t.Run("tenant-scoped command gets the usage error from the addressee", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", missingID("tenant-b"))
+
+		body := requireComment(t, comments, "missing-apply-id control comment")
+		assert.Contains(t, body, "Missing Apply ID")
+	})
+}
+
+// A rollback command without an apply ID is a usage error every deployment can
+// detect from the comment text alone, so on an unscoped fan-out participants
+// defer the reply to the leader, which posts it exactly once. A -t-scoped
+// command answers directly as the single addressee.
+func TestRollbackMissingApplyIDDefersToLeader(t *testing.T) {
+	missingID := func(tenant string) CommandResult {
+		return CommandResult{Action: action.Rollback, Environment: "staging", Tenant: tenant}
+	}
+
+	t.Run("participant stays silent on the unscoped usage error", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleRollbackCommand("octocat/hello-world", 1, 12345, "hubot", missingID(""))
+
+		assert.Empty(t, comments, "a participant must defer the missing-apply-id reply to the leader")
+	})
+
+	t.Run("leader posts the usage error once", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleRollbackCommand("octocat/hello-world", 1, 12345, "hubot", missingID(""))
+
+		body := requireComment(t, comments, "missing-apply-id rollback comment")
+		assert.Contains(t, body, "Missing Apply ID")
+		assert.Contains(t, body, "schemabot rollback <apply-id> -e <environment>")
+	})
+
+	t.Run("tenant-scoped command gets the usage error from the addressee", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleRollbackCommand("octocat/hello-world", 1, 12345, "hubot", missingID("tenant-b"))
+
+		body := requireComment(t, comments, "missing-apply-id rollback comment")
+		assert.Contains(t, body, "Missing Apply ID")
+	})
+}
+
+// A volume command with a missing or invalid -v level is a usage error every
+// deployment can detect from the comment text alone, so on an unscoped fan-out
+// participants defer the reply to the leader, which posts it exactly once.
+func TestVolumeInvalidLevelDefersToLeader(t *testing.T) {
+	invalidLevel := func(tenant string) CommandResult {
+		return CommandResult{Action: action.Volume, ApplyID: "apply_a1b2c3", Environment: "staging", VolumeLevelError: true, Tenant: tenant}
+	}
+
+	t.Run("participant stays silent on the unscoped usage error", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleVolumeCommand("octocat/hello-world", 1, 12345, "hubot", invalidLevel(""))
+
+		assert.Empty(t, comments, "a participant must defer the invalid-volume-level reply to the leader")
+	})
+
+	t.Run("leader posts the usage error once", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+
+		h.handleVolumeCommand("octocat/hello-world", 1, 12345, "hubot", invalidLevel(""))
+
+		body := requireComment(t, comments, "invalid-volume-level comment")
+		assert.Contains(t, body, "Missing or Invalid Volume Level")
+	})
+
+	t.Run("tenant-scoped command gets the usage error from the addressee", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		h.handleVolumeCommand("octocat/hello-world", 1, 12345, "hubot", invalidLevel("tenant-b"))
+
+		body := requireComment(t, comments, "invalid-volume-level comment")
+		assert.Contains(t, body, "Missing or Invalid Volume Level")
+	})
+}
+
+// On an aggregate repo, an -e value this deployment does not recognize may be
+// a perfectly valid environment served by a sibling deployment — a
+// participant's config holds only its own slice of the fleet's environments.
+// A participant therefore defers silently instead of posting "Invalid
+// Environment", even when the command names its own tenant, since the same
+// tenant name can be served in other environments by sibling deployments. The
+// leader, whose environment order spans the fleet, still rejects a genuinely
+// unknown value exactly once, and a non-aggregate deployment keeps rejecting
+// directly.
+func TestUnknownEnvironmentDefersOnAggregateParticipant(t *testing.T) {
+	serveUnknownEnvCommand := func(t *testing.T, cfg *api.ServerConfig, comment string) (*httptest.ResponseRecorder, chan string) {
+		t.Helper()
+		cfg.AllowedEnvironments = []string{"production"}
+		h, _, comments := newFanOutSkipHandler(t, cfg)
+
+		req := buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil)
+		rr := httpResponseRecorder()
+		h.ServeHTTP(rr, req)
+		require.Equal(t, http.StatusOK, rr.Code)
+		return rr, comments
+	}
+
+	// The participant declares only its own slice of the fleet's environments,
+	// so the sibling's environment is neither allowed nor known here.
+	participantConfig := func() *api.ServerConfig {
+		cfg := aggregateParticipantConfig()
+		cfg.Tenant = "alpha"
+		cfg.EnvironmentOrder = []string{"production"}
+		return cfg
+	}
+
+	t.Run("tenant-scoped command for a sibling environment defers silently", func(t *testing.T) {
+		rr, comments := serveUnknownEnvCommand(t, participantConfig(), "schemabot apply -e staging --tenant alpha")
+
+		assert.Contains(t, rr.Body.String(), "environment deferred to sibling deployments")
+		assert.Empty(t, comments, "a participant must not reject an environment a sibling deployment may serve")
+	})
+
+	t.Run("unscoped command with an unrecognized environment defers silently", func(t *testing.T) {
+		rr, comments := serveUnknownEnvCommand(t, participantConfig(), "schemabot apply -e staging")
+
+		assert.Contains(t, rr.Body.String(), "environment deferred to sibling deployments")
+		assert.Empty(t, comments, "a participant must not reject an environment a sibling deployment may serve")
+	})
+
+	t.Run("leader still rejects an unknown environment once", func(t *testing.T) {
+		rr, comments := serveUnknownEnvCommand(t, aggregateLeaderConfig(), "schemabot apply -e prodction")
+
+		assert.Contains(t, rr.Body.String(), "unknown environment")
+		body := requireComment(t, comments, "invalid environment comment")
+		assert.Contains(t, body, "Invalid Environment")
+		assert.Contains(t, body, "`production`")
+	})
+
+	t.Run("non-aggregate deployment still rejects an unknown environment", func(t *testing.T) {
+		rr, comments := serveUnknownEnvCommand(t, nonAggregateConfig(), "schemabot apply -e prodction")
+
+		assert.Contains(t, rr.Body.String(), "unknown environment")
+		body := requireComment(t, comments, "invalid environment comment")
+		assert.Contains(t, body, "Invalid Environment")
+	})
+}
+
+// A malformed -e value (for example a flag glued onto the value) is a usage
+// error every deployment can detect from the comment text alone, so on an
+// aggregate repo participants defer the reply to the leader, which posts it
+// exactly once. A -t-scoped command answers directly as the single addressee.
+func TestMalformedEnvironmentDefersToLeader(t *testing.T) {
+	serveMalformedEnvCommand := func(t *testing.T, cfg *api.ServerConfig, comment string) (*httptest.ResponseRecorder, chan string) {
+		t.Helper()
+		h, _, comments := newFanOutSkipHandler(t, cfg)
+
+		req := buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil)
+		rr := httpResponseRecorder()
+		h.ServeHTTP(rr, req)
+		require.Equal(t, http.StatusOK, rr.Code)
+		return rr, comments
+	}
+
+	t.Run("participant stays silent on the unscoped usage error", func(t *testing.T) {
+		rr, comments := serveMalformedEnvCommand(t, aggregateParticipantConfig(), "schemabot apply -e production--allow-unsafe")
+
+		assert.Contains(t, rr.Body.String(), "usage error deferred to leader")
+		assert.Empty(t, comments, "a participant must defer the malformed-environment reply to the leader")
+	})
+
+	t.Run("leader posts the usage error once", func(t *testing.T) {
+		rr, comments := serveMalformedEnvCommand(t, aggregateLeaderConfig(), "schemabot apply -e production--allow-unsafe")
+
+		assert.Contains(t, rr.Body.String(), "invalid environment value")
+		body := requireComment(t, comments, "invalid environment comment")
+		assert.Contains(t, body, "Invalid Environment")
+	})
+
+	t.Run("tenant-scoped command gets the usage error from the addressee", func(t *testing.T) {
+		cfg := aggregateParticipantConfig()
+		cfg.Tenant = "alpha"
+		rr, comments := serveMalformedEnvCommand(t, cfg, "schemabot apply -e production--allow-unsafe --tenant alpha")
+
+		assert.Contains(t, rr.Body.String(), "invalid environment value")
+		body := requireComment(t, comments, "invalid environment comment")
+		assert.Contains(t, body, "Invalid Environment")
+	})
+}
+
+// A command that requires -e but omits it is a usage error every deployment
+// can detect from the comment text alone, so on an aggregate repo participants
+// defer the reply to the leader, which posts it exactly once. A -t-scoped
+// command answers directly as the single addressee.
+func TestMissingEnvironmentDefersToLeader(t *testing.T) {
+	serveMissingEnvCommand := func(t *testing.T, cfg *api.ServerConfig, comment string) (*httptest.ResponseRecorder, chan string) {
+		t.Helper()
+		h, _, comments := newFanOutSkipHandler(t, cfg)
+
+		req := buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil)
+		rr := httpResponseRecorder()
+		h.ServeHTTP(rr, req)
+		require.Equal(t, http.StatusOK, rr.Code)
+		return rr, comments
+	}
+
+	t.Run("participant stays silent on the unscoped usage error", func(t *testing.T) {
+		rr, comments := serveMissingEnvCommand(t, aggregateParticipantConfig(), "schemabot rollback apply-123")
+
+		assert.Contains(t, rr.Body.String(), "usage error deferred to leader")
+		assert.Empty(t, comments, "a participant must defer the missing-environment reply to the leader")
+	})
+
+	t.Run("leader posts the usage error once", func(t *testing.T) {
+		rr, comments := serveMissingEnvCommand(t, aggregateLeaderConfig(), "schemabot rollback apply-123")
+
+		assert.Contains(t, rr.Body.String(), "missing environment flag")
+		body := requireComment(t, comments, "missing environment comment")
+		assert.Contains(t, body, "Missing Environment")
+	})
+
+	t.Run("tenant-scoped command gets the usage error from the addressee", func(t *testing.T) {
+		cfg := aggregateParticipantConfig()
+		cfg.Tenant = "alpha"
+		rr, comments := serveMissingEnvCommand(t, cfg, "schemabot rollback apply-123 --tenant alpha")
+
+		assert.Contains(t, rr.Body.String(), "missing environment flag")
+		body := requireComment(t, comments, "missing environment comment")
+		assert.Contains(t, body, "Missing Environment")
+	})
+
+	t.Run("non-aggregate repo still posts the usage error", func(t *testing.T) {
+		rr, comments := serveMissingEnvCommand(t, nonAggregateConfig(), "schemabot rollback")
+
+		assert.Contains(t, rr.Body.String(), "missing rollback arguments")
+		body := requireComment(t, comments, "missing arguments comment")
+		assert.Contains(t, body, "Missing Arguments")
+	})
+}
+
+// registerReactionRecorder captures acknowledgment reactions posted to the
+// command comment.
+func registerReactionRecorder(t *testing.T, mux *http.ServeMux) chan string {
+	t.Helper()
+	reactions := make(chan string, 4)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Content string `json:"content"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		reactions <- body.Content
+		w.WriteHeader(http.StatusCreated)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 1}))
+	})
+	return reactions
+}
+
+// The acknowledgment reaction means "this deployment is acting on your
+// command": a deployment that owns the discovered database reacts with eyes,
+// while a fan-out deployment that silently skips unowned work leaves only its
+// log — so the reaction count on a shared repo reflects the deployments doing
+// work, not everyone who heard the command.
+func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
+	t.Run("owning deployment reacts", func(t *testing.T) {
+		cfg := aggregateLeaderConfig()
+		cfg.Databases = map[string]api.DatabaseConfig{
+			"orders": {Environments: map[string]api.EnvironmentConfig{
+				"staging": {Deployment: "default", Target: "orders"},
+			}},
+		}
+		h, mux, _ := newFanOutSkipHandler(t, cfg)
+		serveSchemaConfigForDatabase(t, mux, "orders")
+		// Discovery loads the schema files next to schemabot.yaml: serve the
+		// root directory listing and one table file so the command proceeds
+		// past discovery to the acknowledgment point.
+		mux.HandleFunc("GET /repos/octocat/hello-world/contents/", func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{
+				{"type": "file", "name": "schemabot.yaml", "path": "schemabot.yaml"},
+				{"type": "dir", "name": "staging", "path": "staging"},
+			}))
+		})
+		mux.HandleFunc("GET /repos/octocat/hello-world/contents/staging", func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{
+				{"type": "file", "name": "users.sql", "path": "staging/users.sql"},
+			}))
+		})
+		mux.HandleFunc("GET /repos/octocat/hello-world/contents/staging/users.sql", func(w http.ResponseWriter, _ *http.Request) {
+			ddl := "CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
+				"type": "file", "encoding": "base64",
+				"content": base64.StdEncoding.EncodeToString([]byte(ddl)),
+			}))
+		})
+		reactions := registerReactionRecorder(t, mux)
+
+		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot",
+			CommandResult{Action: action.Apply, CommentID: 42})
+
+		select {
+		case content := <-reactions:
+			assert.Equal(t, "eyes", content)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for the acknowledgment reaction")
+		}
+	})
+
+	// The acknowledgment must not wait for schema files to load: ownership is
+	// decidable from config discovery alone, so on databases with large schema
+	// directories the user still sees the reaction promptly. Failing the file
+	// fetch proves the reaction fired before it.
+	t.Run("owning deployment acknowledges before schema files load", func(t *testing.T) {
+		cfg := aggregateLeaderConfig()
+		cfg.Databases = map[string]api.DatabaseConfig{
+			"orders": {Environments: map[string]api.EnvironmentConfig{
+				"staging": {Deployment: "default", Target: "orders"},
+			}},
+		}
+		h, mux, _ := newFanOutSkipHandler(t, cfg)
+		serveSchemaConfigForDatabase(t, mux, "orders")
+		mux.HandleFunc("GET /repos/octocat/hello-world/contents/staging", func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "schema listing unavailable", http.StatusInternalServerError)
+		})
+		reactions := registerReactionRecorder(t, mux)
+
+		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot",
+			CommandResult{Action: action.Apply, CommentID: 42})
+
+		select {
+		case content := <-reactions:
+			assert.Equal(t, "eyes", content)
+		case <-time.After(2 * time.Second):
+			t.Fatal("the acknowledgment must fire from config discovery, before schema files load")
+		}
+	})
+
+	// A bare multi-env plan on a repo without a schema-dir allowlist resolves
+	// config discovery successfully even on a deployment that does not own the
+	// database — ownership is only decided at the registry lookup. A fan-out
+	// participant in that position silently skips, so it must not acknowledge.
+	t.Run("multi-env plan on unowned database does not react", func(t *testing.T) {
+		h, mux, _ := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+		reactions := registerReactionRecorder(t, mux)
+
+		h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, true, 42)
+
+		select {
+		case <-reactions:
+			t.Fatal("a deployment that cannot resolve the database in its registry must not acknowledge")
+		case <-time.After(100 * time.Millisecond):
+		}
+	})
+
+	t.Run("silently skipping deployment does not react", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+		reactions := registerReactionRecorder(t, mux)
+
+		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot",
+			CommandResult{Action: action.Apply, CommentID: 42})
+
+		assert.Empty(t, comments, "the silent skip posts nothing")
+		select {
+		case <-reactions:
+			t.Fatal("a silently skipping deployment must not acknowledge the command")
+		case <-time.After(100 * time.Millisecond):
+		}
+	})
+}

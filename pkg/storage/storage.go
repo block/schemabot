@@ -12,6 +12,18 @@ import (
 // fresh plan so stale execution context is not reactivated unexpectedly.
 const ReapplyFailureFreshnessDays = 1
 
+// ApplyLeaseStaleAfter is how long an apply or apply_operation lease heartbeat
+// (updated_at) may go unrefreshed before peer drivers treat the lease as
+// expired and reclaim the row for crash recovery. The claim queries in
+// mysqlstore derive their SQL staleness window from this constant.
+//
+// The window is also the driver-side presumed-lost bound: a driver whose
+// heartbeats have been failing for this long must assume a peer can already
+// have reclaimed the work, stop driving, and stop writing apply state. Storage
+// writes remain lease-guarded either way; presuming the lease lost bounds how
+// long two drivers can run the same engine work concurrently.
+const ApplyLeaseStaleAfter = time.Minute
+
 // Storage provides access to all stores.
 type Storage interface {
 	// Locks returns the lock store.
@@ -35,6 +47,9 @@ type Storage interface {
 	// ApplyComments returns the apply comment store.
 	ApplyComments() ApplyCommentStore
 
+	// PlanComments returns the plan comment store.
+	PlanComments() PlanCommentStore
+
 	// ApplyOperations returns the apply-operations store.
 	ApplyOperations() ApplyOperationStore
 
@@ -43,6 +58,9 @@ type Storage interface {
 
 	// Settings returns the settings store.
 	Settings() SettingsStore
+
+	// WebhookEvents returns the durable webhook event inbox store.
+	WebhookEvents() WebhookEventStore
 
 	// Ping verifies the database connection is alive.
 	Ping(ctx context.Context) error
@@ -63,6 +81,11 @@ type LockStore interface {
 	// Release releases a lock. Only succeeds if caller is the owner.
 	// Returns ErrLockNotOwned if the lock is not owned by the caller.
 	Release(ctx context.Context, database, dbType, owner string) error
+
+	// ReleaseIfPendingPlanID releases a lock only while both its owner and
+	// pending plan still match. A mismatch is a no-op so a superseding apply or
+	// rollback intent owned by the same PR remains intact.
+	ReleaseIfPendingPlanID(ctx context.Context, database, dbType, owner, pendingPlanID string) (bool, error)
 
 	// ForceRelease releases a lock regardless of owner (admin override).
 	// Used by `schemabot unlock` command and --force flag.
@@ -94,7 +117,13 @@ type CheckStore interface {
 	// released only by apply completion (CompleteForApply), rollback completion
 	// (MarkActionRequiredForApply), or the explicit same-head no-op recovery
 	// path (RecoverApplyOwnedCheckWithNoOpPlan).
-	UpsertPlanResult(ctx context.Context, check *Check) error
+	//
+	// drift declares how this write treats a review-time deployment drift block:
+	// a write from a path that re-ran the drift rollup can clear a stale block
+	// (PlanDriftClean) or set one (PlanDriftBlocked); a write from a path that
+	// did not evaluate drift (PlanDriftNotEvaluated, e.g. an apply-time plan)
+	// must preserve any existing drift block rather than silently clearing it.
+	UpsertPlanResult(ctx context.Context, check *Check, drift PlanDriftState) error
 
 	// RecoverApplyOwnedCheckWithNoOpPlan updates same-head apply-owned stored check state
 	// from in_progress to a successful no-op plan result. Returns true when recovery occurred.
@@ -107,6 +136,14 @@ type CheckStore interface {
 	// Returns true when the row was marked successful.
 	MarkStalePlanSuccessful(ctx context.Context, check *Check) (bool, error)
 
+	// ClearAggregateBlock clears the blocking reason on stored aggregate check
+	// state after the PR-level guards re-verified that the blocking condition
+	// no longer applies. The update is conditional on the head SHA and blocking
+	// reason the caller read, so a block recorded concurrently by another
+	// writer (for example for a newer commit) is never erased. Returns true
+	// when the row was cleared.
+	ClearAggregateBlock(ctx context.Context, check *Check) (bool, error)
+
 	// CompleteForApply updates stored check state to a terminal state only if
 	// it still belongs to the given apply and no newer apply exists for the
 	// same PR/environment/database. Returns false when another driver changed
@@ -114,9 +151,12 @@ type CheckStore interface {
 	CompleteForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// MarkActionRequiredForApply marks stored check state action_required after
-	// a rollback only if it still belongs to that rollback apply and no newer
-	// apply exists for the same PR/environment/database. Returns false when
-	// another driver changed the stored state first.
+	// a rollback only if no apply newer than the rollback exists for the same
+	// PR/environment/database. Rows owned by the rollback, by an older apply, or
+	// unowned all qualify: a rollback that never claimed the row must still be
+	// able to block the stale successful check left over from the apply it
+	// reverted. Returns false when any apply newer than the rollback exists for
+	// the target, whether or not it has claimed the row.
 	MarkActionRequiredForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// Get returns stored check state by its unique key (PR + env + database), or nil if not found.
@@ -136,12 +176,26 @@ type CheckStore interface {
 	// Delete removes stored check state by ID.
 	Delete(ctx context.Context, id int64) error
 
-	// DeleteByPRExcludingApplyOwned removes stored check state for a PR,
-	// except rows owned by an in-flight apply (apply_id set and status
-	// in_progress). Used for cleanup when a PR is closed or merged:
-	// apply-owned rows must keep blocking until the apply reaches a terminal
-	// state, even across a close and reopen.
-	DeleteByPRExcludingApplyOwned(ctx context.Context, repo string, pr int) error
+	// DeleteByPRRetainingBlockingApplyOwned removes stored check state for a
+	// closed PR, retaining apply-owned rows the close must not unblock. Once
+	// an apply has started, its stored check state stays authoritative across
+	// a close and reopen until an operator reconciles the target environment.
+	// Plan-only rows (no apply_id) are always deleted. Apply-owned rows are
+	// handled by close kind:
+	//
+	//   - merged close: rows that are in_progress or whose conclusion is
+	//     anything but success are retained; rows that concluded successfully
+	//     are deleted, because the merged PR carries the applied schema and
+	//     nothing remains for the row to block.
+	//   - unmerged close: every apply-owned row is retained, including rows
+	//     whose conclusion is success. A stored success only proves the
+	//     database matched the PR when the row was last written — a commit
+	//     that removed the applied change may not have been reconciled into
+	//     the row yet, and the unmerged branch means the change never landed.
+	//     Reopen-time stale cleanup converges the retained row: it converts
+	//     it to action_required when the schema change is gone from the PR,
+	//     or a fresh plan result replaces it when the change is still present.
+	DeleteByPRRetainingBlockingApplyOwned(ctx context.Context, repo string, pr int, merged bool) error
 }
 
 // SettingsStore manages admin-level SchemaBot settings (global config).
@@ -159,6 +213,80 @@ type SettingsStore interface {
 
 	// Delete removes a setting by key.
 	Delete(ctx context.Context, key string) error
+}
+
+// WebhookEventStore manages durable webhook inbox rows. It is the storage
+// primitive behind fast webhook acknowledgement: handlers can persist a delivery
+// before returning 2xx, and drivers can claim/retry the stored event after the
+// HTTP request has finished.
+type WebhookEventStore interface {
+	// Create records a webhook delivery in the pending state. Returns
+	// inserted=false when provider + delivery GUID already exists, so callers
+	// can deduplicate redeliveries. One exception: when the existing row is
+	// terminally failed, Create re-opens it (pending, attempts reset, fresh
+	// payload) and returns inserted=true, so GitHub's "Redeliver" button —
+	// which reuses the original delivery GUID — is a real remediation for a
+	// terminally failed delivery instead of a permanent no-op.
+	Create(ctx context.Context, event *WebhookEvent) (inserted bool, err error)
+
+	// GetByDeliveryID returns a webhook event by provider + delivery GUID, or nil if not found.
+	GetByDeliveryID(ctx context.Context, provider, deliveryID string) (*WebhookEvent, error)
+
+	// HasEventForHead reports whether any delivery is recorded for the given
+	// provider + repository + pull request + head SHA, in any state. The
+	// reconciliation loop uses it to detect open PR heads whose webhook
+	// delivery never reached the inbox.
+	HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error)
+
+	// FindNext atomically claims one pending, retryable, or lease-expired event.
+	// The claim rotates lease_owner/lease_token, increments attempts, and sets a
+	// lease expiry in the same transaction. Retryable and lease-expired rows are
+	// only reclaimed while attempts < MaxWebhookEventAttempts, so a poison event
+	// cannot be reclaimed forever. Returns nil when no event is claimable.
+	//
+	// Ordering is currently global FIFO (created_at, id). A contemplated
+	// evolution is per-(repository, pull_request) claiming with coalescing of
+	// superseded deliveries; callers should not depend on cross-key ordering.
+	FindNext(ctx context.Context, owner string, leaseDuration time.Duration) (*WebhookEvent, error)
+
+	// Heartbeat extends the current lease. Returns ErrWebhookEventNotFound when
+	// the event no longer exists, and ErrWebhookEventLeaseLost when the token is
+	// stale, so drivers can abandon work whose result has nowhere to land.
+	Heartbeat(ctx context.Context, id int64, leaseToken string, leaseDuration time.Duration) error
+
+	// MarkCompleted marks a claimed event terminal-successful.
+	MarkCompleted(ctx context.Context, id int64, leaseToken string) error
+
+	// MarkFailed marks a claimed event failed. A non-nil retryAfter keeps it
+	// retryable after that time; nil makes the failure terminal.
+	MarkFailed(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error
+
+	// Release returns a claimed event to pending and refunds the attempt its
+	// claim consumed. Drivers use it when shutdown cancels in-flight
+	// processing: an interrupted claim must not consume retry budget, or
+	// repeated deploy restarts could terminally fail a delivery that never got
+	// a real processing attempt. Returns ErrWebhookEventLeaseLost when the
+	// lease token is stale.
+	Release(ctx context.Context, id int64, leaseToken string) error
+
+	// InboxStats returns a point-in-time snapshot of the inbox for steady-state
+	// observability: row counts per state, the age of the oldest row that is
+	// ready to claim but not yet claimed (backlog latency), and the count of
+	// rows wedged in processing past the attempt cap with an expired lease. It
+	// is read-only and safe to call on a periodic cadence.
+	InboxStats(ctx context.Context) (*WebhookInboxStats, error)
+
+	// TerminateStuckProcessing marks as terminally failed every processing row
+	// whose lease has expired and whose attempts have reached
+	// MaxWebhookEventAttempts. Such a row is a driver that was hard-killed on
+	// its final attempt before recording a terminal state — FindNext never
+	// reclaims it (it stops reclaiming at the cap). GitHub Redeliver can already
+	// reopen an expired-lease processing row on demand (see
+	// reopenTerminalWebhookEvent), so this sweep is the automatic complement: it
+	// terminalizes rows nobody redelivered, emitting each as a durable failure
+	// (for metrics/alerting) and draining the stuck-processing gauge without
+	// operator action. Returns the number of rows terminated.
+	TerminateStuckProcessing(ctx context.Context, reason string) (int64, error)
 }
 
 // PlanStore manages schema change plans.
@@ -268,6 +396,11 @@ type ApplyStore interface {
 	// Used by `schemabot status` (no args) to show recent activity.
 	GetRecent(ctx context.Context, filter RecentAppliesFilter) ([]*Apply, error)
 
+	// CountRecentByState returns how many applies match the filter, grouped by
+	// state. The filter's Limit is ignored: counts cover every matching row, so
+	// a status summary is not truncated by list pagination.
+	CountRecentByState(ctx context.Context, filter RecentAppliesFilter) (map[string]int, error)
+
 	// GetInProgress returns all applies in non-terminal states.
 	// Note: For recovery, use FindNextApply which handles locking.
 	GetInProgress(ctx context.Context) ([]*Apply, error)
@@ -337,13 +470,26 @@ type ApplyStore interface {
 	// active again.
 	ReapplyFailed(ctx context.Context, applyID int64) (*Apply, error)
 
-	// FindMissingSummaryComment returns GitHub-backed applies that should have
-	// a terminal summary comment but only have a progress comment. Used by
-	// startup reconciliation to post missing summary comments after restarts.
+	// FindMissingSummaryComment returns GitHub-backed applies that recently
+	// reached a terminal state (including stopped, judged by updated_at since a
+	// resumable stop keeps completed_at NULL) but whose progress comment was
+	// never followed by a summary comment — no summary marker exists, the
+	// marker is superseded (a stop's summary consumed by a resume rotation, so
+	// the current terminal state's summary was never posted), or only a claim
+	// sentinel stale for longer than SummaryClaimStaleAfter remains from a
+	// publisher that crashed before posting. Used by startup reconciliation to
+	// post missing summary comments after restarts.
 	FindMissingSummaryComment(ctx context.Context) ([]*Apply, error)
 
 	// GetByPR returns all applies for a PR.
 	GetByPR(ctx context.Context, repo string, pr int) ([]*Apply, error)
+
+	// ExistsForDatabaseHead reports whether any apply for the PR and database
+	// was created from a plan for headSHA. An apply whose plan row no longer
+	// exists also counts: without the plan there is no proof of which head it
+	// came from, so callers deciding whether a record is safe to retire must
+	// treat it as owning.
+	ExistsForDatabaseHead(ctx context.Context, repo string, pr int, database, databaseType, headSHA string) (bool, error)
 
 	// Delete removes an apply by ID.
 	Delete(ctx context.Context, id int64) error
@@ -365,6 +511,12 @@ type RecentAppliesFilter struct {
 	Environment string
 	Deployment  string
 	States      []string
+	// UpdatedSince, when set, restricts results to applies whose updated_at
+	// falls at or after this instant. Filtering on updated_at rather than
+	// started_at keeps two kinds of applies visible in a window: those that
+	// reached a terminal state within it, and those started earlier but
+	// still active (progress keeps touching updated_at).
+	UpdatedSince time.Time
 }
 
 // RetryableExpirationReason identifies why operator retry recovery stopped.
@@ -410,6 +562,13 @@ type TaskStore interface {
 	// GetByApplyID returns all tasks for an apply.
 	// Used for aggregating task states to derive Apply state.
 	GetByApplyID(ctx context.Context, applyID int64) ([]*Task, error)
+
+	// CountByApplyID returns the number of task rows an apply owns, with no
+	// shard or operation filtering. It answers "does this apply own any task
+	// work at all?" — the invariant behind the operator's claim gate — so a
+	// drive can distinguish a genuinely task-less apply from one whose rows a
+	// filtered loader did not return.
+	CountByApplyID(ctx context.Context, applyID int64) (int64, error)
 
 	// GetByApplyOperationID returns the drive tasks for a single apply_operation.
 	// Unsharded operations return their per-table tasks. Sharded work operations
@@ -464,6 +623,67 @@ type ApplyCommentStore interface {
 	// Upsert for the same state clears superseded_at. A missing or already-
 	// superseded row is not an error.
 	Supersede(ctx context.Context, applyID int64, commentState string) error
+
+	// ClearPendingFreeze removes the pending-freeze marker for a single
+	// (apply_id, comment_state) once the superseded comment's frozen rendering
+	// has landed on GitHub. A missing row or an already-clear marker is not an
+	// error.
+	ClearPendingFreeze(ctx context.Context, applyID int64, commentState string) error
+
+	// ClaimSummaryComment atomically claims the right to publish the terminal
+	// summary comment for an apply by inserting the summary marker as a claim
+	// sentinel (github_comment_id = 0). A superseded marker — a stop's summary
+	// consumed by a resume rotation — does not block the claim: it is converted
+	// back into a claim sentinel, since the summary it recorded belongs to an
+	// earlier terminal state. Exactly one caller wins per terminal state: the
+	// winner posts the summary and records the real comment ID via Upsert; every
+	// loser skips. The claim — not the apply lease — is the exactly-once
+	// authority for the summary, so a writer whose lease was re-claimed (stop
+	// reconciliation, resume) can still be beaten to the post without a
+	// duplicate. Returns true when this caller won the claim.
+	ClaimSummaryComment(ctx context.Context, applyID int64) (bool, error)
+
+	// ReclaimStaleSummaryClaim takes over a summary claim sentinel whose holder
+	// crashed between claiming and posting: a sentinel (github_comment_id = 0)
+	// not updated for at least SummaryClaimStaleAfter. Ownership transfers by
+	// bumping updated_at, so concurrent reclaimers race on the same conditional
+	// update and exactly one wins. Returns true when this caller now owns the
+	// claim; false when the sentinel is missing, fresh, or already a real
+	// comment.
+	ReclaimStaleSummaryClaim(ctx context.Context, applyID int64) (bool, error)
+
+	// ReleaseSummaryClaim releases a summary claim this caller won but could not
+	// convert into a posted comment, so a later publisher (or startup
+	// reconciliation) can retry immediately instead of waiting out the stale-
+	// claim window. Deletes only the sentinel form of the marker — a recorded
+	// real comment is never released.
+	ReleaseSummaryClaim(ctx context.Context, applyID int64) error
+}
+
+// SummaryClaimStaleAfter is how long a summary claim sentinel
+// (apply_comments row with github_comment_id = 0) may go without an update
+// before it is considered abandoned by a crashed publisher and becomes
+// reclaimable. Claims are normally held only for the duration of one GitHub
+// post, so anything older than this window is a crash, not a slow post.
+const SummaryClaimStaleAfter = 2 * time.Minute
+
+// PlanCommentStore tracks plan comments posted on PRs so a newer plan comment
+// for the same database can minimize the ones it supersedes. Rows exist only
+// for comments actually posted; minimized_at is set only after the GitHub
+// minimize call succeeded, so an unminimized row is always retried by the next
+// supersede.
+type PlanCommentStore interface {
+	// Insert stores a newly posted plan comment and sets comment.ID.
+	Insert(ctx context.Context, comment *PlanComment) error
+
+	// ListUnminimizedForSlot returns the not-yet-minimized comments for a
+	// (repository, pull_request, database) slot, ordered by id ascending. The
+	// caller decides which of them a newly posted comment supersedes.
+	ListUnminimizedForSlot(ctx context.Context, repo string, pr int, database, databaseType string) ([]*PlanComment, error)
+
+	// MarkMinimized stamps minimized_at after the GitHub minimize call
+	// succeeded. An already-minimized row is not an error.
+	MarkMinimized(ctx context.Context, id int64) error
 }
 
 // ApplyOperationStore manages per-(apply, deployment, operation_key) child rows
@@ -592,7 +812,14 @@ type ApplyLogStore interface {
 	// GetByApply returns all logs for an apply, ordered by created_at.
 	GetByApply(ctx context.Context, applyID int64) ([]*ApplyLog, error)
 
-	// List returns logs matching the filter criteria, ordered by created_at.
+	// GetRecentByApply returns the newest limit logs for an apply, ordered by
+	// created_at ascending so the result reads chronologically. The query is
+	// bounded — long-running applies can accumulate far more log rows than a
+	// caller rendering a tail needs.
+	GetRecentByApply(ctx context.Context, applyID int64, limit int) ([]*ApplyLog, error)
+
+	// List returns the newest Limit logs matching the filter criteria,
+	// ordered by created_at ascending so the result reads chronologically.
 	List(ctx context.Context, filter ApplyLogFilter) ([]*ApplyLog, error)
 }
 

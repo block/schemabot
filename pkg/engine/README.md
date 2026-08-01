@@ -58,25 +58,31 @@ type Engine interface {
                │    Running      │─────────────▶│ Stopped │
                └────────┬────────┘              └─────────┘
                         │
-           ┌────────────┴────────────┐
-           │ (defer_cutover=true)    │ (auto)
-           ▼                         ▼
-  ┌────────────────────┐    ┌──────────────┐
-  │WaitingForCutover   │    │ CuttingOver  │
-  └────────┬───────────┘    └──────┬───────┘
-           │ Cutover()             │
-           ▼                       ▼
-  ┌──────────────┐         ┌─────────────┐
-  │ CuttingOver  │         │  Completed  │
-  └──────┬───────┘         └─────────────┘
-         │
-         ▼
+           ┌────────────┴─────────────┐
+           │ (cutover-ready)          │ (engine-internal cutover:
+           ▼                          │  MySQL/Spirit without
+  ┌────────────────────┐              │  defer_cutover)
+  │WaitingForCutover   │              ▼
+  └────────┬───────────┘     ┌──────────────┐
+           │ Cutover()       │ CuttingOver  │
+           ▼                 └──────┬───────┘
+  ┌──────────────┐                  │
+  │ CuttingOver  │                  ▼
+  └──────┬───────┘          ┌─────────────┐
+         │                  │  Completed  │
+         ▼                  └─────────────┘
   ┌─────────────┐
   │  Completed  │
   └─────────────┘
 
   Terminal states: Completed, Failed, Stopped, Reverted
 ```
+
+`Cutover()` is issued by an operator when the apply was started with
+`defer_cutover`; otherwise the tern drive — the sole cutover actor for
+Vitess/PlanetScale, whose deploy requests are created with the backend's
+auto-cutover disabled — triggers it automatically once the engine reports
+`WaitingForCutover`.
 
 ## Resume Contract
 
