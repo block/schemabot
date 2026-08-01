@@ -59,11 +59,11 @@ engine refuses statement (e.g. primary-key reshape)
                                                progress entry and outcome metric
 ```
 
-The same predicate is re-evaluated at apply time before anything runs, so a
-verdict cannot go stale between plan and execution — a table that grew past
-the bound after planning is blocked at apply, not run. Statements the policy
-does not route stay blocked and keep the blocked-apply gate behavior: a
-plan-time blocked verdict rejects the apply up front, before anything
+The same predicate is re-evaluated at apply time before any ALTER executes,
+so a verdict cannot go stale between plan and execution — a table that grew
+past the bound after planning is blocked at apply, not run. Statements the
+policy does not route stay blocked and keep the blocked-apply gate behavior:
+a plan-time blocked verdict rejects the apply up front, before anything
 executes. A verdict that only becomes blocked at apply time — the table grew
 past the bound after the confirm-time re-plan — fails the apply at the ALTER
 routing step instead; CREATE TABLE statements in the same plan run before
