@@ -355,6 +355,19 @@ func RenderCannotUnlock(database, environment, applyID, applyState string) strin
 	return sb.String()
 }
 
+// RenderDeferCutoverAllDirectConfirm rejects --defer-cutover at confirm time
+// on a plan whose every change the policy routes to direct execution: a
+// direct statement has no cutover to defer, so the flag is refused instead of
+// silently ignored. The rejection preserves the pending confirmation — the
+// lock still pins the plan the operator confirmed against — so the recovery
+// is re-running apply-confirm without the flag, not restarting from apply.
+// Tenant is the deployment's own tenant; when set, the coached command
+// carries it so pasting the hint addresses this deployment.
+func RenderDeferCutoverAllDirectConfirm(environment, tenant string) string {
+	return fmt.Sprintf("`--defer-cutover` has no effect on this plan: every change runs directly as native DDL, which has no cutover to defer. The pending confirmation is preserved — re-run `%s` without the flag.",
+		tenantCommand("schemabot apply-confirm", environment, tenant))
+}
+
 // RenderApplyConfirmNoChanges renders a comment when apply-confirm finds no changes.
 func RenderApplyConfirmNoChanges(database, environment string) string {
 	var sb strings.Builder

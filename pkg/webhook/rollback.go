@@ -19,17 +19,6 @@ const (
 	vSchemaArtifactName       = "vschema.json"
 )
 
-// msgRollbackConfirmBlockedPlan rejects rollback-confirm when the pinned
-// rollback plan carries engine-blocked changes: the rollback apply is
-// guaranteed to fail, so there is nothing that can be confirmed. The format
-// verb takes the environment for the coached command.
-const msgRollbackConfirmBlockedPlan = "The pinned rollback plan contains changes the schema-change engine does not support, so this rollback cannot execute. The lock has been released — re-run `schemabot rollback <apply-id> -e %s` to generate a fresh plan, or contact your SchemaBot operators for help."
-
-// msgRollbackConfirmBlockedPlanLockHeld is the variant posted when the lock
-// release itself failed: the operator must unlock before anything else can
-// run on the database.
-const msgRollbackConfirmBlockedPlanLockHeld = "The pinned rollback plan contains changes the schema-change engine does not support, so this rollback cannot execute. SchemaBot failed to release the database lock — release it with `schemabot unlock`, then re-run `schemabot rollback <apply-id> -e %s` to generate a fresh plan, or contact your SchemaBot operators for help."
-
 // handleRollbackCommand handles the "schemabot rollback <apply-id> -e <env>" PR comment command.
 // It looks up the specified apply, generates a rollback plan from its original schema files,
 // acquires a lock, and posts the plan for confirmation.
@@ -406,13 +395,13 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", dbType, "environment", environment,
 			"plan_id", rollbackPlan.PlanIdentifier)
-		msg := fmt.Sprintf(msgRollbackConfirmBlockedPlan, environment)
+		msg := templates.RenderRollbackConfirmBlockedPlan(environment, h.deploymentTenant())
 		if err := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner); err != nil {
 			h.logger.Error("rollback-confirm rejected a blocked rollback plan but failed to release the database lock; applies on this database will be blocked until the lock is released manually",
 				"repo", repo, "pr", pr, "database", database,
 				"database_type", dbType, "environment", environment,
 				"lock_owner", lockOwner, "plan_id", rollbackPlan.PlanIdentifier, "error", err)
-			msg = fmt.Sprintf(msgRollbackConfirmBlockedPlanLockHeld, environment)
+			msg = templates.RenderRollbackConfirmBlockedPlanLockHeld(environment, h.deploymentTenant())
 		}
 		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, msg)
 		return
@@ -429,7 +418,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 			"database_type", dbType, "environment", environment,
 			"plan_id", rollbackPlan.PlanIdentifier)
 		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy,
-			fmt.Sprintf(msgDeferCutoverAllDirectRollbackConfirm, environment))
+			templates.RenderDeferCutoverAllDirectRollbackConfirm(environment, h.deploymentTenant()))
 		return
 	}
 

@@ -155,7 +155,7 @@ func (h *Handler) executeApply(
 		h.logger.Info("apply rejected: --defer-cutover on an all-direct plan; the pending confirmation is preserved",
 			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
 		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-			fmt.Sprintf(msgDeferCutoverAllDirectConfirm, environment))
+			templates.RenderDeferCutoverAllDirectConfirm(environment, h.deploymentTenant()))
 		return
 	}
 
