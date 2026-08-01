@@ -171,6 +171,97 @@ func TestWaitForDeployRequestPending_NilDeployRequestIsRejected(t *testing.T) {
 	assert.Equal(t, 0, client.getCallCount)
 }
 
+// deployRejectionClient rejects DeployDeployRequest with a configured error a
+// set number of times before accepting, so tests can drive the deploy retry
+// paths (still-validating polls, transient backoff, permanent rejections).
+type deployRejectionClient struct {
+	psclient.PSClient
+	rejectErr   error
+	rejections  int
+	deployCalls int
+}
+
+func (c *deployRejectionClient) DeployDeployRequest(_ context.Context, req *ps.PerformDeployRequest) (*ps.DeployRequest, error) {
+	c.deployCalls++
+	if c.deployCalls <= c.rejections {
+		return nil, c.rejectErr
+	}
+	return &ps.DeployRequest{Number: req.Number, DeploymentState: deployState.InProgress}, nil
+}
+
+// compressDeployValidationWait shrinks the validation poll budget so tests
+// exercise the wait loop without real-time delays.
+func compressDeployValidationWait(t *testing.T, wait, interval time.Duration) {
+	t.Helper()
+	origWait, origInterval := deployValidationWait, deployValidationPollInterval
+	deployValidationWait, deployValidationPollInterval = wait, interval
+	t.Cleanup(func() {
+		deployValidationWait, deployValidationPollInterval = origWait, origInterval
+	})
+}
+
+const stillValidatingMessage = "We're currently validating that these changes are safe to deploy. Please try again in a few moments."
+
+// PlanetScale rejects the deploy call while the deploy request's safety
+// validation is still running. The rejection clears on its own, so the deploy
+// must be retried until validation completes and the apply proceeds — not
+// converted into a terminal failure.
+func TestDeployDeployRequest_RetriesWhileStillValidating(t *testing.T) {
+	compressDeployValidationWait(t, time.Second, time.Millisecond)
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	client := &deployRejectionClient{rejectErr: errors.New(stillValidatingMessage), rejections: 2}
+
+	dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 124, false)
+
+	require.NoError(t, err)
+	require.NotNil(t, dr)
+	assert.Equal(t, uint64(124), dr.Number)
+	assert.Equal(t, 3, client.deployCalls)
+}
+
+// A deploy request whose validation never completes must not hold the apply
+// forever: past the bounded wait the deploy fails with an error naming how
+// long SchemaBot waited.
+func TestDeployDeployRequest_ValidationPastDeadlineFails(t *testing.T) {
+	compressDeployValidationWait(t, 20*time.Millisecond, 5*time.Millisecond)
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	client := &deployRejectionClient{rejectErr: errors.New(stillValidatingMessage), rejections: 1_000_000}
+
+	_, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 126, false)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "still validating")
+	assert.Contains(t, err.Error(), deployValidationWait.String())
+	assert.ErrorContains(t, err, stillValidatingMessage)
+}
+
+// Transient PlanetScale API errors on the deploy call retry with backoff up
+// to the retry bound, then succeed once the API recovers.
+func TestDeployDeployRequest_TransientErrorsRetry(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	client := &deployRejectionClient{rejectErr: &ps.Error{Code: ps.ErrRetry}, rejections: 1}
+
+	dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 7, true)
+
+	require.NoError(t, err)
+	require.NotNil(t, dr)
+	assert.Equal(t, 2, client.deployCalls)
+}
+
+// A deploy rejected because the PlanetScale database requires administrator
+// approval can never succeed on retry; it fails immediately with guidance to
+// disable the approval requirement.
+func TestDeployDeployRequest_ApprovalRequirementFailsImmediately(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	client := &deployRejectionClient{rejectErr: errors.New("deploy request must be approved"), rejections: 1_000_000}
+
+	_, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 9, false)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Require administrator approval")
+	assert.Equal(t, 1, client.deployCalls)
+}
+
 // resumeDeployClient returns a fixed deploy request on Get and records whether a
 // deploy was started. The recovered deploy request lets resume tests drive the
 // reattach path without a live PlanetScale API or vtgate.

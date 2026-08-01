@@ -415,6 +415,17 @@ const (
 	deployRequestPollInterval = 500 * time.Millisecond
 )
 
+// deployValidationWait bounds how long a deploy keeps retrying while
+// PlanetScale is still validating the deploy request, and
+// deployValidationPollInterval paces those retries. Validation runs
+// asynchronously after the deploy request leaves the pending state, so the
+// deploy endpoint can keep rejecting for a while after the request reports
+// ready. Variables rather than constants so tests can compress the wait.
+var (
+	deployValidationWait         = 5 * time.Minute
+	deployValidationPollInterval = 5 * time.Second
+)
+
 // deployState is a shorthand alias for PlanetScale deploy request state constants.
 var deployState = state.DeployRequest
 
@@ -714,6 +725,17 @@ func isRetryableMySQLConnectionError(err error) bool {
 // are blocked while the snapshot completes.
 func isSnapshotInProgress(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "schema snapshot is in progress")
+}
+
+// isDeployStillValidatingError reports whether the PlanetScale API rejected a
+// deploy because the deploy request is still running its pre-deploy safety
+// validation ("We're currently validating that these changes are safe to
+// deploy"). The rejection clears on its own once validation completes, so the
+// deploy should be retried rather than failed. Message matching is required:
+// the API returns this rejection with a non-retryable error code, so the
+// SDK's typed codes cannot distinguish it from a permanent rejection.
+func isDeployStillValidatingError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "validating that these changes are safe to deploy")
 }
 
 // isRetryablePSError returns true if the error is a transient PlanetScale
