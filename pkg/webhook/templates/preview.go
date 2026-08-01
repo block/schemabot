@@ -81,6 +81,38 @@ func PreviewCommentPlanBlocked() string {
 	})
 }
 
+// PreviewCommentPlanDirect renders a sample locked apply-confirmation comment
+// for a plan whose refused statement the direct execution policy routes to
+// native MySQL DDL (execution-mode verdict "direct"), showing the disclosure
+// the operator consents to by confirming.
+func PreviewCommentPlanDirect() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+					"ALTER TABLE `orders` ADD COLUMN `notes` TEXT",
+				},
+			},
+		},
+		DirectChanges: []DirectChangeData{
+			{Table: "users", Reason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows"},
+		},
+		AutoConfirmDowngradeReason: "Plan contains direct-execution changes — review the disclosure and confirm manually",
+	})
+}
+
 // PreviewCommentApplyBlockedRejected renders a sample apply rejection for a
 // plan containing statements the engine refuses.
 func PreviewCommentApplyBlockedRejected() string {
@@ -102,7 +134,7 @@ func PreviewCommentApplyBlockedRejected() string {
 			},
 		},
 		BlockedChanges: []BlockedChangeData{
-			{Table: "users", Reason: "dropping primary key is not supported"},
+			{Table: "users", Reason: "dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000"},
 		},
 	})
 }
