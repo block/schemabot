@@ -51,7 +51,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e staging
 ```
@@ -89,7 +89,7 @@ An apply will fail on these statements. Rewrite them as a supported schema chang
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e staging
 ```
@@ -209,7 +209,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e staging --tenant alpha
 ```
@@ -423,7 +423,7 @@ CREATE TABLE `addresses` (
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e staging
 ```
@@ -555,7 +555,7 @@ CREATE TABLE `metrics` (
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e staging
 ```
@@ -608,7 +608,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** these changes, start with the first environment:
+▶️ **To apply** these changes, start with the first environment:
 ```
 schemabot apply -e staging
 ```
@@ -670,7 +670,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** these changes, comment:
+▶️ **To apply** these changes, comment:
 ```
 schemabot apply -e production
 ```
@@ -728,7 +728,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** these changes, comment:
+▶️ **To apply** these changes, comment:
 ```
 schemabot apply -e staging
 ```
@@ -790,7 +790,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** these changes, start with the first environment:
+▶️ **To apply** these changes, start with the first environment:
 ```
 schemabot apply -e staging
 ```
@@ -6580,7 +6580,7 @@ ALTER TABLE `mutes`
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e production
 ```
@@ -6615,7 +6615,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e production
 ```
@@ -6661,7 +6661,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e production
 ```

@@ -231,15 +231,15 @@ func RenderPlanComment(data PlanCommentData) string {
 		if data.Tenant != "" {
 			applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 		}
-		writeApplyHint(&sb, applyCmd)
+		writeApplyInstruction(&sb, applyCmd)
 	}
 
 	return sb.String()
 }
 
-// writeApplyHint writes the 💡 apply hint with the given command.
-func writeApplyHint(sb *strings.Builder, command string) {
-	sb.WriteString("💡 **To apply** all schema changes from this PR, comment:\n")
+// writeApplyInstruction writes the ▶️ apply instruction with the given command.
+func writeApplyInstruction(sb *strings.Builder, command string) {
+	sb.WriteString("▶️ **To apply** all schema changes from this PR, comment:\n")
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
 }
 
@@ -992,14 +992,14 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	// Apply instructions for environments with changes
 	switch {
 	case len(envsWithChanges) >= 2:
-		sb.WriteString("💡 **To apply** these changes, start with the first environment:\n")
+		sb.WriteString("▶️ **To apply** these changes, start with the first environment:\n")
 		fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot apply", envsWithChanges[0], data.Tenant))
 		for i := 1; i < len(envsWithChanges); i++ {
 			fmt.Fprintf(sb, "\nAfter verifying %s, apply to %s:\n", envsWithChanges[i-1], envsWithChanges[i])
 			fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot apply", envsWithChanges[i], data.Tenant))
 		}
 	case len(envsWithChanges) == 1:
-		sb.WriteString("💡 **To apply** these changes, comment:\n")
+		sb.WriteString("▶️ **To apply** these changes, comment:\n")
 		fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot apply", envsWithChanges[0], data.Tenant))
 	case len(envsWithErrors) == 0:
 		sb.WriteString("No changes to apply.\n")
