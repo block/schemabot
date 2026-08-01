@@ -365,7 +365,7 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 	// Step 6: The rollback apply is attributed to the user who confirmed it,
 	// in the same caller format as any other PR command, so history and
 	// progress views show who acted rather than the lock owner.
-	applies, err := svc.Storage().Applies().GetByDatabase(ctx, dbName, "mysql", "staging")
+	applies, err := svc.Storage().Applies().GetByDatabase(ctx, dbName, "mysql", "staging", 10)
 	require.NoError(t, err)
 	var rollbackApply *storage.Apply
 	for _, a := range applies {
