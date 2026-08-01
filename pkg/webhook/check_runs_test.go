@@ -770,14 +770,16 @@ func TestAggregateLeaderAnswersUsageErrorsDespiteUnscopedPolicy(t *testing.T) {
 			bodyContains: "staging",
 		},
 		{
-			name:    "help",
-			comment: "schemabot help",
-			message: "help posted",
+			name:         "help",
+			comment:      "schemabot help",
+			message:      "help posted",
+			bodyContains: "SchemaBot Help",
 		},
 		{
-			name:    "invalid command",
-			comment: "schemabot foobar",
-			message: "invalid command",
+			name:         "invalid command",
+			comment:      "schemabot foobar",
+			message:      "invalid command",
+			bodyContains: "Invalid Command",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -824,10 +826,10 @@ func TestAggregateLeaderAnswersUsageErrorsDespiteUnscopedPolicy(t *testing.T) {
 
 			require.Equal(t, http.StatusOK, rr.Code)
 			assert.Contains(t, rr.Body.String(), tc.message)
-			if tc.bodyContains != "" {
-				assert.Contains(t, postedComment, tc.bodyContains,
-					"the leader's reply should tell the operator the registered environments")
-			}
+			require.NotEmpty(t, postedComment,
+				"the leader must post the reply on the PR; a passing handler response without a comment is a silent drop")
+			assert.Contains(t, postedComment, tc.bodyContains,
+				"the leader's reply should carry the expected guidance")
 		})
 	}
 }
