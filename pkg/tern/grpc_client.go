@@ -3143,6 +3143,14 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 			storedTask.ChecksumRowsChecked = remoteTask.ChecksumRowsChecked
 			storedTask.ChecksumRowsTotal = remoteTask.ChecksumRowsTotal
 		}
+		// Adopt the remote task's own failure reason (for example an engine
+		// preflight rejection) so the operation row derived from the stored task
+		// carries a per-table error. An empty remote error never clears a stored
+		// one: a data plane running an older proto omits the field entirely, and
+		// the stored message may have been stamped from the apply-level error.
+		if remoteTask.ErrorMessage != "" {
+			storedTask.ErrorMessage = remoteTask.ErrorMessage
+		}
 		if state.IsState(storedTask.State, state.Task.Completed) && storedTask.ProgressPercent != 100 {
 			storedTask.ProgressPercent = 100
 		}

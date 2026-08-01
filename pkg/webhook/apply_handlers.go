@@ -275,6 +275,17 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 		return false, nil
 	}
 
+	// --defer-cutover only affects engine-driven statements; an all-direct
+	// plan has no cutover to defer, so reject the flag instead of silently
+	// ignoring it.
+	if result.DeferCutover && planResp.AllChangesDirect() {
+		h.logger.Info("apply rejected: --defer-cutover on an all-direct plan",
+			"repo", repo, "pr", pr, "database", database, "environment", environment)
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+			msgDeferCutoverAllDirect)
+		return false, nil
+	}
+
 	// Block unsafe changes unless --allow-unsafe was specified
 	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
@@ -335,6 +346,25 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 		return true, fmt.Errorf("apply command fresh-HEAD checks gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "fresh-HEAD checks gate block")
+		return false, nil
+	}
+
+	// Direct-execution changes never run without explicit confirmation: the
+	// operator must consent to their blocking, non-revertible native DDL
+	// against the locked comment that discloses it, so the apply never
+	// proceeds in one step — downgrade to the two-step confirm.
+	if len(planResp.DirectChanges()) > 0 {
+		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
+			"repo", repo, "pr", pr, "database", database, "environment", environment)
+		commentData.AutoConfirmDowngradeReason = "Plan contains direct-execution changes — review the disclosure and confirm manually"
+		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
+		if checkRunErr != nil {
+			h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
+		}
+		if headSHA != "" {
+			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+		}
 		return false, nil
 	}
 

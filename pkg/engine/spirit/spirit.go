@@ -91,6 +91,13 @@ type runningSchemaChange struct {
 	deferCutover            bool // Whether to defer cutover until manual trigger
 	volumeRestartInProgress bool // Set while stored stopped state should still be exposed as running progress.
 
+	// directPolicy is the direct execution policy snapshotted at Apply, so a
+	// resumed schema change routes with the same policy the apply started
+	// with. directStatements tracks each direct-routed statement's lifecycle
+	// for progress reporting.
+	directPolicy     directPolicy
+	directStatements []*directStatementProgress
+
 	// Spirit copy settings for this schema change. Initialized from the
 	// engine's configured defaults and retuned by Volume for this change only;
 	// they end with the change, so the next schema change starts from the
@@ -311,6 +318,19 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, err
 	}
 
+	// The direct execution policy resolves refused statements to a direct or
+	// blocked verdict below. A malformed policy fails the plan: silently
+	// treating it as disabled would record blocked verdicts the apply-time
+	// routing might not agree with.
+	policy, err := directPolicyFromMetadata(req.Credentials.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct execution policy: %w", err)
+	}
+	// Row estimates for the policy bound connect lazily so plans without
+	// refused statements never open the extra connection.
+	target := &lazyTargetDB{dsn: req.Credentials.DSN}
+	defer target.close()
+
 	if !plan.HasChanges() {
 		return &engine.PlanResult{
 			PlanID:    fmt.Sprintf("plan-%d", time.Now().UnixNano()),
@@ -350,20 +370,28 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		}
 
 		// Execution-mode verdict: surface statements Spirit deterministically
-		// refuses so the operator learns at plan time that the apply will fail.
-		// Only ALTERs can be refused, and gating here keeps the verdict — an
-		// informational field — from ever failing the plan on a statement type
-		// the verdict's own parser doesn't accept.
+		// refuses so the operator learns at plan time how the apply will
+		// behave — routed to direct execution when the policy permits, or
+		// guaranteed to fail when it doesn't. Only ALTERs can be refused, and
+		// gating here keeps the verdict — an informational field — from ever
+		// failing the plan on a statement type the verdict's own parser
+		// doesn't accept.
 		if stmtType == statement.StatementAlterTable {
 			reason, refused, err := ddl.EngineRefusalReason(pc.Statement)
 			if err != nil {
 				return nil, fmt.Errorf("execution verdict for table %q: %w", pc.TableName, err)
 			}
 			if refused {
-				change.ExecutionMode = ddl.ExecutionModeBlocked
-				change.ModeReason = reason
-				e.logger.Info("plan contains a statement the engine will refuse at apply time",
-					"database", database, "table", pc.TableName, "reason", reason)
+				decision := e.resolveRefusedMode(ctx, target, policy, database, pc.TableName, reason)
+				change.ExecutionMode = decision.mode
+				change.ModeReason = decision.modeReason
+				if decision.mode == engine.ExecutionModeDirect {
+					e.logger.Info("plan routes a statement the engine refuses to direct execution",
+						"database", database, "table", pc.TableName, "reason", reason, "estimated_rows", decision.rows)
+				} else {
+					e.logger.Info("plan contains a statement the engine will refuse at apply time",
+						"database", database, "table", pc.TableName, "reason", decision.modeReason)
+				}
 			}
 
 			// Table-schema-aware verdict: ENUM reorder / mid-list insertion
@@ -471,6 +499,14 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		}, nil
 	}
 
+	// Resolve the direct execution policy up front so a malformed policy
+	// rejects the apply before any state is created, and snapshot it on the
+	// running change below so resume routes with the same policy.
+	directExecPolicy, err := directPolicyFromMetadata(req.Credentials.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct execution policy: %w", err)
+	}
+
 	// Parse DSN to extract connection info (DSN is the source of truth for actual database)
 	host, username, password, database, err := parseDSN(req.Credentials.DSN)
 	if err != nil {
@@ -513,6 +549,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		state:           engine.StateRunning,
 		started:         time.Now(),
 		deferCutover:    deferCutover,
+		directPolicy:    directExecPolicy,
 		host:            host,
 		username:        username,
 		password:        password,
@@ -535,7 +572,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			e.runningSchemaChange.cancelFunc = cancel
 		}
 		e.mu.Unlock()
-		e.executeSchemaChange(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover)
+		e.executeSchemaChange(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover, directExecPolicy)
 	})
 
 	return &engine.ApplyResult{
@@ -606,6 +643,29 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 			}
 			tableProgress = append(tableProgress, tp)
 		}
+	}
+
+	// Direct-routed statements run outside the Spirit runner, so they report
+	// their own explicit lifecycle entries: no row counts or ETA, just the
+	// per-statement state transitions the executor recorded.
+	for _, ds := range rm.directStatements {
+		tp := engine.TableProgress{
+			Namespace:      rm.tableNamespace[ds.table],
+			Table:          ds.table,
+			DDL:            ds.ddl,
+			State:          ds.state,
+			ProgressDetail: "direct execution (native MySQL DDL)",
+		}
+		started := ds.startedAt
+		tp.StartedAt = &started
+		if ds.completedAt != nil {
+			completed := *ds.completedAt
+			tp.CompletedAt = &completed
+		}
+		if ds.state == directStateCompleted {
+			tp.Progress = 100
+		}
+		tableProgress = append(tableProgress, tp)
 	}
 
 	state := progressState(rm, spiritState)

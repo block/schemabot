@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/pendingdrops"
@@ -977,6 +978,29 @@ type DirectExecutionConfig struct {
 	// its native session lock timeout. A whole number of seconds (e.g.
 	// "10s"). Optional; the engine applies its default when omitted.
 	LockAcquisitionTimeout string `yaml:"lock_acquisition_timeout,omitempty"`
+}
+
+// EngineMetadata resolves the policy into the engine metadata keys a
+// data-plane client forwards with request credentials. Returns nil when the
+// policy is absent or disabled. Every client assembly path must build its
+// direct-execution metadata here, so the forwarded keys and fields cannot
+// drift between paths.
+func (c *DirectExecutionConfig) EngineMetadata() (map[string]string, error) {
+	if c == nil || !c.Enabled {
+		return nil, nil
+	}
+	md := map[string]string{
+		engine.MetadataDirectExecution:             "true",
+		engine.MetadataDirectExecutionMaxTableRows: strconv.FormatInt(c.MaxTableRows, 10),
+	}
+	lockWaitSeconds, err := c.lockAcquisitionTimeoutSeconds()
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct_execution lock_acquisition_timeout: %w", err)
+	}
+	if lockWaitSeconds > 0 {
+		md[engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds] = strconv.FormatInt(lockWaitSeconds, 10)
+	}
+	return md, nil
 }
 
 // lockAcquisitionTimeoutSeconds parses the configured lock acquisition

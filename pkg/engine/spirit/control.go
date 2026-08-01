@@ -212,6 +212,7 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 	originalDDLs := rm.originalDDLs
 	combinedStatement := rm.combinedStatement
 	deferCutover := rm.deferCutover
+	directExecPolicy := rm.directPolicy
 	e.mu.Unlock()
 
 	if state == engine.StateRunning {
@@ -247,7 +248,7 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 			e.runningSchemaChange.cancelFunc = cancel
 		}
 		e.mu.Unlock()
-		e.resumeSchemaChange(bgCtx, host, username, password, database, originalDDLs, combinedStatement, deferCutover)
+		e.resumeSchemaChange(bgCtx, host, username, password, database, originalDDLs, combinedStatement, deferCutover, directExecPolicy)
 	})
 
 	return &engine.ControlResult{
