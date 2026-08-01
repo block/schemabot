@@ -51,12 +51,12 @@ func TestRenderPlanComment_UnsafeShownOnPlanNotOnApply(t *testing.T) {
 	}
 
 	plan := RenderPlanComment(data)
-	assert.Contains(t, plan, "⛔ Unsafe Changes Detected", "the plan comment surfaces unsafe changes for review")
+	assert.Contains(t, plan, "**Issues**: **1** unsafe change detected", "the plan comment surfaces unsafe changes for review")
 	assert.Contains(t, plan, "DROP COLUMN is destructive")
 
 	data.IsLocked = true
 	apply := RenderPlanComment(data)
-	assert.NotContains(t, apply, "⛔ Unsafe Changes Detected", "the locked apply comment omits the unsafe warning as noise")
+	assert.NotContains(t, apply, "**Issues**: **1** unsafe change detected", "the locked apply comment omits the unsafe warning as noise")
 	assert.NotContains(t, apply, "DROP COLUMN is destructive")
 	assert.NotContains(t, apply, "Destructive drop guidance", "the drop guidance rides inside the unsafe block and is omitted with it")
 	assert.Contains(t, apply, "DROP COLUMN `email`", "the DDL itself stays visible on the apply comment")
@@ -172,7 +172,7 @@ func TestRenderPlanComment_UnsafeShardChangeShowsShard(t *testing.T) {
 		}},
 	})
 
-	assert.Contains(t, out, "Unsafe Changes")
+	assert.Contains(t, out, "**Issues**: **1** unsafe change detected")
 	assert.Contains(t, out, "`mutes` (shard `40-80`)", "the unsafe change names the shard it applies to")
 	assert.Contains(t, out, "DROP COLUMN `x`", "the drop is shown in that shard's combined ALTER")
 }

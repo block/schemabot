@@ -879,6 +879,8 @@ func TestOperator_ClaimableStates(t *testing.T) {
 		{name: "waiting for cutover", applyState: state.Apply.WaitingForCutover, databaseType: "vitess", engine: "planetscale", wantClaim: true},
 		{name: "cutting over", applyState: state.Apply.CuttingOver, databaseType: "vitess", engine: "planetscale", wantClaim: true},
 		{name: "revert window", applyState: state.Apply.RevertWindow, databaseType: "vitess", engine: "planetscale", wantClaim: true},
+		{name: "reverting", applyState: state.Apply.Reverting, databaseType: "vitess", engine: "planetscale", wantClaim: true},
+		{name: "skipping revert", applyState: state.Apply.SkippingRevert, databaseType: "vitess", engine: "planetscale", wantClaim: true},
 		{name: "completed", applyState: state.Apply.Completed, databaseType: "mysql", engine: "spirit"},
 		{name: "failed", applyState: state.Apply.Failed, databaseType: "mysql", engine: "spirit"},
 		{name: "stopped", applyState: state.Apply.Stopped, databaseType: "mysql", engine: "spirit"},

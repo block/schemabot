@@ -35,6 +35,15 @@ func (h *Handler) logControlCommandError(command, repo string, pr int, applyID, 
 
 func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int, installationID int64, requestedBy string, result CommandResult, command string) (*storage.Apply, bool) {
 	if result.ApplyID == "" {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping missing-apply-id reply for unscoped fan-out control command; the leader posts it once",
+				"command", command,
+				"repo", repo,
+				"pr", pr,
+				"environment", result.Environment,
+				"requested_by", requestedBy)
+			return nil, false
+		}
 		h.postComment(repo, pr, installationID, templates.RenderControlMissingApplyID(command))
 		return nil, false
 	}
@@ -87,6 +96,20 @@ func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int
 		return nil, false
 	}
 	if apply == nil {
+		// On an aggregate repo an unscoped control command fans out to every
+		// deployment, but the apply lives in exactly one tenant's storage. A
+		// deployment that doesn't have it is not the owner and stays silent so
+		// only the owning deployment answers.
+		if h.silentOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("unscoped fan-out control command targets an apply not stored on this deployment; staying silent so the owning deployment responds",
+				"command", command,
+				"repo", repo,
+				"pr", pr,
+				"apply_id", result.ApplyID,
+				"environment", result.Environment,
+				"requested_by", requestedBy)
+			return nil, false
+		}
 		h.logger.Warn("PR control command rejected because apply was not found",
 			"command", command,
 			"repo", repo,
@@ -123,6 +146,7 @@ func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int
 			fmt.Sprintf("Apply %s belongs to environment %q, not %q", result.ApplyID, apply.Environment, result.Environment))
 		return nil, false
 	}
+	h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 	return apply, true
 }
 
@@ -149,7 +173,11 @@ func runControlCommand[R any](
 	if blocked {
 		return nil
 	}
-	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, apply.Database, apply.DatabaseType, result.Environment, actionName); blocked {
+	// Control commands are not durable cores, so an authorization evaluation
+	// failure and a merit denial both stop the command here; the gate has
+	// already logged and posted the distinction.
+	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, apply.Database, apply.DatabaseType, result.Environment, actionName)
+	if authErr != nil || blocked {
 		return nil
 	}
 
@@ -213,7 +241,7 @@ func (h *Handler) handleStopCommand(repo string, pr int, installationID int64, r
 		"apply_id", result.ApplyID,
 		"environment", result.Environment,
 		"requested_by", requestedBy,
-		"status", resp.Status,
+		"apply_status", resp.Status,
 		"stopped_count", resp.StoppedCount,
 		"skipped_count", resp.SkippedCount)
 	h.postComment(repo, pr, installationID, templates.RenderStopCommandAccepted(templates.StopCommandAcceptedData{
@@ -246,7 +274,7 @@ func (h *Handler) handleCancelCommand(repo string, pr int, installationID int64,
 		"apply_id", result.ApplyID,
 		"environment", result.Environment,
 		"requested_by", requestedBy,
-		"status", resp.Status,
+		"apply_status", resp.Status,
 		"cancelled_count", resp.CancelledCount,
 		"skipped_count", resp.SkippedCount)
 	h.postComment(repo, pr, installationID, templates.RenderCancelCommandAccepted(templates.CancelCommandAcceptedData{
@@ -279,7 +307,7 @@ func (h *Handler) handleStartCommand(repo string, pr int, installationID int64, 
 		"apply_id", result.ApplyID,
 		"environment", result.Environment,
 		"requested_by", requestedBy,
-		"status", resp.Status,
+		"apply_status", resp.Status,
 		"started_count", resp.StartedCount,
 		"skipped_count", resp.SkippedCount)
 	h.postComment(repo, pr, installationID, templates.RenderStartCommandAccepted(templates.StartCommandAcceptedData{
@@ -313,7 +341,7 @@ func (h *Handler) handleReleaseCommand(repo string, pr int, installationID int64
 		"apply_id", result.ApplyID,
 		"environment", result.Environment,
 		"requested_by", requestedBy,
-		"status", resp.Status)
+		"apply_status", resp.Status)
 	h.postComment(repo, pr, installationID, templates.RenderReleaseCommandAccepted(templates.ReleaseCommandAcceptedData{
 		ApplyID:     result.ApplyID,
 		Environment: result.Environment,
@@ -342,12 +370,81 @@ func (h *Handler) handleCutoverCommand(repo string, pr int, installationID int64
 		"apply_id", result.ApplyID,
 		"environment", result.Environment,
 		"requested_by", requestedBy,
-		"status", resp.Status)
+		"apply_status", resp.Status)
 	h.postComment(repo, pr, installationID, templates.RenderCutoverCommandAccepted(templates.CutoverCommandAcceptedData{
 		ApplyID:     result.ApplyID,
 		Environment: result.Environment,
 		RequestedBy: requestedBy,
 		Status:      resp.Status,
+	}))
+}
+
+// volumeCommandLevelValid reports whether the parsed command carries a usable
+// volume level: the `-v` flag was present with a numeric value inside the
+// shared volume range. An absent flag parses as level 0, which the range
+// check rejects.
+func volumeCommandLevelValid(result CommandResult) bool {
+	return !result.VolumeLevelError &&
+		result.VolumeLevel >= storage.MinVolume &&
+		result.VolumeLevel <= storage.MaxVolume
+}
+
+// handleVolumeCommand handles the "schemabot volume <apply-id> -e <env> -v <level>"
+// PR comment command by queueing a durable volume adjustment that the driver
+// applies at its next progress check.
+func (h *Handler) handleVolumeCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
+	ctx, cancel := h.commandContext(commandTimeout)
+	defer cancel()
+
+	// A missing apply ID takes precedence over level validation so the
+	// command posts the standard missing-apply-ID guidance shared by all
+	// apply-scoped control commands (runControlCommand handles that case).
+	if result.ApplyID != "" && !volumeCommandLevelValid(result) {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping invalid-volume-level reply for unscoped fan-out; the leader posts it once",
+				"repo", repo,
+				"pr", pr,
+				"apply_id", result.ApplyID,
+				"environment", result.Environment,
+				"requested_by", requestedBy,
+				"volume", result.VolumeLevel,
+				"volume_flag_error", result.VolumeLevelError)
+			return
+		}
+		h.logger.Warn("volume PR command rejected because the level is missing or invalid",
+			"repo", repo,
+			"pr", pr,
+			"apply_id", result.ApplyID,
+			"environment", result.Environment,
+			"requested_by", requestedBy,
+			"volume", result.VolumeLevel,
+			"volume_flag_error", result.VolumeLevelError)
+		h.postComment(repo, pr, installationID, templates.RenderVolumeInvalidLevel())
+		return
+	}
+
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Volume,
+		func(ctx context.Context, req apitypes.ControlRequest) (*apitypes.VolumeResponse, error) {
+			return h.service.ExecuteVolume(ctx, req, result.VolumeLevel)
+		},
+		func(r *apitypes.VolumeResponse) bool { return r.Accepted },
+		func(r *apitypes.VolumeResponse) string { return r.ErrorMessage })
+	if resp == nil {
+		return
+	}
+
+	h.logger.Info("volume PR command accepted",
+		"repo", repo,
+		"pr", pr,
+		"apply_id", result.ApplyID,
+		"environment", result.Environment,
+		"requested_by", requestedBy,
+		"volume", result.VolumeLevel)
+	h.postComment(repo, pr, installationID, templates.RenderVolumeCommandAccepted(templates.VolumeCommandAcceptedData{
+		ApplyID:     result.ApplyID,
+		Environment: result.Environment,
+		RequestedBy: requestedBy,
+		Volume:      result.VolumeLevel,
 	}))
 }
 

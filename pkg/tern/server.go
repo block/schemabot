@@ -109,6 +109,20 @@ func (s *Server) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*te
 	return resp, nil
 }
 
+func (s *Server) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	if err := requireApplyID(req.GetApplyId()); err != nil {
+		return nil, err
+	}
+	resp, err := s.client.Logs(ctx, req)
+	if err != nil {
+		if errors.Is(err, storage.ErrApplyNotFound) {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return resp, nil
+}
+
 func (s *Server) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
 	if err := requireApplyID(req.ApplyId); err != nil {
 		return nil, err

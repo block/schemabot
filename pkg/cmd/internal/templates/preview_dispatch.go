@@ -43,6 +43,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewLockConflictByCLIOutput()
 	case PreviewNoLockFound:
 		previewNoLockFoundOutput()
+	case PreviewLockOtherType:
+		previewLockExistsUnderOtherTypeOutput()
 	case PreviewUnlockNotOwned:
 		previewUnlockNotOwnedOutput()
 	case PreviewLockReleased:
@@ -114,12 +116,22 @@ func PreviewCLIOutput(previewType PreviewType) {
 	// Comment template previews
 	case PreviewCommentPlan:
 		fmt.Print(webhooktemplates.PreviewCommentPlan())
+	case PreviewCommentPlanBlocked:
+		fmt.Print(webhooktemplates.PreviewCommentPlanBlocked())
+	case PreviewCommentPlanDirect:
+		fmt.Print(webhooktemplates.PreviewCommentPlanDirect())
+	case PreviewCommentApplyBlockedRejected:
+		fmt.Print(webhooktemplates.PreviewCommentApplyBlockedRejected())
 	case PreviewCommentPlanTenant:
 		fmt.Print(webhooktemplates.PreviewCommentPlanTenant())
 	case PreviewCommentPlanEmpty:
 		fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges())
 	case PreviewCommentNoManagedSchema:
 		fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChanges())
+	case PreviewCommentChecksRefreshed:
+		fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshed())
+	case PreviewCommentChecksRefreshedTenant:
+		fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants())
 	case PreviewCommentReconcileInProgress:
 		fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationInProgress())
 	case PreviewCommentReconcileCompleted:
@@ -148,6 +160,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentDropColumnBlocked())
 	case PreviewCommentDropIndexBlocked:
 		fmt.Print(webhooktemplates.PreviewCommentDropIndexBlocked())
+	case PreviewCommentLintErrorsBlocked:
+		fmt.Print(webhooktemplates.PreviewCommentLintErrorsBlocked())
 	case PreviewCommentApplyPlan:
 		fmt.Print(webhooktemplates.PreviewCommentApplyPlan())
 	case PreviewCommentApplyPlanOptions:
@@ -164,10 +178,16 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentApplyCompleted())
 	case PreviewCommentApplyFailed:
 		fmt.Print(webhooktemplates.PreviewCommentApplyFailed())
+	case PreviewCommentApplyFailedBeforeRowCopy:
+		fmt.Print(webhooktemplates.PreviewCommentApplyFailedBeforeRowCopy())
+	case PreviewCommentApplyRetrying:
+		fmt.Print(webhooktemplates.PreviewCommentApplyRetrying())
 	case PreviewCommentApplyStopped:
 		fmt.Print(webhooktemplates.PreviewCommentApplyStopped())
 	case PreviewCommentApplyWaitingCutover:
 		fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutover())
+	case PreviewCommentApplyWaitingCutoverAutomatic:
+		fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutoverAutomatic())
 	case PreviewCommentApplyCuttingOver:
 		fmt.Print(webhooktemplates.PreviewCommentApplyCuttingOver())
 	case PreviewCommentMultiDeployInProgress:
@@ -233,6 +253,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentApplyInProgress())
 	case PreviewCommentApplyNoLock:
 		fmt.Print(webhooktemplates.PreviewCommentApplyConfirmNoLock())
+	case PreviewCommentBaseSchemaStale:
+		fmt.Print(webhooktemplates.PreviewCommentBaseSchemaFreshnessRejected())
 	case PreviewCommentBlockedByPriorEnv:
 		fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnv())
 	case PreviewCommentBlockedByPriorFailed:
@@ -267,8 +289,10 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted())
 	case PreviewCommentCutoverActive:
 		fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress())
-	case PreviewCommentApplyAllType:
-		previewApplyCommandAllOutput()
+	case PreviewCommentVolumeAccepted:
+		fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted())
+	case PreviewCommentVolumeInvalid:
+		fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel())
 	// Paired aggregate previews (PR + CLI subsections)
 	case PreviewCommentPlanAll:
 		previewCommentPlanAllOutput()

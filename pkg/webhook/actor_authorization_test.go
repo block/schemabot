@@ -26,6 +26,7 @@ func TestAuthorizePRCommandActor(t *testing.T) {
 		name       string
 		config     *api.ServerConfig
 		actor      string
+		repo       string
 		database   string
 		wantAllow  bool
 		wantReason string
@@ -64,6 +65,58 @@ func TestAuthorizePRCommandActor(t *testing.T) {
 			wantMatch:  "mona",
 		},
 		{
+			name: "repo admin user allows databases managed through that repository",
+			config: actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+				cfg.Repos = map[string]api.RepoConfig{
+					"octocat/hello-world": {AdminUsers: []string{"mona"}},
+				}
+			}),
+			actor:      "Mona",
+			database:   "orders",
+			wantAllow:  true,
+			wantReason: api.ActorAuthReasonAllowedRepoAdminUser,
+			wantMatch:  "mona",
+		},
+		{
+			name: "global admin user takes precedence over repo admin user",
+			config: actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+				cfg.PRCommandAuthorization.AdminUsers = []string{"mona"}
+				cfg.Repos = map[string]api.RepoConfig{
+					"octocat/hello-world": {AdminUsers: []string{"mona"}},
+				}
+			}),
+			actor:      "mona",
+			database:   "orders",
+			wantAllow:  true,
+			wantReason: api.ActorAuthReasonAllowedAdminUser,
+			wantMatch:  "mona",
+		},
+		{
+			name: "repo admin of a different repository is not authorized",
+			config: actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+				cfg.Repos = map[string]api.RepoConfig{
+					"octocat/other-repo": {AdminUsers: []string{"mona"}},
+				}
+				db := cfg.Databases["orders"]
+				db.OperatorUsers = []string{"hubot"}
+				cfg.Databases["orders"] = db
+			}),
+			actor:      "mona",
+			database:   "orders",
+			wantReason: api.ActorAuthReasonNotAuthorized,
+		},
+		{
+			name: "repo admins on a different repository alone leave no principals and fail closed",
+			config: actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+				cfg.Repos = map[string]api.RepoConfig{
+					"octocat/other-repo": {AdminUsers: []string{"mona"}},
+				}
+			}),
+			actor:      "mona",
+			database:   "orders",
+			wantReason: api.ActorAuthReasonNoConfiguredPrincipal,
+		},
+		{
 			name: "missing actor denies",
 			config: actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
 				cfg.PRCommandAuthorization.AdminUsers = []string{"mona"}
@@ -100,8 +153,12 @@ func TestAuthorizePRCommandActor(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			repo := tt.repo
+			if repo == "" {
+				repo = "octocat/hello-world"
+			}
 			h := actorAuthTestHandler(tt.config, nil)
-			result, err := h.authorizePRCommandActor(t.Context(), nil, tt.actor, tt.database)
+			result, err := h.authorizePRCommandActor(t.Context(), nil, tt.actor, repo, tt.database)
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantAllow, result.Allowed)
 			assert.Equal(t, tt.wantReason, result.Reason)
@@ -166,6 +223,33 @@ func TestAuthorizePRCommandActorTeams(t *testing.T) {
 			wantMatch:   "octocat/orders-operators",
 		},
 		{
+			name: "repo admin team allows",
+			configure: func(cfg *api.ServerConfig) {
+				cfg.Repos = map[string]api.RepoConfig{
+					"octocat/hello-world": {AdminTeams: []string{"octocat/repo-admins"}},
+				}
+			},
+			teamMembers: []string{"mona"},
+			wantAllow:   true,
+			wantReason:  api.ActorAuthReasonAllowedRepoAdminTeam,
+			wantMatch:   "octocat/repo-admins",
+		},
+		{
+			name: "repo admin team takes precedence over operator team",
+			configure: func(cfg *api.ServerConfig) {
+				cfg.Repos = map[string]api.RepoConfig{
+					"octocat/hello-world": {AdminTeams: []string{"octocat/repo-admins"}},
+				}
+				db := cfg.Databases["orders"]
+				db.OperatorTeams = []string{"octocat/orders-operators"}
+				cfg.Databases["orders"] = db
+			},
+			teamMembers: []string{"mona"},
+			wantAllow:   true,
+			wantReason:  api.ActorAuthReasonAllowedRepoAdminTeam,
+			wantMatch:   "octocat/repo-admins",
+		},
+		{
 			name: "not a member denies",
 			configure: func(cfg *api.ServerConfig) {
 				cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
@@ -201,12 +285,13 @@ func TestAuthorizePRCommandActorTeams(t *testing.T) {
 				teamMembersStatusCode = http.StatusOK
 			}
 			mux.HandleFunc("GET /orgs/octocat/teams/schema-admins/members", teamMembersHandler(t, teamMembersStatusCode, tt.teamMembers...))
+			mux.HandleFunc("GET /orgs/octocat/teams/repo-admins/members", teamMembersHandler(t, teamMembersStatusCode, tt.teamMembers...))
 			mux.HandleFunc("GET /orgs/octocat/teams/orders-operators/members", teamMembersHandler(t, teamMembersStatusCode, tt.teamMembers...))
 			installClient := ghclient.NewInstallationClient(client, testLogger())
 
 			cfg := actorAuthTestConfig(true, tt.configure)
 			h := actorAuthTestHandler(cfg, installClient)
-			result, err := h.authorizePRCommandActor(t.Context(), installClient, "mona", "orders")
+			result, err := h.authorizePRCommandActor(t.Context(), installClient, "mona", "octocat/hello-world", "orders")
 			if tt.wantErr {
 				require.Error(t, err)
 			} else {
@@ -233,7 +318,7 @@ func TestAuthorizePRCommandActorUsersOnlyDoesNotCallGitHub(t *testing.T) {
 	})
 	h := actorAuthTestHandler(cfg, installClient)
 
-	result, err := h.authorizePRCommandActor(t.Context(), installClient, "mona", "orders")
+	result, err := h.authorizePRCommandActor(t.Context(), installClient, "mona", "octocat/hello-world", "orders")
 	require.NoError(t, err)
 	assert.False(t, result.Allowed)
 	assert.Equal(t, api.ActorAuthReasonNotAuthorized, result.Reason)
@@ -242,7 +327,7 @@ func TestAuthorizePRCommandActorUsersOnlyDoesNotCallGitHub(t *testing.T) {
 
 func TestAuthorizePRCommandActorMissingServiceFailsClosed(t *testing.T) {
 	h := &Handler{logger: testLogger()}
-	result, err := h.authorizePRCommandActor(t.Context(), nil, "mona", "orders")
+	result, err := h.authorizePRCommandActor(t.Context(), nil, "mona", "octocat/hello-world", "orders")
 	require.Error(t, err)
 	assert.False(t, result.Allowed)
 	assert.Equal(t, api.ActorAuthReasonMissingServerConfig, result.Reason)
@@ -258,7 +343,8 @@ func TestEnforcePRCommandActorAuthorizationComments(t *testing.T) {
 	})
 	h := actorAuthTestHandler(cfg, installClient)
 
-	blocked := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply)
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply)
+	require.NoError(t, err)
 	assert.True(t, blocked)
 
 	body := requireComment(t, comments, "authorization comment")
@@ -281,7 +367,8 @@ func TestEnforcePRCommandActorAuthorizationUnconfiguredDatabaseComment(t *testin
 	})
 	h := actorAuthTestHandler(cfg, installClient)
 
-	blocked := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "payments", storage.DatabaseTypeMySQL, "", action.Unlock)
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "payments", storage.DatabaseTypeMySQL, "", action.Unlock)
+	require.NoError(t, err)
 	assert.True(t, blocked)
 
 	body := requireComment(t, comments, "unconfigured-database authorization comment")
@@ -300,8 +387,9 @@ func TestEnforcePRCommandActorAuthorizationTeamLookupErrorComment(t *testing.T) 
 	})
 	h := actorAuthTestHandler(cfg, installClient)
 
-	blocked := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply)
-	assert.True(t, blocked)
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply)
+	require.Error(t, err)
+	assert.False(t, blocked)
 
 	body := requireComment(t, comments, "authorization failure comment")
 	assert.Contains(t, body, "SchemaBot Authorization Check Failed")
@@ -748,11 +836,12 @@ func (s *actorAuthTaskStore) GetByDatabase(_ context.Context, database string) (
 // a storage outage during lock release.
 type actorAuthLockStore struct {
 	storage.LockStore
-	locks         []*storage.Lock
-	acquired      []*storage.Lock
-	released      []string
-	forceReleased []string
-	releaseErr    error
+	locks             []*storage.Lock
+	acquired          []*storage.Lock
+	released          []string
+	releasedIfPending []string
+	forceReleased     []string
+	releaseErr        error
 }
 
 func (s *actorAuthLockStore) Get(_ context.Context, database, dbType string) (*storage.Lock, error) {
@@ -789,6 +878,11 @@ func (s *actorAuthLockStore) Release(_ context.Context, database, _, _ string) e
 	}
 	s.released = append(s.released, database)
 	return nil
+}
+
+func (s *actorAuthLockStore) ReleaseIfPendingPlanID(_ context.Context, _, _, _, pendingPlanID string) (bool, error) {
+	s.releasedIfPending = append(s.releasedIfPending, pendingPlanID)
+	return true, nil
 }
 
 func (s *actorAuthLockStore) ForceRelease(_ context.Context, database, _ string) error {
@@ -829,6 +923,104 @@ func actorAuthStorageTestHandler(cfg *api.ServerConfig, store storage.Storage, i
 
 // commentRecorder returns a mux handler that captures posted PR comment bodies
 // on the given channel and responds like the GitHub create-comment API.
+// A user-issued plan reads the resolved database's live schema, so an actor
+// who is neither an admin nor one of that database's operators is blocked
+// with a rejection that lists who can run the command.
+func TestPlanForResolvedDatabaseBlocksUnauthorizedActor(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	blocked := h.planForResolvedDatabaseBlocked(t.Context(), "octocat/hello-world", 1, 12345, "mona", "orders", "")
+
+	assert.True(t, blocked)
+	body := requireComment(t, comments, "unauthorized plan comment")
+	assert.Contains(t, body, "SchemaBot Command Not Authorized")
+	assert.Contains(t, body, "@mona is not authorized")
+}
+
+// The database's configured operator users satisfy the plan gate: planning
+// requires the same access the database's mutating commands do.
+func TestPlanForResolvedDatabaseAllowsDatabaseOperator(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"mona"}
+		cfg.Databases["orders"] = db
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	blocked := h.planForResolvedDatabaseBlocked(t.Context(), "octocat/hello-world", 1, 12345, "mona", "orders", "")
+
+	assert.False(t, blocked)
+	select {
+	case body := <-comments:
+		t.Fatalf("no comment should be posted for an authorized operator, got %q", body)
+	default:
+	}
+}
+
+// With PR command authorization disabled, plan keeps its ungated behavior.
+func TestPlanForResolvedDatabaseUngatedWhenAuthorizationDisabled(t *testing.T) {
+	client, _ := setupGitHubServer(t)
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	h := actorAuthTestHandler(actorAuthTestConfig(false), installClient)
+
+	blocked := h.planForResolvedDatabaseBlocked(t.Context(), "octocat/hello-world", 1, 12345, "mona", "orders", "")
+
+	assert.False(t, blocked)
+}
+
+// A database not configured on this deployment defers to the downstream
+// ownership handling, so fan-out deployments stay silent instead of posting
+// authorization rejections for databases they do not manage.
+func TestPlanForResolvedDatabaseSkipsGateForUnconfiguredDatabase(t *testing.T) {
+	client, _ := setupGitHubServer(t)
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	blocked := h.planForResolvedDatabaseBlocked(t.Context(), "octocat/hello-world", 1, 12345, "mona", "someone-elses-db", "")
+
+	assert.False(t, blocked)
+}
+
+// The full plan command path authorizes the actor once discovery resolves
+// the database — even when the PR itself touches that database's schema,
+// planning it requires the database's configured principals.
+func TestHandleMultiEnvPlanBlocksUnauthorizedActorAfterDiscovery(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	registerApplyDiscoveryEndpoints(t, mux, "orders")
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
+	})
+	h := actorAuthStorageTestHandler(cfg, &emptyStorage{}, installClient)
+
+	h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "mona", false, true, 0)
+
+	body := requireComment(t, comments, "unauthorized plan comment")
+	assert.Contains(t, body, "SchemaBot Command Not Authorized")
+	assert.Contains(t, body, "@mona is not authorized")
+}
+
 func commentRecorder(t *testing.T, comments chan<- string) http.HandlerFunc {
 	t.Helper()
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -881,9 +1073,10 @@ func registerApplyDiscoveryEndpoints(t *testing.T, mux *http.ServeMux, database 
 
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"head": map[string]any{"sha": "abc123", "ref": "feature-branch"},
-			"base": map[string]any{"sha": "def456", "ref": "main"},
-			"user": map[string]any{"login": "testuser"},
+			"state": "open",
+			"head":  map[string]any{"sha": "abc123", "ref": "feature-branch"},
+			"base":  map[string]any{"sha": "def456", "ref": "main"},
+			"user":  map[string]any{"login": "testuser"},
 		}))
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {

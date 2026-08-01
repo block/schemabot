@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -29,7 +30,8 @@ import (
 
 // mockStorage implements storage.Storage for testing.
 type mockStorage struct {
-	pingErr error
+	pingErr       error
+	webhookEvents storage.WebhookEventStore
 }
 
 func (m *mockStorage) Locks() storage.LockStore                     { return nil }
@@ -39,9 +41,11 @@ func (m *mockStorage) Tasks() storage.TaskStore                     { return nil
 func (m *mockStorage) ApplyLogs() storage.ApplyLogStore             { return nil }
 func (m *mockStorage) ControlRequests() storage.ControlRequestStore { return nil }
 func (m *mockStorage) ApplyComments() storage.ApplyCommentStore     { return nil }
+func (m *mockStorage) PlanComments() storage.PlanCommentStore       { return nil }
 func (m *mockStorage) ApplyOperations() storage.ApplyOperationStore { return nil }
 func (m *mockStorage) Checks() storage.CheckStore                   { return nil }
 func (m *mockStorage) Settings() storage.SettingsStore              { return nil }
+func (m *mockStorage) WebhookEvents() storage.WebhookEventStore     { return m.webhookEvents }
 func (m *mockStorage) Ping(ctx context.Context) error               { return m.pingErr }
 func (m *mockStorage) Close() error                                 { return nil }
 
@@ -253,6 +257,25 @@ func (s *recentApplyStore) GetRecent(_ context.Context, filter storage.RecentApp
 	if s.err != nil {
 		return nil, s.err
 	}
+	applies := s.matching(filter)
+	if filter.Limit > 0 && len(applies) > filter.Limit {
+		return applies[:filter.Limit], nil
+	}
+	return applies, nil
+}
+
+func (s *recentApplyStore) CountRecentByState(_ context.Context, filter storage.RecentAppliesFilter) (map[string]int, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	counts := map[string]int{}
+	for _, apply := range s.matching(filter) {
+		counts[apply.State]++
+	}
+	return counts, nil
+}
+
+func (s *recentApplyStore) matching(filter storage.RecentAppliesFilter) []*storage.Apply {
 	applies := make([]*storage.Apply, 0, len(s.applies))
 	for _, apply := range s.applies {
 		if filter.Environment != "" && apply.Environment != filter.Environment {
@@ -266,10 +289,7 @@ func (s *recentApplyStore) GetRecent(_ context.Context, filter storage.RecentApp
 		}
 		applies = append(applies, apply)
 	}
-	if filter.Limit > 0 && len(applies) > filter.Limit {
-		return applies[:filter.Limit], nil
-	}
-	return applies, nil
+	return applies
 }
 
 type memoryControlRequestStore struct {
@@ -584,6 +604,8 @@ type mockTernClient struct {
 	progressResp             *ternv1.ProgressResponse
 	progressErr              error
 	progressReq              *ternv1.ProgressRequest
+	logsReqs                 []*ternv1.LogsRequest
+	logsHook                 func(*ternv1.LogsRequest) (*ternv1.LogsResponse, error)
 	volumeResp               *ternv1.VolumeResponse
 	volumeErr                error
 	volumeReq                *ternv1.VolumeRequest // captured request
@@ -657,6 +679,134 @@ func (m *mockTernClient) Progress(ctx context.Context, req *ternv1.ProgressReque
 	}
 	return nil, m.progressErr
 }
+func (m *mockTernClient) Logs(_ context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	m.logsReqs = append(m.logsReqs, req)
+	if m.logsHook != nil {
+		return m.logsHook(req)
+	}
+	return &ternv1.LogsResponse{}, nil
+}
+
+func TestDeploymentLogEntryRejectsMalformedRecords(t *testing.T) {
+	_, err := deploymentLogEntry("remote-a", &ternv1.ApplyLog{CreatedAt: "not-a-time", MetadataJson: []byte(`{}`)})
+	require.ErrorContains(t, err, "created_at")
+
+	_, err = deploymentLogEntry("remote-a", &ternv1.ApplyLog{CreatedAt: "2026-07-17T01:02:03Z", MetadataJson: []byte(`{`)})
+	require.EqualError(t, err, "remote log metadata is not valid JSON")
+
+	taskID := int64(4)
+	entry, err := deploymentLogEntry("remote-a", &ternv1.ApplyLog{Id: 3, TaskId: &taskID, Level: "info", EventType: "state", Source: "driver", Message: "ready", OldState: "pending", NewState: "running", MetadataJson: []byte(`{"target":"-80"}`), CreatedAt: "2026-07-17T01:02:03.000000004Z"})
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), entry.ID)
+	assert.Equal(t, &taskID, entry.TaskID)
+	assert.JSONEq(t, `{"target":"-80"}`, string(entry.Metadata))
+	assert.Equal(t, time.Date(2026, 7, 17, 1, 2, 3, 4, time.UTC), entry.CreatedAt)
+}
+
+func TestDeploymentLogErrorIsSanitizedAndIncludesProvenance(t *testing.T) {
+	fetch := &deploymentLogFetch{target: "cluster-a", externalID: "remote-a", operations: []*apitypes.LogOperationProvenance{{OperationKey: "commerce/-80/orders", Target: "cluster-a", OperationKind: "work"}}}
+	got := deploymentLogError(fetch, status.Error(codes.Unavailable, "dial secret.example:443"))
+	assert.Equal(t, "RemoteLogReadFailed", got.Code)
+	assert.NotContains(t, got.Message, "secret.example")
+	assert.Equal(t, fetch.operations, got.Operations)
+
+	got = deploymentLogError(fetch, status.Error(codes.Unimplemented, "method Logs not implemented"))
+	assert.Equal(t, "UnsupportedCapability", got.Code)
+	assert.Equal(t, "upgrade_required", got.Reason)
+
+	// The gRPC client wraps Unimplemented with upgrade guidance before it
+	// reaches this mapping; detection must see through the wrapping.
+	got = deploymentLogError(fetch, fmt.Errorf("selected data plane does not support log reads; upgrade that data plane: %w", status.Error(codes.Unimplemented, "method Logs not implemented")))
+	assert.Equal(t, "UnsupportedCapability", got.Code)
+	assert.Equal(t, "upgrade_required", got.Reason)
+
+	got = deploymentLogRecordError(fetch)
+	assert.Equal(t, "MalformedRemoteLog", got.Code)
+	assert.Equal(t, "malformed_remote_log", got.Reason)
+	assert.Equal(t, fetch.operations, got.Operations)
+}
+
+func TestHandleDeploymentLogsFansOutDeduplicatesAndPreservesPartialResults(t *testing.T) {
+	apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-control", Database: "commerce", DatabaseType: storage.DatabaseTypeStrata, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/orders", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-a", ExternalID: "remote-a", ExternalOperationID: "101"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/customers", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-a", ExternalID: "remote-a", ExternalOperationID: "102"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/80-/orders", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-b", ExternalID: "remote-b", ExternalOperationID: "103"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/80-/customers", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-c", ExternalID: "remote-c", ExternalOperationID: "104"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/finalize", OperationKind: storage.ApplyOperationKindGroupFinalizer, Target: "cluster-a"},
+	}
+	client := &mockTernClient{isRemote: true}
+	client.logsHook = func(req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+		switch req.ApplyId {
+		case "remote-b":
+			return nil, status.Error(codes.Unavailable, "dial private.example:443")
+		case "remote-c":
+			return &ternv1.LogsResponse{ApplyId: req.ApplyId, Logs: []*ternv1.ApplyLog{{Id: 12, Level: "info", Message: "bad clock", CreatedAt: "not-a-time"}}}, nil
+		}
+		return &ternv1.LogsResponse{ApplyId: req.ApplyId, Logs: []*ternv1.ApplyLog{{Id: 11, Level: "error", EventType: "engine", Source: "driver", Message: "checksum failed", MetadataJson: []byte(`{"chunk":8}`), CreatedAt: "2026-07-17T01:02:03Z"}}}, nil
+	}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&limit=25", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var response apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, client.logsReqs, 3)
+	assert.Equal(t, "remote-a", client.logsReqs[0].ApplyId)
+	assert.Equal(t, "cluster-a", client.logsReqs[0].Target)
+	assert.Equal(t, int32(25), client.logsReqs[0].Limit)
+	assert.Equal(t, "remote-b", client.logsReqs[1].ApplyId)
+	assert.Equal(t, "remote-c", client.logsReqs[2].ApplyId)
+	require.Len(t, response.Sources, 1)
+	assert.Equal(t, "remote-a", response.Sources[0].ExternalID)
+	require.Len(t, response.Sources[0].Operations, 2)
+	assert.Equal(t, "commerce/-80/orders", response.Sources[0].Operations[0].OperationKey)
+	assert.NotContains(t, w.Body.String(), "101")
+	assert.NotContains(t, w.Body.String(), "102")
+	require.Len(t, response.Sources[0].Logs, 1)
+	assert.JSONEq(t, `{"chunk":8}`, string(response.Sources[0].Logs[0].Metadata))
+	require.Len(t, response.Errors, 2)
+	assert.Equal(t, "remote-b", response.Errors[0].ExternalID)
+	assert.Equal(t, "RemoteLogReadFailed", response.Errors[0].Code)
+	assert.Equal(t, "remote-c", response.Errors[1].ExternalID)
+	assert.Equal(t, "MalformedRemoteLog", response.Errors[1].Code)
+	assert.NotContains(t, w.Body.String(), "private.example")
+	assert.NotContains(t, w.Body.String(), "not-a-time")
+}
+
+func TestHandleDeploymentLogsUsesParentExternalIDForSingleOperation(t *testing.T) {
+	apply := &storage.Apply{ID: 8, ApplyIdentifier: "apply-control", ExternalID: "remote-parent", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging", Deployment: "region-a"}
+	operation := &storage.ApplyOperation{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "schema", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-a"}
+	client := &mockTernClient{isRemote: true}
+	client.logsHook = func(req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+		return &ternv1.LogsResponse{ApplyId: req.ApplyId, Logs: []*ternv1.ApplyLog{{Id: 13, Level: "info", Message: "apply complete", CreatedAt: "2026-07-18T18:33:10Z"}}}, nil
+	}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{operation}},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, client.logsReqs, 1)
+	assert.Equal(t, "remote-parent", client.logsReqs[0].ApplyId)
+	var response apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, response.Sources, 1)
+	assert.Equal(t, "remote-parent", response.Sources[0].ExternalID)
+	require.Len(t, response.Sources[0].Logs, 1)
+	assert.Equal(t, "apply complete", response.Sources[0].Logs[0].Message)
+}
+
 func (m *mockTernClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
 	m.cutoverReq = req
 	if m.cutoverResp != nil {
@@ -2345,6 +2495,53 @@ func TestDatabaseListSanitizesConfigAndReportsTopology(t *testing.T) {
 	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=postgres", nil)
 	w = httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Empty(t, resp.Databases)
+
+	// A name filter is a case-insensitive substring match, so a family
+	// prefix selects every shard-style database that contains it.
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?name=ORD", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 1)
+	assert.Equal(t, "orders", resp.Databases[0].Database)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?name=count", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 1)
+	assert.Equal(t, "accounts", resp.Databases[0].Database)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=mysql&name=accounts", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Empty(t, resp.Databases)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=mysql&name=orders", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 1)
+	assert.Equal(t, "orders", resp.Databases[0].Database)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?name=nomatch", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Empty(t, resp.Databases)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=cockroach", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
 	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 	assert.Contains(t, w.Body.String(), "type must be")
 }
@@ -2359,7 +2556,7 @@ func TestDatabaseListRejectsInvalidDeploymentTopology(t *testing.T) {
 				},
 			},
 		},
-	}, "")
+	}, "", "")
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `database "orders" environment "production" deployments map is empty`)
@@ -3249,6 +3446,11 @@ func TestHandleStatusLimitAndEnvironment(t *testing.T) {
 	assert.True(t, resp.HasMore)
 	assert.False(t, resp.FailuresOnly)
 	assert.Equal(t, 1, resp.ActiveCount)
+	assert.Equal(t, map[string]int{
+		state.Apply.Completed: 2,
+		state.Apply.Running:   1,
+		state.Apply.Failed:    1,
+	}, resp.StateCounts, "state counts cover every matching apply, not just the truncated page")
 	require.Len(t, resp.Applies, 2)
 	assert.Equal(t, "apply-one", resp.Applies[0].ApplyID)
 	assert.Equal(t, "external-one", resp.Applies[0].ExternalID)
@@ -3465,6 +3667,129 @@ func TestParseStatusLimit(t *testing.T) {
 	}
 }
 
+func TestParseStatusLast(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		target    string
+		want      time.Duration
+		wantError bool
+	}{
+		{name: "default", target: "/api/status"},
+		{name: "hours", target: "/api/status?last=24h", want: 24 * time.Hour},
+		{name: "minutes", target: "/api/status?last=30m", want: 30 * time.Minute},
+		{name: "zero", target: "/api/status?last=0s", wantError: true},
+		{name: "negative", target: "/api/status?last=-1h", wantError: true},
+		{name: "not a duration", target: "/api/status?last=yesterday", wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tt.target, nil)
+			got, err := parseStatusLast(req)
+			if tt.wantError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestHandleStatusLastWindowBoundsFilter verifies that the `last` query
+// parameter becomes an UpdatedSince bound on the storage filter and is echoed
+// back in the response, and that an invalid window is rejected rather than
+// silently ignored.
+func TestHandleStatusLastWindowBoundsFilter(t *testing.T) {
+	applies := &recentApplyStore{}
+	stor := &mockStorageWithApplyStores{applies: applies}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(stor, testServerConfig(), nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?last=24h", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp apitypes.StatusResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "24h0m0s", resp.Last)
+
+	require.Len(t, applies.filters, 1)
+	assert.WithinDuration(t, time.Now().Add(-24*time.Hour), applies.filters[0].UpdatedSince, time.Minute)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?last=yesterday", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	require.Len(t, applies.filters, 1, "an invalid window must not reach storage")
+}
+
+// TestHandleStatusStateFilter verifies that the `state` query parameter
+// normalizes to the canonical apply state and restricts the storage filter,
+// that a typo'd state is rejected rather than returning a silently empty
+// list, and that `state` cannot be combined with `failed`.
+func TestHandleStatusStateFilter(t *testing.T) {
+	now := time.Now().UTC()
+	applies := &recentApplyStore{
+		applies: []*storage.Apply{
+			{
+				ApplyIdentifier: "apply-running",
+				Database:        "orders",
+				Environment:     "staging",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Running,
+				Caller:          "cli",
+				CreatedAt:       now,
+				UpdatedAt:       now,
+			},
+			{
+				ApplyIdentifier: "apply-completed",
+				Database:        "payments",
+				Environment:     "staging",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Completed,
+				Caller:          "cli",
+				CreatedAt:       now.Add(-time.Minute),
+				UpdatedAt:       now.Add(-time.Minute),
+			},
+		},
+	}
+	stor := &mockStorageWithApplyStores{applies: applies}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(stor, testServerConfig(), nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?state=RUNNING", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.StatusResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, state.Apply.Running, resp.State, "the state filter echoes in canonical form")
+	require.Len(t, resp.Applies, 1)
+	assert.Equal(t, "apply-running", resp.Applies[0].ApplyID)
+	assert.Equal(t, map[string]int{state.Apply.Running: 1}, resp.StateCounts)
+	require.Len(t, applies.filters, 1)
+	assert.Equal(t, []string{state.Apply.Running}, applies.filters[0].States)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?state=comleted", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "unknown state")
+	require.Len(t, applies.filters, 1, "an unknown state must not reach storage")
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?state=running&failed=true", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "state cannot be combined with failed")
+	require.Len(t, applies.filters, 1, "conflicting filters must not reach storage")
+}
+
 func TestParseStatusFailuresOnly(t *testing.T) {
 	for _, tt := range []struct {
 		name      string
@@ -3524,6 +3849,47 @@ func TestHealth(t *testing.T) {
 		err := json.NewDecoder(w.Body).Decode(&resp)
 		require.NoError(t, err, "failed to decode response")
 		assert.NotEmpty(t, resp["error"], "expected error message")
+	})
+}
+
+// TestLivez verifies the liveness endpoint reflects process health only: it
+// reports alive even when the storage database is unreachable, so a storage
+// outage pulls instances from the Service (readiness) instead of restarting
+// them and aborting in-flight schema changes.
+func TestLivez(t *testing.T) {
+	t.Run("alive", func(t *testing.T) {
+		svc := newTestService()
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		req := httptest.NewRequestWithContext(t.Context(), "GET", "/livez", nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp map[string]string
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err, "failed to decode response")
+		assert.Equal(t, "alive", resp["status"])
+	})
+
+	t.Run("alive while storage is unreachable", func(t *testing.T) {
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		svc := New(&mockStorage{pingErr: errors.New("connection refused")}, testServerConfig(), nil, logger)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		req := httptest.NewRequestWithContext(t.Context(), "GET", "/livez", nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp map[string]string
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err, "failed to decode response")
+		assert.Equal(t, "alive", resp["status"])
 	})
 }
 
@@ -3732,12 +4098,14 @@ func TestTernHealth(t *testing.T) {
 }
 
 func TestVolumeHandler(t *testing.T) {
-	t.Run("success returns volume values", func(t *testing.T) {
+	// A volume adjustment is queued as a durable control request for the
+	// driving instance, so the accepted response carries the queued target
+	// level; the previous level is only known to the driver and stays unset.
+	t.Run("accepted queue returns target volume", func(t *testing.T) {
 		mock := &mockTernClient{
 			volumeResp: &ternv1.VolumeResponse{
-				Accepted:       true,
-				PreviousVolume: 3,
-				NewVolume:      11,
+				Accepted:  true,
+				NewVolume: 11,
 			},
 		}
 		svc := newControlTestService(mock, activeTestApply("apply-vol123"))
@@ -3756,16 +4124,16 @@ func TestVolumeHandler(t *testing.T) {
 		err := json.NewDecoder(w.Body).Decode(&resp)
 		require.NoError(t, err, "failed to decode response")
 
-		// Verify the response includes volume values (not zeros)
 		assert.Equal(t, true, resp["accepted"])
 		prevVol, _ := resp["previous_volume"].(float64) // JSON numbers are float64
 		newVol, _ := resp["new_volume"].(float64)
-		assert.Equal(t, float64(3), prevVol)
+		assert.Equal(t, float64(0), prevVol)
 		assert.Equal(t, float64(11), newVol)
 
 		require.NotNil(t, mock.volumeReq, "expected volume request to be captured")
 		assert.Equal(t, "apply-vol123", mock.volumeReq.ApplyId)
 		assert.Equal(t, "staging", mock.volumeReq.Environment)
+		assert.Equal(t, int32(11), mock.volumeReq.Volume)
 	})
 
 	t.Run("invalid volume range", func(t *testing.T) {
@@ -5192,6 +5560,64 @@ func TestSkipRevertHandler(t *testing.T) {
 		assert.Equal(t, http.StatusAccepted, second.Code, second.Body.String())
 		assert.Contains(t, second.Body.String(), apitypes.ControlStatusAlreadyRequested)
 		assert.Nil(t, mock.skipRevertReq, "a duplicate request must not re-drive the engine")
+	})
+}
+
+// Revert and skip-revert are contradictory intents for the same revert window —
+// one undoes the change, the other makes it permanent. Once either has a
+// pending durable request, the opposite command is rejected with a conflict
+// that names the intent already in flight, instead of recording a second,
+// contradictory request for the drive to arbitrate.
+func TestRevertWindowCommandsRejectContradiction(t *testing.T) {
+	revertWindowApply := func(id string) *storage.Apply {
+		apply := activeTestApply(id)
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EnginePlanetScale
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		return apply
+	}
+	post := func(t *testing.T, mux *http.ServeMux, path, applyID string) *httptest.ResponseRecorder {
+		t.Helper()
+		body := fmt.Sprintf(`{"environment": "staging", "apply_id": %q}`, applyID)
+		req := httptest.NewRequestWithContext(t.Context(), "POST", path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w
+	}
+
+	t.Run("revert rejected while skip-revert is pending", func(t *testing.T) {
+		// The immediate skip attempt fails, so the durable skip-revert request
+		// stays pending for the apply owner.
+		mock := &mockTernClient{skipRevertErr: errors.New("data plane unavailable")}
+		svc := newControlTestService(mock, revertWindowApply("apply-conflict-rv"))
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		first := post(t, mux, "/api/skip-revert", "apply-conflict-rv")
+		require.Equal(t, http.StatusAccepted, first.Code, first.Body.String())
+
+		second := post(t, mux, "/api/revert", "apply-conflict-rv")
+		assert.Equal(t, http.StatusConflict, second.Code, second.Body.String())
+		assert.Contains(t, second.Body.String(), "skip-revert is already pending")
+		assert.Nil(t, mock.revertReq, "the contradictory revert must not reach the data plane")
+	})
+
+	t.Run("skip-revert rejected while revert is pending", func(t *testing.T) {
+		// The immediate revert attempt fails, so the durable revert request
+		// stays pending for the apply owner.
+		mock := &mockTernClient{revertErr: errors.New("data plane unavailable")}
+		svc := newControlTestService(mock, revertWindowApply("apply-conflict-sr"))
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		first := post(t, mux, "/api/revert", "apply-conflict-sr")
+		require.Equal(t, http.StatusAccepted, first.Code, first.Body.String())
+
+		second := post(t, mux, "/api/skip-revert", "apply-conflict-sr")
+		assert.Equal(t, http.StatusConflict, second.Code, second.Body.String())
+		assert.Contains(t, second.Body.String(), "revert is already pending")
+		assert.Nil(t, mock.skipRevertReq, "the contradictory skip-revert must not reach the data plane")
 	})
 }
 

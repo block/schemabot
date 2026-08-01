@@ -357,6 +357,7 @@ func gitHubRequestCategory(operation string) string {
 		metrics.GitHubOperationCreateCheckRun,
 		metrics.GitHubOperationCreateIssueComment,
 		metrics.GitHubOperationEditIssueComment,
+		metrics.GitHubOperationGraphQLMinimizeComment,
 		metrics.GitHubOperationRequestReviewers,
 		metrics.GitHubOperationUpdateCheckRun:
 		return metrics.GitHubRequestCategoryWrite

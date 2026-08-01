@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"strings"
@@ -106,13 +107,15 @@ func (c TernConfig) Endpoint(deployment, environment string) (string, error) {
 type RecoveryCallback func(apply *storage.Apply)
 
 // ApplyTerminalSummaryCallback is called after the operator wins the aggregate
-// non-terminal→terminal projection compare-and-swap for a multi-operation apply.
-// A multi-operation drive owns only its operation and suppresses the per-driver
-// terminal observer, so the apply-level terminal summary is published exactly
-// once, here, by the CAS winner. The apply and tasks are reloaded from storage
-// (the apply at its terminal state, the tasks across every operation) before
-// invocation. Single-operation applies keep publishing via the per-driver
-// observer and never reach this callback.
+// non-terminal→terminal projection compare-and-swap for an apply, whatever its
+// operation count. A multi-operation drive owns only its operation and
+// suppresses the per-driver terminal observer, so its apply-level terminal
+// summary is published only here, by the CAS winner. A single-operation apply
+// usually publishes through its live per-driver observer, but paths with no
+// live observer — stop reconciliation terminalizing an orphaned apply — also
+// publish here; the summary-marker claim inside the publisher keeps the two
+// exactly-once. The apply and tasks are reloaded from storage (the apply at
+// its terminal state, the tasks across every operation) before invocation.
 type ApplyTerminalSummaryCallback func(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error
 
 type pendingObserverKey struct {
@@ -129,7 +132,11 @@ type Service struct {
 	routingTernClient *tern.RoutingClient
 	ternMu            sync.Mutex // protects tern client caches and engineFactories
 	logger            *slog.Logger
-	clock             clock.Clock
+	// checkRunBackfiller replays the auto-plan flow for a PR to recreate
+	// missing Check Runs; wired from the webhook handler at serve startup,
+	// nil when no GitHub webhook runtime exists.
+	checkRunBackfiller CheckRunBackfiller
+	clock              clock.Clock
 
 	// engineFactories holds engine implementations for database types this build
 	// does not provide natively, registered by an embedding service via
@@ -148,6 +155,12 @@ type Service struct {
 	remoteHealthWg       sync.WaitGroup
 	remoteHealthInterval time.Duration
 
+	// Webhook inbox metrics monitor loop management.
+	webhookInboxMu       sync.Mutex
+	webhookInboxCancel   context.CancelFunc
+	webhookInboxWg       sync.WaitGroup
+	webhookInboxInterval time.Duration
+
 	// Pending drops cleaner loop management.
 	pendingDropsMu     sync.Mutex
 	pendingDropsCancel context.CancelFunc
@@ -158,10 +171,11 @@ type Service struct {
 	// an observer for PR comments.
 	OnApplyRecovered RecoveryCallback
 
-	// OnApplyTerminalSummary is called after a multi-operation apply is
-	// terminalized by the aggregate projection CAS. Set by the webhook handler to
-	// publish the apply-level terminal PR summary and refresh GitHub check state
-	// exactly once, since multi-operation drives suppress the per-driver observer.
+	// OnApplyTerminalSummary is called after an apply is terminalized by the
+	// aggregate projection CAS. Set by the webhook handler to publish the
+	// apply-level terminal PR summary and refresh GitHub check state; the
+	// summary-marker claim inside the publish path keeps it exactly-once
+	// against any still-live per-driver observer.
 	OnApplyTerminalSummary ApplyTerminalSummaryCallback
 
 	pendingObserverMu sync.Mutex
@@ -250,6 +264,7 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		clock:                clock.Real{},
 		operatorPollInterval: OperatorPollInterval,
 		remoteHealthInterval: RemoteDeploymentHealthCheckInterval,
+		webhookInboxInterval: WebhookInboxMetricsInterval,
 		pendingObservers:     make(map[pendingObserverKey]tern.ProgressObserver),
 	}
 }
@@ -386,6 +401,7 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 	client, err := tern.NewGRPCClient(tern.Config{
 		Address: address,
 		Storage: s.storage,
+		Logger:  s.logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create tern client for %s: %w", key, err)
@@ -448,6 +464,13 @@ func (s *Service) RegisterTernClient(deployment, environment string, client tern
 // TargetRouter so the durable-apply operator and routing client resolve the
 // connection from each request's target — the dynamic-resolution counterpart to
 // RegisterTernClient, without needing one registration per deployment.
+// SetCheckRunBackfiller wires the webhook handler's Check Run backfill entry
+// point into the API service, so the checks operator endpoints can replay the
+// auto-plan flow for a PR. Set once during serve startup, before traffic.
+func (s *Service) SetCheckRunBackfiller(b CheckRunBackfiller) {
+	s.checkRunBackfiller = b
+}
+
 func (s *Service) SetDefaultTernClient(client tern.Client) {
 	s.ternMu.Lock()
 	defer s.ternMu.Unlock()
@@ -544,6 +567,16 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 	if !s.config.PendingDropsEnabled() {
 		metadata["pending_drops"] = "false"
 	}
+	spiritMetadata, err := s.config.SpiritMetadata()
+	if err != nil {
+		return nil, fmt.Errorf("resolve spirit config for %s: %w", key, err)
+	}
+	maps.Copy(metadata, spiritMetadata)
+	directMetadata, err := envConfig.DirectExecution.EngineMetadata()
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct_execution metadata for %s: %w", key, err)
+	}
+	maps.Copy(metadata, directMetadata)
 	client, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:        database,
 		Type:            dbType,
@@ -669,7 +702,10 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 		mux.HandleFunc(pattern, s.limitRequestBody(handler))
 	}
 
-	// Health endpoints
+	// Health endpoints. /livez is process liveness (no dependency checks);
+	// /health is readiness (storage-dependent). See the handler comments for
+	// why the two must not be conflated.
+	handle("GET /livez", s.handleLivez)
 	handle("GET /health", s.handleHealth)
 	handle("GET /tern-health/{deployment}/{environment}", s.handleTernHealth)
 
@@ -695,6 +731,10 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 	handle("GET /api/status", s.handleStatus)
 	handle("GET /api/logs/{database}", s.handleLogs)
 	handle("GET /api/logs", s.handleLogsWithoutDatabase)
+	handle("POST /api/webhooks/redrive", s.handleWebhookRedrive)
+	handle("POST /api/checks/scan", s.handleChecksScan)
+	handle("POST /api/checks/synthesize", s.handleChecksSynthesize)
+	handle("POST /api/checks/repos", s.handleChecksRepos)
 
 	// Lock API (database-level locking)
 	handle("POST /api/locks/acquire", s.handleLockAcquire)
@@ -726,6 +766,7 @@ func (s *Service) Close() error {
 	// Stop background drivers first.
 	s.StopOperator()
 	s.StopRemoteDeploymentHealthMonitor()
+	s.StopWebhookInboxMonitor()
 
 	s.ternMu.Lock()
 	var errs []error

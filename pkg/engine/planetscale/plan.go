@@ -15,6 +15,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/vschema"
 )
 
 // Plan computes the schema changes needed by diffing current schema against desired.
@@ -80,7 +81,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 
 			if vschemaChanged {
 				sc.Metadata["vschema_changed"] = "true"
-				sc.Metadata["vschema"] = VSchemaDiff(currentVSchemaRaw, ns.Files["vschema.json"])
+				sc.Metadata["vschema"] = vschema.Diff(currentVSchemaRaw, ns.Files["vschema.json"])
 				if strings.TrimSpace(currentVSchemaRaw) == "" {
 					currentVSchemaRaw = "{}"
 				}

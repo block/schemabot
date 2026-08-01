@@ -118,3 +118,20 @@ func TestRenderShardedApplyComment_UniformMultiTableIsOneGroup(t *testing.T) {
 	assert.Contains(t, out, "| Shard | Status |")
 	assert.NotContains(t, out, "```sql", "the applied comment shows status only, not DDL")
 }
+
+// A sharded rollback apply carries rollback vocabulary on the stable headline,
+// matching the single-deployment status comment.
+func TestRenderShardedApplyComment_Rollback(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x", RequestedBy: "morgo",
+		Rollback: true,
+		Shards: []ShardStatus{
+			{Shard: "-40", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
+		},
+		Cells: []ShardCell{mutesCell("-40")},
+	})
+
+	assert.Contains(t, out, "## Rollback Status")
+	assert.NotContains(t, out, "Schema Change Status")
+}

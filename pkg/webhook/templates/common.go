@@ -68,6 +68,54 @@ func currentTimestamp() string {
 	return TimestampFunc()
 }
 
+// supportChannelOfferMarker flags a rendered comment as reporting a problem
+// the author may need help resolving. GitHub never renders HTML comments, so
+// the marker is invisible on the PR. Render functions declare footer
+// eligibility explicitly with offerSupportChannel/writeSupportChannelOffer;
+// the webhook layer appends the support-channel footer to any comment that
+// carries the marker, without inspecting human-visible copy.
+const supportChannelOfferMarker = "<!-- schemabot:offer-support-channel -->"
+
+// OffersSupportChannel reports whether a rendered comment declared itself
+// eligible for the support-channel footer. Embedded sections keep their
+// marker, so an aggregate comment containing a failed per-deployment section
+// offers support just like the standalone comment would.
+func OffersSupportChannel(body string) bool {
+	return containsSupportChannelMarkerLine(body)
+}
+
+// containsSupportChannelMarkerLine matches the marker only as a standalone
+// line, the way offerSupportChannel and writeSupportChannelOffer emit it.
+// User-controlled content rendered into a comment (DDL, error detail) that
+// happens to contain the marker text mid-line neither triggers the footer
+// nor suppresses a render function's own declaration.
+func containsSupportChannelMarkerLine(body string) bool {
+	return strings.HasPrefix(body, supportChannelOfferMarker+"\n") ||
+		strings.Contains(body, "\n"+supportChannelOfferMarker+"\n") ||
+		strings.HasSuffix(body, "\n"+supportChannelOfferMarker)
+}
+
+// offerSupportChannel appends the support marker to a rendered comment body.
+func offerSupportChannel(body string) string {
+	if containsSupportChannelMarkerLine(body) {
+		return body
+	}
+	return strings.TrimRight(body, "\n") + "\n" + supportChannelOfferMarker + "\n"
+}
+
+// writeSupportChannelOffer writes the support marker into a comment being
+// composed, for builders that decide eligibility mid-composition (e.g. on a
+// failed status line). At most one marker is written per comment.
+func writeSupportChannelOffer(sb *strings.Builder) {
+	if containsSupportChannelMarkerLine(sb.String()) {
+		return
+	}
+	if sb.Len() > 0 && !strings.HasSuffix(sb.String(), "\n") {
+		sb.WriteString("\n")
+	}
+	sb.WriteString(supportChannelOfferMarker + "\n")
+}
+
 // RenderSupportChannelFooter appends a support-channel footer to a rendered PR comment.
 func RenderSupportChannelFooter(body string, support SupportChannelData) string {
 	if support.Name == "" || support.URL == "" {
@@ -96,6 +144,18 @@ func writeErrorBlock(sb *strings.Builder, msg string) {
 func writeTableErrorLine(sb *strings.Builder, msg string) {
 	quoted := strings.ReplaceAll(msg, "\n", "\n> ")
 	fmt.Fprintf(sb, "> ⚠️ Last error: %s\n", quoted)
+}
+
+// taskErrorAddsDetail reports whether a failed table's own error message adds
+// information beyond the apply-level error block rendered elsewhere in the
+// comment. The apply's failure reason is promoted from its first failed task,
+// so for the common single-table failure the two messages are identical and
+// repeating the text below the row would only add noise. Comparison ignores
+// surrounding whitespace so a stray trailing newline on either message does
+// not defeat the duplicate suppression.
+func taskErrorAddsDetail(taskError, applyError string) bool {
+	trimmed := strings.TrimSpace(taskError)
+	return trimmed != "" && trimmed != strings.TrimSpace(applyError)
 }
 
 // writeSuccessBlock writes a success message as a blockquote.

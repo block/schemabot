@@ -411,12 +411,14 @@ func createTestTable(t *testing.T, tableName, ddlStmt string) {
 			return
 		}
 		defer utils.CloseAndLog(db2)
+		ctx, cancel := testutil.CleanupContext(30 * time.Second)
+		defer cancel()
 		for _, suffix := range []string{"_new", "_old", "_chkpnt", ""} {
 			name := tableName
 			if suffix != "" {
 				name = "_" + tableName + suffix
 			}
-			_, _ = db2.ExecContext(context.Background(), "DROP TABLE IF EXISTS `"+name+"`") //nolint:usetesting // runs after test context cancelled
+			_, _ = db2.ExecContext(ctx, "DROP TABLE IF EXISTS `"+name+"`")
 		}
 	})
 }

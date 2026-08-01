@@ -184,14 +184,16 @@ func (a *OIDCAuthorizer) extractGroups(token *oidc.IDToken) ([]string, error) {
 	return nil, fmt.Errorf("parse %s claim as string or string array", a.groupsClaim)
 }
 
-// skipAuth reports paths that bypass OIDC authentication: webhooks have their
-// own HMAC authentication, and health/metrics are unauthenticated
-// infrastructure endpoints.
+// skipAuth reports paths that bypass authentication: webhooks have their own
+// HMAC authentication, and the probe endpoints (/livez, /health, /tern-health)
+// are unauthenticated infrastructure endpoints — kubelet probes carry no
+// credentials. Prometheus metrics are served on a dedicated listener outside
+// the API handler, so /metrics needs no bypass here.
 func skipAuth(path string) bool {
 	switch {
-	case path == "/health":
+	case path == "/livez":
 		return true
-	case path == "/metrics":
+	case path == "/health":
 		return true
 	case strings.HasPrefix(path, "/webhook"):
 		return true

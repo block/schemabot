@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/vschema"
 )
 
 // verifyBranchMatchesDesiredWithRetry retries verifyBranchMatchesDesired up to
@@ -257,18 +258,28 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 			Keyspace:     ks,
 		})
 		if fetchErr != nil {
-			return nil, false, "", fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, fetchErr)
+			var psErr *ps.Error
+			if !errors.As(fetchErr, &psErr) || psErr.Code != ps.ErrNotFound {
+				return nil, false, "", fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, fetchErr)
+			}
+			// Keyspace has no VSchema on this branch yet — either it has
+			// never had one, or the API has not converged after a recent
+			// write. Treat as empty so the desired VSchema appears as a
+			// change; validation callers absorb convergence lag through
+			// the VSchema staleness retry.
+			e.logger.Warn("VSchema not found for keyspace, treating as empty",
+				"keyspace", ks, "branch", branch)
 		}
 		if currentVSchema != nil {
 			currentVSchemaRaw = currentVSchema.Raw
 		}
-		vschemaChanged = VSchemaChanged(currentVSchemaRaw, content)
+		vschemaChanged = vschema.Changed(currentVSchemaRaw, content)
 		if vschemaChanged {
 			e.logger.Info("diffKeyspace: VSchema mismatch detected",
 				"keyspace", ks,
 				"branch", branch,
-				"current_normalized", normalizeVSchemaJSON(currentVSchemaRaw),
-				"desired_normalized", normalizeVSchemaJSON(content),
+				"current_normalized", vschema.Normalize(currentVSchemaRaw),
+				"desired_normalized", vschema.Normalize(content),
 			)
 		}
 	}
@@ -500,13 +511,18 @@ func (e *Engine) waitForBranchReady(ctx context.Context, client psclient.PSClien
 	}
 }
 
-func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClient, org, database, branchName, intoBranch string, autoCutover, autoDeleteBranch bool) (*ps.DeployRequest, error) {
+func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClient, org, database, branchName, intoBranch string, autoDeleteBranch bool) (*ps.DeployRequest, error) {
+	// AutoCutover stays off so SchemaBot is the sole cutover actor: the deploy
+	// request parks at pending_cutover and the driver completes it via Cutover
+	// (or an operator does, when cutover is deferred). Letting PlanetScale cut
+	// over on its own would race the driver's cutover call and move the schema
+	// without SchemaBot's involvement or caller attribution.
 	return client.CreateDeployRequest(ctx, &ps.CreateDeployRequestRequest{
 		Organization:     org,
 		Database:         database,
 		Branch:           branchName,
 		IntoBranch:       intoBranch,
-		AutoCutover:      autoCutover,
+		AutoCutover:      false,
 		AutoDeleteBranch: autoDeleteBranch,
 	})
 }

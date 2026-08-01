@@ -851,6 +851,149 @@ func TestLocalClient_StopRejectsRevertWindow(t *testing.T) {
 	assert.Equal(t, state.Apply.RevertWindow, apply.State, "revert-window apply must not be marked cancelled by stop")
 }
 
+// A task whose revert is in flight has the engine unwinding an already-applied
+// change. Cancel must be rejected without touching the engine: cancelling the
+// deploy request mid-revert would interrupt the unwind at an arbitrary point,
+// and recording the task cancelled would settle storage while the provider
+// keeps reverting. The revert owns the terminal outcome.
+func TestLocalClient_CancelRejectsRevertingTask(t *testing.T) {
+	operationID := int64(99)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-reverting",
+		State:           state.Apply.Reverting,
+	}
+	task := &storage.Task{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-vitess-reverting",
+		State:            state.Task.Reverting,
+	}
+	resumeState := engineResumeStateFromPlanetScaleData(t, operationID, planetscale.ResumeData{
+		BranchName:       "branch-123",
+		DeployRequestID:  321,
+		MigrationContext: "ctx-123",
+		DeployRequestURL: "https://example.test/deploys/321",
+	})
+	eng := &controlCaptureEngine{}
+	client := newVitessControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
+
+	_, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "is being reverted")
+	assert.ErrorContains(t, err, apply.ApplyIdentifier)
+	assert.NotContains(t, err.Error(), task.TaskIdentifier, "rejection must name the apply identifier, not the per-table task id")
+	assert.Nil(t, eng.cancelReq, "cancel must not touch the engine for a reverting task")
+	assert.Equal(t, state.Task.Reverting, task.State, "reverting task must not be marked cancelled")
+	assert.Equal(t, state.Apply.Reverting, apply.State, "reverting apply must not be marked cancelled")
+}
+
+// Skip-revert finalization has no task marker — the tasks already completed at
+// cutover and the apply alone dwells in skipping_revert while the provider
+// finalizes. Cancel must be rejected on the apply's own state: recording the
+// apply cancelled would settle storage while the provider finishes the
+// skip-revert, and the finalization owns the terminal outcome.
+func TestLocalClient_CancelRejectsSkippingRevertApply(t *testing.T) {
+	operationID := int64(99)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-skipping-revert",
+		State:           state.Apply.SkippingRevert,
+	}
+	task := &storage.Task{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-vitess-skipping-revert",
+		State:            state.Task.Completed,
+	}
+	eng := &controlCaptureEngine{}
+	client := newVitessControlTestClient(apply, []*storage.Task{task}, nil, eng)
+
+	_, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "finalizing skip-revert")
+	assert.ErrorContains(t, err, apply.ApplyIdentifier)
+	assert.Nil(t, eng.cancelReq, "cancel must not touch the engine while skip-revert finalizes")
+	assert.Equal(t, state.Apply.SkippingRevert, apply.State, "skipping_revert apply must not be marked cancelled")
+}
+
+// A durable cancel request that finds the apply in a revert phase is resolved
+// as permanently failed — not retried and not executed. Failing the stored
+// request stops the operator-owned retry loop, and the apply keeps its
+// revert-phase state so the in-flight revert or finalization drives the
+// terminal outcome.
+func TestLocalClient_PendingCancelFailsClosedForRevertPhase(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-pending-cancel-reverting",
+		State:           state.Apply.Reverting,
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-vitess-pending-cancel-reverting",
+		State:          state.Task.Reverting,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationCancel,
+		Status:    storage.ControlRequestPending,
+	}}}
+	eng := &controlCaptureEngine{}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &controlTestStorage{
+			applies:         &controlTestApplyStore{apply: apply},
+			tasks:           &controlTestTaskStore{tasks: []*storage.Task{task}},
+			applyLogs:       &controlTestApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		planetscaleEngine: eng,
+		logger:            slog.Default(),
+	}
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Nil(t, eng.cancelReq, "cancel must not touch the engine for a revert-phase apply")
+	assert.Equal(t, state.Apply.Reverting, apply.State, "revert-phase apply must keep its state")
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the durable cancel request must be resolved, not left pending")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "a revert-phase cancel is a permanent rejection")
+}
+
+// Cancelled must never overwrite a revert-phase apply state, whichever path
+// asks for it: the engine's revert or skip-revert owns the terminal outcome,
+// and settling storage under it would report an unwinding change as resolved.
+func TestMarkApplyCancelledRefusesRevertPhase(t *testing.T) {
+	for _, applyState := range []string{state.Apply.RevertWindow, state.Apply.Reverting, state.Apply.SkippingRevert} {
+		t.Run(applyState, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              42,
+				ApplyIdentifier: "apply-revert-phase-guard",
+				State:           applyState,
+			}
+			client := newVitessControlTestClient(apply, nil, nil, &controlCaptureEngine{})
+
+			err := client.markApplyCancelled(t.Context(), apply.ID)
+
+			require.Error(t, err)
+			assert.ErrorContains(t, err, apply.ApplyIdentifier)
+			assert.Equal(t, applyState, apply.State, "revert-phase apply state must be preserved")
+			assert.Nil(t, apply.CompletedAt)
+		})
+	}
+}
+
 // suppressParentApplyWrites engages only for an operation-lease-only drive (a
 // multi-operation fan-out): the parent applies row is owned by the operator's
 // projection CAS, so the drive must not write it. A drive carrying the parent
@@ -878,4 +1021,49 @@ func TestSuppressParentApplyWrites(t *testing.T) {
 		ctx := storage.WithOperationLease(t.Context(), storage.OperationLease{})
 		assert.False(t, suppressParentApplyWrites(ctx))
 	})
+}
+
+// Consuming a pending stop control request binds the apply's identity to the
+// consumption logger, so the settle line carries apply_id, repo, and pr — the
+// attrs an operator filters on to correlate a stop with its PR — without the
+// call site hand-listing them.
+func TestProcessPendingStopControlRequest_LogsCarryApplyIdentity(t *testing.T) {
+	apply := &storage.Apply{
+		ID: 9, ApplyIdentifier: "apply-stop-identity",
+		Database: "cdb_resolute", DatabaseType: storage.DatabaseTypeStrata,
+		Environment: "staging", State: state.Apply.Completed,
+		Repository: "org/repo", PullRequest: 123,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID: apply.ID, Operation: storage.ControlOperationStop,
+		Status: storage.ControlRequestPending, RequestedBy: "operator",
+	}}}
+	var records []capturedLog
+	client := &LocalClient{
+		storage: &mockStorage{
+			applies:         &mockApplyStore{apply: apply},
+			controlRequests: controlRequests,
+		},
+		logger: slog.New(captureHandler{records: &records}),
+	}
+
+	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.True(t, handled)
+
+	line := requireCapturedLog(t, records, "completing pending stop request for resolved apply")
+	assert.Equal(t, "apply-stop-identity", line.attrs["apply_id"])
+	assert.Equal(t, "cdb_resolute", line.attrs["database"])
+	assert.Equal(t, storage.DatabaseTypeStrata, line.attrs["database_type"])
+	assert.Equal(t, "staging", line.attrs["environment"])
+	assert.Equal(t, "org/repo", line.attrs["repo"])
+	assert.Equal(t, int64(123), line.attrs["pr"])
+	assert.Equal(t, "operator", line.attrs["requested_by"])
+	assert.Equal(t, state.Apply.Completed, line.attrs["state"],
+		"the settle line must snapshot the state current at consumption time")
+
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestCompleted, settled.Status)
 }

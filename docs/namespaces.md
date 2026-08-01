@@ -13,6 +13,8 @@
 - [`$ENV` Substitution in Namespace Names](#env-substitution-in-namespace-names)
   - [Example](#example)
   - [Rules](#rules)
+- [Per-Target Schema Overrides](#per-target-schema-overrides)
+  - [Rules](#rules-1)
 - [Summary](#summary)
 - [How Namespaces Flow Through the System](#how-namespaces-flow-through-the-system)
 
@@ -161,6 +163,33 @@ schemabot plan -s myapp/schema -e production
 - You can mix `$ENV` directories with regular directories in the subdirectory layout.
 - When creating the directory from a shell, quote the name to prevent shell expansion: `mkdir 'bikeshare_$ENV'`
 
+## Per-Target Schema Overrides
+
+`$ENV` substitution handles physical schema names that vary by *environment*. When names vary by *deployment within one environment* — several regional clusters in the same environment naming the schema `bikeshare_qa`, `bikeshare_eu_qa`, and `bikeshare_us_qa` — one schema directory cannot express the variance, and copying the directory per region would triple the source of truth.
+
+Instead, keep one canonical directory (`bikeshare/`) and map the canonical namespace to each deployment's physical schema on the data-plane target:
+
+```yaml
+target_resolver:
+  targets:
+    eu-bikeshare-qa:
+      type: mysql
+      schema_overrides:
+        bikeshare: bikeshare_eu_qa
+      dsn_from:
+        # namespace-free endpoint/credentials
+```
+
+The canonical namespace stays the name everywhere SchemaBot stores or shows it — requests, plans, tasks, drift comparison, pull responses. The physical name only enters the data plane where MySQL is actually addressed: the connection schema in the DSN and `information_schema` predicates.
+
+### Rules
+
+- MySQL only, and currently exactly one mapping per target.
+- The target DSN must be namespace-free; a DSN that already names a database is rejected at config load.
+- A non-empty map is a strict allowlist: a requested namespace without a mapping fails rather than falling back to the canonical name, so a misrouted request cannot land in the wrong physical schema.
+- An empty/omitted map preserves the default behavior: the requested namespace is the physical schema.
+- Schema names must be unquoted-identifier-safe (`[a-zA-Z0-9_$]`, at most 64 characters).
+
 ## Summary
 
 | Scenario | schemabot.yaml | Namespaces | Example |
@@ -170,6 +199,7 @@ schemabot plan -s myapp/schema -e production
 | MySQL, different databases | 1 per database | 1 each | separate directories |
 | Vitess, multiple keyspaces | 1 | many | `commerce/`, `commerce_sharded/` |
 | Environment-specific namespace | 1 | 1 per env | `bikeshare_$ENV/` |
+| Deployment-specific physical schema | 1 | 1 canonical | `bikeshare/` + per-target `schema_overrides` |
 
 ## How Namespaces Flow Through the System
 

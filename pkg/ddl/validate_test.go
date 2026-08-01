@@ -139,4 +139,32 @@ func TestValidateCreateTable(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "duplicate column")
 	})
+
+	t.Run("rejects schema-qualified table name", func(t *testing.T) {
+		sql := "CREATE TABLE otherdb.users (id INT PRIMARY KEY)"
+		ct, err := statement.ParseCreateTable(sql)
+		require.NoError(t, err)
+
+		err = ValidateCreateTable(ct)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "schema-qualified table name")
+	})
+
+	t.Run("rejects backtick-quoted schema qualifier", func(t *testing.T) {
+		sql := "CREATE TABLE `otherdb`.`users` (id INT PRIMARY KEY)"
+		ct, err := statement.ParseCreateTable(sql)
+		require.NoError(t, err)
+
+		err = ValidateCreateTable(ct)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "schema-qualified table name")
+	})
+
+	t.Run("accepts unqualified table name", func(t *testing.T) {
+		sql := "CREATE TABLE users (id INT PRIMARY KEY)"
+		ct, err := statement.ParseCreateTable(sql)
+		require.NoError(t, err)
+
+		assert.NoError(t, ValidateCreateTable(ct))
+	})
 }

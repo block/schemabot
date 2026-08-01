@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
@@ -17,7 +18,8 @@ const applyLogColumns = `id, apply_id, task_id, level, event_type, source, messa
 
 // applyLogStore implements storage.ApplyLogStore using MySQL.
 type applyLogStore struct {
-	db *sql.DB
+	db       *sql.DB
+	identity identityInserter
 }
 
 // Append adds a new log entry.
@@ -33,7 +35,7 @@ func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error
 	}
 
 	if hasLease {
-		result, err := s.db.ExecContext(ctx, `
+		id, inserted, err := s.identity.InsertGuardedID(ctx, s.db, `
 			INSERT INTO apply_logs (
 				apply_id, task_id, level, event_type, source, message,
 				old_state, new_state, metadata
@@ -47,27 +49,19 @@ func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error
 			lease.ApplyID, lease.Token,
 		)
 		if err != nil {
-			return err
+			return fmt.Errorf("append apply log for apply %d: %w", log.ApplyID, err)
 		}
-		rows, err := result.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("read apply log append rows affected for apply %d: %w", log.ApplyID, err)
-		}
-		if rows == 0 {
+		if !inserted {
 			if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
 				return err
 			}
 			return fmt.Errorf("append apply log for apply %d matched no rows despite current lease", log.ApplyID)
 		}
-		id, err := result.LastInsertId()
-		if err != nil {
-			return err
-		}
 		log.ID = id
 		return nil
 	}
 
-	result, err := s.db.ExecContext(ctx, `
+	id, err := s.identity.InsertID(ctx, s.db, `
 		INSERT INTO apply_logs (
 			apply_id, task_id, level, event_type, source, message,
 			old_state, new_state, metadata
@@ -76,12 +70,6 @@ func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error
 		log.ApplyID, nullInt64Ptr(log.TaskID), log.Level, log.EventType, source, log.Message,
 		nullString(log.OldState), nullString(log.NewState), nullJSON(log.Metadata),
 	)
-	if err != nil {
-		return err
-	}
-
-	// Set the auto-generated ID
-	id, err := result.LastInsertId()
 	if err != nil {
 		return err
 	}
@@ -106,7 +94,35 @@ func (s *applyLogStore) GetByApply(ctx context.Context, applyID int64) ([]*stora
 	return scanApplyLogs(rows)
 }
 
-// List returns logs matching the filter criteria, ordered by created_at.
+// GetRecentByApply returns the newest limit logs for an apply, ordered by
+// created_at ascending. Ties on created_at (second precision) are broken by
+// id so entries keep their insertion order.
+func (s *applyLogStore) GetRecentByApply(ctx context.Context, applyID int64, limit int) ([]*storage.ApplyLog, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+applyLogColumns+`
+		FROM apply_logs
+		WHERE apply_id = ?
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?
+	`, applyID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer utils.CloseAndLog(rows)
+
+	logs, err := scanApplyLogs(rows)
+	if err != nil {
+		return nil, err
+	}
+	slices.Reverse(logs)
+	return logs, nil
+}
+
+// List returns the newest Limit logs matching the filter criteria, ordered by
+// created_at ascending so the result reads chronologically. Ties on created_at
+// (second precision) are broken by id so entries keep their insertion order.
+// Callers rendering a bounded tail (like the CLI logs command) need the newest
+// entries — a long-running apply accumulates far more log rows than the window.
 func (s *applyLogStore) List(ctx context.Context, filter storage.ApplyLogFilter) ([]*storage.ApplyLog, error) {
 	// Build query with filters
 	query := `
@@ -129,7 +145,7 @@ func (s *applyLogStore) List(ctx context.Context, filter storage.ApplyLogFilter)
 		args = append(args, filter.EventType)
 	}
 
-	query += " ORDER BY created_at ASC"
+	query += " ORDER BY created_at DESC, id DESC"
 
 	limit := filter.Limit
 	if limit <= 0 {
@@ -144,7 +160,12 @@ func (s *applyLogStore) List(ctx context.Context, filter storage.ApplyLogFilter)
 	}
 	defer utils.CloseAndLog(rows)
 
-	return scanApplyLogs(rows)
+	logs, err := scanApplyLogs(rows)
+	if err != nil {
+		return nil, err
+	}
+	slices.Reverse(logs)
+	return logs, nil
 }
 
 // scanApplyLogs scans multiple apply log rows.

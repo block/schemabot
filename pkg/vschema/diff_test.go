@@ -1,4 +1,4 @@
-package planetscale
+package vschema
 
 import (
 	"testing"
@@ -9,7 +9,7 @@ import (
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 )
 
-func TestVSchemaChanged(t *testing.T) {
+func TestChanged(t *testing.T) {
 	tests := []struct {
 		name     string
 		current  string
@@ -44,6 +44,18 @@ func TestVSchemaChanged(t *testing.T) {
 			name:     "empty vs empty object",
 			current:  "",
 			desired:  "{}",
+			expected: false,
+		},
+		{
+			name:     "whitespace-only vs empty object",
+			current:  "  \n  ",
+			desired:  "{}",
+			expected: false,
+		},
+		{
+			name:     "surrounding whitespace ignored",
+			current:  "\n  {\"sharded\": true}  \n",
+			desired:  `{"sharded": true}`,
 			expected: false,
 		},
 		{
@@ -92,13 +104,13 @@ func TestVSchemaChanged(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := VSchemaChanged(tt.current, tt.desired)
+			got := Changed(tt.current, tt.desired)
 			assert.Equal(t, tt.expected, got)
 		})
 	}
 }
 
-func TestVSchemaDiff(t *testing.T) {
+func TestDiff(t *testing.T) {
 	tests := []struct {
 		name           string
 		current        string
@@ -142,7 +154,7 @@ func TestVSchemaDiff(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			diff := VSchemaDiff(tt.current, tt.desired)
+			diff := Diff(tt.current, tt.desired)
 			if tt.expectEmpty {
 				assert.Empty(t, diff, "expected empty diff")
 				return
@@ -155,107 +167,107 @@ func TestVSchemaDiff(t *testing.T) {
 	}
 }
 
-func TestNormalizeVSchemaJSON_Deterministic(t *testing.T) {
+func TestNormalize_Deterministic(t *testing.T) {
 	// Same VSchema with different key ordering should normalize identically
 	a := `{"tables":{"users":{},"orders":{}},"vindexes":{"hash":{"type":"hash"}},"sharded":true}`
 	b := `{"sharded":true,"vindexes":{"hash":{"type":"hash"}},"tables":{"orders":{},"users":{}}}`
 
-	assert.Equal(t, normalizeVSchemaJSON(a), normalizeVSchemaJSON(b),
+	assert.Equal(t, Normalize(a), Normalize(b),
 		"same VSchema with different key order should normalize identically")
 }
 
-func TestNormalizeVSchemaJSON_RepeatedCalls(t *testing.T) {
+func TestNormalize_RepeatedCalls(t *testing.T) {
 	// Normalizing the same string multiple times should always produce the same result
 	vs := `{"sharded":true,"vindexes":{"hash":{"type":"hash"}},"tables":{"users":{"column_vindexes":[{"column":"id","name":"hash"}]}}}`
-	first := normalizeVSchemaJSON(vs)
+	first := Normalize(vs)
 	for range 10 {
-		assert.Equal(t, first, normalizeVSchemaJSON(vs),
+		assert.Equal(t, first, Normalize(vs),
 			"repeated normalization should be stable")
 	}
 }
 
-func TestVSchemaChanged_RoundTrip(t *testing.T) {
+func TestChanged_RoundTrip(t *testing.T) {
 	// Normalize, then compare against the normalized form — should not detect a change
 	vs := `{"sharded":true,"vindexes":{"hash":{"type":"hash"}},"tables":{"users":{"column_vindexes":[{"column":"id","name":"hash"}]},"orders":{"column_vindexes":[{"column":"user_id","name":"hash"}]}}}`
-	normalized := normalizeVSchemaJSON(vs)
-	assert.False(t, VSchemaChanged(vs, normalized),
+	normalized := Normalize(vs)
+	assert.False(t, Changed(vs, normalized),
 		"original vs normalized should not be detected as changed")
-	assert.False(t, VSchemaChanged(normalized, vs),
+	assert.False(t, Changed(normalized, vs),
 		"normalized vs original should not be detected as changed")
 }
 
-func TestVSchemaChanged_SequenceTablesUnsharded(t *testing.T) {
+func TestChanged_SequenceTablesUnsharded(t *testing.T) {
 	// Simulates the testapp keyspace: sequence tables only, unsharded
 	fileVSchema := `{"tables":{"users_seq":{"type":"sequence"},"orders_seq":{"type":"sequence"},"products_seq":{"type":"sequence"}}}`
 	// API might return with different formatting or field ordering
 	apiVSchema := `{"tables": {"orders_seq": {"type": "sequence"}, "products_seq": {"type": "sequence"}, "users_seq": {"type": "sequence"}}}`
 
-	assert.False(t, VSchemaChanged(apiVSchema, fileVSchema),
+	assert.False(t, Changed(apiVSchema, fileVSchema),
 		"sequence tables VSchema should match regardless of key ordering or whitespace")
 }
 
-func TestVSchemaChanged_ShardedWithVindexes(t *testing.T) {
+func TestChanged_ShardedWithVindexes(t *testing.T) {
 	// Simulates testapp_sharded: full VSchema with vindexes and column_vindexes
 	fileVSchema := `{"sharded":true,"vindexes":{"hash":{"type":"hash"}},"tables":{"users":{"column_vindexes":[{"column":"id","name":"hash"}],"auto_increment":{"column":"id","sequence":"users_seq"}},"orders":{"column_vindexes":[{"column":"user_id","name":"hash"}],"auto_increment":{"column":"id","sequence":"orders_seq"}},"products":{"column_vindexes":[{"column":"id","name":"hash"}],"auto_increment":{"column":"id","sequence":"products_seq"}}}}`
 	// API returns same content, different ordering
 	apiVSchema := `{"vindexes":{"hash":{"type":"hash"}},"sharded":true,"tables":{"products":{"auto_increment":{"sequence":"products_seq","column":"id"},"column_vindexes":[{"name":"hash","column":"id"}]},"users":{"auto_increment":{"sequence":"users_seq","column":"id"},"column_vindexes":[{"name":"hash","column":"id"}]},"orders":{"auto_increment":{"sequence":"orders_seq","column":"id"},"column_vindexes":[{"name":"hash","column":"user_id"}]}}}`
 
-	assert.False(t, VSchemaChanged(apiVSchema, fileVSchema),
+	assert.False(t, Changed(apiVSchema, fileVSchema),
 		"same sharded VSchema with different key ordering should not be detected as changed")
 }
 
-func TestVSchemaChanged_EmptyTables(t *testing.T) {
+func TestChanged_EmptyTables(t *testing.T) {
 	// Some tables have empty config {} — should be identical
 	fileVSchema := `{"tables":{"users":{}}}`
 	apiVSchema := `{"tables":{"users":{}}}`
-	assert.False(t, VSchemaChanged(apiVSchema, fileVSchema))
+	assert.False(t, Changed(apiVSchema, fileVSchema))
 }
 
-func TestVSchemaChanged_ProtoDefaultStripping(t *testing.T) {
+func TestChanged_ProtoDefaultStripping(t *testing.T) {
 	// "sharded": false is a proto default — normalizer should strip it
 	withShardedFalse := `{"sharded":false,"tables":{"users":{"type":"sequence"}}}`
 	withoutSharded := `{"tables":{"users":{"type":"sequence"}}}`
-	assert.False(t, VSchemaChanged(withShardedFalse, withoutSharded),
+	assert.False(t, Changed(withShardedFalse, withoutSharded),
 		"sharded:false (proto default) vs absent should not be detected as changed")
 }
 
-func TestVSchemaChanged_RealDifference(t *testing.T) {
+func TestChanged_RealDifference(t *testing.T) {
 	// Actual VSchema change: adding a table entry
 	before := `{"tables":{"users":{"type":"sequence"}}}`
 	after := `{"tables":{"users":{"type":"sequence"},"orders":{"type":"sequence"}}}`
-	assert.True(t, VSchemaChanged(before, after),
+	assert.True(t, Changed(before, after),
 		"adding a table should be detected as a real change")
 }
 
-func TestVSchemaChanged_RealDifference_RemoveTable(t *testing.T) {
+func TestChanged_RealDifference_RemoveTable(t *testing.T) {
 	before := `{"tables":{"users":{"type":"sequence"},"orders":{"type":"sequence"}}}`
 	after := `{"tables":{"users":{"type":"sequence"}}}`
-	assert.True(t, VSchemaChanged(before, after),
+	assert.True(t, Changed(before, after),
 		"removing a table should be detected as a real change")
 }
 
-func TestVSchemaChanged_ProtojsonRoundTrip(t *testing.T) {
+func TestChanged_ProtojsonRoundTrip(t *testing.T) {
 	fileVSchema := `{"tables":{"users_seq":{"type":"sequence"},"orders_seq":{"type":"sequence"},"products_seq":{"type":"sequence"}}}`
 	var ks vschemapb.Keyspace
 	require.NoError(t, protojson.Unmarshal([]byte(fileVSchema), &ks))
 	apiBytes, err := protojson.Marshal(&ks)
 	require.NoError(t, err)
 	apiVSchema := string(apiBytes)
-	t.Logf("file normalized: %s", normalizeVSchemaJSON(fileVSchema))
-	t.Logf("api normalized:  %s", normalizeVSchemaJSON(apiVSchema))
-	assert.False(t, VSchemaChanged(apiVSchema, fileVSchema),
+	t.Logf("file normalized: %s", Normalize(fileVSchema))
+	t.Logf("api normalized:  %s", Normalize(apiVSchema))
+	assert.False(t, Changed(apiVSchema, fileVSchema),
 		"protojson round-trip should not produce a false positive")
 }
 
-func TestVSchemaChanged_ProtojsonRoundTrip_Sharded(t *testing.T) {
+func TestChanged_ProtojsonRoundTrip_Sharded(t *testing.T) {
 	fileVSchema := `{"sharded":true,"vindexes":{"hash":{"type":"hash"}},"tables":{"users":{"column_vindexes":[{"column":"id","name":"hash"}],"auto_increment":{"column":"id","sequence":"users_seq"}},"orders":{"column_vindexes":[{"column":"user_id","name":"hash"}],"auto_increment":{"column":"id","sequence":"orders_seq"}}}}`
 	var ks vschemapb.Keyspace
 	require.NoError(t, protojson.Unmarshal([]byte(fileVSchema), &ks))
 	apiBytes, err := protojson.Marshal(&ks)
 	require.NoError(t, err)
 	apiVSchema := string(apiBytes)
-	t.Logf("file normalized: %s", normalizeVSchemaJSON(fileVSchema))
-	t.Logf("api normalized:  %s", normalizeVSchemaJSON(apiVSchema))
-	assert.False(t, VSchemaChanged(apiVSchema, fileVSchema),
+	t.Logf("file normalized: %s", Normalize(fileVSchema))
+	t.Logf("api normalized:  %s", Normalize(apiVSchema))
+	assert.False(t, Changed(apiVSchema, fileVSchema),
 		"protojson round-trip of sharded VSchema should not produce a false positive")
 }

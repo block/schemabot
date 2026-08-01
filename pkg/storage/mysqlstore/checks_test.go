@@ -197,23 +197,24 @@ func TestCheckStore_Delete(t *testing.T) {
 	require.ErrorIs(t, store.Checks().Delete(ctx, 99999), storage.ErrCheckNotFound)
 }
 
-// TestCheckStore_DeleteByPRExcludingApplyOwned verifies PR-close cleanup at the
-// storage layer: all of a PR's stored check state is deleted except rows owned
-// by an in-flight apply (apply_id set and status in_progress), which must keep
-// blocking the PR until the apply reaches a terminal state. Rows for other PRs
-// are untouched.
-func TestCheckStore_DeleteByPRExcludingApplyOwned(t *testing.T) {
-	clearTables(t)
+// seedPRCloseRetentionChecks stores one row of every retention shape PR-close
+// cleanup distinguishes for PR 123, plus a row on another PR that cleanup must
+// never touch.
+func seedPRCloseRetentionChecks(t *testing.T, store storage.Storage) {
+	t.Helper()
 	ctx := t.Context()
-	store := New(testDB)
 
-	// Checks for the closed PR: two deletable rows, one apply-owned in-flight
-	// row that must survive, and one terminal apply-owned row that is deletable.
 	checksToCreate := []*storage.Check{
+		// Plan-only rows: deleted on every close kind regardless of status or conclusion.
 		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "staging", DatabaseType: "vitess", DatabaseName: "db1", Status: "pending"},
-		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "staging", DatabaseType: "mysql", DatabaseName: "db2", Status: "pending"},
+		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "staging", DatabaseType: "mysql", DatabaseName: "db2", Status: "completed", Conclusion: "action_required"},
+		// Apply-owned in-flight row: survives every close kind.
 		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "production", DatabaseType: "mysql", DatabaseName: "db3", Status: "in_progress", ApplyID: 77},
+		// Apply-owned row that concluded successfully: retention depends on the close kind.
 		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "production", DatabaseType: "mysql", DatabaseName: "db4", Status: "completed", ApplyID: 88, Conclusion: "success"},
+		// Apply-owned terminal rows that still block: survive every close kind.
+		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "production", DatabaseType: "mysql", DatabaseName: "db5", Status: "completed", ApplyID: 99, Conclusion: "action_required", BlockingReason: "schema_removed_after_apply_started"},
+		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "production", DatabaseType: "mysql", DatabaseName: "db6", Status: "completed", ApplyID: 111, Conclusion: "failure"},
 	}
 	for _, c := range checksToCreate {
 		require.NoError(t, store.Checks().Upsert(ctx, c))
@@ -229,25 +230,114 @@ func TestCheckStore_DeleteByPRExcludingApplyOwned(t *testing.T) {
 		DatabaseName: "db1",
 		Status:       "pending",
 	}))
+}
 
-	require.NoError(t, store.Checks().DeleteByPRExcludingApplyOwned(ctx, "org/repo", 123))
+// retainedChecksByDatabase asserts how many of PR 123's rows survived cleanup
+// and returns them keyed by database name.
+func retainedChecksByDatabase(t *testing.T, store storage.Storage, wantRetained int) map[string]*storage.Check {
+	t.Helper()
+	ctx := t.Context()
 
-	// Only the apply-owned in-flight row survives for PR 123.
 	retrieved, err := store.Checks().GetByPR(ctx, "org/repo", 123)
 	require.NoError(t, err)
-	require.Len(t, retrieved, 1)
-	assert.Equal(t, "db3", retrieved[0].DatabaseName)
-	assert.Equal(t, "in_progress", retrieved[0].Status)
-	assert.Equal(t, int64(77), retrieved[0].ApplyID)
+	require.Len(t, retrieved, wantRetained)
 
-	// PR 456's check still exists.
-	retrieved, err = store.Checks().GetByPR(ctx, "org/repo", 456)
+	byDatabase := make(map[string]*storage.Check, len(retrieved))
+	for _, c := range retrieved {
+		byDatabase[c.DatabaseName] = c
+	}
+	return byDatabase
+}
+
+// assertAlwaysBlockingRowsRetained verifies the apply-owned rows every close
+// kind must retain: the in-flight row and the terminal rows that concluded
+// without success (action_required, failure).
+func assertAlwaysBlockingRowsRetained(t *testing.T, byDatabase map[string]*storage.Check) {
+	t.Helper()
+
+	inFlight, ok := byDatabase["db3"]
+	require.True(t, ok, "apply-owned in-flight row must survive PR close")
+	assert.Equal(t, "in_progress", inFlight.Status)
+	assert.Equal(t, int64(77), inFlight.ApplyID)
+
+	removedAfterApply, ok := byDatabase["db5"]
+	require.True(t, ok, "apply-owned action_required row must survive PR close")
+	assert.Equal(t, "completed", removedAfterApply.Status)
+	assert.Equal(t, "action_required", removedAfterApply.Conclusion)
+	assert.Equal(t, int64(99), removedAfterApply.ApplyID)
+	assert.Equal(t, "schema_removed_after_apply_started", removedAfterApply.BlockingReason)
+
+	failed, ok := byDatabase["db6"]
+	require.True(t, ok, "apply-owned failed row must survive PR close")
+	assert.Equal(t, "completed", failed.Status)
+	assert.Equal(t, "failure", failed.Conclusion)
+	assert.Equal(t, int64(111), failed.ApplyID)
+}
+
+// assertOtherPRUntouched verifies that PR-close cleanup for PR 123 never
+// touches another PR's stored check state.
+func assertOtherPRUntouched(t *testing.T, store storage.Storage) {
+	t.Helper()
+
+	retrieved, err := store.Checks().GetByPR(t.Context(), "org/repo", 456)
 	require.NoError(t, err)
 	require.Len(t, retrieved, 1)
 	assert.Equal(t, "db1", retrieved[0].DatabaseName)
+}
 
-	// Deleting for a non-existent PR is a no-op, not an error.
-	require.NoError(t, store.Checks().DeleteByPRExcludingApplyOwned(ctx, "org/repo", 999))
+// TestCheckStore_DeleteByPRRetainingBlockingApplyOwned verifies PR-close cleanup
+// at the storage layer. On every close kind, plan-only rows are deleted, rows
+// for other PRs are untouched, and apply-owned rows that still block survive:
+// an in_progress row must keep blocking until the apply reaches a terminal
+// state, and a terminal row without a successful conclusion (action_required,
+// failure) must keep blocking until an operator reconciles the target
+// environment — closing and reopening the PR must not bypass either block.
+//
+// The close kinds differ on apply-owned rows that concluded successfully. A
+// merged close deletes them: the merged PR carries the applied schema, so
+// nothing remains to block. An unmerged close retains them: the stored success
+// may predate a commit that removed the applied change (the PR can close
+// before stale cleanup converts the row), so only reopen-time cleanup may
+// decide whether the row still matches the PR contents.
+func TestCheckStore_DeleteByPRRetainingBlockingApplyOwned(t *testing.T) {
+	t.Run("merged close deletes successful apply-owned rows", func(t *testing.T) {
+		clearTables(t)
+		ctx := t.Context()
+		store := New(testDB)
+		seedPRCloseRetentionChecks(t, store)
+
+		require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "org/repo", 123, true))
+
+		byDatabase := retainedChecksByDatabase(t, store, 3)
+		assertAlwaysBlockingRowsRetained(t, byDatabase)
+		_, ok := byDatabase["db4"]
+		assert.False(t, ok, "apply-owned success row is deleted on merged close")
+		assertOtherPRUntouched(t, store)
+
+		// Deleting for a non-existent PR is a no-op, not an error.
+		require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "org/repo", 999, true))
+	})
+
+	t.Run("unmerged close retains successful apply-owned rows", func(t *testing.T) {
+		clearTables(t)
+		ctx := t.Context()
+		store := New(testDB)
+		seedPRCloseRetentionChecks(t, store)
+
+		require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "org/repo", 123, false))
+
+		byDatabase := retainedChecksByDatabase(t, store, 4)
+		assertAlwaysBlockingRowsRetained(t, byDatabase)
+		successful, ok := byDatabase["db4"]
+		require.True(t, ok, "apply-owned success row must survive unmerged close")
+		assert.Equal(t, "completed", successful.Status)
+		assert.Equal(t, "success", successful.Conclusion)
+		assert.Equal(t, int64(88), successful.ApplyID)
+		assertOtherPRUntouched(t, store)
+
+		// Deleting for a non-existent PR is a no-op, not an error.
+		require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "org/repo", 999, false))
+	})
 }
 
 func TestCheckStore_GetByPR_DBError(t *testing.T) {
@@ -374,7 +464,7 @@ func TestCheckStore_UpsertPlanResultPreservesInProgressApply(t *testing.T) {
 		HasChanges:   true,
 		Status:       "completed",
 		Conclusion:   "action_required",
-	})
+	}, storage.PlanDriftClean)
 	require.NoError(t, err)
 
 	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
@@ -417,7 +507,7 @@ func TestCheckStore_RecoverApplyOwnedCheckWithNoOpPlanRecoversStoredCheckState(t
 		HasChanges:   false,
 		Status:       "completed",
 		Conclusion:   "success",
-	})
+	}, storage.PlanDriftClean)
 	require.NoError(t, err)
 
 	recovered, err := store.Checks().RecoverApplyOwnedCheckWithNoOpPlan(ctx, &storage.Check{
@@ -475,7 +565,7 @@ func TestCheckStore_UpsertPlanResultPreservesApplyOwnedCheckStateOnNoOpSuccess(t
 		HasChanges:   false,
 		Status:       "completed",
 		Conclusion:   "success",
-	})
+	}, storage.PlanDriftClean)
 	require.NoError(t, err)
 
 	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
@@ -546,7 +636,7 @@ func TestCheckStore_RecoverApplyOwnedCheckWithNoOpPlanRequiresNoOpSuccess(t *tes
 				HasChanges:   tc.hasChanges,
 				Status:       tc.status,
 				Conclusion:   tc.conclusion,
-			})
+			}, storage.PlanDriftClean)
 			require.NoError(t, err)
 
 			recovered, err := store.Checks().RecoverApplyOwnedCheckWithNoOpPlan(ctx, &storage.Check{
@@ -823,6 +913,105 @@ func TestCheckStore_MarkStalePlanSuccessfulLeavesInProgressApplyBlockingUnderCha
 	require.Equal(t, apply.ID, retrieved.ApplyID)
 }
 
+// seedBlockedAggregateRow stores an aggregate check row carrying a blocking
+// reason, as recorded when a PR-level guard fails the aggregate closed.
+func seedBlockedAggregateRow(t *testing.T, store *Storage, headSHA, blockingReason string) {
+	t.Helper()
+	require.NoError(t, store.Checks().Upsert(t.Context(), &storage.Check{
+		Repository:     "org/repo",
+		PullRequest:    123,
+		HeadSHA:        headSHA,
+		Environment:    "_aggregate",
+		DatabaseType:   "_aggregate",
+		DatabaseName:   "_aggregate",
+		CheckRunID:     200,
+		HasChanges:     false,
+		Status:         "completed",
+		Conclusion:     "failure",
+		BlockingReason: blockingReason,
+		ErrorMessage:   "guard failed the aggregate closed",
+	}))
+}
+
+// After the auto-plan guards re-verify a PR, the blocking reason on the stored
+// aggregate row is released so fresh plan results can drive the aggregate
+// again. The clear is pinned to the head SHA and reason the caller read.
+func TestCheckStore_ClearAggregateBlockClearsMatchingRow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	seedBlockedAggregateRow(t, store, "abc123", "managed_dir_missing_config")
+
+	existing, err := store.Checks().Get(ctx, "org/repo", 123, "_aggregate", "_aggregate", "_aggregate")
+	require.NoError(t, err)
+	require.NotNil(t, existing)
+
+	cleared, err := store.Checks().ClearAggregateBlock(ctx, existing)
+	require.NoError(t, err)
+	require.True(t, cleared)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "_aggregate", "_aggregate", "_aggregate")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Empty(t, retrieved.BlockingReason)
+	assert.Empty(t, retrieved.ErrorMessage)
+	assert.Equal(t, "failure", retrieved.Conclusion, "the clear releases only the block; conclusion is replaced by the next aggregate write")
+}
+
+// The clear is an optimistic-concurrency write: when another writer records a
+// block for a newer commit between the caller's read and the clear, the head
+// SHA no longer matches and the newer block stays authoritative.
+func TestCheckStore_ClearAggregateBlockPreservesConcurrentlyMovedRow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	seedBlockedAggregateRow(t, store, "abc123", "managed_dir_missing_config")
+
+	stale, err := store.Checks().Get(ctx, "org/repo", 123, "_aggregate", "_aggregate", "_aggregate")
+	require.NoError(t, err)
+	require.NotNil(t, stale)
+
+	// Another writer re-records the block on a newer commit before the clear.
+	seedBlockedAggregateRow(t, store, "def456", "managed_dir_missing_config")
+
+	cleared, err := store.Checks().ClearAggregateBlock(ctx, stale)
+	require.NoError(t, err)
+	require.False(t, cleared)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "_aggregate", "_aggregate", "_aggregate")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "def456", retrieved.HeadSHA)
+	assert.Equal(t, "managed_dir_missing_config", retrieved.BlockingReason)
+}
+
+// A block recorded for a different reason after the caller's read is a newer
+// guard decision; the clear must not release it.
+func TestCheckStore_ClearAggregateBlockPreservesDifferentReason(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	seedBlockedAggregateRow(t, store, "abc123", "managed_dir_missing_config")
+
+	stale, err := store.Checks().Get(ctx, "org/repo", 123, "_aggregate", "_aggregate", "_aggregate")
+	require.NoError(t, err)
+	require.NotNil(t, stale)
+
+	seedBlockedAggregateRow(t, store, "abc123", "schema_config_discovery_failed")
+
+	cleared, err := store.Checks().ClearAggregateBlock(ctx, stale)
+	require.NoError(t, err)
+	require.False(t, cleared)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "_aggregate", "_aggregate", "_aggregate")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "schema_config_discovery_failed", retrieved.BlockingReason)
+}
+
 // newChangedRowsStore opens a Storage on a connection without clientFoundRows so
 // UPDATE ... RowsAffected reflects changed rows, matching production semantics.
 func newChangedRowsStore(t *testing.T) *Storage {
@@ -863,7 +1052,7 @@ func TestCheckStore_UpsertPlanResultReplacesUnownedInProgressCheck(t *testing.T)
 		HasChanges:   true,
 		Status:       "completed",
 		Conclusion:   "action_required",
-	})
+	}, storage.PlanDriftClean)
 	require.NoError(t, err)
 
 	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
@@ -909,7 +1098,7 @@ func TestCheckStore_UpsertPlanResultPreservesInProgressApplyOnNewHead(t *testing
 		HasChanges:   false,
 		Status:       "completed",
 		Conclusion:   "success",
-	})
+	}, storage.PlanDriftClean)
 	require.NoError(t, err)
 
 	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
@@ -968,7 +1157,7 @@ func TestCheckStore_UpsertPlanResultReplacesUnownedInProgressCheckOnNewHead(t *t
 		HasChanges:   true,
 		Status:       "completed",
 		Conclusion:   "action_required",
-	})
+	}, storage.PlanDriftClean)
 	require.NoError(t, err)
 
 	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
@@ -1009,7 +1198,7 @@ func TestCheckStore_UpsertPlanResultClearsApplyIDWhenNotInProgress(t *testing.T)
 		HasChanges:   true,
 		Status:       "completed",
 		Conclusion:   "action_required",
-	})
+	}, storage.PlanDriftClean)
 	require.NoError(t, err)
 
 	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
@@ -1077,7 +1266,7 @@ func TestCheckStore_ChangeSummaryRoundTripsAndSurvivesApply(t *testing.T) {
 		Status:        "completed",
 		Conclusion:    "action_required",
 		ChangeSummary: "5 created, 3 altered · 2 vschema updates",
-	}))
+	}, storage.PlanDriftClean))
 
 	checks, err := store.Checks().GetByPR(ctx, "octocat/hello-world", 7)
 	require.NoError(t, err)
@@ -1159,15 +1348,15 @@ func TestCheckStore_ReplanUpdatesChangeSummary(t *testing.T) {
 		return c
 	}
 
-	require.NoError(t, store.Checks().UpsertPlanResult(ctx, planCheck("5 created")))
+	require.NoError(t, store.Checks().UpsertPlanResult(ctx, planCheck("5 created"), storage.PlanDriftClean))
 	assert.Equal(t, "5 created", get().ChangeSummary)
 
 	// A new plan with different changes overwrites the summary.
-	require.NoError(t, store.Checks().UpsertPlanResult(ctx, planCheck("2 altered")))
+	require.NoError(t, store.Checks().UpsertPlanResult(ctx, planCheck("2 altered"), storage.PlanDriftClean))
 	assert.Equal(t, "2 altered", get().ChangeSummary)
 
 	// A new plan that finds no changes clears the summary.
-	require.NoError(t, store.Checks().UpsertPlanResult(ctx, planCheck("")))
+	require.NoError(t, store.Checks().UpsertPlanResult(ctx, planCheck(""), storage.PlanDriftClean))
 	assert.Empty(t, get().ChangeSummary)
 }
 
@@ -1366,6 +1555,86 @@ func TestCheckStore_MarkActionRequiredForApply(t *testing.T) {
 	require.Equal(t, int64(0), retrieved.ApplyID)
 }
 
+// A rollback that never claimed the stored check row (its claim failed or the
+// driver crashed before it landed) must still be able to block the stale
+// successful row left over from the apply it reverted; only a newer apply
+// protects the row from the rollback's terminal write.
+func TestCheckStore_MarkActionRequiredForApplyConvergesPriorApplyOwnedCheck(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	priorApply := createCheckStoreApply(t, store, "apply-succeeded", state.Apply.Completed)
+	rollbackApply := createCheckStoreApply(t, store, "rollback-unclaimed", state.Apply.Completed)
+	require.Greater(t, rollbackApply.ID, priorApply.ID)
+
+	check := &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		ApplyID:      priorApply.ID,
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.HasChanges = true
+	check.Conclusion = "action_required"
+	updated, err := store.Checks().MarkActionRequiredForApply(ctx, check, rollbackApply)
+	require.NoError(t, err)
+	require.True(t, updated)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "completed", retrieved.Status)
+	assert.Equal(t, "action_required", retrieved.Conclusion)
+	assert.True(t, retrieved.HasChanges)
+	assert.Equal(t, int64(0), retrieved.ApplyID, "the rollback's terminal write releases check ownership")
+}
+
+// An unowned successful row (for example after a deliberate stale-cleanup
+// unblock) still yields to a completed rollback's terminal write when the
+// rollback is the newest apply for the target.
+func TestCheckStore_MarkActionRequiredForApplyConvergesUnownedCheck(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	rollbackApply := createCheckStoreApply(t, store, "rollback-unclaimed", state.Apply.Completed)
+
+	check := &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.HasChanges = true
+	check.Conclusion = "action_required"
+	updated, err := store.Checks().MarkActionRequiredForApply(ctx, check, rollbackApply)
+	require.NoError(t, err)
+	require.True(t, updated)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "completed", retrieved.Status)
+	assert.Equal(t, "action_required", retrieved.Conclusion)
+	assert.True(t, retrieved.HasChanges)
+	assert.Equal(t, int64(0), retrieved.ApplyID)
+}
+
 func TestCheckStore_MarkActionRequiredForApplyLeaseGuard(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -1513,4 +1782,199 @@ func createCheckStoreApply(t *testing.T, store storage.Storage, applyIdentifier,
 	require.NoError(t, err)
 	require.NotNil(t, created)
 	return created
+}
+
+// A review-time deployment drift block is stored on a plan-only row as a first-
+// class BlockingReason with conclusion=failure, so the aggregate fails closed.
+func TestCheckStore_UpsertPlanResultStoresDriftBlock(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	err := store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		Repository:     "org/repo",
+		PullRequest:    123,
+		HeadSHA:        "sha1",
+		Environment:    "production",
+		DatabaseType:   "mysql",
+		DatabaseName:   "testdb",
+		HasChanges:     false,
+		Status:         "completed",
+		Conclusion:     "failure",
+		BlockingReason: storage.ReviewTimeDeploymentDriftBlockingReason,
+		ChangeSummary:  "drift blocks apply — diverged: au",
+	}, storage.PlanDriftBlocked)
+	require.NoError(t, err)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "production", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "failure", retrieved.Conclusion)
+	assert.Equal(t, storage.ReviewTimeDeploymentDriftBlockingReason, retrieved.BlockingReason)
+}
+
+// An apply-time plan (a not-evaluated write) must not clear a stored drift
+// block: drift depends on live deployment state, not PR content, so an apply on
+// the same head cannot re-open the gate. The head SHA is refreshed but the block
+// is preserved.
+func TestCheckStore_UpsertPlanResultNotEvaluatedPreservesDriftBlock(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		Repository:     "org/repo",
+		PullRequest:    123,
+		HeadSHA:        "sha1",
+		Environment:    "production",
+		DatabaseType:   "mysql",
+		DatabaseName:   "testdb",
+		Status:         "completed",
+		Conclusion:     "failure",
+		BlockingReason: storage.ReviewTimeDeploymentDriftBlockingReason,
+		ChangeSummary:  "drift blocks apply — diverged: au",
+	}, storage.PlanDriftBlocked))
+
+	// Apply-time plan on the same head: no drift evaluated, primary plan clean.
+	err := store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "sha1",
+		Environment:  "production",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	}, storage.PlanDriftNotEvaluated)
+	require.NoError(t, err)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "production", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "failure", retrieved.Conclusion, "drift block conclusion preserved")
+	assert.Equal(t, storage.ReviewTimeDeploymentDriftBlockingReason, retrieved.BlockingReason, "drift block preserved")
+	assert.Equal(t, "drift blocks apply — diverged: au", retrieved.ChangeSummary, "drift summary preserved")
+}
+
+// A fresh clean rollup (an evaluated write) clears a stored drift block: the
+// deployments now match the reviewed plan, so the gate may pass.
+func TestCheckStore_UpsertPlanResultCleanReplanClearsDriftBlock(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		Repository:     "org/repo",
+		PullRequest:    123,
+		HeadSHA:        "sha1",
+		Environment:    "production",
+		DatabaseType:   "mysql",
+		DatabaseName:   "testdb",
+		Status:         "completed",
+		Conclusion:     "failure",
+		BlockingReason: storage.ReviewTimeDeploymentDriftBlockingReason,
+		ChangeSummary:  "drift blocks apply — diverged: au",
+	}, storage.PlanDriftBlocked))
+
+	err := store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "sha1",
+		Environment:  "production",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	}, storage.PlanDriftClean)
+	require.NoError(t, err)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "production", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "success", retrieved.Conclusion, "clean re-plan cleared the block")
+	assert.Empty(t, retrieved.BlockingReason, "clean re-plan cleared the blocking reason")
+}
+
+// A not-evaluated write on a row that is not drift-blocked behaves like a normal
+// plan-result replacement (no drift block to preserve).
+func TestCheckStore_UpsertPlanResultNotEvaluatedReplacesNonDriftRow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "sha1",
+		Environment:  "production",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   true,
+		Status:       "completed",
+		Conclusion:   "action_required",
+	}, storage.PlanDriftClean))
+
+	err := store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "sha2",
+		Environment:  "production",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	}, storage.PlanDriftNotEvaluated)
+	require.NoError(t, err)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "production", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "sha2", retrieved.HeadSHA)
+	assert.Equal(t, "success", retrieved.Conclusion, "non-drift row is replaced normally")
+	assert.False(t, retrieved.HasChanges)
+}
+
+// Stale cleanup clears a plan-only drift block: once a later commit removes the
+// database from the PR and no apply has started, the reviewed plan no longer
+// gates the merge.
+func TestCheckStore_MarkStalePlanSuccessfulClearsDriftBlock(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		Repository:     "org/repo",
+		PullRequest:    123,
+		HeadSHA:        "sha1",
+		Environment:    "production",
+		DatabaseType:   "mysql",
+		DatabaseName:   "testdb",
+		Status:         "completed",
+		Conclusion:     "failure",
+		BlockingReason: storage.ReviewTimeDeploymentDriftBlockingReason,
+		ChangeSummary:  "drift blocks apply — diverged: au",
+	}, storage.PlanDriftBlocked))
+
+	ok, err := store.Checks().MarkStalePlanSuccessful(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "sha1",
+		Environment:  "production",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "production", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "success", retrieved.Conclusion)
+	assert.Empty(t, retrieved.BlockingReason)
 }

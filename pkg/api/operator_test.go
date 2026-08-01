@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/panicsafe"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -134,6 +137,98 @@ func TestResumeClaimedApplyWithOptions_SuppressesRecoveredObserverForMultiOp(t *
 	assert.False(t, observerSet, "a multi-op drive must not fire the per-driver observer hook")
 	assert.Zero(t, deploymentClient.observerApplyID, "no observer must be registered for a multi-op drive")
 	assert.Nil(t, deploymentClient.observer)
+}
+
+// An operator drive binds a drive-scoped logger once at the claim boundary, so
+// every log line of the drive carries the apply's identity (apply_id, repo, pr,
+// database, environment) and the effective deployment without each call site
+// hand-listing them — including calls that pass no identity attrs at all, such
+// as the missing-apply-log-store warning. Mutable state is not frozen into the
+// bound logger: lines carry a state attribute only where the call site supplies
+// the value that is current at emit time.
+func TestResumeClaimedApply_DriveLogsCarryApplyIdentity(t *testing.T) {
+	deploymentClient := &mockTernClient{}
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, &ServerConfig{}, map[string]tern.Client{
+		"east/staging": deploymentClient,
+	}, logger)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "appdb",
+		DatabaseType:    "mysql",
+		Deployment:      "east",
+		Environment:     "staging",
+		Repository:      "org/repo",
+		PullRequest:     123,
+		State:           state.Apply.Pending,
+	}
+
+	resumed, err := svc.resumeClaimedApply(t.Context(), 1, apply, 0, "")
+	require.NoError(t, err)
+	assert.True(t, resumed)
+
+	lines := decodeLogLines(t, logBuf.Bytes())
+
+	assertDriveIdentity := func(line map[string]any) {
+		t.Helper()
+		assert.Equal(t, "apply-42", line["apply_id"])
+		assert.Equal(t, "appdb", line["database"])
+		assert.Equal(t, "mysql", line["database_type"])
+		assert.Equal(t, "staging", line["environment"])
+		assert.Equal(t, "org/repo", line["repo"])
+		assert.Equal(t, float64(123), line["pr"])
+		assert.Equal(t, "east", line["deployment"])
+		assert.Equal(t, float64(1), line["driver"])
+	}
+
+	claimed := requireLogLine(t, lines, "operator: claimed apply")
+	assertDriveIdentity(claimed)
+	assert.Equal(t, state.Apply.Pending, claimed["state"],
+		"claim line must snapshot the state current at claim time")
+
+	// The call site passes only the message — every identity attr must come
+	// from the bound logger.
+	noStore := requireLogLine(t, lines, "operator: no apply log store configured; apply claim will not appear in apply logs")
+	assertDriveIdentity(noStore)
+
+	resumedLine := requireLogLine(t, lines, "operator: resumed apply")
+	assertDriveIdentity(resumedLine)
+	assert.Equal(t, state.Apply.Pending, resumedLine["previous_state"])
+	assert.NotContains(t, resumedLine, "state",
+		"mutable state must not be frozen into the bound drive logger")
+}
+
+// decodeLogLines parses newline-delimited slog JSON output into one map per line.
+func decodeLogLines(t *testing.T, output []byte) []map[string]any {
+	t.Helper()
+	var lines []map[string]any
+	for raw := range bytes.SplitSeq(bytes.TrimSpace(output), []byte("\n")) {
+		if len(raw) == 0 {
+			continue
+		}
+		var line map[string]any
+		require.NoError(t, json.Unmarshal(raw, &line), "log output must be valid JSON: %s", raw)
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// requireLogLine returns the first log line with the given message, failing the
+// test when none exists.
+func requireLogLine(t *testing.T, lines []map[string]any, msg string) map[string]any {
+	t.Helper()
+	for _, line := range lines {
+		if line["msg"] == msg {
+			return line
+		}
+	}
+	require.Failf(t, "log line not found", "no log line with msg %q in %d lines", msg, len(lines))
+	return nil
 }
 
 // TestMarkOperationFromApplyState_MirrorsFailedRetryable verifies that a parent
@@ -780,20 +875,18 @@ func TestUpdateApplyStateFromOperations_ReturnsProjectionResult(t *testing.T) {
 	}
 }
 
-// fakeControlRequestStore is a minimal ControlRequestStore for stop
-// reconciliation tests: GetPending returns the configured pending stop request,
-// and CompletePending records the operations it was asked to complete.
+// fakeControlRequestStore is a minimal ControlRequestStore for control-request
+// reconciliation tests: GetPending returns the configured pending request for
+// the operation, and CompletePending records the operations it was asked to
+// complete.
 type fakeControlRequestStore struct {
 	storage.ControlRequestStore
-	pendingStop *storage.ApplyControlRequest
-	completed   []storage.ControlOperation
+	pending   map[storage.ControlOperation]*storage.ApplyControlRequest
+	completed []storage.ControlOperation
 }
 
 func (s *fakeControlRequestStore) GetPending(_ context.Context, _ int64, op storage.ControlOperation) (*storage.ApplyControlRequest, error) {
-	if op == storage.ControlOperationStop {
-		return s.pendingStop, nil
-	}
-	return nil, nil
+	return s.pending[op], nil
 }
 
 func (s *fakeControlRequestStore) CompletePending(_ context.Context, _ int64, op storage.ControlOperation) error {
@@ -816,8 +909,9 @@ func (s *markPendingStoppedRecordingStore) MarkPendingStoppedByApply(_ context.C
 	return s.count, nil
 }
 
-// getApplyStore returns a fixed apply from Get so completePendingStopIfApplyResolved
-// can be driven against a chosen terminal/non-terminal state.
+// getApplyStore returns a fixed apply from Get so
+// completePendingControlRequestsIfApplyResolved can be driven against a chosen
+// terminal/non-terminal state.
 type getApplyStore struct {
 	storage.ApplyStore
 	apply *storage.Apply
@@ -854,8 +948,8 @@ func TestStopPendingOperationsForPendingStop(t *testing.T) {
 
 	t.Run("stops pending siblings when a stop is pending", func(t *testing.T) {
 		ops := &markPendingStoppedRecordingStore{count: 2}
-		control := &fakeControlRequestStore{pendingStop: &storage.ApplyControlRequest{
-			ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending,
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStop: {ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending},
 		}}
 		svc := newStopReconcileTestService(&getApplyStore{}, ops, control)
 
@@ -866,7 +960,7 @@ func TestStopPendingOperationsForPendingStop(t *testing.T) {
 
 	t.Run("no-op when no stop is pending", func(t *testing.T) {
 		ops := &markPendingStoppedRecordingStore{}
-		control := &fakeControlRequestStore{pendingStop: nil}
+		control := &fakeControlRequestStore{}
 		svc := newStopReconcileTestService(&getApplyStore{}, ops, control)
 
 		require.NoError(t, svc.stopPendingOperationsForPendingStop(t.Context(), 1, apply))
@@ -874,39 +968,72 @@ func TestStopPendingOperationsForPendingStop(t *testing.T) {
 	})
 }
 
-// TestCompletePendingStopIfApplyResolved verifies the operator completes a
-// pending stop request only once the apply has settled terminally.
-func TestCompletePendingStopIfApplyResolved(t *testing.T) {
-	pendingStop := func() *storage.ApplyControlRequest {
-		return &storage.ApplyControlRequest{ApplyID: 9, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending}
+// TestCompletePendingControlRequestsIfApplyResolved verifies the operator
+// completes pending stop and cancel requests only once the apply has settled
+// terminally, and keeps a pending cancel deliverable when the terminal state
+// is stopped — a stopped apply remains cancellable, so completing the cancel
+// there would consume a command the next drive still has to deliver.
+func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
+	pendingRequest := func(op storage.ControlOperation) *storage.ApplyControlRequest {
+		return &storage.ApplyControlRequest{ApplyID: 9, Operation: op, Status: storage.ControlRequestPending}
 	}
 
 	t.Run("completes the stop when the apply is terminal", func(t *testing.T) {
 		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Failed}}
-		control := &fakeControlRequestStore{pendingStop: pendingStop()}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStop: pendingRequest(storage.ControlOperationStop),
+		}}
 		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
 
-		require.NoError(t, svc.completePendingStopIfApplyResolved(t.Context(), 1, 9))
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
 		require.Len(t, control.completed, 1, "a terminal apply with a pending stop completes the request")
 		assert.Equal(t, storage.ControlOperationStop, control.completed[0])
 	})
 
-	t.Run("leaves the stop pending while the apply is non-terminal", func(t *testing.T) {
-		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-running", State: state.Apply.Running}}
-		control := &fakeControlRequestStore{pendingStop: pendingStop()}
+	t.Run("completes the cancel when the apply is terminal", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Cancelled}}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationCancel: pendingRequest(storage.ControlOperationCancel),
+		}}
 		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
 
-		require.NoError(t, svc.completePendingStopIfApplyResolved(t.Context(), 1, 9))
-		assert.Empty(t, control.completed, "a non-terminal apply must not complete the stop request")
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		require.Len(t, control.completed, 1, "a terminal apply with a pending cancel completes the request")
+		assert.Equal(t, storage.ControlOperationCancel, control.completed[0])
 	})
 
-	t.Run("no-op when no stop is pending", func(t *testing.T) {
-		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Failed}}
-		control := &fakeControlRequestStore{pendingStop: nil}
+	t.Run("keeps the cancel pending when the apply settled stopped", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-stopped", State: state.Apply.Stopped}}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStop:   pendingRequest(storage.ControlOperationStop),
+			storage.ControlOperationCancel: pendingRequest(storage.ControlOperationCancel),
+		}}
 		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
 
-		require.NoError(t, svc.completePendingStopIfApplyResolved(t.Context(), 1, 9))
-		assert.Empty(t, control.completed, "no pending stop means nothing to complete")
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		require.Len(t, control.completed, 1, "a stopped apply completes the stop but must keep the cancel deliverable")
+		assert.Equal(t, storage.ControlOperationStop, control.completed[0])
+	})
+
+	t.Run("leaves both requests pending while the apply is non-terminal", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-running", State: state.Apply.Running}}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStop:   pendingRequest(storage.ControlOperationStop),
+			storage.ControlOperationCancel: pendingRequest(storage.ControlOperationCancel),
+		}}
+		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		assert.Empty(t, control.completed, "a non-terminal apply must not complete any control request")
+	})
+
+	t.Run("no-op when nothing is pending", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Failed}}
+		control := &fakeControlRequestStore{}
+		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		assert.Empty(t, control.completed, "no pending requests means nothing to complete")
 	})
 }
 
@@ -1245,4 +1372,296 @@ func TestRecoverApplies_ExpiryErrorDoesNotBlockClaim(t *testing.T) {
 
 	assert.True(t, applyStore.findNextCalled,
 		"FindNextApply must run even when ExpireRetryable fails")
+}
+
+// panickingResumeClient simulates an engine whose resume path hits a code or
+// data fault (for example malformed stored metadata) and panics mid-drive.
+type panickingResumeClient struct {
+	mockTernClient
+	panicValue string
+}
+
+func (c *panickingResumeClient) ResumeApply(context.Context, *storage.Apply) error {
+	panic(c.panicValue)
+}
+
+func (c *panickingResumeClient) ResumeApplyOperation(context.Context, *storage.Apply, int64) error {
+	panic(c.panicValue)
+}
+
+// recordingTaskStore serves a fixed task set and records state writes, so tests
+// can assert what the panic containment persisted.
+type recordingTaskStore struct {
+	storage.TaskStore
+	tasks   []*storage.Task
+	updated []*storage.Task
+}
+
+func (s *recordingTaskStore) GetByApplyID(_ context.Context, applyID int64) ([]*storage.Task, error) {
+	tasks := make([]*storage.Task, 0, len(s.tasks))
+	for _, task := range s.tasks {
+		if task.ApplyID == applyID {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks, nil
+}
+
+func (s *recordingTaskStore) GetByApplyOperationID(_ context.Context, applyOperationID int64) ([]*storage.Task, error) {
+	tasks := make([]*storage.Task, 0, len(s.tasks))
+	for _, task := range s.tasks {
+		if task.ApplyOperationID != nil && *task.ApplyOperationID == applyOperationID {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks, nil
+}
+
+func (s *recordingTaskStore) Update(_ context.Context, task *storage.Task) error {
+	s.updated = append(s.updated, task)
+	return nil
+}
+
+// panicContainmentApplyStore claims a single apply, rotating a lease onto it,
+// and records the terminal write the panic containment path performs. Once the
+// apply is terminal it is no longer claimable, matching the durable claim
+// predicate.
+type panicContainmentApplyStore struct {
+	storage.ApplyStore
+	apply        *storage.Apply
+	claims       int
+	updateCalled bool
+}
+
+func (s *panicContainmentApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {
+	return nil, nil
+}
+
+func (s *panicContainmentApplyStore) FindNextApply(_ context.Context, owner string) (*storage.Apply, error) {
+	s.claims++
+	if s.apply == nil || state.IsTerminalApplyState(s.apply.State) {
+		return nil, nil
+	}
+	s.apply.LeaseOwner = owner
+	s.apply.LeaseToken = "lease-token"
+	return s.apply, nil
+}
+
+func (s *panicContainmentApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	if s.apply == nil {
+		return nil, nil
+	}
+	fresh := *s.apply
+	return &fresh, nil
+}
+
+func (s *panicContainmentApplyStore) Update(_ context.Context, apply *storage.Apply) error {
+	s.updateCalled = true
+	s.apply = apply
+	return nil
+}
+
+// staticOperationLookupStore serves one operation row for routing lookups.
+type staticOperationLookupStore struct {
+	storage.ApplyOperationStore
+	op *storage.ApplyOperation
+}
+
+func (s *staticOperationLookupStore) Get(context.Context, int64) (*storage.ApplyOperation, error) {
+	return s.op, nil
+}
+
+// A panic inside the engine drive must be contained to the claimed apply: the
+// resume call returns an error instead of crashing the driver, the apply is
+// marked failed (permanent) so recovery does not re-claim the poisoned row and
+// panic again, and the apply's tasks are failed so dependent state can settle.
+// The containment write persists the reloaded row, so a field a peer wrote
+// between the claim and the panic survives instead of being clobbered by the
+// claim-time snapshot.
+func TestResumeClaimedApply_DrivePanicFailsApply(t *testing.T) {
+	client := &panickingResumeClient{panicValue: "corrupt engine metadata"}
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "appdb",
+		Deployment:      "east",
+		Environment:     "staging",
+		State:           state.Apply.Running,
+		LeaseOwner:      "driver-0",
+		LeaseToken:      "lease-token",
+	}
+	applyStore := &panicContainmentApplyStore{apply: apply}
+	taskStore := &recordingTaskStore{tasks: []*storage.Task{
+		{ID: 9, ApplyID: 42, State: state.Task.Running},
+	}}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: applyStore,
+		tasks:   taskStore,
+	}, &ServerConfig{}, map[string]tern.Client{
+		"east/staging": client,
+	}, logger)
+
+	ctx := storage.WithApplyLease(t.Context(), apply.Lease())
+	// The drive holds the claim-time snapshot while a peer writes the stored
+	// row (a skip-revert dispatch) before the panic is contained.
+	claimed := *apply
+	peerWrite := time.Now()
+	apply.RevertSkippedAt = &peerWrite
+
+	var resumed bool
+	var err error
+	require.NotPanics(t, func() {
+		resumed, err = svc.resumeClaimedApply(ctx, 0, &claimed, 0, "")
+	})
+
+	require.Error(t, err)
+	var drivePanic *panicsafe.Error
+	require.ErrorAs(t, err, &drivePanic, "a contained drive panic must surface as a panicsafe error")
+	assert.Equal(t, "corrupt engine metadata", drivePanic.Value)
+	assert.False(t, resumed)
+
+	require.True(t, applyStore.updateCalled, "the apply row must be written to its failed state")
+	written := applyStore.apply
+	assert.True(t, state.IsState(written.State, state.Apply.Failed),
+		"the apply must be failed (permanent), not failed_retryable, so it is not re-claimed and re-panicked")
+	assert.Contains(t, written.ErrorMessage, "corrupt engine metadata")
+	require.NotNil(t, written.CompletedAt)
+	require.NotNil(t, written.RevertSkippedAt,
+		"a peer update stored between the claim and the panic must survive the containment write")
+
+	require.Len(t, taskStore.updated, 1, "the in-flight task must be settled")
+	assert.True(t, state.IsState(taskStore.updated[0].State, state.Task.Failed))
+	assert.Contains(t, taskStore.updated[0].ErrorMessage, "corrupt engine metadata")
+}
+
+// A drive panic contained while holding only an operation lease fails the
+// operation's tasks but leaves the parent applies row untouched: under the
+// multi-operation fan-out the parent state is owned by the rollout projection,
+// which settles it from the failed operation row.
+func TestResumeClaimedApply_DrivePanicUnderOperationLeaseLeavesParentToProjection(t *testing.T) {
+	client := &panickingResumeClient{panicValue: "corrupt operation metadata"}
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "appdb",
+		Deployment:      "east",
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	operationID := int64(7)
+	applyStore := &panicContainmentApplyStore{apply: apply}
+	taskStore := &recordingTaskStore{tasks: []*storage.Task{
+		{ID: 9, ApplyID: 42, ApplyOperationID: &operationID, State: state.Task.Running},
+	}}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: applyStore,
+		tasks:   taskStore,
+		operations: &staticOperationLookupStore{op: &storage.ApplyOperation{
+			ID:         operationID,
+			ApplyID:    42,
+			Deployment: "east",
+			State:      state.ApplyOperation.Running,
+		}},
+	}, &ServerConfig{}, map[string]tern.Client{
+		"east/staging": client,
+	}, logger)
+
+	ctx := storage.WithOperationLease(t.Context(), storage.OperationLease{
+		ApplyID:     42,
+		OperationID: operationID,
+		Owner:       "driver-0",
+		Token:       "op-token",
+	})
+	var resumed bool
+	var err error
+	require.NotPanics(t, func() {
+		resumed, err = svc.resumeClaimedApply(ctx, 0, apply, operationID, "east")
+	})
+
+	var drivePanic *panicsafe.Error
+	require.ErrorAs(t, err, &drivePanic)
+	assert.False(t, resumed)
+
+	assert.False(t, applyStore.updateCalled,
+		"an operation-lease-only drive must not write the parent applies row; the rollout projection owns it")
+	assert.True(t, state.IsState(apply.State, state.Apply.Running))
+
+	require.Len(t, taskStore.updated, 1, "the operation's task must be failed so the operation row can settle")
+	assert.True(t, state.IsState(taskStore.updated[0].State, state.Task.Failed))
+	assert.Contains(t, taskStore.updated[0].ErrorMessage, "corrupt operation metadata")
+}
+
+// One poisoned apply must degrade only itself: the drive tick that claims it
+// contains the panic and marks the apply failed, and the driver keeps claiming
+// fresh work on subsequent ticks instead of crashing the process.
+func TestDriveTick_ContainsDrivePanicAndKeepsClaiming(t *testing.T) {
+	client := &panickingResumeClient{panicValue: "corrupt engine metadata"}
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "appdb",
+		Deployment:      "east",
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	applyStore := &panicContainmentApplyStore{apply: apply}
+	taskStore := &recordingTaskStore{tasks: []*storage.Task{
+		{ID: 9, ApplyID: 42, State: state.Task.Running},
+	}}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	claimOperations := false
+	cfg := testServerConfig()
+	cfg.OperatorClaimOperations = &claimOperations
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: applyStore,
+		tasks:   taskStore,
+	}, cfg, map[string]tern.Client{
+		"east/staging": client,
+	}, logger)
+
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	assert.Equal(t, 1, applyStore.claims)
+	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.Failed),
+		"the poisoned apply must be failed so it is not re-claimed")
+
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	assert.Equal(t, 2, applyStore.claims,
+		"the driver must keep claiming after containing the panic, and the failed apply must not be claimable")
+}
+
+// panickingClaimApplyStore simulates a panic in the claim machinery itself
+// (outside the engine drive), counting claim attempts.
+type panickingClaimApplyStore struct {
+	storage.ApplyStore
+	claims int
+}
+
+func (s *panickingClaimApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {
+	return nil, nil
+}
+
+func (s *panickingClaimApplyStore) FindNextApply(context.Context, string) (*storage.Apply, error) {
+	s.claims++
+	panic("claim scan hit a corrupt row")
+}
+
+// A panic in the claim machinery itself (outside the engine drive) must not
+// kill the driver goroutine: the tick boundary contains it and the driver
+// polls again on the next tick.
+func TestDriveTick_ContainsClaimPanic(t *testing.T) {
+	applyStore := &panickingClaimApplyStore{}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	claimOperations := false
+	cfg := testServerConfig()
+	cfg.OperatorClaimOperations = &claimOperations
+	svc := New(&mockStorageWithApplyStores{applies: applyStore}, cfg, nil, logger)
+
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	assert.Equal(t, 2, applyStore.claims, "the driver must keep polling after each contained panic")
 }

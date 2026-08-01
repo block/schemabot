@@ -128,6 +128,7 @@ func TestPSDisplayMetadataStorageBlobRoundTrip(t *testing.T) {
 		"branch_name":                      "schemabot-db-7",
 		"deploy_request_url":               "https://app.planetscale.com/org/db/deploy-requests/106",
 		"is_instant":                       "true",
+		"revert_expires_at":                "2026-06-29T18:30:00Z",
 		apitypes.VSchemaChangesMetadataKey: encodedVSchema,
 	}
 
@@ -140,12 +141,43 @@ func TestPSDisplayMetadataStorageBlobRoundTrip(t *testing.T) {
 	assert.Equal(t, "https://app.planetscale.com/org/db/deploy-requests/106", got["deploy_request_url"])
 	assert.Equal(t, "schemabot-db-7", got["branch_name"])
 	assert.Equal(t, "true", got["is_instant"])
+	assert.Equal(t, "2026-06-29T18:30:00Z", got["revert_expires_at"])
 
 	changes, err := apitypes.ParseVSchemaChanges(got)
 	require.NoError(t, err)
 	require.Len(t, changes, 1)
 	assert.Equal(t, "commerce_sharded", changes[0].Namespace)
 	assert.Equal(t, "applied", changes[0].Status)
+}
+
+// The revert-window deadline is a display field in its own right: the
+// "nothing worth storing" guard counts revert_expires_at like the other
+// display fields, so a map carrying only the deadline still yields a blob
+// rather than being discarded as empty. (Live progress responses carry the
+// deploy-request URL alongside the deadline; this pins the guard itself.)
+func TestPSDisplayMetadataStorageBlobRevertExpiresOnly(t *testing.T) {
+	blob, err := PSDisplayMetadataStorageBlob(map[string]string{
+		"revert_expires_at": "2026-06-29T18:30:00Z",
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, blob)
+
+	got, err := PSDisplayMetadata(blob)
+	require.NoError(t, err)
+	assert.Equal(t, "2026-06-29T18:30:00Z", got["revert_expires_at"])
+}
+
+// A malformed revert-window deadline fails the whole conversion rather than
+// storing a corrupt or partial blob: the mirror logs the error and persists
+// nothing from that poll, leaving any previously stored blob as-is. A value
+// that no writer emits is a loud version-skew tripwire, not display state to
+// degrade around.
+func TestPSDisplayMetadataStorageBlobBadRevertExpires(t *testing.T) {
+	_, err := PSDisplayMetadataStorageBlob(map[string]string{
+		"deploy_request_url": "https://app.planetscale.com/org/db/deploy-requests/106",
+		"revert_expires_at":  "not-a-timestamp",
+	})
+	require.ErrorContains(t, err, "revert_expires_at")
 }
 
 // A display map with nothing worth storing yields an empty blob, so the caller

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
@@ -227,6 +228,19 @@ func controlOperationCaller(caller string) string {
 	return caller
 }
 
+// resolveCaller returns the identity an operation is attributed to: the
+// authenticated caller when the request carried a real identity (API auth
+// enabled), otherwise the caller supplied in the request. The authenticated
+// identity wins so a direct-API action is auditable to the verified user rather
+// than a client-supplied string; with auth disabled (or on paths with no
+// authenticated user, like control-plane dispatch) the request caller is used
+// unchanged.
+func resolveCaller(ctx context.Context, requestCaller string) string {
+	if subject, ok := auth.AuthenticatedSubject(ctx); ok {
+		return subject
+	}
+	return requestCaller
+}
 func (s *Service) logControlOperationForApply(ctx context.Context, apply *storage.Apply, caller, eventType, message string) {
 	logStore := s.storage.ApplyLogs()
 	if logStore == nil {
@@ -490,6 +504,7 @@ func (s *Service) ExecuteCutover(ctx context.Context, req apitypes.ControlReques
 // returns a zero status, and callers must derive the response status from the
 // error (e.g. via writeControlError).
 func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.ControlResponse, int, error) {
+	caller = resolveCaller(ctx, caller)
 	controlStore := s.storage.ControlRequests()
 	if controlStore == nil {
 		err := fmt.Errorf("control request store is not available")
@@ -704,6 +719,7 @@ func (s *Service) ExecuteStop(ctx context.Context, req apitypes.ControlRequest) 
 // err == nil; every error path returns a zero status, and callers must derive
 // the response status from the error (e.g. via writeControlError).
 func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) (*apitypes.StopResponse, int, error) {
+	caller = resolveCaller(ctx, caller)
 	if apply.Engine == storage.EnginePlanetScale {
 		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "stop is not supported for this schema change; use cancel to permanently cancel it")
@@ -938,6 +954,7 @@ func (s *Service) ExecuteCancel(ctx context.Context, req apitypes.ControlRequest
 }
 
 func (s *Service) executeCancelForApply(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) (*apitypes.CancelResponse, int, error) {
+	caller = resolveCaller(ctx, caller)
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
 		metrics.RecordControlOperation(ctx, "cancel", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlConflictf("schema change is already terminal (current state: %s)", apply.State)
@@ -1298,6 +1315,7 @@ func (s *Service) ExecuteStart(ctx context.Context, req apitypes.ControlRequest)
 // zero status, and callers must derive the response status from the error (e.g.
 // via writeControlError).
 func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) (*apitypes.StartResponse, int, error) {
+	caller = resolveCaller(ctx, caller)
 	if err := validateStartRequestState(apply); err != nil {
 		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, err
@@ -1764,6 +1782,7 @@ func (s *Service) ExecuteRelease(ctx context.Context, req apitypes.ControlReques
 // HTTP status is meaningful only when err == nil; every error path returns a
 // zero status, and callers derive the response status from the error.
 func (s *Service) executeReleaseForApply(ctx context.Context, apply *storage.Apply, caller string) (*apitypes.ReleaseResponse, int, error) {
+	caller = resolveCaller(ctx, caller)
 	if err := s.validateReleaseRequestState(ctx, apply); err != nil {
 		s.recordReleaseRejectionMetric(ctx, apply, err)
 		return nil, 0, err
@@ -1893,6 +1912,7 @@ type VolumeRequest struct {
 	ApplyID     string `json:"apply_id"`
 	Environment string `json:"environment"`
 	Volume      int32  `json:"volume"` // 1-11 (1=conservative, 11=aggressive)
+	Caller      string `json:"caller,omitempty"`
 }
 
 // handleVolume handles POST /api/volume requests.
@@ -1903,29 +1923,60 @@ func (s *Service) handleVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Volume < 1 || req.Volume > 11 {
-		s.writeError(w, http.StatusBadRequest, "volume must be between 1 and 11")
+	if req.Volume < storage.MinVolume || req.Volume > storage.MaxVolume {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("volume must be between %d and %d", storage.MinVolume, storage.MaxVolume))
 		return
 	}
 
-	resp, err := client.Volume(r.Context(), &ternv1.VolumeRequest{
-		ApplyId:     applyID,
-		Environment: apply.Environment,
-		Volume:      req.Volume,
-	})
+	resp, err := s.executeVolumeForApply(r.Context(), client, apply, applyID, req.Caller, req.Volume)
 	if err != nil {
-		metrics.RecordControlOperation(r.Context(), "volume", apply.Database, apply.Deployment, apply.Environment, "error")
 		s.writeControlError(w, "volume", apply, err)
 		return
 	}
-	metrics.RecordControlOperation(r.Context(), "volume", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
+	s.writeJSON(w, http.StatusOK, resp)
+}
 
-	s.writeJSON(w, http.StatusOK, &apitypes.VolumeResponse{
+// ExecuteVolume queues a durable volume adjustment for an apply. The driving
+// instance retunes the engine at its next progress tick. It resolves the
+// apply's data-plane client and proxies the request, so the HTTP handler and
+// the PR-comment command share one path — the tern client owns the gating
+// (terminal apply, conflicting pending level, multi-deployment apply).
+func (s *Service) ExecuteVolume(ctx context.Context, req apitypes.ControlRequest, volume int32) (*apitypes.VolumeResponse, error) {
+	if volume < storage.MinVolume || volume > storage.MaxVolume {
+		return nil, controlHTTPErrorf(http.StatusBadRequest, "volume must be between %d and %d", storage.MinVolume, storage.MaxVolume)
+	}
+	client, apply, ternApplyID, err := s.controlTarget(ctx, "volume", req.ApplyID, req.Environment)
+	if err != nil {
+		return nil, err
+	}
+	return s.executeVolumeForApply(ctx, client, apply, ternApplyID, req.Caller, volume)
+}
+
+// executeVolumeForApply proxies the volume adjustment to the apply's tern
+// client, which queues a durable control request for the driver, and records
+// an apply log entry when the queue accepts the level.
+func (s *Service) executeVolumeForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string, volume int32) (*apitypes.VolumeResponse, error) {
+	resp, err := client.Volume(ctx, &ternv1.VolumeRequest{
+		ApplyId:     ternApplyID,
+		Environment: apply.Environment,
+		Volume:      volume,
+	})
+	if err != nil {
+		metrics.RecordControlOperation(ctx, "volume", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, fmt.Errorf("queue volume change to %d for apply %s: %w", volume, apply.ApplyIdentifier, err)
+	}
+	metrics.RecordControlOperation(ctx, "volume", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
+	if resp.Accepted {
+		s.logControlOperationForApply(ctx, apply, resolveCaller(ctx, caller), storage.LogEventVolumeRequested,
+			fmt.Sprintf("Volume change to %d queued; the driver applies it at its next progress check", volume))
+	}
+
+	return &apitypes.VolumeResponse{
 		Accepted:       resp.Accepted,
 		ErrorMessage:   resp.ErrorMessage,
 		PreviousVolume: resp.PreviousVolume,
 		NewVolume:      resp.NewVolume,
-	})
+	}, nil
 }
 
 // RevertRequest is the HTTP request body for POST /api/revert.
@@ -1966,6 +2017,7 @@ func (s *Service) ExecuteRevert(ctx context.Context, req apitypes.ControlRequest
 // revert. The returned HTTP status is meaningful only when err == nil; error
 // paths return a zero status and callers derive it from the error.
 func (s *Service) executeRevertForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.ControlResponse, int, error) {
+	caller = resolveCaller(ctx, caller)
 	// Revert undoes a PlanetScale deploy request in its revert window; other
 	// engines hard-error it. Gate on the engine so a non-PlanetScale apply can
 	// never accumulate a permanently-pending revert request.
@@ -1984,6 +2036,21 @@ func (s *Service) executeRevertForApply(ctx context.Context, client tern.Client,
 	if controlStore == nil {
 		metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, "error")
 		return nil, 0, fmt.Errorf("control request store is not available")
+	}
+
+	// Revert and skip-revert are mutually exclusive intents: one undoes the
+	// change, the other makes it permanent. Reject the contradiction up front
+	// instead of recording both and leaving the drive to pick a winner by
+	// ordering. The check is advisory — under a concurrent race the drive's
+	// ordering remains authoritative — but it catches the common sequential case.
+	skipRevertPending, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationSkipRevert)
+	if err != nil {
+		metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, 0, fmt.Errorf("check pending skip-revert control request before revert for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if skipRevertPending != nil {
+		metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, controlConflictf("skip-revert is already pending for this schema change; the revert window is being closed and the change will become permanent")
 	}
 
 	// Record durable revert intent before the engine call, so a comment-driven
@@ -2078,6 +2145,7 @@ func (s *Service) ExecuteSkipRevert(ctx context.Context, req apitypes.ControlReq
 // immediate skip. The returned HTTP status is meaningful only when err == nil;
 // error paths return a zero status and callers derive it from the error.
 func (s *Service) executeSkipRevertForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.ControlResponse, int, error) {
+	caller = resolveCaller(ctx, caller)
 	// Skip-revert closes a PlanetScale revert window; other engines hard-error
 	// it. Gate on the engine so a non-PlanetScale apply can never accumulate a
 	// permanently-pending skip-revert request.
@@ -2094,6 +2162,21 @@ func (s *Service) executeSkipRevertForApply(ctx context.Context, client tern.Cli
 	if controlStore == nil {
 		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "error")
 		return nil, 0, fmt.Errorf("control request store is not available")
+	}
+
+	// Skip-revert and revert are mutually exclusive intents: one makes the
+	// change permanent, the other undoes it. Reject the contradiction up front
+	// instead of recording both and leaving the drive to pick a winner by
+	// ordering. The check is advisory — under a concurrent race the drive's
+	// ordering remains authoritative — but it catches the common sequential case.
+	revertPending, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationRevert)
+	if err != nil {
+		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, 0, fmt.Errorf("check pending revert control request before skip-revert for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if revertPending != nil {
+		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, controlConflictf("revert is already pending for this schema change; it is being undone")
 	}
 
 	// Record durable skip-revert intent before the engine call, so a

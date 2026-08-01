@@ -26,6 +26,12 @@ grpc:
   enabled: false
   port: 13370
 
+# The dedicated Prometheus metrics listener. Must match the server's
+# metrics_port config (defaults to 9102 in both places); /metrics is not
+# served on the API port.
+metrics:
+  port: 9102
+
 # SchemaBot config file contents. Rendered into a ConfigMap and mounted
 # at /config/config.yaml. See docs/configuration.md for all options.
 #
