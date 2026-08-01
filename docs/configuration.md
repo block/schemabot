@@ -10,6 +10,7 @@
 - [Multi-Deployment Environment (preview)](#multi-deployment-environment-preview)
   - [Deployment Order](#deployment-order)
 - [Environment Order](#environment-order)
+  - [Per-Database Environment Order](#per-database-environment-order)
 - [Hybrid Mode](#hybrid-mode)
 - [Drivers](#drivers)
 - [Metrics](#metrics)
