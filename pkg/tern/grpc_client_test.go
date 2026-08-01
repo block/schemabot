@@ -1993,6 +1993,80 @@ func TestGRPCClient_ProcessPendingCancelControlRequestCompletesWholeApply(t *tes
 	assert.Nil(t, cancelReq)
 }
 
+// A cancel accepted while the remote change is finishing can be overtaken by
+// engine completion: the remote settles completed before the cancel takes
+// effect. The drive must complete the durable cancel request and record an
+// apply event disclosing that the cancel did not take effect and the change
+// is live — the apply history otherwise shows an accepted cancel followed by
+// a completed apply with no explanation.
+func TestGRPCClient_ProcessPendingCancelMootedByRemoteCompletionWritesEvent(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_COMPLETED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "users",
+			Status:    state.Task.Completed,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-cancel-mooted",
+		ExternalID:      "remote-grpc-cancel-mooted",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             11,
+		TaskIdentifier: "task-users",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	storedApply := *apply
+	applyStore := &mockApplyStore{apply: &storedApply}
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, state.Apply.Completed, applyStore.apply.State)
+	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, cancelReq, "the mooted cancel request must be completed so the apply is not claimable forever")
+
+	var mootEvent *storage.ApplyLog
+	for _, entry := range logs.logs {
+		if strings.Contains(entry.Message, "Cancel did not take effect") {
+			mootEvent = entry
+			break
+		}
+	}
+	require.NotNil(t, mootEvent, "a mooted cancel must be disclosed in the apply history")
+	assert.Contains(t, mootEvent.Message, "completed on the engine before the cancel could take effect")
+	assert.Contains(t, mootEvent.Message, "the change is live on the target")
+	assert.Contains(t, mootEvent.Message, "(caller: cli:alice)")
+}
+
 func TestGRPCClient_ProcessPendingCancelOperationLeavesApplyCancelPending(t *testing.T) {
 	// A multi-deployment apply has one durable cancel request shared by every
 	// deployment. One operation reaching a terminal remote state must not

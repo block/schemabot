@@ -977,7 +977,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 			logOperationDriveLeavesParentCancel(apply, scope)
 			return true, nil
 		}
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
+		if err := completeCancelRequestForTerminalApply(ctx, c.storage, slog.Default(), apply, controlReq); err != nil {
 			return true, err
 		}
 		c.controlSendGate.clear(controlReq.ID)
@@ -1040,7 +1040,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 			logOperationDriveLeavesParentCancel(apply, scope)
 			return true, nil
 		}
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
+		if err := completeCancelRequestForTerminalApply(ctx, c.storage, slog.Default(), apply, controlReq); err != nil {
 			return true, err
 		}
 		c.controlSendGate.clear(controlReq.ID)

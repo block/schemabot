@@ -169,6 +169,7 @@ const (
 	PreviewCommentSummaryCompleted         PreviewType = "comment_summary_completed"           // Summary: completed
 	PreviewCommentSummaryFailed            PreviewType = "comment_summary_failed"              // Summary: failed
 	PreviewCommentSummaryStopped           PreviewType = "comment_summary_stopped"             // Summary: stopped
+	PreviewCommentSummaryMootedCancel      PreviewType = "comment_summary_mooted_cancel"       // Summary: completed with mooted-cancel note
 	PreviewCommentSummaryCompletedLarge    PreviewType = "comment_summary_completed_large"     // Summary: completed (8 tables, rollup)
 	PreviewCommentSummaryVitessVSchema     PreviewType = "comment_summary_vitess_vschema"      // Summary: completed Vitess DDL + VSchema
 	PreviewCommentSummaryVitessVSchemaOnly PreviewType = "comment_summary_vitess_vschema_only" // Summary: completed Vitess VSchema-only

@@ -1842,6 +1842,18 @@ func PreviewCommentSummaryCompleted() string {
 	return RenderApplySummaryComment(sampleSummaryData(state.Apply.Completed, tables))
 }
 
+// PreviewCommentSummaryMootedCancel renders a completed summary carrying the
+// mooted-cancel note: the operator's cancel was accepted but the schema change
+// completed on the engine before it could take effect.
+func PreviewCommentSummaryMootedCancel() string {
+	tables := sampleApplyTables()
+	for i := range tables {
+		tables[i].Status = state.Task.Completed
+	}
+	return RenderApplySummaryComment(sampleSummaryData(state.Apply.Completed, tables)) +
+		RenderMootedCancelNote(previewRequestedBy)
+}
+
 // sampleRollbackTables returns reverse-DDL table rows for rollback previews.
 func sampleRollbackTables(status string) []TableProgressData {
 	return []TableProgressData{
