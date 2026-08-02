@@ -9,10 +9,10 @@ import (
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
-	"github.com/block/spirit/pkg/statement"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
@@ -90,7 +90,7 @@ func TestDiffKeyspace_DetectsSchemaChanges(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, changes, 1, "should detect CREATE TABLE")
 		assert.Equal(t, "users", changes[0].Table)
-		assert.Equal(t, statement.StatementCreateTable, changes[0].Operation)
+		assert.Equal(t, ddl.StatementCreateTable, changes[0].Operation)
 	})
 }
 

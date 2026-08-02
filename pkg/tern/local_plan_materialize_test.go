@@ -9,11 +9,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/spirit/pkg/statement"
 )
 
 // fakePlanStore lets a test script the plan Get/Create behavior the plan
@@ -84,7 +84,7 @@ func alterUsersEmailPlan() *engine.PlanResult {
 			Namespace: "testapp",
 			TableChanges: []engine.TableChange{{
 				Table:     "users",
-				Operation: statement.StatementAlterTable,
+				Operation: ddl.StatementAlterTable,
 				DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 			}},
 		}},

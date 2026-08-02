@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/block/spirit/pkg/statement"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
@@ -1073,15 +1073,15 @@ func TestGroupedResumeChangesGroupsTasksByNamespace(t *testing.T) {
 	require.Len(t, changes[0].TableChanges, 2)
 	assert.Equal(t, "users", changes[0].TableChanges[0].Table)
 	assert.Equal(t, tasks[0].DDL, changes[0].TableChanges[0].DDL)
-	assert.Equal(t, statement.StatementAlterTable, changes[0].TableChanges[0].Operation)
+	assert.Equal(t, ddl.StatementAlterTable, changes[0].TableChanges[0].Operation)
 	assert.Equal(t, "orders", changes[0].TableChanges[1].Table)
 	assert.Equal(t, tasks[1].DDL, changes[0].TableChanges[1].DDL)
-	assert.Equal(t, statement.StatementCreateTable, changes[0].TableChanges[1].Operation)
+	assert.Equal(t, ddl.StatementCreateTable, changes[0].TableChanges[1].Operation)
 	assert.Equal(t, "billing", changes[1].Namespace)
 	require.Len(t, changes[1].TableChanges, 1)
 	assert.Equal(t, "invoices", changes[1].TableChanges[0].Table)
 	assert.Equal(t, tasks[2].DDL, changes[1].TableChanges[0].DDL)
-	assert.Equal(t, statement.StatementAlterTable, changes[1].TableChanges[0].Operation)
+	assert.Equal(t, ddl.StatementAlterTable, changes[1].TableChanges[0].Operation)
 }
 
 // A resumed grouped apply rebuilds the engine changes from the stored DDL
@@ -1099,7 +1099,7 @@ func TestGroupedResumeChangesPreservesDDL(t *testing.T) {
 	require.Len(t, changes[0].TableChanges, 1)
 	assert.Equal(t, "users", changes[0].TableChanges[0].Table)
 	assert.Equal(t, tasks[0].DDL, changes[0].TableChanges[0].DDL)
-	assert.Equal(t, statement.StatementAlterTable, changes[0].TableChanges[0].Operation)
+	assert.Equal(t, ddl.StatementAlterTable, changes[0].TableChanges[0].Operation)
 	for _, tc := range changes[0].TableChanges {
 		assert.NotEmpty(t, tc.DDL, "resume changes must not contain an empty-DDL table change")
 	}
@@ -1122,11 +1122,11 @@ func TestGroupedResumeChangesPreservesMultiNamespaceScopedTasks(t *testing.T) {
 	require.Len(t, commerce.TableChanges, 1)
 	assert.Equal(t, "users", commerce.TableChanges[0].Table)
 	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", commerce.TableChanges[0].DDL)
-	assert.Equal(t, statement.StatementAlterTable, commerce.TableChanges[0].Operation)
+	assert.Equal(t, ddl.StatementAlterTable, commerce.TableChanges[0].Operation)
 	routing := byNamespace["routing"]
 	require.Len(t, routing.TableChanges, 1)
 	assert.Equal(t, "lookup", routing.TableChanges[0].Table)
-	assert.Equal(t, statement.StatementAlterTable, routing.TableChanges[0].Operation)
+	assert.Equal(t, ddl.StatementAlterTable, routing.TableChanges[0].Operation)
 }
 
 func TestTaskTargetShardsReturnsSortedUniqueShardSelector(t *testing.T) {

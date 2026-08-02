@@ -7,8 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/block/spirit/pkg/statement"
-
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
@@ -24,9 +22,9 @@ const indentTable = "     " // 5 spaces — matches "  ── " in FormatKeyspac
 // progressSymbol returns a Terraform-style prefix for the change type.
 func progressSymbol(changeType string) string {
 	switch ddl.OpToStatementType(changeType) {
-	case statement.StatementCreateTable:
+	case ddl.StatementCreateTable:
 		return "+ "
-	case statement.StatementDropTable:
+	case ddl.StatementDropTable:
 		return "- "
 	default:
 		return "~ "
@@ -510,7 +508,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBarRowCopy(100) // blue — still in progress
 		label := "Cutting over..."
 		op := ddl.OpToStatementType(t.ChangeType)
-		if op == statement.StatementCreateTable || op == statement.StatementDropTable {
+		if op == ddl.StatementCreateTable || op == ddl.StatementDropTable {
 			label = "Applying..."
 		}
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s\n", t.TableName, bar, label)
@@ -677,7 +675,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		switch {
 		case t.IsInstant:
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying instantly...\n", t.TableName, bar)
-		case op == statement.StatementCreateTable || op == statement.StatementDropTable:
+		case op == ddl.StatementCreateTable || op == ddl.StatementDropTable:
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying...\n", t.TableName, bar)
 		default:
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Running...\n", t.TableName, bar)

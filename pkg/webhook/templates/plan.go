@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/block/spirit/pkg/statement"
-
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
@@ -416,11 +414,11 @@ func countStatementTypes(changes []KeyspaceChangeData) (creates, alters, drops i
 				continue
 			}
 			switch stmtType {
-			case statement.StatementCreateTable:
+			case ddl.StatementCreateTable:
 				creates++
-			case statement.StatementAlterTable:
+			case ddl.StatementAlterTable:
 				alters++
-			case statement.StatementDropTable:
+			case ddl.StatementDropTable:
 				drops++
 			}
 		}

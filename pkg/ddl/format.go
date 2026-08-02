@@ -3,10 +3,6 @@ package ddl
 import (
 	"regexp"
 	"strings"
-
-	"github.com/pingcap/tidb/pkg/parser"
-	"github.com/pingcap/tidb/pkg/parser/ast"
-	"github.com/pingcap/tidb/pkg/parser/format"
 )
 
 // FormatDDL formats a DDL statement for better readability.
@@ -364,28 +360,4 @@ func isClauseKeyword(s string) bool {
 // Returns the original statement if parsing fails.
 func Canonicalize(ddl string) string {
 	return defaultParser.Canonicalize(ddl)
-}
-
-// restoreCanonical uses TiDB parser to restore a statement in canonical format.
-func restoreCanonical(ddl string) string {
-	p := parser.New()
-	stmtNodes, _, err := p.Parse(ddl, "", "")
-	if err != nil || len(stmtNodes) == 0 {
-		return ddl
-	}
-
-	node := stmtNodes[0]
-
-	// Only canonicalize CREATE TABLE and DROP TABLE
-	switch node.(type) {
-	case *ast.CreateTableStmt, *ast.DropTableStmt:
-		var sb strings.Builder
-		rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
-		if err := node.Restore(rCtx); err != nil {
-			return ddl
-		}
-		return sb.String()
-	default:
-		return ddl
-	}
 }
