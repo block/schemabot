@@ -126,11 +126,12 @@ func statementTypeFromSpirit(t statement.StatementType) StatementType {
 // Canonicalize implements StatementParser.
 //
 // For ALTER TABLE statements it reconstructs from Spirit's normalized Alter
-// field; for CREATE TABLE and DROP TABLE it uses TiDB's Restore. It returns the
-// original statement when parsing fails.
+// field; for CREATE TABLE and DROP TABLE it uses TiDB's Restore. It returns
+// the original statement when parsing fails or when the input contains more
+// than one statement, so canonicalization never truncates its input.
 func (tidbStatementParser) Canonicalize(ddl string) string {
 	stmts, err := statement.New(ddl)
-	if err != nil || len(stmts) == 0 {
+	if err != nil || len(stmts) != 1 {
 		return ddl
 	}
 
@@ -148,11 +149,13 @@ func (tidbStatementParser) Canonicalize(ddl string) string {
 	return restoreCanonical(ddl)
 }
 
-// restoreCanonical uses TiDB parser to restore a statement in canonical format.
+// restoreCanonical uses TiDB parser to restore a statement in canonical
+// format. It returns the input unchanged unless exactly one statement was
+// parsed, so it never drops trailing statements from multi-statement input.
 func restoreCanonical(ddl string) string {
 	p := parser.New()
 	stmtNodes, _, err := p.Parse(ddl, "", "")
-	if err != nil || len(stmtNodes) == 0 {
+	if err != nil || len(stmtNodes) != 1 {
 		return ddl
 	}
 

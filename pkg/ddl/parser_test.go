@@ -191,3 +191,30 @@ func TestTiDBClassifyTranslatesToOwnedTypes(t *testing.T) {
 		})
 	}
 }
+
+// restoreCanonical must never truncate its input: multi-statement input is
+// returned unchanged instead of restoring only the first statement.
+func TestRestoreCanonicalMultiStatementUnchanged(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "two create statements",
+			input: "CREATE TABLE users (id INT); CREATE TABLE orders (id INT)",
+		},
+		{
+			name:  "create followed by drop",
+			input: "CREATE TABLE users (id INT); DROP TABLE orders",
+		},
+		{
+			name:  "two drop statements",
+			input: "DROP TABLE users; DROP TABLE orders",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.input, restoreCanonical(tt.input))
+		})
+	}
+}

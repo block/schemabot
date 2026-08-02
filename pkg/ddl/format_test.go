@@ -215,6 +215,21 @@ func TestCanonicalize(t *testing.T) {
 			input:    "not valid sql",
 			expected: "not valid sql",
 		},
+		{
+			name:     "multi-statement CREATE input returned unchanged",
+			input:    "CREATE TABLE users (id INT); CREATE TABLE orders (id INT)",
+			expected: "CREATE TABLE users (id INT); CREATE TABLE orders (id INT)",
+		},
+		{
+			name:     "multi-statement DROP input returned unchanged",
+			input:    "DROP TABLE users; DROP TABLE orders",
+			expected: "DROP TABLE users; DROP TABLE orders",
+		},
+		{
+			name:     "multi-statement ALTER input returned unchanged",
+			input:    "alter table orders add index idx (col); drop table users",
+			expected: "alter table orders add index idx (col); drop table users",
+		},
 	}
 
 	for _, tt := range tests {
