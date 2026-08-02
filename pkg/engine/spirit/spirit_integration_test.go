@@ -10,12 +10,14 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/docker/go-connections/nat"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -39,7 +41,12 @@ var (
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
-	// Start shared MySQL container
+	// Start shared MySQL container. The MySQL entrypoint runs a throwaway
+	// init server that also logs "ready for connections" and binds nothing
+	// on TCP, so log- and port-based waits can be satisfied before the
+	// final server accepts clients. Gate readiness on a real query through
+	// the mapped port instead — the same handshake the tests themselves
+	// perform.
 	req := testcontainers.ContainerRequest{
 		Image:        "mysql:8.0",
 		ExposedPorts: []string{"3306/tcp"},
@@ -47,10 +54,9 @@ func TestMain(m *testing.M) {
 			"MYSQL_ROOT_PASSWORD": "testpassword",
 			"MYSQL_DATABASE":      "testdb",
 		},
-		WaitingFor: wait.ForAll(
-			wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(30*time.Second),
-			wait.ForListeningPort("3306/tcp"),
-		),
+		WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port nat.Port) string {
+			return fmt.Sprintf("root:testpassword@tcp(%s:%s)/testdb", host, port.Port())
+		}).WithStartupTimeout(30 * time.Second),
 	}
 
 	var err error
@@ -72,25 +78,6 @@ func TestMain(m *testing.M) {
 		log.Fatalf("get container port: %v", err)
 	}
 	sharedDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/testdb?parseTime=true&multiStatements=true", host, port)
-
-	// Wait for MySQL to be ready
-	var db *sql.DB
-	for range 30 {
-		db, err = sql.Open("mysql", sharedDSN)
-		if err != nil {
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-		if err = db.PingContext(ctx); err == nil {
-			_ = db.Close()
-			break
-		}
-		_ = db.Close()
-		time.Sleep(500 * time.Millisecond)
-	}
-	if err != nil {
-		log.Fatalf("connect to mysql: %v", err)
-	}
 
 	code := m.Run()
 
@@ -1164,7 +1151,7 @@ func TestEngine_ExecuteMigration_AddColumn(t *testing.T) {
 	eng.mu.Unlock()
 
 	// Execute the schema change synchronously for testing
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, directPolicy{})
 
 	// Check that schema change completed
 	eng.mu.Lock()
@@ -1229,7 +1216,7 @@ func TestEngine_ExecuteMigration_ModifyColumn(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, directPolicy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -1285,7 +1272,7 @@ func TestEngine_ExecuteMigration_DropColumn(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, directPolicy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -1342,7 +1329,7 @@ func TestEngine_ExecuteMigration_AddIndex(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, directPolicy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -1391,7 +1378,7 @@ func TestEngine_ExecuteMigration_InvalidSQL(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, directPolicy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -1433,7 +1420,7 @@ func TestEngine_Progress_FailingApplyNeverReportsCompleted(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		eng.executeSchemaChange(ctx, host, username, password, database, ddlStatements, false)
+		eng.executeSchemaChange(ctx, host, username, password, database, ddlStatements, false, directPolicy{})
 	}()
 
 	deadline := time.NewTimer(30 * time.Second)
@@ -1510,7 +1497,7 @@ func TestEngine_ExecuteMigration_MultipleStatements(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, directPolicy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -1596,7 +1583,7 @@ func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T
 		}
 		eng.mu.Unlock()
 
-		eng.executeSchemaChange(t.Context(), host, username, password, database, []string{createDDL}, false)
+		eng.executeSchemaChange(t.Context(), host, username, password, database, []string{createDDL}, false, directPolicy{})
 
 		eng.mu.Lock()
 		createState := eng.runningSchemaChange.state
@@ -1621,7 +1608,7 @@ func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T
 		}
 		eng.mu.Unlock()
 
-		eng.executeSchemaChange(t.Context(), host, username, password, database, []string{dropDDL}, false)
+		eng.executeSchemaChange(t.Context(), host, username, password, database, []string{dropDDL}, false, directPolicy{})
 
 		eng.mu.Lock()
 		dropState := eng.runningSchemaChange.state
@@ -1648,6 +1635,63 @@ func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T
 	assert.LessOrEqual(t, settled, baseline+5,
 		"server connections grew far beyond baseline after %d single-statement applies (baseline=%d, settled=%d)",
 		iterations*2, baseline, settled)
+}
+
+// TestEngine_ExecuteSchemaChange_SingleStatementRoutesSpiritLogs runs a CREATE
+// TABLE through Spirit's single-statement path with the engine's log callback
+// registered. Spirit's INFO log lines for the run are routed through the
+// callback — the same path that feeds operator-visible apply logs — so
+// single-statement applies (CREATE/DROP/RENAME) are traceable in the apply
+// log stream just like ALTERs.
+func TestEngine_ExecuteSchemaChange_SingleStatementRoutesSpiritLogs(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger, DisablePendingDrops: true})
+
+	var mu sync.Mutex
+	var captured []string
+	capturedTables := make(map[string]bool)
+	eng.SetLogCallback(func(level slog.Level, table, msg string) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, msg)
+		capturedTables[table] = true
+	})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	createDDL := "CREATE TABLE `log_routed` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `name` varchar(100) NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{
+		database: database,
+		tables:   []string{"log_routed"},
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	}
+	eng.mu.Unlock()
+
+	eng.executeSchemaChange(t.Context(), host, username, password, database, []string{createDDL}, false, directPolicy{})
+
+	eng.mu.Lock()
+	finalState := eng.runningSchemaChange.state
+	eng.mu.Unlock()
+	require.Equal(t, engine.StateCompleted, finalState, "CREATE TABLE did not complete")
+	require.True(t, tableExists(t, db, "log_routed"), "expected log_routed to exist after CREATE")
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Contains(t, captured, "Starting spirit migration",
+		"Spirit's run-start log line was not routed through the engine log callback")
+	assert.Contains(t, captured, "apply complete",
+		"Spirit's completion log line was not routed through the engine log callback")
+	// Every routed line must carry the table so operators can attribute
+	// interleaved log lines during multi-table applies.
+	assert.Equal(t, map[string]bool{"log_routed": true}, capturedTables,
+		"every routed Spirit log line should carry the table being changed")
 }
 
 // TestEngine_Apply_StartsGoroutine tests that Apply starts a schema change goroutine
@@ -1988,7 +2032,7 @@ func TestEngine_ExecuteMigration_CancelledContextKeepsStoppedState(t *testing.T)
 		"DROP TABLE `stop_pending_drop`",
 	}
 
-	eng.executeSchemaChange(ctx, host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(ctx, host, username, password, database, ddlStatements, false, directPolicy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -2319,10 +2363,14 @@ func TestNewSpiritMigrationGTIDChangeSource(t *testing.T) {
 			"MYSQL_ROOT_PASSWORD": "testpassword",
 			"MYSQL_DATABASE":      "testdb",
 		},
-		WaitingFor: wait.ForAll(
-			wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(30*time.Second),
-			wait.ForListeningPort("3306/tcp"),
-		),
+		// Gate readiness on a real query through the mapped port: the
+		// MySQL entrypoint's throwaway init server also logs "ready for
+		// connections", so log- and port-based waits can be satisfied
+		// before the final server accepts clients — and the GTID probe
+		// treats any connection failure as "no GTID support".
+		WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port nat.Port) string {
+			return fmt.Sprintf("root:testpassword@tcp(%s:%s)/testdb", host, port.Port())
+		}).WithStartupTimeout(30 * time.Second),
 	}
 	container, err := testcontainers.GenericContainer(t.Context(), testcontainers.GenericContainerRequest{
 		ContainerRequest: req,

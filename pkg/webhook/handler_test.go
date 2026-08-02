@@ -226,7 +226,64 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment("## MySQL Schema Change Plan\n\nplan summary\n\n---\n\n💡 **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e staging\n```")
+		body := h.renderPRComment("## MySQL Schema Change Plan\n\nplan summary\n\n---\n\n▶️ **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e staging\n```")
+
+		assert.NotContains(t, body, "Support:")
+	})
+
+	t.Run("appends to unsafe-changes apply refusals", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment(templates.PreviewCommentUnsafeBlocked())
+
+		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
+	})
+
+	t.Run("appends to unmanaged schema change notices", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment(templates.RenderUnmanagedSchemaConfigsNotice([]templates.UnmanagedSchemaConfigNoticeData{
+			{SchemaPath: "services/orders/schema", Database: "orders"},
+		}))
+
+		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
+	})
+
+	t.Run("does not append to plan comments with unsafe-change advisories", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment(templates.RenderPlanComment(templates.PlanCommentData{
+			Database:    "orders",
+			SchemaName:  "orders",
+			Environment: "staging",
+			IsMySQL:     true,
+			Changes: []templates.KeyspaceChangeData{{
+				Keyspace:   "orders",
+				Statements: []string{"ALTER TABLE `users` DROP INDEX `idx_email`;"},
+			}},
+			HasUnsafeChanges: true,
+			UnsafeChanges: []templates.UnsafeChangeData{
+				{Table: "users", Reason: "DROP INDEX idx_email"},
+			},
+		}))
 
 		assert.NotContains(t, body, "Support:")
 	})

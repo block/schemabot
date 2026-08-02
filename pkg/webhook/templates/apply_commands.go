@@ -65,7 +65,7 @@ func RenderPRCommandNotAuthorized(data ActorAuthorizationCommentData) string {
 		sb.WriteString("A configured SchemaBot admin/database operator must run this command.\n")
 	}
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderPRCommandDatabaseNotConfigured renders a comment when a mutating PR
@@ -81,7 +81,7 @@ func RenderPRCommandDatabaseNotConfigured(data ActorAuthorizationCommentData) st
 	fmt.Fprintf(&sb, "`schemabot %s` cannot run because database `%s` is not configured on this SchemaBot instance.\n\n", data.CommandName, data.Database)
 	sb.WriteString("Verify the database name, or run the command against the SchemaBot instance that manages this database.\n")
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderPRCommandAuthorizationUnavailable renders a comment when SchemaBot
@@ -99,7 +99,7 @@ func RenderPRCommandAuthorizationUnavailable(data ActorAuthorizationCommentData)
 	sb.WriteString("If access is granted through a GitHub team, verify the GitHub App can read organization members and team membership.\n\n")
 	sb.WriteString("A configured SchemaBot admin/database operator should inspect SchemaBot authorization logs before retrying.\n")
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderUnsafeChangesBlocked renders a comment when unsafe changes are detected
@@ -148,7 +148,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	applyCmd += " --allow-unsafe"
 	fmt.Fprintf(&sb, "```\n%s\n```\n", applyCmd)
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderBlockedChangesApplyRejected renders the rejection comment for an
@@ -274,7 +274,7 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 		sb.WriteString("Wait for the other PR to complete or ask the lock holder to run `schemabot unlock`.\n")
 	}
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderApplyInProgress renders a comment when the same PR already has an active apply.
@@ -312,7 +312,7 @@ func RenderApplyBlockedClosedPR(environment, requestedBy string, merged bool) st
 	sb.WriteString("\nThis PR is closed, so its schema changes can never merge. SchemaBot only applies schema changes from open PRs.\n\n")
 	sb.WriteString("Reopen this PR, or open a new PR with the schema change, and apply from there.\n")
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderNoLocksFound renders a comment when unlock finds no locks for this PR.
@@ -475,7 +475,7 @@ func RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, actio
 	fmt.Fprintf(&sb, "%s %s. %s before applying to %s.\n\n", capitalizeFirst(priorEnv), status, action, environment)
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", priorEnv)
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // BlockingCheck represents a PR check that is blocking apply, either because
@@ -512,13 +512,15 @@ func RenderApplyBlockedByNonPassingChecks(environment string, notPassing []Block
 	sb.WriteString("\nGet the checks passing — fix failures and re-run cancelled or stale checks — then retry:\n")
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderApplyBlockedByCheckStatusError renders a comment when apply is blocked
 // because the GitHub API returned an error while fetching PR check statuses.
 // The function recognises the "Resource not accessible" permission error and
-// surfaces a targeted hint; all other errors are shown verbatim. Both branches
+// surfaces a targeted hint; the error itself is never rendered — raw GitHub
+// errors can carry internal detail (hosts, headers, newlines) that must not
+// land in PR markdown, so operators triage from the server logs. Both branches
 // include a fenced retry command, matching the non-passing/in-progress siblings.
 type CheckStatusAccessDetails struct {
 	GitHubApp              string
@@ -555,22 +557,11 @@ func RenderApplyBlockedByCheckStatusError(environment string, err error, details
 		return sb.String()
 	}
 
-	if err != nil {
-		sb.WriteString("Unable to verify PR check statuses:\n\n")
-		sb.WriteString("```\n")
-		fmt.Fprintf(&sb, "%s\n", err)
-		sb.WriteString("```\n")
-		sb.WriteString("\nResolve the issue and retry:\n")
-	} else {
-		// Defensive: callers should always pass a non-nil error here, but
-		// rendering an empty fenced block followed by "Resolve the issue"
-		// would be confusing if a nil error ever slipped through.
-		sb.WriteString("Unable to verify PR check statuses.\n\n")
-		sb.WriteString("Retry:\n")
-	}
+	sb.WriteString("Unable to verify PR check statuses; see server logs for details.\n\n")
+	sb.WriteString("Retry:\n")
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderApplyBlockedByInProgressChecks renders a comment when apply is blocked
@@ -626,21 +617,24 @@ func RenderApplyBlockedByInProgressChecks(environment string, inProgress, notRep
 		fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
 	}
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderApplyBlockedByPriorEnvCheckError renders a comment when apply is blocked
 // because the GitHub API returned an error while verifying a prior environment's
 // aggregate check status. Reason describes the operation that failed (e.g.
-// "create GitHub client", "fetch PR details", "query check runs").
-func RenderApplyBlockedByPriorEnvCheckError(priorEnv, reason string, err error) string {
+// "create GitHub client", "fetch PR details", "query check runs"). The error
+// itself is never rendered — raw GitHub/storage errors can carry internal
+// detail that must not land in PR markdown, so operators triage from the
+// server logs.
+func RenderApplyBlockedByPriorEnvCheckError(priorEnv, reason string) string {
 	var sb strings.Builder
 
 	sb.WriteString("## ❌ Apply Blocked\n\n")
 	fmt.Fprintf(&sb, "Could not verify %s status: failed to %s. Retry the apply command.\n\n", priorEnv, reason)
-	fmt.Fprintf(&sb, "_Error: %v_", err)
+	sb.WriteString("_See server logs for details._")
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderApplyBlockedByMissingPriorEnvCheck renders a comment when apply is
@@ -656,7 +650,7 @@ func RenderApplyBlockedByMissingPriorEnvCheck(priorEnv string) string {
 	fmt.Fprintf(&sb, "```\nschemabot plan -e %s\n```\n\n", priorEnv)
 	fmt.Fprintf(&sb, "If the plan finds changes, apply `%s` and wait for the SchemaBot check to succeed. Then retry this apply.\n", priorEnv)
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderApplyBlockedByUntrustedPriorEnvCheck renders a comment when apply is
@@ -680,7 +674,7 @@ func RenderApplyBlockedByUntrustedPriorEnvCheck(priorEnv, checkName string, untr
 	sb.WriteString("- If you do not recognize the App, do not trust it — the check may be impersonating SchemaBot.\n\n")
 	fmt.Fprintf(&sb, "Re-running `schemabot plan -e %s` will not resolve this.\n", priorEnv)
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderApplyBlockedByPriorEnvInProgress renders a comment when an apply is blocked
@@ -695,7 +689,7 @@ func RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv stri
 	fmt.Fprintf(&sb, "Once %s completes, retry:\n", priorEnv)
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderApplyBlockedByUnlistedEnvironment renders a comment when an apply is
@@ -711,7 +705,7 @@ func RenderApplyBlockedByUnlistedEnvironment(environment string, promotionOrder 
 	if len(promotionOrder) > 0 {
 		fmt.Fprintf(&sb, "Configured promotion order: `%s`\n\n", strings.Join(promotionOrder, "` → `"))
 	}
-	fmt.Fprintf(&sb, "Add `%s` to `environment_order` so SchemaBot knows where it sits in the promotion sequence, then retry the apply.\n", environment)
+	fmt.Fprintf(&sb, "Add `%s` to `environment_order` (the server-wide list, or this database's override when it has one) so SchemaBot knows where it sits in the promotion sequence, then retry the apply.\n", environment)
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }

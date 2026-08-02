@@ -111,6 +111,16 @@ type ExternallyAuthoritativeProgress interface {
 	ProgressIsExternallyAuthoritative() bool
 }
 
+// ProgressIsExternallyAuthoritative reports whether eng declares its Progress
+// result authoritative regardless of which instance answers. Engines that do
+// not implement ExternallyAuthoritativeProgress are treated as instance-local —
+// this fails closed: a new engine's progress is never trusted as backend truth
+// unless it explicitly declares it.
+func ProgressIsExternallyAuthoritative(eng Engine) bool {
+	auth, ok := eng.(ExternallyAuthoritativeProgress)
+	return ok && auth.ProgressIsExternallyAuthoritative()
+}
+
 // DeferredCutoverSignalRequest identifies the target database whose deferred
 // cutover signal should be inspected.
 type DeferredCutoverSignalRequest struct {
@@ -254,11 +264,54 @@ type TableChange struct {
 	// Execution-mode verdict: how the engine will run this statement at apply
 	// time. Empty means the engine's default path. "blocked" means the engine
 	// deterministically refuses the statement — the apply will fail, and the
-	// plan surfaces that up front. Distinct from IsUnsafe, which flags a
-	// change the engine *can* run but the operator must acknowledge.
+	// plan surfaces that up front. "direct" means the database's direct
+	// execution policy routes the refused statement to native DDL on the
+	// target instead. Distinct from IsUnsafe, which flags a change the engine
+	// *can* run but the operator must acknowledge.
 	ExecutionMode string
-	ModeReason    string // Engine's reason when ExecutionMode is "blocked"
+	ModeReason    string // Engine's reason for any non-empty ExecutionMode verdict
 }
+
+// Execution-mode verdicts recorded on a planned table change. The verdict
+// answers "how will this statement actually run?" so operators learn about
+// engine limitations at plan time instead of at apply time.
+const (
+	// ExecutionModeBlocked marks a statement the engine deterministically
+	// refuses. An apply containing it will fail, and retrying cannot succeed
+	// until the statement changes.
+	ExecutionModeBlocked = "blocked"
+
+	// ExecutionModeDirect marks a statement the engine refuses but that the
+	// database's direct execution policy routes to native DDL on the target
+	// instead: it runs synchronously, it blocks writes to the table while it
+	// runs, and it is not revertible.
+	ExecutionModeDirect = "direct"
+)
+
+// Engine metadata keys carrying the direct execution policy from config
+// surfaces (server config, embedder assemblers) to an engine via request
+// credentials. Exported so producers and consumers share one spelling and
+// cannot drift on the key strings.
+const (
+	// MetadataDirectExecution enables direct execution ("true") for ALTER
+	// statements the engine deterministically refuses. Absent or "false"
+	// leaves refused statements blocked.
+	MetadataDirectExecution = "direct_execution"
+
+	// MetadataDirectExecutionMaxTableRows bounds direct execution by the
+	// target table's row count. Required (a positive integer) when direct
+	// execution is enabled, so a native table rebuild can never run
+	// unbounded: above the bound — or when the size cannot be determined —
+	// the statement stays blocked.
+	MetadataDirectExecutionMaxTableRows = "direct_execution_max_table_rows"
+
+	// MetadataDirectExecutionLockAcquisitionTimeoutSeconds bounds, in whole
+	// seconds, how long each direct statement waits to acquire its locks
+	// before failing with a retryable busy-table error instead of queueing
+	// on the table's lock indefinitely. Optional; engines apply their
+	// default when the key is absent.
+	MetadataDirectExecutionLockAcquisitionTimeoutSeconds = "direct_execution_lock_acquisition_timeout_seconds"
+)
 
 // ApplyRequest contains the input for starting a schema change.
 // On first apply, set the resume context to group related DDL.

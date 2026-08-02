@@ -21,10 +21,6 @@ const (
 	lockHashLen    = 16
 )
 
-// cleanupLocker serializes pending-drops cleanup across SchemaBot instances
-// with a session-scoped advisory lock held on the pinned target connection.
-var cleanupLocker namedlock.Locker = namedlock.MySQL{}
-
 // Target is one database the cleaner inspects. The DSN must be resolved
 // (no secret references) and reachable from this process.
 type Target struct {
@@ -36,6 +32,14 @@ type Target struct {
 
 	// DSN is the resolved MySQL connection string for the target.
 	DSN string
+
+	// Locker is the advisory-lock implementation for this target's engine,
+	// used to serialize cleanup across SchemaBot instances with a
+	// session-scoped lock held on the pinned target connection. The producer
+	// chooses it per target because one cleanup pass can span heterogeneous
+	// engines. A target without a locker fails closed rather than assuming
+	// MySQL semantics.
+	Locker namedlock.Locker
 }
 
 // Cleaner permanently drops quarantined tables from _pending_drops once they
@@ -91,6 +95,14 @@ func (c *Cleaner) Run(ctx context.Context) error {
 // cleanTarget connects to one target, serializes against other SchemaBot
 // instances with an advisory lock, and drops expired quarantined tables.
 func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
+	// A missing locker is a producer wiring bug, not a connectivity failure:
+	// it fails every pass until the producer is fixed, so it gets its own
+	// metric reason instead of blending into transient target errors.
+	if target.Locker == nil {
+		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "locker_missing")
+		return fmt.Errorf("target %s/%s has no advisory locker; cleanup cannot serialize across instances without one", target.Database, target.Environment)
+	}
+
 	db, err := mysqlconn.Open(target.DSN)
 	if err != nil {
 		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "target_error")
@@ -113,7 +125,7 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 	defer utils.CloseAndLog(conn)
 
 	lockName := targetLockName(target)
-	acquired, err := cleanupLocker.Acquire(ctx, conn, lockName, 0)
+	acquired, err := target.Locker.Acquire(ctx, conn, lockName, 0)
 	if err != nil {
 		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "target_error")
 		return fmt.Errorf("acquire advisory lock on %s/%s: %w", target.Database, target.Environment, err)
@@ -128,7 +140,7 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		return nil
 	}
 	defer func() {
-		released, err := cleanupLocker.Release(context.WithoutCancel(ctx), conn, lockName)
+		released, err := target.Locker.Release(context.WithoutCancel(ctx), conn, lockName)
 		switch {
 		case err != nil:
 			c.logger.Warn("failed to release pending drops cleanup lock; the lock releases when the session closes",

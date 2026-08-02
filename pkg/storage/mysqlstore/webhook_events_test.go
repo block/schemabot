@@ -5,6 +5,8 @@ package mysqlstore
 import (
 	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -139,6 +141,38 @@ func TestWebhookEventStore_FindNextClaimsOldestPendingEvent(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, next)
 	assert.Equal(t, "delivery-2", next.DeliveryID)
+}
+
+// A delivery's claimability must not depend on its payload width. Ordering the
+// claimable set must keep the payload out of the sort, so a single delivery
+// whose payload exceeds the server's sort buffer is claimed like any other row
+// instead of failing every claim attempt and wedging the inbox behind it.
+func TestWebhookEventStore_FindNextClaimsPayloadWiderThanSortBuffer(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	var sortBufferSize int
+	require.NoError(t, testDB.QueryRowContext(ctx, `SELECT @@sort_buffer_size`).Scan(&sortBufferSize))
+
+	payload := fmt.Sprintf(`{"data":%q}`, strings.Repeat("a", 2*sortBufferSize))
+	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+		DeliveryID: "delivery-wide",
+		Event:      "push",
+		Repository: "block/example",
+		Payload:    []byte(payload),
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, "delivery-wide", claimed.DeliveryID)
+	assert.Equal(t, storage.WebhookEventProcessing, claimed.State)
+	assert.Equal(t, 1, claimed.Attempts)
+	assert.Equal(t, "driver-a", claimed.LeaseOwner)
+	assert.JSONEq(t, payload, string(claimed.Payload))
 }
 
 func TestWebhookEventStore_FindNextRequiresOwnerWithoutLeaseLostSentinel(t *testing.T) {

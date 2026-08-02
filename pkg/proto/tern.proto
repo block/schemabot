@@ -596,7 +596,8 @@ message ShardProgress {
   int64 eta_seconds = 5;
   int32 cutover_attempts = 6;
   string last_cutover_attempt = 7;
-  bool ready_to_complete = 8;
+  reserved 8;
+  reserved "ready_to_complete";
 }
 
 // TableProgress contains progress information for a single table.
@@ -618,6 +619,10 @@ message TableProgress {
   // Populated while the table is checksumming (verifying copied data), 0 otherwise.
   int64 checksum_rows_checked = 14;
   int64 checksum_rows_total = 15;
+  // The table's own failure reason (for example an engine preflight
+  // rejection), distinct from the apply-level error_message on
+  // ProgressResponse. Empty when the table has not failed.
+  string error_message = 16;
 }
 
 // ProgressResponse contains detailed progress information.

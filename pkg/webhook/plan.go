@@ -9,9 +9,9 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/ddl"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -29,7 +29,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Fix checks stuck at "in_progress" from crashed applies
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
 		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, "Failed to reconcile stale status checks: "+err.Error())
+		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, "Failed to reconcile stale status checks. Retry, and see server logs if it persists.")
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "status check reconciliation failed"})
 		return
 	}
@@ -202,7 +202,11 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 			"repo", repo, "pr", pr, "database", databaseName, "requested_by", requestedBy)
 		return false
 	}
-	return h.enforcePRCommandActorAuthorization(ctx, authzClient, repo, pr, installationID, requestedBy, databaseName, dbConfig.Type, environment, action.Plan)
+	// The plan handler is not a durable core, so an authorization evaluation
+	// failure blocks the plan the same as a merit denial (fail closed); the
+	// gate has already logged and posted the distinction.
+	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, authzClient, repo, pr, installationID, requestedBy, databaseName, dbConfig.Type, environment, action.Plan)
+	return authErr != nil || blocked
 }
 
 // handleMultiEnvPlan runs plan for all configured environments and posts a single combined comment.
@@ -220,7 +224,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// Fix checks stuck at "in_progress" from crashed applies
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
 		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, "Failed to reconcile stale status checks: "+err.Error())
+		h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, "Failed to reconcile stale status checks. Retry, and see server logs if it persists.")
 		return
 	}
 
@@ -247,13 +251,24 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			return
 		}
 		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Plan) {
-			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, newSchemaConfigOutsideAllowedDirsError(config, configDir))
+			unownedErr := h.unownedDiscoveredConfigError(repo, config, configDir)
+			if h.skipUnownedUnscopedCommand(repo, tenant, unownedErr) {
+				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
+					"repo", repo, "pr", pr, "database", databaseName, "error", unownedErr)
+				return
+			}
+			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, unownedErr)
 			return
 		}
 		schemaDatabase = config.Database
 	} else {
 		config, _, findErr := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, action.Plan)
 		if findErr != nil {
+			if h.skipUnownedUnscopedCommand(repo, tenant, findErr) {
+				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
+					"repo", repo, "pr", pr, "error", findErr)
+				return
+			}
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr)
 			return
 		}
@@ -417,6 +432,19 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy)
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 		multiEnvData.Plans[env] = &commentData
+	}
+
+	// When every environment fails before a schema request resolves, no
+	// successful result seeded the comment's database identity. Fall back to
+	// the config-resolved database and this deployment's registry type so the
+	// failure comment names what failed to plan instead of rendering an empty
+	// database and a defaulted type.
+	if multiEnvData.Database == "" {
+		multiEnvData.Database = schemaDatabase
+		if db := h.service.Config().Database(schemaDatabase); db != nil {
+			multiEnvData.DatabaseType = db.Type
+			multiEnvData.IsMySQL = db.Type == storage.DatabaseTypeMySQL
+		}
 	}
 
 	// Update aggregate check once after all environments are planned.
@@ -625,10 +653,52 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 	return out
 }
 
-// engineBlocked reports whether the planner's execution-mode verdict says the
-// engine will refuse this change at apply time.
-func engineBlocked(t *apitypes.TableChangeResponse) bool {
-	return t != nil && t.ExecutionMode == ddl.ExecutionModeBlocked
+// msgDeferCutoverAllDirect rejects --defer-cutover on a plan whose every
+// change the policy routes to direct execution: a direct statement has no
+// cutover to defer, so the flag is refused instead of silently ignored.
+const msgDeferCutoverAllDirect = "`--defer-cutover` has no effect on this plan: every change runs directly as native DDL, which has no cutover to defer. Re-run without the flag."
+
+// msgDeferCutoverAllDirectConfirm rejects --defer-cutover at confirm time on
+// an all-direct plan. The rejection preserves the pending confirmation — the
+// lock still pins the plan the operator confirmed against — so the recovery
+// is re-running apply-confirm without the flag, not restarting from apply.
+// The format verb takes the environment for the coached command.
+const msgDeferCutoverAllDirectConfirm = "`--defer-cutover` has no effect on this plan: every change runs directly as native DDL, which has no cutover to defer. The pending confirmation is preserved — re-run `schemabot apply-confirm -e %s` without the flag."
+
+// shardedDirectChanges collects direct-execution per-shard changes, grouped by
+// (table, reason) so a change present on several shards lists them together
+// rather than repeating. Returns nil when the plan carries no per-shard
+// changes (the non-sharded path uses the namespace-level view instead).
+func shardedDirectChanges(shards []*apitypes.ShardPlanResponse) []templates.DirectChangeData {
+	if len(shards) == 0 {
+		return nil
+	}
+	type key struct{ table, reason string }
+	var order []key
+	byKey := make(map[key]*templates.DirectChangeData)
+	for _, sp := range shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if !t.DirectExecution() {
+				continue
+			}
+			k := key{table: t.TableName, reason: t.ModeReason}
+			dc := byKey[k]
+			if dc == nil {
+				dc = &templates.DirectChangeData{Table: t.TableName, Reason: t.ModeReason}
+				byKey[k] = dc
+				order = append(order, k)
+			}
+			dc.Shards = append(dc.Shards, sp.Shard)
+		}
+	}
+	out := make([]templates.DirectChangeData, 0, len(order))
+	for _, k := range order {
+		out = append(out, *byKey[k])
+	}
+	return out
 }
 
 // shardedBlockedChanges collects blocked per-shard changes, grouped by (table,
@@ -647,7 +717,7 @@ func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.Blo
 			continue
 		}
 		for _, t := range sp.Changes {
-			if !engineBlocked(t) {
+			if !t.EngineBlocked() {
 				continue
 			}
 			k := key{table: t.TableName, reason: t.ModeReason}
@@ -750,7 +820,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		}
 	}
 
-	// Blocked changes — the engine will refuse these at apply time. Like the
+	// Blocked changes — the apply commands will reject these. Like the
 	// unsafe view, a sharded plan derives them per shard so a blocked change
 	// confined to one shard names the shard it applies to.
 	if blocked := shardedBlockedChanges(planResp.Shards); len(blocked) > 0 {
@@ -761,10 +831,31 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 				continue
 			}
 			for _, t := range sc.TableChanges {
-				if !engineBlocked(t) {
+				if !t.EngineBlocked() {
 					continue
 				}
 				data.BlockedChanges = append(data.BlockedChanges, templates.BlockedChangeData{
+					Table:  t.TableName,
+					Reason: t.ModeReason,
+				})
+			}
+		}
+	}
+
+	// Direct-execution changes — the policy routes these to native MySQL DDL,
+	// derived the same way as the blocked view.
+	if direct := shardedDirectChanges(planResp.Shards); len(direct) > 0 {
+		data.DirectChanges = direct
+	} else {
+		for _, sc := range planResp.Changes {
+			if sc == nil {
+				continue
+			}
+			for _, t := range sc.TableChanges {
+				if !t.DirectExecution() {
+					continue
+				}
+				data.DirectChanges = append(data.DirectChanges, templates.DirectChangeData{
 					Table:  t.TableName,
 					Reason: t.ModeReason,
 				})

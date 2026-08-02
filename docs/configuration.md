@@ -14,10 +14,14 @@
 - [Drivers](#drivers)
 - [Metrics](#metrics)
 - [Pending Drops](#pending-drops)
+- [Direct Execution](#direct-execution)
+- [Storage Connection Pool](#storage-connection-pool)
+- [Spirit Run Settings](#spirit-run-settings)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
 - [Repository Allowlist](#repository-allowlist)
 - [PR Checks Gate](#pr-checks-gate)
+- [Base Branch Schema Freshness](#base-branch-schema-freshness)
 - [Review Gate](#review-gate)
 - [Authentication](#authentication)
   - [OIDC (Bearer tokens)](#oidc-bearer-tokens)
@@ -25,6 +29,7 @@
 - [Multi-Environment Deployment](#multi-environment-deployment)
   - [Staging Instance](#staging-instance)
   - [Production Instance](#production-instance)
+  - [Shared prior environment: `promotion-check-name`](#shared-prior-environment-promotion-check-name)
   - [Environment-local gRPC targets](#environment-local-grpc-targets)
   - [Tenant-scoped command routing](#tenant-scoped-command-routing)
   - [How it works](#how-it-works)
@@ -236,6 +241,45 @@ tern_deployments:
 
 The production deployment does not need a staging target. It verifies staging by reading the staging deployment's GitHub aggregate check, then resolves only the production target from its own config.
 
+### Per-Database Environment Order
+
+Databases promote through different environment sequences — one database may run `qa → sandbox → production` while another runs `qa → staging → production` — and a single server-wide order cannot express both. A database entry may override the promotion order with its own `environment_order`. In this example a qa/sandbox-scoped instance promotes `payments` through `qa → sandbox` locally, with `production` owned by a peer instance:
+
+```yaml
+allowed_environments:
+  - qa
+  - sandbox
+
+environment_order:
+  - qa
+  - staging
+  - production
+
+databases:
+  payments:
+    type: mysql
+    environment_order:
+      - qa
+      - sandbox
+      - production
+    environments:
+      qa:
+        target: "payments-qa"
+        deployment: primary
+      sandbox:
+        target: "payments-sandbox"
+        deployment: primary
+```
+
+When set, the database's `environment_order` replaces the server-wide order entirely for that database's promotion gating: an apply to an environment in the list requires a successful SchemaBot check for every earlier entry, and environments the database does not promote through simply do not appear. Databases without an override keep using the server-wide `environment_order` unchanged.
+
+The override is validated at startup, fail-fast in both directions:
+
+- Every environment configured under the database's `environments` must appear in its `environment_order` — otherwise applies to it would be blocked as unlisted.
+- Every `environment_order` entry owned by this instance (per `allowed_environments`; all entries when the instance is unscoped) must be configured under the database's `environments` — otherwise a later environment's apply would wait on a prior check that can never exist.
+
+Entries owned by another instance in the promotion chain (outside this instance's `allowed_environments`) may be absent from the database's local `environments`: the promotion gate verifies them through the peer's GitHub aggregate check, exactly as with the server-wide order. Instances sharing a database must declare the same effective order for it — render all instances' config from a single source.
+
 ## Hybrid Mode
 
 Both modes can be used simultaneously. Each database environment in the `databases` section chooses one route: local mode with `dsn`, or gRPC mode with `target` and `deployment`. This is useful when some databases are co-located with SchemaBot and others are in remote environments.
@@ -319,6 +363,57 @@ The cleaner only runs against local-mode MySQL databases (environments with a
 process has no target DSN and cannot clean that target. Cleanup runs only if the
 remote deployment is also a SchemaBot server with the target configured as
 local-mode MySQL and `cleanup_enabled: true`.
+
+## Direct Execution
+
+For MySQL databases executed by the Spirit engine, some ALTER statements are
+deterministically refused by the engine — for example dropping a primary key or
+adding a foreign key, which its online copy cannot preserve. By default those
+statements block the apply. The per-database-environment `direct_execution`
+policy lets a refused statement instead run verbatim as native MySQL DDL when
+the target table is small enough. See
+[Direct Execution](direct-execution.md) for how routing works and what other
+engines need to adopt it:
+
+```yaml
+databases:
+  payments:
+    type: mysql
+    environments:
+      staging:
+        dsn_secret_ref: "..."
+        direct_execution:
+          enabled: true           # default: false
+          max_table_rows: 100000  # required (positive) when enabled
+          lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
+```
+
+A direct statement is synchronous, blocks writes to the table while it runs,
+and cannot be reverted — `max_table_rows` is the fail-closed blast-radius
+bound. A refused statement runs directly only when the table's size is within
+the bound; larger tables, and tables whose size cannot be determined, stay
+blocked. The size gate trusts the InnoDB optimizer's estimate
+(`information_schema` `TABLE_ROWS`) only to block, and corroborates a verdict
+for direct execution with an exact row count whose scan is capped just past
+the bound — a stale estimate can never approve a large table. The bound is
+re-evaluated when the apply executes, so a table that grew past it after
+planning is blocked, not run.
+
+`lock_acquisition_timeout` bounds how long each direct statement waits to
+acquire its locks. Each engine maps it to its native session lock timeout —
+on MySQL, `lock_wait_timeout` and `innodb_lock_wait_timeout`. Native DDL
+queues on the table's metadata lock behind any open transaction that has
+touched the table — and by default MySQL lets it queue essentially forever,
+with all new table traffic stalling behind it. When the bound expires the
+apply fails fast with a retryable "table is busy" error instead. Lower it for
+environments where even a short stall is unacceptable; the value must be a
+whole number of seconds (at least `1s`).
+
+Config validation fails at startup when a `direct_execution` block — even a
+disabled one — is set on a non-MySQL database, when the policy is enabled
+without a positive `max_table_rows`, or when `lock_acquisition_timeout` is malformed
+(not a duration, under a second, or not whole seconds). A policy that can
+never take effect is never silently carried in config.
 
 ## Storage Connection Pool
 
@@ -641,12 +736,20 @@ auth:
       - 127.0.0.1/32
     read_groups: [readers]                # groups granted read (empty = any authenticated caller)
     write_groups: [operators]             # groups granted write (empty = no writes)
+    # Optional service-caller lane — read-only access for services calling as
+    # themselves through a caller-forwarding gateway:
+    trusted_gateway_spiffe:               # gateways allowed to forward a verified caller SPIFFE ID
+      - spiffe://example.org/ns/service-ingress/sa/gateway
+    read_service_spiffe:                  # caller SPIFFE IDs granted read-tier access
+      - spiffe://example.org/ns/reporting/sa/reporting
+    caller_spiffe_header: X-Forwarded-Caller-Spiffe-Id   # optional (default)
 ```
 
 The authorizer proves the request came from the trusted proxy, then reads the forwarded identity:
 
 - **Trust anchor (required, fail-closed).** With neither `trusted_proxy_cidrs` nor `trusted_proxy_spiffe` set, the server refuses to start. There are three modes: **CIDR only** (trust any request whose source IP is in a trusted network), **SPIFFE only** (trust any request whose XFCC carries a trusted SPIFFE ID), or **both** (require the source CIDR *and* a matching XFCC SPIFFE ID — defense in depth). `X-Forwarded-Client-Cert` (XFCC) is a spoofable HTTP header, so SPIFFE-only is safe only when the proxy sanitizes inbound XFCC and the server is not directly reachable (a service mesh) — the server logs a startup warning in that mode.
 - **Tiers.** Reads are open to any authenticated caller unless `read_groups` is set; writes require membership in `write_groups`. Only the canonical header is read, so a smuggled underscore variant (`X_Forwarded_User`) is ignored.
+- **Service callers (read-only).** `trusted_gateway_spiffe` + `read_service_spiffe` open a second lane for services calling as themselves: a caller-forwarding gateway terminates the caller's mTLS, verifies the client certificate, and forwards the caller's SPIFFE ID in `caller_spiffe_header`. The header is honored only when the XFCC-verified peer is a listed gateway, the forwarded caller must appear in `read_service_spiffe`, and service callers never get the write tier (denied with reason `service_caller_write`). The user and groups headers are never read on this lane, and the identity-header proxy always wins — the gateway lane is consulted only when the request did not arrive through the trusted proxy. `trusted_proxy_cidrs`, when set, gate this lane like everything else: a gateway SVID claimed from outside the trusted networks is never honored. **List a gateway only if it strips inbound copies of the caller header before setting it from the verified certificate** — otherwise any caller could forge an identity through it. The lane fails closed: gateways without callers (or callers without a gateway) refuse to start, the lane requires SPIFFE-anchored proxy trust (`trusted_proxy_spiffe`) — under CIDR-only trust an in-CIDR gateway request would be mistaken for the identity-header proxy, leaving the lane unreachable, so that combination refuses to start too — and an empty config disables the lane entirely.
 
 ## Multi-Environment Deployment
 
@@ -728,6 +831,40 @@ gate and cannot be hidden from the passing-checks gate. When the passing-checks
 gate sees an aggregate-named check from an untrusted app, it blocks as usual
 and emits a warning log and metric so operators can distinguish a check-name
 spoof from a chain member missing from the list.
+
+### Shared prior environment: `promotion-check-name`
+
+By default, the promotion gate looks for the prior environment's aggregate
+check run under this instance's own `check-name` base — for example, a
+production instance with `check-name: "SchemaBot X"` looks for
+`SchemaBot X (staging)`. That works when each promotion chain is a matched
+pair of instances publishing under the same base name.
+
+Some fleets instead share one staging instance across several production
+instances, each with its own distinct `check-name`. The shared staging
+instance publishes its aggregate under *its* base name, so a production
+instance's default lookup targets a check run that is never created and every
+apply fails closed. Set `promotion-check-name` to the shared prior
+deployment's `check-name` base to point the gate at the check run that
+actually exists:
+
+```yaml
+github:
+  check-name: "SchemaBot Y"            # this instance's own aggregate base
+  promotion-check-name: "SchemaBot X"  # the shared staging instance's base
+  trusted-check-app-slugs:
+    - schemabot-x-staging              # the shared staging instance's App slug
+```
+
+The prior environment is still appended in parentheses: with the config above,
+a production apply requires `SchemaBot X (staging)` to be successful. The
+shared prior deployment's App slug must be listed in
+`trusted-check-app-slugs` — the overridden name is published by a different
+App, and the gate only accepts check runs from trusted Apps. Config load
+rejects an override that differs from the instance's own base while
+`trusted-check-app-slugs` is empty, since no check run could ever satisfy that
+gate. `promotion-check-name` only redirects the promotion gate's prior-env
+lookup; the instance's own aggregate check runs keep using `check-name`.
 
 **Command routing across instances.** Every instance receives every PR comment
 through its own App's webhook. A command whose `-e` value is in the instance's

@@ -119,7 +119,7 @@ See [Configuration](configuration.md#pending-drops) for field semantics.
 | `schemabot.pending_drops.cleanup_dropped_total` | Expired quarantined tables permanently dropped by the cleaner. |
 | `schemabot.pending_drops.cleanup_skipped_total` | Quarantined tables skipped because their names carry no valid timestamp prefix. A sustained nonzero rate means tables are accumulating that an operator must inspect and remove manually. |
 | `schemabot.pending_drops.cleanup_lock_skipped_total` | Cleanup target passes skipped because another instance held the per-target advisory lock. |
-| `schemabot.pending_drops.cleanup_errors_total` | Cleanup failures by reason (`dsn_resolution_error`, `target_error`, or `drop_error`). Failed work retries on the next pass. |
+| `schemabot.pending_drops.cleanup_errors_total` | Cleanup failures by reason (`dsn_resolution_error`, `locker_missing`, `target_error`, or `drop_error`). Failed work retries on the next pass, but `locker_missing` is a producer wiring bug that fails every pass until fixed. |
 
 The apply log for a schema change that drops a table records the quarantine
 database and table name, so operators can locate the table for recovery without

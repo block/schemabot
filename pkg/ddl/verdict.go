@@ -7,16 +7,6 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/ast"
 )
 
-// Execution-mode verdicts recorded on a planned table change. The verdict
-// answers "how will this statement actually run?" so operators learn about
-// engine limitations at plan time instead of at apply time.
-const (
-	// ExecutionModeBlocked marks a statement the MySQL schema-change engine
-	// deterministically refuses. An apply containing it will fail, and
-	// retrying cannot succeed until the statement changes.
-	ExecutionModeBlocked = "blocked"
-)
-
 // EngineRefusalReason reports whether the MySQL schema-change engine (Spirit)
 // deterministically refuses the given statement, and the engine's reason.
 //

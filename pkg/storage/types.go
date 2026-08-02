@@ -330,10 +330,13 @@ type TableChange struct {
 
 	// ExecutionMode records the planner's execution-mode verdict. Empty means
 	// the engine's default path; "blocked" means the engine deterministically
-	// refuses the statement and the apply will fail.
+	// refuses the statement and the apply will fail; "direct" means the
+	// database's direct execution policy routes the refused statement to
+	// native DDL on the target instead.
 	ExecutionMode string `json:"execution_mode,omitempty"`
 
-	// ModeReason records the engine's reason when ExecutionMode is "blocked".
+	// ModeReason records the engine's reason for any non-empty ExecutionMode
+	// verdict.
 	ModeReason string `json:"mode_reason,omitempty"`
 }
 
@@ -1104,7 +1107,6 @@ type Task struct {
 
 	// Execution flags
 	IsInstant         bool   // True if INSTANT DDL (no copy needed)
-	ReadyToComplete   bool   // Row copy done, waiting for cutover
 	EngineMigrationID string // Engine-specific migration ID
 
 	// Timestamps

@@ -483,6 +483,55 @@ func TestE2EAutoPlanSourcePolicyBlocksWithFailingAggregate(t *testing.T) {
 	}
 }
 
+// TestE2EAutoPlanEmptySchemaRootNamesDatabase verifies that when a PR empties
+// a managed schema root (removing every schema file), the auto-plan failure
+// comment still identifies the database and type it failed to plan. No
+// environment produces a schema request, so the comment's identity falls back
+// to the config-resolved database and the deployment's registry type instead
+// of rendering an empty database and a defaulted type.
+func TestE2EAutoPlanEmptySchemaRootNamesDatabase(t *testing.T) {
+	dbName := "webhook_autoplan_empty_root"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	prFiles := []*gh.CommitFile{{
+		Filename: new("schema/" + dbName + "/users.sql"),
+		Status:   new("removed"),
+	}}
+	result := setupFakeGitHubForPlanWithPRFiles(t, mux, map[string]string{}, schemabotConfig, dbName, prFiles)
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "failed to plan")
+		assert.Contains(t, body, "no schema files found")
+		assert.Contains(t, body, "**Database**: `"+dbName+"`")
+		assert.Contains(t, body, "**Type**: `MySQL`")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for empty schema root auto-plan failure comment")
+	}
+}
+
 // TestE2EReopenedPRAutoPlansCurrentHead verifies that reopening a PR follows
 // the same auto-plan path as a new PR and records checks on the current commit.
 func TestE2EReopenedPRAutoPlansCurrentHead(t *testing.T) {

@@ -147,8 +147,13 @@ type LocalConfig struct {
 	// Keys used by PlanetScale: organization, token_name, token_value,
 	// tls_name, revert_window_duration, main_branch.
 	// Keys used by Spirit: pending_drops ("false" disables the pending drops
-	// quarantine so DROP TABLE executes directly), plus the run-settings
-	// overrides parsed by spirit.SettingsFromMetadata
+	// quarantine so DROP TABLE executes directly); direct_execution ("true"
+	// lets engine-refused ALTER statements run verbatim as native MySQL DDL)
+	// with its required companion direct_execution_max_table_rows (positive
+	// estimated-row-count bound above which direct execution is blocked) and
+	// optional direct_execution_lock_acquisition_timeout_seconds (positive bound on
+	// each direct statement's lock acquisition; engine default when absent);
+	// plus the run-settings overrides parsed by spirit.SettingsFromMetadata
 	// (enable_experimental_autoscaling, checkpoint_max_age,
 	// checksum_yield_timeout).
 	Metadata map[string]string
@@ -2359,13 +2364,14 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 
 	for _, t := range currentApplyTasks {
 		tp := &ternv1.TableProgress{
-			TableName:  t.TableName,
-			Ddl:        t.DDL,
-			Namespace:  t.Namespace,
-			Status:     t.State,
-			TaskId:     t.TaskIdentifier,
-			IsInstant:  t.IsInstant || vitessApplyIsInstant,
-			ChangeType: ddlActionToProtoChangeType(t.DDLAction),
+			TableName:    t.TableName,
+			Ddl:          t.DDL,
+			Namespace:    t.Namespace,
+			Status:       t.State,
+			TaskId:       t.TaskIdentifier,
+			IsInstant:    t.IsInstant || vitessApplyIsInstant,
+			ChangeType:   ddlActionToProtoChangeType(t.DDLAction),
+			ErrorMessage: t.ErrorMessage,
 		}
 
 		// Table figures come from the stored task row the drive maintains.

@@ -20,6 +20,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/testutil"
 )
 
@@ -116,7 +117,7 @@ func assertEnsureSchemaDoesNotCleanSpiritTablesWhileWaitingForLock(
 	// Simulate pod A actively running EnsureSchema. The lock is the production
 	// coordination mechanism, and the shadow table represents Spirit work that
 	// must not be cleaned up by a second pod before it acquires the lock.
-	lockConn, err := acquireEnsureSchemaLock(ctx, dsn, logger)
+	lockConn, err := acquireMySQLEnsureSchemaLock(ctx, dsn, logger, namedlock.MySQL{})
 	require.NoError(t, err)
 	lockReleased := false
 	defer func() {

@@ -7,12 +7,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log/slog"
 	"time"
 
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 
 	"github.com/block/schemabot/pkg/metrics"
@@ -52,14 +50,7 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 		return nil
 	}
 
-	cfg := mysql.NewConfig()
-	cfg.Net = "tcp"
-	cfg.Addr = host
-	cfg.User = username
-	cfg.Passwd = password
-	cfg.DBName = database
-
-	db, err := mysqlconn.Open(cfg.FormatDSN())
+	db, err := mysqlconn.Open(targetDSN(host, username, password, database))
 	if err != nil {
 		return fmt.Errorf("open database %s: %w", database, err)
 	}
@@ -105,14 +96,9 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 		)
 		// Route the quarantine location to the apply log so operators can find
 		// the table for recovery without querying information_schema.
-		e.mu.Lock()
-		onLog := e.onLog
-		e.mu.Unlock()
-		if onLog != nil {
-			onLog(slog.LevelInfo, table.TableName,
-				fmt.Sprintf("table quarantined as `%s`.`%s`; recoverable until the pending drops retention period expires",
-					table.QuarantineSchema, table.QuarantineTable))
-		}
+		e.emitTableLog(table.TableName,
+			fmt.Sprintf("table quarantined as `%s`.`%s`; recoverable until the pending drops retention period expires",
+				table.QuarantineSchema, table.QuarantineTable))
 		metrics.RecordPendingDropMoved(ctx, table.SchemaName)
 	}
 	return nil

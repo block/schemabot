@@ -61,8 +61,8 @@ github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERo
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
 github.com/alecthomas/assert/v2 v2.11.0 h1:2Q9r3ki8+JYXvGsDyBXwH3LcJ+WK5D0gc5E8vS6K3D0=
 github.com/alecthomas/assert/v2 v2.11.0/go.mod h1:Bze95FyfUr7x34QZrjL+XP+0qgp/zg8yS+TtBj1WA3k=
-github.com/alecthomas/kong v1.15.0 h1:BVJstKbpO73zKpmIu+m/aLRrNmWwxXPIGTNin9VmLVI=
-github.com/alecthomas/kong v1.15.0/go.mod h1:wrlbXem1CWqUV5Vbmss5ISYhsVPkBb1Yo7YKJghju2I=
+github.com/alecthomas/kong v1.16.0 h1:g92/kUxBcdcTPOM79yE63viJgtcp5dNyrB3/O2cjYT4=
+github.com/alecthomas/kong v1.16.0/go.mod h1:wrlbXem1CWqUV5Vbmss5ISYhsVPkBb1Yo7YKJghju2I=
 github.com/alecthomas/repr v0.5.2 h1:SU73FTI9D1P5UNtvseffFSGmdNci/O6RsqzeXJtP0Qs=
 github.com/alecthomas/repr v0.5.2/go.mod h1:Fr0507jx4eOXV7AlPV6AVZLYrLIuIeSOWtW57eE/O/4=
 github.com/alecthomas/template v0.0.0-20160405071501-a0175ee3bccc/go.mod h1:LOuyumcjzFXgccqObfd/Ljyb9UuFJ6TxHnclSeseNhc=
@@ -113,8 +113,8 @@ github.com/beorn7/perks v0.0.0-20180321164747-3a771d992973/go.mod h1:Dwedo/Wpr24
 github.com/beorn7/perks v1.0.0/go.mod h1:KWe93zE9D1o94FZ5RNwFwVgaQK1VOXiVxmqh+CedLV8=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
-github.com/block/spirit v0.15.2-0.20260724130620-48b5ea432a74 h1:fIIkkFjAqM+cwlgGE71dOC4i3Kr8ie+8j7QKEf/ioRA=
-github.com/block/spirit v0.15.2-0.20260724130620-48b5ea432a74/go.mod h1:eSX+yt8Ukl+v7ZMNLuVbBreM+2X4gDnR+ree6rLM6tQ=
+github.com/block/spirit v0.15.2-0.20260731132010-e94e99be2c1b h1:Eimx5kTnpoxXKjl42PSPIvWIIJEDIxq8Y1bAiVxdYQU=
+github.com/block/spirit v0.15.2-0.20260731132010-e94e99be2c1b/go.mod h1:+ztqAd6YaMx844cr3/GnxWh+vqyOBHHApW7eAg92BW0=
 github.com/block/tidb/pkg/parser v0.0.0-20260506200501-e528fd979fc8 h1:+OfdTacrEyjlqcRUpBFX9uJ6ROBq6cUjwY4DClhnsdU=
 github.com/block/tidb/pkg/parser v0.0.0-20260506200501-e528fd979fc8/go.mod h1:zDLDsfNBU5+L6T4J9/OgWAHc/WZvMUjbpgHqQ/t3yKo=
 github.com/block/vitess v0.0.0-20260703150944-881ec2298245 h1:R7e7uAxl6WIZpeY957JDsrZtuihck6vm7QgRooI295U=

@@ -3085,15 +3085,20 @@ type capturedLog struct {
 }
 
 // captureHandler is a minimal slog.Handler that records every emitted record so
-// tests can assert on level, message, and attributes.
+// tests can assert on level, message, and attributes — including attrs bound
+// with Logger.With, so tests can prove bound-logger inheritance.
 type captureHandler struct {
 	records *[]capturedLog
+	bound   []slog.Attr
 }
 
 func (h captureHandler) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
-	attrs := make(map[string]any, r.NumAttrs())
+	attrs := make(map[string]any, len(h.bound)+r.NumAttrs())
+	for _, a := range h.bound {
+		attrs[a.Key] = a.Value.Any()
+	}
 	r.Attrs(func(a slog.Attr) bool {
 		attrs[a.Key] = a.Value.Any()
 		return true
@@ -3102,8 +3107,24 @@ func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 
-func (h captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
-func (h captureHandler) WithGroup(string) slog.Handler      { return h }
+func (h captureHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	h.bound = append(slices.Clip(h.bound), attrs...)
+	return h
+}
+func (h captureHandler) WithGroup(string) slog.Handler { return h }
+
+// requireCapturedLog returns the first captured record with the given message,
+// failing the test when none exists.
+func requireCapturedLog(t *testing.T, records []capturedLog, msg string) capturedLog {
+	t.Helper()
+	for _, rec := range records {
+		if rec.msg == msg {
+			return rec
+		}
+	}
+	t.Fatalf("expected a log record with message %q; got %d records", msg, len(records))
+	return capturedLog{}
+}
 
 // A canonical, positive revert_window_duration in metadata is honored, while an
 // empty value falls back to the engine default. A malformed or non-positive
@@ -3136,7 +3157,7 @@ func TestLocalClient_RevertWindowDuration(t *testing.T) {
 				logger: slog.New(captureHandler{records: &records}),
 			}
 
-			got := client.revertWindowDuration()
+			got := client.revertWindowDuration(client.logger.With("database", client.config.Database))
 			assert.Equal(t, tc.want, got)
 
 			var warnings []capturedLog
@@ -3686,4 +3707,63 @@ func TestLocalClient_ProgressRendersNonShardedTableFromStoredTask(t *testing.T) 
 	assert.Equal(t, int64(10), tp.ChecksumRowsChecked)
 	assert.Equal(t, int64(1000), tp.ChecksumRowsTotal)
 	assert.Empty(t, tp.Shards, "a non-sharded table has no per-shard breakdown")
+}
+
+// Progress serves each table's own failure reason from its stored task row, so
+// a multi-table apply where one table failed (for example an engine preflight
+// rejection) reports the error on exactly that table — the control plane and
+// the PR comment can attribute the failure to the right table instead of
+// showing a bare failed row.
+func TestLocalClient_ProgressCarriesPerTableErrorMessage(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              43,
+		ApplyIdentifier: "apply-table-error",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Failed,
+	}
+	failedTask := &storage.Task{
+		ID:             8,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-users",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		TableName:      "users",
+		State:          state.Task.Failed,
+		DDLAction:      "alter",
+		ErrorMessage:   "engine preflight: enumReorder check failed for table users",
+	}
+	completedTask := &storage.Task{
+		ID:             9,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-orders",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		TableName:      "orders",
+		State:          state.Task.Completed,
+		DDLAction:      "alter",
+	}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{failedTask, completedTask}},
+		},
+		logger: slog.Default(),
+	}
+
+	progress, err := client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: apply.ApplyIdentifier, Environment: "staging"})
+	require.NoError(t, err)
+	require.Len(t, progress.Tables, 2)
+
+	byTable := make(map[string]*ternv1.TableProgress, len(progress.Tables))
+	for _, tp := range progress.Tables {
+		byTable[tp.TableName] = tp
+	}
+	require.Contains(t, byTable, "users")
+	require.Contains(t, byTable, "orders")
+	assert.Equal(t, "engine preflight: enumReorder check failed for table users", byTable["users"].ErrorMessage)
+	assert.Empty(t, byTable["orders"].ErrorMessage, "a table that did not fail carries no error")
 }

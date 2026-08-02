@@ -80,3 +80,58 @@ func TestBuildPlanCommentData_NoBlockedChanges(t *testing.T) {
 
 	assert.Empty(t, data.BlockedChanges)
 }
+
+// A change the planner's execution-mode verdict routes to direct execution is
+// surfaced in the plan comment's direct section, naming the table and the
+// planner's reason, so the operator sees the disclosure before confirming.
+func TestBuildPlanCommentData_DirectChanges(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "testapp", Type: "mysql"}
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "testapp",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "users", DDL: "ALTER TABLE `users` DROP PRIMARY KEY", ChangeType: "alter",
+					ExecutionMode: "direct", ModeReason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~40 rows"},
+				{TableName: "orders", DDL: "ALTER TABLE `orders` ADD COLUMN `notes` TEXT", ChangeType: "alter"},
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+
+	require.Len(t, data.DirectChanges, 1)
+	assert.Equal(t, "users", data.DirectChanges[0].Table)
+	assert.Equal(t, "dropping primary key is not supported; runs as native MySQL DDL on a table with ~40 rows", data.DirectChanges[0].Reason)
+	assert.Empty(t, data.DirectChanges[0].Shards)
+	assert.Empty(t, data.BlockedChanges, "a direct verdict is not a block")
+}
+
+// A direct change on a sharded plan is derived per shard and grouped by
+// (table, reason), so a statement fanned out to several shards lists them
+// together instead of repeating.
+func TestBuildPlanCommentData_PerShardDirect(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "testapp", Type: "strata"}
+	const dropPK = "ALTER TABLE `mutes` DROP PRIMARY KEY"
+	directChange := func() *apitypes.TableChangeResponse {
+		return &apitypes.TableChangeResponse{
+			TableName: "mutes", DDL: dropPK, ChangeType: "alter",
+			ExecutionMode: "direct", ModeReason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~40 rows",
+		}
+	}
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace:    "testapp_sharded",
+			TableChanges: []*apitypes.TableChangeResponse{directChange()},
+		}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "testapp_sharded", Shard: "-40", Changes: []*apitypes.TableChangeResponse{directChange()}},
+			{Namespace: "testapp_sharded", Shard: "40-80", Changes: []*apitypes.TableChangeResponse{directChange()}},
+		},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+
+	require.Len(t, data.DirectChanges, 1, "the same direct statement on two shards is grouped, not repeated")
+	assert.Equal(t, "mutes", data.DirectChanges[0].Table)
+	assert.Equal(t, []string{"-40", "40-80"}, data.DirectChanges[0].Shards)
+}

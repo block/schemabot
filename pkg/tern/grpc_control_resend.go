@@ -77,17 +77,19 @@ func (g *remoteControlSendGate) clear(controlReqID int64) {
 // remoteControlStaleThreshold — at that point the data plane is not consuming
 // an accepted command and an operator must check its logs for the failing
 // consume.
-func logRemoteControlResend(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, now time.Time) {
+// The logger is expected to carry the apply's identity attributes already
+// bound, so each line appends only the mutable snapshot.
+func logRemoteControlResend(ctx context.Context, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, now time.Time) {
 	pendingFor := now.Sub(controlReq.CreatedAt)
-	attrs := append(apply.LogAttrs(),
+	attrs := append(apply.MutableLogAttrs(),
 		"operation", string(controlReq.Operation),
 		"requested_by", controlReq.RequestedBy,
 		"pending_for", pendingFor.Round(time.Second),
 	)
 	if pendingFor >= remoteControlStaleThreshold {
 		metrics.RecordRemoteControlRequestStale(ctx, string(controlReq.Operation), apply.Database, apply.Deployment, apply.Environment)
-		slog.Warn("remote control request accepted but still unconsumed by the data plane; driver keeps re-sending and polling — check data-plane logs for the failing consume", attrs...)
+		logger.Warn("remote control request accepted but still unconsumed by the data plane; driver keeps re-sending and polling — check data-plane logs for the failing consume", attrs...)
 		return
 	}
-	slog.Info("re-sent pending remote control request to the data plane", attrs...)
+	logger.Info("re-sent pending remote control request to the data plane", attrs...)
 }

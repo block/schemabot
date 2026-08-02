@@ -82,7 +82,7 @@ func RenderSchemaChangeReconciliationRequired(data SchemaChangeReconciliationDat
 		writeCompletedReconciliation(&sb, data.Tenant, data.Items)
 	}
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 func writeReconciliationMetadata(sb *strings.Builder, items []SchemaChangeReconciliationItem) {

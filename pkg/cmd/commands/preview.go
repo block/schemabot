@@ -71,6 +71,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCLIOutput(previewType)
 	// Comment template types
 	case templates.PreviewCommentPlan, templates.PreviewCommentPlanBlocked,
+		templates.PreviewCommentPlanDirect,
 		templates.PreviewCommentApplyBlockedRejected,
 		templates.PreviewCommentPlanTenant,
 		templates.PreviewCommentPlanEmpty,
@@ -90,6 +91,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyProgress, templates.PreviewCommentApplyCompleted,
 		templates.PreviewCommentApplyEstimateExceeded,
 		templates.PreviewCommentApplyFailed,
+		templates.PreviewCommentApplyFailedBeforeRowCopy,
 		templates.PreviewCommentApplyRetrying,
 		templates.PreviewCommentApplyStopped,
 		templates.PreviewCommentApplyWaitingCutover, templates.PreviewCommentApplyCuttingOver,
@@ -246,6 +248,7 @@ Interactive TUI:
 Comment Templates (GitHub PR comments):
   comment_plan                  Plan comment with DDL changes + lint violations
   comment_plan_blocked          Plan with a statement the engine refuses (blocked verdict)
+  comment_plan_direct           Locked plan with a statement routed to direct execution
   comment_apply_blocked_rejected Apply rejected: plan contains engine-blocked statements
   comment_plan_tenant           Tenant-targeted plan comment
   comment_plan_empty            Plan comment with no changes
@@ -270,6 +273,7 @@ Comment Templates (GitHub PR comments):
   comment_apply_estimate_exceeded Multi-table: running after MySQL row estimate was exceeded
   comment_apply_completed       Multi-table: completed (all tables done)
   comment_apply_failed          Multi-table: failed (with error and cancelled tables)
+  comment_apply_failed_before_row_copy Multi-table: failed before row copy (preflight rejection, per-table error)
   comment_apply_retrying        Multi-table: interrupted, retrying automatically (attempt counter)
   comment_apply_stopped         Multi-table: stopped (partial progress)
   comment_apply_waiting_cutover Waiting for cutover (deferred, operator triggers)

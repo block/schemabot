@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -249,11 +250,11 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 	if controlReq == nil {
 		return nil
 	}
+	// Bind the apply's identity once so every consumption log line is
+	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
+	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if cutoverRequestResolvedByApplyState(apply.State) {
-		c.logger.Info("completing pending cutover request for resolved apply",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
+		logger.Info("completing pending cutover request for resolved apply",
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
@@ -268,10 +269,7 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
 	if state.IsState(apply.State, state.Apply.Recovering) {
-		c.logger.Info("pending cutover request is waiting for recovery to complete",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
+		logger.Info("pending cutover request is waiting for recovery to complete",
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 		return nil
@@ -281,10 +279,7 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		return fmt.Errorf("check cutover readiness for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if !readyForCutover {
-		c.logger.Info("pending cutover request is waiting for cutover-ready state",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
+		logger.Info("pending cutover request is waiting for cutover-ready state",
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 		return nil
@@ -307,8 +302,8 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		// rejection clears on its own. Leave the request pending so the next
 		// progress tick retries it — terminally failing it would strand a
 		// deferred cutover until an operator notices and re-issues the command.
-		c.logger.Info("pending cutover request not accepted yet by engine backend; retrying at the next progress tick",
-			append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq), "error", err)...)
+		logger.Info("pending cutover request not accepted yet by engine backend; retrying at the next progress tick",
+			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq), "error", err)...)
 		return nil
 	}
 	if err != nil {
@@ -338,10 +333,7 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover); err != nil {
 		return err
 	}
-	c.logger.Info("pending cutover request accepted and completed",
-		"apply_id", apply.ApplyIdentifier,
-		"database", apply.Database,
-		"environment", apply.Environment,
+	logger.Info("pending cutover request accepted and completed",
 		"requested_by", controlRequestCaller(controlReq),
 		"state", apply.State)
 	return nil
@@ -913,16 +905,13 @@ func (c *LocalClient) settleStopForTasklessApply(ctx context.Context, targetAppl
 // this, a stop and a start that race into the same claim would consume only the
 // stop, leaving the apply stopped with a pending start that the claim
 // lease-freshness gate cannot re-claim until the lease goes stale.
-func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, apply *storage.Apply) (bool, error) {
+func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, logger *slog.Logger, apply *storage.Apply) (bool, error) {
 	hasPendingStart, err := hasPendingStartControlRequest(ctx, c.storage, apply)
 	if err != nil {
 		return true, fmt.Errorf("check pending start request after stop for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if hasPendingStart {
-		c.logger.Info("pending stop completed but a start is queued; continuing to resume in the same claim",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
+		logger.Info("pending stop completed but a start is queued; continuing to resume in the same claim",
 			"state", apply.State)
 		return false, nil
 	}
@@ -937,20 +926,21 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	if controlReq == nil {
 		return false, nil
 	}
+	// Bind the apply's identity once so every consumption log line is
+	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
+	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if completed, err := completePendingStopIfStoredApplyResolved(ctx, c.storage, apply); err != nil {
 		return true, err
 	} else if completed {
-		c.logger.Info("completing pending stop request for resolved apply",
-			"apply_id", apply.ApplyIdentifier,
+		logger.Info("completing pending stop request for resolved apply",
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending stop request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		return c.stopHandledUnlessStartPending(ctx, apply)
+		return c.stopHandledUnlessStartPending(ctx, logger, apply)
 	}
 	if state.IsTerminalApplyState(apply.State) {
-		c.logger.Info("completing pending stop request for terminal apply",
-			"apply_id", apply.ApplyIdentifier,
+		logger.Info("completing pending stop request for terminal apply",
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
@@ -958,7 +948,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 			return true, err
 		}
-		return c.stopHandledUnlessStartPending(ctx, apply)
+		return c.stopHandledUnlessStartPending(ctx, logger, apply)
 	}
 
 	// A revert-phase apply has already cut over. Stop is a permanent rejection,
@@ -969,8 +959,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		return true, err
 	} else if revertPhase != "" {
 		message := revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase)
-		c.logger.Warn("rejecting pending stop request: schema change is in a revert phase and has already cut over",
-			"apply_id", apply.ApplyIdentifier,
+		logger.Warn("rejecting pending stop request: schema change is in a revert phase and has already cut over",
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State,
 			"revert_phase", revertPhase)
@@ -1015,9 +1004,12 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 	if controlReq == nil {
 		return false, nil
 	}
+	// Bind the apply's identity once so every consumption log line is
+	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
+	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
-		c.logger.Info("completing pending cancel request for terminal apply",
-			append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
+		logger.Info("completing pending cancel request for terminal apply",
+			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending cancel request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
@@ -1029,8 +1021,8 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		return true, err
 	} else if revertPhase != "" {
 		message := revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase)
-		c.logger.Warn("rejecting pending cancel request: schema change is in a revert phase and has already cut over",
-			append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq), "revert_phase", revertPhase)...)
+		logger.Warn("rejecting pending cancel request: schema change is in a revert phase and has already cut over",
+			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq), "revert_phase", revertPhase)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending cancel request rejected: %s%s", message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel, message); err != nil {
@@ -1821,7 +1813,7 @@ func (c *LocalClient) processPendingVolumeControlRequest(ctx context.Context, ap
 			message = result.Message
 		}
 		c.logger.Warn("engine did not accept pending volume request; schema change continues at its current volume",
-			append(apply.LogAttrs(), "volume", volume, "requested_by", caller, "message", message)...)
+			append(apply.LogAttrs(), "volume", volume, "requested_by", caller, "engine_message", message)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Volume change to %d was not accepted: %s; schema change continues at its current volume", volume, message), "", "")
 		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationVolume, message)
@@ -1907,7 +1899,7 @@ func (c *LocalClient) convergeTaskVolumeToStoredLevel(ctx context.Context, apply
 			message = result.Message
 		}
 		c.logger.Warn("engine did not accept converging task to the stored volume level; task continues at the engine default",
-			append(task.LogAttrs(), "volume", volume, "message", message)...)
+			append(task.LogAttrs(), "volume", volume, "engine_message", message)...)
 		return
 	}
 	c.logger.Info("task volume converged to the apply's stored level",

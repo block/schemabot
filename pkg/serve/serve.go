@@ -551,6 +551,7 @@ func (s *Server) Start(ctx context.Context) {
 	s.svc.StartOperator(ctx)
 	s.svc.StartRemoteDeploymentHealthMonitor(ctx)
 	s.svc.StartWebhookInboxMonitor(ctx)
+	s.svc.StartOperatorStuckPendingMonitor(ctx)
 	s.svc.StartPendingDropsCleaner(ctx)
 }
 
@@ -660,14 +661,20 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysq
 
 	dbName := matches[0]
 	dbConfig := config.Databases[dbName]
-	targetDSN, err := dbConfig.Environments[env].ResolveDSN()
+	envConfig := dbConfig.Environments[env]
+	targetDSN, err := envConfig.ResolveDSN()
 	if err != nil {
 		return nil, fmt.Errorf("resolve DSN for %s/%s: %w", dbName, env, err)
+	}
+	metadata, err := envConfig.DirectExecution.EngineMetadata()
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct_execution metadata for %s/%s: %w", dbName, env, err)
 	}
 	client, err := grpcLocalClientFactory(config, wake, engineFactories)(tern.LocalConfig{
 		Database:  dbName,
 		Type:      dbConfig.Type,
 		TargetDSN: targetDSN,
+		Metadata:  metadata,
 	}, st, logger)
 	if err != nil {
 		return nil, fmt.Errorf("create local client for %s: %w", dbName, err)
@@ -912,15 +919,20 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups []stri
 			"trusted_proxy_cidrs", len(fa.TrustedProxyCIDRs),
 			"trusted_proxy_spiffe", len(fa.TrustedProxySPIFFE),
 			"read_groups", len(fa.ReadGroups),
-			"write_groups", len(fa.WriteGroups))
+			"write_groups", len(fa.WriteGroups),
+			"trusted_gateway_spiffe", len(fa.TrustedGatewaySPIFFE),
+			"read_service_spiffe", len(fa.ReadServiceSPIFFE))
 		authz, err := auth.NewForwardAuthAuthorizer(auth.ForwardAuthConfig{
-			UserHeader:         fa.UserHeader,
-			GroupsHeader:       fa.GroupsHeader,
-			GroupsDelimiter:    fa.GroupsDelimiter,
-			TrustedProxySPIFFE: fa.TrustedProxySPIFFE,
-			TrustedProxyCIDRs:  fa.TrustedProxyCIDRs,
-			ReadGroups:         fa.ReadGroups,
-			WriteGroups:        fa.WriteGroups,
+			UserHeader:           fa.UserHeader,
+			GroupsHeader:         fa.GroupsHeader,
+			GroupsDelimiter:      fa.GroupsDelimiter,
+			TrustedProxySPIFFE:   fa.TrustedProxySPIFFE,
+			TrustedProxyCIDRs:    fa.TrustedProxyCIDRs,
+			ReadGroups:           fa.ReadGroups,
+			WriteGroups:          fa.WriteGroups,
+			TrustedGatewaySPIFFE: fa.TrustedGatewaySPIFFE,
+			CallerSPIFFEHeader:   fa.CallerSPIFFEHeader,
+			ReadServiceSPIFFE:    fa.ReadServiceSPIFFE,
 		}, logger)
 		if err != nil {
 			return nil, err

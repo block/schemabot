@@ -41,6 +41,7 @@ func previewCommentAllOutput() {
 	}{
 		{"PLAN COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentPlan()) }},
 		{"PLAN COMMENT (ENGINE-BLOCKED CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlocked()) }},
+		{"PLAN COMMENT (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDirect()) }},
 		{"APPLY REJECTED (ENGINE-BLOCKED CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedRejected()) }},
 		{"PLAN COMMENT (TENANT TARGET)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanTenant()) }},
 		{"PLAN COMMENT (NO CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges()) }},
@@ -78,6 +79,7 @@ func previewCommentAllOutput() {
 		{"APPLY COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCompleted()) }},
 		{"APPLY RETRYING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyRetrying()) }},
 		{"APPLY FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFailed()) }},
+		{"APPLY FAILED (BEFORE ROW COPY)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFailedBeforeRowCopy()) }},
 		{"APPLY STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStopped()) }},
 		{"APPLY WAITING FOR CUTOVER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutover()) }},
 		{"APPLY WAITING FOR CUTOVER (AUTOMATIC)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutoverAutomatic()) }},
@@ -128,6 +130,7 @@ func previewCommentPlanAllOutput() {
 	}{
 		{"MYSQL PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentPlan()) }},
 		{"MYSQL PLAN (ENGINE-BLOCKED CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlocked()) }},
+		{"MYSQL PLAN (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDirect()) }},
 		{"APPLY REJECTED (ENGINE-BLOCKED CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedRejected()) }},
 		{"MYSQL PLAN (TENANT TARGET)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanTenant()) }},
 		{"MYSQL PLAN (NO CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges()) }},
@@ -241,6 +244,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"MIDDLE TABLE RETRYING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyRetrying()) }},
 		{"FIRST TABLE FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFirstFailed()) }},
 		{"MIDDLE TABLE FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFailed()) }},
+		{"FAILED BEFORE ROW COPY (PREFLIGHT)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFailedBeforeRowCopy()) }},
 		{"STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStopped()) }},
 		{"RESUMING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyResuming()) }},
 		{"CANCELLED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCancelled()) }},

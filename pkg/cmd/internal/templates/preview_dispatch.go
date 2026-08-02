@@ -118,6 +118,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentPlan())
 	case PreviewCommentPlanBlocked:
 		fmt.Print(webhooktemplates.PreviewCommentPlanBlocked())
+	case PreviewCommentPlanDirect:
+		fmt.Print(webhooktemplates.PreviewCommentPlanDirect())
 	case PreviewCommentApplyBlockedRejected:
 		fmt.Print(webhooktemplates.PreviewCommentApplyBlockedRejected())
 	case PreviewCommentPlanTenant:
@@ -176,6 +178,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentApplyCompleted())
 	case PreviewCommentApplyFailed:
 		fmt.Print(webhooktemplates.PreviewCommentApplyFailed())
+	case PreviewCommentApplyFailedBeforeRowCopy:
+		fmt.Print(webhooktemplates.PreviewCommentApplyFailedBeforeRowCopy())
 	case PreviewCommentApplyRetrying:
 		fmt.Print(webhooktemplates.PreviewCommentApplyRetrying())
 	case PreviewCommentApplyStopped:
