@@ -369,7 +369,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		// gating here keeps the verdict — an informational field — from ever
 		// failing the plan on a statement type the verdict's own parser
 		// doesn't accept.
-		if stmtType == statement.StatementAlterTable {
+		if stmtType == ddl.StatementAlterTable {
 			reason, refused, err := ddl.EngineRefusalReason(pc.Statement)
 			if err != nil {
 				return nil, fmt.Errorf("execution verdict for table %q: %w", pc.TableName, err)
