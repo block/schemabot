@@ -5,6 +5,7 @@
 ## Table of Contents
 
 - [Routing](#routing)
+- [Stop, resume, and retry](#stop-resume-and-retry)
 - [The size bound](#the-size-bound)
 - [Engine compatibility](#engine-compatibility)
 - [Operator consent in the PR workflow](#operator-consent-in-the-pr-workflow)
@@ -58,11 +59,47 @@ engine refuses statement (e.g. primary-key reshape)
                                                progress entry and outcome metric
 ```
 
-The same predicate is re-evaluated at apply time before anything runs, so a
-verdict cannot go stale between plan and execution — a table that grew past
-the bound after planning is blocked at apply, not run. Statements the policy
-does not route stay blocked and keep the blocked-apply gate behavior: the
-apply is rejected up front with the engine's refusal reason.
+The same predicate is re-evaluated at apply time before any ALTER executes,
+so a verdict cannot go stale between plan and execution — a table that grew
+past the bound after planning is blocked at apply, not run. Statements the
+policy does not route stay blocked and keep the blocked-apply gate behavior:
+a plan-time blocked verdict rejects the apply up front, before anything
+executes. A verdict that only becomes blocked at apply time — the table grew
+past the bound after the confirm-time re-plan — fails the apply at the ALTER
+routing step instead; CREATE TABLE statements in the same plan run before
+that step, so such an apply can leave new tables created while every ALTER
+is untouched.
+
+Routing partitions the ALTER phase, and the partition is also the execution
+order: all direct statements run first, then all engine-driven statements,
+regardless of their relative order in the plan. A statement in one partition
+that depends on one in the other fails at apply time — the apply fails closed
+rather than reordering statements to satisfy the dependency.
+
+## Stop, resume, and retry
+
+A direct statement has no checkpoint — it is a single synchronous DDL — so
+stop and resume work on statement boundaries:
+
+- A stop that lands before or between direct statements leaves the schema
+  change cleanly stopped and resumable; nothing ran that the resume would
+  repeat.
+- Each completed direct statement is recorded, and a resume consults the
+  record: statements that already completed are skipped (the
+  `skipped_completed` metric outcome), never executed twice.
+- A stop that lands mid-statement leaves that statement's outcome unknown —
+  the connection dropped, but MySQL may have finished the DDL server-side.
+  Resuming over an unknown outcome fails closed (the
+  `blocked_outcome_unknown` metric outcome) instead of re-executing: a
+  re-run of non-revertible DDL can silently duplicate it (an unnamed
+  `FOREIGN KEY` re-runs successfully as a second identical constraint). The
+  failure tells the operator to inspect the table and run a fresh plan,
+  which diffs the live schema and picks up exactly what still needs to run.
+- `volume` on a schema change whose direct stage is still running behaves
+  like the stop it is built on: mid-statement it lands in the unknown-outcome
+  case above.
+- A retry after a terminal failure goes through a fresh plan, so statements
+  that landed before the failure drop out of the diff and are not repeated.
 
 ## The size bound
 
@@ -154,12 +191,19 @@ containing direct-execution changes never does:
 
 ## Observability
 
-Every routing outcome increments
+Apply-time routing and execution increment
 `schemabot.direct_execution.statements_total` with the database and an
 `outcome` attribute: `completed`, `failed`, or `stopped` for executed
-statements; `blocked_policy_disabled`, `blocked_size_limit`, or
-`blocked_size_unknown` for statements the policy did not route. Direct
-executions are rare, operator-consented events — a spike in `failed` means
-native DDL is erroring on the target (check the apply logs for the statement
-and MySQL error), and a spike in `blocked_size_unknown` means row counts
-are unavailable (check target connectivity and `information_schema` access).
+statements; `skipped_completed` for a statement a resume skipped because it
+already completed; `blocked_policy_disabled`, `blocked_size_limit`, or
+`blocked_size_unknown` for statements the policy did not route; and
+`blocked_outcome_unknown` when a resume fails closed over a statement an
+earlier run left with an unknown outcome. Plan-time verdicts are not
+counted, and apply-time routing stops at the first blocking statement, so a
+blocked apply increments the counter once. Direct executions are rare,
+operator-consented events — a spike in `failed` means native DDL is erroring
+on the target (check the apply logs for the statement and MySQL error), a
+spike in `blocked_size_unknown` means row counts are unavailable (check
+target connectivity and `information_schema` access), and any
+`blocked_outcome_unknown` means an interrupted direct statement needs an
+operator to inspect the table and re-plan.

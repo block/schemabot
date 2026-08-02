@@ -11,7 +11,6 @@ import (
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
@@ -71,13 +70,7 @@ func (e *Engine) newSpiritMigration(ctx context.Context, host, username, passwor
 // Spirit's pre-cutover checksum turns a missed change into a failed apply,
 // never silent divergence.
 func (e *Engine) gtidChangeSourceSupported(ctx context.Context, host, username, password, database string) bool {
-	cfg := mysql.NewConfig()
-	cfg.User = username
-	cfg.Passwd = password
-	cfg.Net = "tcp"
-	cfg.Addr = host
-	cfg.DBName = database
-	db, err := mysqlconn.Open(cfg.FormatDSN())
+	db, err := mysqlconn.Open(targetDSN(host, username, password, database))
 	if err != nil {
 		e.logger.Warn("failed to probe target GTID support, using the binlog file+position change source",
 			"target_host", host, "database", database, "error", err)
@@ -113,8 +106,11 @@ func (e *Engine) gtidChangeSourceSupported(ctx context.Context, host, username, 
 // CREATE and DROP statements are executed individually through Spirit. ALTER
 // statements Spirit accepts are combined for atomic multi-table execution;
 // ALTERs Spirit refuses run as native MySQL DDL when the direct execution
-// policy permits, and fail the schema change otherwise.
-func (e *Engine) executeSchemaChange(ctx context.Context, host, username, password, database string, ddlStatements []string, deferCutover bool, policy directPolicy) {
+// policy permits, and fail the schema change otherwise. dsn is the verbatim
+// credentials DSN; it may carry connection parameters (e.g. TLS) that the
+// parsed-out parts don't, so paths that open their own target connection use
+// it rather than rebuilding a DSN from the parts.
+func (e *Engine) executeSchemaChange(ctx context.Context, dsn, host, username, password, database string, ddlStatements []string, deferCutover bool, policy directPolicy) {
 	phases, err := classifyDDLPhases(ddlStatements)
 	if err != nil {
 		e.logger.Error("failed to classify statement", "error", err)
@@ -130,7 +126,7 @@ func (e *Engine) executeSchemaChange(ctx context.Context, host, username, passwo
 	// Execute ALTER statements (routed per statement between Spirit and
 	// direct execution).
 	if len(phases.alters) > 0 {
-		if !e.executeAlterPhase(ctx, host, username, password, database, phases.alters, deferCutover, policy) {
+		if !e.executeAlterPhase(ctx, dsn, host, username, password, database, phases.alters, deferCutover, policy) {
 			return
 		}
 	}
@@ -167,9 +163,9 @@ func (e *Engine) executeSchemaChange(ctx context.Context, host, username, passwo
 // phase, so once an ALTER has started they are already applied; only the DROP
 // phase remains and must run after the resumed ALTER completes. When no ALTER was
 // in flight, the whole plan is run from the start.
-func (e *Engine) resumeSchemaChange(ctx context.Context, host, username, password, database string, originalDDLs []string, combinedStatement string, deferCutover bool, policy directPolicy) {
+func (e *Engine) resumeSchemaChange(ctx context.Context, dsn, host, username, password, database string, originalDDLs []string, combinedStatement string, deferCutover bool, policy directPolicy) {
 	if combinedStatement == "" {
-		e.executeSchemaChange(ctx, host, username, password, database, originalDDLs, deferCutover, policy)
+		e.executeSchemaChange(ctx, dsn, host, username, password, database, originalDDLs, deferCutover, policy)
 		return
 	}
 
@@ -282,12 +278,23 @@ func (e *Engine) executeCreateStatements(ctx context.Context, host, username, pa
 // already set StateFailed). A stop cancels the context but may return true;
 // the caller's later ctx.Err() checks then keep the state Stopped without
 // running further phases.
-func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password, database string, alters []string, deferCutover bool, policy directPolicy) bool {
-	target := &lazyTargetDB{dsn: targetDSN(host, username, password, database)}
+func (e *Engine) executeAlterPhase(ctx context.Context, dsn, host, username, password, database string, alters []string, deferCutover bool, policy directPolicy) bool {
+	// The size gate and direct executor connect with the verbatim credentials
+	// DSN — the same connection Plan's gate used — so DSN parameters (e.g.
+	// TLS) survive to apply time instead of being dropped by a rebuild from
+	// the parsed parts.
+	target := &lazyTargetDB{dsn: dsn}
 	defer target.close()
 
 	routing, err := e.routeAlterStatements(ctx, target, database, alters, policy)
 	if err != nil {
+		if ctx.Err() != nil {
+			e.logger.Info("schema change stopped during ALTER routing",
+				"database", database,
+				"reason", ctx.Err(),
+			)
+			return true
+		}
 		e.logger.Error("ALTER routing failed", "database", database, "error", err)
 		e.setSchemaChangeFailed(err)
 		return false

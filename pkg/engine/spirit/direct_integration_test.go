@@ -206,10 +206,31 @@ func TestResolveRefusedMode_UnreachableTargetBlocks(t *testing.T) {
 	defer target.close()
 
 	policy := directPolicy{Enabled: true, MaxTableRows: 1000}
-	decision := eng.resolveRefusedMode(ctx, target, policy, "absent", "users", "dropping primary key is not supported")
+	decision, err := eng.resolveRefusedMode(ctx, target, policy, "absent", "users", "dropping primary key is not supported")
+	require.NoError(t, err, "an unreachable target is a verdict, not an error")
 	assert.Equal(t, engine.ExecutionModeBlocked, decision.mode)
 	assert.Contains(t, decision.modeReason, "dropping primary key is not supported")
 	assert.Contains(t, decision.modeReason, "row count is unavailable")
+}
+
+// A context cancelled while the size gate runs is an operator stop, not an
+// unmeasurable table: the resolver reports it as an error instead of a
+// blocked verdict, so a stop is never misdiagnosed as "row count unavailable"
+// and never recorded under the blocked_size_unknown metric outcome.
+func TestResolveRefusedMode_CancelledContextIsAnErrorNotAVerdict(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	eng := New(Config{Logger: logger})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	target := &lazyTargetDB{dsn: "root:nopass@tcp(127.0.0.1:1)/absent"}
+	defer target.close()
+
+	policy := directPolicy{Enabled: true, MaxTableRows: 1000}
+	_, err := eng.resolveRefusedMode(ctx, target, policy, "absent", "users", "dropping primary key is not supported")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.NotContains(t, err.Error(), "row count is unavailable")
 }
 
 // The size gate fails closed on every input it cannot measure: a table
@@ -319,7 +340,7 @@ func TestEngine_ExecuteAlterPhase_DirectApply(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false,
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false,
 		directPolicy{Enabled: true, MaxTableRows: 100000})
 
 	eng.mu.Lock()
@@ -350,7 +371,10 @@ func TestEngine_ExecuteAlterPhase_DirectApply(t *testing.T) {
 
 // A single apply carrying both a refused reshape and an ordinary
 // engine-driven statement routes each to its own path: the reshape runs as
-// native DDL, the engine applies the rest, and both land on the target.
+// native DDL, the engine applies the rest, and both land on the target. The
+// engine-driven statement deliberately precedes the direct one in plan order —
+// the partition is the execution order (direct statements run first), so plan
+// order must not affect where each statement routes or whether both land.
 func TestEngine_ExecuteAlterPhase_MixedRouting(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	dropTablesOnCleanup(t, db, "mixed_direct", "mixed_spirit")
@@ -374,8 +398,8 @@ func TestEngine_ExecuteAlterPhase_MixedRouting(t *testing.T) {
 	require.NoError(t, err, "parseDSN")
 
 	ddlStatements := []string{
-		"ALTER TABLE `mixed_direct` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
 		"ALTER TABLE `mixed_spirit` ADD COLUMN `email` varchar(255) NULL",
+		"ALTER TABLE `mixed_direct` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
 	}
 
 	eng.mu.Lock()
@@ -387,7 +411,7 @@ func TestEngine_ExecuteAlterPhase_MixedRouting(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false,
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false,
 		directPolicy{Enabled: true, MaxTableRows: 100000})
 
 	eng.mu.Lock()
@@ -439,7 +463,7 @@ func TestEngine_ExecuteAlterPhase_PolicyOffFailsFast(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, directPolicy{})
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, directPolicy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -496,7 +520,7 @@ func TestEngine_ExecuteAlterPhase_AboveBoundFailsFast(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false,
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false,
 		directPolicy{Enabled: true, MaxTableRows: 10})
 
 	eng.mu.Lock()
@@ -564,7 +588,7 @@ func TestEngine_ExecuteAlterPhase_BusyTableFailsFast(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	const lockWaitSeconds = 2
-	eng.executeSchemaChange(ctx, host, username, password, database, ddlStatements, false,
+	eng.executeSchemaChange(ctx, dsn, host, username, password, database, ddlStatements, false,
 		directPolicy{Enabled: true, MaxTableRows: 100000, LockAcquisitionTimeoutSeconds: lockWaitSeconds})
 
 	eng.mu.Lock()
@@ -602,4 +626,349 @@ func TestEngine_RouteAlterStatements_UnknownSizeBlocked(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "direct_missing")
 	assert.Contains(t, err.Error(), "row count is unavailable")
+}
+
+// directProgressEntries returns the direct-execution entries a progress poll
+// reports, so tests can assert per-statement lifecycle rendering.
+func directProgressEntries(t *testing.T, eng *Engine) []engine.TableProgress {
+	t.Helper()
+	progress, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+	require.NoError(t, err, "Progress()")
+	var entries []engine.TableProgress
+	for _, tp := range progress.Tables {
+		if tp.ProgressDetail == "direct execution (native MySQL DDL)" {
+			entries = append(entries, tp)
+		}
+	}
+	return entries
+}
+
+// An operator stop that lands while a direct statement is executing leaves the
+// schema change cleanly stopped — never failed — with the statement's entry
+// recording the interruption: state "stopped" and no completion time, because
+// MySQL may have finished the DDL server-side after the connection dropped.
+// A subsequent resume then fails closed instead of re-executing the statement:
+// non-revertible DDL must never run again when whether it took effect is
+// unknown, and the failure tells the operator to reconcile with a fresh plan.
+func TestEngine_DirectStatements_StopMidStatementThenResumeFailsClosed(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "direct_stop")
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE direct_stop (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create direct_stop table")
+	_, err = db.ExecContext(t.Context(), `INSERT INTO direct_stop (tenant_id) VALUES (1)`)
+	require.NoError(t, err, "insert data")
+
+	// Hold the table's metadata lock so the direct DDL queues instead of
+	// completing before the stop lands.
+	holder, err := db.BeginTx(t.Context(), nil)
+	require.NoError(t, err, "begin lock-holding transaction")
+	defer func() { _ = holder.Rollback() }()
+	var id int
+	require.NoError(t, holder.QueryRowContext(t.Context(),
+		"SELECT `id` FROM `direct_stop` LIMIT 1 FOR UPDATE").Scan(&id), "acquire the metadata lock")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	ddlStatements := []string{
+		"ALTER TABLE `direct_stop` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+	}
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{
+		database: database,
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	}
+	eng.mu.Unlock()
+
+	// The lock bound must outlast the stop below; if the stop machinery fails,
+	// the bounded wait fails the statement instead and the state assertions
+	// diagnose it.
+	policy := directPolicy{Enabled: true, MaxTableRows: 100000, LockAcquisitionTimeoutSeconds: 25}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		eng.executeSchemaChange(ctx, dsn, host, username, password, database, ddlStatements, false, policy)
+	}()
+
+	// Wait until the DDL is queued on the metadata lock before stopping, so
+	// the stop provably lands mid-statement.
+	require.Eventually(t, func() bool {
+		var waiting int
+		err := db.QueryRowContext(t.Context(), `
+			SELECT COUNT(*) FROM information_schema.PROCESSLIST
+			WHERE STATE = 'Waiting for table metadata lock' AND INFO LIKE '%direct_stop%'`).Scan(&waiting)
+		return err == nil && waiting > 0
+	}, 20*time.Second, 100*time.Millisecond, "the direct DDL never queued on the metadata lock")
+
+	// Stop the way Stop() does: record the stopped state, then cancel.
+	eng.mu.Lock()
+	eng.runningSchemaChange.state = engine.StateStopped
+	eng.mu.Unlock()
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("executeSchemaChange did not return after the stop")
+	}
+
+	eng.mu.Lock()
+	stoppedState := eng.runningSchemaChange.state
+	stoppedError := eng.runningSchemaChange.errorMessage
+	eng.mu.Unlock()
+	assert.Equal(t, engine.StateStopped, stoppedState, "a stop must never surface as a failure")
+	assert.Empty(t, stoppedError, "a stop records no error message")
+
+	entries := directProgressEntries(t, eng)
+	require.Len(t, entries, 1, "the interrupted statement reports one lifecycle entry")
+	assert.Equal(t, "direct_stop", entries[0].Table)
+	assert.Equal(t, "stopped", entries[0].State)
+	assert.Nil(t, entries[0].CompletedAt, "an interrupted statement has no completion time: its outcome is unknown")
+
+	require.NoError(t, holder.Rollback(), "release the metadata lock")
+
+	// Resume the way Start() does: mark running and re-run the plan from the
+	// start (no Spirit statement was in flight, so there is no checkpoint).
+	eng.mu.Lock()
+	eng.runningSchemaChange.state = engine.StateRunning
+	eng.mu.Unlock()
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, policy)
+
+	eng.mu.Lock()
+	resumedState := eng.runningSchemaChange.state
+	resumedError := eng.runningSchemaChange.errorMessage
+	directCount := len(eng.runningSchemaChange.directStatements)
+	eng.mu.Unlock()
+	assert.Equal(t, engine.StateFailed, resumedState, "resuming over an unknown outcome fails closed")
+	assert.Contains(t, resumedError, "direct_stop")
+	assert.Contains(t, resumedError, "outcome is unknown")
+	assert.Contains(t, resumedError, "run a fresh plan")
+	assert.Equal(t, 1, directCount, "the resume reuses the recorded entry instead of appending a duplicate")
+}
+
+// A resume never re-executes a direct statement that already completed on an
+// earlier run: the recorded completion is consulted and the statement is
+// skipped, so non-revertible native DDL runs exactly once even when the whole
+// plan is re-run from the start. Re-executing this statement would fail
+// outright (the primary key is already gone), so a completed resume proves
+// the skip.
+func TestEngine_DirectStatements_ResumeSkipsCompletedStatement(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "direct_resume_skip")
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE direct_resume_skip (
+		id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create direct_resume_skip table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	ddlStatements := []string{"ALTER TABLE `direct_resume_skip` DROP PRIMARY KEY"}
+	policy := directPolicy{Enabled: true, MaxTableRows: 100000}
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{
+		database: database,
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	}
+	eng.mu.Unlock()
+
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, policy)
+
+	eng.mu.Lock()
+	firstState := eng.runningSchemaChange.state
+	eng.mu.Unlock()
+	require.Equal(t, engine.StateCompleted, firstState)
+	assert.Empty(t, pkColumns(t, database, "direct_resume_skip"), "the primary key drop landed")
+
+	// Resume the whole plan from the start, the way Start() does when no
+	// Spirit statement was in flight.
+	eng.mu.Lock()
+	eng.runningSchemaChange.state = engine.StateRunning
+	eng.mu.Unlock()
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false, policy)
+
+	eng.mu.Lock()
+	resumedState := eng.runningSchemaChange.state
+	resumedError := eng.runningSchemaChange.errorMessage
+	directCount := len(eng.runningSchemaChange.directStatements)
+	eng.mu.Unlock()
+	assert.Equal(t, engine.StateCompleted, resumedState, "the completed statement is skipped, not re-executed")
+	assert.Empty(t, resumedError)
+	assert.Equal(t, 1, directCount, "the resume reuses the recorded entry instead of appending a duplicate")
+}
+
+// When one direct statement lands and a later one fails, the schema change
+// fails with the failing table named, and each statement's progress entry
+// records its own terminal lifecycle — completed with a completion time for
+// the statement that ran, failed with a completion time for the one that
+// didn't — so an operator can tell exactly which non-revertible changes took
+// effect.
+func TestEngine_DirectStatements_PartialFailureMarksEachStatement(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "direct_partial_ok", "direct_partial_fail")
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE direct_partial_ok (
+		id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create direct_partial_ok table")
+	// No primary key: the DROP PRIMARY KEY statement routes direct (the
+	// refusal is statement-based) and then fails at execution.
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE direct_partial_fail (
+		id INT NOT NULL
+	)`)
+	require.NoError(t, err, "create direct_partial_fail table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	ddlStatements := []string{
+		"ALTER TABLE `direct_partial_ok` DROP PRIMARY KEY",
+		"ALTER TABLE `direct_partial_fail` DROP PRIMARY KEY",
+	}
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{
+		database: database,
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	}
+	eng.mu.Unlock()
+
+	eng.executeSchemaChange(t.Context(), dsn, host, username, password, database, ddlStatements, false,
+		directPolicy{Enabled: true, MaxTableRows: 100000})
+
+	eng.mu.Lock()
+	finalState := eng.runningSchemaChange.state
+	errorMessage := eng.runningSchemaChange.errorMessage
+	eng.mu.Unlock()
+	assert.Equal(t, engine.StateFailed, finalState)
+	assert.Contains(t, errorMessage, "direct_partial_fail", "the failure names the failing table")
+
+	assert.Empty(t, pkColumns(t, database, "direct_partial_ok"),
+		"the statement that ran before the failure took effect")
+
+	entries := directProgressEntries(t, eng)
+	require.Len(t, entries, 2)
+	byTable := make(map[string]engine.TableProgress, len(entries))
+	for _, tp := range entries {
+		byTable[tp.Table] = tp
+	}
+	completed := byTable["direct_partial_ok"]
+	assert.Equal(t, "completed", completed.State)
+	assert.NotNil(t, completed.CompletedAt)
+	failed := byTable["direct_partial_fail"]
+	assert.Equal(t, "failed", failed.State)
+	assert.NotNil(t, failed.CompletedAt)
+}
+
+// A stop that lands before routing finishes — while the size gate is still
+// measuring — leaves the schema change cleanly stopped: the cancellation is
+// never misreported as a routing failure, no error message is recorded, and
+// the change stays resumable.
+func TestEngine_DirectStatements_StopDuringRoutingKeepsStopped(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "direct_stop_routing")
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE direct_stop_routing (
+		id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create direct_stop_routing table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{
+		database: database,
+		state:    engine.StateStopped,
+		started:  time.Now(),
+	}
+	eng.mu.Unlock()
+
+	// The way a stop reaches routing: Stop() records StateStopped and cancels
+	// the context the execution goroutine runs under.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	eng.executeSchemaChange(ctx, dsn, host, username, password, database,
+		[]string{"ALTER TABLE `direct_stop_routing` DROP PRIMARY KEY"}, false,
+		directPolicy{Enabled: true, MaxTableRows: 100000})
+
+	eng.mu.Lock()
+	finalState := eng.runningSchemaChange.state
+	errorMessage := eng.runningSchemaChange.errorMessage
+	eng.mu.Unlock()
+	assert.Equal(t, engine.StateStopped, finalState, "a stop during routing must never surface as a failure")
+	assert.Empty(t, errorMessage)
+	assert.Equal(t, []string{"id"}, pkColumns(t, database, "direct_stop_routing"), "the target is untouched")
+}
+
+// A resumed schema change routes refused statements with the policy that was
+// snapshotted at Apply: the resume path forwards the stored policy into
+// routing, so a stopped direct apply resumes to completion instead of being
+// refused as if the policy were disabled.
+func TestEngine_ResumeSchemaChange_RoutesWithSnapshottedPolicy(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "direct_resume_policy")
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE direct_resume_policy (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create direct_resume_policy table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{
+		database: database,
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	}
+	eng.mu.Unlock()
+
+	// No Spirit statement was in flight when the change stopped, so the
+	// resume runs the whole plan from the start with the snapshotted policy.
+	eng.resumeSchemaChange(t.Context(), dsn, host, username, password, database,
+		[]string{"ALTER TABLE `direct_resume_policy` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)"},
+		"", false, directPolicy{Enabled: true, MaxTableRows: 100000})
+
+	eng.mu.Lock()
+	finalState := eng.runningSchemaChange.state
+	eng.mu.Unlock()
+	require.Equal(t, engine.StateCompleted, finalState)
+	assert.Equal(t, []string{"id", "tenant_id"}, pkColumns(t, database, "direct_resume_policy"),
+		"the resumed direct statement landed")
 }

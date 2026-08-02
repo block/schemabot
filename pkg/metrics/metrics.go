@@ -1498,14 +1498,20 @@ func RecordPendingDropMoved(ctx context.Context, database string) {
 // knownDirectExecutionOutcomes limits metric cardinality to the outcomes the
 // direct execution path can produce. Executed statements terminate as
 // completed, failed, or stopped; refused statements the policy does not route
-// directly are blocked with the reason encoded in the outcome.
+// directly are blocked with the reason encoded in the outcome. Resumed schema
+// changes add two outcomes: skipped_completed (a statement that already
+// completed on an earlier run is not re-executed) and blocked_outcome_unknown
+// (an earlier run was interrupted mid-statement, so the resume fails closed
+// rather than re-executing non-revertible DDL against an unknown outcome).
 var knownDirectExecutionOutcomes = map[string]bool{
 	"completed":               true,
 	"failed":                  true,
 	"stopped":                 true,
+	"skipped_completed":       true,
 	"blocked_policy_disabled": true,
 	"blocked_size_limit":      true,
 	"blocked_size_unknown":    true,
+	"blocked_outcome_unknown": true,
 }
 
 // RecordDirectExecution increments the counter for a statement the
