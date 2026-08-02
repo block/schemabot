@@ -92,7 +92,7 @@ func TestApplyOperation_Lease(t *testing.T) {
 func TestLeaseOwnedByThisProcess(t *testing.T) {
 	self := LeaseOwnerProcess()
 	assert.NotEmpty(t, self)
-	assert.NotContains(t, self, "driver", "the process identity carries no claimer suffix")
+	assert.Regexp(t, `/[0-9]+$`, self, "the process identity ends at the pid; claimer suffixes are appended by callers")
 
 	assert.True(t, LeaseOwnedByThisProcess(self+"/driver-0"))
 	assert.True(t, LeaseOwnedByThisProcess(self+"/driver-12"))
