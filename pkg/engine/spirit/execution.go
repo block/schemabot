@@ -231,9 +231,9 @@ func classifyDDLPhases(ddlStatements []string) (ddlPhases, error) {
 			return ddlPhases{}, fmt.Errorf("classify statement %q: %w", stmt, err)
 		}
 		switch stmtType {
-		case statement.StatementCreateTable:
+		case ddl.StatementCreateTable:
 			phases.creates = append(phases.creates, stmt)
-		case statement.StatementDropTable:
+		case ddl.StatementDropTable:
 			phases.drops = append(phases.drops, stmt)
 		default:
 			phases.alters = append(phases.alters, stmt)

@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 	drivermysql "github.com/go-sql-driver/mysql"
@@ -22,6 +21,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/mysql"
 
 	waitutil "github.com/block/schemabot/e2e/testutil"
+	ddlpkg "github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -3203,7 +3203,7 @@ func TestLocalClient_ResumeApplyGroupedRebuildsChangesFromTasks(t *testing.T) {
 	require.Len(t, applyReq.Changes[0].TableChanges, 1)
 	assert.Equal(t, "users", applyReq.Changes[0].TableChanges[0].Table)
 	assert.Equal(t, ddl, applyReq.Changes[0].TableChanges[0].DDL)
-	assert.Equal(t, statement.StatementAlterTable, applyReq.Changes[0].TableChanges[0].Operation)
+	assert.Equal(t, ddlpkg.StatementAlterTable, applyReq.Changes[0].TableChanges[0].Operation)
 
 	storedApply, err := stor.Applies().Get(ctx, applyID)
 	require.NoError(t, err)

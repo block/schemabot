@@ -15,8 +15,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/block/spirit/pkg/statement"
-
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -255,7 +254,7 @@ type LintViolation struct {
 // TableChange describes a change to a single table within a SchemaChange namespace.
 type TableChange struct {
 	Table     string // Table name
-	Operation statement.StatementType
+	Operation ddl.StatementType
 	DDL       string // The DDL statement
 
 	// Unsafe change tracking

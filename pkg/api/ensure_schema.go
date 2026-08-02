@@ -383,9 +383,9 @@ func isDestructiveStorageStatement(stmt string) (bool, string, error) {
 		return false, "", fmt.Errorf("classify statement: %w", err)
 	}
 	switch stmtType {
-	case statement.StatementDropTable:
+	case ddl.StatementDropTable:
 		return true, "DROP TABLE removes the table and its data", nil
-	case statement.StatementAlterTable:
+	case ddl.StatementAlterTable:
 		return alterDropsColumn(stmt)
 	default:
 		return false, "", nil
