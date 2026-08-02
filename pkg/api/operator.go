@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"slices"
 	"time"
 
@@ -2103,9 +2102,5 @@ func (s *Service) publishTerminalSummaryIfWon(ctx context.Context, driverID int,
 }
 
 func driverLeaseOwner(driverID int) string {
-	hostname, err := os.Hostname()
-	if err != nil || hostname == "" {
-		hostname = "unknown-host"
-	}
-	return fmt.Sprintf("%s/%d/driver-%d", hostname, os.Getpid(), driverID)
+	return fmt.Sprintf("%s/driver-%d", storage.LeaseOwnerProcess(), driverID)
 }

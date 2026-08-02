@@ -635,6 +635,19 @@ func (a *Apply) Lease() ApplyLease {
 	}
 }
 
+// HasFreshLease reports whether a driver holds this apply's lease with a
+// heartbeat newer than ApplyLeaseStaleAfter. A fresh lease means a live driver
+// owns the apply and its work right now; a stale or absent lease means no
+// driver is heartbeating and the apply is eligible for stale-claim recovery.
+// This mirrors the claim queries' staleness bound: drivers refresh UpdatedAt on
+// every heartbeat, so the row's last write is the liveness signal.
+func (a *Apply) HasFreshLease(now time.Time) bool {
+	if a == nil || a.LeaseOwner == "" {
+		return false
+	}
+	return now.Sub(a.UpdatedAt) < ApplyLeaseStaleAfter
+}
+
 // IsRollback reports whether this apply reverts a previously applied schema
 // change. It reads the durable rollback option so any terminal path can tell a
 // rollback from an ordinary apply without the rollback command's in-memory
