@@ -150,6 +150,7 @@ type Service struct {
 	operatorWake         chan struct{}
 	recoveryWg           sync.WaitGroup
 	operatorPollInterval time.Duration
+	strandedReaperEvery  time.Duration
 	remoteHealthMu       sync.Mutex
 	remoteHealthCancel   context.CancelFunc
 	remoteHealthWg       sync.WaitGroup
@@ -268,6 +269,7 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		logger:               logger,
 		clock:                clock.Real{},
 		operatorPollInterval: OperatorPollInterval,
+		strandedReaperEvery:  StrandedReaperInterval,
 		remoteHealthInterval: RemoteDeploymentHealthCheckInterval,
 		webhookInboxInterval: WebhookInboxMetricsInterval,
 		pendingObservers:     make(map[pendingObserverKey]tern.ProgressObserver),

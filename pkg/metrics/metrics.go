@@ -802,8 +802,27 @@ func RecordOperatorResumeFailure(ctx context.Context, database, deployment, envi
 	)
 }
 
+// RecordOperatorStrandedOperationReaped counts apply operations the reaper
+// settled from an already-settled parent apply — rows describing work that will
+// never run, left behind non-terminal.
+//
+// A one-time burst is the historical backlog draining and needs no action. A
+// rate that keeps climbing means something is actively stranding operations, so
+// the investigation belongs on the producer — a path that terminalizes a parent
+// apply without settling its children — not on the reaper.
+func RecordOperatorStrandedOperationReaped(ctx context.Context, database, deployment, environment, parentState string) {
+	addOperatorCounter(ctx, "stranded_operations_reaped_total",
+		"Total number of stranded apply operations the reaper settled from their parent apply's outcome", "{operation}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("parent_state", parentState),
+	)
+}
+
 var knownOperatorClaimFailureReasons = map[string]bool{
 	"expire_retryable_error":                  true,
+	"stranded_reaper_error":                   true,
 	"missing_lease_token":                     true,
 	"storage_error":                           true,
 	"operation_storage_error":                 true,

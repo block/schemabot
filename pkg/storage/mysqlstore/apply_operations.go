@@ -8,11 +8,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
@@ -28,6 +30,7 @@ type applyOperationStore struct {
 	db       *sql.DB
 	dialect  Dialect
 	identity identityInserter
+	locker   namedlock.Locker
 }
 
 // Insert stores a new apply_operations row and returns its ID.
@@ -1409,6 +1412,193 @@ func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, app
 		return 0, err
 	}
 	return rows, nil
+}
+
+// strandedParentQuiescence is how long a parent apply must have been settled
+// before the reaper mirrors its outcome onto a pending operation row. Stranded
+// rows keep indefinitely, so the wait costs nothing, and it keeps the reaper
+// clear of an apply that only just terminalized and whose own paths — stop
+// reconciliation, terminal derivation — may still be writing sibling rows.
+const strandedParentQuiescence = 10 * time.Minute
+
+// strandedReaperLockName is the advisory lock that elects one reaper per pass.
+// It is instance-wide rather than per-target: the reaper scans every deployment's
+// rows in one pass, so there is nothing to scope it to.
+const strandedReaperLockName = "schemabot_stranded_reaper"
+
+// ReapStranded elects one reaper per pass and reaps under the lock. See
+// storage.ApplyOperationStore for the contract.
+func (s *applyOperationStore) ReapStranded(ctx context.Context, limit int) ([]*storage.ReapedOperation, error) {
+	if s.locker == nil {
+		return nil, fmt.Errorf("reap stranded apply_operations requires an advisory locker; reapers cannot elect a single instance without one")
+	}
+
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get stranded reaper connection: %w", err)
+	}
+	defer utils.CloseAndLog(conn)
+
+	// Do not wait for the lock: whoever holds it is doing this pass's work, and
+	// this instance's next tick is soon enough.
+	acquired, err := s.locker.Acquire(ctx, conn, strandedReaperLockName, 0)
+	if err != nil {
+		return nil, fmt.Errorf("acquire stranded reaper lock: %w", err)
+	}
+	if !acquired {
+		return nil, storage.ErrStrandedReaperBusy
+	}
+	defer func() {
+		if _, err := s.locker.Release(context.WithoutCancel(ctx), conn, strandedReaperLockName); err != nil {
+			slog.WarnContext(ctx, "failed to release the stranded reaper lock; it drops when the connection closes",
+				"lock", strandedReaperLockName, "error", err)
+		}
+	}()
+
+	return s.reapStranded(ctx, limit)
+}
+
+// reapStranded mirrors settled parents' outcomes onto their pending, unleased
+// operation rows, without electing a reaper. ReapStranded is the entry point that
+// holds the lock; this is separate so the reaping itself can be exercised on its
+// own.
+func (s *applyOperationStore) reapStranded(ctx context.Context, limit int) ([]*storage.ReapedOperation, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("reap stranded apply_operations: limit must be positive, got %d", limit)
+	}
+
+	parentStates := settledApplyStates()
+	quiescentBefore := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(strandedParentQuiescence.Microseconds())), IntervalMicrosecond)
+
+	selectArgs := []any{state.ApplyOperation.Pending}
+	selectArgs = append(selectArgs, stringArgs(parentStates)...)
+	selectArgs = append(selectArgs, limit)
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM apply_operations
+		WHERE state = ?
+			AND (lease_owner IS NULL OR lease_owner = '')
+			AND EXISTS (
+				SELECT 1
+				FROM applies a
+				WHERE a.id = apply_operations.apply_id
+					AND a.state IN (%s)
+					AND a.updated_at < %s
+			)
+		ORDER BY created_at, id
+		LIMIT ?
+	`, applyOperationColumns, placeholders(len(parentStates)), quiescentBefore), selectArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("query stranded apply_operations: %w", err)
+	}
+	stranded, err := scanApplyOperations(rows)
+	utils.CloseAndLog(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan stranded apply_operations: %w", err)
+	}
+	if len(stranded) == 0 {
+		return nil, nil
+	}
+
+	parents, err := s.loadStrandedParents(ctx, stranded)
+	if err != nil {
+		return nil, err
+	}
+
+	reaped := make([]*storage.ReapedOperation, 0, len(stranded))
+	for _, op := range stranded {
+		parent, ok := parents[op.ApplyID]
+		if !ok {
+			// The parent was deleted between the two reads (PR cleanup races the
+			// reaper). Its rows go with it, so there is nothing left to settle.
+			slog.WarnContext(ctx, "parent apply disappeared while reaping a stranded apply_operation; the row is being deleted with it",
+				op.LogAttrs()...)
+			continue
+		}
+		settled, err := s.reapStrandedOperation(ctx, op, parent)
+		if err != nil {
+			return nil, err
+		}
+		if !settled {
+			// The row left pending (or was claimed) between the read and the
+			// guarded write, so it is live again and belongs to whoever moved it.
+			slog.DebugContext(ctx, "stranded apply_operation changed before it could be reaped; skipping",
+				op.LogAttrs()...)
+			continue
+		}
+		reaped = append(reaped, &storage.ReapedOperation{Operation: op, Parent: parent})
+	}
+	return reaped, nil
+}
+
+// loadStrandedParents returns the settled parent applies of the reaped rows,
+// keyed by apply id.
+func (s *applyOperationStore) loadStrandedParents(ctx context.Context, stranded []*storage.ApplyOperation) (map[int64]*storage.Apply, error) {
+	applyIDs := make([]any, 0, len(stranded))
+	seen := make(map[int64]bool, len(stranded))
+	for _, op := range stranded {
+		if seen[op.ApplyID] {
+			continue
+		}
+		seen[op.ApplyID] = true
+		applyIDs = append(applyIDs, op.ApplyID)
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+applyColumns+`
+		FROM applies
+		WHERE id IN (`+placeholders(len(applyIDs))+`)
+	`, applyIDs...)
+	if err != nil {
+		return nil, fmt.Errorf("query settled parents of %d stranded apply_operations: %w", len(stranded), err)
+	}
+	applies, err := scanApplies(rows)
+	utils.CloseAndLog(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan settled parents of %d stranded apply_operations: %w", len(stranded), err)
+	}
+
+	parents := make(map[int64]*storage.Apply, len(applies))
+	for _, apply := range applies {
+		parents[apply.ID] = apply
+	}
+	return parents, nil
+}
+
+// reapStrandedOperation writes one operation row from its settled parent,
+// reporting whether the guarded write landed. The row keeps the same field
+// stamping the claim-path settle uses: every settled parent state is
+// non-resumable, so completed_at is stamped, and error_message is mirrored only
+// for a failed parent — the state that owns an explanation.
+func (s *applyOperationStore) reapStrandedOperation(ctx context.Context, op *storage.ApplyOperation, parent *storage.Apply) (bool, error) {
+	setClause := "state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()"
+	args := []any{parent.State}
+	if state.IsState(parent.State, state.Apply.Failed) {
+		setClause = "state = ?, error_message = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()"
+		args = []any{parent.State, nullString(parent.ErrorMessage)}
+	}
+	args = append(args, op.ID, state.ApplyOperation.Pending)
+
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_operations
+		SET `+setClause+`
+		WHERE id = ? AND state = ? AND (lease_owner IS NULL OR lease_owner = '')
+	`, args...)
+	if err != nil {
+		return false, fmt.Errorf("reap stranded apply_operation %d (deployment %q) from %s parent apply: %w",
+			op.ID, op.Deployment, parent.State, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read reaped rows for stranded apply_operation %d (deployment %q): %w",
+			op.ID, op.Deployment, err)
+	}
+	if changed == 0 {
+		return false, nil
+	}
+	op.State = parent.State
+	return true, nil
 }
 
 // scanApplyOperation scans a single apply_operations row, returning nil if not found.

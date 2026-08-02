@@ -141,6 +141,19 @@ func terminalApplyStates() []string {
 	}
 }
 
+// settledApplyStates are the terminal states whose verdict is final: the
+// rollout is over and nothing will claim its rows again. It is
+// terminalApplyStates minus stopped, which is terminal for claiming but
+// resumable — a stopped apply's rows belong to its resume path.
+func settledApplyStates() []string {
+	return []string{
+		state.Apply.Completed,
+		state.Apply.Failed,
+		state.Apply.Cancelled,
+		state.Apply.Reverted,
+	}
+}
+
 func isActiveApplyState(applyState string) bool {
 	return !state.IsTerminalApplyState(applyState)
 }

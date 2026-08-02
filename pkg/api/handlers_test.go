@@ -163,6 +163,12 @@ func (s *staticApplyOperationStore) GetEngineResumeState(_ context.Context, oper
 	return nil, storage.ErrEngineResumeStateNotFound
 }
 
+// ReapStranded is called by the stranded-operation reaper, which starts with the
+// operator, so every double reachable from the operator lifecycle answers it.
+func (s *staticApplyOperationStore) ReapStranded(context.Context, int) ([]*storage.ReapedOperation, error) {
+	return nil, nil
+}
+
 type staticPlanStore struct {
 	storage.PlanStore
 	plan      *storage.Plan

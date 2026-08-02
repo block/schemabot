@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -4185,4 +4186,297 @@ func TestApplyOperationStore_MarkPendingStoppedByApply_OperationLease(t *testing
 	again, err := store.ApplyOperations().MarkPendingStoppedByApply(opCtx(apply.ID, ownerID, "op-token"), apply.ID)
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), again)
+}
+
+// backdateApplyUpdatedAt ages a parent apply's updated_at so the stranded sweep
+// sees it as quiescent rather than freshly written.
+func backdateApplyUpdatedAt(t *testing.T, applyID int64, age time.Duration) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(),
+		"UPDATE applies SET updated_at = NOW() - INTERVAL ? SECOND WHERE id = ?",
+		int64(age.Seconds()), applyID)
+	require.NoError(t, err)
+}
+
+func setApplyErrorMessage(t *testing.T, applyID int64, message string) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(),
+		"UPDATE applies SET error_message = ? WHERE id = ?", message, applyID)
+	require.NoError(t, err)
+}
+
+func leaseApplyOperation(t *testing.T, operationID int64, owner string) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(),
+		"UPDATE apply_operations SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW() WHERE id = ?",
+		owner, "lease-token", operationID)
+	require.NoError(t, err)
+}
+
+func insertPendingOperation(t *testing.T, store *Storage, applyID int64, deployment string) *storage.ApplyOperation {
+	t.Helper()
+	op := &storage.ApplyOperation{ApplyID: applyID, Deployment: deployment}
+	_, err := store.ApplyOperations().Insert(t.Context(), op)
+	require.NoError(t, err)
+	require.Equal(t, state.ApplyOperation.Pending, op.State)
+	return op
+}
+
+// A pending operation row under an apply that has already settled describes work
+// that will never run: the rollout's verdict is recorded on the parent and no
+// driver will claim the row again. The sweep mirrors the parent's outcome onto
+// the row so pending keeps meaning "waiting to run" and a real backlog is not
+// hidden behind harmless history. Parents that are only paused — stopped or
+// failed_retryable — are resumable, so their pending rows belong to the resume
+// path and are left alone, as are the rows of a parent that is still active.
+func TestApplyOperationStore_ReapStranded_MirrorsSettledParentOutcome(t *testing.T) {
+	const parentError = "target rejected the schema change"
+
+	tests := []struct {
+		name        string
+		parentState string
+		settles     bool
+	}{
+		{"completed parent settles its stranded row", state.Apply.Completed, true},
+		{"failed parent settles its stranded row", state.Apply.Failed, true},
+		{"cancelled parent settles its stranded row", state.Apply.Cancelled, true},
+		{"reverted parent settles its stranded row", state.Apply.Reverted, true},
+		{"stopped parent keeps its row for the resume path", state.Apply.Stopped, false},
+		{"failed_retryable parent keeps its row for the resume path", state.Apply.FailedRetryable, false},
+		{"running parent keeps its row for its driver", state.Apply.Running, false},
+		{"running_degraded parent keeps its row for its driver", state.Apply.RunningDegraded, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := New(testDB)
+
+			lock := createTestLock(t, store, "stranded_db", "mysql", "staging")
+			parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_stranded_"+tt.parentState, 1, tt.parentState, "staging")
+			// Every parent carries an explanation, so the assertions below prove
+			// the mirror is keyed on the state that owns one rather than on
+			// whichever parents happen to have written the column.
+			setApplyErrorMessage(t, parent.ID, parentError)
+			backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+
+			op := insertPendingOperation(t, store, parent.ID, "region-a")
+
+			settled, err := store.applyOperations.reapStranded(ctx, 10)
+			require.NoError(t, err)
+
+			reloaded, err := store.ApplyOperations().Get(ctx, op.ID)
+			require.NoError(t, err)
+
+			if !tt.settles {
+				assert.Empty(t, settled, "a %s parent has not settled, so its pending rows stay pending", tt.parentState)
+				assert.Equal(t, state.ApplyOperation.Pending, reloaded.State)
+				assert.Nil(t, reloaded.CompletedAt, "an untouched pending row has no completion time")
+				return
+			}
+
+			require.Len(t, settled, 1, "the stranded row under a %s parent settles", tt.parentState)
+			assert.Equal(t, op.ID, settled[0].Operation.ID)
+			assert.Equal(t, tt.parentState, settled[0].Operation.State, "the returned row carries the state it was written to")
+			assert.Equal(t, parent.ApplyIdentifier, settled[0].Parent.ApplyIdentifier, "the parent travels with the settlement for triage logging")
+
+			assert.Equal(t, tt.parentState, reloaded.State, "the row mirrors its parent's recorded outcome")
+			assert.NotNil(t, reloaded.CompletedAt, "every settled parent state is non-resumable, so the row is stamped complete")
+			if tt.parentState == state.Apply.Failed {
+				assert.Equal(t, parentError, reloaded.ErrorMessage, "a failed parent's explanation travels to the row it settles")
+			} else {
+				assert.Empty(t, reloaded.ErrorMessage, "failed is the only state whose explanation belongs on the row it settles")
+			}
+
+			again, err := store.applyOperations.reapStranded(ctx, 10)
+			require.NoError(t, err)
+			assert.Empty(t, again, "a settled row is no longer pending, so a later sweep finds nothing to do")
+		})
+	}
+}
+
+// A parent that settled moments ago may still have a driver finishing its own
+// writes, so the sweep waits for the parent to go quiescent before treating its
+// pending rows as stranded.
+func TestApplyOperationStore_ReapStranded_WaitsForParentQuiescence(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "stranded_fresh_db", "mysql", "staging")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_stranded_fresh", 1, state.Apply.Completed, "staging")
+	op := insertPendingOperation(t, store, parent.ID, "region-a")
+
+	settled, err := store.applyOperations.reapStranded(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, settled, "a parent that settled just now is not yet quiescent")
+	assertApplyOperationState(t, store, op.ID, state.ApplyOperation.Pending)
+
+	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+
+	settled, err = store.applyOperations.reapStranded(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, settled, 1, "once the parent is quiescent the row settles")
+	assertApplyOperationState(t, store, op.ID, state.Apply.Completed)
+}
+
+// A leased row belongs to the driver holding the lease, which is the only writer
+// allowed to advance it. The sweep never settles a leased row, even under a
+// settled parent.
+func TestApplyOperationStore_ReapStranded_LeavesLeasedRows(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "stranded_leased_db", "mysql", "staging")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_stranded_leased", 1, state.Apply.Completed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+
+	leased := insertPendingOperation(t, store, parent.ID, "region-a")
+	unleased := insertPendingOperation(t, store, parent.ID, "region-b")
+	leaseApplyOperation(t, leased.ID, "host/1/driver-0")
+
+	settled, err := store.applyOperations.reapStranded(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, settled, 1, "only the unleased row is stranded")
+	assert.Equal(t, unleased.ID, settled[0].Operation.ID)
+	assertApplyOperationState(t, store, leased.ID, state.ApplyOperation.Pending)
+	assertApplyOperationState(t, store, unleased.ID, state.Apply.Completed)
+}
+
+// The sweep is a bounded maintenance pass: it settles at most the requested
+// number of rows per call, oldest first, so a large backlog drains across ticks
+// instead of in one long transaction.
+func TestApplyOperationStore_ReapStranded_RespectsLimit(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "stranded_limit_db", "mysql", "staging")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_stranded_limit", 1, state.Apply.Completed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+
+	first := insertPendingOperation(t, store, parent.ID, "region-a")
+	second := insertPendingOperation(t, store, parent.ID, "region-b")
+	third := insertPendingOperation(t, store, parent.ID, "region-c")
+
+	settled, err := store.applyOperations.reapStranded(ctx, 2)
+	require.NoError(t, err)
+	require.Len(t, settled, 2)
+	assert.Equal(t, first.ID, settled[0].Operation.ID, "the oldest stranded row settles first")
+	assert.Equal(t, second.ID, settled[1].Operation.ID)
+	assertApplyOperationState(t, store, third.ID, state.ApplyOperation.Pending)
+
+	settled, err = store.applyOperations.reapStranded(ctx, 2)
+	require.NoError(t, err)
+	require.Len(t, settled, 1, "the next sweep drains the remainder")
+	assert.Equal(t, third.ID, settled[0].Operation.ID)
+}
+
+// Selection and the write are separate statements, so a driver can claim and
+// advance a row in between. The write is guarded on the row still being pending
+// and unleased, so the sweep skips it rather than overwriting a newer state.
+func TestApplyOperationStore_ReapStranded_SkipsRowThatLeftPending(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "stranded_guard_db", "mysql", "staging")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_stranded_guard", 1, state.Apply.Completed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+
+	op := insertPendingOperation(t, store, parent.ID, "region-a")
+	stranded, err := store.ApplyOperations().Get(ctx, op.ID)
+	require.NoError(t, err)
+
+	// The row advances after selection: a driver claimed it and started work.
+	require.NoError(t, store.ApplyOperations().UpdateState(ctx, op.ID, state.ApplyOperation.Running))
+	leaseApplyOperation(t, op.ID, "host/1/driver-0")
+
+	settledRow, err := store.applyOperations.reapStrandedOperation(ctx, stranded, parent)
+	require.NoError(t, err, "losing the race is a skip, not an error")
+	assert.False(t, settledRow, "the guarded write reports that it did not land")
+	assertApplyOperationState(t, store, op.ID, state.ApplyOperation.Running)
+}
+
+// A stopped apply is paused, not finished: its pending rows are the work its
+// resume path will claim. The sweep leaves them pending so a resumed apply still
+// has operations to drive.
+func TestApplyOperationStore_ReapStranded_PreservesStoppedParentResumeShape(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "stranded_stopped_db", "mysql", "staging")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_stranded_stopped", 1, state.Apply.Stopped, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+
+	stoppedRow := insertPendingOperation(t, store, parent.ID, "region-a")
+	require.NoError(t, store.ApplyOperations().UpdateState(ctx, stoppedRow.ID, state.ApplyOperation.Stopped))
+	pendingSibling := insertPendingOperation(t, store, parent.ID, "region-b")
+
+	settled, err := store.applyOperations.reapStranded(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, settled, "a stopped parent's rows are not stranded")
+	assertApplyOperationState(t, store, stoppedRow.ID, state.ApplyOperation.Stopped)
+	assertApplyOperationState(t, store, pendingSibling.ID, state.ApplyOperation.Pending)
+
+	// The resume path still sees claimable work on the stopped apply.
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     parent.ID,
+		Operation:   storage.ControlOperationStart,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "host/1/driver-0")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "the stopped apply's operation is still claimable after the sweep")
+	assert.Equal(t, stoppedRow.ID, claimed.ID)
+}
+
+// Only one instance reaps per pass. A second reaper running concurrently would
+// be correct — every write is guarded — but would pay a full scan to settle rows
+// the first one already handled, so it steps aside instead.
+func TestApplyOperationStore_ReapStranded_ElectsOneReaperPerPass(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "stranded_reaper_db", "mysql", "staging")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_stranded_reaper", 1, state.Apply.Completed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+	op := insertPendingOperation(t, store, parent.ID, "region-a")
+
+	// A second store stands in for another instance: it holds the reaper lock on
+	// its own connection while the first store tries to reap.
+	other := New(testDB)
+	held, err := other.applyOperations.db.Conn(ctx)
+	require.NoError(t, err)
+	acquired, err := namedlock.MySQL{}.Acquire(ctx, held, strandedReaperLockName, 0)
+	require.NoError(t, err)
+	require.True(t, acquired, "the stand-in instance should take the reaper lock")
+
+	_, err = store.ApplyOperations().ReapStranded(ctx, 10)
+	require.ErrorIs(t, err, storage.ErrStrandedReaperBusy, "a second reaper steps aside rather than re-scanning")
+	assertApplyOperationState(t, store, op.ID, state.ApplyOperation.Pending)
+
+	released, err := namedlock.MySQL{}.Release(ctx, held, strandedReaperLockName)
+	require.NoError(t, err)
+	require.True(t, released)
+	require.NoError(t, held.Close())
+
+	// With the lock free, the reaper settles the row and releases the lock again,
+	// so the pass after it is not locked out by its own predecessor.
+	settled, err := store.ApplyOperations().ReapStranded(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, settled, 1)
+	assertApplyOperationState(t, store, op.ID, state.Apply.Completed)
+
+	next := insertPendingOperation(t, store, parent.ID, "region-b")
+	settled, err = store.ApplyOperations().ReapStranded(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, settled, 1, "the reaper lock is released after each pass")
+	assert.Equal(t, next.ID, settled[0].Operation.ID)
 }
