@@ -138,8 +138,8 @@ Namespaces come from directory names in either layout: with the config at the
 schema root, each subdirectory is a namespace (as below); with the config
 inside a single namespace directory next to its `.sql` files (flat layout),
 that directory's basename is the namespace. Nothing in SchemaBot forces a
-particular path, so placement is a repository-semantics choice. That said, a
-repository-root `schema/` directory is the recommended layout:
+particular path, so placement is a repository-semantics choice. For greenfield
+repositories, a repository-root `schema/` directory is the recommended layout:
 
 ```
 myapp/
@@ -152,11 +152,12 @@ myapp/
 └── service-b/
 ```
 
-- **Don't put schema files in build-tool resource directories** (Maven/Gradle
-  `src/main/resources`, embedded asset dirs). Those paths mean "packaged into
-  the application artifact" — but the application never reads these files.
-  Only SchemaBot does, from GitHub, at PR time. Placing them there ships dead
-  weight in every build and implies runtime semantics the files don't have.
+- **Prefer to keep schema files out of build-tool resource directories**
+  (Maven/Gradle `src/main/resources`, embedded asset dirs). Those paths mean
+  "packaged into the application artifact" — but the application never reads
+  these files. Only SchemaBot does, from GitHub, at PR time. Placing them
+  there ships dead weight in every build and implies runtime semantics the
+  files don't have.
 - **Keep visible distance from imperative tools during coexistence.** If the
   repository still carries Flyway or Liquibase versioned change scripts while
   SchemaBot takes over, keep the two mechanisms in visibly different places.
@@ -177,6 +178,13 @@ myapp/
 A module-root directory outside `src/` (e.g. `my-data-module/schema/`) also
 works and avoids the packaging problem — reasonable when one module clearly
 owns the database, but most schemas span modules.
+
+For existing (brownfield) repositories, treat the root `schema/` layout as a
+nice-to-have, not a requirement. SchemaBot behaves identically wherever the
+config lives, so adopting it does not require moving files that already have
+an established home. Relocating is worth it only if the points above start to
+bite — packaging dead weight, confusion next to imperative change scripts, or
+allowlist/CODEOWNERS churn — and can be done later as a follow-up.
 
 ## `$ENV` Substitution in Namespace Names
 
