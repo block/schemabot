@@ -4464,6 +4464,29 @@ func stageOperationProjectionOrphan(t *testing.T, store *Storage, identifier, pa
 	return apply
 }
 
+// createStrandedStopApply seeds the minimal stop-reconciliation shape: an apply
+// in the given state with one pending operation and a pending stop control
+// request, so FindNextApplyForStopReconciliation considers it a candidate.
+func createStrandedStopApply(t *testing.T, store *Storage, lock *storage.Lock, applyID string, planID int64) *storage.Apply {
+	t.Helper()
+	ctx := t.Context()
+	apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Running, "staging")
+
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OnFailure: storage.OnFailureContinue,
+	})
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+	return apply
+}
+
 // TestApplyStore_FindNextApplyForOperationProjection_ClaimsSettledOperationOrphan
 // verifies the repair trigger for a parent left behind its own children: every
 // operation has reached a terminal state, the apply itself is still running, and
@@ -4569,6 +4592,125 @@ func TestApplyStore_FindNextApplyForOperationProjection_RequiresOwner(t *testing
 
 	_, err := store.Applies().FindNextApplyForOperationProjection(t.Context(), "")
 	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+}
+
+// TestApplyStore_FindNextApplyForStopReconciliation_ReclaimGatedOnLeaseStaleness
+// verifies the claim is once-per-request, not once-per-poll: the first claim
+// (never claimed, no lease) succeeds and rotates the lease, and the same stop
+// request does not re-match while that lease is fresh — the driver that claimed
+// it owns the reconciliation, and re-claiming every poll would consume the tick
+// that the rest of the claim ladder runs on. Once the claim's heartbeat goes
+// stale (a crashed or wedged driver), the apply is claimable again so the stop
+// is never stranded.
+func TestApplyStore_FindNextApplyForStopReconciliation_ReclaimGatedOnLeaseStaleness(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createStrandedStopApply(t, store, lock, "apply_stop_recon_lease", 1)
+
+	claimed, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a never-claimed apply with a pending stop must be claimable")
+	assert.Equal(t, apply.ID, claimed.ID)
+	assert.Equal(t, "operator-a", claimed.LeaseOwner)
+
+	reclaimed, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "operator-b")
+	require.NoError(t, err)
+	assert.Nil(t, reclaimed, "a freshly claimed stop request must not re-match while the lease heartbeat is fresh")
+
+	// A crashed driver stops heartbeating; once the claim goes stale the apply
+	// must be claimable again so the stop is not stranded.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+
+	recovered, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "operator-b")
+	require.NoError(t, err)
+	require.NotNil(t, recovered, "a stale claim must be recoverable by another driver")
+	assert.Equal(t, apply.ID, recovered.ID)
+	assert.Equal(t, "operator-b", recovered.LeaseOwner, "recovery rotates the lease to the new owner")
+}
+
+// TestApplyStore_FindNextApplyForStopReconciliation_ReclaimableWhenStopReissued
+// verifies a fresh lease yields to a newer stop request: re-opening the stop
+// control request stamps cr.updated_at past the lease (RequestPending's re-open
+// path), which re-admits the apply immediately — the operator asked again, so
+// reconciliation must not wait out the previous claim's staleness window.
+func TestApplyStore_FindNextApplyForStopReconciliation_ReclaimableWhenStopReissued(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createStrandedStopApply(t, store, lock, "apply_stop_recon_reissue", 1)
+
+	claimed, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, apply.ID, claimed.ID)
+
+	// Separate the request and lease timestamps so the ordering under test is
+	// unambiguous at column precision: the stop request predates the lease, and
+	// the lease's heartbeat stays fresh.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_control_requests SET updated_at = NOW() - INTERVAL 10 SECOND WHERE apply_id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE applies SET lease_acquired_at = NOW() - INTERVAL 5 SECOND, updated_at = updated_at WHERE id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+
+	reclaimed, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "operator-b")
+	require.NoError(t, err)
+	assert.Nil(t, reclaimed, "a lease newer than the stop request must hold the claim")
+
+	// Re-opening the stop request moves cr.updated_at past the lease.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_control_requests SET updated_at = NOW() WHERE apply_id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+
+	reissued, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "operator-b")
+	require.NoError(t, err)
+	require.NotNil(t, reissued, "a stop request newer than the lease must be claimable immediately")
+	assert.Equal(t, apply.ID, reissued.ID)
+	assert.Equal(t, "operator-b", reissued.LeaseOwner)
+}
+
+// TestApplyStore_FindNextApplyForStopReconciliation_FreshLeaseDoesNotBlockOtherApplies
+// verifies claim ordering across applies: an already-claimed stop at the head
+// of the queue (oldest created_at, fresh lease) does not shadow another apply's
+// pending stop — the claim skips it and reaches the never-claimed apply behind
+// it.
+func TestApplyStore_FindNextApplyForStopReconciliation_FreshLeaseDoesNotBlockOtherApplies(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	olderLock := createTestLock(t, store, "testdb", "mysql", "staging")
+	older := createStrandedStopApply(t, store, olderLock, "apply_stop_recon_older", 1)
+	newerLock := createTestLock(t, store, "testdb2", "mysql", "staging")
+	newer := createStrandedStopApply(t, store, newerLock, "apply_stop_recon_newer", 2)
+
+	// Make the queue order deterministic at column precision.
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET created_at = NOW() - INTERVAL 1 MINUTE, updated_at = updated_at WHERE id = ?
+	`, older.ID)
+	require.NoError(t, err)
+
+	first, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	assert.Equal(t, older.ID, first.ID, "the oldest candidate is claimed first")
+
+	second, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, second, "a fresh lease at the head of the queue must not starve other applies' stops")
+	assert.Equal(t, newer.ID, second.ID)
 }
 
 // SetRevertSkipped records skip-revert on the apply and the timestamp round-trips
