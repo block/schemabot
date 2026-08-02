@@ -51,7 +51,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e staging
 ```
@@ -89,9 +89,53 @@ An apply will fail on these statements. Rewrite them as a supported schema chang
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-directexecution-change"></a><strong>MySQL Plan (Direct-execution Change)</strong></summary>
+
+
+## Schema Change Apply — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
+
+```sql
+ALTER TABLE `users`
+    DROP PRIMARY KEY,
+    ADD PRIMARY KEY(`id`, `tenant_id`);
+
+ALTER TABLE `orders` ADD COLUMN `notes` text;
+```
+
+⚙️ **Direct execution**: **1** change will run as native MySQL DDL
+- `users`: dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows
+
+These statements run synchronously outside the schema-change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this.
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+⚠️ **Automatic apply paused**: Plan contains direct-execution changes — review the disclosure and confirm manually
+
+Review the plan above, then confirm manually:
+```
+schemabot apply-confirm -e staging
+```
+
+🔓 To discard this plan and unlock, comment:
+```
+schemabot unlock
 ```
 
 </details>
@@ -119,7 +163,7 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 ---
 
 **⛔ Apply rejected**: **1** planned change not supported by the schema-change engine
-- `users`: dropping primary key is not supported
+- `users`: dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000
 
 Rewrite these statements as a supported schema change, or contact your SchemaBot operators for help.
 
@@ -165,7 +209,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e staging --tenant alpha
 ```
@@ -379,7 +423,7 @@ CREATE TABLE `addresses` (
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e staging
 ```
@@ -511,7 +555,7 @@ CREATE TABLE `metrics` (
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e staging
 ```
@@ -564,7 +608,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** these changes, start with the first environment:
+▶️ **To apply** these changes, start with the first environment:
 ```
 schemabot apply -e staging
 ```
@@ -626,7 +670,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** these changes, comment:
+▶️ **To apply** these changes, comment:
 ```
 schemabot apply -e production
 ```
@@ -684,7 +728,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** these changes, comment:
+▶️ **To apply** these changes, comment:
 ```
 schemabot apply -e staging
 ```
@@ -746,7 +790,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** these changes, start with the first environment:
+▶️ **To apply** these changes, start with the first environment:
 ```
 schemabot apply -e staging
 ```
@@ -6536,7 +6580,7 @@ ALTER TABLE `mutes`
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e production
 ```
@@ -6571,7 +6615,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e production
 ```
@@ -6617,7 +6661,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e production
 ```

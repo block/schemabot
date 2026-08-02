@@ -137,3 +137,46 @@ func TestApplyLogAttrs(t *testing.T) {
 			"LogAttrs snapshots the external_id at each call once the data plane assigns it")
 	})
 }
+
+func TestTaskLogAttrs(t *testing.T) {
+	t.Run("nil receiver returns nil", func(t *testing.T) {
+		var task *Task
+		assert.Nil(t, task.LogAttrs())
+	})
+
+	t.Run("carries task identity and PR provenance", func(t *testing.T) {
+		task := &Task{
+			TaskIdentifier: "task-abc123",
+			Database:       "orders",
+			DatabaseType:   "mysql",
+			Environment:    "staging",
+			TableName:      "customers",
+			State:          "running",
+			Repository:     "org/repo",
+			PullRequest:    1090,
+		}
+		m := attrsToMap(t, task.LogAttrs())
+		assert.Equal(t, "task-abc123", m["task_id"])
+		assert.Equal(t, "orders", m["database"])
+		assert.Equal(t, "mysql", m["database_type"])
+		assert.Equal(t, "staging", m["environment"])
+		assert.Equal(t, "customers", m["table"])
+		assert.Equal(t, "running", m["state"])
+		assert.Equal(t, "org/repo", m["repo"])
+		assert.Equal(t, 1090, m["pr"])
+	})
+
+	t.Run("omits unset PR provenance", func(t *testing.T) {
+		task := &Task{
+			TaskIdentifier: "task-abc123",
+			Database:       "orders",
+			DatabaseType:   "mysql",
+			Environment:    "staging",
+			TableName:      "customers",
+			State:          "pending",
+		}
+		m := attrsToMap(t, task.LogAttrs())
+		assert.NotContains(t, m, "repo")
+		assert.NotContains(t, m, "pr")
+	})
+}

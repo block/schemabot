@@ -1116,6 +1116,44 @@ func (s *applyStore) GetInProgress(ctx context.Context) ([]*storage.Apply, error
 	return scanApplies(rows)
 }
 
+// FindStuckPendingApplies returns pending applies older than olderThan that
+// carry child rows — the child-rows arm of FindNextApply's pending predicate, so
+// every row returned is one a driver should already have claimed. It is a
+// read-only diagnostic (no lease, no FOR UPDATE): apply creation rejects a
+// second active apply for the same target instead of queuing it, so a pending
+// apply this old is never legitimately waiting its turn. Ordered oldest first
+// (with an id tiebreak so same-second rows are stable) and capped at limit; a
+// non-positive limit means no cap.
+func (s *applyStore) FindStuckPendingApplies(ctx context.Context, olderThan time.Duration, limit int) ([]*storage.Apply, error) {
+	cutoffMicros := max(olderThan.Microseconds(), 0)
+	cutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(cutoffMicros)), IntervalMicrosecond)
+
+	// The column list and cutoff are trusted internal fragments; concatenate
+	// them directly rather than through a format string so a stray % can never
+	// corrupt the SQL.
+	query := `
+		SELECT ` + applyColumnsForApplyAlias + `
+		FROM applies a
+		WHERE a.state = ?
+			AND a.created_at < ` + cutoff + `
+			AND (
+				EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id)
+				OR EXISTS (SELECT 1 FROM apply_operations ao WHERE ao.apply_id = a.id)
+			)
+		ORDER BY a.created_at, a.id`
+	if limit > 0 {
+		query += fmt.Sprintf("\n\t\tLIMIT %d", limit)
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, state.Apply.Pending)
+	if err != nil {
+		return nil, fmt.Errorf("query stuck pending applies older than %s: %w", olderThan, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	return scanApplies(rows)
+}
+
 // recentAppliesWhere builds the WHERE predicates and args shared by the
 // recent-apply list and count queries, so both views agree on which applies a
 // filter selects.

@@ -122,28 +122,40 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// Direct-verdict changes reject the apply for a different reason: running
-	// native MySQL DDL blocks writes to the table and is not revertible, so
-	// it requires operator consent the apply commands do not collect. Release
-	// the lock — retrying the same command cannot succeed either.
-	if len(planResp.DirectChanges()) > 0 {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
-		h.logger.Info("apply rejected: re-plan routes changes to direct execution",
-			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
-		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
-		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "direct execution changes rejection")
-		return
-	}
-
 	// Automatic apply DDL drift check: if the re-plan DDL differs from the stored auto-plan,
 	// downgrade to manual confirmation so the user reviews the new plan.
 	if storedPlan != nil && !ddlMatchesStoredPlan(planResp, storedPlan) {
 		h.logger.Info("automatic apply downgraded: DDL drift detected",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
-		commentData.IsLocked = true
-		commentData.AutoConfirmDowngradeReason = "Schema changes differ from auto-plan — review and confirm manually"
-		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		h.postAutoConfirmDowngrade(repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+			"Schema changes differ from auto-plan — review and confirm manually")
+		return
+	}
+
+	// Direct-execution changes never run from the automatic apply path: the
+	// operator must confirm the blocking, non-revertible native DDL against
+	// the locked plan comment that discloses it, so downgrade to manual
+	// confirmation.
+	if storedPlan != nil && len(planResp.DirectChanges()) > 0 {
+		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
+			"repo", repo, "pr", pr, "database", database, "environment", environment)
+		h.postAutoConfirmDowngrade(repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+			"Plan contains direct-execution changes — review the disclosure and confirm manually")
+		return
+	}
+
+	// --defer-cutover only affects engine-driven statements; an all-direct
+	// plan has no cutover to defer, so reject the flag instead of silently
+	// ignoring it. Only apply-confirm reaches this gate (the apply command
+	// rejects the flag before locking, and an automatic apply whose re-plan
+	// carries direct changes downgrades above), so keep the lock: it still
+	// pins the plan the operator confirmed against, and re-running
+	// apply-confirm without the flag executes it.
+	if result.DeferCutover && planResp.AllChangesDirect() {
+		h.logger.Info("apply rejected: --defer-cutover on an all-direct plan; the pending confirmation is preserved",
+			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
+		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+			fmt.Sprintf(msgDeferCutoverAllDirectConfirm, environment))
 		return
 	}
 
@@ -281,6 +293,24 @@ func (h *Handler) executeApply(
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot could not update the required status check: "+err.Error())
 		return
 	}
+}
+
+// postAutoConfirmDowngrade posts the locked plan comment that pauses an
+// automatic apply for manual confirmation. It carries the original command's
+// flags and the lock owner so the coached apply-confirm command re-issues the
+// operator's full intent and the comment shows who holds the lock.
+func (h *Handler) postAutoConfirmDowngrade(
+	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
+	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy, reason string,
+) {
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+	commentData.IsLocked = true
+	commentData.LockOwner = fmt.Sprintf("%s#%d", repo, pr)
+	commentData.AllowUnsafe = result.AllowUnsafe
+	commentData.DeferCutover = result.DeferCutover
+	commentData.SkipRevert = result.SkipRevert
+	commentData.AutoConfirmDowngradeReason = reason
+	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 }
 
 // releaseApplyLockIfIntentUnchanged releases this PR's apply lock after a
