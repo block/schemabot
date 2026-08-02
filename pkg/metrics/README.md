@@ -33,6 +33,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.github.rate_limit.used` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
 | `schemabot.lock_operations_total` | Counter | operation, database, environment, status | Lock acquire/release operations |
+| `schemabot.orphaned_task_cancel_total` | Counter | database, environment, outcome | Conflict-check cancellations of pending tasks whose apply was already terminal |
 | `schemabot.operator.resumed_total` | Counter | database, environment, previous_state | Applies resumed by the operator |
 | `schemabot.operator.resume_failures_total` | Counter | database, environment, reason | Operator resume attempts that failed |
 | `schemabot.operator.claim_failures_total` | Counter | environment, reason | Operator claim attempts that failed |

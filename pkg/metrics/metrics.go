@@ -764,6 +764,34 @@ func RecordRemoteApplyDedup(ctx context.Context, database, environment, outcome 
 	)
 }
 
+// knownOrphanedTaskCancelOutcomes limits metric cardinality to the expected
+// orphaned pending task cancellation outcomes.
+var knownOrphanedTaskCancelOutcomes = map[string]bool{
+	"cancelled":    true,
+	"write_failed": true,
+}
+
+// RecordOrphanedTaskCancel increments the counter for conflict-check
+// cancellations of orphaned pending tasks — tasks whose apply reached a
+// terminal state before they started and would otherwise block every later
+// apply on their database as phantom active work. Outcome should be one of:
+//   - "cancelled": the orphan was durably cancelled and stopped blocking. The
+//     sweep self-heals, but a spike means something upstream is settling
+//     applies while leaving their tasks pending, which is worth investigating.
+//   - "write_failed": the cancellation could not be written, so the task kept
+//     blocking fail-closed and the new apply was refused.
+func RecordOrphanedTaskCancel(ctx context.Context, database, environment, outcome string) {
+	if !knownOrphanedTaskCancelOutcomes[outcome] {
+		outcome = "unknown"
+	}
+	addCounter(ctx, "schemabot.orphaned_task_cancel_total",
+		"Total conflict-check cancellations of orphaned pending tasks", "{task}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
 // operatorMetricNames returns the canonical operator metric name alongside its
 // deprecated schemabot.scheduler.* alias. Both are emitted for one release so
 // dashboards and alerts can migrate before the legacy series is removed.

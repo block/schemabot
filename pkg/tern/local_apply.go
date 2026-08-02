@@ -8,6 +8,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -134,8 +135,10 @@ func (c *LocalClient) tryResolveOrphanedPendingTask(ctx context.Context, t *stor
 		t.CompletedAt = nil
 		c.logger.Error("conflict check: failed to persist orphaned task cancellation; the task keeps blocking the database",
 			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "error", err)...)
+		metrics.RecordOrphanedTaskCancel(ctx, t.Database, t.Environment, "write_failed")
 		return false
 	}
+	metrics.RecordOrphanedTaskCancel(ctx, t.Database, t.Environment, "cancelled")
 	taskID := t.ID
 	c.logApplyEvent(ctx, apply.ID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 		"Cancelled orphaned pending task: its apply was already terminal, so the task could never start",
