@@ -469,7 +469,7 @@ func TestEngine_SpiritRefusesVerdictBlockedStatements(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reason, refused, err := check.StatementRefusal(t.Context(), tt.stmt, currentCreateTable, slog.New(slog.DiscardHandler))
+			reason, refused, err := check.StatementRefusal(t.Context(), tt.stmt, currentCreateTable, discardLogger())
 			require.NoError(t, err, "StatementRefusal")
 			require.True(t, refused, "the verdict must classify this statement as blocked")
 			require.NotEmpty(t, reason)
@@ -536,7 +536,7 @@ func TestEngine_VerdictSilentOnNativeDDLStatements(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reason, refused, err := check.StatementRefusal(t.Context(), tt.stmt, currentCreateTable, slog.New(slog.DiscardHandler))
+			reason, refused, err := check.StatementRefusal(t.Context(), tt.stmt, currentCreateTable, discardLogger())
 			require.NoError(t, err, "StatementRefusal")
 			assert.False(t, refused, "the verdict must not claim a refusal the native DDL path completes")
 			assert.Empty(t, reason)

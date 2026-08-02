@@ -585,7 +585,9 @@ func TestEngine_ExecuteAlterPhase_BusyTableFailsFast(t *testing.T) {
 // because some of the engine's refusals depend on the existing column types. A
 // table whose definition cannot be read fails the apply before any statement
 // runs: classifying without it would narrow the refusals the engine reports and
-// hand a refused statement to the engine anyway.
+// hand a refused statement to the engine anyway. The failure names the table but
+// not the database's answer — that error reaches a PR comment, so the driver and
+// target detail it carries stays in the logs.
 func TestEngine_RouteAlterStatements_UnreadableTableBlocked(t *testing.T) {
 	dsn, _ := setupTestMySQL(t)
 
@@ -602,8 +604,10 @@ func TestEngine_RouteAlterStatements_UnreadableTableBlocked(t *testing.T) {
 		[]string{"ALTER TABLE `direct_missing` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)"},
 		directPolicy{Enabled: true, MaxTableRows: 100000})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "direct_missing")
-	assert.Contains(t, err.Error(), "SHOW CREATE TABLE")
+	assert.Contains(t, err.Error(), "cannot read the current definition of table \"direct_missing\"")
+	assert.Contains(t, err.Error(), "see server logs")
+	assert.NotContains(t, err.Error(), "SHOW CREATE TABLE", "the raw query and driver error belong in the logs")
+	assert.NotContains(t, err.Error(), "Error 1146", "the raw query and driver error belong in the logs")
 }
 
 // A refused statement whose table size cannot be estimated is blocked: an

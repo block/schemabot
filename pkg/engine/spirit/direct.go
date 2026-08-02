@@ -312,9 +312,11 @@ type alterRouting struct {
 //
 // Some of the engine's refusals depend on the table's current column types, so
 // each statement is classified against the target's live definition of its
-// table — the same input the plan used. A definition that cannot be read fails
-// the apply: classifying without it would silently narrow the refusals Spirit
-// reports and route a statement Spirit refuses onto Spirit anyway.
+// table, read here rather than taken from the plan's snapshot: re-reading it is
+// how a column type changed since the plan is caught. A definition that cannot
+// be read fails the apply, because classifying without it would silently narrow
+// the refusals Spirit reports and route a statement Spirit refuses onto Spirit
+// anyway.
 func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB, database string, alters []string, policy directPolicy) (alterRouting, error) {
 	var routing alterRouting
 	schema := &targetSchema{target: target}
@@ -330,12 +332,20 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 
 		currentCreateTable, err := schema.createTable(ctx, table)
 		if err != nil {
+			// The raw error carries target infrastructure detail (host, account,
+			// driver internals) and this one surfaces in a PR comment, so the
+			// apply fails with a fixed line and the cause stays in the logs.
 			e.logger.Error("routing failed: cannot read the target's current table definition",
 				"database", database, "table", table, "error", err)
-			return alterRouting{}, fmt.Errorf("route ALTER statement for table %q: %w", table, err)
+			return alterRouting{}, fmt.Errorf("cannot read the current definition of table %q on the target; see server logs", table)
 		}
 		reason, refused, err := check.StatementRefusal(ctx, stmt, currentCreateTable, e.logger)
 		if err != nil {
+			// The engine could not judge the statement — typically the current
+			// definition no longer describes a column the statement redeclares.
+			// That is not a refusal, so it must not be routed as one.
+			e.logger.Error("routing failed: the engine cannot classify the statement against the current table definition",
+				"database", database, "table", table, "error", err)
 			return alterRouting{}, fmt.Errorf("route ALTER statement for table %q: %w", table, err)
 		}
 		if !refused {
@@ -478,9 +488,11 @@ func targetDSN(host, username, password, database string) string {
 	return cfg.FormatDSN()
 }
 
-// lazyTargetDB opens a connection to the target database on first use so
-// callers that never need one (no refused statements, policy disabled with no
-// direct work) never pay for a connection.
+// lazyTargetDB opens a connection to the target database on first use, so an
+// apply that never reaches the target — one with no ALTER to route, or no
+// statement at all — never pays for a connection. An apply carrying an ALTER
+// always does: routing reads the table's current definition to classify it,
+// whether or not the statement turns out to be refused.
 type lazyTargetDB struct {
 	dsn string
 	db  *sql.DB
