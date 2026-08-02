@@ -7,8 +7,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/block/spirit/pkg/statement"
-
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
@@ -132,14 +130,14 @@ func storageStateToProto(ts string) ternv1.State {
 	}
 }
 
-// changeTypeToProto converts a Spirit StatementType to the proto ChangeType enum.
-func changeTypeToProto(op statement.StatementType) ternv1.ChangeType {
+// changeTypeToProto converts a ddl.StatementType to the proto ChangeType enum.
+func changeTypeToProto(op ddl.StatementType) ternv1.ChangeType {
 	switch op {
-	case statement.StatementCreateTable:
+	case ddl.StatementCreateTable:
 		return ternv1.ChangeType_CHANGE_TYPE_CREATE
-	case statement.StatementAlterTable:
+	case ddl.StatementAlterTable:
 		return ternv1.ChangeType_CHANGE_TYPE_ALTER
-	case statement.StatementDropTable:
+	case ddl.StatementDropTable:
 		return ternv1.ChangeType_CHANGE_TYPE_DROP
 	default:
 		return ternv1.ChangeType_CHANGE_TYPE_OTHER
@@ -166,11 +164,11 @@ func protoChangeTypeToDDLAction(ct ternv1.ChangeType) string {
 	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
 		return "vschema_update"
 	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return ddl.StatementTypeToOp(statement.StatementCreateTable)
+		return ddl.StatementTypeToOp(ddl.StatementCreateTable)
 	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return ddl.StatementTypeToOp(statement.StatementAlterTable)
+		return ddl.StatementTypeToOp(ddl.StatementAlterTable)
 	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return ddl.StatementTypeToOp(statement.StatementDropTable)
+		return ddl.StatementTypeToOp(ddl.StatementDropTable)
 	default:
 		return "unknown"
 	}

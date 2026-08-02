@@ -96,6 +96,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		Options:      options,
 		ResumeState:  &engine.ResumeState{MigrationContext: apply.ApplyIdentifier},
 		Credentials:  creds,
+		Logger:       logger,
 		OnEvent: func(event engine.ApplyEvent) {
 			oldState := apply.State
 			newState := deriveApplyPhase(event)

@@ -9,10 +9,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/spirit/pkg/statement"
 )
 
 // A sharded re-plan repeats the same table across shards (and across keyspaces),
@@ -124,7 +124,7 @@ func TestReplanAndFilterTasks_FailsClosedOnDrift(t *testing.T) {
 			Namespace: "testapp",
 			TableChanges: []engine.TableChange{{
 				Table:     "users",
-				Operation: statement.StatementAlterTable,
+				Operation: ddl.StatementAlterTable,
 				DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(100)",
 			}},
 		}},
@@ -184,7 +184,7 @@ func TestTableStillNeedsChange_TableAbsentReportsDone(t *testing.T) {
 			Namespace: "testapp",
 			TableChanges: []engine.TableChange{{
 				Table:     "orders",
-				Operation: statement.StatementAlterTable,
+				Operation: ddl.StatementAlterTable,
 				DDL:       "ALTER TABLE `orders` ADD COLUMN `total` int",
 			}},
 		}},
@@ -218,7 +218,7 @@ func TestTableStillNeedsChange_DriftFailsClosed(t *testing.T) {
 			Namespace: "testapp",
 			TableChanges: []engine.TableChange{{
 				Table:     "users",
-				Operation: statement.StatementAlterTable,
+				Operation: ddl.StatementAlterTable,
 				DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(100)",
 			}},
 		}},
@@ -305,7 +305,7 @@ func TestReplanAndFilterTasks_RevertPhaseTaskStaysActive(t *testing.T) {
 				Namespace: "testapp",
 				TableChanges: []engine.TableChange{{
 					Table:     "users",
-					Operation: statement.StatementAlterTable,
+					Operation: ddl.StatementAlterTable,
 					DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(500)",
 				}},
 			}},

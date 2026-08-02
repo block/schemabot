@@ -5,7 +5,6 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/block/spirit/pkg/statement"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -103,38 +102,38 @@ func TestClassifyStatement(t *testing.T) {
 	tests := []struct {
 		name       string
 		stmt       string
-		wantType   statement.StatementType
+		wantType   StatementType
 		wantTable  string
 		wantErrMsg string
 	}{
 		{
 			name:      "create table",
 			stmt:      "CREATE TABLE t1 (id INT)",
-			wantType:  statement.StatementCreateTable,
+			wantType:  StatementCreateTable,
 			wantTable: "t1",
 		},
 		{
 			name:      "alter table",
 			stmt:      "ALTER TABLE t1 ADD COLUMN x INT",
-			wantType:  statement.StatementAlterTable,
+			wantType:  StatementAlterTable,
 			wantTable: "t1",
 		},
 		{
 			name:      "drop table",
 			stmt:      "DROP TABLE t1",
-			wantType:  statement.StatementDropTable,
+			wantType:  StatementDropTable,
 			wantTable: "t1",
 		},
 		{
 			name:      "rename table",
 			stmt:      "RENAME TABLE t1 TO t2",
-			wantType:  statement.StatementRenameTable,
+			wantType:  StatementRenameTable,
 			wantTable: "t1",
 		},
 		{
 			name:      "single statement with trailing semicolon",
 			stmt:      "ALTER TABLE t1 ADD COLUMN x INT;",
-			wantType:  statement.StatementAlterTable,
+			wantType:  StatementAlterTable,
 			wantTable: "t1",
 		},
 		{

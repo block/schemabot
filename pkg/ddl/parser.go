@@ -5,6 +5,9 @@ import (
 	"strings"
 
 	"github.com/block/spirit/pkg/statement"
+	"github.com/pingcap/tidb/pkg/parser"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/format"
 )
 
 // StatementParser abstracts the dialect-specific, string-level DDL parsing
@@ -29,7 +32,7 @@ type StatementParser interface {
 	// Classify returns the statement type and table name for a single
 	// statement. It rejects multi-statement input so a destructive statement
 	// cannot hide behind the classification of the first one.
-	Classify(stmt string) (statement.StatementType, string, error)
+	Classify(stmt string) (StatementType, string, error)
 
 	// Canonicalize normalizes a single DDL statement's formatting, returning
 	// the input unchanged when it cannot be parsed.
@@ -69,31 +72,66 @@ func (tidbStatementParser) Split(content string) ([]string, error) {
 }
 
 // Classify implements StatementParser.
-func (tidbStatementParser) Classify(stmt string) (statement.StatementType, string, error) {
+func (tidbStatementParser) Classify(stmt string) (StatementType, string, error) {
 	results, err := statement.Classify(stmt)
 	if err != nil {
-		return statement.StatementUnknown, "", fmt.Errorf("classify statement %q: %w", statementPreview(stmt), err)
+		return StatementUnknown, "", fmt.Errorf("classify statement %q: %w", statementPreview(stmt), err)
 	}
 	if len(results) == 0 {
-		return statement.StatementUnknown, "", fmt.Errorf("no classification result for statement %q", statementPreview(stmt))
+		return StatementUnknown, "", fmt.Errorf("no classification result for statement %q", statementPreview(stmt))
 	}
 	if len(results) > 1 {
-		return statement.StatementUnknown, "", fmt.Errorf(
+		return StatementUnknown, "", fmt.Errorf(
 			"expected a single statement but %q parsed as %d statements; split with SplitStatements before classifying",
 			statementPreview(stmt), len(results),
 		)
 	}
-	return results[0].Type, results[0].Table, nil
+	return statementTypeFromSpirit(results[0].Type), results[0].Table, nil
+}
+
+// statementTypeFromSpirit translates Spirit's parser-owned statement type into
+// the pkg/ddl-owned vocabulary at the seam boundary, so Spirit's type never
+// escapes the TiDB implementation.
+func statementTypeFromSpirit(t statement.StatementType) StatementType {
+	switch t {
+	case statement.StatementAlterTable:
+		return StatementAlterTable
+	case statement.StatementCreateTable:
+		return StatementCreateTable
+	case statement.StatementDropTable:
+		return StatementDropTable
+	case statement.StatementRenameTable:
+		return StatementRenameTable
+	case statement.StatementTruncateTable:
+		return StatementTruncateTable
+	case statement.StatementCreateIndex:
+		return StatementCreateIndex
+	case statement.StatementDropIndex:
+		return StatementDropIndex
+	case statement.StatementCreateView:
+		return StatementCreateView
+	case statement.StatementInsert:
+		return StatementInsert
+	case statement.StatementUpdate:
+		return StatementUpdate
+	case statement.StatementDelete:
+		return StatementDelete
+	case statement.StatementUnknown:
+		return StatementUnknown
+	default:
+		return StatementUnknown
+	}
 }
 
 // Canonicalize implements StatementParser.
 //
 // For ALTER TABLE statements it reconstructs from Spirit's normalized Alter
-// field; for CREATE TABLE and DROP TABLE it uses TiDB's Restore. It returns the
-// original statement when parsing fails.
+// field; for CREATE TABLE and DROP TABLE it uses TiDB's Restore. It returns
+// the original statement when parsing fails or when the input contains more
+// than one statement, so canonicalization never truncates its input.
 func (tidbStatementParser) Canonicalize(ddl string) string {
 	stmts, err := statement.New(ddl)
-	if err != nil || len(stmts) == 0 {
+	if err != nil || len(stmts) != 1 {
 		return ddl
 	}
 
@@ -109,4 +147,30 @@ func (tidbStatementParser) Canonicalize(ddl string) string {
 
 	// For CREATE TABLE and DROP TABLE, use TiDB's Restore for canonical format.
 	return restoreCanonical(ddl)
+}
+
+// restoreCanonical uses TiDB parser to restore a statement in canonical
+// format. It returns the input unchanged unless exactly one statement was
+// parsed, so it never drops trailing statements from multi-statement input.
+func restoreCanonical(ddl string) string {
+	p := parser.New()
+	stmtNodes, _, err := p.Parse(ddl, "", "")
+	if err != nil || len(stmtNodes) != 1 {
+		return ddl
+	}
+
+	node := stmtNodes[0]
+
+	// Only canonicalize CREATE TABLE and DROP TABLE
+	switch node.(type) {
+	case *ast.CreateTableStmt, *ast.DropTableStmt:
+		var sb strings.Builder
+		rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
+		if err := node.Restore(rCtx); err != nil {
+			return ddl
+		}
+		return sb.String()
+	default:
+		return ddl
+	}
 }

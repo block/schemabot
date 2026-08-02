@@ -352,10 +352,11 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 // leaves the engine state Stopped, a genuine failure transitions to
 // StateFailed.
 func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTargetDB, database string, stmts []directRouted, policy directPolicy) bool {
+	logger := e.changeLogger()
 	lockWaitSeconds := policy.lockAcquisitionTimeoutSeconds()
 	db, err := target.get(ctx)
 	if err != nil {
-		e.logger.Error("direct execution failed: cannot connect to target",
+		logger.Error("direct execution failed: cannot connect to target",
 			"database", database, "error", err)
 		e.setSchemaChangeFailed(fmt.Errorf("connect for direct execution: %w", err))
 		return false
@@ -365,7 +366,7 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 	// reliably apply to the DDL if both went through the pool.
 	conn, err := db.Conn(ctx)
 	if err != nil {
-		e.logger.Error("direct execution failed: cannot acquire a dedicated connection",
+		logger.Error("direct execution failed: cannot acquire a dedicated connection",
 			"database", database, "error", err)
 		e.setSchemaChangeFailed(fmt.Errorf("acquire dedicated connection for direct execution: %w", err))
 		return false
@@ -373,14 +374,14 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 	defer utils.CloseAndLog(conn)
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION lock_wait_timeout = %d, innodb_lock_wait_timeout = %d",
 		lockWaitSeconds, lockWaitSeconds)); err != nil {
-		e.logger.Error("direct execution failed: cannot bound the session lock wait timeouts",
+		logger.Error("direct execution failed: cannot bound the session lock wait timeouts",
 			"database", database, "error", err)
 		e.setSchemaChangeFailed(fmt.Errorf("bound session lock wait timeouts for direct execution: %w", err))
 		return false
 	}
 	for _, ds := range stmts {
 		progress := e.trackDirectStatement(ds.table, ds.stmt)
-		e.logger.Info("executing statement directly as native MySQL DDL",
+		logger.Info("executing statement directly as native MySQL DDL",
 			"database", database, "table", ds.table, "reason", ds.reason, "estimated_rows", ds.rows)
 		e.emitTableLog(ds.table, "executing statement as native MySQL DDL: writes to the table block while it runs; not revertible")
 		if _, err := conn.ExecContext(ctx, ds.stmt); err != nil {
@@ -390,27 +391,27 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 				// indeterminate until an operator inspects the table.
 				e.setDirectStatementState(progress, directStateStopped)
 				metrics.RecordDirectExecution(ctx, database, "stopped")
-				e.logger.Info("schema change stopped during direct execution; the in-flight statement may still complete server-side",
+				logger.Info("schema change stopped during direct execution; the in-flight statement may still complete server-side",
 					"database", database, "table", ds.table, "reason", ctx.Err())
 				return false
 			}
 			e.setDirectStatementState(progress, directStateFailed)
 			metrics.RecordDirectExecution(ctx, database, "failed")
 			if isLockWaitTimeout(err) {
-				e.logger.Error("direct execution failed: statement could not acquire the table's metadata lock within the bounded wait",
+				logger.Error("direct execution failed: statement could not acquire the table's metadata lock within the bounded wait",
 					"database", database, "table", ds.table, "lock_wait_timeout_seconds", lockWaitSeconds, "error", err)
 				e.setSchemaChangeFailed(fmt.Errorf("table %q is busy: could not acquire the metadata lock within %ds; retry when long-running transactions on the table have finished: %w",
 					ds.table, lockWaitSeconds, err))
 				return false
 			}
-			e.logger.Error("direct execution failed",
+			logger.Error("direct execution failed",
 				"database", database, "table", ds.table, "error", err)
 			e.setSchemaChangeFailed(fmt.Errorf("direct execution of ALTER on table %q failed: %w", ds.table, err))
 			return false
 		}
 		e.setDirectStatementState(progress, directStateCompleted)
 		metrics.RecordDirectExecution(ctx, database, "completed")
-		e.logger.Info("direct execution completed", "database", database, "table", ds.table)
+		logger.Info("direct execution completed", "database", database, "table", ds.table)
 		e.emitTableLog(ds.table, "statement completed as native MySQL DDL")
 	}
 	return true

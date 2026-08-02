@@ -12,8 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/block/spirit/pkg/statement"
-
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -31,11 +29,11 @@ const (
 func changeTypeToString(ct ternv1.ChangeType) string {
 	switch ct {
 	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return ddl.StatementTypeToOp(statement.StatementCreateTable)
+		return ddl.StatementTypeToOp(ddl.StatementCreateTable)
 	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return ddl.StatementTypeToOp(statement.StatementAlterTable)
+		return ddl.StatementTypeToOp(ddl.StatementAlterTable)
 	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return ddl.StatementTypeToOp(statement.StatementDropTable)
+		return ddl.StatementTypeToOp(ddl.StatementDropTable)
 	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
 		return "vschema_update"
 	default:
