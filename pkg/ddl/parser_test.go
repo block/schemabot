@@ -165,6 +165,12 @@ func TestTiDBClassifyTranslatesToOwnedTypes(t *testing.T) {
 			wantTable: "users",
 		},
 		{
+			name:      "create view",
+			stmt:      "CREATE VIEW `active_users` AS SELECT `id` FROM `users`",
+			wantType:  StatementCreateView,
+			wantTable: "active_users",
+		},
+		{
 			name:     "insert",
 			stmt:     "INSERT INTO `users` (`id`) VALUES (1)",
 			wantType: StatementInsert,
