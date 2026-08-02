@@ -778,6 +778,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		Options:      options,
 		ResumeState:  resumeState,
 		Credentials:  creds,
+		Logger:       c.logger.With(apply.IdentityLogAttrs()...),
 		OnStateChange: func(rs *engine.ResumeState) {
 			if rs == nil {
 				c.logger.Debug("OnStateChange: nil resume state", "apply_id", apply.ApplyIdentifier)
@@ -1295,6 +1296,7 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		Options:       apply.GetOptions().Map(),
 		ResumeState:   resumeState,
 		Credentials:   creds,
+		Logger:        c.logger.With(apply.IdentityLogAttrs()...),
 		OnStateChange: persistResume,
 	})
 	if err != nil {
