@@ -291,19 +291,23 @@ func TestOperator_OperatorClaimsOperationToCompletion(t *testing.T) {
 	assert.Equal(t, derived, finalApply.State, "parent apply state is derived from its child operations")
 }
 
-// TestOperator_OperatorReconcilesOperationWhenParentTerminal covers the safety
-// case where the operator claims an apply_operations row whose parent apply is
-// already terminal — for example the operator flag is enabled after the apply
-// finished, or the parent reached a terminal state via another path. The
-// operator must reconcile the operation to the parent's terminal state rather
-// than re-claiming the same non-terminal row on every poll forever.
-func TestOperator_OperatorReconcilesOperationWhenParentTerminal(t *testing.T) {
+// TestOperator_OperatorSkipsOperationWhenParentTerminal covers the safety case
+// where an apply_operations row is still pending while its parent apply is
+// already terminal — for example operation-level claiming is enabled after the
+// apply finished, or the parent reached a terminal state via another path. The
+// rollout's outcome is settled, so the operator must not claim the row: it
+// stays pending and unleased, and it must not sit at the head of the claim
+// queue shadowing live work — an apply submitted behind it still runs to
+// completion.
+func TestOperator_OperatorSkipsOperationWhenParentTerminal(t *testing.T) {
 	ctx := t.Context()
-	appDBName, appDSN := createTestDB(t, "operator_reconcile_")
+	appDBName, appDSN := createTestDB(t, "operator_skip_terminal_")
 	ts := startTestServerOperator(t, appDBName, appDSN)
 
+	// A pending operation under an already-completed parent, created before any
+	// live work so it sits ahead of it in claim order.
 	now := time.Now()
-	applyID, err := ts.Storage.Applies().Create(ctx, &storage.Apply{
+	deadParentID, err := ts.Storage.Applies().Create(ctx, &storage.Apply{
 		ApplyIdentifier: "apply-terminal-parent",
 		Database:        appDBName,
 		DatabaseType:    "mysql",
@@ -317,37 +321,47 @@ func TestOperator_OperatorReconcilesOperationWhenParentTerminal(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	opID, err := ts.Storage.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID:    applyID,
+	deadOpID, err := ts.Storage.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    deadParentID,
 		Deployment: appDBName,
 		Target:     appDBName,
 		State:      state.ApplyOperation.Pending,
 	})
 	require.NoError(t, err)
 
-	require.Eventually(t, func() bool {
-		op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
-		if err != nil || op == nil {
-			return false
-		}
-		return state.IsState(op.State, state.ApplyOperation.Completed)
-	}, 10*time.Second, 100*time.Millisecond,
-		"operator should reconcile the operation to completed when its parent apply is already completed")
-
-	op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+	// Live work submitted behind the dead row completes: the operator's claim
+	// skips the dead row instead of wedging on it.
+	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
 	require.NoError(t, err)
-	require.NotNil(t, op)
-	assert.Equal(t, state.ApplyOperation.Completed, op.State)
-	require.NotNil(t, op.CompletedAt, "reconciled completed operation stamps completed_at")
+	planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database": appDBName, "environment": "staging", "type": "mysql",
+		"schema_files": map[string]any{"default": map[string]any{"files": map[string]string{"users.sql": string(schemaSQL)}}},
+	})
+	planID, _ := planResp["plan_id"].(string)
+	require.NotEmpty(t, planID)
 
-	// Even on the terminal-parent reconciliation path, the parent stays equal to
-	// DeriveApplyState of its child operations.
-	parent, err := ts.Storage.Applies().Get(ctx, applyID)
+	applyResp := postJSON(t, "http://"+ts.Addr+"/api/apply", map[string]any{
+		"plan_id": planID, "environment": "staging",
+	})
+	require.True(t, applyResp["accepted"] == true)
+	liveApplyID, _ := applyResp["apply_id"].(string)
+	require.NotEmpty(t, liveApplyID)
+
+	waitForState(t, "http://"+ts.Addr, liveApplyID, "completed", 20*time.Second)
+
+	// The dead row is untouched: still pending, never claimed, and its settled
+	// parent still reads completed.
+	deadOp, err := ts.Storage.ApplyOperations().Get(ctx, deadOpID)
 	require.NoError(t, err)
-	require.NotNil(t, parent)
-	derived := state.DeriveApplyState([]string{op.State})
-	assert.Equal(t, state.Apply.Completed, derived)
-	assert.Equal(t, derived, parent.State, "parent apply state is derived from its child operations")
+	require.NotNil(t, deadOp)
+	assert.Equal(t, state.ApplyOperation.Pending, deadOp.State, "a pending operation under a terminal parent is never claimed")
+	assert.Empty(t, deadOp.LeaseOwner, "no driver leases the dead row")
+	assert.Nil(t, deadOp.StartedAt, "the dead row is never started")
+
+	deadParent, err := ts.Storage.Applies().Get(ctx, deadParentID)
+	require.NoError(t, err)
+	require.NotNil(t, deadParent)
+	assert.Equal(t, state.Apply.Completed, deadParent.State, "the settled parent's outcome is untouched")
 }
 
 // TestOperator_StopReconciliationDrivesTaskStop covers the operation-claim stop

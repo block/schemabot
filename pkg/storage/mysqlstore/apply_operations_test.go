@@ -837,6 +837,147 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsPending(t *testing.T) 
 	assert.Nil(t, again)
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_PendingClaimRequiresActiveParent
+// verifies the active-parent gate on the pending arm: a pending operation is
+// claimable only while its parent apply is non-terminal. Starting a deployment
+// belongs to a live rollout — once the parent's outcome is settled (completed,
+// failed, stopped, cancelled, or reverted), its never-started pending rows must
+// not be claimed, and must not shadow other applies' work in the claim order.
+// Non-terminal parents — including running_degraded, which an on_failure
+// "continue" rollout derives while a failed sibling coexists with in-flight
+// ones — keep their pending operations claimable.
+func TestApplyOperationStore_FindNextApplyOperation_PendingClaimRequiresActiveParent(t *testing.T) {
+	cases := []struct {
+		parentState string
+		claimable   bool
+	}{
+		{state.Apply.Completed, false},
+		{state.Apply.Failed, false},
+		{state.Apply.Stopped, false},
+		{state.Apply.Cancelled, false},
+		{state.Apply.Reverted, false},
+		{state.Apply.Running, true},
+		{state.Apply.RunningDegraded, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.parentState, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := New(testDB)
+
+			lock := createTestLock(t, store, "testdb", "mysql", "staging")
+			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_parent_gate", 1, tc.parentState, "staging")
+
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+			})
+			require.NoError(t, err)
+
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+			require.NoError(t, err)
+			if !tc.claimable {
+				assert.Nil(t, claimed, "a pending operation whose parent apply is %s must not be claimable", tc.parentState)
+				return
+			}
+			require.NotNil(t, claimed, "a pending operation whose parent apply is %s must be claimable", tc.parentState)
+			assert.Equal(t, id, claimed.ID)
+		})
+	}
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_TerminalParentDoesNotBlockNewerWork
+// verifies claim ordering across applies: a pending row whose parent apply is
+// already settled does not sit at the head of the claim queue shadowing newer
+// claimable work. The claim skips it and returns the pending row whose parent
+// is still active.
+func TestApplyOperationStore_FindNextApplyOperation_TerminalParentDoesNotBlockNewerWork(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	settled := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_parent_settled", 1, state.Apply.Completed, "staging")
+	active := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_parent_active", 2, state.Apply.Running, "staging")
+
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: settled.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+	newerID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: active.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "the pending operation under the active apply must be claimed")
+	assert.Equal(t, newerID, claimed.ID, "the settled apply's pending row must be skipped, not block the queue")
+	assert.Equal(t, active.ID, claimed.ApplyID)
+
+	// The settled apply's pending row stays unclaimable afterwards too.
+	again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, again, "no claimable work remains once the active apply's row is claimed")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_StoppedParentResumesThroughStoppedRow
+// verifies the resume path for a stopped rollout with a not-yet-started
+// sibling under a parallel cutover policy (which has no earlier-sibling gate,
+// so the parent's state is the only thing standing between the pending row and
+// a claim). While the parent apply is stopped, a pending start request claims
+// the stopped operation — the row that resumes the rollout — and the pending
+// sibling stays unclaimable. Once the resume drive brings the parent back to a
+// non-terminal state, the pending sibling becomes claimable.
+func TestApplyOperationStore_FindNextApplyOperation_StoppedParentResumesThroughStoppedRow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_stopped_resume", 1, state.Apply.Stopped, "staging")
+
+	stoppedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+		State: state.ApplyOperation.Stopped, CutoverPolicy: storage.CutoverPolicyParallel,
+	})
+	require.NoError(t, err)
+	pendingID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", Target: "payments",
+		CutoverPolicy: storage.CutoverPolicyParallel,
+	})
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "the stopped operation must be reclaimable via the pending start request")
+	assert.Equal(t, stoppedID, claimed.ID, "resume must go through the stopped row, not the pending sibling")
+
+	// The pending sibling stays unclaimable while the parent is stopped: the
+	// resume drive owns bringing the rollout back, and only then may
+	// not-yet-started work be picked up.
+	blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, blocked, "the pending sibling must not be claimable while the parent apply is stopped")
+
+	// Once the resume drive re-derives the parent to a non-terminal state, the
+	// pending sibling is claimable again.
+	_, err = testDB.ExecContext(ctx, `UPDATE applies SET state = ? WHERE id = ?`, state.Apply.Running, apply.ID)
+	require.NoError(t, err)
+
+	unblocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, unblocked, "the pending sibling must become claimable once the parent apply is active again")
+	assert.Equal(t, pendingID, unblocked.ID)
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_SkipsFreshRunning verifies
 // that a running row whose heartbeat is fresh is *not* re-claimed: the active
 // driver still owns it.

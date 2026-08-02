@@ -686,6 +686,8 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 
 	activeStates := claimableApplyStates()
 	activeStatePlaceholders := placeholders(len(activeStates))
+	terminalStates := terminalApplyStates()
+	terminalStatePlaceholders := placeholders(len(terminalStates))
 
 	queryArgs := []any{state.ApplyOperation.Pending}
 	queryArgs = append(queryArgs, storage.ApplyOperationKindGroupFinalizer)
@@ -725,6 +727,19 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// is recovering work it started and is handled by the staleness clause below.
 	queryArgs = append(queryArgs,
 		storage.ControlOperationStop, storage.ControlRequestPending)
+	// Active-parent gate: a pending operation is only claimable while its
+	// parent apply is non-terminal — starting a deployment belongs to a live
+	// rollout, and a terminal parent means the apply's outcome is already
+	// settled (completed, failed, stopped, cancelled, or reverted). The
+	// predicate is NOT IN terminal rather than IN claimable so a future
+	// non-terminal parent state keeps its pending operations claimable. It
+	// gates only this pending arm: the stale-active, stopped+start,
+	// waiting_for_deploy+start, and failed_retryable arms recover or resume
+	// work that already started and carry their own parent-state conditions.
+	// The window where the parent terminalizes after this SELECT is handled by
+	// the driver-side parent claim refusing and reconcileUnclaimableParent
+	// settling the claimed row from the parent's state.
+	queryArgs = append(queryArgs, stringArgs(terminalStates)...)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	// Stale-active barrier-park exemption (see the staleness clause below): a
 	// multi-deployment operation parked at the cutover barrier under an
@@ -845,6 +860,12 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.operation = ?
 						AND cr.status = ?
 				)
+				AND EXISTS (
+					SELECT 1
+					FROM applies a
+					WHERE a.id = apply_operations.apply_id
+						AND a.state NOT IN (%s)
+				)
 			)
 			OR (
 				state IN (%s)
@@ -914,7 +935,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
+	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
