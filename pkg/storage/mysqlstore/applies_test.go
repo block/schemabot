@@ -4464,9 +4464,9 @@ func stageOperationProjectionOrphan(t *testing.T, store *Storage, identifier, pa
 	return apply
 }
 
-// createStrandedStopApply seeds the minimal stop-reconciliation shape: an apply
-// in the given state with one pending operation and a pending stop control
-// request, so FindNextApplyForStopReconciliation considers it a candidate.
+// createStrandedStopApply seeds the minimal stop-reconciliation shape: a
+// running apply with one pending operation and a pending stop control request,
+// so FindNextApplyForStopReconciliation considers it a candidate.
 func createStrandedStopApply(t *testing.T, store *Storage, lock *storage.Lock, applyID string, planID int64) *storage.Apply {
 	t.Helper()
 	ctx := t.Context()
