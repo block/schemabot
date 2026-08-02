@@ -153,6 +153,16 @@ jobs:
             ~/.cache/go-build
           key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so transient registry outages
+      # surface here as a named, retryable, fail-fast step instead of as many
+      # parallel testcontainer "context deadline exceeded" test failures.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            mysql:8.0 \
+            mysql:8.4 \
+            localstack/localstack:3.0 \
+            testcontainers/ryuk:0.13.0
       - name: "Test"
         # Cap package-level parallelism: the integration suite runs many heavy
         # MySQL/Spirit package binaries that otherwise thrash CPU and the shared
@@ -231,6 +241,14 @@ jobs:
             ~/.cache/go-build
           key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so a transient registry outage
+      # fails fast in a named, retryable step instead of failing the image
+      # build or the testcontainer-based tests below.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            testcontainers/ryuk:0.13.0 \
+            --dockerfile deploy/local/Dockerfile.localscale
       - name: "Build LocalScale image"
         run: |
           CGO_ENABLED=0 GOOS=linux go build -o bin/localscale-linux ./cmd/localscale
@@ -261,6 +279,15 @@ jobs:
             ~/.cache/go-build
           key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so a transient registry outage
+      # fails fast in a named, retryable step instead of failing the compose
+      # image builds or container startup mid-job.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            mysql:8.0 \
+            --dockerfile deploy/local/Dockerfile.dev \
+            --dockerfile deploy/local/Dockerfile.localscale
       - name: "Test"
         run: make test-e2e-mysql test-e2e-grpc
       - name: "Capture container logs on failure"
@@ -314,6 +341,14 @@ jobs:
             ~/.cache/go-build
           key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so a transient registry outage
+      # fails fast in a named, retryable step instead of failing the compose
+      # image builds or container startup mid-job.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            mysql:8.0 \
+            --dockerfile deploy/local/Dockerfile.dev
       - name: "Test"
         run: make test-e2e-grpc-multideploy E2E_GRPC_MD_RUN='${{ matrix.run }}'
       - name: "Show captured container logs on failure"
@@ -404,6 +439,15 @@ jobs:
             ~/.cache/go-build
           key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so a transient registry outage
+      # fails fast in a named, retryable step instead of failing the compose
+      # image builds or container startup mid-job.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            mysql:8.0 \
+            --dockerfile deploy/local/Dockerfile.dev \
+            --dockerfile deploy/local/Dockerfile.localscale
       - name: "Test"
         run: |
           echo "Vitess e2e shard ${{ matrix.shard }}: ${{ matrix.run_filter }}"
