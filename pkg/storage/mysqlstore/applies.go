@@ -1225,6 +1225,32 @@ const recentAppliesLastActivity = `GREATEST(
 	), applies.updated_at)
 )`
 
+// recentAppliesActivityAlias names the last-activity value once it has been
+// projected by recentAppliesSelect, so the sort keys reference a column instead
+// of repeating the subquery.
+const recentAppliesActivityAlias = "last_activity"
+
+// recentAppliesListAlias is the name the projected rows take in the outer query.
+const recentAppliesListAlias = "recent"
+
+// recentAppliesSelect projects the filtered applies along with their last
+// activity, for the outer query to sort.
+//
+// The list computes last activity in this inner select rather than inside its
+// ORDER BY because the value appears in three of the four sort keys: evaluated
+// in place, the subquery runs once per key per candidate row, and the query
+// spends most of its time re-deriving a value it already has. Projecting it once
+// makes the sort keys plain column references.
+func recentAppliesSelect(filter storage.RecentAppliesFilter) (string, []any) {
+	query := "SELECT " + applyColumns + ", " + recentAppliesLastActivity + " AS " + recentAppliesActivityAlias +
+		" FROM applies"
+	where, args := recentAppliesWhere(filter)
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	return query, args
+}
+
 // recentAppliesOrderBy sorts the status list into a live group and a quiet
 // group, and orders each by the key that means something for it.
 //
@@ -1257,15 +1283,16 @@ func (s *applyStore) recentAppliesOrderBy() (string, []any) {
 	liveWindow := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
 		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	terminal := terminalApplyStates()
-	isLive := fmt.Sprintf("(%s >= %s AND applies.state NOT IN (%s))",
-		recentAppliesLastActivity, liveWindow, placeholders(len(terminal)))
+	col := func(name string) string { return recentAppliesListAlias + "." + name }
+	isLive := fmt.Sprintf("(%s >= %s AND %s NOT IN (%s))",
+		col(recentAppliesActivityAlias), liveWindow, col("state"), placeholders(len(terminal)))
 
 	orderBy := fmt.Sprintf(`
 		ORDER BY %s DESC,
-			CASE WHEN %s THEN COALESCE(applies.started_at, applies.created_at) END ASC,
+			CASE WHEN %s THEN COALESCE(%s, %s) END ASC,
 			%s DESC,
-			applies.id DESC
-	`, isLive, isLive, recentAppliesLastActivity)
+			%s DESC
+	`, isLive, isLive, col("started_at"), col("created_at"), col(recentAppliesActivityAlias), col("id"))
 
 	// The live predicate appears twice, so its states bind twice.
 	args := append(stringArgs(terminal), stringArgs(terminal)...)
@@ -1274,16 +1301,11 @@ func (s *applyStore) recentAppliesOrderBy() (string, []any) {
 
 // GetRecent returns applies matching the filter, in-flight work first.
 func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentAppliesFilter) ([]*storage.Apply, error) {
-	query := `
-		SELECT ` + applyColumns + `
-		FROM applies
-	`
-	where, args := recentAppliesWhere(filter)
-	if len(where) > 0 {
-		query += " WHERE " + strings.Join(where, " AND ")
-	}
+	inner, args := recentAppliesSelect(filter)
 	orderBy, orderArgs := s.recentAppliesOrderBy()
-	query += orderBy + " LIMIT ?"
+	query := "SELECT " + applyColumns +
+		" FROM (" + inner + ") AS " + recentAppliesListAlias +
+		orderBy + " LIMIT ?"
 	args = append(args, orderArgs...)
 	args = append(args, filter.Limit)
 
