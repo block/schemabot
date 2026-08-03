@@ -770,6 +770,15 @@ databases:
 
 Which environments accept scoped writes is a deployment policy, uniform across databases, so it is stated once rather than repeated on every entry. On a server that hosts several environments, that one line is the guard keeping scoped writes out of the environments not named in it.
 
+`operator_groups` is the direct API/CLI counterpart of the database's `operator_teams`/`operator_users` (PR comment commands). The suffix carries the identity domain, consistently across this file — `*_teams`/`*_users` are GitHub identities, `*_groups` are forwarded identity groups:
+
+| Field | Identity domain | Grants | Verified by |
+|---|---|---|---|
+| `operator_teams`, `operator_users` | GitHub teams and users | Mutating PR comment commands for this database | GitHub team membership, checked at command time |
+| `operator_groups` | Forwarded identity groups (`auth.forward_auth`) | Mutating direct API/CLI operations for this database, in `operator_environments` | Groups header from the trusted forward-auth proxy |
+
+The two value namespaces do not overlap and are verified by different systems, so they are deliberately separate fields: a GitHub team slug has no meaning in the groups header, and a forwarded group name is not a GitHub team. Grant each lane explicitly.
+
 The decision has two halves. The middleware admits any caller in `write_groups` or in any database's `operator_groups` to write-tier endpoints — it runs before the request body is parsed, so it cannot know the target. Each mutating handler then enforces the scope once the target database resolves: `plan` and `apply` from the request/stored plan, control operations (`stop`, `start`, `cutover`, `cancel`, `volume`, `release`, `revert`, `skip-revert`, `rollback plan`) from the stored apply, and lock acquire/release from the named database (locks are operator controls in the same family as stop/cancel and have no environment dimension, so the grant applies database-wide). Operations with no single target database — settings mutation, checks scan/synthesize/repos, webhook redrive — stay admin-only (`write_groups`). Operator members also get the read tier, deployment-wide.
 
 The grant fails closed everywhere: an unconfigured database, an environment outside `operator_environments`, or an unresolvable target denies scoped callers with a `403` naming the groups that would grant access. Misconfiguration is a startup error, not a silent no-op: any `operator_groups` grant requires a non-empty `operator_environments` (and the reverse), requires `auth.type: forward_auth`, and every listed environment must exist on at least one configured database.
