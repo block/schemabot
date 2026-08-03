@@ -38,7 +38,7 @@ func New(db *sql.DB) *Storage {
 		controlRequests: &controlRequestStore{db: db, identity: MySQLDialect{}},
 		applyComments:   &applyCommentStore{db: db, dialect: MySQLDialect{}},
 		planComments:    &planCommentStore{db: db, identity: MySQLDialect{}},
-		applyOperations: &applyOperationStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}},
+		applyOperations: &applyOperationStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}, locker: namedlock.MySQL{}},
 		checks:          &checkStore{db: db, dialect: MySQLDialect{}},
 		settings:        &settingsStore{db: db, dialect: MySQLDialect{}},
 		webhookEvents:   &webhookEventStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}},

@@ -5,6 +5,7 @@ package mysqlstore
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -2377,6 +2378,119 @@ func TestApplyStore_FindNextApplyRequiresTasksForPendingApply(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, persisted)
 	assert.Equal(t, state.Apply.Running, persisted.State)
+}
+
+// FindStuckPendingApplies is the operator's stuck-pending observability probe.
+// It surfaces pending applies a driver should already have claimed — pending
+// with child rows, the same claimability predicate FindNextApply uses — that
+// have aged past the threshold, so an operator can tell a wedged or saturated
+// driver pool from a healthy one. It must never surface a young pending apply
+// (still within normal claim latency), a pending apply with no child rows (not
+// yet claimable), or a terminal apply.
+func TestApplyStore_FindStuckPendingApplies(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	// Each pending apply needs a distinct target: apply creation rejects a
+	// second active apply for the same database/type/environment, and pending is
+	// an active state.
+	seedPending := func(t *testing.T, applyID string, planID int64, withTask bool) *storage.Apply {
+		t.Helper()
+		lock := createTestLock(t, store, "db_"+applyID, storage.DatabaseTypeMySQL, "staging")
+		apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Pending, "staging")
+		if withTask {
+			now := time.Now()
+			_, err := store.Tasks().Create(ctx, &storage.Task{
+				TaskIdentifier: "task_" + applyID,
+				ApplyID:        apply.ID,
+				PlanID:         apply.PlanID,
+				Database:       apply.Database,
+				DatabaseType:   apply.DatabaseType,
+				Engine:         storage.EngineSpirit,
+				Environment:    apply.Environment,
+				State:          state.Task.Pending,
+				TableName:      "users",
+				DDL:            "CREATE TABLE users (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+				DDLAction:      "CREATE",
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			})
+			require.NoError(t, err)
+		}
+		return apply
+	}
+	// A VSchema-only apply carries an apply_operations row but no tasks; that
+	// operation row alone makes it claimable, so the stuck scan must surface it.
+	seedPendingVSchemaOnly := func(t *testing.T, applyID string, planID int64) *storage.Apply {
+		t.Helper()
+		lock := createTestLock(t, store, "db_"+applyID, storage.DatabaseTypeVitess, "staging")
+		apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Pending, "staging")
+		now := time.Now()
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID:    apply.ID,
+			Deployment: apply.Database,
+			State:      state.ApplyOperation.Pending,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		})
+		require.NoError(t, err)
+		return apply
+	}
+	backdate := func(t *testing.T, id int64, age time.Duration) {
+		t.Helper()
+		_, err := testDB.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE applies SET created_at = NOW() - INTERVAL %d SECOND WHERE id = ?`, int(age.Seconds())),
+			id)
+		require.NoError(t, err)
+	}
+
+	// Old claimable pending applies → stuck, oldest first. The tasks arm and the
+	// apply_operations arm are both claimable, so both must be surfaced.
+	oldest := seedPending(t, "apply_oldest_claimable", 9001, true)
+	backdate(t, oldest.ID, 40*time.Minute)
+	vschemaOnly := seedPendingVSchemaOnly(t, "apply_vschema_only", 9006)
+	backdate(t, vschemaOnly.ID, 30*time.Minute)
+	older := seedPending(t, "apply_old_claimable", 9002, true)
+	backdate(t, older.ID, 20*time.Minute)
+
+	// Young claimable pending apply (created now) → below threshold, not stuck.
+	seedPending(t, "apply_young_claimable", 9003, true)
+
+	// Old pending apply with no child rows → not yet claimable, excluded.
+	noChildren := seedPending(t, "apply_old_no_children", 9004, false)
+	backdate(t, noChildren.ID, 40*time.Minute)
+
+	// Old terminal apply → not pending, excluded.
+	completedLock := createTestLock(t, store, "db_completed", storage.DatabaseTypeMySQL, "staging")
+	completed := createTestApplyWithStateAndEnv(t, store, completedLock, "apply_old_completed", 9005, state.Apply.Completed, "staging")
+	backdate(t, completed.ID, 40*time.Minute)
+
+	threshold := 10 * time.Minute
+
+	t.Run("returns aged claimable pending applies oldest first", func(t *testing.T) {
+		stuck, err := store.Applies().FindStuckPendingApplies(ctx, threshold, 0)
+		require.NoError(t, err)
+		require.Len(t, stuck, 3)
+		assert.Equal(t, oldest.ApplyIdentifier, stuck[0].ApplyIdentifier)
+		assert.Equal(t, vschemaOnly.ApplyIdentifier, stuck[1].ApplyIdentifier,
+			"a task-less pending apply with an apply_operations row must be surfaced")
+		assert.Equal(t, older.ApplyIdentifier, stuck[2].ApplyIdentifier)
+		assert.Equal(t, state.Apply.Pending, stuck[0].State)
+	})
+
+	t.Run("limit caps the result to the oldest rows", func(t *testing.T) {
+		stuck, err := store.Applies().FindStuckPendingApplies(ctx, threshold, 1)
+		require.NoError(t, err)
+		require.Len(t, stuck, 1)
+		assert.Equal(t, oldest.ApplyIdentifier, stuck[0].ApplyIdentifier)
+	})
+
+	t.Run("a threshold above every age surfaces nothing", func(t *testing.T) {
+		stuck, err := store.Applies().FindStuckPendingApplies(ctx, time.Hour, 0)
+		require.NoError(t, err)
+		assert.Empty(t, stuck)
+	})
 }
 
 // A VSchema-only apply carries an apply_operations row but no tasks — the

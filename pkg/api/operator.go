@@ -65,6 +65,10 @@ func (s *Service) StartOperator(ctx context.Context) {
 	stop := make(chan struct{})
 	wake := make(chan struct{}, driverCount)
 	driverCtx, cancel := context.WithCancel(ctx)
+	reaperEvery := s.strandedReaperEvery
+	if reaperEvery <= 0 {
+		reaperEvery = StrandedReaperInterval
+	}
 	s.stopRecovery = stop
 	s.cancelRecovery = cancel
 	s.operatorWake = wake
@@ -77,7 +81,17 @@ func (s *Service) StartOperator(ctx context.Context) {
 		})
 	}
 
-	s.logger.Info("operator started", "drivers", driverCount, "interval", s.operatorPollInterval)
+	// The stranded-operation reaper is maintenance, not claim work, so it runs on
+	// its own slow cadence outside the driver pool. It shares the driver
+	// lifecycle: one goroutine per process, stopped by StopOperator.
+	s.recoveryWg.Go(func() {
+		s.strandedReaperLoop(driverCtx, stop, reaperEvery)
+	})
+
+	s.logger.Info("operator started",
+		"drivers", driverCount,
+		"interval", s.operatorPollInterval,
+		"stranded_reaper_interval", reaperEvery)
 }
 
 // StopOperator stops the background operator and waits for all drivers to finish.
@@ -214,12 +228,10 @@ func (s *Service) expireRetryableApplies(ctx context.Context, driverID int) {
 	for _, expiration := range expired {
 		apply := expiration.Apply
 		s.logger.Error("operator: retryable apply expired",
-			"driver", driverID,
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"attempt", apply.Attempt,
-			"reason", expiration.Reason)
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"attempt", apply.Attempt,
+				"reason", expiration.Reason)...)
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, string(expiration.Reason))
 	}
 }
@@ -416,13 +428,11 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	applyLease := apply.Lease()
 	if !applyLease.Valid() {
 		s.logger.Error("operator: claimed parent apply without a valid lease token; operation will not be driven",
-			"driver", driverID,
-			"lease_owner", owner,
-			"apply_operation_id", op.ID,
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"deployment", op.Deployment,
-			"environment", apply.Environment)
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"lease_owner", owner,
+				"apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment)...)
 		metrics.RecordOperatorClaimFailure(ctx, "missing_lease_token")
 		return
 	}
@@ -450,14 +460,11 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	// with no routing key, so fail closed rather than fall back to a default.
 	if op.Deployment == "" {
 		s.logger.Error("operator: claimed operation is missing deployment metadata; operation will not be driven",
-			"driver", driverID,
-			"lease_owner", owner,
-			"apply_operation_id", op.ID,
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"deployment", op.Deployment,
-			"apply_deployment", apply.Deployment,
-			"environment", apply.Environment)
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"lease_owner", owner,
+				"apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment)...)
 		metrics.RecordOperatorClaimFailure(ctx, "missing_operation_deployment")
 		return
 	}
@@ -836,8 +843,8 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 	lease := apply.Lease()
 	if !lease.Valid() {
 		s.logger.Error("operator: claimed apply for stop reconciliation without a valid lease token; skipping",
-			"driver", driverID, "lease_owner", owner,
-			"apply_id", apply.ApplyIdentifier, "database", apply.Database, "environment", apply.Environment)
+			append(apply.LogAttrs(),
+				"driver", driverID, "lease_owner", owner)...)
 		metrics.RecordOperatorClaimFailure(ctx, "stop_reconciliation_missing_lease_token")
 		return true
 	}
@@ -858,9 +865,8 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 		// Fail closed: leave the pending stop and pending operation rows untouched
 		// so the next tick reclaims this apply and retries the data-plane stop.
 		s.logger.Error("operator: failed to drive data-plane stop during stop reconciliation",
-			"driver", driverID, "apply_id", apply.ApplyIdentifier,
-			"database", apply.Database, "deployment", apply.Deployment,
-			"environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"driver", driverID, "error", err)...)
 		return true
 	}
 
@@ -881,22 +887,22 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 	finalApply, err := s.storage.Applies().Get(applyLeaseCtx, apply.ID)
 	if err != nil {
 		s.logger.Error("operator: failed to reload apply during stop reconciliation; derived apply state not updated",
-			"driver", driverID, "apply_id", apply.ApplyIdentifier,
-			"database", apply.Database, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"driver", driverID, "error", err)...)
 		return true
 	}
 	if finalApply == nil {
 		s.logger.Error("operator: apply not found during stop reconciliation; derived apply state not updated",
-			"driver", driverID, "apply_id", apply.ApplyIdentifier,
-			"database", apply.Database, "environment", apply.Environment)
+			append(apply.LogAttrs(),
+				"driver", driverID)...)
 		return true
 	}
 
 	result, err := s.updateApplyStateFromOperations(applyLeaseCtx, driverID, finalApply, allowLeaseScopedFailedReopen)
 	if err != nil {
 		s.logger.Error("operator: failed to update derived apply state during stop reconciliation",
-			"driver", driverID, "apply_id", finalApply.ApplyIdentifier,
-			"database", finalApply.Database, "environment", finalApply.Environment, "error", err)
+			append(finalApply.LogAttrs(),
+				"driver", driverID, "error", err)...)
 		return true
 	}
 
@@ -942,9 +948,8 @@ func (s *Service) markPendingOperationsStopped(ctx context.Context, driverID int
 	}
 	if stopped > 0 {
 		s.logger.Info("operator: stopped pending sibling operations for pending stop request",
-			"driver", driverID, "apply_id", apply.ApplyIdentifier,
-			"database", apply.Database, "environment", apply.Environment,
-			"stopped_operation_count", stopped)
+			append(apply.LogAttrs(),
+				"driver", driverID, "stopped_operation_count", stopped)...)
 	}
 	return nil
 }
@@ -975,8 +980,8 @@ func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Cont
 	}
 	if state.IsState(apply.State, state.Apply.Stopped) {
 		s.logger.Debug("operator: leaving pending cancel request deliverable for stopped apply",
-			"driver", driverID, "apply_id", apply.ApplyIdentifier,
-			"database", apply.Database, "environment", apply.Environment, "state", apply.State)
+			append(apply.LogAttrs(),
+				"driver", driverID)...)
 		return nil
 	}
 	return s.completePendingRequestForResolvedApply(ctx, driverID, apply, storage.ControlOperationCancel)
@@ -998,9 +1003,8 @@ func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, dr
 		return fmt.Errorf("complete pending %s request for resolved apply %s (%d): %w", op, apply.ApplyIdentifier, apply.ID, err)
 	}
 	s.logger.Info("operator: completed pending control request for resolved apply",
-		"driver", driverID, "apply_id", apply.ApplyIdentifier,
-		"database", apply.Database, "environment", apply.Environment,
-		"state", apply.State, "operation", op)
+		append(apply.LogAttrs(),
+			"driver", driverID, "operation", op)...)
 	return nil
 }
 
@@ -1042,12 +1046,10 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, 
 
 func (s *Service) reconcileClaimedOperationFromTerminalParent(ctx context.Context, driverID int, op *storage.ApplyOperation, parent *storage.Apply) {
 	s.logger.Info("operator: parent apply already terminal; reconciling operation to terminal state",
-		"driver", driverID,
-		"apply_operation_id", op.ID,
-		"apply_id", parent.ApplyIdentifier,
-		"deployment", op.Deployment,
-		"environment", parent.Environment,
-		"state", parent.State)
+		append(parent.LogAttrs(),
+			"driver", driverID,
+			"apply_operation_id", op.ID,
+			"operation_deployment", op.Deployment)...)
 	marked, err := s.markOperationFromApplyState(ctx, driverID, op, parent)
 	if err != nil {
 		s.logger.Error("operator: failed to reconcile apply_operation from terminal parent; derived apply state not updated",
@@ -1437,8 +1439,8 @@ func (s *Service) logApplyDrivePanicFailure(ctx context.Context, driverID int, a
 	logStore := s.storage.ApplyLogs()
 	if logStore == nil {
 		s.logger.Warn("operator: no apply log store configured; the drive panic will not appear in apply logs",
-			"driver", driverID,
-			"apply_id", apply.ApplyIdentifier)
+			append(apply.LogAttrs(),
+				"driver", driverID)...)
 		return
 	}
 	logCtx, cancel := context.WithTimeout(ctx, ApplyClaimLogTimeout)
@@ -1454,11 +1456,9 @@ func (s *Service) logApplyDrivePanicFailure(ctx context.Context, driverID int, a
 		CreatedAt: s.clock.Now(),
 	}); err != nil {
 		s.logger.Warn("operator: failed to log drive panic failure; the failure will not appear in apply logs",
-			"driver", driverID,
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"error", err)
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"error", err)...)
 	}
 }
 
@@ -1511,12 +1511,8 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, driverID int
 // driver can already have reclaimed the stale row. A transient failure inside
 // the window keeps the run going and is retried on the next tick.
 func (s *Service) operationHeartbeatFailureStopsDrive(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply, hbErr error, lastSuccess time.Time) bool {
-	logAttrs := append(op.LogAttrs(),
-		"driver", driverID,
-		"apply_id", apply.ApplyIdentifier,
-		"database", apply.Database,
-		"environment", apply.Environment,
-	)
+	logAttrs := append(append(op.LogAttrs(), apply.IdentityLogAttrs()...),
+		"driver", driverID)
 	if errors.Is(hbErr, storage.ErrApplyLeaseLost) {
 		s.logger.Warn("operator: apply_operation heartbeat lost operation lease; driver will stop",
 			append(logAttrs, "error", hbErr)...)
@@ -1862,9 +1858,8 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 
 	if state.IsState(apply.State, derived) && startedAt == nil {
 		s.logger.Debug("operator: derived apply state matches current; no update",
-			"driver", driverID, "apply_id", apply.ApplyIdentifier,
-			"database", apply.Database, "environment", apply.Environment,
-			"state", derived, "operation_count", len(ops))
+			append(apply.LogAttrs(),
+				"driver", driverID, "operation_count", len(ops))...)
 		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops)}, nil
 	}
 
@@ -1904,15 +1899,13 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		// Another drive advanced the apply between our read and write; our
 		// projection is stale. Skip and let the next poll reconcile.
 		s.logger.Info("operator: derived apply state write lost a race; skipping",
-			"driver", driverID, "apply_id", apply.ApplyIdentifier,
-			"database", apply.Database, "environment", apply.Environment,
-			"expected_state", apply.State, "derived_state", derived, "operation_count", len(ops))
+			append(apply.LogAttrs(),
+				"driver", driverID, "derived_state", derived, "operation_count", len(ops))...)
 		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops)}, nil
 	}
 	s.logger.Info("operator: updated derived apply state from apply_operations",
-		"driver", driverID, "apply_id", apply.ApplyIdentifier,
-		"database", apply.Database, "environment", apply.Environment,
-		"previous_state", apply.State, "derived_state", derived, "operation_count", len(ops))
+		append(apply.LogAttrs(),
+			"driver", driverID, "derived_state", derived, "operation_count", len(ops))...)
 
 	// Own the active-apply gauge for multi-operation applies. The enqueue-time
 	// increment is keyed to the parent's primary deployment, and operation-scoped
@@ -1956,9 +1949,9 @@ func (s *Service) publishTerminalSummaryIfWon(ctx context.Context, driverID int,
 	}
 	if s.OnApplyTerminalSummary == nil {
 		s.logger.Debug("operator: aggregate terminal summary publisher not configured; skipping",
-			"driver", driverID, "apply_id", apply.ApplyIdentifier,
-			"database", apply.Database, "environment", apply.Environment,
-			"derived_state", result.DerivedState, "operation_count", result.OperationCount)
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"derived_state", result.DerivedState, "operation_count", result.OperationCount)...)
 		return
 	}
 
@@ -2013,9 +2006,9 @@ func (s *Service) publishTerminalSummaryIfWon(ctx context.Context, driverID int,
 		return
 	}
 	s.logger.Info("operator: published aggregate terminal summary",
-		"driver", driverID, "apply_id", terminalApply.ApplyIdentifier,
-		"database", terminalApply.Database, "environment", terminalApply.Environment,
-		"derived_state", result.DerivedState, "operation_count", result.OperationCount)
+		append(terminalApply.LogAttrs(),
+			"driver", driverID,
+			"derived_state", result.DerivedState, "operation_count", result.OperationCount)...)
 }
 
 func driverLeaseOwner(driverID int) string {

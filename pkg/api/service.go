@@ -150,6 +150,7 @@ type Service struct {
 	operatorWake         chan struct{}
 	recoveryWg           sync.WaitGroup
 	operatorPollInterval time.Duration
+	strandedReaperEvery  time.Duration
 	remoteHealthMu       sync.Mutex
 	remoteHealthCancel   context.CancelFunc
 	remoteHealthWg       sync.WaitGroup
@@ -160,6 +161,11 @@ type Service struct {
 	webhookInboxCancel   context.CancelFunc
 	webhookInboxWg       sync.WaitGroup
 	webhookInboxInterval time.Duration
+
+	// Operator stuck-pending apply monitor loop management.
+	stuckPendingMu     sync.Mutex
+	stuckPendingCancel context.CancelFunc
+	stuckPendingWg     sync.WaitGroup
 
 	// Pending drops cleaner loop management.
 	pendingDropsMu     sync.Mutex
@@ -263,6 +269,7 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		logger:               logger,
 		clock:                clock.Real{},
 		operatorPollInterval: OperatorPollInterval,
+		strandedReaperEvery:  StrandedReaperInterval,
 		remoteHealthInterval: RemoteDeploymentHealthCheckInterval,
 		webhookInboxInterval: WebhookInboxMetricsInterval,
 		pendingObservers:     make(map[pendingObserverKey]tern.ProgressObserver),
@@ -767,6 +774,7 @@ func (s *Service) Close() error {
 	s.StopOperator()
 	s.StopRemoteDeploymentHealthMonitor()
 	s.StopWebhookInboxMonitor()
+	s.StopOperatorStuckPendingMonitor()
 
 	s.ternMu.Lock()
 	var errs []error

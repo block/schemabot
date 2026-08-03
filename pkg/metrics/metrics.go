@@ -802,8 +802,36 @@ func RecordOperatorResumeFailure(ctx context.Context, database, deployment, envi
 	)
 }
 
+// RecordOperatorStrandedOperationReaped counts apply operations the reaper
+// settled from an already-settled parent apply — rows describing work that will
+// never run, left behind non-terminal.
+//
+// A one-time burst is the historical backlog draining and needs no action. A
+// rate that keeps climbing means something is actively stranding operations, so
+// the investigation belongs on the producer — a path that terminalizes a parent
+// apply without settling its children — not on the reaper.
+//
+// deployment is the reaped operation's own deployment, the routing key that says
+// which target the settled row belonged to; stranded rows arise in exactly the
+// multi-deployment applies where it differs from the parent's.
+//
+// This counter is emitted under the operator name only. The deprecated
+// schemabot.scheduler.* alias exists to carry pre-existing series through one
+// release, and a metric introduced after that rename has no legacy series to
+// migrate.
+func RecordOperatorStrandedOperationReaped(ctx context.Context, database, deployment, environment, parentState string) {
+	addCounter(ctx, "schemabot.operator.stranded_operations_reaped_total",
+		"Total number of stranded apply operations the reaper settled from their parent apply's outcome", "{operation}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("parent_state", parentState),
+	)
+}
+
 var knownOperatorClaimFailureReasons = map[string]bool{
 	"expire_retryable_error":                  true,
+	"stranded_reaper_error":                   true,
 	"missing_lease_token":                     true,
 	"storage_error":                           true,
 	"operation_storage_error":                 true,
@@ -828,6 +856,33 @@ func RecordOperatorClaimFailure(ctx context.Context, reason string) {
 		"Total number of operator claim attempts that failed", "{attempt}",
 		EnvironmentAttribute(""),
 		attribute.String("reason", reason),
+	)
+}
+
+// RecordOperatorStuckPendingApplies records how many pending applies are older
+// than the stuck threshold while still carrying the child rows that make them
+// claimable — work a driver should already have picked up. Apply creation
+// rejects a concurrent apply for the same target rather than queuing it, so a
+// nonzero value is not normal backpressure: it means the operator driver pool is
+// not claiming (all drivers saturated on long-running applies, an
+// operator-less/crash-looping deployment, or a wedged claim path). The expected
+// operator action is to check driver liveness and claim-failure metrics/logs.
+func RecordOperatorStuckPendingApplies(ctx context.Context, count int64) {
+	recordGauge(ctx, "schemabot.operator.stuck_pending_applies", count,
+		"Number of pending applies past the stuck threshold that a driver should have claimed", "{apply}",
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordOperatorStuckPendingScanFailure counts failed stuck-pending scans. The
+// stuck-pending gauge is a last-value instrument, so a failed scan leaves it
+// frozen at its last-good value — indistinguishable from a healthy operator.
+// This counter is the liveness signal for the gauge: a nonzero rate means the
+// stuck-pending value is stale and must not be trusted.
+func RecordOperatorStuckPendingScanFailure(ctx context.Context) {
+	addCounter(ctx, "schemabot.operator.stuck_pending_scan_failures",
+		"Total number of failed operator stuck-pending apply scans", "{failure}",
+		EnvironmentAttribute(""),
 	)
 }
 
