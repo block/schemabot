@@ -727,19 +727,34 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// is recovering work it started and is handled by the staleness clause below.
 	queryArgs = append(queryArgs,
 		storage.ControlOperationStop, storage.ControlRequestPending)
-	// Active-parent gate: a pending operation is only claimable while its
-	// parent apply is non-terminal — starting a deployment belongs to a live
-	// rollout, and a terminal parent means the apply's outcome is already
-	// settled (completed, failed, stopped, cancelled, or reverted). The
-	// predicate is NOT IN terminal rather than IN claimable so a future
-	// non-terminal parent state keeps its pending operations claimable. It
-	// gates only this pending arm: the stale-active, stopped+start,
-	// waiting_for_deploy+start, and failed_retryable arms recover or resume
-	// work that already started and carry their own parent-state conditions.
-	// The window where the parent terminalizes after this SELECT is handled by
-	// the driver-side parent claim refusing and reconcileUnclaimableParent
-	// settling the claimed row from the parent's state.
+	// Claimable-parent gate: a pending operation is claimable exactly while its
+	// parent apply is itself claimable. Starting a deployment belongs to a
+	// rollout a driver can still take somewhere; a terminal parent means the
+	// apply's outcome is already settled (completed, failed, cancelled,
+	// reverted) and its never-started rows must not be claimed or shadow live
+	// work in the claim order.
+	//
+	// The one terminal state that stays claimable is stopped with a pending
+	// start request — a stopped rollout is resumable, and ClaimApplyByID admits
+	// exactly that pair. Mirroring it here keeps the two claims from
+	// disagreeing: a stopped apply whose deployments had not started yet has
+	// only pending rows, so gating them off would leave an accepted start
+	// request with nothing able to service it, and the rollout could never
+	// resume. Without a start request those same rows stay gated off, so a
+	// stopped-and-abandoned apply still costs the queue nothing.
+	//
+	// The non-stopped half is written NOT IN terminal rather than IN claimable
+	// so a future non-terminal parent state keeps its pending operations
+	// claimable. It gates only this pending arm: the stale-active,
+	// stopped+start, waiting_for_deploy+start, and failed_retryable arms
+	// recover or resume work that already started. The window where the parent
+	// terminalizes after this SELECT is handled by the driver-side parent claim
+	// refusing and reconcileUnclaimableParent settling the claimed row from the
+	// parent's state.
 	queryArgs = append(queryArgs, stringArgs(terminalStates)...)
+	queryArgs = append(queryArgs,
+		state.Apply.Stopped,
+		storage.ControlOperationStart, storage.ControlRequestPending)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	// Stale-active barrier-park exemption (see the staleness clause below): a
 	// multi-deployment operation parked at the cutover barrier under an
@@ -864,7 +879,19 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 					SELECT 1
 					FROM applies a
 					WHERE a.id = apply_operations.apply_id
-						AND a.state NOT IN (%s)
+						AND (
+							a.state NOT IN (%s)
+							OR (
+								a.state = ?
+								AND EXISTS (
+									SELECT 1
+									FROM apply_control_requests cr
+									WHERE cr.apply_id = a.id
+										AND cr.operation = ?
+										AND cr.status = ?
+								)
+							)
+						)
 				)
 			)
 			OR (
