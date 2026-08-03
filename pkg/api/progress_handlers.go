@@ -256,7 +256,8 @@ func (s *Service) resolveReleaseLatch(ctx context.Context, apply *storage.Apply,
 	released, err := storage.ReleaseLatched(ctx, s.storage, apply.ID, ops)
 	if err != nil {
 		s.logger.Warn("progress response will treat rollout as unreleased: failed to load release latch",
-			"apply_id", apply.ApplyIdentifier, "database", apply.Database, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"error", err)...)
 		return false
 	}
 	return released
@@ -287,10 +288,8 @@ func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *stora
 		// Operation rows are observability enrichment, not an apply safety gate.
 		// Serve progress without the enrichment and log the storage uncertainty.
 		s.logger.Warn("progress response will omit per-deployment operations",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"error", err)
+			append(apply.LogAttrs(),
+				"error", err)...)
 		return nil, nil, false
 	}
 	return operations, deploymentByOperationID, s.resolveReleaseLatch(ctx, apply, ops)
@@ -322,7 +321,9 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	if shouldServeProgressFromStorage(apply.State) {
 		httpResp, err := s.progressFromLocalStorage(r.Context(), apply)
 		if err != nil {
-			s.logger.Error("failed to read apply progress from storage", append(apply.LogAttrs(), "error", err)...)
+			s.logger.Error("failed to read apply progress from storage",
+				append(apply.LogAttrs(),
+					"error", err)...)
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read tasks: "+err.Error())
 			return
 		}
@@ -336,7 +337,8 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	ops, opsErr := s.storage.ApplyOperations().ListByApply(r.Context(), apply.ID)
 	if opsErr != nil {
 		s.logger.Warn("could not determine apply operation count; serving progress via the single-deployment path",
-			"apply_id", applyID, "database", apply.Database, "environment", apply.Environment, "error", opsErr)
+			append(apply.LogAttrs(),
+				"error", opsErr)...)
 	}
 
 	// A multi-operation apply has no single remote data-plane id — each
@@ -351,7 +353,8 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		httpResp, err := s.progressFromLocalStorage(r.Context(), apply)
 		if err != nil {
 			s.logger.Warn("failed to read multi-operation apply progress from storage; falling back to the single-deployment path",
-				"apply_id", applyID, "state", apply.State, "error", err)
+				append(apply.LogAttrs(),
+					"error", err)...)
 		} else {
 			s.writeJSON(w, http.StatusOK, httpResp)
 			return
@@ -362,26 +365,32 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	deployment, err := storedDeploymentForApply(apply)
 	if err != nil {
 		s.logger.Error("active apply is missing stored deployment metadata",
-			"apply_id", applyID, "database", apply.Database, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"error", err)...)
 		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, err.Error())
 		return
 	}
-	s.logger.Debug("progress by apply-id: resolving client", "apply_id", applyID, "database", apply.Database, "deployment", deployment, "environment", apply.Environment)
+	s.logger.Debug("progress by apply-id: resolving client", apply.LogAttrs()...)
 
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
 		s.logger.Error("no tern client for active apply — server is misconfigured",
-			"apply_id", applyID, "database", apply.Database, "deployment", deployment, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"error", err)...)
 		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound,
 			fmt.Sprintf("no tern client configured for database %q (deployment=%q, environment=%q) — add this database to the server config", apply.Database, deployment, apply.Environment))
 		return
 	}
-	s.logger.Debug("progress by apply-id: got client", "apply_id", applyID, "is_remote", client.IsRemote())
+	s.logger.Debug("progress by apply-id: got client",
+		append(apply.LogAttrs(),
+			"is_remote", client.IsRemote())...)
 
 	if shouldServeRemoteProgressFromStorage(apply, client) {
 		httpResp, err := s.progressFromLocalStorage(r.Context(), queuedRemoteProgressApply(apply))
 		if err != nil {
-			s.logger.Error("failed to read queued remote apply progress from storage", append(apply.LogAttrs(), "error", err)...)
+			s.logger.Error("failed to read queued remote apply progress from storage",
+				append(apply.LogAttrs(),
+					"error", err)...)
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read tasks: "+err.Error())
 			return
 		}
@@ -1034,7 +1043,8 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	if stale && apply.ExternalID != "" {
 		if err := s.syncTasksFromTern(ctx, apply, tasks); err != nil {
 			s.logger.Warn("task sync from Tern failed, serving stale data",
-				"apply_id", apply.ApplyIdentifier, "error", err)
+				append(apply.LogAttrs(),
+					"error", err)...)
 		} else {
 			// Re-read tasks after sync; keep original on failure.
 			if refreshed, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID); err == nil {
@@ -1141,7 +1151,8 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 		tp, ok := tableProgress[progressTableKey(task.Namespace, task.TableName)]
 		if !ok {
 			s.logger.Error("task has no matching table in Tern progress response",
-				"task_id", task.TaskIdentifier, "namespace", task.Namespace, "table", task.TableName, "apply_id", apply.ApplyIdentifier)
+				append(apply.LogAttrs(),
+					"task_id", task.TaskIdentifier, "namespace", task.Namespace, "table", task.TableName)...)
 			continue
 		}
 		task.State = state.NormalizeTaskStatus(tp.Status)
@@ -1158,7 +1169,8 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 		synced++
 	}
 	s.logger.Info("synced stale task records from Tern",
-		"apply_id", apply.ApplyIdentifier, "synced", synced, "total", len(tasks))
+		append(apply.LogAttrs(),
+			"synced", synced, "total", len(tasks))...)
 	return nil
 }
 
