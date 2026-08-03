@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -452,21 +451,6 @@ func ternApplyIDForStoredApply(apply *storage.Apply) string {
 	return apply.ApplyIdentifier
 }
 
-// operatorFacingControlError rewrites a data-plane rejection message for the
-// operator. A remote deployment knows the apply only by its own id (the
-// stored external_id), so its rejection copy names an identifier that
-// resolves to nothing on the control plane — it reads like an answer about a
-// different schema change and leaks an internal identifier into PR-facing
-// markdown. Every occurrence of the remote id is replaced with the operator's
-// apply identifier; the remote id stays triageable from the apply row's
-// external_id and the server logs, which keep the raw message.
-func operatorFacingControlError(apply *storage.Apply, errorMessage string) string {
-	if errorMessage == "" || apply == nil || apply.ExternalID == "" {
-		return errorMessage
-	}
-	return strings.ReplaceAll(errorMessage, apply.ExternalID, apply.ApplyIdentifier)
-}
-
 // CutoverRequest is the HTTP request body for POST /api/cutover.
 type CutoverRequest struct {
 	ApplyID     string `json:"apply_id"`
@@ -775,7 +759,7 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 	}
 	return &apitypes.StopResponse{
 		Accepted:     resp.Accepted,
-		ErrorMessage: operatorFacingControlError(apply, resp.ErrorMessage),
+		ErrorMessage: apply.OperatorFacingMessage(resp.ErrorMessage),
 		StoppedCount: resp.StoppedCount,
 		SkippedCount: resp.SkippedCount,
 		Status:       responseStatus,
@@ -832,8 +816,11 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 			"environment", apply.Environment,
 			"requested_by", caller,
 			"error", err)
+		// The transport error is logged above with the identifiers that make it
+		// triageable. The apply log is operator-facing, so it carries the outcome
+		// rather than raw driver text naming hosts, addresses, or internals.
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
-			fmt.Sprintf("Immediate stop attempt failed; durable stop request remains pending: %v", err))
+			"Immediate stop attempt failed; durable stop request remains pending; see server logs")
 		return
 	}
 	if resp == nil {
@@ -860,7 +847,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 			"stopped_count", resp.StoppedCount,
 			"skipped_count", resp.SkippedCount)
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
-			fmt.Sprintf("Immediate stop attempt was not accepted; durable stop request remains pending: %s", operatorFacingControlError(apply, resp.ErrorMessage)))
+			fmt.Sprintf("Immediate stop attempt was not accepted; durable stop request remains pending: %s", apply.OperatorFacingMessage(resp.ErrorMessage)))
 		return
 	}
 	stopCompleted, err := s.completeImmediateStopRequestIfStopped(ctx, apply, caller)
@@ -993,7 +980,7 @@ func (s *Service) executeCancelForApply(ctx context.Context, client tern.Client,
 
 	httpResp := &apitypes.CancelResponse{
 		Accepted:       resp.Accepted,
-		ErrorMessage:   operatorFacingControlError(apply, resp.ErrorMessage),
+		ErrorMessage:   apply.OperatorFacingMessage(resp.ErrorMessage),
 		CancelledCount: resp.CancelledCount,
 		SkippedCount:   resp.SkippedCount,
 		Status:         responseStatus,
@@ -1400,7 +1387,7 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 
 	httpResp := &apitypes.StartResponse{
 		Accepted:     resp.Accepted,
-		ErrorMessage: operatorFacingControlError(apply, resp.ErrorMessage),
+		ErrorMessage: apply.OperatorFacingMessage(resp.ErrorMessage),
 		StartedCount: resp.StartedCount,
 		SkippedCount: resp.SkippedCount,
 		Status:       responseStatus,
@@ -1985,11 +1972,14 @@ func (s *Service) executeVolumeForApply(ctx context.Context, client tern.Client,
 	if resp.Accepted {
 		s.logControlOperationForApply(ctx, apply, resolveCaller(ctx, caller), storage.LogEventVolumeRequested,
 			fmt.Sprintf("Volume change to %d queued; the driver applies it at its next progress check", volume))
+	} else {
+		s.logger.Warn("volume change was not accepted by the data plane",
+			append(apply.LogAttrs(), "requested_volume", volume, "error_message", resp.ErrorMessage)...)
 	}
 
 	return &apitypes.VolumeResponse{
 		Accepted:       resp.Accepted,
-		ErrorMessage:   operatorFacingControlError(apply, resp.ErrorMessage),
+		ErrorMessage:   apply.OperatorFacingMessage(resp.ErrorMessage),
 		PreviousVolume: resp.PreviousVolume,
 		NewVolume:      resp.NewVolume,
 	}, nil
@@ -2114,13 +2104,17 @@ func (s *Service) executeRevertForApply(ctx context.Context, client tern.Client,
 			s.logger.Warn("failed to complete revert control request after immediate success; operator will reconcile",
 				append(apply.LogAttrs(), "error", err)...)
 		}
-	} else if err := controlStore.FailPending(ctx, apply.ID, storage.ControlOperationRevert, operatorFacingControlError(apply, resp.ErrorMessage)); err != nil {
-		s.logger.Warn("failed to fail rejected revert control request",
-			append(apply.LogAttrs(), "error", err)...)
+	} else {
+		s.logger.Warn("revert was not accepted by the data plane",
+			append(apply.LogAttrs(), "error_message", resp.ErrorMessage)...)
+		if err := controlStore.FailPending(ctx, apply.ID, storage.ControlOperationRevert, apply.OperatorFacingMessage(resp.ErrorMessage)); err != nil {
+			s.logger.Warn("failed to fail rejected revert control request",
+				append(apply.LogAttrs(), "error", err)...)
+		}
 	}
 	s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 
-	return &apitypes.ControlResponse{Accepted: resp.Accepted, ErrorMessage: operatorFacingControlError(apply, resp.ErrorMessage)}, http.StatusOK, nil
+	return &apitypes.ControlResponse{Accepted: resp.Accepted, ErrorMessage: apply.OperatorFacingMessage(resp.ErrorMessage)}, http.StatusOK, nil
 }
 
 // SkipRevertRequest is the HTTP request body for POST /api/skip-revert.
@@ -2245,13 +2239,17 @@ func (s *Service) executeSkipRevertForApply(ctx context.Context, client tern.Cli
 			s.logger.Warn("failed to complete skip-revert control request after immediate success; operator will reconcile",
 				append(apply.LogAttrs(), "error", err)...)
 		}
-	} else if err := controlStore.FailPending(ctx, apply.ID, storage.ControlOperationSkipRevert, operatorFacingControlError(apply, resp.ErrorMessage)); err != nil {
-		s.logger.Warn("failed to fail rejected skip-revert control request",
-			append(apply.LogAttrs(), "error", err)...)
+	} else {
+		s.logger.Warn("skip-revert was not accepted by the data plane",
+			append(apply.LogAttrs(), "error_message", resp.ErrorMessage)...)
+		if err := controlStore.FailPending(ctx, apply.ID, storage.ControlOperationSkipRevert, apply.OperatorFacingMessage(resp.ErrorMessage)); err != nil {
+			s.logger.Warn("failed to fail rejected skip-revert control request",
+				append(apply.LogAttrs(), "error", err)...)
+		}
 	}
 	s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 
-	return &apitypes.ControlResponse{Accepted: resp.Accepted, ErrorMessage: operatorFacingControlError(apply, resp.ErrorMessage)}, http.StatusOK, nil
+	return &apitypes.ControlResponse{Accepted: resp.Accepted, ErrorMessage: apply.OperatorFacingMessage(resp.ErrorMessage)}, http.StatusOK, nil
 }
 
 // RollbackPlanRequest is the HTTP request body for POST /api/rollback/plan.

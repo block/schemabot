@@ -76,10 +76,19 @@ func completePendingRequestsForTerminalApply(ctx context.Context, store storage.
 // operation terminally failed. A failed request is no longer pending, so the
 // operator-owned retry loop stops re-running the operation instead of spinning
 // on a permanent rejection.
-func failPendingControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation, errorMessage string) error {
+//
+// The stored message is rewritten for the operator before it is persisted, so a
+// rejection reads the same whether it arrived on the API's immediate attempt or
+// on this retry — the durable record must not spell the schema change
+// differently depending on which path reached the data plane. remoteIDs are the
+// remote identifiers the caller addressed; a remote caller passes the id it sent
+// the RPC to, and a local caller passes none because its identifiers are already
+// operator-facing.
+func failPendingControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation, errorMessage string, remoteIDs ...string) error {
 	if store == nil {
 		return fmt.Errorf("storage is not available")
 	}
+	errorMessage = apply.OperatorFacingMessage(errorMessage, remoteIDs...)
 	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, operation); err != nil {
 		return err
 	}

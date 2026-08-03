@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/block/schemabot/pkg/state"
@@ -77,4 +78,65 @@ func TestCompletePendingRequestsForStoppedApplyKeepsCancelPending(t *testing.T) 
 	pendingCancel, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
 	assert.NotNil(t, pendingCancel, "a stopped apply remains cancellable; the pending cancel must stay deliverable")
+}
+
+// A control request can be rejected on either of two paths: the API's immediate
+// attempt, or the driver's retry after that attempt never landed. Both write the
+// same durable record, so both must spell the schema change the same way — an
+// operator reading a failed request should never see the remote data plane's
+// identifier just because the retry, rather than the immediate call, was the one
+// that reached the data plane.
+func TestFailPendingControlRequestsRecordsTheOperatorApplyID(t *testing.T) {
+	const (
+		operatorID    = "apply-driver-retry"
+		remoteID      = "apply-remote999"
+		remoteOpID    = "apply-remote-op42"
+		rejectionCopy = "revert was not accepted: %s is no longer in its revert window"
+	)
+
+	tests := []struct {
+		name       string
+		externalID string
+		remoteIDs  []string
+	}{
+		{
+			name:       "a single-operation apply names the remote apply id",
+			externalID: remoteID,
+			remoteIDs:  []string{remoteID},
+		},
+		{
+			name:      "a multi-operation apply names the claimed operation's remote id",
+			remoteIDs: []string{remoteOpID},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              9,
+				ApplyIdentifier: operatorID,
+				ExternalID:      tt.externalID,
+				Database:        "testdb",
+				Environment:     "staging",
+				State:           state.Apply.RevertWindow,
+			}
+			controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+				ApplyID:   apply.ID,
+				Operation: storage.ControlOperationRevert,
+				Status:    storage.ControlRequestPending,
+			}}}
+			store := &mockStorage{controlRequests: controlRequests}
+
+			rejection := fmt.Sprintf(rejectionCopy, tt.remoteIDs[0])
+			require.NoError(t, failPendingControlRequests(t.Context(), store, apply,
+				storage.ControlOperationRevert, rejection, tt.remoteIDs...))
+
+			failed, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationRevert)
+			require.NoError(t, err)
+			require.NotNil(t, failed)
+			assert.Equal(t, storage.ControlRequestFailed, failed.Status)
+			assert.Equal(t, fmt.Sprintf(rejectionCopy, operatorID), failed.ErrorMessage,
+				"the stored rejection must name the apply the operator asked about")
+		})
+	}
 }

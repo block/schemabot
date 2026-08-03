@@ -1049,6 +1049,31 @@ func newControlTestServiceWithTasks(client tern.Client, apply *storage.Apply, ta
 	}, logger)
 }
 
+// controlTestStores exposes the durable surfaces a control-relay test asserts
+// on: the control request a rejection is recorded against, and the apply log an
+// operator reads.
+type controlTestStores struct {
+	controls  *memoryControlRequestStore
+	applyLogs *capturingApplyLogStore
+}
+
+func newControlTestServiceWithStores(client tern.Client, apply *storage.Apply, tasks []*storage.Task) (*Service, *controlTestStores) {
+	stores := &controlTestStores{
+		controls:  &memoryControlRequestStore{},
+		applyLogs: &capturingApplyLogStore{},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		applies:   &staticApplyStore{apply: apply},
+		tasks:     &capturingTaskStore{tasks: tasks},
+		controls:  stores.controls,
+		applyLogs: stores.applyLogs,
+	}, testServerConfig(), map[string]tern.Client{
+		"default/staging": client,
+	}, logger)
+	return svc, stores
+}
+
 func newControlTestServiceWithOperations(client tern.Client, apply *storage.Apply, tasks []*storage.Task, operations []*storage.ApplyOperation) *Service {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	return New(&mockStorageWithApplyStores{
@@ -5600,6 +5625,126 @@ func TestSkipRevertHandler(t *testing.T) {
 		assert.Equal(t, http.StatusAccepted, second.Code, second.Body.String())
 		assert.Contains(t, second.Body.String(), apitypes.ControlStatusAlreadyRequested)
 		assert.Nil(t, mock.skipRevertReq, "a duplicate request must not re-drive the engine")
+	})
+}
+
+// A remote deployment names the schema change by its own data-plane identifier,
+// which resolves to nothing on the control plane. Wherever a rejection is
+// durably recorded or shown to an operator — a failed control request, an apply
+// log line — it must name the identifier the operator addressed, so the record
+// reads as an answer about their schema change rather than an internal id.
+func TestControlRejectionsNameTheOperatorApplyID(t *testing.T) {
+	const (
+		operatorID = "apply-op7788"
+		remoteID   = "apply-remote999"
+	)
+
+	remoteRevertWindowApply := func(applyID string) *storage.Apply {
+		apply := activeTestApply(applyID)
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EnginePlanetScale
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		apply.ExternalID = remoteID
+		return apply
+	}
+
+	assertOperatorFacing := func(t *testing.T, message, context string) {
+		t.Helper()
+		assert.Contains(t, message, operatorID, context)
+		assert.NotContains(t, message, remoteID, context)
+	}
+
+	postControl := func(t *testing.T, svc *Service, path, applyID string) *httptest.ResponseRecorder {
+		t.Helper()
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+		body := fmt.Sprintf(`{"environment":"staging","apply_id":%q}`, applyID)
+		req := httptest.NewRequestWithContext(t.Context(), "POST", path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w
+	}
+
+	t.Run("a rejected revert is recorded against the operator apply id", func(t *testing.T) {
+		mock := &mockTernClient{
+			revertResp: &ternv1.RevertResponse{
+				Accepted:     false,
+				ErrorMessage: "Schema change " + remoteID + " has already been finalized",
+			},
+		}
+		apply := remoteRevertWindowApply(operatorID)
+		svc, stores := newControlTestServiceWithStores(mock, apply, nil)
+
+		w := postControl(t, svc, "/api/revert", operatorID)
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		assertOperatorFacing(t, w.Body.String(), "the response an operator reads")
+
+		stored, err := stores.controls.GetByOperation(t.Context(), apply.ID, storage.ControlOperationRevert)
+		require.NoError(t, err)
+		require.NotNil(t, stored, "a rejected revert must leave a terminal control request")
+		assert.Equal(t, storage.ControlRequestFailed, stored.Status)
+		assertOperatorFacing(t, stored.ErrorMessage, "the durable control request")
+
+		require.NotNil(t, mock.revertReq)
+		assert.Equal(t, remoteID, mock.revertReq.ApplyId, "the data plane is still addressed by its own id")
+	})
+
+	t.Run("a rejected skip-revert is recorded against the operator apply id", func(t *testing.T) {
+		mock := &mockTernClient{
+			skipRevertResp: &ternv1.SkipRevertResponse{
+				Accepted:     false,
+				ErrorMessage: "Schema change " + remoteID + " is no longer in its revert window",
+			},
+		}
+		apply := remoteRevertWindowApply(operatorID)
+		svc, stores := newControlTestServiceWithStores(mock, apply, nil)
+
+		w := postControl(t, svc, "/api/skip-revert", operatorID)
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		assertOperatorFacing(t, w.Body.String(), "the response an operator reads")
+
+		stored, err := stores.controls.GetByOperation(t.Context(), apply.ID, storage.ControlOperationSkipRevert)
+		require.NoError(t, err)
+		require.NotNil(t, stored, "a rejected skip-revert must leave a terminal control request")
+		assert.Equal(t, storage.ControlRequestFailed, stored.Status)
+		assertOperatorFacing(t, stored.ErrorMessage, "the durable control request")
+
+		require.NotNil(t, mock.skipRevertReq)
+		assert.Equal(t, remoteID, mock.skipRevertReq.ApplyId, "the data plane is still addressed by its own id")
+	})
+
+	// A stop is queued durably first, then attempted immediately. When the data
+	// plane accepts the queued request but rejects the immediate attempt, the
+	// apply log records why the request is still pending — and does so in the
+	// operator's terms.
+	t.Run("a rejected immediate stop is logged against the operator apply id", func(t *testing.T) {
+		mock := &mockTernClient{
+			stopResp: &ternv1.StopResponse{
+				Accepted:     false,
+				ErrorMessage: "Schema change " + remoteID + " is already cutting over",
+			},
+		}
+		apply := activeTestApply(operatorID)
+		apply.ExternalID = remoteID
+		tasks := []*storage.Task{{
+			ID:             30,
+			TaskIdentifier: "task-stop-relay",
+			ApplyID:        apply.ID,
+			State:          state.Task.Running,
+		}}
+		svc, stores := newControlTestServiceWithStores(mock, apply, tasks)
+
+		w := postControl(t, svc, "/api/stop", operatorID)
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		require.NotNil(t, mock.stopReq, "the queued stop is followed by an immediate attempt")
+		assert.Equal(t, remoteID, mock.stopReq.ApplyId, "the data plane is still addressed by its own id")
+
+		require.True(t, hasApplyLogMessageContaining(stores.applyLogs.logs, "Immediate stop attempt was not accepted"),
+			"the apply log must record why the stop request is still pending")
+		for _, log := range stores.applyLogs.logs {
+			assert.NotContains(t, log.Message, remoteID, "no apply log line names the remote id")
+		}
 	})
 }
 
