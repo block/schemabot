@@ -21,7 +21,7 @@ import (
 // tests can verify whether the unlock guard permitted a release.
 type unlockTestStorage struct {
 	emptyStorage
-	locks   *unlockTestLockStore
+	locks   storage.LockStore
 	applies storage.ApplyStore
 }
 
