@@ -706,7 +706,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch eventType {
 	case "issue_comment":
-		h.handleIssueComment(ctx, metricApp, sw, body)
+		h.handleIssueComment(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
 		recordProcessed()
 	case "check_run":
 		h.handleCheckRun(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))

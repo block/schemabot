@@ -418,6 +418,8 @@ func (h *Handler) processDurableWebhookEvent(ctx context.Context, event *storage
 		return h.processDurableMergeGroup(ctx, event)
 	case "push":
 		return h.processDurablePush(ctx, event)
+	case "issue_comment":
+		return h.processDurableIssueComment(ctx, event)
 	default:
 		h.logger.Info("durable webhook delivery ignored because event type is unsupported",
 			"delivery_id", event.DeliveryID, "event", event.Event, "action", event.Action,

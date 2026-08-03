@@ -3,7 +3,9 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
@@ -41,7 +43,7 @@ type webhookPayload struct {
 }
 
 // handleIssueComment processes GitHub issue comment webhooks.
-func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte) {
+func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte, deliveryID string) {
 	var payload webhookPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid webhook payload")
@@ -384,11 +386,19 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		h.postComment(repo, pr, installationID, templates.RenderHelpComment())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "help posted"})
 	case action.Apply:
+		if h.durableWebhookDispatch {
+			h.enqueueDurableIssueCommentCommand(ctx, w, metricApp, body, deliveryID, repo, pr, installationID, result.Action)
+			return
+		}
 		h.goSafe(repo, pr, installationID, func() {
 			h.handleApplyCommand(repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "apply started"})
 	case action.ApplyConfirm:
+		if h.durableWebhookDispatch {
+			h.enqueueDurableIssueCommentCommand(ctx, w, metricApp, body, deliveryID, repo, pr, installationID, result.Action)
+			return
+		}
 		h.goSafe(repo, pr, installationID, func() {
 			h.handleApplyConfirmCommand(repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
 		})
@@ -768,4 +778,130 @@ func appendSupportChannelFooter(body string, support api.SupportChannelConfig) s
 		Name: support.Name,
 		URL:  support.URL,
 	})
+}
+
+// enqueueDurableIssueCommentCommand persists an apply or apply-confirm command
+// delivery into the durable inbox and ACKs the webhook. The request path has
+// already run the routing and usage gates, so the stored row is a command this
+// deployment committed to act on; a leased driver re-drives the command core
+// with retries so a process restart cannot drop an acknowledged command.
+// Enqueue failure is a deliberate 500 with no in-process fallback — it fails
+// loudly (a red delivery in GitHub's webhook UI) so an operator can Redeliver.
+func (h *Handler) enqueueDurableIssueCommentCommand(ctx context.Context, w http.ResponseWriter, metricApp string, body []byte, deliveryID, repo string, pr int, installationID int64, commandAction string) {
+	inserted, err := h.enqueueDurableIssueComment(ctx, body, deliveryID, repo, pr, installationID)
+	if err != nil {
+		h.logger.Error("failed to enqueue durable issue_comment command",
+			"repo", repo, "pr", pr, "command", commandAction,
+			"installation_id", installationID, "delivery_id", deliveryID, "error", err)
+		metrics.RecordWebhookEvent(ctx, metricApp, "issue_comment", "created", repo, "durable_enqueue_failed")
+		h.writeError(w, http.StatusInternalServerError, "failed to enqueue webhook delivery")
+		return
+	}
+	if !inserted {
+		h.logger.Info("durable issue_comment command already queued",
+			"repo", repo, "pr", pr, "command", commandAction, "delivery_id", deliveryID)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": commandAction + " already queued"})
+		return
+	}
+	h.logger.Info("durable issue_comment command queued",
+		"repo", repo, "pr", pr, "command", commandAction, "delivery_id", deliveryID)
+	h.writeJSON(w, http.StatusOK, map[string]string{"message": commandAction + " queued"})
+}
+
+// enqueueDurableIssueComment persists an issue_comment delivery in the inbox.
+// The stored TenantID is the resolved installation ID so the driver, which
+// runs outside any HTTP request, does not have to re-resolve a repo-level
+// install.
+func (h *Handler) enqueueDurableIssueComment(ctx context.Context, body []byte, deliveryID, repo string, pr int, installationID int64) (bool, error) {
+	return h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
+		Provider:    storage.WebhookProviderGitHub,
+		DeliveryID:  deliveryID,
+		Event:       "issue_comment",
+		Action:      "created",
+		Repository:  repo,
+		PullRequest: pr,
+		TenantID:    strconv.FormatInt(installationID, 10),
+		Payload:     body,
+	})
+}
+
+// processDurableIssueComment re-drives an apply or apply-confirm command from
+// a claimed issue_comment delivery. The request path runs the synchronous
+// routing gates (tenant addressing, environment ownership, usage errors) and
+// the acknowledgment reaction before enqueueing, so the driver's job is the
+// command itself: it re-parses the stored comment — parsing is deterministic
+// on the payload — and routes to the command core, whose (retry, err)
+// disposition drives the lease. Enqueue-time guards are re-validated
+// fail-closed (rows can arrive via replay or a hand-crafted insert), so a
+// delivery that no longer decodes to a durably dispatched command completes as
+// a no-op rather than running work the request path would not have enqueued.
+func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
+	var payload webhookPayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return false, fmt.Errorf("decode durable issue_comment delivery %s: %w", event.DeliveryID, err)
+	}
+	if payload.Action != "created" || payload.Issue == nil || payload.Issue.PullRequest == nil ||
+		payload.Comment == nil || payload.Repository == nil {
+		h.logger.Info("durable issue_comment delivery ignored because it is not a PR comment creation",
+			"delivery_id", event.DeliveryID, "action", payload.Action,
+			"repo", event.Repository, "pr", event.PullRequest)
+		return false, nil
+	}
+	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" {
+		h.logger.Info("durable issue_comment delivery ignored because the comment author is a bot",
+			"delivery_id", event.DeliveryID, "repo", event.Repository, "pr", event.PullRequest)
+		return false, nil
+	}
+
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		return false, err
+	}
+
+	repo := payload.Repository.FullName
+	pr := payload.Issue.Number
+	if repo == "" || pr == 0 {
+		return false, fmt.Errorf("durable issue_comment delivery %s missing repo or PR", event.DeliveryID)
+	}
+	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
+		h.logger.Warn("durable issue_comment delivery from unregistered repository",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "installation_id", installationID)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "issue_comment", payload.Action, repo)
+		return false, nil
+	}
+
+	requestedBy := ""
+	if payload.Comment.User != nil {
+		requestedBy = payload.Comment.User.Login
+	}
+	result := NewCommandParser().ParseCommand(payload.Comment.Body)
+	result.CommentID = payload.Comment.ID
+	if !durableIssueCommentCommandReady(result) {
+		h.logger.Info("durable issue_comment delivery ignored because its comment is not a durably dispatched command",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "command", result.Action)
+		return false, nil
+	}
+
+	switch result.Action {
+	case action.Apply:
+		return h.applyCommandCore(repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
+	case action.ApplyConfirm:
+		return h.applyConfirmCommandCore(repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
+	default:
+		h.logger.Info("durable issue_comment delivery ignored because its command has no durable driver",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "command", result.Action)
+		return false, nil
+	}
+}
+
+// durableIssueCommentCommandReady reports whether a re-parsed comment carries
+// a well-formed command the driver dispatches durably. The request path
+// answers usage errors (missing or malformed flags) synchronously and never
+// enqueues them, so a claimed row failing these checks is a replayed or
+// hand-crafted delivery, not a user waiting on an answer.
+func durableIssueCommentCommandReady(result CommandResult) bool {
+	if !result.Found || result.TenantError || result.EnvironmentError || result.MissingEnv {
+		return false
+	}
+	return result.Action == action.Apply || result.Action == action.ApplyConfirm
 }
