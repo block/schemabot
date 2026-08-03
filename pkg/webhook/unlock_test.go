@@ -29,24 +29,48 @@ func (s *unlockTestStorage) Locks() storage.LockStore { return s.locks }
 
 func (s *unlockTestStorage) Applies() storage.ApplyStore { return s.applies }
 
+// unlockTestLockStore serves configurable lock lookups and records release
+// calls, with injectable failures for each storage touchpoint the unlock core
+// classifies. Release failures are injected per database so multi-lock tests
+// can fail one release while the rest succeed.
 type unlockTestLockStore struct {
 	storage.LockStore
-	locks             []*storage.Lock
+	locks       []*storage.Lock
+	getByPRErr  error
+	releaseErrs map[string]error
+
 	releaseCalls      int
 	forceReleaseCalls int
+	released          []string
+	forceReleased     []string
 }
 
 func (s *unlockTestLockStore) GetByPR(_ context.Context, _ string, _ int) ([]*storage.Lock, error) {
+	if s.getByPRErr != nil {
+		return nil, s.getByPRErr
+	}
 	return s.locks, nil
 }
 
-func (s *unlockTestLockStore) Release(_ context.Context, _, _, _ string) error {
+func (s *unlockTestLockStore) List(_ context.Context) ([]*storage.Lock, error) {
+	return s.locks, nil
+}
+
+func (s *unlockTestLockStore) Release(_ context.Context, database, _, _ string) error {
 	s.releaseCalls++
+	if err := s.releaseErrs[database]; err != nil {
+		return err
+	}
+	s.released = append(s.released, database)
 	return nil
 }
 
-func (s *unlockTestLockStore) ForceRelease(_ context.Context, _, _ string) error {
+func (s *unlockTestLockStore) ForceRelease(_ context.Context, database, _ string) error {
 	s.forceReleaseCalls++
+	if err := s.releaseErrs[database]; err != nil {
+		return err
+	}
+	s.forceReleased = append(s.forceReleased, database)
 	return nil
 }
 

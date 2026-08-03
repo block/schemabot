@@ -663,9 +663,9 @@ func isUnlockRejection(err error) bool {
 //     Released locks drop out of the lookup, so a re-drive retries only the
 //     locks that remain.
 //   - retry=false, err=nil — a terminal outcome that is the command's answer
-//     (a deterministic inference or lookup rejection, no locks found, an
-//     authorization block on the merits, or an active apply still protecting
-//     the lock).
+//     (a completed release, a deterministic inference or lookup rejection, no
+//     locks found, an authorization block on the merits, or an active apply
+//     still protecting the lock).
 //
 // A gate block is terminal only when the gate evaluated its inputs and
 // blocked on the merits. A gate that could not evaluate (for example a
@@ -677,8 +677,9 @@ func isUnlockRejection(err error) bool {
 // post best-effort error comments too, so a durable driver re-driving one may
 // post the same comment again.
 //
-// The core logs each failure at its site, so the synchronous wrapper can
-// discard the result without losing observability.
+// Every failure is logged where it is classified — by the core at its own
+// exits, and by the authorization gates for gate outcomes — so the synchronous
+// wrapper can discard the result without losing observability.
 func (h *Handler) unlockCommandCore(repo string, pr int, installationID int64, requestedBy string, result CommandResult) (bool, error) {
 	ctx, cancel := h.commandContext(30 * time.Second)
 	defer cancel()
@@ -848,6 +849,12 @@ func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, 
 		// for this deployment to unlock: same outcome as no config at all.
 		if isSchemaUnownedByDeploymentError(err) {
 			return "", unlockRejection(ghclient.ErrNoConfig)
+		}
+		// A repo with no config, or only malformed ones, is a deterministic
+		// discovery outcome the same delivery always reproduces — the
+		// command's answer, not a transient read failure.
+		if errors.Is(err, ghclient.ErrNoConfig) || errors.Is(err, ghclient.ErrInvalidConfig) {
+			return "", unlockRejection(err)
 		}
 		if errors.Is(err, ghclient.ErrMultipleConfigs) {
 			return "", unlockRejection(fmt.Errorf("multiple SchemaBot configs match this PR; retry with `schemabot unlock -d <database> --force`: %w", err))
