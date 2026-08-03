@@ -1190,13 +1190,89 @@ func recentAppliesWhere(filter storage.RecentAppliesFilter) ([]string, []any) {
 		args = append(args, stringArgs(filter.States)...)
 	}
 	if !filter.UpdatedSince.IsZero() {
-		where = append(where, "updated_at >= ?")
+		where = append(where, recentAppliesLastActivity+" >= ?")
 		args = append(args, filter.UpdatedSince)
 	}
 	return where, args
 }
 
-// GetRecent returns the most recent applies across all databases, ordered by creation time desc.
+// recentAppliesLastActivity is the most recent activity on an apply, across the
+// apply row and its operation rows. The status views both window and sort on it,
+// so a time window and the ordering inside it agree on what recent means.
+//
+// updated_at is the lease heartbeat a driver refreshes on every tick, so it
+// tracks work in flight rather than when the apply was requested. Creation time
+// does not: a copy that runs for days keeps sinking as newer applies are
+// created against other databases, until the one schema change still touching a
+// production table falls outside the page an operator sees, while the summary
+// counts — which ignore the limit — still report it as running.
+//
+// The operation rows have to be part of the key because an operation-scoped
+// drive is refused a parent heartbeat by design: parent liveness belongs to the
+// parent lease, so a fanned-out apply advances apply_operations.updated_at every
+// tick while applies.updated_at stays frozen at its last parent state change.
+// Keying on the apply row alone would sink exactly the multi-deployment rollout
+// that is still copying rows.
+//
+// GREATEST keeps whichever row moved last, so an apply whose own state changed
+// after its operations went quiet still sorts by its own timestamp.
+const recentAppliesLastActivity = `GREATEST(
+	applies.updated_at,
+	COALESCE((
+		SELECT MAX(ao.updated_at)
+		FROM apply_operations ao
+		WHERE ao.apply_id = applies.id
+	), applies.updated_at)
+)`
+
+// recentAppliesOrderBy sorts the status list into a live group and a quiet
+// group, and orders each by the key that means something for it.
+//
+// An apply is live when a driver is still on it: recent activity *and* a
+// non-terminal state. Both halves are load-bearing. Activity alone would call a
+// just-finished apply live for as long as its last heartbeat stays fresh, and
+// then sort it by start time among the running work. State alone would float an
+// abandoned apply — pending with no driver, or retryable that nothing is
+// retrying — above the work actually in flight, forever. Together they say what
+// an operator means by "running now": something is driving it, and it has not
+// finished. An apply stopped and never resumed is terminal, so it stays quiet.
+//
+// Activity is bucketed rather than compared because every driver refreshes its
+// heartbeat on the same short interval: live rows all carry a timestamp from
+// within one interval, so ordering on the timestamp itself would put whichever
+// driver ticked most recently first and reshuffle the top of the list between one
+// status call and the next. The bucket bound is the lease staleness window — the
+// same bound the claim queries use to decide whether a driver still holds a row,
+// so "live" means one thing across the system.
+//
+// Inside the live group the key is when the apply started, oldest first: the
+// risk of a schema change grows with how long it has been holding a table, and
+// the order is stable as time passes, so a newly started apply joins the bottom
+// of the group instead of displacing every row above it. Applies still starting
+// up have no started_at yet and fall back to their creation time.
+//
+// The quiet group keeps last activity, which for a finished apply is when it
+// finished, so the most recently settled work reads first.
+func (s *applyStore) recentAppliesOrderBy() (string, []any) {
+	liveWindow := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	terminal := terminalApplyStates()
+	isLive := fmt.Sprintf("(%s >= %s AND applies.state NOT IN (%s))",
+		recentAppliesLastActivity, liveWindow, placeholders(len(terminal)))
+
+	orderBy := fmt.Sprintf(`
+		ORDER BY %s DESC,
+			CASE WHEN %s THEN COALESCE(applies.started_at, applies.created_at) END ASC,
+			%s DESC,
+			applies.id DESC
+	`, isLive, isLive, recentAppliesLastActivity)
+
+	// The live predicate appears twice, so its states bind twice.
+	args := append(stringArgs(terminal), stringArgs(terminal)...)
+	return orderBy, args
+}
+
+// GetRecent returns applies matching the filter, in-flight work first.
 func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentAppliesFilter) ([]*storage.Apply, error) {
 	query := `
 		SELECT ` + applyColumns + `
@@ -1206,7 +1282,9 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
-	query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+	orderBy, orderArgs := s.recentAppliesOrderBy()
+	query += orderBy + " LIMIT ?"
+	args = append(args, orderArgs...)
 	args = append(args, filter.Limit)
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
