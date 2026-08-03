@@ -241,6 +241,19 @@ func (e *Engine) changeLogger() *slog.Logger {
 	return e.logger
 }
 
+// schemaChangeLogger returns the logger bound to the given schema change,
+// falling back to the engine's configured logger when the change is nil or
+// carries no caller-bound logger. Control paths that hold a specific change
+// use it instead of changeLogger so their lines carry that change's triage
+// identity even when the engine has since started tracking a different one.
+// The change's logger is set once at creation, so no lock is needed.
+func (e *Engine) schemaChangeLogger(rm *runningSchemaChange) *slog.Logger {
+	if rm != nil && rm.logger != nil {
+		return rm.logger
+	}
+	return e.logger
+}
+
 // changeSpiritLogger returns the filtered Spirit logger for the tracked
 // schema change, falling back to the engine-level Spirit logger. Runner log
 // lines routed through it inherit the change's triage identity.
@@ -549,7 +562,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	cpuHint := e.cpuHint
 	e.mu.Unlock()
 	if cpuHint == 0 {
-		cpuHint = e.queryCPUHint(ctx, req.Credentials.DSN)
+		cpuHint = e.queryCPUHint(ctx, req.Credentials.DSN, logger)
 		e.mu.Lock()
 		e.cpuHint = cpuHint
 		e.mu.Unlock()

@@ -147,6 +147,45 @@ func TestResolveChangeLoggers_SpiritLoggerKeepsFilterAndRouting(t *testing.T) {
 	assert.Equal(t, "customers", routed[0].table)
 }
 
+// schemaChangeLogger resolves a specific change's bound logger for control
+// paths that hold the change directly, falling back to the engine's logger
+// when the change is nil or carries none.
+func TestSchemaChangeLogger_BoundAndFallback(t *testing.T) {
+	logger, _ := identityBoundLogger()
+	eng := New(Config{})
+
+	assert.Same(t, eng.logger, eng.schemaChangeLogger(nil))
+	assert.Same(t, eng.logger, eng.schemaChangeLogger(&runningSchemaChange{}))
+	assert.Same(t, logger, eng.schemaChangeLogger(&runningSchemaChange{logger: logger}))
+}
+
+// A stop on a tracked schema change must emit its lifecycle lines through the
+// change's caller-bound logger, so an operator can filter the stop by the
+// same apply/repo/PR identity as the drive that started it.
+func TestStop_LogsCarryChangeIdentity(t *testing.T) {
+	logger, captured := identityBoundLogger()
+	eng := New(Config{})
+	boundLogger, boundSpirit := eng.resolveChangeLoggers(logger)
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{
+		logger:       boundLogger,
+		spiritLogger: boundSpirit,
+		database:     "app_db",
+		state:        engine.StateRunning,
+	}
+	eng.mu.Unlock()
+
+	res, err := eng.Stop(t.Context(), &engine.ControlRequest{Database: "app_db"})
+	require.NoError(t, err)
+	assert.True(t, res.Accepted)
+
+	line := requireRecord(t, captured(), "schema change stopped")
+	assert.Equal(t, "apply-lf2", line.attrs["apply_id"])
+	assert.Equal(t, "org/repo", line.attrs["repo"])
+	assert.Equal(t, int64(42), line.attrs["pr"])
+	assert.Equal(t, "app_db", line.attrs["database"])
+}
+
 // changeLogger and changeSpiritLogger expose the tracked change's loggers to
 // the execution path and fall back to the engine's loggers when no change is
 // tracked or the change carries none, so background execution never loses its

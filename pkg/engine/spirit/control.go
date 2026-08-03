@@ -12,6 +12,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"math"
 	"strings"
 	"time"
@@ -56,16 +57,18 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 		return nil, engine.NewAlreadyCompletedError("stop rejected: the schema change on database %s completed before the stop arrived", database)
 	}
 
+	logger := e.schemaChangeLogger(rm)
+
 	// Force a checkpoint BEFORE canceling the context.
 	// Spirit only checkpoints every 50s, so without this we could lose progress.
 	if len(runners) > 0 && runners[0] != nil {
-		e.logger.Info("forcing checkpoint before stop",
+		logger.Info("forcing checkpoint before stop",
 			"database", database,
 			"tables", tables,
 		)
 		if err := runners[0].DumpCheckpoint(ctx); err != nil {
 			// Log but don't fail - checkpoint might not be ready yet (early in execution)
-			e.logger.Warn("could not force checkpoint before stop",
+			logger.Warn("could not force checkpoint before stop",
 				"error", err,
 			)
 		}
@@ -79,7 +82,7 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	rm.state = engine.StateStopped
 	e.mu.Unlock()
 
-	e.logger.Info("stop requested, waiting for goroutine",
+	logger.Info("stop requested, waiting for goroutine",
 		"database", database,
 		"tables", tables,
 	)
@@ -87,7 +90,7 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	// Wait for the goroutine to complete
 	rm.wg.Wait()
 
-	e.logger.Info("schema change stopped",
+	logger.Info("schema change stopped",
 		"database", database,
 		"tables", tables,
 	)
@@ -126,13 +129,14 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 	rm.state = engine.StateCancelled
 	e.mu.Unlock()
 
-	e.logger.Info("cancel requested, waiting for goroutine",
+	logger := e.schemaChangeLogger(rm)
+	logger.Info("cancel requested, waiting for goroutine",
 		"database", database,
 		"tables", tables,
 	)
 	rm.wg.Wait()
 
-	e.logger.Info("schema change cancelled",
+	logger.Info("schema change cancelled",
 		"database", database,
 		"tables", tables,
 	)
@@ -231,7 +235,7 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 		return nil, fmt.Errorf("credentials not available for resume")
 	}
 
-	e.logger.Info("resuming schema change",
+	e.schemaChangeLogger(rm).Info("resuming schema change",
 		"database", database,
 		"tables", tables,
 	)
@@ -332,7 +336,7 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 		return nil, fmt.Errorf("drop sentinel table: %w", err)
 	}
 
-	e.logger.Info("sentinel table dropped, cutover will proceed", "database", database, "stateless", rm == nil)
+	e.schemaChangeLogger(rm).Info("sentinel table dropped, cutover will proceed", "database", database, "stateless", rm == nil)
 
 	return &engine.ControlResult{
 		Accepted:    true,
@@ -423,7 +427,7 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 	// Calculate settings from volume level (1-11)
 	newThreads, newChunkTime, newLockTimeout := volumeToSpiritSettings(req.Volume, cpuHint)
 
-	e.logger.Info("adjusting volume",
+	e.schemaChangeLogger(rm).Info("adjusting volume",
 		"database", database,
 		"volume", req.Volume,
 		"previous_volume", previousVolume,
@@ -511,7 +515,7 @@ func (e *Engine) setSchemaChangeVolume(rm *runningSchemaChange, volume int32, th
 	}
 	e.mu.Unlock()
 	if !tracked {
-		e.logger.Warn("volume adjustment target is no longer the tracked schema change; settings not applied",
+		e.schemaChangeLogger(rm).Warn("volume adjustment target is no longer the tracked schema change; settings not applied",
 			"database", rm.database,
 			"volume", volume,
 		)
@@ -614,22 +618,24 @@ func settingsToVolume(threads int, chunkTime time.Duration) int32 {
 // match the instance's vCPU count. On self-managed MySQL 8.4+, the default is
 // dynamically calculated from available_logical_processors / 4.
 // Returns 0 if the query fails or the value can't be determined.
-func (e *Engine) queryCPUHint(ctx context.Context, dsn string) int {
+// The logger is passed by the caller because the hint is probed while
+// preparing a schema change, before it is tracked on the engine.
+func (e *Engine) queryCPUHint(ctx context.Context, dsn string, logger *slog.Logger) int {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
-		e.logger.Debug("queryCPUHint: failed to open", "error", err)
+		logger.Debug("queryCPUHint: failed to open", "error", err)
 		return 0
 	}
 	defer utils.CloseAndLog(db)
 
 	if err := db.PingContext(ctx); err != nil {
-		e.logger.Debug("queryCPUHint: failed to ping", "error", err)
+		logger.Debug("queryCPUHint: failed to ping", "error", err)
 		return 0
 	}
 
 	var instances int
 	if err := db.QueryRowContext(ctx, "SELECT @@innodb_buffer_pool_instances").Scan(&instances); err != nil {
-		e.logger.Debug("queryCPUHint: failed to query", "error", err)
+		logger.Debug("queryCPUHint: failed to query", "error", err)
 		return 0
 	}
 
@@ -637,7 +643,7 @@ func (e *Engine) queryCPUHint(ctx context.Context, dsn string) int {
 		return 0
 	}
 
-	e.logger.Info("detected CPU hint from innodb_buffer_pool_instances",
+	logger.Info("detected CPU hint from innodb_buffer_pool_instances",
 		"innodb_buffer_pool_instances", instances,
 	)
 	return instances
@@ -652,8 +658,9 @@ func (e *Engine) queryCPUHint(ctx context.Context, dsn string) int {
 // - binlog_pos: position within the binlog file
 // - statement: the DDL being executed
 func (e *Engine) logCheckpointState(rm *runningSchemaChange, phase string, extra map[string]any) {
+	logger := e.schemaChangeLogger(rm)
 	if rm == nil || rm.host == "" {
-		e.logger.Debug("logCheckpointState: no running schema change or credentials")
+		logger.Debug("logCheckpointState: no running schema change or credentials")
 		return
 	}
 
@@ -669,13 +676,13 @@ func (e *Engine) logCheckpointState(rm *runningSchemaChange, phase string, extra
 
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
-		e.logger.Warn("logCheckpointState: failed to open", "error", err)
+		logger.Warn("logCheckpointState: failed to open", "error", err)
 		return
 	}
 	defer utils.CloseAndLog(db)
 
 	if err := db.PingContext(context.Background()); err != nil {
-		e.logger.Warn("logCheckpointState: failed to connect", "error", err)
+		logger.Warn("logCheckpointState: failed to connect", "error", err)
 		return
 	}
 
@@ -688,7 +695,7 @@ func (e *Engine) logCheckpointState(rm *runningSchemaChange, phase string, extra
 		err := db.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
 			rm.database, checkpointTable).Scan(&count)
 		if err != nil || count == 0 {
-			e.logger.Debug("logCheckpointState: no checkpoint table found",
+			logger.Debug("logCheckpointState: no checkpoint table found",
 				"table", tableName,
 				"checkpoint_table", checkpointTable,
 				"phase", phase,
@@ -704,7 +711,7 @@ func (e *Engine) logCheckpointState(rm *runningSchemaChange, phase string, extra
 			rm.database, checkpointTable)
 		err = db.QueryRowContext(context.Background(), query).Scan(&copierWatermark, &checksumWatermark, &binlogName, &binlogPos, &statement)
 		if err != nil {
-			e.logger.Warn("logCheckpointState: failed to read checkpoint",
+			logger.Warn("logCheckpointState: failed to read checkpoint",
 				"table", tableName,
 				"checkpoint_table", checkpointTable,
 				"error", err,
@@ -727,6 +734,6 @@ func (e *Engine) logCheckpointState(rm *runningSchemaChange, phase string, extra
 			logFields = append(logFields, k, v)
 		}
 
-		e.logger.Info("checkpoint_state", logFields...)
+		logger.Info("checkpoint_state", logFields...)
 	}
 }
