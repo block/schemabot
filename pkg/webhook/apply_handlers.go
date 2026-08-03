@@ -778,7 +778,9 @@ func (h *Handler) unlockCommandCore(repo string, pr int, installationID int64, r
 			err = h.service.Storage().Locks().Release(ctx, lock.DatabaseName, lock.DatabaseType, lock.Owner)
 		}
 		if err != nil {
-			h.logger.Error("failed to release lock", "database", lock.DatabaseName, "error", err)
+			h.logger.Error("failed to release lock",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+				"owner", lock.Owner, "force", result.Force, "error", err)
 			releaseErrs = append(releaseErrs, fmt.Errorf("release lock for %s: %w", lock.DatabaseName, err))
 			continue
 		}
