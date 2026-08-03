@@ -1526,3 +1526,78 @@ func TestOperator_DatabaseExclusionScopedByEnvironment(t *testing.T) {
 	require.NotNil(t, claimed)
 	assert.Equal(t, "apply-env-stale-production", claimed.ApplyIdentifier)
 }
+
+// A pending operation row left under an apply that has already settled will
+// never be claimed: the parent's verdict is recorded and no driver revisits it.
+// The stranded-operation reaper settles the row to the parent's outcome so
+// operators reading pending work see only work that can still run, and it does
+// this without rewriting the parent apply, whose recorded verdict and timestamps
+// stay exactly as the drive that settled it left them.
+func TestOperator_ReaperSettlesStrandedOperationsUnderSettledApplies(t *testing.T) {
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	fixture := newOperatorClaimFixture(t, "stranded_ops_")
+	appDBName := fixture.appDBName
+	stor := fixture.store
+
+	now := time.Now()
+	applyID, err := stor.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply-stranded-operation",
+		Database:        appDBName,
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      appDBName,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Completed,
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	require.NoError(t, err)
+
+	operationID, err := stor.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    applyID,
+		Deployment: appDBName,
+		Target:     appDBName,
+	})
+	require.NoError(t, err)
+
+	// Age the parent past the quiescence bound so its rows read as stranded
+	// rather than as the tail of a drive that is still writing.
+	_, err = fixture.storageDB.ExecContext(ctx,
+		"UPDATE applies SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?", applyID)
+	require.NoError(t, err)
+
+	before, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+
+	// Rows strand precisely while drivers claim at the apply level and leave the
+	// operation rows undriven, so the reaper must run in that shape too.
+	claimAtApplyLevel := false
+	svc := schemabotapi.New(stor, &schemabotapi.ServerConfig{
+		Drivers:                 1,
+		OperatorClaimOperations: &claimAtApplyLevel,
+	}, nil, logger)
+	require.NoError(t, svc.SetOperatorPollInterval(50*time.Millisecond))
+	require.NoError(t, svc.SetStrandedReaperInterval(50*time.Millisecond))
+	svc.StartOperator(ctx)
+	defer svc.StopOperator()
+
+	require.Eventually(t, func() bool {
+		op, err := stor.ApplyOperations().Get(ctx, operationID)
+		require.NoError(t, err)
+		return op != nil && op.State == state.Apply.Completed
+	}, 5*time.Second, 100*time.Millisecond, "the reaper should settle the stranded operation to its parent's outcome")
+
+	op, err := stor.ApplyOperations().Get(ctx, operationID)
+	require.NoError(t, err)
+	assert.NotNil(t, op.CompletedAt, "a settled operation carries a completion time")
+
+	after, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, before.State, after.State, "the reaper records nothing on the parent apply")
+	assert.True(t, before.UpdatedAt.Equal(after.UpdatedAt), "the parent apply row is not rewritten: %s != %s", before.UpdatedAt, after.UpdatedAt)
+}

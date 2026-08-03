@@ -4,6 +4,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -811,6 +812,40 @@ type ApplyOperationStore interface {
 	// is resumable, so completed_at is left nil. Apply-lease guarded when a lease
 	// is present in ctx.
 	MarkPendingStoppedByApply(ctx context.Context, applyID int64) (int64, error)
+
+	// ReapStranded mirrors the parent's outcome onto pending, unleased operation
+	// rows whose parent apply settled long enough ago to be quiescent, returning
+	// what it reaped (at most limit rows, oldest first). A pending row under a
+	// settled parent describes work that will never run — the rollout's verdict was
+	// recorded on the parent — so leaving it pending makes that state mean two
+	// different things and hides genuinely stranded work behind harmless history.
+	//
+	// Only completed, failed, cancelled, and reverted parents qualify. stopped and
+	// failed_retryable parents are resumable: their pending rows belong to the
+	// resume path, which claims them once the parent is active again. Each write
+	// is guarded on the row still being pending and unleased, so a row a driver
+	// claimed or advanced in the meantime is skipped rather than overwritten, and
+	// the parent apply row is never touched.
+	//
+	// One instance reaps per pass, guarded by an advisory lock;
+	// ErrStrandedReaperBusy reports that another instance holds it. The lock is an
+	// efficiency gate, not a safety one: every write is already guarded and
+	// idempotent, so concurrent reapers would be correct but would each pay the
+	// full scan to find rows the first one already settled.
+	ReapStranded(ctx context.Context, limit int) ([]*ReapedOperation, error)
+}
+
+// ErrStrandedReaperBusy reports that another instance holds the stranded-operation
+// reaper lock, so this pass did no work. It is an expected outcome on every
+// instance but one, not a failure.
+var ErrStrandedReaperBusy = errors.New("another instance is reaping stranded apply operations")
+
+// ReapedOperation records one operation row settled from its parent apply's
+// outcome, carrying both rows so callers can log what the reaper did with the
+// canonical triage attributes.
+type ReapedOperation struct {
+	Operation *ApplyOperation
+	Parent    *Apply
 }
 
 // ApplyLogStore manages apply log entries for debugging and audit.

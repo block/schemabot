@@ -65,6 +65,10 @@ func (s *Service) StartOperator(ctx context.Context) {
 	stop := make(chan struct{})
 	wake := make(chan struct{}, driverCount)
 	driverCtx, cancel := context.WithCancel(ctx)
+	reaperEvery := s.strandedReaperEvery
+	if reaperEvery <= 0 {
+		reaperEvery = StrandedReaperInterval
+	}
 	s.stopRecovery = stop
 	s.cancelRecovery = cancel
 	s.operatorWake = wake
@@ -77,7 +81,17 @@ func (s *Service) StartOperator(ctx context.Context) {
 		})
 	}
 
-	s.logger.Info("operator started", "drivers", driverCount, "interval", s.operatorPollInterval)
+	// The stranded-operation reaper is maintenance, not claim work, so it runs on
+	// its own slow cadence outside the driver pool. It shares the driver
+	// lifecycle: one goroutine per process, stopped by StopOperator.
+	s.recoveryWg.Go(func() {
+		s.strandedReaperLoop(driverCtx, stop, reaperEvery)
+	})
+
+	s.logger.Info("operator started",
+		"drivers", driverCount,
+		"interval", s.operatorPollInterval,
+		"stranded_reaper_interval", reaperEvery)
 }
 
 // StopOperator stops the background operator and waits for all drivers to finish.

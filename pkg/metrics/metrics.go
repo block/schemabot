@@ -802,8 +802,36 @@ func RecordOperatorResumeFailure(ctx context.Context, database, deployment, envi
 	)
 }
 
+// RecordOperatorStrandedOperationReaped counts apply operations the reaper
+// settled from an already-settled parent apply — rows describing work that will
+// never run, left behind non-terminal.
+//
+// A one-time burst is the historical backlog draining and needs no action. A
+// rate that keeps climbing means something is actively stranding operations, so
+// the investigation belongs on the producer — a path that terminalizes a parent
+// apply without settling its children — not on the reaper.
+//
+// deployment is the reaped operation's own deployment, the routing key that says
+// which target the settled row belonged to; stranded rows arise in exactly the
+// multi-deployment applies where it differs from the parent's.
+//
+// This counter is emitted under the operator name only. The deprecated
+// schemabot.scheduler.* alias exists to carry pre-existing series through one
+// release, and a metric introduced after that rename has no legacy series to
+// migrate.
+func RecordOperatorStrandedOperationReaped(ctx context.Context, database, deployment, environment, parentState string) {
+	addCounter(ctx, "schemabot.operator.stranded_operations_reaped_total",
+		"Total number of stranded apply operations the reaper settled from their parent apply's outcome", "{operation}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("parent_state", parentState),
+	)
+}
+
 var knownOperatorClaimFailureReasons = map[string]bool{
 	"expire_retryable_error":                  true,
+	"stranded_reaper_error":                   true,
 	"missing_lease_token":                     true,
 	"storage_error":                           true,
 	"operation_storage_error":                 true,
