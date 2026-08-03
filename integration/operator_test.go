@@ -291,19 +291,23 @@ func TestOperator_OperatorClaimsOperationToCompletion(t *testing.T) {
 	assert.Equal(t, derived, finalApply.State, "parent apply state is derived from its child operations")
 }
 
-// TestOperator_OperatorReconcilesOperationWhenParentTerminal covers the safety
-// case where the operator claims an apply_operations row whose parent apply is
-// already terminal — for example the operator flag is enabled after the apply
-// finished, or the parent reached a terminal state via another path. The
-// operator must reconcile the operation to the parent's terminal state rather
-// than re-claiming the same non-terminal row on every poll forever.
-func TestOperator_OperatorReconcilesOperationWhenParentTerminal(t *testing.T) {
+// TestOperator_OperatorSkipsOperationWhenParentTerminal covers the safety case
+// where an apply_operations row is still pending while its parent apply is
+// already terminal — for example operation-level claiming is enabled after the
+// apply finished, or the parent reached a terminal state via another path. The
+// rollout's outcome is settled, so the operator must not claim the row: it
+// stays pending and unleased, and it must not sit at the head of the claim
+// queue shadowing live work — an apply submitted behind it still runs to
+// completion.
+func TestOperator_OperatorSkipsOperationWhenParentTerminal(t *testing.T) {
 	ctx := t.Context()
-	appDBName, appDSN := createTestDB(t, "operator_reconcile_")
+	appDBName, appDSN := createTestDB(t, "operator_skip_terminal_")
 	ts := startTestServerOperator(t, appDBName, appDSN)
 
+	// A pending operation under an already-completed parent, created before any
+	// live work so it sits ahead of it in claim order.
 	now := time.Now()
-	applyID, err := ts.Storage.Applies().Create(ctx, &storage.Apply{
+	deadParentID, err := ts.Storage.Applies().Create(ctx, &storage.Apply{
 		ApplyIdentifier: "apply-terminal-parent",
 		Database:        appDBName,
 		DatabaseType:    "mysql",
@@ -317,37 +321,246 @@ func TestOperator_OperatorReconcilesOperationWhenParentTerminal(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	opID, err := ts.Storage.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID:    applyID,
+	deadOpID, err := ts.Storage.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    deadParentID,
 		Deployment: appDBName,
 		Target:     appDBName,
 		State:      state.ApplyOperation.Pending,
 	})
 	require.NoError(t, err)
 
+	// Live work submitted behind the dead row completes: the operator's claim
+	// skips the dead row instead of wedging on it.
+	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
+	require.NoError(t, err)
+	planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database": appDBName, "environment": "staging", "type": "mysql",
+		"schema_files": map[string]any{"default": map[string]any{"files": map[string]string{"users.sql": string(schemaSQL)}}},
+	})
+	planID, _ := planResp["plan_id"].(string)
+	require.NotEmpty(t, planID)
+
+	applyResp := postJSON(t, "http://"+ts.Addr+"/api/apply", map[string]any{
+		"plan_id": planID, "environment": "staging",
+	})
+	require.True(t, applyResp["accepted"] == true)
+	liveApplyID, _ := applyResp["apply_id"].(string)
+	require.NotEmpty(t, liveApplyID)
+
+	waitForState(t, "http://"+ts.Addr, liveApplyID, "completed", 20*time.Second)
+
+	// The dead row is untouched: still pending, never claimed, and its settled
+	// parent still reads completed.
+	deadOp, err := ts.Storage.ApplyOperations().Get(ctx, deadOpID)
+	require.NoError(t, err)
+	require.NotNil(t, deadOp)
+	assert.Equal(t, state.ApplyOperation.Pending, deadOp.State, "a pending operation under a terminal parent is never claimed")
+	assert.Empty(t, deadOp.LeaseOwner, "no driver leases the dead row")
+	assert.Nil(t, deadOp.StartedAt, "the dead row is never started")
+
+	deadParent, err := ts.Storage.Applies().Get(ctx, deadParentID)
+	require.NoError(t, err)
+	require.NotNil(t, deadParent)
+	assert.Equal(t, state.Apply.Completed, deadParent.State, "the settled parent's outcome is untouched")
+}
+
+// TestOperator_ReconcilesClaimedOperationWhoseParentSettled covers an operation
+// a driver claimed while its parent apply was still going somewhere, whose
+// parent settled before the driver got to it — the row was under way, so the
+// stale-lease recovery arm reaches it regardless of the parent's state. The
+// driver cannot claim a settled parent, and leaving the row non-terminal would
+// re-lease it on every poll forever, so it mirrors the parent's outcome onto the
+// operation instead.
+func TestOperator_ReconcilesClaimedOperationWhoseParentSettled(t *testing.T) {
+	ctx := t.Context()
+	appDBName, appDSN := createTestDB(t, "operator_settled_parent_")
+	ts := startTestServerOperator(t, appDBName, appDSN)
+
+	now := time.Now()
+	parentID, err := ts.Storage.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply-settled-parent",
+		Database:        appDBName,
+		DatabaseType:    "mysql",
+		Deployment:      appDBName,
+		Engine:          "spirit",
+		State:           state.Apply.Completed,
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	require.NoError(t, err)
+
+	opID, err := ts.Storage.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    parentID,
+		Deployment: appDBName,
+		Target:     appDBName,
+		State:      state.ApplyOperation.Running,
+	})
+	require.NoError(t, err)
+
+	// Age the operation's heartbeat past the lease staleness window so the
+	// driver that was running it is no longer presumed live. Written directly
+	// because every storage write path refreshes updated_at, which is the
+	// heartbeat itself.
+	storageDB, err := sql.Open("mysql", schemabotDSN)
+	require.NoError(t, err, "open schemabot db")
+	require.NoError(t, storageDB.PingContext(ctx))
+	t.Cleanup(func() {
+		utils.CloseAndLog(storageDB)
+	})
+	_, err = storageDB.ExecContext(ctx,
+		`UPDATE apply_operations SET updated_at = NOW() - INTERVAL ? SECOND WHERE id = ?`,
+		int64((2 * storage.ApplyLeaseStaleAfter).Seconds()), opID)
+	require.NoError(t, err)
+
 	require.Eventually(t, func() bool {
 		op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
-		if err != nil || op == nil {
-			return false
-		}
+		require.NoError(t, err)
+		require.NotNil(t, op)
 		return state.IsState(op.State, state.ApplyOperation.Completed)
-	}, 10*time.Second, 100*time.Millisecond,
-		"operator should reconcile the operation to completed when its parent apply is already completed")
+	}, 30*time.Second, 200*time.Millisecond,
+		"the claimed operation must be reconciled to its settled parent's state instead of being re-claimed forever")
 
-	op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
-	require.NoError(t, err)
-	require.NotNil(t, op)
-	assert.Equal(t, state.ApplyOperation.Completed, op.State)
-	require.NotNil(t, op.CompletedAt, "reconciled completed operation stamps completed_at")
-
-	// Even on the terminal-parent reconciliation path, the parent stays equal to
-	// DeriveApplyState of its child operations.
-	parent, err := ts.Storage.Applies().Get(ctx, applyID)
+	parent, err := ts.Storage.Applies().Get(ctx, parentID)
 	require.NoError(t, err)
 	require.NotNil(t, parent)
-	derived := state.DeriveApplyState([]string{op.State})
-	assert.Equal(t, state.Apply.Completed, derived)
-	assert.Equal(t, derived, parent.State, "parent apply state is derived from its child operations")
+	assert.Equal(t, state.Apply.Completed, parent.State, "the settled parent's outcome is untouched")
+}
+
+// TestOperator_StartResumesStoppedApplyWhoseDeploymentsNeverStarted covers a
+// rollout stopped before any of its deployments began: the apply is stopped and
+// every operation row is still pending, so there is no already-started row for
+// the resume to go through. An accepted start request must still be serviced —
+// the operator claims the never-started operation and drives the deployment to
+// completion — otherwise the request would be durably recorded and then acted on
+// by nothing, and the only escape would be cancelling and losing the rollout.
+func TestOperator_StartResumesStoppedApplyWhoseDeploymentsNeverStarted(t *testing.T) {
+	ctx := t.Context()
+	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
+	require.NoError(t, err)
+
+	appDBName, appDSN := createTestDB(t, "start_resumes_never_started_")
+	ts := startTestServerOperator(t, appDBName, appDSN)
+
+	// Apply the schema normally so a plan exists, then drop the table so a
+	// replan yields DDL the resumed operation actually has to run.
+	planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database": appDBName, "environment": "staging", "type": "mysql",
+		"schema_files": map[string]any{"default": map[string]any{"files": map[string]string{"users.sql": string(schemaSQL)}}},
+	})
+	planID, _ := planResp["plan_id"].(string)
+	require.NotEmpty(t, planID)
+	applyResp := postJSON(t, "http://"+ts.Addr+"/api/apply", map[string]any{
+		"plan_id": planID, "environment": "staging",
+	})
+	require.True(t, applyResp["accepted"] == true)
+	firstApplyID, _ := applyResp["apply_id"].(string)
+	require.NotEmpty(t, firstApplyID)
+	waitForState(t, "http://"+ts.Addr, firstApplyID, "completed", 20*time.Second)
+	ts.Service.StopOperator()
+
+	targetConn, err := sql.Open("mysql", appDSN)
+	require.NoError(t, err)
+	require.NoError(t, targetConn.PingContext(ctx))
+	defer utils.CloseAndLog(targetConn)
+	_, err = targetConn.ExecContext(ctx, "DROP TABLE IF EXISTS users")
+	require.NoError(t, err)
+
+	plan2Resp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database": appDBName, "environment": "staging", "type": "mysql",
+		"schema_files": map[string]any{"default": map[string]any{"files": map[string]string{"users.sql": string(schemaSQL)}}},
+	})
+	planID2, _ := plan2Resp["plan_id"].(string)
+	plan2, err := ts.Storage.Plans().Get(ctx, planID2)
+	require.NoError(t, err)
+
+	// The wedge shape: a stopped apply whose one deployment never started, so
+	// its operation row is still pending. The tasks carry the stop, which is
+	// where a stopped rollout's remaining work lives.
+	now := time.Now()
+	applyDBID, err := ts.Storage.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply-start-never-started",
+		PlanID:          plan2.ID,
+		Database:        appDBName,
+		DatabaseType:    "mysql",
+		Deployment:      appDBName,
+		Engine:          "spirit",
+		State:           state.Apply.Stopped,
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		StartedAt:       &now,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	require.NoError(t, err)
+
+	opID, err := ts.Storage.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    applyDBID,
+		Deployment: appDBName,
+		Target:     appDBName,
+		State:      state.ApplyOperation.Pending,
+	})
+	require.NoError(t, err)
+
+	for _, tc := range plan2.FlatDDLChanges() {
+		_, err := ts.Storage.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier:   fmt.Sprintf("task-start-never-started-%d", time.Now().UnixNano()),
+			ApplyID:          applyDBID,
+			ApplyOperationID: &opID,
+			PlanID:           plan2.ID,
+			Database:         appDBName,
+			DatabaseType:     "mysql",
+			Engine:           "spirit",
+			State:            state.Task.Stopped,
+			Namespace:        tc.Namespace,
+			TableName:        tc.Table,
+			DDL:              tc.DDL,
+			DDLAction:        tc.Operation,
+			Options:          []byte("{}"),
+			Environment:      "staging",
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		})
+		require.NoError(t, err)
+	}
+
+	_, _, err = ts.Storage.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     applyDBID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "test",
+	})
+	require.NoError(t, err)
+
+	ts.Service.StartOperator(t.Context())
+	defer ts.Service.StopOperator()
+
+	require.Eventually(t, func() bool {
+		op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		return op != nil && state.IsState(op.State, state.ApplyOperation.Completed)
+	}, 30*time.Second, 200*time.Millisecond,
+		"a start request must resume a stopped rollout whose deployments never started")
+
+	// The rollout really ran: the parent settles from its operation row and the
+	// dropped table is back on the target.
+	parent, err := ts.Storage.Applies().Get(ctx, applyDBID)
+	require.NoError(t, err)
+	require.NotNil(t, parent)
+	assert.Equal(t, state.Apply.Completed, parent.State, "the resumed apply settles from its completed operation")
+
+	var tableName string
+	require.NoError(t, targetConn.QueryRowContext(ctx, "SHOW TABLES LIKE 'users'").Scan(&tableName),
+		"the resumed deployment must have run its DDL against the target")
+	assert.Equal(t, "users", tableName)
+
+	// The start request is consumed rather than left pending forever.
+	require.Eventually(t, func() bool {
+		req, err := ts.Storage.ControlRequests().GetPending(ctx, applyDBID, storage.ControlOperationStart)
+		return err == nil && req == nil
+	}, 10*time.Second, 100*time.Millisecond,
+		"the serviced start request is completed")
 }
 
 // TestOperator_StopReconciliationDrivesTaskStop covers the operation-claim stop

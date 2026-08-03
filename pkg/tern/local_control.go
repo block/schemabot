@@ -783,7 +783,14 @@ func (c *LocalClient) settleCancelForTasklessApply(ctx context.Context, targetAp
 	apply.UpdatedAt = now
 	c.logger.Info("cancel settled task-less apply as cancelled",
 		append(apply.LogAttrs(), "previous_state", previousState, "requested_by", caller)...)
-	c.settleOperationRowsForTasklessApply(ctx, apply, state.ApplyOperation.Cancelled)
+	// The cancel is committed and authoritative, so it is still reported as
+	// accepted. A row left behind belongs to a resolved apply, which no claim arm
+	// reaches: it stays pending until an operator settles it, and nothing else
+	// will.
+	if err := c.settleOperationRowsForTasklessApply(ctx, apply, state.ApplyOperation.Cancelled); err != nil {
+		c.logger.Error("cancel settled the apply but left operation rows unsettled; they stay pending under a cancelled apply until an operator settles them",
+			append(apply.LogAttrs(), "target_operation_state", state.ApplyOperation.Cancelled, "error", err)...)
+	}
 	c.notifyTerminalObserver(apply, nil)
 	return &ternv1.CancelResponse{Accepted: true}, nil
 }
@@ -792,17 +799,19 @@ func (c *LocalClient) settleCancelForTasklessApply(ctx context.Context, targetAp
 // apply_operations rows to the apply's settled state so the operation rows
 // agree with the apply row the task-less settle just wrote. The settle runs
 // inside a claimed drive, so the lease in ctx guards each write and a lost
-// claim fails closed in storage. A load or write failure is logged, never
-// returned: the apply-level settle is the authoritative outcome, and the next
-// operation claim's terminal-parent reconciliation settles any row this pass
-// could not move.
-func (c *LocalClient) settleOperationRowsForTasklessApply(ctx context.Context, apply *storage.Apply, operationState string) {
+// claim fails closed in storage.
+//
+// Every row is attempted before returning, so one failing write does not strand
+// the rest, and the failures are returned joined. The caller decides what an
+// unsettled row means: the apply-level settle already committed and is
+// authoritative, but what happens to the row afterwards depends on which state
+// the apply settled to, so the caller — not this function — owns that story.
+func (c *LocalClient) settleOperationRowsForTasklessApply(ctx context.Context, apply *storage.Apply, operationState string) error {
 	ops, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
-		c.logger.Error("task-less settle could not load operation rows; the apply is settled and the next operation claim will reconcile them",
-			append(apply.LogAttrs(), "target_operation_state", operationState, "error", err)...)
-		return
+		return fmt.Errorf("load operation rows for task-less settle of apply %s to %s: %w", apply.ApplyIdentifier, operationState, err)
 	}
+	var settleErrs []error
 	for _, op := range ops {
 		if !operationRowSettlesWithTasklessApply(op.State, operationState) {
 			c.logger.Info("task-less settle leaving terminal operation row unchanged",
@@ -822,13 +831,8 @@ func (c *LocalClient) settleOperationRowsForTasklessApply(ctx context.Context, a
 			writeErr = c.storage.ApplyOperations().MarkTerminal(ctx, op.ID, operationState)
 		}
 		if writeErr != nil {
-			c.logger.Error("task-less settle could not move operation row to the apply's settled state; the next operation claim will reconcile it",
-				append(apply.LogAttrs(),
-					"apply_operation_id", op.ID,
-					"operation_deployment", op.Deployment,
-					"operation_state", op.State,
-					"target_operation_state", operationState,
-					"error", writeErr)...)
+			settleErrs = append(settleErrs, fmt.Errorf("move apply_operation %d (%s) from %s to %s: %w",
+				op.ID, op.Deployment, op.State, operationState, writeErr))
 			continue
 		}
 		c.logger.Info("task-less settle moved operation row to the apply's settled state",
@@ -838,6 +842,7 @@ func (c *LocalClient) settleOperationRowsForTasklessApply(ctx context.Context, a
 				"previous_operation_state", op.State,
 				"operation_state", operationState)...)
 	}
+	return errors.Join(settleErrs...)
 }
 
 // operationRowSettlesWithTasklessApply reports whether a task-less settle may
@@ -894,7 +899,14 @@ func (c *LocalClient) settleStopForTasklessApply(ctx context.Context, targetAppl
 	apply.UpdatedAt = time.Now()
 	c.logger.Info("stop settled task-less apply as stopped",
 		append(apply.LogAttrs(), "previous_state", previousState, "requested_by", caller)...)
-	c.settleOperationRowsForTasklessApply(ctx, apply, state.ApplyOperation.Stopped)
+	// The stop is committed and authoritative, so it is still reported as
+	// accepted. A row left behind still resolves on its own: a stopped apply is
+	// resumable, so its pending rows stay claimable and the next claim mirrors
+	// the parent's stopped state onto them.
+	if err := c.settleOperationRowsForTasklessApply(ctx, apply, state.ApplyOperation.Stopped); err != nil {
+		c.logger.Error("stop settled the apply but left operation rows unsettled; the next operation claim mirrors the stopped parent onto them",
+			append(apply.LogAttrs(), "target_operation_state", state.ApplyOperation.Stopped, "error", err)...)
+	}
 	c.notifyTerminalObserver(apply, nil)
 	return &ternv1.StopResponse{Accepted: true}, nil
 }
