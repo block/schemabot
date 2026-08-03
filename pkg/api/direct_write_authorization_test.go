@@ -122,6 +122,22 @@ func TestServerConfig_ValidateOperatorScoping(t *testing.T) {
 	})
 }
 
+// Metric attributes that can arrive from request bodies are bounded to
+// configured names so the authorization counter stays low-cardinality no
+// matter what callers send.
+func TestServerConfig_MetricAttributeBounding(t *testing.T) {
+	cfg := scopedWriteConfig()
+
+	assert.Equal(t, "payments", cfg.metricDatabaseAttribute("payments"))
+	assert.Equal(t, "unconfigured", cfg.metricDatabaseAttribute("ghost"))
+	assert.Equal(t, "", cfg.metricDatabaseAttribute(""))
+
+	assert.Equal(t, "staging", cfg.metricEnvironmentAttribute("staging"))
+	assert.Equal(t, "production", cfg.metricEnvironmentAttribute("production"))
+	assert.Equal(t, "unconfigured", cfg.metricEnvironmentAttribute("mars"))
+	assert.Equal(t, "", cfg.metricEnvironmentAttribute(""))
+}
+
 func TestServerConfig_OperatorGroupUnion(t *testing.T) {
 	cfg := scopedWriteConfig()
 	orders := cfg.Databases["orders"]
@@ -284,6 +300,17 @@ func TestHandlersEnforceScopedWriteDenials(t *testing.T) {
 
 		assert.Equal(t, http.StatusForbidden, rec.Code)
 		assert.Contains(t, rec.Body.String(), "payments", "the denial names the database resolved from the plan")
+	})
+
+	t.Run("apply rejects a plan that does not exist at decision time", func(t *testing.T) {
+		st := &mockStorageWithPlanLookup{plans: &mockPlanLookupStore{}}
+		svc := New(st, scopedWriteConfig(), nil, logger)
+		rec := scopedDenialRequest(t, svc.handleApply, operator, http.MethodPost, "/api/apply",
+			`{"plan_id":"plan-missing","environment":"staging"}`)
+
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
+		assert.Contains(t, rec.Body.String(), "plan not found: plan-missing",
+			"the authorization decision is bound to a plan that exists when it is made")
 	})
 
 	t.Run("control operation resolves the database from the stored apply", func(t *testing.T) {

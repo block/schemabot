@@ -532,7 +532,10 @@ var knownDirectWriteAuthReasons = map[string]bool{
 // A spike in denied decisions means scoped operators are attempting operations
 // outside their grant — check the reason attribute to see whether the target
 // database, the environment, or the group membership is what mismatched.
-// Operation, status, and reason are allowlisted to keep cardinality bounded.
+// Operation, status, and reason are allowlisted here; database and
+// environment can arrive from request bodies, so callers bound them to
+// configured names before recording. Every attribute stays low-cardinality
+// even when a request names a database or environment that does not exist.
 func RecordDirectWriteAuthorization(ctx context.Context, operation, database, environment, status, reason string) {
 	if !knownDirectWriteAuthOperations[operation] {
 		operation = "unknown"

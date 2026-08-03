@@ -216,6 +216,35 @@ func (c *ServerConfig) OperatorGroupUnion() []string {
 	return union
 }
 
+// metricDatabaseAttribute bounds the database metric attribute to configured
+// database names. The value can arrive straight from a request body (plan,
+// locks), so an unrecognized name is collapsed to a sentinel — the counter
+// stays low-cardinality no matter what callers send, and the sentinel itself
+// is the signal (requests naming unconfigured databases). The real name is in
+// the denial log.
+func (c *ServerConfig) metricDatabaseAttribute(database string) string {
+	if database == "" {
+		return ""
+	}
+	if _, ok := c.Databases[database]; ok {
+		return database
+	}
+	return "unconfigured"
+}
+
+// metricEnvironmentAttribute bounds the environment metric attribute to
+// environments configured on at least one database, for the same reason as
+// metricDatabaseAttribute.
+func (c *ServerConfig) metricEnvironmentAttribute(environment string) string {
+	if environment == "" {
+		return ""
+	}
+	if c.environmentConfiguredOnAnyDatabase(environment) {
+		return environment
+	}
+	return "unconfigured"
+}
+
 // trimmedNonEmpty returns the values with surrounding whitespace removed and
 // empty entries dropped.
 func trimmedNonEmpty(values []string) []string {
@@ -240,14 +269,16 @@ func (s *Service) authorizeDirectWrite(w http.ResponseWriter, r *http.Request, o
 
 // authorizeDirectWriteForStoredPlan resolves the target database from the
 // stored plan — the source of truth for what an apply will mutate — and then
-// enforces the per-database half of the direct-write decision. A nil plan
-// passes through: nothing can be mutated without a stored plan, and the
-// handler's normal path reports the missing plan with its canonical error. A
-// storage failure denies (fail closed) — an unreadable plan means an
-// unresolvable target.
+// enforces the per-database half of the direct-write decision. The plan must
+// exist and resolve at decision time: a missing plan rejects the request with
+// the same error the apply path reports for it, and a storage failure denies
+// — an unresolvable target must never authorize. Failing closed here (rather
+// than deferring the missing plan to the handler's own plan load) keeps the
+// authorization bound to a plan that existed when the decision was made.
 func (s *Service) authorizeDirectWriteForStoredPlan(w http.ResponseWriter, r *http.Request, operation, planID, environment string) bool {
 	if !s.config.scopedWriteEnabled() {
-		metrics.RecordDirectWriteAuthorization(r.Context(), operation, "", environment, "skipped", DirectWriteReasonScopedLaneDisabled)
+		metrics.RecordDirectWriteAuthorization(r.Context(), operation, "",
+			s.config.metricEnvironmentAttribute(environment), "skipped", DirectWriteReasonScopedLaneDisabled)
 		return true
 	}
 	plan, err := s.storage.Plans().Get(r.Context(), planID)
@@ -258,7 +289,10 @@ func (s *Service) authorizeDirectWriteForStoredPlan(w http.ResponseWriter, r *ht
 		return false
 	}
 	if plan == nil {
-		return true
+		s.logger.Warn("rejecting direct write because the stored plan does not exist",
+			"operation", operation, "plan_id", planID, "environment", environment)
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("%s failed: plan not found: %s", operation, planID))
+		return false
 	}
 	return s.authorizeDirectWrite(w, r, operation, plan.Database, environment)
 }
@@ -278,7 +312,9 @@ func (s *Service) authorizeDirectAdminWrite(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Service) finishDirectWriteDecision(w http.ResponseWriter, r *http.Request, operation, database, environment string, result DirectWriteAuthorizationResult) bool {
-	metrics.RecordDirectWriteAuthorization(r.Context(), operation, database, environment, directWriteMetricStatus(result), result.Reason)
+	metrics.RecordDirectWriteAuthorization(r.Context(), operation,
+		s.config.metricDatabaseAttribute(database), s.config.metricEnvironmentAttribute(environment),
+		directWriteMetricStatus(result), result.Reason)
 	if result.Allowed {
 		return true
 	}
