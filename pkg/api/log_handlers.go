@@ -110,7 +110,7 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 		Limit:   limit,
 	})
 	if err != nil {
-		s.logger.Error("failed to get logs", "apply_id", apply.ID, "error", err)
+		s.logger.Error("failed to get logs", append(apply.LogAttrs(), "error", err)...)
 		s.writeError(w, http.StatusInternalServerError, "failed to get logs")
 		return
 	}
@@ -153,7 +153,9 @@ type deploymentLogFetch struct {
 func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, apply *storage.Apply, deployment string, limit int) {
 	ops, err := s.storage.ApplyOperations().ListByApply(r.Context(), apply.ID)
 	if err != nil {
-		s.logger.Error("failed to list apply operations for data-plane logs", append(apply.LogAttrs(), "operation", "read_deployment_logs", "operation_deployment", deployment, "error", err)...)
+		s.logger.Error("failed to list apply operations for data-plane logs",
+			append(apply.LogAttrs(),
+				"operation", "read_deployment_logs", "operation_deployment", deployment, "error", err)...)
 		s.writeError(w, http.StatusInternalServerError, "failed to list apply operations")
 		return
 	}
@@ -171,7 +173,9 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 		if externalID == "" {
 			// An operation without a remote apply id ran on the control plane;
 			// its logs live in control-plane storage, not behind this fan-out.
-			s.logger.Debug("skipping operation without a remote apply id for data-plane logs", append(apply.LogAttrs(), "operation", "read_deployment_logs", "operation_deployment", deployment, "operation_key", op.OperationKey, "target", op.Target)...)
+			s.logger.Debug("skipping operation without a remote apply id for data-plane logs",
+				append(apply.LogAttrs(),
+					"operation", "read_deployment_logs", "operation_deployment", deployment, "operation_key", op.OperationKey, "target", op.Target)...)
 			continue
 		}
 		key := op.Target + "\x00" + externalID
@@ -192,7 +196,9 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 	}
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
-		s.logger.Error("failed to resolve deployment for data-plane logs", append(apply.LogAttrs(), "operation", "read_deployment_logs", "operation_deployment", deployment, "error", err)...)
+		s.logger.Error("failed to resolve deployment for data-plane logs",
+			append(apply.LogAttrs(),
+				"operation", "read_deployment_logs", "operation_deployment", deployment, "error", err)...)
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("cannot resolve deployment %q; check server logs", deployment))
 		return
 	}
