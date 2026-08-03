@@ -203,6 +203,61 @@ func TestResumeClaimedApply_DriveLogsCarryApplyIdentity(t *testing.T) {
 		"mutable state must not be frozen into the bound drive logger")
 }
 
+// expiringApplyStore returns a fixed set of retryable-apply expirations so the
+// expiry maintenance pass can be exercised without a database.
+type expiringApplyStore struct {
+	storage.ApplyStore
+	expirations []*storage.RetryableApplyExpiration
+}
+
+func (s *expiringApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {
+	return s.expirations, nil
+}
+
+// A retryable-apply expiry is a control-plane lifecycle transition an operator
+// triages from logs alone, so the expiry line must carry the apply's full
+// triage attributes — including external_id, the join key to the data plane's
+// logs — plus the expiry-specific attempt and reason.
+func TestExpireRetryableApplies_LogsCarryFullApplyAttrs(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "appdb",
+		DatabaseType:    "mysql",
+		Deployment:      "east",
+		Environment:     "staging",
+		Repository:      "org/repo",
+		PullRequest:     123,
+		State:           state.Apply.Failed,
+		Attempt:         3,
+		ExternalID:      "remote-apply-7",
+	}
+	svc := New(&mockStorageWithApplyStores{
+		applies: &expiringApplyStore{expirations: []*storage.RetryableApplyExpiration{
+			{Apply: apply, Reason: storage.RetryableExpirationAttemptBudget},
+		}},
+	}, testServerConfig(), nil, logger)
+
+	svc.expireRetryableApplies(t.Context(), 1)
+
+	lines := decodeLogLines(t, logBuf.Bytes())
+	line := requireLogLine(t, lines, "operator: retryable apply expired")
+	assert.Equal(t, "apply-42", line["apply_id"])
+	assert.Equal(t, "appdb", line["database"])
+	assert.Equal(t, "mysql", line["database_type"])
+	assert.Equal(t, "staging", line["environment"])
+	assert.Equal(t, "org/repo", line["repo"])
+	assert.Equal(t, float64(123), line["pr"])
+	assert.Equal(t, "east", line["deployment"])
+	assert.Equal(t, state.Apply.Failed, line["state"])
+	assert.Equal(t, "remote-apply-7", line["external_id"])
+	assert.Equal(t, float64(3), line["attempt"])
+	assert.Equal(t, string(storage.RetryableExpirationAttemptBudget), line["reason"])
+	assert.Equal(t, float64(1), line["driver"])
+}
+
 // decodeLogLines parses newline-delimited slog JSON output into one map per line.
 func decodeLogLines(t *testing.T, output []byte) []map[string]any {
 	t.Helper()
