@@ -420,8 +420,9 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 		//     FindNextApplyOperation, so leaving it non-terminal would re-claim
 		//     it forever. Reconcile it to the parent's terminal state now.
 		//   - transiently unclaimable (a peer holds a fresh lease, or the row is
-		//     locked): fail closed and let a later poll retry once it goes stale.
-		s.reconcileUnclaimableParent(ctx, driverID, op)
+		//     locked): release the operation lease so the next poll retries,
+		//     instead of squatting on it until it goes stale.
+		s.reconcileUnclaimableParent(ctx, driverID, op, opLease)
 		return
 	}
 
@@ -1014,11 +1015,13 @@ func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, dr
 // (the write is unguarded — the operation holds no apply lease — but a terminal
 // apply has no competing driver, so the mirror is safe and idempotent). If the
 // parent is non-terminal (a peer holds a fresh lease, or the row was locked),
-// the operation is left claimable and retried once the parent lease goes stale.
-func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, op *storage.ApplyOperation) {
+// the just-acquired operation lease is released so the next poll retries the
+// operation immediately — retaining it would stall the operation for the full
+// lease staleness window over a refusal that typically clears in milliseconds.
+func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease) {
 	parent, err := s.storage.Applies().Get(ctx, op.ApplyID)
 	if err != nil {
-		s.logger.Error("operator: failed to load unclaimable parent apply; operation will be retried",
+		s.logger.Error("operator: failed to load unclaimable parent apply; operation will be retried once its lease goes stale",
 			append(op.LogAttrs(),
 				"driver", driverID,
 				"error", err)...)
@@ -1026,7 +1029,7 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, 
 		return
 	}
 	if parent == nil {
-		s.logger.Error("operator: parent apply not found for claimed operation; operation will be retried",
+		s.logger.Error("operator: parent apply not found for claimed operation; operation will be retried once its lease goes stale",
 			append(op.LogAttrs(),
 				"driver", driverID)...)
 		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
@@ -1036,12 +1039,31 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, 
 		s.reconcileClaimedOperationFromTerminalParent(ctx, driverID, op, parent)
 		return
 	}
-	s.logger.Warn("operator: parent apply not claimable for operation; operation will be retried",
+	metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
+	released, err := s.storage.ApplyOperations().ReleaseClaim(ctx, opLease)
+	if err != nil {
+		s.logger.Error("operator: parent apply not claimable and operation lease release failed; operation will be retried once its lease goes stale",
+			append(parent.LogAttrs(),
+				"driver", driverID,
+				"apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment,
+				"error", err)...)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_lease_release_error")
+		return
+	}
+	if !released {
+		s.logger.Warn("operator: parent apply not claimable and operation lease already rotated; the new lease owner drives the operation",
+			append(parent.LogAttrs(),
+				"driver", driverID,
+				"apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment)...)
+		return
+	}
+	s.logger.Warn("operator: parent apply not claimable for operation; operation lease released for retry on the next poll",
 		append(parent.LogAttrs(),
 			"driver", driverID,
 			"apply_operation_id", op.ID,
 			"operation_deployment", op.Deployment)...)
-	metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
 }
 
 func (s *Service) reconcileClaimedOperationFromTerminalParent(ctx context.Context, driverID int, op *storage.ApplyOperation, parent *storage.Apply) {
