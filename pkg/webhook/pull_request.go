@@ -683,7 +683,7 @@ func (h *Handler) inFlightAppliesForClosedPR(ctx context.Context, repo string, p
 			"repo", repo, "pr", pr,
 			"database", a.Database, "database_type", a.DatabaseType,
 			"environment", a.Environment,
-			"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier, "apply_state", a.State)
+			"apply_id", a.ApplyIdentifier, "apply_state", a.State)
 	}
 	return inFlight
 }

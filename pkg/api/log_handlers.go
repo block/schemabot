@@ -110,7 +110,7 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 		Limit:   limit,
 	})
 	if err != nil {
-		s.logger.Error("failed to get logs", "apply_id", apply.ID, "error", err)
+		s.logger.Error("failed to get logs", append(apply.LogAttrs(), "error", err)...)
 		s.writeError(w, http.StatusInternalServerError, "failed to get logs")
 		return
 	}
