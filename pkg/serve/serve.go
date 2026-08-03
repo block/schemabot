@@ -305,10 +305,17 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		}
 	}()
 
-	// Proactively discard idle connections before MySQL's wait_timeout (default 28800s)
-	// to avoid "invalid connection" errors when the pool hands out stale connections.
-	db.SetConnMaxLifetime(5 * time.Minute)
-	db.SetConnMaxIdleTime(3 * time.Minute)
+	// Apply the storage connection-pool settings. Each knob is configurable via
+	// storage.pool; the *OrDefault helpers supply the defaults (and their
+	// rationale) from the api package. MaxOpenConns is left unset when zero so
+	// the pool stays unbounded, matching database/sql's default.
+	pool := cfg.Storage.Pool
+	db.SetConnMaxLifetime(pool.ConnMaxLifetimeOrDefault())
+	db.SetConnMaxIdleTime(pool.ConnMaxIdleTimeOrDefault())
+	db.SetMaxIdleConns(pool.MaxIdleConnsOrDefault())
+	if pool.MaxOpenConns > 0 {
+		db.SetMaxOpenConns(pool.MaxOpenConns)
+	}
 
 	// Log config summary for debugging
 	logger.Info("config loaded",
@@ -454,7 +461,8 @@ func connectStorage(ctx context.Context, cfg *api.ServerConfig, logger *slog.Log
 	if err := api.EnsureSchema(dsn, logger, api.WithAllowDestructiveSchemaChanges(cfg.Storage.AllowDestructiveSchemaChanges)); err != nil {
 		return nil, fmt.Errorf("ensure storage schema: %w", err)
 	}
-	db, err := mysqlconn.OpenReloadable(dsn, cfg.StorageDSN)
+	db, err := mysqlconn.OpenReloadable(dsn, cfg.StorageDSN,
+		mysqlconn.WithConnectTimeout(cfg.Storage.Pool.ConnectTimeoutOrZero()))
 	if err != nil {
 		return nil, fmt.Errorf("open storage database: %w", err)
 	}
@@ -543,6 +551,7 @@ func (s *Server) Start(ctx context.Context) {
 	s.svc.StartOperator(ctx)
 	s.svc.StartRemoteDeploymentHealthMonitor(ctx)
 	s.svc.StartWebhookInboxMonitor(ctx)
+	s.svc.StartOperatorStuckPendingMonitor(ctx)
 	s.svc.StartPendingDropsCleaner(ctx)
 }
 
@@ -652,14 +661,20 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysq
 
 	dbName := matches[0]
 	dbConfig := config.Databases[dbName]
-	targetDSN, err := dbConfig.Environments[env].ResolveDSN()
+	envConfig := dbConfig.Environments[env]
+	targetDSN, err := envConfig.ResolveDSN()
 	if err != nil {
 		return nil, fmt.Errorf("resolve DSN for %s/%s: %w", dbName, env, err)
+	}
+	metadata, err := envConfig.DirectExecution.EngineMetadata()
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct_execution metadata for %s/%s: %w", dbName, env, err)
 	}
 	client, err := grpcLocalClientFactory(config, wake, engineFactories)(tern.LocalConfig{
 		Database:  dbName,
 		Type:      dbConfig.Type,
 		TargetDSN: targetDSN,
+		Metadata:  metadata,
 	}, st, logger)
 	if err != nil {
 		return nil, fmt.Errorf("create local client for %s: %w", dbName, err)
@@ -675,11 +690,24 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysq
 func grpcLocalClientFactory(config *api.ServerConfig, wakeOperator func(applyIdentifier, database, environment string), engineFactories map[string]tern.EngineFactory) tern.LocalClientFactory {
 	pendingDropsDisabled := !config.PendingDropsEnabled()
 	return func(cfg tern.LocalConfig, st storage.Storage, logger *slog.Logger) (tern.Client, error) {
-		if pendingDropsDisabled {
+		spiritMetadata, err := config.SpiritMetadata()
+		if err != nil {
+			return nil, fmt.Errorf("resolve spirit config for database %q: %w", cfg.Database, err)
+		}
+		if pendingDropsDisabled || len(spiritMetadata) > 0 {
 			if cfg.Metadata == nil {
 				cfg.Metadata = map[string]string{}
 			}
+		}
+		if pendingDropsDisabled {
 			cfg.Metadata["pending_drops"] = "false"
+		}
+		// Server-level spirit overrides are defaults; a database's own
+		// metadata entry for the same key wins.
+		for key, value := range spiritMetadata {
+			if _, ok := cfg.Metadata[key]; !ok {
+				cfg.Metadata[key] = value
+			}
 		}
 		if cfg.WakeOperator == nil {
 			cfg.WakeOperator = wakeOperator
@@ -891,15 +919,20 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups []stri
 			"trusted_proxy_cidrs", len(fa.TrustedProxyCIDRs),
 			"trusted_proxy_spiffe", len(fa.TrustedProxySPIFFE),
 			"read_groups", len(fa.ReadGroups),
-			"write_groups", len(fa.WriteGroups))
+			"write_groups", len(fa.WriteGroups),
+			"trusted_gateway_spiffe", len(fa.TrustedGatewaySPIFFE),
+			"read_service_spiffe", len(fa.ReadServiceSPIFFE))
 		authz, err := auth.NewForwardAuthAuthorizer(auth.ForwardAuthConfig{
-			UserHeader:         fa.UserHeader,
-			GroupsHeader:       fa.GroupsHeader,
-			GroupsDelimiter:    fa.GroupsDelimiter,
-			TrustedProxySPIFFE: fa.TrustedProxySPIFFE,
-			TrustedProxyCIDRs:  fa.TrustedProxyCIDRs,
-			ReadGroups:         fa.ReadGroups,
-			WriteGroups:        fa.WriteGroups,
+			UserHeader:           fa.UserHeader,
+			GroupsHeader:         fa.GroupsHeader,
+			GroupsDelimiter:      fa.GroupsDelimiter,
+			TrustedProxySPIFFE:   fa.TrustedProxySPIFFE,
+			TrustedProxyCIDRs:    fa.TrustedProxyCIDRs,
+			ReadGroups:           fa.ReadGroups,
+			WriteGroups:          fa.WriteGroups,
+			TrustedGatewaySPIFFE: fa.TrustedGatewaySPIFFE,
+			CallerSPIFFEHeader:   fa.CallerSPIFFEHeader,
+			ReadServiceSPIFFE:    fa.ReadServiceSPIFFE,
 		}, logger)
 		if err != nil {
 			return nil, err

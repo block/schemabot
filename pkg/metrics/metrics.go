@@ -488,8 +488,9 @@ func RecordPRCommandActorAuthorization(ctx context.Context, command, database, e
 }
 
 // RecordAuthDecision increments the counter for API auth decisions on the
-// direct (OIDC) request path. Labels are inherently low-cardinality: tier is
-// read/plan/write, decision is allow/deny, reason is a fixed set.
+// direct request path (the OIDC and forward-auth authorizers). Labels are
+// inherently low-cardinality: tier is read/write, decision is allow/deny,
+// reason is a fixed set.
 func RecordAuthDecision(ctx context.Context, tier, decision, reason string) {
 	addCounter(ctx, "schemabot.auth_decisions.total",
 		"Total API auth decisions on the OIDC request path", "{decision}",
@@ -608,8 +609,10 @@ func RecordLeaderParticipantGate(ctx context.Context, repository, environment, t
 // promotion order on a scoped SchemaBot instance. This fires only on operator
 // misconfiguration: the gate cannot identify the target's prior environments,
 // so it fails closed. A non-zero count means an operator must add the
-// environment to environment_order; the matching warn log carries the
-// promotion_order so they can see what is configured.
+// environment to the database's effective promotion order (its
+// environment_order override when set, otherwise the server-wide
+// environment_order); the matching warn log carries the promotion_order so
+// they can see what is configured.
 func RecordPromotionConfigErrorBlock(ctx context.Context, repository, database, environment string) {
 	addCounter(ctx, "schemabot.promotion.config_error_blocks_total",
 		"Total applies blocked because the target environment is absent from the configured promotion order", "{block}",
@@ -634,6 +637,7 @@ func AdjustActiveApplies(ctx context.Context, delta int64, database, deployment,
 var knownControlOperations = map[string]bool{
 	"cutover":       true,
 	"stop":          true,
+	"cancel":        true,
 	"start":         true,
 	"volume":        true,
 	"revert":        true,
@@ -655,6 +659,64 @@ func RecordControlOperation(ctx context.Context, operation, database, deployment
 		DeploymentAttribute(deployment),
 		EnvironmentAttribute(environment),
 		attribute.String("status", status),
+	)
+}
+
+// RecordRemoteControlRequestStale counts retransmissions of a durable
+// stop/cancel control request that the data plane accepted but has not
+// consumed within the stale threshold. A non-zero rate means an accepted
+// operator command is not taking effect on the remote apply — the data plane's
+// own driver is failing to consume it (its logs carry the failing consume
+// error) — and the apply will not converge until that is resolved.
+func RecordRemoteControlRequestStale(ctx context.Context, operation, database, deployment, environment string) {
+	if !knownControlOperations[operation] {
+		operation = "unknown"
+	}
+	addCounter(ctx, "schemabot.remote_control_requests.stale_resends_total",
+		"Total retransmissions of remote control requests still unconsumed by the data plane past the stale threshold", "{resend}",
+		attribute.String("operation", operation),
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+	)
+}
+
+// RecordEngineTerminalTruthReconcile counts drive claims that read the
+// engine's authoritative state before consuming a pending stop/cancel control
+// request. Outcomes:
+//   - "adopted_completed" / "adopted_failed" / "adopted_cancelled" /
+//     "adopted_reverted": the engine's change was already terminal, so the
+//     drive settled stored state to that outcome and mooted the pending
+//     command instead of running it. A sustained rate means operator commands
+//     are routinely losing the race with the engine — check why commands are
+//     queued so late (e.g. webhook delivery lag, slow claim turnaround).
+//   - "progress_error": the authoritative read failed and the drive fell back
+//     to consuming the pending command as before. A sustained rate means the
+//     drive cannot see the engine's backend — check engine API connectivity
+//     and the persisted engine resume state for the apply in the drive logs.
+func RecordEngineTerminalTruthReconcile(ctx context.Context, database, deployment, environment, outcome string) {
+	addCounter(ctx, "schemabot.operator.engine_terminal_truth_reconciles_total",
+		"Total drive claims that read the engine's authoritative state before consuming a pending stop/cancel command", "{reconcile}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
+// RecordPlanetScaleUnclassifiedCancelRejection counts PlanetScale cancel
+// rejections whose live deployment state has no explicit classification. Every
+// known deployment state is classified explicitly; a hit here means PlanetScale
+// introduced a new deployment state (or returned one SchemaBot has never
+// mapped), and the rejection fell back to a plain retryable error. Add an
+// explicit classification for the state — until then the durable stop/cancel
+// request may be retried against a rejection that can never succeed, and only
+// the drive's terminal-truth reconcile can converge it.
+func RecordPlanetScaleUnclassifiedCancelRejection(ctx context.Context, database, deploymentState string) {
+	addCounter(ctx, "schemabot.engine.planetscale.unclassified_cancel_rejections_total",
+		"Total PlanetScale cancel rejections observed in a deployment state with no explicit classification", "{rejection}",
+		attribute.String("database", database),
+		attribute.String("deployment_state", deploymentState),
 	)
 }
 
@@ -740,8 +802,36 @@ func RecordOperatorResumeFailure(ctx context.Context, database, deployment, envi
 	)
 }
 
+// RecordOperatorStrandedOperationReaped counts apply operations the reaper
+// settled from an already-settled parent apply — rows describing work that will
+// never run, left behind non-terminal.
+//
+// A one-time burst is the historical backlog draining and needs no action. A
+// rate that keeps climbing means something is actively stranding operations, so
+// the investigation belongs on the producer — a path that terminalizes a parent
+// apply without settling its children — not on the reaper.
+//
+// deployment is the reaped operation's own deployment, the routing key that says
+// which target the settled row belonged to; stranded rows arise in exactly the
+// multi-deployment applies where it differs from the parent's.
+//
+// This counter is emitted under the operator name only. The deprecated
+// schemabot.scheduler.* alias exists to carry pre-existing series through one
+// release, and a metric introduced after that rename has no legacy series to
+// migrate.
+func RecordOperatorStrandedOperationReaped(ctx context.Context, database, deployment, environment, parentState string) {
+	addCounter(ctx, "schemabot.operator.stranded_operations_reaped_total",
+		"Total number of stranded apply operations the reaper settled from their parent apply's outcome", "{operation}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("parent_state", parentState),
+	)
+}
+
 var knownOperatorClaimFailureReasons = map[string]bool{
 	"expire_retryable_error":                  true,
+	"stranded_reaper_error":                   true,
 	"missing_lease_token":                     true,
 	"storage_error":                           true,
 	"operation_storage_error":                 true,
@@ -766,6 +856,33 @@ func RecordOperatorClaimFailure(ctx context.Context, reason string) {
 		"Total number of operator claim attempts that failed", "{attempt}",
 		EnvironmentAttribute(""),
 		attribute.String("reason", reason),
+	)
+}
+
+// RecordOperatorStuckPendingApplies records how many pending applies are older
+// than the stuck threshold while still carrying the child rows that make them
+// claimable — work a driver should already have picked up. Apply creation
+// rejects a concurrent apply for the same target rather than queuing it, so a
+// nonzero value is not normal backpressure: it means the operator driver pool is
+// not claiming (all drivers saturated on long-running applies, an
+// operator-less/crash-looping deployment, or a wedged claim path). The expected
+// operator action is to check driver liveness and claim-failure metrics/logs.
+func RecordOperatorStuckPendingApplies(ctx context.Context, count int64) {
+	recordGauge(ctx, "schemabot.operator.stuck_pending_applies", count,
+		"Number of pending applies past the stuck threshold that a driver should have claimed", "{apply}",
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordOperatorStuckPendingScanFailure counts failed stuck-pending scans. The
+// stuck-pending gauge is a last-value instrument, so a failed scan leaves it
+// frozen at its last-good value — indistinguishable from a healthy operator.
+// This counter is the liveness signal for the gauge: a nonzero rate means the
+// stuck-pending value is stale and must not be trusted.
+func RecordOperatorStuckPendingScanFailure(ctx context.Context) {
+	addCounter(ctx, "schemabot.operator.stuck_pending_scan_failures",
+		"Total number of failed operator stuck-pending apply scans", "{failure}",
+		EnvironmentAttribute(""),
 	)
 }
 
@@ -1192,7 +1309,7 @@ func logUnknownWebhookMetricLabel(label, value, appName, repo, status string) {
 		"value", value,
 		"app_name", appName,
 		"repo", repo,
-		"status", status)
+		"event_status", status)
 }
 
 // RecordUnregisteredRepositoryWebhook increments the counter for webhook events
@@ -1355,6 +1472,7 @@ var knownStatusCheckStatuses = map[string]bool{
 	"blocked":   true,
 	"scheduled": true,
 	"exhausted": true,
+	"recreated": true,
 }
 
 // StatusCheckOperation describes one status-check storage or GitHub operation.
@@ -1401,6 +1519,39 @@ func RecordPendingDropMoved(ctx context.Context, database string) {
 	addCounter(ctx, "schemabot.pending_drops.tables_moved_total",
 		"Total number of dropped tables quarantined into the pending drops database", "{table}",
 		attribute.String("database", database),
+		EnvironmentAttribute(""),
+	)
+}
+
+// knownDirectExecutionOutcomes limits metric cardinality to the outcomes the
+// direct execution path can produce. Executed statements terminate as
+// completed, failed, or stopped; refused statements the policy does not route
+// directly are blocked with the reason encoded in the outcome.
+var knownDirectExecutionOutcomes = map[string]bool{
+	"completed":               true,
+	"failed":                  true,
+	"stopped":                 true,
+	"blocked_policy_disabled": true,
+	"blocked_size_limit":      true,
+	"blocked_size_unknown":    true,
+}
+
+// RecordDirectExecution increments the counter for a statement the
+// schema-change engine refused and the direct execution policy resolved — to a
+// native MySQL DDL execution (completed/failed/stopped) or to a block
+// (blocked_*). Direct executions are rare, operator-consented events: a spike
+// in failed means native DDL is erroring on the target (check the apply logs
+// for the statement and MySQL error), and a spike in blocked_size_unknown
+// means row estimates are unavailable (check target connectivity and
+// information_schema access).
+func RecordDirectExecution(ctx context.Context, database, outcome string) {
+	if !knownDirectExecutionOutcomes[outcome] {
+		outcome = "unknown"
+	}
+	addCounter(ctx, "schemabot.direct_execution.statements_total",
+		"Total number of engine-refused statements resolved by the direct execution policy", "{statement}",
+		attribute.String("database", database),
+		attribute.String("outcome", outcome),
 		EnvironmentAttribute(""),
 	)
 }

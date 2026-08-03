@@ -348,27 +348,27 @@ func TestTenantScopedWorkCommandRouting(t *testing.T) {
 		assert.Contains(t, rr.Body.String(), "help posted")
 	})
 
-	// A participant fans out unscoped apply/plan, but commands that target a
-	// single apply owned by one tenant must not: an unscoped rollback or control
-	// op requires an explicit -t so only the owning tenant acts. Critically, a
-	// participant that does not own the targeted apply stays silent — it must not
-	// post "apply not found" for a database owned by another tenant.
-	t.Run("participant requires -t for rollback and control ops without erroring", func(t *testing.T) {
-		for _, comment := range []string{
-			"schemabot rollback apply_a1b2c3 -e staging",
-			"schemabot stop apply_a1b2c3 -e staging",
-			"schemabot cancel apply_a1b2c3 -e staging",
+	// A participant fans out unscoped rollback and control ops like any other
+	// work command: every deployment checks its own storage for the target
+	// apply and only the owner acts. A participant whose storage does not hold
+	// the apply dispatches the command and then stays silent — it must not post
+	// "apply not found" for an apply stored on another tenant's deployment.
+	t.Run("participant fans out rollback and control ops and stays silent as a non-owner", func(t *testing.T) {
+		for _, tc := range []struct{ comment, dispatched string }{
+			{"schemabot rollback apply_a1b2c3 -e staging", "rollback started"},
+			{"schemabot stop apply_a1b2c3 -e staging", "stop started"},
+			{"schemabot cancel apply_a1b2c3 -e staging", "cancel started"},
 		} {
 			client, mux := setupGitHubServer(t)
 			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(http.ResponseWriter, *http.Request) {
-				t.Errorf("participant must not post a comment for unscoped %q on an unowned apply", comment)
+				t.Errorf("participant must not post a comment for unscoped %q on an unowned apply", tc.comment)
 			})
 			mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(http.ResponseWriter, *http.Request) {
-				t.Errorf("participant must not react to unscoped %q on an unowned apply", comment)
+				t.Errorf("participant must not react to unscoped %q on an unowned apply", tc.comment)
 			})
 			factory := &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}
 
-			service := api.New(nil, &api.ServerConfig{
+			service := api.New(&emptyStorage{}, &api.ServerConfig{
 				Tenant: "alpha",
 				Repos: map[string]api.RepoConfig{
 					"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}},
@@ -381,14 +381,39 @@ func TestTenantScopedWorkCommandRouting(t *testing.T) {
 				logger:    testLogger(),
 			}
 
-			req := buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil)
+			req := buildWebhookRequest(t, webhookPayloadOpts{comment: tc.comment, isPR: true}, nil)
 			rr := httpResponseRecorder()
 			h.ServeHTTP(rr, req)
 
 			require.Equal(t, http.StatusOK, rr.Code)
-			assert.Contains(t, rr.Body.String(), "tenant target required",
-				"unscoped %q must require -t on a participant", comment)
+			assert.Contains(t, rr.Body.String(), tc.dispatched,
+				"unscoped %q must dispatch on a participant", tc.comment)
+			assert.NotContains(t, rr.Body.String(), "tenant target required")
 		}
+	})
+
+	// A rollback without an apply ID is a usage error every deployment can
+	// detect from the comment text alone; an unscoped fan-out participant
+	// defers the reply so the leader posts it exactly once.
+	t.Run("participant defers rollback missing-apply-id usage error to the leader", func(t *testing.T) {
+		service := api.New(nil, &api.ServerConfig{
+			Tenant: "alpha",
+			Repos: map[string]api.RepoConfig{
+				"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}},
+			},
+		}, nil, testLogger())
+
+		h := &Handler{
+			service: service,
+			logger:  testLogger(),
+		}
+
+		req := buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot rollback -e staging", isPR: true}, nil)
+		rr := httpResponseRecorder()
+		h.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "usage error deferred to leader")
 	})
 }
 
@@ -455,6 +480,29 @@ func TestRespondToUnscoped(t *testing.T) {
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{
 			comment: "schemabot apply -e production--allow-unsafe",
+			isPR:    true,
+		}, nil)
+
+		rr := httpResponseRecorder()
+		h.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "unscoped command skipped")
+	})
+
+	t.Run("missing environment skipped when respond_to_unscoped is false", func(t *testing.T) {
+		service := api.New(nil, &api.ServerConfig{
+			RespondToUnscoped: &falseVal,
+			Repos:             map[string]api.RepoConfig{},
+		}, nil, testLogger())
+
+		h := &Handler{
+			service: service,
+			logger:  testLogger(),
+		}
+
+		req := buildWebhookRequest(t, webhookPayloadOpts{
+			comment: "schemabot apply",
 			isPR:    true,
 		}, nil)
 

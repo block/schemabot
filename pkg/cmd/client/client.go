@@ -55,15 +55,22 @@ func GetEnvironments(endpoint, database string) ([]string, error) {
 // ListDatabasesOptions controls database list request fields.
 type ListDatabasesOptions struct {
 	Type string
+	// Name keeps only databases whose name contains it, case-insensitively.
+	Name string
 }
 
 // ListDatabases fetches the configured databases known to the server.
 func ListDatabases(endpoint string, opts ListDatabasesOptions) (*apitypes.DatabaseListResponse, error) {
 	requestPath := "/api/databases"
+	values := url.Values{}
 	if opts.Type != "" {
-		values := url.Values{}
 		values.Set("type", opts.Type)
-		requestPath += "?" + values.Encode()
+	}
+	if opts.Name != "" {
+		values.Set("name", opts.Name)
+	}
+	if encoded := values.Encode(); encoded != "" {
+		requestPath += "?" + encoded
 	}
 	var result apitypes.DatabaseListResponse
 	if err := doGetInto(endpoint, requestPath, &result); err != nil {
@@ -565,7 +572,12 @@ type StatusOptions struct {
 	Limit       int
 	Environment string
 	Deployment  string
-	Failed      bool
+	// State restricts the list to one apply state; empty means all states.
+	State  string
+	Failed bool
+	// Last bounds the list to applies updated within this window; zero means
+	// unbounded.
+	Last time.Duration
 }
 
 // GetStatus fetches recent schema changes.
@@ -583,8 +595,14 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 		if opts[0].Deployment != "" {
 			values.Set("deployment", opts[0].Deployment)
 		}
+		if opts[0].State != "" {
+			values.Set("state", opts[0].State)
+		}
 		if opts[0].Failed {
 			values.Set("failed", "true")
+		}
+		if opts[0].Last > 0 {
+			values.Set("last", opts[0].Last.String())
 		}
 		if encoded := values.Encode(); encoded != "" {
 			requestPath += "?" + encoded

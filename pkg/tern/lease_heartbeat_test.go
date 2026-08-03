@@ -92,20 +92,20 @@ func TestDriveEndingHeartbeatFailure(t *testing.T) {
 
 	t.Run("lost lease ends the drive immediately", func(t *testing.T) {
 		hbErr := fmt.Errorf("heartbeat apply %d: %w", apply.ID, storage.ErrApplyLeaseLost)
-		stopErr := driveEndingHeartbeatFailure(apply, hbErr, time.Now())
+		stopErr := driveEndingHeartbeatFailure(slog.Default(), apply, hbErr, time.Now())
 		require.Error(t, stopErr)
 		assert.ErrorIs(t, stopErr, storage.ErrApplyLeaseLost)
 	})
 
 	t.Run("transient failure inside the window keeps driving", func(t *testing.T) {
 		hbErr := errors.New("connection refused")
-		assert.NoError(t, driveEndingHeartbeatFailure(apply, hbErr, time.Now()))
+		assert.NoError(t, driveEndingHeartbeatFailure(slog.Default(), apply, hbErr, time.Now()))
 	})
 
 	t.Run("failures spanning the staleness window end the drive", func(t *testing.T) {
 		hbErr := errors.New("connection refused")
 		lastSuccess := time.Now().Add(-storage.ApplyLeaseStaleAfter)
-		stopErr := driveEndingHeartbeatFailure(apply, hbErr, lastSuccess)
+		stopErr := driveEndingHeartbeatFailure(slog.Default(), apply, hbErr, lastSuccess)
 		require.Error(t, stopErr)
 		assert.ErrorIs(t, stopErr, hbErr)
 		assert.ErrorIs(t, stopErr, ErrApplyLeasePresumedLost,

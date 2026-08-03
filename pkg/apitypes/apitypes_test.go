@@ -195,3 +195,156 @@ func TestPlanResponse_HasChanges(t *testing.T) {
 		})
 	}
 }
+
+// A blocked verdict anywhere in the plan — namespace-level or per-shard —
+// marks the plan as containing blocked changes, so apply gates reject it
+// before the apply starts.
+func TestPlanResponse_HasBlockedChanges(t *testing.T) {
+	tests := []struct {
+		name string
+		resp *PlanResponse
+		want bool
+	}{
+		{
+			name: "namespace-level blocked change",
+			resp: &PlanResponse{
+				Changes: []*SchemaChangeResponse{{
+					Namespace: "testdb",
+					TableChanges: []*TableChangeResponse{
+						{TableName: "users", ExecutionMode: "blocked", ModeReason: "dropping primary key is not supported"},
+					},
+				}},
+			},
+			want: true,
+		},
+		{
+			name: "per-shard blocked change only",
+			resp: &PlanResponse{
+				Shards: []*ShardPlanResponse{{
+					Shard: "-40",
+					Changes: []*TableChangeResponse{
+						{TableName: "users", ExecutionMode: "blocked"},
+					},
+				}},
+			},
+			want: true,
+		},
+		{
+			name: "direct and default modes are not blocked",
+			resp: &PlanResponse{
+				Changes: []*SchemaChangeResponse{{
+					Namespace: "testdb",
+					TableChanges: []*TableChangeResponse{
+						{TableName: "users", ExecutionMode: "direct"},
+						{TableName: "orders"},
+					},
+				}},
+			},
+			want: false,
+		},
+		{
+			name: "nil plan",
+			resp: nil,
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.resp.HasBlockedChanges())
+		})
+	}
+}
+
+// DirectChanges collects direct-execution verdicts across namespace-level and
+// per-shard changes, and only those.
+func TestPlanResponse_DirectChanges(t *testing.T) {
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace: "testdb",
+			TableChanges: []*TableChangeResponse{
+				{TableName: "users", ExecutionMode: "direct", ModeReason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~40 rows"},
+				{TableName: "orders"},
+				{TableName: "items", ExecutionMode: "blocked"},
+			},
+		}},
+		Shards: []*ShardPlanResponse{{
+			Shard: "-40",
+			Changes: []*TableChangeResponse{
+				{TableName: "mutes", ExecutionMode: "direct"},
+			},
+		}},
+	}
+
+	direct := resp.DirectChanges()
+	require.Len(t, direct, 2)
+	assert.Equal(t, "users", direct[0].TableName)
+	assert.Equal(t, "mutes", direct[1].TableName)
+
+	assert.Empty(t, (&PlanResponse{}).DirectChanges())
+}
+
+// AllChangesDirect holds only when the plan has at least one table change and
+// every one carries the direct verdict — a mixed or empty plan still has
+// engine-driven work, and a VSchema change is never direct.
+func TestPlanResponse_AllChangesDirect(t *testing.T) {
+	direct := func(table string) *TableChangeResponse {
+		return &TableChangeResponse{TableName: table, ExecutionMode: "direct"}
+	}
+	tests := []struct {
+		name string
+		resp *PlanResponse
+		want bool
+	}{
+		{
+			name: "single direct change",
+			resp: &PlanResponse{
+				Changes: []*SchemaChangeResponse{{Namespace: "testdb", TableChanges: []*TableChangeResponse{direct("users")}}},
+			},
+			want: true,
+		},
+		{
+			name: "mixed direct and engine-driven",
+			resp: &PlanResponse{
+				Changes: []*SchemaChangeResponse{{
+					Namespace:    "testdb",
+					TableChanges: []*TableChangeResponse{direct("users"), {TableName: "orders"}},
+				}},
+			},
+			want: false,
+		},
+		{
+			name: "direct namespace change with engine-driven shard change",
+			resp: &PlanResponse{
+				Changes: []*SchemaChangeResponse{{Namespace: "testdb", TableChanges: []*TableChangeResponse{direct("users")}}},
+				Shards:  []*ShardPlanResponse{{Shard: "-40", Changes: []*TableChangeResponse{{TableName: "orders"}}}},
+			},
+			want: false,
+		},
+		{
+			name: "vschema change alongside a direct change",
+			resp: &PlanResponse{
+				Changes: []*SchemaChangeResponse{{
+					Namespace:    "testdb",
+					TableChanges: []*TableChangeResponse{direct("users")},
+					Metadata:     map[string]string{"vschema": "{}"},
+				}},
+			},
+			want: false,
+		},
+		{
+			name: "no changes",
+			resp: &PlanResponse{},
+			want: false,
+		},
+		{
+			name: "nil plan",
+			resp: nil,
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.resp.AllChangesDirect())
+		})
+	}
+}

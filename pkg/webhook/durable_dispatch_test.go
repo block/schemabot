@@ -299,7 +299,7 @@ func TestDurableWebhookDriverCompletesUnsupportedEvent(t *testing.T) {
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
 		Provider:   storage.WebhookProviderGitHub,
 		DeliveryID: "delivery-unsupported",
-		Event:      "push",
+		Event:      "issue_comment",
 		Payload:    []byte(`{}`),
 	})
 	h := newDurableDriverHandler(t, store, nil, nil)
@@ -333,6 +333,66 @@ func TestDurableWebhookDriverFailsMalformedPullRequestTerminally(t *testing.T) {
 		require.Contains(t, failure.errMsg, "decode durable pull_request delivery")
 	default:
 		t.Fatal("expected malformed event to be marked failed")
+	}
+	require.Empty(t, store.completed)
+}
+
+func TestDurableInstallationID(t *testing.T) {
+	tests := []struct {
+		name        string
+		event       string
+		pullRequest int
+		tenantID    string
+		wantID      int64
+		wantErr     string
+	}{
+		{name: "valid tenant", event: "pull_request", pullRequest: 7, tenantID: "12345", wantID: 12345},
+		{name: "unparseable tenant", event: "pull_request", pullRequest: 7, tenantID: "not-an-installation-id", wantErr: "unparseable tenant ID"},
+		{name: "empty tenant", event: "pull_request", pullRequest: 7, tenantID: "", wantErr: "unparseable tenant ID"},
+		{name: "zero tenant", event: "pull_request", pullRequest: 7, tenantID: "0", wantErr: "non-positive installation ID"},
+		{name: "negative tenant", event: "pull_request", pullRequest: 7, tenantID: "-42", wantErr: "non-positive installation ID"},
+		{name: "zero tenant on PR-less event", event: "push", tenantID: "0", wantErr: "non-positive installation ID"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := &storage.WebhookEvent{
+				DeliveryID:  "delivery-tenant",
+				Event:       tt.event,
+				Repository:  "octocat/hello-world",
+				PullRequest: tt.pullRequest,
+				TenantID:    tt.tenantID,
+			}
+			id, err := durableInstallationID(event)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				require.ErrorContains(t, err, "octocat/hello-world")
+				if tt.pullRequest > 0 {
+					require.ErrorContains(t, err, "octocat/hello-world#7")
+				} else {
+					require.NotContains(t, err.Error(), "#0", "PR-less deliveries must not render a fabricated #0 location")
+				}
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantID, id)
+		})
+	}
+}
+
+func TestDurableWebhookDriverFailsUnparseableTenantTerminally(t *testing.T) {
+	event := durablePullRequestEvent(t)
+	event.TenantID = "not-an-installation-id"
+	store := newScriptedWebhookEventStore(event)
+	h := newDurableDriverHandler(t, store, nil, nil)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case failure := <-store.failed:
+		require.Nil(t, failure.retryAfter, "a corrupted persisted tenant must not be retried")
+		require.Contains(t, failure.errMsg, "unparseable tenant ID")
+	default:
+		t.Fatal("expected unparseable tenant to be marked failed")
 	}
 	require.Empty(t, store.completed)
 }
@@ -440,9 +500,9 @@ func TestDurableWebhookDriverStopsRetryingAtAttemptCap(t *testing.T) {
 // a burst of queued deliveries is worked down without waiting for the next tick.
 func TestDurableWebhookDrainProcessesBacklogInOnePass(t *testing.T) {
 	store := newScriptedWebhookEventStore(
-		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d1", Event: "push", Payload: []byte(`{}`)},
-		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d2", Event: "push", Payload: []byte(`{}`)},
-		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d3", Event: "push", Payload: []byte(`{}`)},
+		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d1", Event: "issue_comment", Payload: []byte(`{}`)},
+		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d2", Event: "issue_comment", Payload: []byte(`{}`)},
+		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d3", Event: "issue_comment", Payload: []byte(`{}`)},
 	)
 	h := newDurableDriverHandler(t, store, nil, nil)
 
@@ -570,7 +630,7 @@ func TestDurableWebhookDispatchLifecycleDrainsQueuedEvent(t *testing.T) {
 		Provider:   storage.WebhookProviderGitHub,
 		DeliveryID: "delivery-lifecycle",
 		Event:      "push",
-		Payload:    []byte(`{}`),
+		Payload:    []byte(`{"ref": "refs/heads/feature", "after": "abc123def456", "repository": {"full_name": "octocat/hello-world", "default_branch": "main"}}`),
 	})
 	h := newDurableDriverHandler(t, store, nil, nil)
 	h.durableWebhookPollInterval = 10 * time.Millisecond

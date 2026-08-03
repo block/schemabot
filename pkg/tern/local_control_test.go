@@ -1022,3 +1022,48 @@ func TestSuppressParentApplyWrites(t *testing.T) {
 		assert.False(t, suppressParentApplyWrites(ctx))
 	})
 }
+
+// Consuming a pending stop control request binds the apply's identity to the
+// consumption logger, so the settle line carries apply_id, repo, and pr — the
+// attrs an operator filters on to correlate a stop with its PR — without the
+// call site hand-listing them.
+func TestProcessPendingStopControlRequest_LogsCarryApplyIdentity(t *testing.T) {
+	apply := &storage.Apply{
+		ID: 9, ApplyIdentifier: "apply-stop-identity",
+		Database: "cdb_resolute", DatabaseType: storage.DatabaseTypeStrata,
+		Environment: "staging", State: state.Apply.Completed,
+		Repository: "org/repo", PullRequest: 123,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID: apply.ID, Operation: storage.ControlOperationStop,
+		Status: storage.ControlRequestPending, RequestedBy: "operator",
+	}}}
+	var records []capturedLog
+	client := &LocalClient{
+		storage: &mockStorage{
+			applies:         &mockApplyStore{apply: apply},
+			controlRequests: controlRequests,
+		},
+		logger: slog.New(captureHandler{records: &records}),
+	}
+
+	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.True(t, handled)
+
+	line := requireCapturedLog(t, records, "completing pending stop request for resolved apply")
+	assert.Equal(t, "apply-stop-identity", line.attrs["apply_id"])
+	assert.Equal(t, "cdb_resolute", line.attrs["database"])
+	assert.Equal(t, storage.DatabaseTypeStrata, line.attrs["database_type"])
+	assert.Equal(t, "staging", line.attrs["environment"])
+	assert.Equal(t, "org/repo", line.attrs["repo"])
+	assert.Equal(t, int64(123), line.attrs["pr"])
+	assert.Equal(t, "operator", line.attrs["requested_by"])
+	assert.Equal(t, state.Apply.Completed, line.attrs["state"],
+		"the settle line must snapshot the state current at consumption time")
+
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestCompleted, settled.Status)
+}

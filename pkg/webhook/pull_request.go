@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -70,8 +71,40 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 	case isAutoPlannablePullRequestAction(payload.Action):
 		// proceed to auto-plan below
 	case payload.Action == "closed":
+		if h.durableWebhookDispatch {
+			// Enqueue and ACK fast; a leased driver runs cleanup with retries so
+			// a process restart mid-cleanup cannot drop the delivery and leave a
+			// lock held or stale check state behind.
+			inserted, err := h.enqueueDurablePullRequest(ctx, payload, body, deliveryID, installationID)
+			if err != nil {
+				h.logger.Error("failed to enqueue durable PR close cleanup",
+					"repo", payload.Repository.FullName, "pr", payload.PullRequest.Number,
+					"delivery_id", deliveryID, "error", err)
+				metrics.RecordWebhookEvent(ctx, metricApp, "pull_request", payload.Action, payload.Repository.FullName, "durable_enqueue_failed")
+				h.writeError(w, http.StatusInternalServerError, "failed to enqueue webhook delivery")
+				return
+			}
+			if !inserted {
+				h.logger.Info("durable PR close cleanup already queued",
+					"repo", payload.Repository.FullName, "pr", payload.PullRequest.Number, "delivery_id", deliveryID)
+				h.writeJSON(w, http.StatusOK, map[string]string{"message": "PR close cleanup already queued"})
+				return
+			}
+			h.logger.Info("durable PR close cleanup queued",
+				"repo", payload.Repository.FullName, "pr", payload.PullRequest.Number, "delivery_id", deliveryID)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "PR close cleanup queued"})
+			return
+		}
 		h.goSafe(payload.Repository.FullName, payload.PullRequest.Number, installationID, func() {
-			h.handlePRClosed(payload.Repository.FullName, payload.PullRequest.Number, installationID, payload.PullRequest.Merged)
+			// One-shot: a failure here (including a lock lookup/release error,
+			// which also skips the check-state delete) is logged and not
+			// retried. That direction is fail-closed — retained locks and
+			// check state block until an operator or a reopen reconciles;
+			// nothing is wrongly unblocked. The durable path retries instead.
+			if err := h.runPRCloseCleanup(context.Background(), payload.Repository.FullName, payload.PullRequest.Number, payload.PullRequest.Merged); err != nil {
+				h.logger.Error("PR close cleanup failed",
+					"repo", payload.Repository.FullName, "pr", payload.PullRequest.Number, "error", err)
+			}
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "PR close cleanup started"})
 		return
@@ -175,7 +208,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			"pr", pr,
 			"head_sha", headSHA,
 			"delivery_id", deliveryID,
-			"message", message,
+			"outcome", message,
 		)
 	})
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan started"})
@@ -198,7 +231,7 @@ func (h *Handler) autoPlanBootstrap(parent context.Context, repo string, install
 	return ctx, cancel, client, nil
 }
 
-func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclient.InstallationClient, action, repo string, pr int, beforeSHA, headSHA string) bool {
+func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclient.InstallationClient, action, repo string, pr int, beforeSHA, headSHA string, configs []ghclient.DiscoveredConfig) bool {
 	if action != "synchronize" {
 		return true
 	}
@@ -216,7 +249,64 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 	if ghclient.HasSchemaInputFiles(files) {
 		return true
 	}
-	h.logger.Info("auto-plan will refresh checks without posting a plan comment because synchronize changed no schema inputs",
+
+	// The synchronize range was just proven schema-neutral. Reuse that result
+	// when the visible plan was rendered at the immediately preceding head.
+	comparedHeads := map[string]bool{beforeSHA: true}
+	for _, cfg := range configs {
+		environments, err := h.allowedDatabaseEnvironments(cfg.Config.Database)
+		if err != nil {
+			h.logger.Warn("auto-plan will post plan comment because the expected environment scope could not be resolved",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "head_sha", headSHA, "error", err)
+			return true
+		}
+		expectedScope := (planCommentSlot{Environments: environments}).environmentScope()
+		comments, err := h.service.Storage().PlanComments().ListUnminimizedForSlot(ctx,
+			repo, pr, cfg.Config.Database, string(cfg.Config.GetType()))
+		if err != nil {
+			h.logger.Warn("auto-plan will post plan comment because prior plan comment state could not be read",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "head_sha", headSHA, "error", err)
+			return true
+		}
+		var prior *storage.PlanComment
+		for _, v := range slices.Backward(comments) {
+			if v.EnvironmentScope == expectedScope {
+				prior = v
+				break
+			}
+		}
+		if prior == nil {
+			h.logger.Info("auto-plan will post plan comment because no prior visible plan comment is tracked",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "environment_scope", expectedScope,
+				"head_sha", headSHA)
+			return true
+		}
+
+		planHeadSHA := prior.HeadSHA
+		if planHeadSHA == headSHA || comparedHeads[planHeadSHA] {
+			continue
+		}
+		filesSincePlan, err := client.FetchChangedFilesBetween(ctx, repo, planHeadSHA, headSHA)
+		if err != nil {
+			h.logger.Warn("auto-plan will post plan comment because plan freshness could not be compared",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "plan_head_sha", planHeadSHA,
+				"head_sha", headSHA, "error", err)
+			return true
+		}
+		if ghclient.HasSchemaInputFiles(filesSincePlan) {
+			h.logger.Info("auto-plan will post plan comment because the visible plan predates schema input changes",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "plan_head_sha", planHeadSHA,
+				"head_sha", headSHA)
+			return true
+		}
+		comparedHeads[planHeadSHA] = true
+	}
+	h.logger.Info("auto-plan will refresh checks without posting a plan comment because the visible plan covers the current schema inputs",
 		"repo", repo, "pr", pr, "before_sha", beforeSHA, "head_sha", headSHA)
 	return false
 }
@@ -262,7 +352,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// follow the same cadence, so the decision is memoized and computed at most
 	// once per delivery, only when a caller needs it.
 	shouldPostComment := sync.OnceValue(func() bool {
-		return h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA)
+		return h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA, configs)
 	})
 	h.notifyUnmanagedDiscoveredConfigs(repo, pr, installationID, source, headSHA, shouldPostComment, discovered, configs)
 
@@ -470,8 +560,9 @@ func (h *Handler) aggregateMessagesForAllEnvironments(message string) map[string
 	return messages
 }
 
-// handlePRClosed cleans up resources when a PR is closed (merged or unmerged):
-// it releases locks held by this PR and deletes its stored check state.
+// runPRCloseCleanup cleans up resources when a PR is closed (merged or
+// unmerged): it releases locks held by this PR and deletes its stored check
+// state.
 //
 // Cleanup only covers finished work. While any apply for the PR is
 // non-terminal, that apply's database lock is retained so another PR cannot
@@ -485,8 +576,16 @@ func (h *Handler) aggregateMessagesForAllEnvironments(message string) map[string
 // and only reopen-time cleanup can re-verify it against the PR contents. If
 // apply state cannot be read, cleanup fails closed and nothing is released
 // or deleted.
-func (h *Handler) handlePRClosed(repo string, pr int, _ int64, merged bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+//
+// It takes a context so the durable driver can bound it to the delivery lease
+// (shutdown or lease loss cancels it) while the legacy request path passes a
+// detached context. Every failure is returned so a caller with a retry
+// mechanism (the durable driver) can retry: each step — the applies read, the
+// list-then-release lock pass, and the check delete — is safe to re-run, so
+// re-running the whole cleanup after a partial failure reconciles rather than
+// double-acts.
+func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, merged bool) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	// A closed PR gets no more scheduled re-folds; drop its budget entry so the
@@ -505,17 +604,19 @@ func (h *Handler) handlePRClosed(repo string, pr int, _ int64, merged bool) {
 		})
 		h.logger.Error("PR close cleanup skipped: cannot verify apply state; all locks and check state are retained",
 			"repo", repo, "pr", pr, "error", err)
-		return
+		return fmt.Errorf("read applies for closed PR %s#%d: %w", repo, pr, err)
 	}
 
 	inFlight := h.inFlightAppliesForClosedPR(ctx, repo, pr, applies)
 
-	h.releaseLocksForClosedPR(ctx, repo, pr, inFlight)
+	if err := h.releaseLocksForClosedPR(ctx, repo, pr, inFlight); err != nil {
+		return fmt.Errorf("release locks for closed PR %s#%d: %w", repo, pr, err)
+	}
 
 	if len(inFlight) > 0 {
 		h.logger.Info("check state retained for closed PR until all applies reach a terminal state",
 			"repo", repo, "pr", pr, "in_flight_databases", len(inFlight))
-		return
+		return nil
 	}
 
 	// Delete stored check state for this PR. Apply-owned rows that still block
@@ -534,20 +635,21 @@ func (h *Handler) handlePRClosed(repo string, pr int, _ int64, merged bool) {
 			Status:     "error",
 		})
 		h.logger.Error("failed to delete checks for closed PR", "repo", repo, "pr", pr, "merged", merged, "error", err)
-	} else {
-		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:  "pr_close_cleanup",
-			Repository: repo,
-			Status:     "success",
-		})
-		if merged {
-			h.logger.Info("deleted checks for merged PR; apply-owned rows that still block are retained",
-				"repo", repo, "pr", pr)
-		} else {
-			h.logger.Info("deleted plan-only checks for unmerged closed PR; all apply-owned rows are retained",
-				"repo", repo, "pr", pr)
-		}
+		return fmt.Errorf("delete checks for closed PR %s#%d (merged=%t): %w", repo, pr, merged, err)
 	}
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:  "pr_close_cleanup",
+		Repository: repo,
+		Status:     "success",
+	})
+	if merged {
+		h.logger.Info("deleted checks for merged PR; apply-owned rows that still block are retained",
+			"repo", repo, "pr", pr)
+	} else {
+		h.logger.Info("deleted plan-only checks for unmerged closed PR; all apply-owned rows are retained",
+			"repo", repo, "pr", pr)
+	}
+	return nil
 }
 
 // closedPRDatabase identifies the database lock an apply holds.
@@ -587,13 +689,23 @@ func (h *Handler) inFlightAppliesForClosedPR(ctx context.Context, repo string, p
 }
 
 // releaseLocksForClosedPR releases the closed PR's locks, except locks on
-// databases that still have an in-flight apply.
-func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr int, inFlight map[closedPRDatabase]bool) {
+// databases that still have an in-flight apply. Every release is attempted even
+// if an earlier one fails, and the failures are joined and returned so a caller
+// with a retry mechanism re-attempts the still-held locks. Release itself is
+// not idempotent — a missing row returns storage.ErrLockNotFound and a
+// re-acquired lock returns storage.ErrLockNotOwned — so re-running converges
+// only because each attempt re-lists the PR's locks first and a released
+// lock's row is deleted, never reappearing in a later attempt. A concurrent
+// manual unlock between the list and the release surfaces as a spurious
+// ErrLockNotFound that fails that attempt; the next retry no longer sees the
+// row and converges.
+func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr int, inFlight map[closedPRDatabase]bool) error {
 	locks, err := h.service.Storage().Locks().GetByPR(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to look up locks for closed PR; no locks released", "repo", repo, "pr", pr, "error", err)
-		return
+		return fmt.Errorf("look up locks for closed PR %s#%d: %w", repo, pr, err)
 	}
+	var releaseErrs []error
 	for _, lock := range locks {
 		if inFlight[closedPRDatabase{database: lock.DatabaseName, databaseType: lock.DatabaseType}] {
 			h.logger.Info("lock retained on PR close because an apply is in flight",
@@ -603,11 +715,13 @@ func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr i
 		if err := h.service.Storage().Locks().Release(ctx, lock.DatabaseName, lock.DatabaseType, lock.Owner); err != nil {
 			h.logger.Error("failed to release lock on PR close",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
-		} else {
-			h.logger.Info("released lock on PR close",
-				"repo", repo, "pr", pr, "database", lock.DatabaseName)
+			releaseErrs = append(releaseErrs, fmt.Errorf("release lock on %s (%s): %w", lock.DatabaseName, lock.DatabaseType, err))
+			continue
 		}
+		h.logger.Info("released lock on PR close",
+			"repo", repo, "pr", pr, "database", lock.DatabaseName)
 	}
+	return errors.Join(releaseErrs...)
 }
 
 // cleanupStaleChecks updates checks for databases no longer in the PR.

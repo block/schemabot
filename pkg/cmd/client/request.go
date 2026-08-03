@@ -163,7 +163,7 @@ func doSendBody(endpoint, method, path string, body any) error {
 }
 
 // doPostInto sends a JSON POST to endpoint+path and unmarshals the JSON response into result.
-// Returns an *APIError for non-200 responses (use IsNotFound to check for 404).
+// Returns an *APIError for error responses (use IsNotFound to check for 404).
 func doPostInto(endpoint, path string, body any, result any) error {
 	return doPostIntoWithClient(context.Background(), httpClient, endpoint, path, body, result)
 }
@@ -202,7 +202,10 @@ func doPostIntoWithClient(ctx context.Context, client *http.Client, endpoint, pa
 		return fmt.Errorf("read response: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	// Control endpoints answer 202 Accepted when the request is durably
+	// recorded and the apply owner completes it asynchronously; the body
+	// carries the same JSON shape as a 200 and is equally a success.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		return parseAPIError(resp.StatusCode, respBody)
 	}
 

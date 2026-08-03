@@ -414,6 +414,10 @@ func (h *Handler) processDurableWebhookEvent(ctx context.Context, event *storage
 		return h.processDurablePullRequest(ctx, event)
 	case "check_run":
 		return h.processDurableCheckRun(ctx, event)
+	case "merge_group":
+		return h.processDurableMergeGroup(ctx, event)
+	case "push":
+		return h.processDurablePush(ctx, event)
 	default:
 		h.logger.Info("durable webhook delivery ignored because event type is unsupported",
 			"delivery_id", event.DeliveryID, "event", event.Event, "action", event.Action,
@@ -422,50 +426,56 @@ func (h *Handler) processDurableWebhookEvent(ctx context.Context, event *storage
 	}
 }
 
-// processDurablePullRequest drives the auto-plan flow for a claimed
-// pull_request delivery. The durability contract of this slice covers config
-// discovery and plan dispatch: per-database plan execution still runs in
-// detached goroutines (handleMultiEnvPlan via goSafe), exactly as on the
-// request path, and its durability is owned by the applies/tasks layer once
-// plans are created.
+// processDurablePullRequest decodes a claimed pull_request delivery and routes
+// it to the processor for its action. It re-validates the action fail-closed —
+// rows can arrive via replay or a future producer — so a replayed action can
+// never reach the wrong flow.
 func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
 	var payload pullRequestPayload
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		return false, fmt.Errorf("decode durable pull_request delivery %s: %w", event.DeliveryID, err)
 	}
 
-	// The HTTP handler only enqueues auto-plannable actions, but rows can also
-	// come from replay or future producers; re-validate so a replayed "closed"
-	// action can never trigger an auto-plan.
-	if !isAutoPlannablePullRequestAction(payload.Action) {
-		h.logger.Info("durable pull_request delivery ignored because action is not auto-plannable",
+	switch {
+	case isAutoPlannablePullRequestAction(payload.Action):
+		return h.processDurablePullRequestAutoPlan(ctx, event, payload)
+	case payload.Action == "closed":
+		return h.processDurablePullRequestClosed(ctx, event, payload)
+	default:
+		h.logger.Info("durable pull_request delivery ignored because action needs no work",
 			"delivery_id", event.DeliveryID, "action", payload.Action,
 			"repo", event.Repository, "pr", event.PullRequest)
 		return false, nil
 	}
+}
 
-	installationID, parseErr := strconv.ParseInt(event.TenantID, 10, 64)
-	if parseErr != nil {
-		// A non-numeric TenantID is a corrupted/enqueue-side bug, distinct from a
-		// legitimately empty tenant; surface it rather than silently folding it
-		// into the payload fallback below.
-		h.logger.Warn("durable pull_request delivery has an unparseable tenant ID; falling back to the payload installation",
-			"delivery_id", event.DeliveryID, "tenant_id", event.TenantID,
-			"repo", event.Repository, "pr", event.PullRequest, "error", parseErr)
+// processDurablePullRequestClosed runs PR-close cleanup for a claimed closed
+// delivery under the delivery lease. runPRCloseCleanup is idempotent, so a
+// retry after a partial cleanup reconciles rather than double-acts.
+func (h *Handler) processDurablePullRequestClosed(ctx context.Context, event *storage.WebhookEvent, payload pullRequestPayload) (retry bool, err error) {
+	repo := payload.Repository.FullName
+	pr := payload.PullRequest.Number
+	if repo == "" || pr == 0 {
+		return false, fmt.Errorf("durable pull_request closed delivery %s missing repo or PR", event.DeliveryID)
 	}
-	if parseErr != nil || installationID == 0 {
-		// Fallback for rows without a stored tenant. Today the only producer
-		// (enqueueDurablePullRequest) always stores a resolved non-zero
-		// installation ID, so this only matters for replay or future producers.
-		// The payload carries an installation ID only for org/user App installs;
-		// repo-level deliveries have none, so a future producer that synthesizes
-		// such rows (WH-6b) must persist a resolved installation ID in TenantID
-		// rather than relying on this fallback, or repo-level deliveries will
-		// terminally fail here.
-		installationID = h.effectiveInstallationID(ctx, payload.Installation.ID)
+	if err := h.runPRCloseCleanup(ctx, repo, pr, payload.PullRequest.Merged); err != nil {
+		return true, fmt.Errorf("pr close cleanup for durable delivery %s (%s#%d): %w", event.DeliveryID, repo, pr, err)
 	}
-	if installationID == 0 {
-		return false, fmt.Errorf("durable pull_request delivery %s missing installation ID", event.DeliveryID)
+	h.logger.Info("durable pull_request close cleanup completed",
+		"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "merged", payload.PullRequest.Merged)
+	return false, nil
+}
+
+// processDurablePullRequestAutoPlan drives the auto-plan flow for a claimed
+// pull_request delivery. The durability contract of this slice covers config
+// discovery and plan dispatch: per-database plan execution still runs in
+// detached goroutines (handleMultiEnvPlan via goSafe), exactly as on the
+// request path, and its durability is owned by the applies/tasks layer once
+// plans are created.
+func (h *Handler) processDurablePullRequestAutoPlan(ctx context.Context, event *storage.WebhookEvent, payload pullRequestPayload) (retry bool, err error) {
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		return false, err
 	}
 
 	repo := payload.Repository.FullName
@@ -507,7 +517,7 @@ func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.
 	}
 	h.logger.Info("durable pull_request auto-plan dispatched",
 		"action", payload.Action, "repo", repo, "pr", pr, "head_sha", headSHA,
-		"delivery_id", event.DeliveryID, "message", message)
+		"delivery_id", event.DeliveryID, "outcome", message)
 	return false, nil
 }
 
@@ -671,25 +681,9 @@ func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *st
 		return false, nil
 	}
 
-	installationID, parseErr := strconv.ParseInt(event.TenantID, 10, 64)
-	if parseErr != nil {
-		// A non-numeric TenantID is a corrupted/enqueue-side bug, distinct from a
-		// legitimately empty tenant; surface it rather than silently folding it
-		// into the payload fallback below.
-		h.logger.Warn("durable check_run rerequest has an unparseable tenant ID; falling back to the payload installation",
-			"delivery_id", event.DeliveryID, "tenant_id", event.TenantID,
-			"repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA, "error", parseErr)
-	}
-	if parseErr != nil || installationID == 0 {
-		// Fallback for rows without a stored tenant. The only producer today
-		// (enqueueDurableCheckRun) always stores a resolved non-zero
-		// installation ID; check_run payloads carry an installation ID only for
-		// org/user App installs, so a repo-level delivery relying on this
-		// fallback would fail below.
-		installationID = h.effectiveInstallationID(ctx, payload.Installation.ID)
-	}
-	if installationID == 0 {
-		return false, fmt.Errorf("durable check_run rerequest %s missing installation ID", event.DeliveryID)
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		return false, err
 	}
 
 	// Keep the driver's run context: autoPlanBootstrap rebinds ctx to a
@@ -742,7 +736,7 @@ func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *st
 	}
 	h.logger.Info("durable check_run rerequest auto-plan dispatched",
 		"action", payload.Action, "repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA,
-		"delivery_id", event.DeliveryID, "message", message)
+		"delivery_id", event.DeliveryID, "outcome", message)
 	return false, nil
 }
 
@@ -774,9 +768,19 @@ func (h *Handler) enqueueDurableCheckRun(ctx context.Context, payload checkRunPa
 	})
 }
 
-// enqueueDurableWebhookEvent persists a delivery into the durable inbox. The
-// enqueue is the durability boundary: once the row is inserted, the durable
-// driver owns the delivery. On graceful shutdown the request ctx is
+// enqueueDurableWebhookEvent persists a delivery into the durable inbox and
+// wakes the driver pool. It is the shared fast-ACK path behind every durable
+// event type: the caller builds a fully-populated WebhookEvent (Provider,
+// DeliveryID, Event, and the raw Payload the driver re-decodes), and this
+// helper enforces the invariants every producer shares — storage must be
+// available and the GitHub delivery GUID (the dedup key) must be present —
+// before Create. It returns inserted=false when the delivery GUID already
+// exists so callers can treat a redelivery as an idempotent no-op, and only
+// wakes the pool on a genuine insert so a duplicate does not spin a driver
+// for a row that is already queued or terminal.
+//
+// The enqueue is the durability boundary: once the row is inserted, the
+// durable driver owns the delivery. On graceful shutdown the request ctx is
 // cancelled, which would abort the INSERT and 500 the delivery — and GitHub
 // does not auto-retry failed webhook deliveries, so the work would be lost
 // until an operator manually redelivers it. Detach from request cancellation
@@ -800,6 +804,36 @@ func (h *Handler) enqueueDurableWebhookEvent(ctx context.Context, event *storage
 		h.wakeDurableWebhookDispatch()
 	}
 	return inserted, nil
+}
+
+// durableInstallationID resolves the installation ID for a claimed delivery
+// from the tenant persisted at enqueue. Every producer stores a resolved
+// positive installation ID in TenantID, so an unparseable or non-positive
+// tenant is a corrupted or hand-crafted row: retrying cannot repair it, and
+// driver work runs outside an HTTP request, so there is no out-of-band
+// resolution to recover with. Callers treat the returned error as terminal.
+func durableInstallationID(event *storage.WebhookEvent) (int64, error) {
+	installationID, err := strconv.ParseInt(event.TenantID, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("durable %s delivery %s for %s has an unparseable tenant ID %q: %w",
+			event.Event, event.DeliveryID, durableDeliveryLocation(event), event.TenantID, err)
+	}
+	if installationID <= 0 {
+		return 0, fmt.Errorf("durable %s delivery %s for %s has a non-positive installation ID %d in its tenant",
+			event.Event, event.DeliveryID, durableDeliveryLocation(event), installationID)
+	}
+	return installationID, nil
+}
+
+// durableDeliveryLocation renders the repository location of a durable
+// delivery for error messages: repo#pr when the delivery targets a pull
+// request, or just the repository for PR-less events such as push and
+// merge_group.
+func durableDeliveryLocation(event *storage.WebhookEvent) string {
+	if event.PullRequest > 0 {
+		return fmt.Sprintf("%s#%d", event.Repository, event.PullRequest)
+	}
+	return event.Repository
 }
 
 func (h *Handler) webhookEventStore() storage.WebhookEventStore {

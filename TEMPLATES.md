@@ -51,10 +51,121 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e staging
 ```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-engineblocked-change"></a><strong>MySQL Plan (Engine-blocked Change)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `users`
+    DROP PRIMARY KEY,
+    ADD PRIMARY KEY(`id`, `tenant_id`);
+
+ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`);
+
+ALTER TABLE `orders` ADD COLUMN `notes` text;
+```
+
+⛔ **Cannot apply**: **2** changes not supported by the schema-change engine
+- `users`: dropping primary key is not supported
+- `orders`: adding foreign key constraints is not supported
+
+An apply will fail on these statements. Rewrite them as a supported schema change, or contact your SchemaBot operators for help.
+
+📋 **Plan**: **3** tables to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-directexecution-change"></a><strong>MySQL Plan (Direct-execution Change)</strong></summary>
+
+
+## Schema Change Apply — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
+
+```sql
+ALTER TABLE `users`
+    DROP PRIMARY KEY,
+    ADD PRIMARY KEY(`id`, `tenant_id`);
+
+ALTER TABLE `orders` ADD COLUMN `notes` text;
+```
+
+⚙️ **Direct execution**: **1** change will run as native MySQL DDL
+- `users`: dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows
+
+These statements run synchronously outside the schema-change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this.
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+⚠️ **Automatic apply paused**: Plan contains direct-execution changes — review the disclosure and confirm manually
+
+Review the plan above, then confirm manually:
+```
+schemabot apply-confirm -e staging
+```
+
+🔓 To discard this plan and unlock, comment:
+```
+schemabot unlock
+```
+
+</details>
+
+<details>
+<summary><a name="apply-rejected-engineblocked-changes"></a><strong>Apply Rejected (Engine-blocked Changes)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `users`
+    DROP PRIMARY KEY,
+    ADD PRIMARY KEY(`id`, `tenant_id`);
+
+ALTER TABLE `orders` ADD COLUMN `notes` text;
+```
+
+📋 **Plan**: **2** tables to alter
+
+---
+
+**⛔ Apply rejected**: **1** planned change not supported by the schema-change engine
+- `users`: dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000
+
+Rewrite these statements as a supported schema change, or contact your SchemaBot operators for help.
 
 </details>
 
@@ -98,7 +209,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e staging --tenant alpha
 ```
@@ -190,6 +301,7 @@ The live database operation was already started and may continue independently o
      schemabot rollback apply-09f8ba28fb67492e -e staging
      ```
      After rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan.
+<!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
 </details>
@@ -225,6 +337,7 @@ Choose one:
      schemabot rollback apply-09f8ba28fb67492e -e staging
      ```
    - after rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan
+<!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
 </details>
@@ -310,7 +423,7 @@ CREATE TABLE `addresses` (
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e staging
 ```
@@ -442,7 +555,7 @@ CREATE TABLE `metrics` (
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e staging
 ```
@@ -495,7 +608,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** these changes, start with the first environment:
+▶️ **To apply** these changes, start with the first environment:
 ```
 schemabot apply -e staging
 ```
@@ -557,7 +670,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** these changes, comment:
+▶️ **To apply** these changes, comment:
 ```
 schemabot apply -e production
 ```
@@ -615,7 +728,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** these changes, comment:
+▶️ **To apply** these changes, comment:
 ```
 schemabot apply -e staging
 ```
@@ -677,7 +790,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-💡 **To apply** these changes, start with the first environment:
+▶️ **To apply** these changes, start with the first environment:
 ```
 schemabot apply -e staging
 ```
@@ -718,6 +831,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 ```
 schemabot apply -e staging --allow-unsafe
 ```
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -750,6 +864,7 @@ Before dropping an index in MySQL, first make the dropped index invisible and ve
 ```
 schemabot apply -e staging --allow-unsafe
 ```
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -781,6 +896,7 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 ```
 schemabot apply -e staging --allow-unsafe
 ```
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -808,6 +924,7 @@ schemabot apply -e staging --allow-unsafe
 **Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
 
 **Quick start**: `plan` → `apply`
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -839,6 +956,7 @@ That command wasn't recognized. Available commands:
 **Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
 
 **Quick start**: `plan` → `apply`
+<!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
 
@@ -851,6 +969,7 @@ That command wasn't recognized. Available commands:
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **Status**: Failed
+<!-- schemabot:offer-support-channel -->
 
 📊 1/3 complete · 1 failed · 1 cancelled
 
@@ -939,6 +1058,8 @@ Use the `-d` flag:
 ```
 schemabot plan -e staging -d <database-name>
 ```
+<!-- schemabot:offer-support-channel -->
+
 </details>
 
 <details>
@@ -954,6 +1075,8 @@ schemabot plan -e staging -d <database-name>
 No `schemabot.yaml` configuration with `database: nonexistent-db` was found in this repository.
 
 Check that your `schemabot.yaml` file has the correct `database` field matching the `-d` flag value.
+<!-- schemabot:offer-support-channel -->
+
 </details>
 
 <details>
@@ -975,6 +1098,8 @@ type: mysql
 
 - **database** (required): The database name
 - **type** (required): `vitess` or `mysql`
+<!-- schemabot:offer-support-channel -->
+
 </details>
 
 <details>
@@ -990,6 +1115,9 @@ This PR changes schema under the following path(s), which this SchemaBot instanc
 These schema changes will **not** be planned or applied, and the SchemaBot checks on this PR do not cover them.
 
 If SchemaBot should manage them, ask a SchemaBot operator to add the directory to the database's `allowed_dirs` in the server config; otherwise remove these schema changes from this PR.
+<!-- schemabot:offer-support-channel -->
+
+> 💬 Support: [#schema-help](https://chat.example.com/schema-help).
 </details>
 
 <details>
@@ -1005,6 +1133,8 @@ If SchemaBot should manage them, ask a SchemaBot operator to add the directory t
 ### Error
 
 > failed to fetch repository contents: API rate limit exceeded
+<!-- schemabot:offer-support-channel -->
+
 </details>
 
 <details>
@@ -1020,6 +1150,8 @@ If SchemaBot should manage them, ask a SchemaBot operator to add the directory t
 ### Error
 
 > failed to fetch repository contents: API rate limit exceeded
+<!-- schemabot:offer-support-channel -->
+
 </details>
 
 <details>
@@ -1036,6 +1168,8 @@ You'll need to specify which environment to target with the `-e` flag.
 ```
 schemabot plan -e staging
 ```
+<!-- schemabot:offer-support-channel -->
+
 </details>
 
 <details>
@@ -1064,6 +1198,7 @@ That command wasn't recognized. Available commands:
 **Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
 
 **Quick start**: `plan` → `apply`
+<!-- schemabot:offer-support-channel -->
 </details>
 
 ### CLI Output
@@ -1463,6 +1598,17 @@ No lock found for testapp (mysql)
 </details>
 
 <details>
+<summary><a name="lock-exists-under-other-type"></a><strong>Lock Exists Under Other Type</strong></summary>
+
+```
+
+No lock found for testapp (mysql), but a vitess lock exists for this database.
+Release it with: schemabot unlock -d testapp -t vitess
+
+```
+</details>
+
+<details>
 <summary><a name="unlock-not-owned"></a><strong>Unlock Not Owned</strong></summary>
 
 ```
@@ -1785,6 +1931,7 @@ Another PR currently holds the lock for this database.
 **Since**: 2026-03-15 12:30:00 UTC
 
 Wait for the other PR to complete or ask the lock holder to run `schemabot unlock`.
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -1807,6 +1954,7 @@ Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock wi
 ```
 schemabot unlock -d testapp --force
 ```
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -1838,6 +1986,7 @@ Wait for it to complete or stop it first.
 This PR is closed, so its schema changes can never merge. SchemaBot only applies schema changes from open PRs.
 
 Reopen this PR, or open a new PR with the schema change, and apply from there.
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -1925,6 +2074,7 @@ Staging has pending changes. Apply staging first before applying to production.
 ```
 schemabot apply -e staging
 ```
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -1941,6 +2091,7 @@ Staging failed. Fix the issue and re-apply staging before applying to production
 ```
 schemabot apply -e staging
 ```
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -1958,6 +2109,7 @@ Once staging completes, retry:
 ```
 schemabot apply -e production
 ```
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -1975,6 +2127,7 @@ schemabot plan -e staging
 ```
 
 If the plan finds changes, apply `staging` and wait for the SchemaBot check to succeed. Then retry this apply.
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -1986,7 +2139,9 @@ If the plan finds changes, apply `staging` and wait for the SchemaBot check to s
 
 Could not verify staging status: failed to query check runs. Retry the apply command.
 
-_Error: list check runs for ref: 502 Bad Gateway_
+_See server logs for details._
+<!-- schemabot:offer-support-channel -->
+
 </details>
 
 <details>
@@ -2006,6 +2161,7 @@ SchemaBot only verifies `staging` through check runs created by trusted SchemaBo
 - If you do not recognize the App, do not trust it — the check may be impersonating SchemaBot.
 
 Re-running `schemabot plan -e staging` will not resolve this.
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -2019,7 +2175,8 @@ Re-running `schemabot plan -e staging` will not resolve this.
 
 Configured promotion order: `staging` → `production`
 
-Add `development` to `environment_order` so SchemaBot knows where it sits in the promotion sequence, then retry the apply.
+Add `development` to `environment_order` (the server-wide list, or this database's override when it has one) so SchemaBot knows where it sits in the promotion sequence, then retry the apply.
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -2057,7 +2214,9 @@ Schema changes require approval from an authorized reviewer before applying.
 
 ### Error
 
-> Review gate check failed: expand team @acme/schema-reviewers: team membership cannot be read. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
+> Review gate check failed; see server logs for details. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
+<!-- schemabot:offer-support-channel -->
+
 </details>
 
 <details>
@@ -2077,6 +2236,7 @@ Get the checks passing — fix failures and re-run cancelled or stale checks —
 ```
 schemabot apply -e staging
 ```
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -2097,6 +2257,7 @@ Wait for checks to complete and retry:
 ```
 schemabot apply -e staging
 ```
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -2130,6 +2291,7 @@ schemabot apply -e staging
 @mona is not authorized to run `schemabot apply` for this database.
 
 A configured SchemaBot admin/database operator must run this command.
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -2147,6 +2309,7 @@ SchemaBot could not verify authorization for `schemabot apply-confirm`. No schem
 If access is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
 
 A configured SchemaBot admin/database operator should inspect SchemaBot authorization logs before retrying.
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -2161,6 +2324,7 @@ A configured SchemaBot admin/database operator should inspect SchemaBot authoriz
 `schemabot unlock` cannot run because database `payments` is not configured on this SchemaBot instance.
 
 Verify the database name, or run the command against the SchemaBot instance that manages this database.
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -2258,6 +2422,7 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **Status**: Failed
+<!-- schemabot:offer-support-channel -->
 
 **`users`**: 🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
 
@@ -2862,6 +3027,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **Status**: Failed
+<!-- schemabot:offer-support-channel -->
 
 📊 1 failed · 2 cancelled
 
@@ -2908,6 +3074,7 @@ schemabot apply -e staging
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **Status**: Failed
+<!-- schemabot:offer-support-channel -->
 
 📊 1/3 complete · 1 failed · 1 cancelled
 
@@ -2933,6 +3100,54 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 
 > ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
+
+---
+
+To retry:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="failed-before-row-copy-preflight"></a><strong>Failed Before Row Copy (Preflight)</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Failed
+<!-- schemabot:offer-support-channel -->
+
+📊 1 failed · 2 cancelled
+
+**Schema `testapp`**
+
+**`orders`**: ❌ Failed (before row copy started)
+
+```sql
+ALTER TABLE `orders` MODIFY COLUMN `status` enum('NEW','PENDING','SHIPPED','DELIVERED') NOT NULL;
+```
+> ⚠️ Last error: preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end
+
+**`users`**: ⊘ Cancelled (not started)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: ⊘ Cancelled (not started)
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+> ⚠️ **Error:** table orders failed: preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end
 
 ---
 
@@ -3400,6 +3615,8 @@ Volume change to 8 requested. SchemaBot will adjust the speed of this schema cha
 Usage: `schemabot volume <apply-id> -e <environment> -v <level>`
 
 The `-v` flag is required and must be a number between 1 (slowest) and 11 (fastest).
+<!-- schemabot:offer-support-channel -->
+
 </details>
 
 <details>
@@ -3411,6 +3628,8 @@ The `-v` flag is required and must be a number between 1 (slowest) and 11 (faste
 Usage: `schemabot volume <apply-id> -e <environment> -v <1-11>`
 
 Use `schemabot status -e <environment>` to find the apply ID.
+<!-- schemabot:offer-support-channel -->
+
 </details>
 
 <details>
@@ -3690,6 +3909,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ## ❌ Schema Change Failed — Staging
 
+<!-- schemabot:offer-support-channel -->
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
 
 *Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
@@ -3938,6 +4158,7 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 
 ## ❌ Schema Change Failed — Staging
 
+<!-- schemabot:offer-support-channel -->
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 3h 30m
 
 *Applied by @jackjackbits at 2026-03-15 11:00:00 UTC*
@@ -4015,6 +4236,7 @@ schemabot apply -e staging
 
 ## ❌ Schema Change Failed — Staging
 
+<!-- schemabot:offer-support-channel -->
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
 
 *Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
@@ -5915,6 +6137,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
 **Status**: Failed
+<!-- schemabot:offer-support-channel -->
 
 📊 1/3 complete · 1 failed · 1 cancelled
 
@@ -6212,6 +6435,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ## ❌ Schema Change Failed — Production
 
+<!-- schemabot:offer-support-channel -->
 **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
@@ -6269,6 +6493,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 <details open>
 <summary>❌ us — failed</summary>
 
+<!-- schemabot:offer-support-channel -->
 **Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @aparajon at 2026-03-15 14:22:00 UTC*
@@ -6355,7 +6580,7 @@ ALTER TABLE `mutes`
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e production
 ```
@@ -6390,7 +6615,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e production
 ```
@@ -6436,7 +6661,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-💡 **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment:
 ```
 schemabot apply -e production
 ```

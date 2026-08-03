@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -74,13 +75,20 @@ func metricActionKey(action string) string {
 	return strings.ReplaceAll(action, "-", "_")
 }
 
-// assertBaseSchemaStillCurrent enforces the opt-in repository policy that a PR
-// must include every base-branch change under its managed schema directory.
-// It compares Git tree object IDs at the PR merge base and the current tip of
-// the base branch (resolved from prInfo.BaseRef — the PR object's base SHA is
-// a creation-time snapshot that never observes later base commits), so
-// unrelated commits elsewhere in a monorepo never block an apply. GitHub read
-// uncertainty rejects the apply rather than silently bypassing the guard.
+// assertBaseSchemaStillCurrent enforces the invariant that a PR must include
+// every base-branch change under its managed schema directory before it can
+// apply — a stale branch's plan would otherwise revert schema that already
+// landed. It compares Git tree object IDs at the PR merge base and the
+// current tip of the base branch (resolved from prInfo.BaseRef — the PR
+// object's base SHA is a creation-time snapshot that never observes later
+// base commits), so unrelated commits elsewhere in a monorepo never block an
+// apply.
+//
+// Returns rejected=true only for a verified stale branch. GitHub read
+// uncertainty stops the apply rather than silently bypassing the guard, and is
+// returned as an error, not a rejection: freshness could not be verified, so
+// the outcome is not the command's answer and a durable driver may re-drive
+// it.
 func (h *Handler) assertBaseSchemaStillCurrent(
 	ctx context.Context,
 	client *ghclient.InstallationClient,
@@ -92,19 +100,14 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 	environment string,
 	requestedBy string,
 	action string,
-) bool {
-	config, ok := h.serverConfig()
-	if !ok || !config.RequiresUpToDateWithBase(repo) {
-		return false
-	}
-
+) (rejected bool, err error) {
 	schemaPaths := []string{schema.SchemaPath}
 	if schema.SchemaLinkPath != "" {
 		schemaPaths = append(schemaPaths, schema.SchemaLinkPath)
 	}
 	changed, baseTipSHA, err := client.SchemaPathsChangedSinceMergeBase(ctx, repo, prInfo.BaseRef, prInfo.HeadSHA, schemaPaths)
 	if err != nil {
-		h.logger.Error("apply rejected: could not verify base schema freshness",
+		h.logger.Error("apply stopped: could not verify base schema freshness",
 			"repo", repo,
 			"pr", pr,
 			"environment", environment,
@@ -125,10 +128,10 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 			SchemaPath:        schema.SchemaPath,
 			VerificationError: true,
 		}))
-		return true
+		return false, fmt.Errorf("base schema freshness gate compare %s against %s tip for %s#%d: %w", schema.SchemaPath, prInfo.BaseRef, repo, pr, err)
 	}
 	if !changed {
-		return false
+		return false, nil
 	}
 
 	h.logger.Warn("apply rejected: schema path changed on base branch after PR divergence",
@@ -151,5 +154,5 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 		Environment: environment,
 		SchemaPath:  schema.SchemaPath,
 	}))
-	return true
+	return true, nil
 }

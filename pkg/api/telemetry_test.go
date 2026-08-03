@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -721,19 +722,35 @@ func TestRecordOperatorMetrics(t *testing.T) {
 	metrics.RecordOperatorClaimFailure(t.Context(), "expire_retryable_error")
 	metrics.RecordOperatorClaimFailure(t.Context(), "missing_lease_token")
 	metrics.RecordOperatorClaimFailure(t.Context(), "operation_parent_not_claimable")
+	metrics.RecordOperatorClaimFailure(t.Context(), "stranded_reaper_error")
 	metrics.RecordOperatorClaimDuration(t.Context(), 50*time.Millisecond, "testdb", "pie", "staging", "running")
+	metrics.RecordOperatorStrandedOperationReaped(t.Context(), "testdb", "pie", "staging", state.Apply.Completed)
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))
 
 	names := make(map[string]bool)
 	var sawExpireRetryableError bool
+	var sawStrandedReaperError bool
 	var sawMissingLeaseToken bool
 	var sawLeaseLost bool
 	var sawOperationParentNotClaimable bool
+	var sawStrandedParentState bool
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			names[m.Name] = true
+			if m.Name == "schemabot.operator.stranded_operations_reaped_total" {
+				sum, ok := m.Data.(metricdata.Sum[int64])
+				require.True(t, ok)
+				for _, dp := range sum.DataPoints {
+					parentState, hasParentState := dp.Attributes.Value(attribute.Key("parent_state"))
+					require.True(t, hasParentState, "a reaped stranded operation must say which parent outcome it mirrored")
+					if parentState.AsString() == state.Apply.Completed {
+						sawStrandedParentState = true
+					}
+				}
+				continue
+			}
 			if m.Name != "schemabot.operator.claim_failures_total" && m.Name != "schemabot.operator.resume_failures_total" {
 				continue
 			}
@@ -745,6 +762,8 @@ func TestRecordOperatorMetrics(t *testing.T) {
 				switch reason.AsString() {
 				case "expire_retryable_error":
 					sawExpireRetryableError = true
+				case "stranded_reaper_error":
+					sawStrandedReaperError = true
 				case "missing_lease_token":
 					sawMissingLeaseToken = true
 				case "lease_lost":
@@ -764,7 +783,10 @@ func TestRecordOperatorMetrics(t *testing.T) {
 	assert.True(t, names["schemabot.scheduler.resume_failures_total"], "expected deprecated schemabot.scheduler.resume_failures_total alias")
 	assert.True(t, names["schemabot.scheduler.claim_failures_total"], "expected deprecated schemabot.scheduler.claim_failures_total alias")
 	assert.True(t, names["schemabot.scheduler.claim_duration_seconds"], "expected deprecated schemabot.scheduler.claim_duration_seconds alias")
+	assert.True(t, names["schemabot.operator.stranded_operations_reaped_total"], "expected schemabot.operator.stranded_operations_reaped_total")
+	assert.True(t, sawStrandedParentState, "expected the reaped stranded operation to carry its parent's outcome as parent_state")
 	assert.True(t, sawExpireRetryableError, "expected expire_retryable_error claim failure reason to be preserved")
+	assert.True(t, sawStrandedReaperError, "expected stranded_reaper_error claim failure reason to be preserved")
 	assert.True(t, sawMissingLeaseToken, "expected missing_lease_token claim failure reason to be preserved")
 	assert.True(t, sawLeaseLost, "expected lease_lost resume failure reason to be recorded")
 	assert.True(t, sawOperationParentNotClaimable, "expected operation_parent_not_claimable claim failure reason to be preserved, not collapsed to unknown")

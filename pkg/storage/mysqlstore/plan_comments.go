@@ -17,22 +17,19 @@ const planCommentColumns = `id, repository, pull_request, database_name, databas
 
 // planCommentStore implements storage.PlanCommentStore using MySQL.
 type planCommentStore struct {
-	db *sql.DB
+	db       *sql.DB
+	identity identityInserter
 }
 
 // Insert stores a newly posted plan comment and sets comment.ID.
 func (s *planCommentStore) Insert(ctx context.Context, comment *storage.PlanComment) error {
-	result, err := s.db.ExecContext(ctx, `
+	id, err := s.identity.InsertID(ctx, s.db, `
 		INSERT INTO plan_comments (repository, pull_request, database_name, database_type, environment_scope, head_sha, github_comment_id, github_node_id)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, comment.Repository, comment.PullRequest, comment.DatabaseName, comment.DatabaseType,
 		comment.EnvironmentScope, comment.HeadSHA, comment.GitHubCommentID, comment.GitHubNodeID)
 	if err != nil {
 		return fmt.Errorf("insert plan comment for %s#%d database %s: %w", comment.Repository, comment.PullRequest, comment.DatabaseName, err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return fmt.Errorf("read plan comment insert id for %s#%d database %s: %w", comment.Repository, comment.PullRequest, comment.DatabaseName, err)
 	}
 	comment.ID = id
 	return nil

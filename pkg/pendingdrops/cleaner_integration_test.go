@@ -18,6 +18,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/testutil"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -146,7 +147,7 @@ func quarantinedTables(t *testing.T, db *sql.DB) []string {
 func testCleaner(t *testing.T, retention time.Duration, dryRun bool) *Cleaner {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	targets := []Target{{Database: "testdb", Environment: "staging", DSN: sharedDSN}}
+	targets := []Target{{Database: "testdb", Environment: "staging", DSN: sharedDSN, Locker: namedlock.MySQL{}}}
 	return NewCleaner(targets, retention, dryRun, logger)
 }
 
@@ -254,7 +255,7 @@ func TestCleaner_DropFailureReturnsError(t *testing.T) {
 // failed target is retried on the next pass.
 func TestCleaner_UnreachableTargetReturnsError(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	targets := []Target{{Database: "downdb", Environment: "staging", DSN: "root:wrong@tcp(127.0.0.1:1)/missing?timeout=2s"}}
+	targets := []Target{{Database: "downdb", Environment: "staging", DSN: "root:wrong@tcp(127.0.0.1:1)/missing?timeout=2s", Locker: namedlock.MySQL{}}}
 	cleaner := NewCleaner(targets, DefaultRetention, false, logger)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)

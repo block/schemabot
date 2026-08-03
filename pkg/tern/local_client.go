@@ -147,7 +147,15 @@ type LocalConfig struct {
 	// Keys used by PlanetScale: organization, token_name, token_value,
 	// tls_name, revert_window_duration, main_branch.
 	// Keys used by Spirit: pending_drops ("false" disables the pending drops
-	// quarantine so DROP TABLE executes directly).
+	// quarantine so DROP TABLE executes directly); direct_execution ("true"
+	// lets engine-refused ALTER statements run verbatim as native MySQL DDL)
+	// with its required companion direct_execution_max_table_rows (positive
+	// estimated-row-count bound above which direct execution is blocked) and
+	// optional direct_execution_lock_acquisition_timeout_seconds (positive bound on
+	// each direct statement's lock acquisition; engine default when absent);
+	// plus the run-settings overrides parsed by spirit.SettingsFromMetadata
+	// (enable_experimental_autoscaling, checkpoint_max_age,
+	// checksum_yield_timeout).
 	Metadata map[string]string
 
 	// SchemaOverrides maps a requested (canonical) MySQL namespace to the
@@ -282,6 +290,11 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 		customEngine = eng
 	}
 
+	spiritSettings, err := spirit.SettingsFromMetadata(cfg.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("parse Spirit settings for database %q: %w", cfg.Database, err)
+	}
+
 	return &LocalClient{
 		config:  cfg,
 		storage: stor,
@@ -290,6 +303,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 			// Pending drops quarantine is on by default; deployments opt out
 			// via the pending_drops metadata key.
 			DisablePendingDrops: cfg.Metadata["pending_drops"] == "false",
+			Settings:            spiritSettings,
 		}),
 		planetscaleEngine: psEngine,
 		customEngine:      customEngine,
@@ -1266,13 +1280,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	// Store the plan in SchemaBot's storage
 	ddlChanges := make([]storage.TableChange, len(result.FlatTableChanges()))
 	for i, t := range result.FlatTableChanges() {
-		ddlChanges[i] = storage.TableChange{
-			Table:        t.Table,
-			DDL:          t.DDL,
-			Operation:    ddl.StatementTypeToOp(t.Operation),
-			IsUnsafe:     t.IsUnsafe,
-			UnsafeReason: t.UnsafeReason,
-		}
+		ddlChanges[i] = storageTableChangeFromEngine(t, "")
 	}
 
 	// Build per-namespace plan data from the engine's changes.
@@ -1296,13 +1304,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 				continue
 			}
 			seenTable[ns][tc.Table] = true
-			nsData.Tables = append(nsData.Tables, storage.TableChange{
-				Table:        tc.Table,
-				DDL:          tc.DDL,
-				Operation:    ddl.StatementTypeToOp(tc.Operation),
-				IsUnsafe:     tc.IsUnsafe,
-				UnsafeReason: tc.UnsafeReason,
-			})
+			nsData.Tables = append(nsData.Tables, storageTableChangeFromEngine(tc, ""))
 		}
 		// Record each changing shard's own changes so apply-create can rebuild
 		// per-shard operation groups with per-shard DDL (a keyspace whose shards
@@ -1312,14 +1314,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		if shardName := strings.TrimSpace(sc.Shard.Name); shardName != "" {
 			sp := storage.ShardPlan{Shard: shardName, Namespace: ns}
 			for _, tc := range sc.TableChanges {
-				sp.Changes = append(sp.Changes, storage.TableChange{
-					Namespace:    ns,
-					Table:        tc.Table,
-					DDL:          tc.DDL,
-					Operation:    ddl.StatementTypeToOp(tc.Operation),
-					IsUnsafe:     tc.IsUnsafe,
-					UnsafeReason: tc.UnsafeReason,
-				})
+				sp.Changes = append(sp.Changes, storageTableChangeFromEngine(tc, ns))
 			}
 			nsData.Shards = append(nsData.Shards, sp)
 			allShardPlans = append(allShardPlans, sp)
@@ -1502,28 +1497,14 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 				continue
 			}
 			protoTableSeen[ns][t.Table] = true
-			protoSC.TableChanges = append(protoSC.TableChanges, &ternv1.TableChange{
-				TableName:    t.Table,
-				ChangeType:   changeTypeToProto(t.Operation),
-				Ddl:          t.DDL,
-				IsUnsafe:     t.IsUnsafe,
-				UnsafeReason: t.UnsafeReason,
-				Namespace:    ns,
-			})
+			protoSC.TableChanges = append(protoSC.TableChanges, protoTableChangeFromEngine(t, ns))
 		}
 		// A SchemaChange with an empty shard targets the whole namespace
 		// (non-sharded engines) and contributes no shard rows.
 		if shardName := strings.TrimSpace(sc.Shard.Name); shardName != "" {
 			protoSP := &ternv1.ShardPlan{Shard: shardName, Namespace: ns}
 			for _, t := range sc.TableChanges {
-				protoSP.Changes = append(protoSP.Changes, &ternv1.TableChange{
-					Namespace:    ns,
-					TableName:    t.Table,
-					Ddl:          t.DDL,
-					ChangeType:   changeTypeToProto(t.Operation),
-					IsUnsafe:     t.IsUnsafe,
-					UnsafeReason: t.UnsafeReason,
-				})
+				protoSP.Changes = append(protoSP.Changes, protoTableChangeFromEngine(t, ns))
 			}
 			shards = append(shards, protoSP)
 		}
@@ -1664,14 +1645,7 @@ func scopedDispatchDDLChanges(changes []*ternv1.TableChange) ([]storage.TableCha
 		if op == "unknown" || op == "vschema_update" {
 			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d (table %q) has unsupported change type %v", i, table, ch.ChangeType)
 		}
-		out = append(out, storage.TableChange{
-			Namespace:    namespace,
-			Table:        table,
-			DDL:          ddl,
-			Operation:    op,
-			IsUnsafe:     ch.IsUnsafe,
-			UnsafeReason: ch.UnsafeReason,
-		})
+		out = append(out, StorageTableChangeFromProto(ch, namespace, table, ddl, op))
 	}
 	return out, nil
 }
@@ -1827,14 +1801,7 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 			return nil, err
 		}
 		nsData := ensure(ch.Namespace)
-		nsData.Tables = append(nsData.Tables, storage.TableChange{
-			Namespace:    ch.Namespace,
-			Table:        ch.TableName,
-			DDL:          ch.Ddl,
-			Operation:    op,
-			IsUnsafe:     ch.IsUnsafe,
-			UnsafeReason: ch.UnsafeReason,
-		})
+		nsData.Tables = append(nsData.Tables, StorageTableChangeFromProto(ch, ch.Namespace, ch.TableName, ch.Ddl, op))
 	}
 
 	for ns := range vschemaChangedNamespaces {
@@ -2397,13 +2364,14 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 
 	for _, t := range currentApplyTasks {
 		tp := &ternv1.TableProgress{
-			TableName:  t.TableName,
-			Ddl:        t.DDL,
-			Namespace:  t.Namespace,
-			Status:     t.State,
-			TaskId:     t.TaskIdentifier,
-			IsInstant:  t.IsInstant || vitessApplyIsInstant,
-			ChangeType: ddlActionToProtoChangeType(t.DDLAction),
+			TableName:    t.TableName,
+			Ddl:          t.DDL,
+			Namespace:    t.Namespace,
+			Status:       t.State,
+			TaskId:       t.TaskIdentifier,
+			IsInstant:    t.IsInstant || vitessApplyIsInstant,
+			ChangeType:   ddlActionToProtoChangeType(t.DDLAction),
+			ErrorMessage: t.ErrorMessage,
 		}
 
 		// Table figures come from the stored task row the drive maintains.
@@ -2412,6 +2380,11 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		tp.RowsTotal = t.RowsTotal
 		tp.ChecksumRowsChecked = t.ChecksumRowsChecked
 		tp.ChecksumRowsTotal = t.ChecksumRowsTotal
+		// For Spirit the stored figure is the runner-wide remaining-copy
+		// estimate stamped on every still-copying table (see
+		// buildSpiritTableProgress), so in a multi-table apply each table
+		// reports the whole run's ETA rather than its own.
+		tp.EtaSeconds = int64(t.ETASeconds)
 		// Clamp to 100% only for successfully completed tasks — Vitess row
 		// counts can lag slightly due to concurrent inserts during copy.
 		if state.IsState(t.State, state.Task.Completed) && t.RowsTotal > 0 {

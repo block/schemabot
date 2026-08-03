@@ -74,7 +74,17 @@ func (h *Handler) executeApply(
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final stale-schema rejection")
 		return
 	}
-	if rejected := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, freshPRInfo, environment, requestedBy, actionName); rejected {
+	// executeApply runs past the durable hand-off boundary, so a verification
+	// failure and a verified-stale rejection both stop the apply here and
+	// release the observed lock intent; the gate has already logged and
+	// posted the distinction, and the user's recovery is re-issuing the
+	// command.
+	rejected, freshnessErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, freshPRInfo, environment, requestedBy, actionName)
+	if freshnessErr != nil {
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final base-schema freshness verification failure")
+		return
+	}
+	if rejected {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final base-schema freshness rejection")
 		return
 	}
@@ -98,15 +108,54 @@ func (h *Handler) executeApply(
 		return
 	}
 
+	// Engine-blocked changes reject the apply outright — the re-plan may have
+	// resolved a change to blocked even if the reviewed plan had none (e.g.
+	// the direct execution policy changed, or the table grew past its bound).
+	// Release the lock: no retry of this command can succeed, so holding it
+	// would only force a manual unlock after the schema is rewritten.
+	if planResp.HasBlockedChanges() {
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+		h.logger.Info("apply rejected: re-plan contains engine-blocked changes",
+			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
+		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "engine-blocked changes rejection")
+		return
+	}
+
 	// Automatic apply DDL drift check: if the re-plan DDL differs from the stored auto-plan,
 	// downgrade to manual confirmation so the user reviews the new plan.
 	if storedPlan != nil && !ddlMatchesStoredPlan(planResp, storedPlan) {
 		h.logger.Info("automatic apply downgraded: DDL drift detected",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
-		commentData.IsLocked = true
-		commentData.AutoConfirmDowngradeReason = "Schema changes differ from auto-plan — review and confirm manually"
-		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		h.postAutoConfirmDowngrade(repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+			"Schema changes differ from auto-plan — review and confirm manually")
+		return
+	}
+
+	// Direct-execution changes never run from the automatic apply path: the
+	// operator must confirm the blocking, non-revertible native DDL against
+	// the locked plan comment that discloses it, so downgrade to manual
+	// confirmation.
+	if storedPlan != nil && len(planResp.DirectChanges()) > 0 {
+		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
+			"repo", repo, "pr", pr, "database", database, "environment", environment)
+		h.postAutoConfirmDowngrade(repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+			"Plan contains direct-execution changes — review the disclosure and confirm manually")
+		return
+	}
+
+	// --defer-cutover only affects engine-driven statements; an all-direct
+	// plan has no cutover to defer, so reject the flag instead of silently
+	// ignoring it. Only apply-confirm reaches this gate (the apply command
+	// rejects the flag before locking, and an automatic apply whose re-plan
+	// carries direct changes downgrades above), so keep the lock: it still
+	// pins the plan the operator confirmed against, and re-running
+	// apply-confirm without the flag executes it.
+	if result.DeferCutover && planResp.AllChangesDirect() {
+		h.logger.Info("apply rejected: --defer-cutover on an all-direct plan; the pending confirmation is preserved",
+			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
+		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+			fmt.Sprintf(msgDeferCutoverAllDirectConfirm, environment))
 		return
 	}
 
@@ -212,14 +261,14 @@ func (h *Handler) executeApply(
 		h.logger.Error("failed to load apply after accepted apply",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", schemaResult.Type, "environment", environment,
-			"apply_id", applyID, "error", err)
+			"apply_id", applyResp.ApplyID, "error", err)
 		return
 	}
 	if apply == nil {
 		h.logger.Error("apply missing after accepted apply",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", schemaResult.Type, "environment", environment,
-			"apply_id", applyID)
+			"apply_id", applyResp.ApplyID)
 		return
 	}
 
@@ -238,14 +287,30 @@ func (h *Handler) executeApply(
 	h.postInitialProgressComment(ctx, repo, pr, installationID, apply, progressBody)
 
 	// Update stored check state to in_progress (transitions action_required to in_progress).
-	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID); err != nil {
+	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply); err != nil {
 		h.logger.Error("failed to mark check in_progress for apply",
-			"repo", repo, "pr", pr, "database", database,
-			"database_type", schemaResult.Type, "environment", environment,
-			"apply_id", applyID, "error", err)
+			append(apply.LogAttrs(), "error", err)...)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot could not update the required status check: "+err.Error())
 		return
 	}
+}
+
+// postAutoConfirmDowngrade posts the locked plan comment that pauses an
+// automatic apply for manual confirmation. It carries the original command's
+// flags and the lock owner so the coached apply-confirm command re-issues the
+// operator's full intent and the comment shows who holds the lock.
+func (h *Handler) postAutoConfirmDowngrade(
+	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
+	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy, reason string,
+) {
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+	commentData.IsLocked = true
+	commentData.LockOwner = fmt.Sprintf("%s#%d", repo, pr)
+	commentData.AllowUnsafe = result.AllowUnsafe
+	commentData.DeferCutover = result.DeferCutover
+	commentData.SkipRevert = result.SkipRevert
+	commentData.AutoConfirmDowngradeReason = reason
+	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 }
 
 // releaseApplyLockIfIntentUnchanged releases this PR's apply lock after a

@@ -1003,6 +1003,10 @@ func (ic *InstallationClient) FetchChangedFilesBetween(ctx context.Context, repo
 	if err != nil {
 		return nil, err
 	}
+	status := readResult.GetStatus()
+	if status != "ahead" && status != "identical" {
+		return nil, fmt.Errorf("compare commits %s...%s for %s cannot prove linear history: status %q", base, head, repo, status)
+	}
 
 	files := make([]PRFile, 0, len(readResult.Files))
 	for _, f := range readResult.Files {

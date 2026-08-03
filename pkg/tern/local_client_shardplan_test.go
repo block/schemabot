@@ -8,10 +8,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/spirit/pkg/statement"
 )
 
 // namedPlanEngine is a fake engine that implements Plan and Name, so the full
@@ -43,7 +43,7 @@ func shardPlanTestClient(t *testing.T, store *fakePlanStore, result *engine.Plan
 func alterUsersEmail() []engine.TableChange {
 	return []engine.TableChange{{
 		Table:     "users",
-		Operation: statement.StatementAlterTable,
+		Operation: ddl.StatementAlterTable,
 		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 	}}
 }
@@ -150,7 +150,7 @@ func TestPlanPreservesUnsafeMetadataInStoredPlanAndResponse(t *testing.T) {
 	}
 	unsafeDrop := []engine.TableChange{{
 		Table:        "users",
-		Operation:    statement.StatementDropTable,
+		Operation:    ddl.StatementDropTable,
 		DDL:          "DROP TABLE `users`",
 		IsUnsafe:     true,
 		UnsafeReason: "DROP TABLE removes all data",

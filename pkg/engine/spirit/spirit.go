@@ -59,7 +59,13 @@ type Engine struct {
 	lockWaitTimeout     time.Duration
 	debugLogs           bool
 	disablePendingDrops bool
-	cpuHint             int // Inferred CPU count from innodb_buffer_pool_instances (0 = unknown); guarded by mu
+
+	// Resolved Settings applied to every Spirit run; immutable after New.
+	checkpointMaxAge     time.Duration
+	checksumYieldTimeout time.Duration
+	autoscaling          bool
+
+	cpuHint int // Inferred CPU count from innodb_buffer_pool_instances (0 = unknown); guarded by mu
 
 	// Log callback for routing Spirit logs to ApplyLogStore (with table context)
 	onLog func(level slog.Level, table, msg string)
@@ -71,6 +77,13 @@ type Engine struct {
 
 // runningSchemaChange tracks the state of an in-progress schema change.
 type runningSchemaChange struct {
+	// logger is the schema-change-scoped logger carrying the caller's triage
+	// identity (apply id, repo, PR, environment); spiritLogger is the
+	// filtered Spirit logger derived from it. Both fall back to the engine's
+	// loggers when the caller did not provide one.
+	logger       *slog.Logger
+	spiritLogger *slog.Logger
+
 	database                string            // MySQL database name parsed from DSN
 	tableNamespace          map[string]string // table name → namespace (from ApplyRequest.Changes)
 	tables                  []string
@@ -84,6 +97,13 @@ type runningSchemaChange struct {
 	started                 time.Time
 	deferCutover            bool // Whether to defer cutover until manual trigger
 	volumeRestartInProgress bool // Set while stored stopped state should still be exposed as running progress.
+
+	// directPolicy is the direct execution policy snapshotted at Apply, so a
+	// resumed schema change routes with the same policy the apply started
+	// with. directStatements tracks each direct-routed statement's lifecycle
+	// for progress reporting.
+	directPolicy     directPolicy
+	directStatements []*directStatementProgress
 
 	// Spirit copy settings for this schema change. Initialized from the
 	// engine's configured defaults and retuned by Volume for this change only;
@@ -122,6 +142,10 @@ type Config struct {
 	// default because it keeps dropped table data recoverable until the
 	// retention period expires.
 	DisablePendingDrops bool
+
+	// Settings tunes the Spirit runs the engine starts; zero-value fields
+	// resolve to the fleet defaults (see settings.go).
+	Settings Settings
 }
 
 // New creates a new Spirit engine.
@@ -146,14 +170,29 @@ func New(cfg Config) *Engine {
 		lockWaitTimeout = DefaultLockWaitTimeout
 	}
 
+	checkpointMaxAge := cfg.Settings.CheckpointMaxAge
+	if checkpointMaxAge == 0 {
+		checkpointMaxAge = DefaultCheckpointMaxAge
+	}
+
+	checksumYieldTimeout := cfg.Settings.ChecksumYieldTimeout
+	if checksumYieldTimeout == 0 {
+		checksumYieldTimeout = DefaultChecksumYieldTimeout
+	}
+
+	autoscaling := cfg.Settings.EnableExperimentalAutoscaling == nil || *cfg.Settings.EnableExperimentalAutoscaling
+
 	eng := &Engine{
-		logger:              logger,
-		linter:              lint.New(),
-		targetChunkTime:     targetChunkTime,
-		threads:             threads,
-		lockWaitTimeout:     lockWaitTimeout,
-		debugLogs:           cfg.DebugLogs,
-		disablePendingDrops: cfg.DisablePendingDrops,
+		logger:               logger,
+		linter:               lint.New(),
+		targetChunkTime:      targetChunkTime,
+		threads:              threads,
+		lockWaitTimeout:      lockWaitTimeout,
+		debugLogs:            cfg.DebugLogs,
+		disablePendingDrops:  cfg.DisablePendingDrops,
+		checkpointMaxAge:     checkpointMaxAge,
+		checksumYieldTimeout: checksumYieldTimeout,
+		autoscaling:          autoscaling,
 	}
 
 	// Create Spirit logger with filter that checks debugLogs at runtime
@@ -169,6 +208,62 @@ func New(cfg Config) *Engine {
 
 func (e *Engine) Name() string {
 	return "spirit"
+}
+
+// resolveChangeLoggers resolves the loggers for one schema change from the
+// caller's optional request logger. When the caller provides a logger — bound
+// with its triage identity (apply id, repo, PR, environment) — every engine
+// line and every routed Spirit runner line for the change inherits that
+// identity; otherwise the engine's configured loggers are used. The Spirit
+// logger is rebuilt on the request logger's handler so it keeps the runtime
+// debug-log filter and apply-log routing.
+func (e *Engine) resolveChangeLoggers(reqLogger *slog.Logger) (logger, spiritLogger *slog.Logger) {
+	if reqLogger == nil {
+		return e.logger, e.spiritLogger
+	}
+	return reqLogger, slog.New(&spiritLogFilter{
+		handler:  reqLogger.Handler(),
+		debugRef: &e.debugLogs,
+		onLogRef: &e.onLog,
+	})
+}
+
+// changeLogger returns the logger for the tracked schema change: the
+// change-scoped logger bound by Apply when the caller provided one, or the
+// engine's configured logger otherwise. Execution paths use it so every line
+// about the running change carries the caller's triage identity.
+func (e *Engine) changeLogger() *slog.Logger {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.runningSchemaChange != nil && e.runningSchemaChange.logger != nil {
+		return e.runningSchemaChange.logger
+	}
+	return e.logger
+}
+
+// schemaChangeLogger returns the logger bound to the given schema change,
+// falling back to the engine's configured logger when the change is nil or
+// carries no caller-bound logger. Control paths that hold a specific change
+// use it instead of changeLogger so their lines carry that change's triage
+// identity even when the engine has since started tracking a different one.
+// The change's logger is set once at creation, so no lock is needed.
+func (e *Engine) schemaChangeLogger(rm *runningSchemaChange) *slog.Logger {
+	if rm != nil && rm.logger != nil {
+		return rm.logger
+	}
+	return e.logger
+}
+
+// changeSpiritLogger returns the filtered Spirit logger for the tracked
+// schema change, falling back to the engine-level Spirit logger. Runner log
+// lines routed through it inherit the change's triage identity.
+func (e *Engine) changeSpiritLogger() *slog.Logger {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.runningSchemaChange != nil && e.runningSchemaChange.spiritLogger != nil {
+		return e.runningSchemaChange.spiritLogger
+	}
+	return e.spiritLogger
 }
 
 // SetLogCallback sets a callback that receives Spirit log messages.
@@ -286,6 +381,19 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, err
 	}
 
+	// The direct execution policy resolves refused statements to a direct or
+	// blocked verdict below. A malformed policy fails the plan: silently
+	// treating it as disabled would record blocked verdicts the apply-time
+	// routing might not agree with.
+	policy, err := directPolicyFromMetadata(req.Credentials.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct execution policy: %w", err)
+	}
+	// Row estimates for the policy bound connect lazily so plans without
+	// refused statements never open the extra connection.
+	target := &lazyTargetDB{dsn: req.Credentials.DSN}
+	defer target.close()
+
 	if !plan.HasChanges() {
 		return &engine.PlanResult{
 			PlanID:    fmt.Sprintf("plan-%d", time.Now().UnixNano()),
@@ -315,6 +423,32 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 				msgs[i] = v.Message
 			}
 			change.UnsafeReason = strings.Join(msgs, "; ")
+		}
+
+		// Execution-mode verdict: surface statements Spirit deterministically
+		// refuses so the operator learns at plan time how the apply will
+		// behave — routed to direct execution when the policy permits, or
+		// guaranteed to fail when it doesn't. Only ALTERs can be refused, and
+		// gating here keeps the verdict — an informational field — from ever
+		// failing the plan on a statement type the verdict's own parser
+		// doesn't accept.
+		if stmtType == ddl.StatementAlterTable {
+			reason, refused, err := ddl.EngineRefusalReason(pc.Statement)
+			if err != nil {
+				return nil, fmt.Errorf("execution verdict for table %q: %w", pc.TableName, err)
+			}
+			if refused {
+				decision := e.resolveRefusedMode(ctx, target, policy, database, pc.TableName, reason)
+				change.ExecutionMode = decision.mode
+				change.ModeReason = decision.modeReason
+				if decision.mode == engine.ExecutionModeDirect {
+					e.logger.Info("plan routes a statement the engine refuses to direct execution",
+						"database", database, "table", pc.TableName, "reason", reason, "estimated_rows", decision.rows)
+				} else {
+					e.logger.Info("plan contains a statement the engine will refuse at apply time",
+						"database", database, "table", pc.TableName, "reason", decision.modeReason)
+				}
+			}
 		}
 
 		changes = append(changes, change)
@@ -385,7 +519,9 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// Check for defer_cutover option
 	deferCutover := req.Options["defer_cutover"] == "true"
 
-	e.logger.Info("applying plan",
+	logger, spiritLogger := e.resolveChangeLoggers(req.Logger)
+
+	logger.Info("applying plan",
 		"database", req.Database,
 		"ddl_count", len(req.FlatDDL()),
 		"defer_cutover", deferCutover,
@@ -403,6 +539,14 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		}, nil
 	}
 
+	// Resolve the direct execution policy up front so a malformed policy
+	// rejects the apply before any state is created, and snapshot it on the
+	// running change below so resume routes with the same policy.
+	directExecPolicy, err := directPolicyFromMetadata(req.Credentials.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct execution policy: %w", err)
+	}
+
 	// Parse DSN to extract connection info (DSN is the source of truth for actual database)
 	host, username, password, database, err := parseDSN(req.Credentials.DSN)
 	if err != nil {
@@ -418,7 +562,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	cpuHint := e.cpuHint
 	e.mu.Unlock()
 	if cpuHint == 0 {
-		cpuHint = e.queryCPUHint(ctx, req.Credentials.DSN)
+		cpuHint = e.queryCPUHint(ctx, req.Credentials.DSN, logger)
 		e.mu.Lock()
 		e.cpuHint = cpuHint
 		e.mu.Unlock()
@@ -438,6 +582,8 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	rm := &runningSchemaChange{
+		logger:          logger,
+		spiritLogger:    spiritLogger,
 		database:        database,
 		tableNamespace:  tableNamespace,
 		tables:          nil, // Tables will be populated by executeSchemaChange
@@ -445,6 +591,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		state:           engine.StateRunning,
 		started:         time.Now(),
 		deferCutover:    deferCutover,
+		directPolicy:    directExecPolicy,
 		host:            host,
 		username:        username,
 		password:        password,
@@ -467,7 +614,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			e.runningSchemaChange.cancelFunc = cancel
 		}
 		e.mu.Unlock()
-		e.executeSchemaChange(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover)
+		e.executeSchemaChange(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover, directExecPolicy)
 	})
 
 	return &engine.ApplyResult{
@@ -538,6 +685,29 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 			}
 			tableProgress = append(tableProgress, tp)
 		}
+	}
+
+	// Direct-routed statements run outside the Spirit runner, so they report
+	// their own explicit lifecycle entries: no row counts or ETA, just the
+	// per-statement state transitions the executor recorded.
+	for _, ds := range rm.directStatements {
+		tp := engine.TableProgress{
+			Namespace:      rm.tableNamespace[ds.table],
+			Table:          ds.table,
+			DDL:            ds.ddl,
+			State:          ds.state,
+			ProgressDetail: "direct execution (native MySQL DDL)",
+		}
+		started := ds.startedAt
+		tp.StartedAt = &started
+		if ds.completedAt != nil {
+			completed := *ds.completedAt
+			tp.CompletedAt = &completed
+		}
+		if ds.state == directStateCompleted {
+			tp.Progress = 100
+		}
+		tableProgress = append(tableProgress, tp)
 	}
 
 	state := progressState(rm, spiritState)

@@ -14,9 +14,9 @@ import (
 // the tenant flag in optional form because this message also renders on
 // untenanted deployments.
 func RenderRollbackMissingArguments() string {
-	return "## Missing Arguments\n\n" +
+	return offerSupportChannel("## Missing Arguments\n\n" +
 		"Usage: `schemabot rollback <apply-id> -e <environment> [-t <tenant>]`\n\n" +
-		"Rollback requires both an apply ID and the `-e` flag to select the target environment."
+		"Rollback requires both an apply ID and the `-e` flag to select the target environment.")
 }
 
 // RenderRollbackMissingEnv renders the message posted when `schemabot rollback`
@@ -25,9 +25,9 @@ func RenderRollbackMissingArguments() string {
 // usage line keeps the tenant flag in optional form because this message also
 // renders on untenanted deployments.
 func RenderRollbackMissingEnv() string {
-	return "## Missing Environment\n\n" +
+	return offerSupportChannel("## Missing Environment\n\n" +
 		"Usage: `schemabot rollback <apply-id> -e <environment> [-t <tenant>]`\n\n" +
-		"The `-e` flag is required to select the target environment."
+		"The `-e` flag is required to select the target environment.")
 }
 
 // RenderUnsupportedAutoConfirm renders the message posted when the `-y` /
@@ -97,19 +97,19 @@ func RenderControlMissingApplyID(command string) string {
 	if command == action.Volume {
 		usage += fmt.Sprintf(" -v <%d-%d>", storage.MinVolume, storage.MaxVolume)
 	}
-	return fmt.Sprintf("## Missing Apply ID\n\n"+
+	return offerSupportChannel(fmt.Sprintf("## Missing Apply ID\n\n"+
 		"Usage: `%s`\n\n"+
-		"Use `schemabot status -e <environment>` to find the apply ID.", usage)
+		"Use `schemabot status -e <environment>` to find the apply ID.", usage))
 }
 
 // RenderVolumeInvalidLevel renders the message posted when a volume command
 // is missing the `-v` flag, carries a non-numeric value, or names a level
 // outside the supported range.
 func RenderVolumeInvalidLevel() string {
-	return fmt.Sprintf("## Missing or Invalid Volume Level\n\n"+
+	return offerSupportChannel(fmt.Sprintf("## Missing or Invalid Volume Level\n\n"+
 		"Usage: `schemabot volume <apply-id> -e <environment> -v <level>`\n\n"+
 		"The `-v` flag is required and must be a number between %d (slowest) and %d (fastest).",
-		storage.MinVolume, storage.MaxVolume)
+		storage.MinVolume, storage.MaxVolume))
 }
 
 // RenderStopCommandAccepted renders the acknowledgement posted when a PR

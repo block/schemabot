@@ -37,6 +37,9 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.operator.resume_failures_total` | Counter | database, environment, reason | Operator resume attempts that failed |
 | `schemabot.operator.claim_failures_total` | Counter | environment, reason | Operator claim attempts that failed |
 | `schemabot.operator.claim_duration_seconds` | Histogram | database, environment, previous_state | Operator claim and resume duration |
+| `schemabot.operator.stuck_pending_applies` | Gauge | environment | Pending applies past the stuck threshold that a driver should have claimed (sampled; capped at 500, so a value of 500 means "at least 500") |
+| `schemabot.operator.stuck_pending_scan_failures` | Counter | environment | Failed stuck-pending apply scans (liveness signal for the gauge above) |
+| `schemabot.operator.stranded_operations_reaped_total` | Counter | database, deployment, environment, parent_state | Pending apply operations the reaper settled from an already-settled parent apply. `deployment` is the reaped operation's own. A one-time burst is the historical backlog draining; a climbing rate means a producer is terminalizing parents without settling their children |
 | `schemabot.pending_drops.tables_moved_total` | Counter | database, environment | Dropped tables quarantined into the pending drops database |
 | `schemabot.pending_drops.cleanup_dropped_total` | Counter | database, environment | Expired quarantined tables permanently dropped by the cleaner |
 | `schemabot.pending_drops.cleanup_skipped_total` | Counter | database, environment | Quarantined tables skipped by the cleaner due to unparseable names |
@@ -44,6 +47,8 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.pending_drops.cleanup_errors_total` | Counter | database, environment, reason | Pending drops cleanup failures (retried on the next pass) |
 
 > **Deprecated aliases:** the `schemabot.scheduler.*` series (`resumed_total`, `resume_failures_total`, `claim_failures_total`, `claim_duration_seconds`) is still emitted alongside the `schemabot.operator.*` series for one release so dashboards and alerts can migrate. The scheduler-named series will be removed afterward.
+
+> **`stuck_pending_applies` is per-pod, not fleet-wide:** every pod running the server runs the stuck-pending monitor (there is no leader election, matching the inbox-depth and health monitors), so each pod reports the same DB-wide count as its own series. Aggregate with `max()`/`avg()`, not `sum()`, and expect the paired WARN log to fire from every pod each scan while anything is stuck.
 
 ### Attribute Values
 
@@ -95,7 +100,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (GitHub API): `success`, `error`, `unknown`
 
-**reason** (operator claim failures): `storage_error`, `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `unknown`
+**reason** (operator claim failures): `storage_error`, `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `stranded_reaper_error`, `unknown`
 
 **reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `retry_budget_exhausted`, `recovery_window_expired`
 

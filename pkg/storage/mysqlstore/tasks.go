@@ -19,7 +19,7 @@ const taskColumns = `id, task_identifier, apply_id, apply_operation_id, plan_id,
 	namespace, table_name, shard, ddl, ddl_action,
 	engine, repository, pull_request, environment, state, error_message, options, attempt,
 	rows_copied, rows_total, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, cutover_attempts,
-	is_instant, ready_to_complete, engine_migration_id,
+	is_instant, engine_migration_id,
 	started_at, completed_at, created_at, updated_at`
 
 func prefixedTaskColumns(alias string) string {
@@ -41,48 +41,40 @@ var terminalTaskStatesSQL = func() string {
 
 // taskStore implements storage.TaskStore using MySQL.
 type taskStore struct {
-	db *sql.DB
-}
-
-type taskInserter interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	db       *sql.DB
+	identity identityInserter
 }
 
 // Create stores a new task.
 func (s *taskStore) Create(ctx context.Context, task *storage.Task) (int64, error) {
-	return insertTask(ctx, s.db, task)
+	return insertTask(ctx, s.db, s.identity, task)
 }
 
-func insertTask(ctx context.Context, execer taskInserter, task *storage.Task) (int64, error) {
+func insertTask(ctx context.Context, exec queryExecer, identity identityInserter, task *storage.Task) (int64, error) {
 	// Ensure options has valid JSON (empty object if nil)
 	options := task.Options
 	if len(options) == 0 {
 		options = []byte("{}")
 	}
 
-	result, err := execer.ExecContext(ctx, `
+	id, err := identity.InsertID(ctx, exec, `
 		INSERT INTO tasks (
 			task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
 			namespace, table_name, shard, ddl, ddl_action,
 			engine, repository, pull_request, environment, state, error_message, options, attempt,
 			rows_copied, rows_total, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, cutover_attempts,
-			is_instant, ready_to_complete, engine_migration_id,
+			is_instant, engine_migration_id,
 			started_at, completed_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 		task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 		task.Engine, task.Repository, task.PullRequest, task.Environment,
 		task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
 		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.CutoverAttempts,
-		task.IsInstant, task.ReadyToComplete, nullString(task.EngineMigrationID),
+		task.IsInstant, nullString(task.EngineMigrationID),
 		task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
 	)
-	if err != nil {
-		return 0, err
-	}
-
-	id, err := result.LastInsertId()
 	if err != nil {
 		return 0, err
 	}
@@ -112,7 +104,7 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 	args := []any{
 		task.State, nullString(task.ErrorMessage), nullJSON(task.Options), task.Attempt,
 		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.CutoverAttempts,
-		task.IsInstant, task.ReadyToComplete, nullString(task.EngineMigrationID),
+		task.IsInstant, nullString(task.EngineMigrationID),
 		task.StartedAt, task.CompletedAt,
 		task.ID,
 	}
@@ -147,7 +139,7 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 		UPDATE tasks SET
 			state = ?, error_message = ?, options = ?, attempt = ?,
 			rows_copied = ?, rows_total = ?, progress_percent = ?, eta_seconds = ?, checksum_rows_checked = ?, checksum_rows_total = ?, cutover_attempts = ?,
-			is_instant = ?, ready_to_complete = ?, engine_migration_id = ?,
+			is_instant = ?, engine_migration_id = ?,
 			started_at = ?, completed_at = ?, updated_at = NOW()
 		WHERE id = ?`+leasePredicate+`
 	`, args...)
@@ -278,7 +270,7 @@ const shardTaskInsertColumns = `
 	namespace, table_name, shard, ddl, ddl_action,
 	engine, repository, pull_request, environment, state, error_message, options, attempt,
 	rows_copied, rows_total, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, cutover_attempts,
-	is_instant, ready_to_complete, engine_migration_id,
+	is_instant, engine_migration_id,
 	started_at, completed_at, created_at, updated_at`
 
 // shardTaskInsertValues returns the placeholder list and value args for a
@@ -290,14 +282,14 @@ func shardTaskInsertValues(task *storage.Task) (string, []any) {
 	if len(options) == 0 {
 		options = []byte("{}")
 	}
-	return `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`,
+	return `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`,
 		[]any{
 			task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 			task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 			task.Engine, task.Repository, task.PullRequest, task.Environment,
 			task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
 			task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.CutoverAttempts,
-			task.IsInstant, task.ReadyToComplete, nullString(task.EngineMigrationID),
+			task.IsInstant, nullString(task.EngineMigrationID),
 			task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
 		}
 }
@@ -309,7 +301,7 @@ func shardTaskInsertValues(task *storage.Task) (string, []any) {
 func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Task, opLease storage.OperationLease) error {
 	values, args := shardTaskInsertValues(task)
 	args = append(args, opLease.OperationID, opLease.Token)
-	result, err := s.db.ExecContext(ctx, `
+	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db, `
 		INSERT INTO tasks (`+shardTaskInsertColumns+`)
 		SELECT `+values+`
 		FROM apply_operations ao
@@ -319,17 +311,11 @@ func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Ta
 		return fmt.Errorf("insert shard task for operation %d %s.%s shard %q: %w",
 			opLease.OperationID, task.Namespace, task.TableName, task.Shard, err)
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("read shard task insert rows affected for operation %d: %w", opLease.OperationID, err)
-	}
-	if rows == 0 {
+	if !inserted {
 		// Zero rows inserted means the operation lease is no longer current.
 		return ensureOperationLeaseStillOwned(ctx, s.db, opLease)
 	}
-	if newID, err := result.LastInsertId(); err == nil {
-		task.ID = newID
-	}
+	task.ID = id
 	return nil
 }
 
@@ -341,7 +327,7 @@ func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Ta
 func (s *taskStore) insertShardTaskGuardedByApply(ctx context.Context, task *storage.Task, lease storage.ApplyLease) error {
 	values, args := shardTaskInsertValues(task)
 	args = append(args, lease.ApplyID, lease.Token)
-	result, err := s.db.ExecContext(ctx, `
+	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db, `
 		INSERT INTO tasks (`+shardTaskInsertColumns+`)
 		SELECT `+values+`
 		FROM applies a
@@ -351,17 +337,11 @@ func (s *taskStore) insertShardTaskGuardedByApply(ctx context.Context, task *sto
 		return fmt.Errorf("insert shard task for apply %d %s.%s shard %q: %w",
 			lease.ApplyID, task.Namespace, task.TableName, task.Shard, err)
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("read shard task insert rows affected for apply %d: %w", lease.ApplyID, err)
-	}
-	if rows == 0 {
+	if !inserted {
 		// Zero rows inserted means the apply lease is no longer current.
 		return ensureApplyLeaseStillOwned(ctx, s.db, lease)
 	}
-	if newID, err := result.LastInsertId(); err == nil {
-		task.ID = newID
-	}
+	task.ID = id
 	return nil
 }
 
@@ -625,7 +605,6 @@ func scanTaskInto(s scanner) (*storage.Task, error) {
 		&task.ChecksumRowsTotal,
 		&task.CutoverAttempts,
 		&task.IsInstant,
-		&task.ReadyToComplete,
 		&engineMigrationID,
 		&startedAt,
 		&completedAt,

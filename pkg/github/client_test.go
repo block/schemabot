@@ -103,6 +103,44 @@ func TestAddReactionToCommentRetriesSecondaryRateLimitedWrite(t *testing.T) {
 	assert.Equal(t, int64(2), attempts.Load())
 }
 
+func TestFetchChangedFilesBetweenRequiresLinearHistory(t *testing.T) {
+	tests := []struct {
+		status  string
+		wantErr bool
+	}{
+		{status: "ahead"},
+		{status: "identical"},
+		{status: "behind", wantErr: true},
+		{status: "diverged", wantErr: true},
+		{wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.status, func(t *testing.T) {
+			client, mux := setupRateLimitedTestGitHubServer(t)
+			mux.HandleFunc("GET /repos/octocat/hello-world/compare/base...head", func(w http.ResponseWriter, _ *http.Request) {
+				require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
+					Status: &tt.status,
+					Files: []*gh.CommitFile{{
+						Filename: new("app/service.go"),
+						Status:   new("modified"),
+					}},
+				}))
+			})
+
+			ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			files, err := ic.FetchChangedFilesBetween(t.Context(), "octocat/hello-world", "base", "head")
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "cannot prove linear history")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, "app/service.go", files[0].Filename)
+		})
+	}
+}
+
 func TestEditIssueCommentDoesNotRetryNonRateLimitWriteError(t *testing.T) {
 	client, mux := setupRateLimitedTestGitHubServer(t)
 	var attempts atomic.Int64

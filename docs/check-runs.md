@@ -302,7 +302,7 @@ Important columns:
 | `head_sha` | Commit SHA the record represents. GitHub only displays checks for the current PR head. |
 | `status` | `in_progress` or `completed`. |
 | `conclusion` | `success`, `failure`, or `action_required` when complete. |
-| `apply_id` | Storage apply ID represented by the row. It is set when an apply or rollback starts, and normal apply completion leaves it set so later cleanup can tell that live work started. |
+| `apply_id` | Internal numeric apply row ID represented by the row (distinct from the user-facing apply identifier that logs report as `apply_id`). It is set when an apply or rollback starts, and normal apply completion leaves it set so later cleanup can tell that live work started. |
 | `blocking_reason` | Stable machine-readable reason for fail-closed states that operators may need to triage. |
 | `check_run_id` | GitHub check run ID for aggregate records. |
 
@@ -656,6 +656,15 @@ on expected participants that have not reported. A missing participant check
 is repaired by running the backfill on that participant's deployment — never
 by the leader.
 
+**The exit code means "nothing needs an operator after this run."** A run
+that leaves work behind exits nonzero with a one-line count summary, after
+printing the full report, so a scheduled sweep can alert on the exit code
+without parsing the output. A `--dry-run` acts on nothing, so any finding —
+missing, held, or stuck — fails the run. Outside `--dry-run`, successfully
+recreated checks are resolved and do not fail the run; held PRs, failed
+recreations, and stuck Check Runs do, because the backfill never acts on
+those and an operator still has to.
+
 [github-create-check-run]: https://docs.github.com/en/rest/checks/runs#create-a-check-run
 [github-check-runs]: https://docs.github.com/en/rest/checks/runs
 [github-protected-branches]: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches
@@ -1004,11 +1013,13 @@ If `environment_order` is omitted, SchemaBot defaults to staging before
 production.
 
 Before applying to an environment from a PR comment, SchemaBot checks prior
-environments from the server-owned promotion order. In a single deployment, the
-promotion gate uses the database environments configured on that server. In a
-deployment scoped with `allowed_environments`, the promotion gate uses
-`environment_order` so an environment-local deployment can still verify earlier
-environments owned by another SchemaBot deployment.
+environments from the database's effective promotion order — the database's
+`environment_order` override when set, otherwise the server-wide
+`environment_order`. In a single deployment, the promotion gate uses the
+database environments configured on that server. In a deployment scoped with
+`allowed_environments`, the promotion gate uses the effective order so an
+environment-local deployment can still verify earlier environments owned by
+another SchemaBot deployment.
 
 | Prior environment state | Apply allowed? | Reason |
 | --- | --- | --- |

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"strings"
@@ -149,6 +150,7 @@ type Service struct {
 	operatorWake         chan struct{}
 	recoveryWg           sync.WaitGroup
 	operatorPollInterval time.Duration
+	strandedReaperEvery  time.Duration
 	remoteHealthMu       sync.Mutex
 	remoteHealthCancel   context.CancelFunc
 	remoteHealthWg       sync.WaitGroup
@@ -159,6 +161,11 @@ type Service struct {
 	webhookInboxCancel   context.CancelFunc
 	webhookInboxWg       sync.WaitGroup
 	webhookInboxInterval time.Duration
+
+	// Operator stuck-pending apply monitor loop management.
+	stuckPendingMu     sync.Mutex
+	stuckPendingCancel context.CancelFunc
+	stuckPendingWg     sync.WaitGroup
 
 	// Pending drops cleaner loop management.
 	pendingDropsMu     sync.Mutex
@@ -262,6 +269,7 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		logger:               logger,
 		clock:                clock.Real{},
 		operatorPollInterval: OperatorPollInterval,
+		strandedReaperEvery:  StrandedReaperInterval,
 		remoteHealthInterval: RemoteDeploymentHealthCheckInterval,
 		webhookInboxInterval: WebhookInboxMetricsInterval,
 		pendingObservers:     make(map[pendingObserverKey]tern.ProgressObserver),
@@ -400,6 +408,7 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 	client, err := tern.NewGRPCClient(tern.Config{
 		Address: address,
 		Storage: s.storage,
+		Logger:  s.logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create tern client for %s: %w", key, err)
@@ -565,6 +574,16 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 	if !s.config.PendingDropsEnabled() {
 		metadata["pending_drops"] = "false"
 	}
+	spiritMetadata, err := s.config.SpiritMetadata()
+	if err != nil {
+		return nil, fmt.Errorf("resolve spirit config for %s: %w", key, err)
+	}
+	maps.Copy(metadata, spiritMetadata)
+	directMetadata, err := envConfig.DirectExecution.EngineMetadata()
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct_execution metadata for %s: %w", key, err)
+	}
+	maps.Copy(metadata, directMetadata)
 	client, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:        database,
 		Type:            dbType,
@@ -755,6 +774,7 @@ func (s *Service) Close() error {
 	s.StopOperator()
 	s.StopRemoteDeploymentHealthMonitor()
 	s.StopWebhookInboxMonitor()
+	s.StopOperatorStuckPendingMonitor()
 
 	s.ternMu.Lock()
 	var errs []error

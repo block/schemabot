@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -88,11 +89,12 @@ func TestCallPullSchemaAPIError(t *testing.T) {
 }
 
 func TestListDatabases(t *testing.T) {
-	var gotType string
+	var gotType, gotName string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, http.MethodGet, r.Method)
 		assert.Equal(t, "/api/databases", r.URL.Path)
 		gotType = r.URL.Query().Get("type")
+		gotName = r.URL.Query().Get("name")
 		w.Header().Set("Content-Type", "application/json")
 		require.NoError(t, json.NewEncoder(w).Encode(apitypes.DatabaseListResponse{
 			Databases: []*apitypes.DatabaseResponse{
@@ -108,10 +110,11 @@ func TestListDatabases(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	result, err := ListDatabases(server.URL, ListDatabasesOptions{Type: "mysql"})
+	result, err := ListDatabases(server.URL, ListDatabasesOptions{Type: "mysql", Name: "ord"})
 	require.NoError(t, err)
 
 	assert.Equal(t, "mysql", gotType)
+	assert.Equal(t, "ord", gotName)
 	require.NotNil(t, result)
 	require.Len(t, result.Databases, 1)
 	assert.Equal(t, "orders", result.Databases[0].Database)
@@ -120,11 +123,13 @@ func TestListDatabases(t *testing.T) {
 }
 
 func TestGetStatusWithOptions(t *testing.T) {
-	var gotLimit, gotEnvironment, gotFailed string
+	var gotLimit, gotEnvironment, gotFailed, gotLast, gotState string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotLimit = r.URL.Query().Get("limit")
 		gotEnvironment = r.URL.Query().Get("environment")
 		gotFailed = r.URL.Query().Get("failed")
+		gotLast = r.URL.Query().Get("last")
+		gotState = r.URL.Query().Get("state")
 		w.Header().Set("Content-Type", "application/json")
 		_, err := w.Write([]byte(`{"active_count":0,"limit":50,"applies":[]}`))
 		require.NoError(t, err)
@@ -135,13 +140,21 @@ func TestGetStatusWithOptions(t *testing.T) {
 		Limit:       50,
 		Environment: "staging",
 		Failed:      true,
+		Last:        24 * time.Hour,
 	})
 	require.NoError(t, err)
 
 	assert.Equal(t, "50", gotLimit)
 	assert.Equal(t, "staging", gotEnvironment)
 	assert.Equal(t, "true", gotFailed)
+	assert.Equal(t, "24h0m0s", gotLast)
+	assert.Empty(t, gotState)
 	assert.Equal(t, 50, result.Limit)
+
+	_, err = GetStatus(server.URL, StatusOptions{State: "running"})
+	require.NoError(t, err)
+	assert.Equal(t, "running", gotState)
+	assert.Empty(t, gotFailed)
 }
 
 func TestReadSchemaFiles_RegularDirectories(t *testing.T) {

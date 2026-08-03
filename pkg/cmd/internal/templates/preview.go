@@ -35,6 +35,7 @@ const (
 	PreviewLockReleased      PreviewType = "lock_released"
 	PreviewLocksList         PreviewType = "locks_list"
 	PreviewNoLockFound       PreviewType = "no_lock_found"
+	PreviewLockOtherType     PreviewType = "lock_other_type"
 	PreviewUnlockNotOwned    PreviewType = "unlock_not_owned"
 	PreviewAll               PreviewType = "all"
 
@@ -110,6 +111,9 @@ const (
 
 	// Comment template previews (GitHub PR comments)
 	PreviewCommentPlan                         PreviewType = "comment_plan"                            // Plan comment with DDL changes + lint violations
+	PreviewCommentPlanBlocked                  PreviewType = "comment_plan_blocked"                    // Plan with a statement the engine refuses (blocked verdict)
+	PreviewCommentPlanDirect                   PreviewType = "comment_plan_direct"                     // Locked plan with a statement routed to direct execution (direct verdict)
+	PreviewCommentApplyBlockedRejected         PreviewType = "comment_apply_blocked_rejected"          // Apply rejected: plan contains engine-blocked statements
 	PreviewCommentPlanTenant                   PreviewType = "comment_plan_tenant"                     // Tenant-targeted plan comment
 	PreviewCommentPlanEmpty                    PreviewType = "comment_plan_empty"                      // Plan comment with no changes
 	PreviewCommentNoManagedSchema              PreviewType = "comment_no_managed_schema"               // No managed schema changes in current PR
@@ -138,6 +142,7 @@ const (
 	PreviewCommentApplyEstimateExceeded        PreviewType = "comment_apply_estimate_exceeded"         // Apply in progress after row estimate was exceeded
 	PreviewCommentApplyCompleted               PreviewType = "comment_apply_completed"                 // Apply completed (all tables done)
 	PreviewCommentApplyFailed                  PreviewType = "comment_apply_failed"                    // Apply failed (1 done, 1 failed, 1 cancelled)
+	PreviewCommentApplyFailedBeforeRowCopy     PreviewType = "comment_apply_failed_before_row_copy"    // Apply failed before row copy (preflight rejection, per-table error)
 	PreviewCommentApplyRetrying                PreviewType = "comment_apply_retrying"                  // Apply interrupted, retrying automatically (attempt counter)
 	PreviewCommentApplyStopped                 PreviewType = "comment_apply_stopped"                   // Apply stopped (1 done, 1 stopped)
 	PreviewCommentApplyWaitingCutover          PreviewType = "comment_apply_waiting_cutover"           // Waiting for cutover (deferred, operator triggers)

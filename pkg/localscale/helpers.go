@@ -865,7 +865,7 @@ func (s *Server) writeJSON(w http.ResponseWriter, data any) {
 
 func (s *Server) writeError(w http.ResponseWriter, code int, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	s.logger.Warn("api error", "code", code, "message", msg)
+	s.logger.Warn("api error", "code", code, "error_message", msg)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	// Use PlanetScale SDK error code strings so the SDK's error parser

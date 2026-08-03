@@ -621,7 +621,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	appName, appID, authStatus, ok := h.authenticateWebhook(r, body)
 	if !ok {
 		h.logger.Warn("webhook rejected",
-			"status", authStatus,
+			"auth_status", authStatus,
 			"app_name", appName,
 			"app_id", appID,
 			"delivery_id", r.Header.Get(headerDeliveryID),
@@ -715,10 +715,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handlePullRequest(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
 		recordProcessed()
 	case "merge_group":
-		h.handleMergeGroup(ctx, metricApp, sw, body)
+		h.handleMergeGroup(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
 		recordProcessed()
 	case "push":
-		h.handlePush(ctx, metricApp, sw, body)
+		h.handlePush(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
 		recordProcessed()
 	default:
 		h.logger.Info("webhook ignored",

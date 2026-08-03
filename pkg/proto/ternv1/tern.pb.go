@@ -1126,8 +1126,13 @@ type TableChange struct {
 	ChangeType ChangeType             `protobuf:"varint,3,opt,name=change_type,json=changeType,proto3,enum=tern.v1.ChangeType" json:"change_type,omitempty"`
 	Namespace  string                 `protobuf:"bytes,4,opt,name=namespace,proto3" json:"namespace,omitempty"`
 	// Unsafe change tracking
-	IsUnsafe      bool   `protobuf:"varint,5,opt,name=is_unsafe,json=isUnsafe,proto3" json:"is_unsafe,omitempty"`
-	UnsafeReason  string `protobuf:"bytes,6,opt,name=unsafe_reason,json=unsafeReason,proto3" json:"unsafe_reason,omitempty"`
+	IsUnsafe     bool   `protobuf:"varint,5,opt,name=is_unsafe,json=isUnsafe,proto3" json:"is_unsafe,omitempty"`
+	UnsafeReason string `protobuf:"bytes,6,opt,name=unsafe_reason,json=unsafeReason,proto3" json:"unsafe_reason,omitempty"`
+	// Execution-mode verdict: how the engine will run this statement at apply
+	// time. Empty means the engine's default path; "blocked" means the engine
+	// deterministically refuses the statement and the apply will fail.
+	ExecutionMode string `protobuf:"bytes,7,opt,name=execution_mode,json=executionMode,proto3" json:"execution_mode,omitempty"`
+	ModeReason    string `protobuf:"bytes,8,opt,name=mode_reason,json=modeReason,proto3" json:"mode_reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1200,6 +1205,20 @@ func (x *TableChange) GetIsUnsafe() bool {
 func (x *TableChange) GetUnsafeReason() string {
 	if x != nil {
 		return x.UnsafeReason
+	}
+	return ""
+}
+
+func (x *TableChange) GetExecutionMode() string {
+	if x != nil {
+		return x.ExecutionMode
+	}
+	return ""
+}
+
+func (x *TableChange) GetModeReason() string {
+	if x != nil {
+		return x.ModeReason
 	}
 	return ""
 }
@@ -2141,7 +2160,6 @@ type ShardProgress struct {
 	EtaSeconds         int64                  `protobuf:"varint,5,opt,name=eta_seconds,json=etaSeconds,proto3" json:"eta_seconds,omitempty"`
 	CutoverAttempts    int32                  `protobuf:"varint,6,opt,name=cutover_attempts,json=cutoverAttempts,proto3" json:"cutover_attempts,omitempty"`
 	LastCutoverAttempt string                 `protobuf:"bytes,7,opt,name=last_cutover_attempt,json=lastCutoverAttempt,proto3" json:"last_cutover_attempt,omitempty"`
-	ReadyToComplete    bool                   `protobuf:"varint,8,opt,name=ready_to_complete,json=readyToComplete,proto3" json:"ready_to_complete,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -2225,13 +2243,6 @@ func (x *ShardProgress) GetLastCutoverAttempt() string {
 	return ""
 }
 
-func (x *ShardProgress) GetReadyToComplete() bool {
-	if x != nil {
-		return x.ReadyToComplete
-	}
-	return false
-}
-
 // TableProgress contains progress information for a single table.
 type TableProgress struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
@@ -2252,8 +2263,12 @@ type TableProgress struct {
 	// Populated while the table is checksumming (verifying copied data), 0 otherwise.
 	ChecksumRowsChecked int64 `protobuf:"varint,14,opt,name=checksum_rows_checked,json=checksumRowsChecked,proto3" json:"checksum_rows_checked,omitempty"`
 	ChecksumRowsTotal   int64 `protobuf:"varint,15,opt,name=checksum_rows_total,json=checksumRowsTotal,proto3" json:"checksum_rows_total,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// The table's own failure reason (for example an engine preflight
+	// rejection), distinct from the apply-level error_message on
+	// ProgressResponse. Empty when the table has not failed.
+	ErrorMessage  string `protobuf:"bytes,16,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *TableProgress) Reset() {
@@ -2389,6 +2404,13 @@ func (x *TableProgress) GetChecksumRowsTotal() int64 {
 		return x.ChecksumRowsTotal
 	}
 	return 0
+}
+
+func (x *TableProgress) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
 }
 
 // ProgressResponse contains detailed progress information.
@@ -3531,7 +3553,7 @@ const file_tern_proto_rawDesc = "" +
 	"schemaPath\x1aT\n" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
-	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01J\x04\b\a\x10\b\"\xd4\x01\n" +
+	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01J\x04\b\a\x10\b\"\x9c\x02\n" +
 	"\vTableChange\x12\x1d\n" +
 	"\n" +
 	"table_name\x18\x01 \x01(\tR\ttableName\x12\x10\n" +
@@ -3540,7 +3562,10 @@ const file_tern_proto_rawDesc = "" +
 	"changeType\x12\x1c\n" +
 	"\tnamespace\x18\x04 \x01(\tR\tnamespace\x12\x1b\n" +
 	"\tis_unsafe\x18\x05 \x01(\bR\bisUnsafe\x12#\n" +
-	"\runsafe_reason\x18\x06 \x01(\tR\funsafeReason\"\xb0\x03\n" +
+	"\runsafe_reason\x18\x06 \x01(\tR\funsafeReason\x12%\n" +
+	"\x0eexecution_mode\x18\a \x01(\tR\rexecutionMode\x12\x1f\n" +
+	"\vmode_reason\x18\b \x01(\tR\n" +
+	"modeReason\"\xb0\x03\n" +
 	"\fSchemaChange\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x129\n" +
 	"\rtable_changes\x18\x02 \x03(\v2\x14.tern.v1.TableChangeR\ftableChanges\x12?\n" +
@@ -3630,7 +3655,7 @@ const file_tern_proto_rawDesc = "" +
 	"\b_task_id\"P\n" +
 	"\fLogsResponse\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12%\n" +
-	"\x04logs\x18\x02 \x03(\v2\x11.tern.v1.ApplyLogR\x04logs\"\xa7\x02\n" +
+	"\x04logs\x18\x02 \x03(\v2\x11.tern.v1.ApplyLogR\x04logs\"\x94\x02\n" +
 	"\rShardProgress\x12\x14\n" +
 	"\x05shard\x18\x01 \x01(\tR\x05shard\x12\x16\n" +
 	"\x06status\x18\x02 \x01(\tR\x06status\x12\x1f\n" +
@@ -3641,8 +3666,7 @@ const file_tern_proto_rawDesc = "" +
 	"\veta_seconds\x18\x05 \x01(\x03R\n" +
 	"etaSeconds\x12)\n" +
 	"\x10cutover_attempts\x18\x06 \x01(\x05R\x0fcutoverAttempts\x120\n" +
-	"\x14last_cutover_attempt\x18\a \x01(\tR\x12lastCutoverAttempt\x12*\n" +
-	"\x11ready_to_complete\x18\b \x01(\bR\x0freadyToComplete\"\xad\x04\n" +
+	"\x14last_cutover_attempt\x18\a \x01(\tR\x12lastCutoverAttemptJ\x04\b\b\x10\tR\x11ready_to_complete\"\xd2\x04\n" +
 	"\rTableProgress\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12\x1d\n" +
@@ -3665,7 +3689,8 @@ const file_tern_proto_rawDesc = "" +
 	"\vchange_type\x18\r \x01(\x0e2\x13.tern.v1.ChangeTypeR\n" +
 	"changeType\x122\n" +
 	"\x15checksum_rows_checked\x18\x0e \x01(\x03R\x13checksumRowsChecked\x12.\n" +
-	"\x13checksum_rows_total\x18\x0f \x01(\x03R\x11checksumRowsTotal\"\xc7\x03\n" +
+	"\x13checksum_rows_total\x18\x0f \x01(\x03R\x11checksumRowsTotal\x12#\n" +
+	"\rerror_message\x18\x10 \x01(\tR\ferrorMessage\"\xc7\x03\n" +
 	"\x10ProgressResponse\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12$\n" +
 	"\x05state\x18\x02 \x01(\x0e2\x0e.tern.v1.StateR\x05state\x12'\n" +

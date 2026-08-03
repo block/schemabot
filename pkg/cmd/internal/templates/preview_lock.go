@@ -70,6 +70,10 @@ func previewNoLockFoundOutput() {
 	WriteNoLockFound("testapp", "mysql")
 }
 
+func previewLockExistsUnderOtherTypeOutput() {
+	WriteLockExistsUnderOtherType("testapp", "mysql", "vitess")
+}
+
 func previewUnlockNotOwnedOutput() {
 	WriteUnlockNotOwned("testapp", "mysql", "block/schemabot#123")
 }

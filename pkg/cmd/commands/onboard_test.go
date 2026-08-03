@@ -3,6 +3,7 @@ package commands
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -231,24 +232,120 @@ func TestFileStatusForDryRunTreatsStatErrorsAsExisting(t *testing.T) {
 }
 
 func TestValidateOnboardPlanResult(t *testing.T) {
-	assert.NoError(t, validateOnboardPlanResult(&apitypes.PlanResponse{Environment: "production"}))
+	assert.NoError(t, validateOnboardPlanResult(&apitypes.PlanResponse{Environment: "production"}, "orders", "production"))
 	assert.NoError(t, validateOnboardPlanResult(&apitypes.PlanResponse{
 		Environment: "production",
 		LintResults: []*apitypes.LintViolationResponse{{Severity: "error", Message: "existing lint violation"}},
-	}))
+	}, "orders", "production"))
 
 	err := validateOnboardPlanResult(&apitypes.PlanResponse{
 		Environment: "production",
 		Changes: []*apitypes.SchemaChangeResponse{
-			{TableChanges: []*apitypes.TableChangeResponse{{TableName: "users", ChangeType: "ALTER"}}},
+			{
+				Namespace: "orders",
+				TableChanges: []*apitypes.TableChangeResponse{{
+					TableName:  "users",
+					ChangeType: "ALTER",
+					DDL:        "ALTER TABLE `users`\n  ADD COLUMN `email` varchar(255)",
+				}},
+			},
+		},
+	}, "orders", "production")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "database orders environment production")
+	assert.Contains(t, err.Error(), "still produce schema changes")
+	assert.Contains(t, err.Error(), "orders/users (alter): ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+
+	err = validateOnboardPlanResult(&apitypes.PlanResponse{Errors: []string{"syntax error"}}, "orders", "production")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "database orders environment production")
+	assert.Contains(t, err.Error(), "plan returned errors")
+	assert.Contains(t, err.Error(), "syntax error")
+
+	err = validateOnboardPlanResult(nil, "orders", "production")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "database orders environment production")
+	assert.Contains(t, err.Error(), "plan response is empty")
+}
+
+func TestDescribeOnboardPlanChangesIncludesVSchemaAndClampsDDL(t *testing.T) {
+	longDDL := "ALTER TABLE `users` ADD COLUMN " + strings.Repeat("`c` varchar(255), ", 20)
+	lines := describeOnboardPlanChanges(&apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{
+			{
+				Namespace:    "orders",
+				TableChanges: []*apitypes.TableChangeResponse{{TableName: "users", ChangeType: "ALTER", DDL: longDDL}},
+				Metadata:     map[string]string{"vschema": "{\"sharded\": true}"},
+			},
 		},
 	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "still produce schema changes")
+	require.Len(t, lines, 2)
+	assert.True(t, strings.HasPrefix(lines[0], "orders/users (alter): ALTER TABLE `users` ADD COLUMN"), lines[0])
+	assert.True(t, strings.HasSuffix(lines[0], "…"), lines[0])
+	assert.LessOrEqual(t, len([]rune(lines[0])), onboardVerifyDDLPreviewLimit+len("orders/users (alter): ")+len("…"))
+	assert.Equal(t, "orders: vschema change", lines[1])
+}
 
-	err = validateOnboardPlanResult(&apitypes.PlanResponse{Errors: []string{"syntax error"}})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "plan returned errors")
+// A leftover schema file for a table that no longer exists in the target is
+// the classic cause of a failed onboarding verification: the pull rewrites
+// every table in the namespace but never deletes strays, so the stale file
+// resurfaces as a spurious create. strayFiles must name exactly those files —
+// and ignore non-schema files — so the operator knows what to delete.
+func TestOnboardWritePlanStrayFiles(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		},
+	})
+	require.NoError(t, err)
+
+	// Namespace directory absent (dry run before any write): nothing to scan.
+	strays, err := plan.strayFiles()
+	require.NoError(t, err)
+	assert.Empty(t, strays)
+
+	require.NoError(t, plan.write())
+	strays, err = plan.strayFiles()
+	require.NoError(t, err)
+	assert.Empty(t, strays)
+
+	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "legacy_bak.sql"), []byte("CREATE TABLE `legacy_bak` (`id` bigint NOT NULL);\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "vschema.json"), []byte("{}"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "README.md"), []byte("docs"), 0o644))
+
+	// MySQL planning never reads vschema.json, so only the table file is stray.
+	strays, err = plan.strayFiles()
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		filepath.Join(root, "orders", "legacy_bak.sql"),
+	}, strays)
+}
+
+// For Vitess, vschema.json is a schema input: a leftover copy the pull did not
+// write proposes a VSchema the target doesn't have, so it must be flagged
+// alongside stray table files.
+func TestOnboardWritePlanStrayFilesFlagsVSchemaForVitess(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "vitess",
+		Environment: "production",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "vschema.json"), []byte("{\"sharded\": true}"), 0o644))
+
+	strays, err := plan.strayFiles()
+	require.NoError(t, err)
+	assert.Equal(t, []string{filepath.Join(root, "orders", "vschema.json")}, strays)
 }
 
 func validPullSchemaResponse() *apitypes.PullSchemaResponse {

@@ -5,6 +5,7 @@ package mysqlstore
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -1022,13 +1024,13 @@ func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 	// Hold the same target lock that the create path must acquire. The creates
 	// below use the public store API; a result before release means active
 	// apply writes are not serialized by the per-target lock.
-	guardConn, guardLockName, err := acquireApplyTargetLockConn(ctx, testDB, "testdb", "mysql", "staging")
+	guardConn, guardLockName, err := acquireApplyTargetLockConn(ctx, testDB, namedlock.MySQL{}, "testdb", "mysql", "staging")
 	require.NoError(t, err)
 	releaseGuard := func() {
 		if guardConn == nil {
 			return
 		}
-		releaseApplyTargetLockConn(ctx, guardConn, guardLockName, "test active apply guard")
+		releaseApplyTargetLockConn(ctx, namedlock.MySQL{}, guardConn, guardLockName, "test active apply guard")
 		guardConn = nil
 	}
 	t.Cleanup(releaseGuard)
@@ -1387,6 +1389,83 @@ func TestApplyStore_GetRecentLimitAndEnvironment(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
 	assert.Equal(t, "apply_recent_staging_failed", applies[0].ApplyIdentifier)
+}
+
+// TestApplyStore_GetRecentUpdatedSince verifies the status window bound: only
+// applies whose updated_at falls at or after the bound are returned, so an
+// apply that last changed before the window drops out while fresh activity
+// stays visible.
+func TestApplyStore_GetRecentUpdatedSince(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "windowdb", "mysql", "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_window_stale", 220, state.Apply.Completed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_window_fresh", 221, state.Apply.Completed, "staging")
+
+	_, err := testDB.ExecContext(ctx,
+		"UPDATE `applies` SET updated_at = ? WHERE apply_identifier = ?",
+		time.Now().Add(-2*time.Hour), "apply_window_stale")
+	require.NoError(t, err)
+
+	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit:        10,
+		Environment:  "staging",
+		UpdatedSince: time.Now().Add(-time.Hour),
+	})
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, "apply_window_fresh", applies[0].ApplyIdentifier)
+
+	applies, err = store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit:        10,
+		Environment:  "staging",
+		UpdatedSince: time.Now().Add(-3 * time.Hour),
+	})
+	require.NoError(t, err)
+	require.Len(t, applies, 2)
+}
+
+// A status summary must tally every apply matching the filters — unbounded by
+// the list limit, scoped by environment, and windowed by UpdatedSince — so an
+// operator reading a truncated status page still sees truthful totals.
+func TestApplyStore_CountRecentByState(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "countdb", "mysql", "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_completed_one", 230, state.Apply.Completed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_completed_two", 231, state.Apply.Completed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_failed", 232, state.Apply.Failed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_other_env", 233, state.Apply.Completed, "production")
+
+	counts, err := store.Applies().CountRecentByState(ctx, storage.RecentAppliesFilter{
+		Limit:       1,
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{
+		state.Apply.Completed: 2,
+		state.Apply.Failed:    1,
+	}, counts, "counts cover every matching row even when the list limit is 1")
+
+	_, err = testDB.ExecContext(ctx,
+		"UPDATE `applies` SET updated_at = ? WHERE apply_identifier = ?",
+		time.Now().Add(-2*time.Hour), "apply_count_completed_one")
+	require.NoError(t, err)
+
+	counts, err = store.Applies().CountRecentByState(ctx, storage.RecentAppliesFilter{
+		Limit:        10,
+		Environment:  "staging",
+		UpdatedSince: time.Now().Add(-time.Hour),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{
+		state.Apply.Completed: 1,
+		state.Apply.Failed:    1,
+	}, counts)
 }
 
 func TestApplyStore_GetRecentDeploymentFilterMatchesParentAndOperation(t *testing.T) {
@@ -2301,6 +2380,119 @@ func TestApplyStore_FindNextApplyRequiresTasksForPendingApply(t *testing.T) {
 	assert.Equal(t, state.Apply.Running, persisted.State)
 }
 
+// FindStuckPendingApplies is the operator's stuck-pending observability probe.
+// It surfaces pending applies a driver should already have claimed — pending
+// with child rows, the same claimability predicate FindNextApply uses — that
+// have aged past the threshold, so an operator can tell a wedged or saturated
+// driver pool from a healthy one. It must never surface a young pending apply
+// (still within normal claim latency), a pending apply with no child rows (not
+// yet claimable), or a terminal apply.
+func TestApplyStore_FindStuckPendingApplies(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	// Each pending apply needs a distinct target: apply creation rejects a
+	// second active apply for the same database/type/environment, and pending is
+	// an active state.
+	seedPending := func(t *testing.T, applyID string, planID int64, withTask bool) *storage.Apply {
+		t.Helper()
+		lock := createTestLock(t, store, "db_"+applyID, storage.DatabaseTypeMySQL, "staging")
+		apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Pending, "staging")
+		if withTask {
+			now := time.Now()
+			_, err := store.Tasks().Create(ctx, &storage.Task{
+				TaskIdentifier: "task_" + applyID,
+				ApplyID:        apply.ID,
+				PlanID:         apply.PlanID,
+				Database:       apply.Database,
+				DatabaseType:   apply.DatabaseType,
+				Engine:         storage.EngineSpirit,
+				Environment:    apply.Environment,
+				State:          state.Task.Pending,
+				TableName:      "users",
+				DDL:            "CREATE TABLE users (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+				DDLAction:      "CREATE",
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			})
+			require.NoError(t, err)
+		}
+		return apply
+	}
+	// A VSchema-only apply carries an apply_operations row but no tasks; that
+	// operation row alone makes it claimable, so the stuck scan must surface it.
+	seedPendingVSchemaOnly := func(t *testing.T, applyID string, planID int64) *storage.Apply {
+		t.Helper()
+		lock := createTestLock(t, store, "db_"+applyID, storage.DatabaseTypeVitess, "staging")
+		apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Pending, "staging")
+		now := time.Now()
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID:    apply.ID,
+			Deployment: apply.Database,
+			State:      state.ApplyOperation.Pending,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		})
+		require.NoError(t, err)
+		return apply
+	}
+	backdate := func(t *testing.T, id int64, age time.Duration) {
+		t.Helper()
+		_, err := testDB.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE applies SET created_at = NOW() - INTERVAL %d SECOND WHERE id = ?`, int(age.Seconds())),
+			id)
+		require.NoError(t, err)
+	}
+
+	// Old claimable pending applies → stuck, oldest first. The tasks arm and the
+	// apply_operations arm are both claimable, so both must be surfaced.
+	oldest := seedPending(t, "apply_oldest_claimable", 9001, true)
+	backdate(t, oldest.ID, 40*time.Minute)
+	vschemaOnly := seedPendingVSchemaOnly(t, "apply_vschema_only", 9006)
+	backdate(t, vschemaOnly.ID, 30*time.Minute)
+	older := seedPending(t, "apply_old_claimable", 9002, true)
+	backdate(t, older.ID, 20*time.Minute)
+
+	// Young claimable pending apply (created now) → below threshold, not stuck.
+	seedPending(t, "apply_young_claimable", 9003, true)
+
+	// Old pending apply with no child rows → not yet claimable, excluded.
+	noChildren := seedPending(t, "apply_old_no_children", 9004, false)
+	backdate(t, noChildren.ID, 40*time.Minute)
+
+	// Old terminal apply → not pending, excluded.
+	completedLock := createTestLock(t, store, "db_completed", storage.DatabaseTypeMySQL, "staging")
+	completed := createTestApplyWithStateAndEnv(t, store, completedLock, "apply_old_completed", 9005, state.Apply.Completed, "staging")
+	backdate(t, completed.ID, 40*time.Minute)
+
+	threshold := 10 * time.Minute
+
+	t.Run("returns aged claimable pending applies oldest first", func(t *testing.T) {
+		stuck, err := store.Applies().FindStuckPendingApplies(ctx, threshold, 0)
+		require.NoError(t, err)
+		require.Len(t, stuck, 3)
+		assert.Equal(t, oldest.ApplyIdentifier, stuck[0].ApplyIdentifier)
+		assert.Equal(t, vschemaOnly.ApplyIdentifier, stuck[1].ApplyIdentifier,
+			"a task-less pending apply with an apply_operations row must be surfaced")
+		assert.Equal(t, older.ApplyIdentifier, stuck[2].ApplyIdentifier)
+		assert.Equal(t, state.Apply.Pending, stuck[0].State)
+	})
+
+	t.Run("limit caps the result to the oldest rows", func(t *testing.T) {
+		stuck, err := store.Applies().FindStuckPendingApplies(ctx, threshold, 1)
+		require.NoError(t, err)
+		require.Len(t, stuck, 1)
+		assert.Equal(t, oldest.ApplyIdentifier, stuck[0].ApplyIdentifier)
+	})
+
+	t.Run("a threshold above every age surfaces nothing", func(t *testing.T) {
+		stuck, err := store.Applies().FindStuckPendingApplies(ctx, time.Hour, 0)
+		require.NoError(t, err)
+		assert.Empty(t, stuck)
+	})
+}
+
 // A VSchema-only apply carries an apply_operations row but no tasks — the
 // VSchema application is the whole apply. Its dual-written operation row proves
 // the create committed fully, so the pending claim must accept it; gating the
@@ -2753,7 +2945,10 @@ func TestApplyStore_FindNextApplyConcurrentPendingClaims(t *testing.T) {
 
 // TestApplyStore_ExpireRetryable verifies retryable expiry at the storage
 // layer. A retryable apply that has used all attempts becomes failed, and
-// unfinished tasks are finalized as failed with completion timestamps.
+// unfinished tasks are finalized with completion timestamps: the task that
+// had started work is failed, while a pending task that never started is
+// cancelled — it was blocked behind the failure, and marking it failed would
+// misattribute the failure to a table that did no work.
 func TestApplyStore_ExpireRetryable(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -2818,7 +3013,7 @@ func TestApplyStore_ExpireRetryable(t *testing.T) {
 	pendingTask, err := store.Tasks().Get(ctx, "task_retryable_pending")
 	require.NoError(t, err)
 	require.NotNil(t, pendingTask)
-	assert.Equal(t, state.Task.Failed, pendingTask.State)
+	assert.Equal(t, state.Task.Cancelled, pendingTask.State, "a task that never started is cancelled, not failed")
 	assert.NotNil(t, pendingTask.CompletedAt)
 }
 
@@ -3239,6 +3434,37 @@ func TestApplyStore_FindMissingSummaryComment_SummaryClaimSentinels(t *testing.T
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
 	assert.Equal(t, staleClaim.ApplyIdentifier, applies[0].ApplyIdentifier)
+}
+
+// TestApplyStore_FindMissingSummaryComment_SupersededSummaryMarker verifies a
+// superseded summary marker counts as missing: a stop's summary consumed by a
+// resume rotation belongs to an earlier terminal state, so once the apply
+// reaches its next terminal state, reconciliation must repair the summary
+// rather than treating the stale marker as posted.
+func TestApplyStore_FindMissingSummaryComment_SupersededSummaryMarker(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	superseded := seedApplyMissingSummary(t, store, "apply_summary_superseded", state.Apply.Completed, 720)
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         superseded.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 2003,
+	}))
+	require.NoError(t, store.ApplyComments().Supersede(ctx, superseded.ID, state.Comment.Summary))
+
+	live := seedApplyMissingSummary(t, store, "apply_summary_live", state.Apply.Completed, 721)
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         live.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 2004,
+	}))
+
+	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, superseded.ApplyIdentifier, applies[0].ApplyIdentifier)
 }
 
 func TestApplyStore_GetByPR(t *testing.T) {

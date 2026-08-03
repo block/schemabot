@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -248,11 +250,11 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 	if controlReq == nil {
 		return nil
 	}
+	// Bind the apply's identity once so every consumption log line is
+	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
+	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if cutoverRequestResolvedByApplyState(apply.State) {
-		c.logger.Info("completing pending cutover request for resolved apply",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
+		logger.Info("completing pending cutover request for resolved apply",
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
@@ -267,10 +269,7 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
 	if state.IsState(apply.State, state.Apply.Recovering) {
-		c.logger.Info("pending cutover request is waiting for recovery to complete",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
+		logger.Info("pending cutover request is waiting for recovery to complete",
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 		return nil
@@ -280,10 +279,7 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		return fmt.Errorf("check cutover readiness for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if !readyForCutover {
-		c.logger.Info("pending cutover request is waiting for cutover-ready state",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
+		logger.Info("pending cutover request is waiting for cutover-ready state",
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 		return nil
@@ -306,8 +302,8 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		// rejection clears on its own. Leave the request pending so the next
 		// progress tick retries it — terminally failing it would strand a
 		// deferred cutover until an operator notices and re-issues the command.
-		c.logger.Info("pending cutover request not accepted yet by engine backend; retrying at the next progress tick",
-			append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq), "error", err)...)
+		logger.Info("pending cutover request not accepted yet by engine backend; retrying at the next progress tick",
+			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq), "error", err)...)
 		return nil
 	}
 	if err != nil {
@@ -337,10 +333,7 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover); err != nil {
 		return err
 	}
-	c.logger.Info("pending cutover request accepted and completed",
-		"apply_id", apply.ApplyIdentifier,
-		"database", apply.Database,
-		"environment", apply.Environment,
+	logger.Info("pending cutover request accepted and completed",
 		"requested_by", controlRequestCaller(controlReq),
 		"state", apply.State)
 	return nil
@@ -534,6 +527,17 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 	// returns the progress data reflects the true final state of each table.
 	stopCreds, err := c.stopEngineForTasks(ctx, eng, tasks, targetApplyID)
 	if err != nil {
+		if engine.IsAlreadyCompleted(err) {
+			skippedCount, settleErr := c.settleControlForCompletedEngineChange(ctx, "stop", tasks, targetApplyID, targetApply, caller, err)
+			if settleErr != nil {
+				return nil, settleErr
+			}
+			return &ternv1.StopResponse{
+				Accepted:     true,
+				SkippedCount: skippedCount,
+				ErrorMessage: "Schema change already completed before the stop; apply recorded as completed",
+			}, nil
+		}
 		return nil, fmt.Errorf("engine stop failed: %w", err)
 	}
 
@@ -657,6 +661,17 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 	eng := c.getEngine()
 	applyCancel := c.currentApplyCancel()
 	if err := c.cancelEngineForTasks(ctx, eng, tasks, targetApplyID); err != nil {
+		if engine.IsAlreadyCompleted(err) {
+			skippedCount, settleErr := c.settleControlForCompletedEngineChange(ctx, "cancel", tasks, targetApplyID, targetApply, caller, err)
+			if settleErr != nil {
+				return nil, settleErr
+			}
+			return &ternv1.CancelResponse{
+				Accepted:     true,
+				SkippedCount: skippedCount,
+				ErrorMessage: "Schema change already completed before the cancel; apply recorded as completed",
+			}, nil
+		}
 		return nil, fmt.Errorf("engine cancel failed: %w", err)
 	}
 	c.cancelApplyHandle(applyCancel)
@@ -768,7 +783,14 @@ func (c *LocalClient) settleCancelForTasklessApply(ctx context.Context, targetAp
 	apply.UpdatedAt = now
 	c.logger.Info("cancel settled task-less apply as cancelled",
 		append(apply.LogAttrs(), "previous_state", previousState, "requested_by", caller)...)
-	c.settleOperationRowsForTasklessApply(ctx, apply, state.ApplyOperation.Cancelled)
+	// The cancel is committed and authoritative, so it is still reported as
+	// accepted. A row left behind belongs to a resolved apply, which no claim arm
+	// reaches: it stays pending until an operator settles it, and nothing else
+	// will.
+	if err := c.settleOperationRowsForTasklessApply(ctx, apply, state.ApplyOperation.Cancelled); err != nil {
+		c.logger.Error("cancel settled the apply but left operation rows unsettled; they stay pending under a cancelled apply until an operator settles them",
+			append(apply.LogAttrs(), "target_operation_state", state.ApplyOperation.Cancelled, "error", err)...)
+	}
 	c.notifyTerminalObserver(apply, nil)
 	return &ternv1.CancelResponse{Accepted: true}, nil
 }
@@ -777,17 +799,19 @@ func (c *LocalClient) settleCancelForTasklessApply(ctx context.Context, targetAp
 // apply_operations rows to the apply's settled state so the operation rows
 // agree with the apply row the task-less settle just wrote. The settle runs
 // inside a claimed drive, so the lease in ctx guards each write and a lost
-// claim fails closed in storage. A load or write failure is logged, never
-// returned: the apply-level settle is the authoritative outcome, and the next
-// operation claim's terminal-parent reconciliation settles any row this pass
-// could not move.
-func (c *LocalClient) settleOperationRowsForTasklessApply(ctx context.Context, apply *storage.Apply, operationState string) {
+// claim fails closed in storage.
+//
+// Every row is attempted before returning, so one failing write does not strand
+// the rest, and the failures are returned joined. The caller decides what an
+// unsettled row means: the apply-level settle already committed and is
+// authoritative, but what happens to the row afterwards depends on which state
+// the apply settled to, so the caller — not this function — owns that story.
+func (c *LocalClient) settleOperationRowsForTasklessApply(ctx context.Context, apply *storage.Apply, operationState string) error {
 	ops, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
-		c.logger.Error("task-less settle could not load operation rows; the apply is settled and the next operation claim will reconcile them",
-			append(apply.LogAttrs(), "target_operation_state", operationState, "error", err)...)
-		return
+		return fmt.Errorf("load operation rows for task-less settle of apply %s to %s: %w", apply.ApplyIdentifier, operationState, err)
 	}
+	var settleErrs []error
 	for _, op := range ops {
 		if !operationRowSettlesWithTasklessApply(op.State, operationState) {
 			c.logger.Info("task-less settle leaving terminal operation row unchanged",
@@ -807,13 +831,8 @@ func (c *LocalClient) settleOperationRowsForTasklessApply(ctx context.Context, a
 			writeErr = c.storage.ApplyOperations().MarkTerminal(ctx, op.ID, operationState)
 		}
 		if writeErr != nil {
-			c.logger.Error("task-less settle could not move operation row to the apply's settled state; the next operation claim will reconcile it",
-				append(apply.LogAttrs(),
-					"apply_operation_id", op.ID,
-					"operation_deployment", op.Deployment,
-					"operation_state", op.State,
-					"target_operation_state", operationState,
-					"error", writeErr)...)
+			settleErrs = append(settleErrs, fmt.Errorf("move apply_operation %d (%s) from %s to %s: %w",
+				op.ID, op.Deployment, op.State, operationState, writeErr))
 			continue
 		}
 		c.logger.Info("task-less settle moved operation row to the apply's settled state",
@@ -823,6 +842,7 @@ func (c *LocalClient) settleOperationRowsForTasklessApply(ctx context.Context, a
 				"previous_operation_state", op.State,
 				"operation_state", operationState)...)
 	}
+	return errors.Join(settleErrs...)
 }
 
 // operationRowSettlesWithTasklessApply reports whether a task-less settle may
@@ -879,7 +899,14 @@ func (c *LocalClient) settleStopForTasklessApply(ctx context.Context, targetAppl
 	apply.UpdatedAt = time.Now()
 	c.logger.Info("stop settled task-less apply as stopped",
 		append(apply.LogAttrs(), "previous_state", previousState, "requested_by", caller)...)
-	c.settleOperationRowsForTasklessApply(ctx, apply, state.ApplyOperation.Stopped)
+	// The stop is committed and authoritative, so it is still reported as
+	// accepted. A row left behind still resolves on its own: a stopped apply is
+	// resumable, so its pending rows stay claimable and the next claim mirrors
+	// the parent's stopped state onto them.
+	if err := c.settleOperationRowsForTasklessApply(ctx, apply, state.ApplyOperation.Stopped); err != nil {
+		c.logger.Error("stop settled the apply but left operation rows unsettled; the next operation claim mirrors the stopped parent onto them",
+			append(apply.LogAttrs(), "target_operation_state", state.ApplyOperation.Stopped, "error", err)...)
+	}
 	c.notifyTerminalObserver(apply, nil)
 	return &ternv1.StopResponse{Accepted: true}, nil
 }
@@ -890,16 +917,13 @@ func (c *LocalClient) settleStopForTasklessApply(ctx context.Context, targetAppl
 // this, a stop and a start that race into the same claim would consume only the
 // stop, leaving the apply stopped with a pending start that the claim
 // lease-freshness gate cannot re-claim until the lease goes stale.
-func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, apply *storage.Apply) (bool, error) {
+func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, logger *slog.Logger, apply *storage.Apply) (bool, error) {
 	hasPendingStart, err := hasPendingStartControlRequest(ctx, c.storage, apply)
 	if err != nil {
 		return true, fmt.Errorf("check pending start request after stop for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if hasPendingStart {
-		c.logger.Info("pending stop completed but a start is queued; continuing to resume in the same claim",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
+		logger.Info("pending stop completed but a start is queued; continuing to resume in the same claim",
 			"state", apply.State)
 		return false, nil
 	}
@@ -914,20 +938,21 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	if controlReq == nil {
 		return false, nil
 	}
+	// Bind the apply's identity once so every consumption log line is
+	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
+	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if completed, err := completePendingStopIfStoredApplyResolved(ctx, c.storage, apply); err != nil {
 		return true, err
 	} else if completed {
-		c.logger.Info("completing pending stop request for resolved apply",
-			"apply_id", apply.ApplyIdentifier,
+		logger.Info("completing pending stop request for resolved apply",
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending stop request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		return c.stopHandledUnlessStartPending(ctx, apply)
+		return c.stopHandledUnlessStartPending(ctx, logger, apply)
 	}
 	if state.IsTerminalApplyState(apply.State) {
-		c.logger.Info("completing pending stop request for terminal apply",
-			"apply_id", apply.ApplyIdentifier,
+		logger.Info("completing pending stop request for terminal apply",
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
@@ -935,7 +960,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 			return true, err
 		}
-		return c.stopHandledUnlessStartPending(ctx, apply)
+		return c.stopHandledUnlessStartPending(ctx, logger, apply)
 	}
 
 	// A revert-phase apply has already cut over. Stop is a permanent rejection,
@@ -946,8 +971,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		return true, err
 	} else if revertPhase != "" {
 		message := revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase)
-		c.logger.Warn("rejecting pending stop request: schema change is in a revert phase and has already cut over",
-			"apply_id", apply.ApplyIdentifier,
+		logger.Warn("rejecting pending stop request: schema change is in a revert phase and has already cut over",
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State,
 			"revert_phase", revertPhase)
@@ -992,9 +1016,12 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 	if controlReq == nil {
 		return false, nil
 	}
+	// Bind the apply's identity once so every consumption log line is
+	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
+	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
-		c.logger.Info("completing pending cancel request for terminal apply",
-			append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
+		logger.Info("completing pending cancel request for terminal apply",
+			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending cancel request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
@@ -1006,8 +1033,8 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		return true, err
 	} else if revertPhase != "" {
 		message := revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase)
-		c.logger.Warn("rejecting pending cancel request: schema change is in a revert phase and has already cut over",
-			append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq), "revert_phase", revertPhase)...)
+		logger.Warn("rejecting pending cancel request: schema change is in a revert phase and has already cut over",
+			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq), "revert_phase", revertPhase)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending cancel request rejected: %s%s", message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel, message); err != nil {
@@ -1460,6 +1487,84 @@ func (c *LocalClient) markApplyCancelled(ctx context.Context, applyID int64) err
 	return nil
 }
 
+// settleControlForCompletedEngineChange terminalizes a stop or cancel that the
+// engine rejected because the schema change had already completed on its
+// backend before the operation arrived. The backend's terminal outcome is
+// authoritative: the change is live on the target, so the stored apply and its
+// still-active tasks settle to completed — recording them stopped or cancelled
+// would misrepresent a schema change that actually landed — and the accepted
+// settle lets the durable control request resolve, so the operator's claim
+// loop stops re-running an operation the engine will reject forever. Returns
+// the number of targeted tasks that were already terminal. An apply already in
+// a non-resumable terminal state keeps its outcome. operation names the
+// rejected verb ("stop" or "cancel") for logs and the apply event.
+func (c *LocalClient) settleControlForCompletedEngineChange(ctx context.Context, operation string, tasks []*storage.Task, targetApplyID int64, targetApply *storage.Apply, caller string, rejection error) (int64, error) {
+	now := time.Now()
+	var completedCount, skippedCount, applyID int64
+	if targetApply != nil {
+		applyID = targetApply.ID
+	}
+	for _, task := range tasks {
+		if targetApplyID > 0 && task.ApplyID != targetApplyID {
+			continue
+		}
+		if applyID == 0 && task.ApplyID > 0 {
+			applyID = task.ApplyID
+		}
+		if state.IsTerminalTaskState(task.State) {
+			skippedCount++
+			continue
+		}
+		task.ProgressPercent = 100
+		task.CompletedAt = &now
+		c.transitionTaskState(ctx, task, task.ApplyID, state.Task.Completed,
+			fmt.Sprintf("Task %s completed on the engine before the %s took effect", task.TaskIdentifier, operation))
+		completedCount++
+	}
+	if applyID == 0 {
+		return 0, fmt.Errorf("%s found the schema change already completed on the engine, but resolved no apply to settle: %w", operation, rejection)
+	}
+	apply, err := c.storage.Applies().Get(ctx, applyID)
+	if err != nil {
+		return 0, fmt.Errorf("load apply %d to settle %s for a completed schema change: %w", applyID, operation, err)
+	}
+	if apply == nil {
+		return 0, fmt.Errorf("load apply %d to settle %s for a completed schema change: %w", applyID, operation, storage.ErrApplyNotFound)
+	}
+	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
+		c.logger.Info(operation+" found the schema change already completed on the engine and the apply already terminal; accepting without a state change",
+			append(apply.LogAttrs(), "requested_by", caller)...)
+		return skippedCount, nil
+	}
+	previousState := apply.State
+	apply.State = state.Apply.Completed
+	apply.CompletedAt = &now
+	apply.UpdatedAt = now
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		return 0, fmt.Errorf("mark apply %s completed after %s found the schema change already completed on the engine: %w", apply.ApplyIdentifier, operation, err)
+	}
+	c.logger.Warn("engine rejected "+operation+" because the schema change already completed; apply settled as completed",
+		append(apply.LogAttrs(), "requested_by", caller, "previous_state", previousState, "error", rejection)...)
+	eventMsg := fmt.Sprintf("%s arrived after the schema change completed on the engine; apply recorded as completed (%d tasks completed, %d already terminal)",
+		capitalizeControlVerb(operation), completedCount, skippedCount)
+	if caller != "" {
+		eventMsg += callerApplyLogSuffix(caller)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+		eventMsg, previousState, state.Apply.Completed)
+	c.notifyTerminalObserver(apply, tasks)
+	return skippedCount, nil
+}
+
+// capitalizeControlVerb upper-cases the first letter of a control verb for use
+// at the start of an operator-facing apply event message.
+func capitalizeControlVerb(operation string) string {
+	if operation == "" {
+		return operation
+	}
+	return strings.ToUpper(operation[:1]) + operation[1:]
+}
+
 // controlSetup resolves the active task, credentials, and engine for a control operation.
 // Returns an error if no active schema change exists or no engine is configured.
 func (c *LocalClient) controlSetup(ctx context.Context) (*storage.Task, *engine.Credentials, engine.Engine, error) {
@@ -1720,7 +1825,7 @@ func (c *LocalClient) processPendingVolumeControlRequest(ctx context.Context, ap
 			message = result.Message
 		}
 		c.logger.Warn("engine did not accept pending volume request; schema change continues at its current volume",
-			append(apply.LogAttrs(), "volume", volume, "requested_by", caller, "message", message)...)
+			append(apply.LogAttrs(), "volume", volume, "requested_by", caller, "engine_message", message)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Volume change to %d was not accepted: %s; schema change continues at its current volume", volume, message), "", "")
 		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationVolume, message)
@@ -1779,6 +1884,11 @@ func (c *LocalClient) convergeTaskVolumeToStoredLevel(ctx context.Context, apply
 			"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier)
 		return
 	}
+	if !taskHasTunableRowCopy(task) {
+		c.logger.Debug("task has no row-copy work for volume to tune; volume convergence skipped",
+			append(task.LogAttrs(), "ddl_action", task.DDLAction, "volume", volume)...)
+		return
+	}
 	if volume < storage.MinVolume || volume > storage.MaxVolume {
 		c.logger.Warn("stored volume level is out of range; task starts at the engine default",
 			append(task.LogAttrs(), "volume", volume)...)
@@ -1801,11 +1911,19 @@ func (c *LocalClient) convergeTaskVolumeToStoredLevel(ctx context.Context, apply
 			message = result.Message
 		}
 		c.logger.Warn("engine did not accept converging task to the stored volume level; task continues at the engine default",
-			append(task.LogAttrs(), "volume", volume, "message", message)...)
+			append(task.LogAttrs(), "volume", volume, "engine_message", message)...)
 		return
 	}
 	c.logger.Info("task volume converged to the apply's stored level",
 		append(task.LogAttrs(), "volume", volume)...)
+}
+
+// taskHasTunableRowCopy reports whether a task carries row-copy work that
+// engine volume levels tune. Volume maps to copy throughput, which only exists
+// for an ALTER's row copy; create and drop tasks run statement phases where an
+// engine volume retune restarts the schema change for no benefit.
+func taskHasTunableRowCopy(task *storage.Task) bool {
+	return strings.EqualFold(task.DDLAction, "alter")
 }
 
 // Revert reverts a completed schema change during the revert window.

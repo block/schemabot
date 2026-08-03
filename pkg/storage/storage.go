@@ -4,6 +4,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -396,9 +397,25 @@ type ApplyStore interface {
 	// Used by `schemabot status` (no args) to show recent activity.
 	GetRecent(ctx context.Context, filter RecentAppliesFilter) ([]*Apply, error)
 
+	// CountRecentByState returns how many applies match the filter, grouped by
+	// state. The filter's Limit is ignored: counts cover every matching row, so
+	// a status summary is not truncated by list pagination.
+	CountRecentByState(ctx context.Context, filter RecentAppliesFilter) (map[string]int, error)
+
 	// GetInProgress returns all applies in non-terminal states.
 	// Note: For recovery, use FindNextApply which handles locking.
 	GetInProgress(ctx context.Context) ([]*Apply, error)
+
+	// FindStuckPendingApplies returns pending applies that FindNextApply should
+	// already have claimed — pending with child rows (the child-rows arm of
+	// FindNextApply's pending predicate) — but whose created_at is older than
+	// olderThan, ordered oldest first and capped at limit. It is a read-only
+	// diagnostic: apply creation rejects a second active apply for the same
+	// target rather than queuing it, so a pending apply this old is not waiting
+	// its turn — either no driver is claiming (a starved or crash-looping
+	// operator pool) or the claim path is wedged. Returns an empty slice when
+	// nothing is stuck. A non-positive limit means no cap.
+	FindStuckPendingApplies(ctx context.Context, olderThan time.Duration, limit int) ([]*Apply, error)
 
 	// FindNextApply atomically claims the next apply that needs attention.
 	// A claim selects one apply that needs work and refreshes its heartbeat in
@@ -468,10 +485,12 @@ type ApplyStore interface {
 	// FindMissingSummaryComment returns GitHub-backed applies that recently
 	// reached a terminal state (including stopped, judged by updated_at since a
 	// resumable stop keeps completed_at NULL) but whose progress comment was
-	// never followed by a summary comment — either no summary marker exists, or
-	// only a claim sentinel stale for longer than SummaryClaimStaleAfter
-	// remains from a publisher that crashed before posting. Used by startup
-	// reconciliation to post missing summary comments after restarts.
+	// never followed by a summary comment — no summary marker exists, the
+	// marker is superseded (a stop's summary consumed by a resume rotation, so
+	// the current terminal state's summary was never posted), or only a claim
+	// sentinel stale for longer than SummaryClaimStaleAfter remains from a
+	// publisher that crashed before posting. Used by startup reconciliation to
+	// post missing summary comments after restarts.
 	FindMissingSummaryComment(ctx context.Context) ([]*Apply, error)
 
 	// GetByPR returns all applies for a PR.
@@ -504,6 +523,12 @@ type RecentAppliesFilter struct {
 	Environment string
 	Deployment  string
 	States      []string
+	// UpdatedSince, when set, restricts results to applies whose updated_at
+	// falls at or after this instant. Filtering on updated_at rather than
+	// started_at keeps two kinds of applies visible in a window: those that
+	// reached a terminal state within it, and those started earlier but
+	// still active (progress keeps touching updated_at).
+	UpdatedSince time.Time
 }
 
 // RetryableExpirationReason identifies why operator retry recovery stopped.
@@ -619,7 +644,10 @@ type ApplyCommentStore interface {
 
 	// ClaimSummaryComment atomically claims the right to publish the terminal
 	// summary comment for an apply by inserting the summary marker as a claim
-	// sentinel (github_comment_id = 0). Exactly one caller wins per apply: the
+	// sentinel (github_comment_id = 0). A superseded marker — a stop's summary
+	// consumed by a resume rotation — does not block the claim: it is converted
+	// back into a claim sentinel, since the summary it recorded belongs to an
+	// earlier terminal state. Exactly one caller wins per terminal state: the
 	// winner posts the summary and records the real comment ID via Upsert; every
 	// loser skips. The claim — not the apply lease — is the exactly-once
 	// authority for the summary, so a writer whose lease was re-claimed (stop
@@ -784,6 +812,40 @@ type ApplyOperationStore interface {
 	// is resumable, so completed_at is left nil. Apply-lease guarded when a lease
 	// is present in ctx.
 	MarkPendingStoppedByApply(ctx context.Context, applyID int64) (int64, error)
+
+	// ReapStranded mirrors the parent's outcome onto pending, unleased operation
+	// rows whose parent apply settled long enough ago to be quiescent, returning
+	// what it reaped (at most limit rows, oldest first). A pending row under a
+	// settled parent describes work that will never run — the rollout's verdict was
+	// recorded on the parent — so leaving it pending makes that state mean two
+	// different things and hides genuinely stranded work behind harmless history.
+	//
+	// Only completed, failed, cancelled, and reverted parents qualify. stopped and
+	// failed_retryable parents are resumable: their pending rows belong to the
+	// resume path, which claims them once the parent is active again. Each write
+	// is guarded on the row still being pending and unleased, so a row a driver
+	// claimed or advanced in the meantime is skipped rather than overwritten, and
+	// the parent apply row is never touched.
+	//
+	// One instance reaps per pass, guarded by an advisory lock;
+	// ErrStrandedReaperBusy reports that another instance holds it. The lock is an
+	// efficiency gate, not a safety one: every write is already guarded and
+	// idempotent, so concurrent reapers would be correct but would each pay the
+	// full scan to find rows the first one already settled.
+	ReapStranded(ctx context.Context, limit int) ([]*ReapedOperation, error)
+}
+
+// ErrStrandedReaperBusy reports that another instance holds the stranded-operation
+// reaper lock, so this pass did no work. It is an expected outcome on every
+// instance but one, not a failure.
+var ErrStrandedReaperBusy = errors.New("another instance is reaping stranded apply operations")
+
+// ReapedOperation records one operation row settled from its parent apply's
+// outcome, carrying both rows so callers can log what the reaper did with the
+// canonical triage attributes.
+type ReapedOperation struct {
+	Operation *ApplyOperation
+	Parent    *Apply
 }
 
 // ApplyLogStore manages apply log entries for debugging and audit.
@@ -802,7 +864,8 @@ type ApplyLogStore interface {
 	// caller rendering a tail needs.
 	GetRecentByApply(ctx context.Context, applyID int64, limit int) ([]*ApplyLog, error)
 
-	// List returns logs matching the filter criteria, ordered by created_at.
+	// List returns the newest Limit logs matching the filter criteria,
+	// ordered by created_at ascending so the result reads chronologically.
 	List(ctx context.Context, filter ApplyLogFilter) ([]*ApplyLog, error)
 }
 
