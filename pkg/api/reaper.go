@@ -110,21 +110,34 @@ func (s *Service) strandedReaperLoop(ctx context.Context, stop <-chan struct{}, 
 // the expected outcome on every instance but one, so it is not an error.
 func (s *Service) runStrandedReaperPass(ctx context.Context) {
 	reaped, err := s.storage.ApplyOperations().ReapStranded(ctx, strandedReaperBatch)
-	if errors.Is(err, storage.ErrStrandedReaperBusy) {
-		s.logger.Debug("operator: another instance is reaping stranded apply operations; skipping this pass")
-		return
-	}
-	if err != nil {
-		s.logger.Error("operator: failed to reap stranded apply operations", "error", err)
-		metrics.RecordOperatorClaimFailure(ctx, "stranded_reaper_error")
-		return
-	}
+
+	// Report what landed before handling the error. A failed pass still returns
+	// the rows it settled before failing, and those writes are committed — an
+	// operator asking who changed a settled apply's rows must find them.
 	for _, settled := range reaped {
 		parent, op := settled.Parent, settled.Operation
 		s.logger.Info("operator: reaped a stranded apply operation to its parent apply's recorded outcome",
 			append(parent.LogAttrs(),
 				"apply_operation_id", op.ID,
 				"operation_deployment", op.Deployment)...)
-		metrics.RecordOperatorStrandedOperationReaped(ctx, parent.Database, parent.Deployment, parent.Environment, parent.State)
+		metrics.RecordOperatorStrandedOperationReaped(ctx, parent.Database, op.Deployment, parent.Environment, parent.State)
+	}
+
+	if errors.Is(err, storage.ErrStrandedReaperBusy) {
+		s.logger.Debug("operator: another instance is reaping stranded apply operations; skipping this pass")
+		return
+	}
+	if ctx.Err() != nil {
+		// A pass interrupted by shutdown is a routine deploy, not a fault, and
+		// must not tick the claim-failure counter operators alert on.
+		s.logger.Debug("operator: stranded-operation reaper pass interrupted by shutdown",
+			"reaped_before_shutdown", len(reaped), "error", err)
+		return
+	}
+	if err != nil {
+		s.logger.Error("operator: failed to reap stranded apply operations",
+			"reaped_before_failure", len(reaped), "error", err)
+		metrics.RecordOperatorClaimFailure(ctx, "stranded_reaper_error")
+		return
 	}
 }

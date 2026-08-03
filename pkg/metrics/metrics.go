@@ -810,8 +810,17 @@ func RecordOperatorResumeFailure(ctx context.Context, database, deployment, envi
 // rate that keeps climbing means something is actively stranding operations, so
 // the investigation belongs on the producer — a path that terminalizes a parent
 // apply without settling its children — not on the reaper.
+//
+// deployment is the reaped operation's own deployment, the routing key that says
+// which target the settled row belonged to; stranded rows arise in exactly the
+// multi-deployment applies where it differs from the parent's.
+//
+// This counter is emitted under the operator name only. The deprecated
+// schemabot.scheduler.* alias exists to carry pre-existing series through one
+// release, and a metric introduced after that rename has no legacy series to
+// migrate.
 func RecordOperatorStrandedOperationReaped(ctx context.Context, database, deployment, environment, parentState string) {
-	addOperatorCounter(ctx, "stranded_operations_reaped_total",
+	addCounter(ctx, "schemabot.operator.stranded_operations_reaped_total",
 		"Total number of stranded apply operations the reaper settled from their parent apply's outcome", "{operation}",
 		attribute.String("database", database),
 		DeploymentAttribute(deployment),

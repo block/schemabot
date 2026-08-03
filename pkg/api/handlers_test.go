@@ -121,6 +121,8 @@ type staticApplyOperationStore struct {
 	err             error
 	resumeStateByOp map[int64]*storage.EngineResumeState
 	resumeStateErr  error
+	reaped          []*storage.ReapedOperation
+	reapErr         error
 }
 
 func (s *staticApplyOperationStore) ListByApply(_ context.Context, applyID int64) ([]*storage.ApplyOperation, error) {
@@ -164,9 +166,11 @@ func (s *staticApplyOperationStore) GetEngineResumeState(_ context.Context, oper
 }
 
 // ReapStranded is called by the stranded-operation reaper, which starts with the
-// operator, so every double reachable from the operator lifecycle answers it.
+// operator, so every double reachable from the operator lifecycle answers it. It
+// can return settlements and an error together, the way a pass that fails partway
+// reports the rows it already committed.
 func (s *staticApplyOperationStore) ReapStranded(context.Context, int) ([]*storage.ReapedOperation, error) {
-	return nil, nil
+	return s.reaped, s.reapErr
 }
 
 type staticPlanStore struct {
