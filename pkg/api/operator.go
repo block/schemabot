@@ -1025,14 +1025,14 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, 
 			append(op.LogAttrs(),
 				"driver", driverID,
 				"error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
+		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_load_error")
 		return
 	}
 	if parent == nil {
 		s.logger.Error("operator: parent apply not found for claimed operation; operation will be retried once its lease goes stale",
 			append(op.LogAttrs(),
 				"driver", driverID)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
+		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_missing")
 		return
 	}
 	if state.IsTerminalApplyState(parent.State) {

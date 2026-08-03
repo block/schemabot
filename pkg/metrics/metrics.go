@@ -842,6 +842,7 @@ var knownOperatorClaimFailureReasons = map[string]bool{
 	"operation_parent_missing":                true,
 	"operation_parent_claim_error":            true,
 	"operation_parent_not_claimable":          true,
+	"operation_lease_release_error":           true,
 	"missing_operation_deployment":            true,
 	"stop_reconciliation_claim_error":         true,
 	"stop_reconciliation_missing_lease_token": true,
