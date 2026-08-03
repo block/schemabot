@@ -428,6 +428,141 @@ func TestOperator_ReconcilesClaimedOperationWhoseParentSettled(t *testing.T) {
 	assert.Equal(t, state.Apply.Completed, parent.State, "the settled parent's outcome is untouched")
 }
 
+// TestOperator_StartResumesStoppedApplyWhoseDeploymentsNeverStarted covers a
+// rollout stopped before any of its deployments began: the apply is stopped and
+// every operation row is still pending, so there is no already-started row for
+// the resume to go through. An accepted start request must still be serviced —
+// the operator claims the never-started operation and drives the deployment to
+// completion — otherwise the request would be durably recorded and then acted on
+// by nothing, and the only escape would be cancelling and losing the rollout.
+func TestOperator_StartResumesStoppedApplyWhoseDeploymentsNeverStarted(t *testing.T) {
+	ctx := t.Context()
+	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
+	require.NoError(t, err)
+
+	appDBName, appDSN := createTestDB(t, "start_resumes_never_started_")
+	ts := startTestServerOperator(t, appDBName, appDSN)
+
+	// Apply the schema normally so a plan exists, then drop the table so a
+	// replan yields DDL the resumed operation actually has to run.
+	planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database": appDBName, "environment": "staging", "type": "mysql",
+		"schema_files": map[string]any{"default": map[string]any{"files": map[string]string{"users.sql": string(schemaSQL)}}},
+	})
+	planID, _ := planResp["plan_id"].(string)
+	require.NotEmpty(t, planID)
+	applyResp := postJSON(t, "http://"+ts.Addr+"/api/apply", map[string]any{
+		"plan_id": planID, "environment": "staging",
+	})
+	require.True(t, applyResp["accepted"] == true)
+	firstApplyID, _ := applyResp["apply_id"].(string)
+	require.NotEmpty(t, firstApplyID)
+	waitForState(t, "http://"+ts.Addr, firstApplyID, "completed", 20*time.Second)
+	ts.Service.StopOperator()
+
+	targetConn, err := sql.Open("mysql", appDSN)
+	require.NoError(t, err)
+	require.NoError(t, targetConn.PingContext(ctx))
+	defer utils.CloseAndLog(targetConn)
+	_, err = targetConn.ExecContext(ctx, "DROP TABLE IF EXISTS users")
+	require.NoError(t, err)
+
+	plan2Resp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database": appDBName, "environment": "staging", "type": "mysql",
+		"schema_files": map[string]any{"default": map[string]any{"files": map[string]string{"users.sql": string(schemaSQL)}}},
+	})
+	planID2, _ := plan2Resp["plan_id"].(string)
+	plan2, err := ts.Storage.Plans().Get(ctx, planID2)
+	require.NoError(t, err)
+
+	// The wedge shape: a stopped apply whose one deployment never started, so
+	// its operation row is still pending. The tasks carry the stop, which is
+	// where a stopped rollout's remaining work lives.
+	now := time.Now()
+	applyDBID, err := ts.Storage.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply-start-never-started",
+		PlanID:          plan2.ID,
+		Database:        appDBName,
+		DatabaseType:    "mysql",
+		Deployment:      appDBName,
+		Engine:          "spirit",
+		State:           state.Apply.Stopped,
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		StartedAt:       &now,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	require.NoError(t, err)
+
+	opID, err := ts.Storage.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    applyDBID,
+		Deployment: appDBName,
+		Target:     appDBName,
+		State:      state.ApplyOperation.Pending,
+	})
+	require.NoError(t, err)
+
+	for _, tc := range plan2.FlatDDLChanges() {
+		_, err := ts.Storage.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier:   fmt.Sprintf("task-start-never-started-%d", time.Now().UnixNano()),
+			ApplyID:          applyDBID,
+			ApplyOperationID: &opID,
+			PlanID:           plan2.ID,
+			Database:         appDBName,
+			DatabaseType:     "mysql",
+			Engine:           "spirit",
+			State:            state.Task.Stopped,
+			Namespace:        tc.Namespace,
+			TableName:        tc.Table,
+			DDL:              tc.DDL,
+			DDLAction:        tc.Operation,
+			Options:          []byte("{}"),
+			Environment:      "staging",
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		})
+		require.NoError(t, err)
+	}
+
+	_, _, err = ts.Storage.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     applyDBID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "test",
+	})
+	require.NoError(t, err)
+
+	ts.Service.StartOperator(t.Context())
+	defer ts.Service.StopOperator()
+
+	require.Eventually(t, func() bool {
+		op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		return op != nil && state.IsState(op.State, state.ApplyOperation.Completed)
+	}, 30*time.Second, 200*time.Millisecond,
+		"a start request must resume a stopped rollout whose deployments never started")
+
+	// The rollout really ran: the parent settles from its operation row and the
+	// dropped table is back on the target.
+	parent, err := ts.Storage.Applies().Get(ctx, applyDBID)
+	require.NoError(t, err)
+	require.NotNil(t, parent)
+	assert.Equal(t, state.Apply.Completed, parent.State, "the resumed apply settles from its completed operation")
+
+	var tableName string
+	require.NoError(t, targetConn.QueryRowContext(ctx, "SHOW TABLES LIKE 'users'").Scan(&tableName),
+		"the resumed deployment must have run its DDL against the target")
+	assert.Equal(t, "users", tableName)
+
+	// The start request is consumed rather than left pending forever.
+	require.Eventually(t, func() bool {
+		req, err := ts.Storage.ControlRequests().GetPending(ctx, applyDBID, storage.ControlOperationStart)
+		return err == nil && req == nil
+	}, 10*time.Second, 100*time.Millisecond,
+		"the serviced start request is completed")
+}
+
 // TestOperator_StopReconciliationDrivesTaskStop covers the operation-claim stop
 // path for an apply whose operation row is still pending when a stop is
 // requested — the window before the operator claims and drives the operation.
