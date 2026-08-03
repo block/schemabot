@@ -586,10 +586,11 @@ func (h *Handler) processDurableCheckRunCompleted(ctx context.Context, event *st
 	}
 
 	installationID, parseErr := strconv.ParseInt(event.TenantID, 10, 64)
-	if parseErr != nil {
-		// A non-numeric TenantID is a corrupted/enqueue-side bug, distinct from a
-		// legitimately empty tenant; surface it rather than silently folding it
-		// into the payload fallback below.
+	if parseErr != nil && event.TenantID != "" {
+		// A non-empty, non-numeric TenantID is a corrupted/enqueue-side bug,
+		// distinct from a legitimately empty tenant (a legacy row that stored no
+		// tenant, which parses as an error too); surface only the corrupted case
+		// rather than silently folding it into the payload fallback below.
 		h.logger.Warn("durable check_run completion has an unparseable tenant ID; falling back to the payload installation",
 			"delivery_id", event.DeliveryID, "tenant_id", event.TenantID,
 			"repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA, "error", parseErr)

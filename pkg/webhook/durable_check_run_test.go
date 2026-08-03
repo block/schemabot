@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -481,6 +482,51 @@ func TestDurableCheckRunDriverCompletionRetriesFoldFailure(t *testing.T) {
 		t.Fatal("expected a fold failure to be marked failed")
 	}
 	require.Empty(t, store.completed)
+}
+
+// A stored tenant that is missing and one that is corrupted are different
+// conditions: a legacy row with no tenant falls back to the payload installation
+// silently, while a non-numeric tenant is an enqueue-side bug an operator should
+// see. Only the corrupted case warns, so legacy rows do not generate misleading
+// "unparseable tenant ID" noise on every re-fold.
+func TestDurableCheckRunDriverCompletionWarnsOnlyForCorruptedTenant(t *testing.T) {
+	refold := func(t *testing.T, tenantID string) string {
+		t.Helper()
+		event := durableCheckRunCompletedEvent(t)
+		event.TenantID = tenantID
+		store := newScriptedWebhookEventStore(event)
+
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+		ghClient, mux := setupGitHubServer(t)
+		serveCheckRunPRHead(t, mux, "head-sha")
+		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7/files", func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{}))
+		})
+		service := api.New(&durableWebhookTestStorage{webhookEvents: store}, aggregateLeaderConfig(), nil, logger)
+		factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghClient, testLogger())}
+		h := NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch())
+
+		h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+		select {
+		case <-store.completed:
+		default:
+			t.Fatal("expected the completion re-fold to be marked completed via the payload installation")
+		}
+		require.Empty(t, store.failed)
+		return logBuf.String()
+	}
+
+	t.Run("missing tenant", func(t *testing.T) {
+		require.NotContains(t, refold(t, ""), "unparseable tenant ID",
+			"a legacy row with no stored tenant is missing, not corrupted")
+	})
+
+	t.Run("corrupted tenant", func(t *testing.T) {
+		require.Contains(t, refold(t, "not-a-number"), "unparseable tenant ID",
+			"a non-numeric stored tenant is an enqueue-side bug an operator must see")
+	})
 }
 
 // A leader's re-fold on a current head runs discovery (proving the leader fold
