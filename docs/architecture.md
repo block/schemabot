@@ -725,13 +725,13 @@ store pending apply + tasks
 best-effort operator wake
       |
       v
-driver calls FindNextApply()
+driver calls FindNextApplyOperation()
       |
       v
-claim row + refresh heartbeat
+claim operation row + parent apply lease
       |
       v
-TernClient.ResumeApply()
+TernClient.ResumeApplyOperation()
       |
       v
 dispatch through LocalClient or GRPCClient

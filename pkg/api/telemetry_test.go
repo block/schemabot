@@ -261,7 +261,7 @@ func TestSchemaBotMetricsIncludeEnvironmentAttribute(t *testing.T) {
 	metrics.RecordLockOperation(t.Context(), "acquire", "mydb", "success")
 	metrics.RecordOperatorResume(t.Context(), "mydb", "pie", "staging", "running")
 	metrics.RecordOperatorResumeFailure(t.Context(), "mydb", "pie", "staging", "no_client")
-	metrics.RecordOperatorClaimFailure(t.Context(), "storage_error")
+	metrics.RecordOperatorClaimFailure(t.Context(), "expire_retryable_error")
 	metrics.RecordOperatorClaimDuration(t.Context(), time.Second, "mydb", "pie", "staging", "running")
 	metrics.RecordSchemaRequestError(t.Context(), "org/repo", "apply", "mydb", "staging", "invalid_config")
 	metrics.RecordGitHubRequest(t.Context(), metrics.GitHubRequestSample{
@@ -718,7 +718,6 @@ func TestRecordOperatorMetrics(t *testing.T) {
 	metrics.RecordOperatorResume(t.Context(), "testdb", "pie", "staging", "running")
 	metrics.RecordOperatorResumeFailure(t.Context(), "testdb", "pie", "staging", "no_client")
 	metrics.RecordOperatorResumeFailure(t.Context(), "testdb", "pie", "staging", "lease_lost")
-	metrics.RecordOperatorClaimFailure(t.Context(), "storage_error")
 	metrics.RecordOperatorClaimFailure(t.Context(), "expire_retryable_error")
 	metrics.RecordOperatorClaimFailure(t.Context(), "missing_lease_token")
 	metrics.RecordOperatorClaimFailure(t.Context(), "operation_parent_not_claimable")

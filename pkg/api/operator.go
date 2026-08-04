@@ -236,8 +236,9 @@ func (s *Service) expireRetryableApplies(ctx context.Context, driverID int) {
 	}
 }
 
-// recoverApplies claims and resumes applies that need attention.
-// Each call claims one apply (if available) to keep the scheduling loop responsive.
+// recoverApplies claims and resumes work that needs attention. Each call
+// claims at most one unit — a pending-stop reconciliation, a barrier-parked
+// cutover, or an apply operation — to keep the drive loop responsive.
 func (s *Service) recoverApplies(ctx context.Context, driverID int) {
 	// Retryable-apply expiry is best-effort maintenance: run it first, but a
 	// storage failure here must not stop the driver from claiming new pending
@@ -247,50 +248,21 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int) {
 
 	owner := driverLeaseOwner(driverID)
 
-	if s.config.ShouldClaimOperations() {
-		// Service a pending stop with no claimable operation to carry it before
-		// claiming new operation work, so a queued stop wins over starting more
-		// deployments. When nothing needs stop reconciliation this is a cheap
-		// no-op and the driver falls through to the normal operation claim.
-		if s.recoverApplyPendingStop(ctx, driverID, owner) {
-			return
-		}
-		// Drive a barrier-parked cutover whose deployment-ordered turn it is
-		// before claiming new copy work, so the high-risk ordered swaps make
-		// progress ahead of starting more copy phases. Dormant until the
-		// multi-deployment fan-out lands (nothing parks at the barrier today).
-		if s.recoverApplyOperationCutover(ctx, driverID, owner) {
-			return
-		}
-		s.recoverApplyOperation(ctx, driverID, owner)
+	// Service a pending stop with no claimable operation to carry it before
+	// claiming new operation work, so a queued stop wins over starting more
+	// deployments. When nothing needs stop reconciliation this is a cheap
+	// no-op and the driver falls through to the normal operation claim.
+	if s.recoverApplyPendingStop(ctx, driverID, owner) {
 		return
 	}
-
-	apply, err := s.storage.Applies().FindNextApply(ctx, owner)
-	if err != nil {
-		s.logger.Error("operator: failed to claim apply", "driver", driverID, "lease_owner", owner, "error", err)
-		metrics.RecordOperatorClaimFailure(ctx, "storage_error")
+	// Drive a barrier-parked cutover whose deployment-ordered turn it is
+	// before claiming new copy work, so the high-risk ordered swaps make
+	// progress ahead of starting more copy phases. Dormant until the
+	// multi-deployment fan-out lands (nothing parks at the barrier today).
+	if s.recoverApplyOperationCutover(ctx, driverID, owner) {
 		return
 	}
-
-	if apply == nil {
-		s.logger.Debug("operator: no apply to claim", "driver", driverID)
-		return
-	}
-	lease := apply.Lease()
-	if !lease.Valid() {
-		s.logger.Error("operator: claimed apply without a valid lease token; operator will not resume it",
-			append(apply.LogAttrs(),
-				"driver", driverID,
-				"lease_owner", owner)...)
-		metrics.RecordOperatorClaimFailure(ctx, "missing_lease_token")
-		return
-	}
-	ctx = storage.WithApplyLease(ctx, lease)
-	// Legacy FindNextApply path drives the whole apply (applyOperationID == 0).
-	// Failures are handled inside resumeClaimedApply; the whole-apply path has no
-	// operation row to terminalize, so the return values are not needed here.
-	_, _ = s.resumeClaimedApply(ctx, driverID, apply, 0, "")
+	s.recoverApplyOperation(ctx, driverID, owner)
 }
 
 // recoverApplyOperation claims work at the apply_operations (per-deployment)
