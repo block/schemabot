@@ -2067,9 +2067,9 @@ func TestApplyStore_ClaimApplyByIDRefusesUnrecoverableRetryable(t *testing.T) {
 		apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_old_retryable", 604, state.Apply.FailedRetryable, "staging")
 		_, err := testDB.ExecContext(ctx, `
 			UPDATE applies
-			SET updated_at = NOW() - INTERVAL 2 DAY
+			SET updated_at = NOW() - INTERVAL ? DAY
 			WHERE id = ?
-		`, apply.ID)
+		`, retryableRecoveryFreshnessDays+1, apply.ID)
 		require.NoError(t, err)
 
 		claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
