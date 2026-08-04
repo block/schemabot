@@ -59,7 +59,7 @@ func TestWriteStatusListHasMoreFooter(t *testing.T) {
 	assert.Contains(t, output, "apply-example")
 	assert.Contains(t, output, "STARTED")
 	assert.NotContains(t, output, "DURATION")
-	assert.Contains(t, output, "Showing the 20 most recent schema changes. Use --limit N to show more.")
+	assert.Contains(t, output, "Showing 20 schema changes, in-flight first. Use --limit N to show more.")
 	assert.Contains(t, output, "Use 'schemabot status <apply_id>' to view details")
 }
 
@@ -84,7 +84,7 @@ func TestWriteStatusListHasMoreFooterAtMaxLimit(t *testing.T) {
 		})
 	})
 
-	assert.Contains(t, output, "Showing the 1000 most recent schema changes. This server caps status history at 1000.")
+	assert.Contains(t, output, "Showing 1000 schema changes, in-flight first. This server caps status history at 1000.")
 	assert.NotContains(t, output, "Use --limit N to show more.")
 }
 

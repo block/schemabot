@@ -16,7 +16,7 @@ type StatusCmd struct {
 	Database    string `short:"d" help:"Database name (show apply history)"`
 	Environment string `short:"e" help:"Environment filter"`
 	Deployment  string `help:"Deployment filter"`
-	Last        string `help:"Only show applies updated within this window, for example 6h or 2d; by default the list is bounded by --limit alone"`
+	Last        string `help:"Only show applies active within this window, for example 6h or 2d; counts the latest activity on the apply or any of its deployments, so a long-running change stays listed; by default the list is bounded by --limit alone"`
 	State       string `help:"Only show applies in this state, for example running, completed, or failed_retryable; cannot be combined with --failed"`
 	Limit       int    `short:"n" help:"Maximum recent applies to show (default 20, max 1000)"`
 	Failed      bool   `help:"Show only failed recent applies" name:"failed"`

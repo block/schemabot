@@ -1067,6 +1067,19 @@ func WriteStatusList(data StatusListData) {
 	writeStatusListFooter(data)
 }
 
+// writeStatusListTruncation says what a truncated page holds. The list is ranked
+// rather than purely chronological — in-flight work sorts above settled work — so
+// the notice says so: on a full page of running changes, one that finished
+// moments ago sits below the cut, and calling the page the most recent changes
+// would misdescribe what was left off.
+func writeStatusListTruncation(data StatusListData, item string) {
+	if data.MaxLimit > 0 && data.Limit >= data.MaxLimit {
+		fmt.Printf("%sShowing %d %s, in-flight first. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
+		return
+	}
+	fmt.Printf("%sShowing %d %s, in-flight first. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
+}
+
 func writeStatusListFooter(data StatusListData) {
 	fmt.Println()
 	if data.HasMore && data.Limit > 0 {
@@ -1074,11 +1087,7 @@ func writeStatusListFooter(data StatusListData) {
 		if data.FailuresOnly {
 			item = "failed schema changes"
 		}
-		if data.MaxLimit > 0 && data.Limit >= data.MaxLimit {
-			fmt.Printf("%sShowing the %d most recent %s. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
-		} else {
-			fmt.Printf("%sShowing the %d most recent %s. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
-		}
+		writeStatusListTruncation(data, item)
 	}
 	fmt.Printf("%sUse 'schemabot status <apply_id>' to view details%s\n", ANSIDim, ANSIReset)
 }
@@ -1104,12 +1113,7 @@ func writeFailedStatusList(data StatusListData) {
 
 	if data.HasMore && data.Limit > 0 {
 		fmt.Println()
-		item := "failed schema changes"
-		if data.MaxLimit > 0 && data.Limit >= data.MaxLimit {
-			fmt.Printf("%sShowing the %d most recent %s. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
-		} else {
-			fmt.Printf("%sShowing the %d most recent %s. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
-		}
+		writeStatusListTruncation(data, "failed schema changes")
 	}
 }
 
