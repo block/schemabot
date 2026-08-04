@@ -521,9 +521,10 @@ func (h *Handler) processDurablePullRequestAutoPlan(ctx context.Context, event *
 	return false, nil
 }
 
-// processDurableCheckRun routes a claimed check_run delivery by action. Only
-// rerequested is enqueued today; a row with any other action is ignored rather
-// than retried so a replayed or future-producer row cannot wedge the queue.
+// processDurableCheckRun routes a claimed check_run delivery by action.
+// rerequested re-runs auto-plan; completed re-folds the leader's aggregate. A
+// row with any other action is ignored rather than retried so a replayed or
+// future-producer row cannot wedge the queue.
 func (h *Handler) processDurableCheckRun(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
 	var payload checkRunPayload
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
@@ -532,12 +533,98 @@ func (h *Handler) processDurableCheckRun(ctx context.Context, event *storage.Web
 	switch payload.Action {
 	case "rerequested":
 		return h.processDurableCheckRunRerequest(ctx, event, payload)
+	case "completed":
+		return h.processDurableCheckRunCompleted(ctx, event, payload)
 	default:
 		h.logger.Info("durable check_run delivery ignored because action is unsupported",
 			"delivery_id", event.DeliveryID, "action", payload.Action,
 			"repo", event.Repository, "pr", event.PullRequest)
 		return false, nil
 	}
+}
+
+// processDurableCheckRunCompleted re-folds the aggregate leader's check when a
+// participant deployment's Check Run completes on a repo this deployment leads.
+// It re-validates the same guards the synchronous request path applies, then
+// folds once under the delivery lease via updateAggregateCheckOnce: an
+// operational failure (head fetch, per-environment upsert) keeps the delivery
+// retryable so a transient outage cannot drop the re-fold, while a still-pending
+// participant convergence returns no error and is handed to the in-memory
+// re-fold budget through the shared follow-up, exactly as the wrapper does.
+func (h *Handler) processDurableCheckRunCompleted(ctx context.Context, event *storage.WebhookEvent, payload checkRunPayload) (retry bool, err error) {
+	repo := payload.Repository.FullName
+	if h.service == nil || !h.service.Config().IsAggregateLeaderForRepo(repo) {
+		h.logger.Info("durable check_run completion ignored because deployment is not the aggregate leader",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", event.PullRequest,
+			"check_run_id", payload.CheckRun.ID, "check_name", payload.CheckRun.Name)
+		return false, nil
+	}
+	if h.isSchemaBotAggregateCheckName(repo, payload.CheckRun.Name) {
+		h.logger.Info("durable check_run completion ignored because it is the leader's own aggregate check",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", event.PullRequest,
+			"check_run_id", payload.CheckRun.ID, "check_name", payload.CheckRun.Name)
+		return false, nil
+	}
+	if !h.service.Config().IsRepoAllowed(repo) {
+		h.logger.Warn("durable check_run completion from unregistered repository",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", event.PullRequest,
+			"check_run_id", payload.CheckRun.ID, "check_name", payload.CheckRun.Name)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "check_run", payload.Action, repo)
+		return false, nil
+	}
+
+	pr, ok := checkRunPullRequestNumber(payload)
+	if !ok {
+		h.logger.Info("durable check_run completion ignored without pull request",
+			"delivery_id", event.DeliveryID, "repo", repo,
+			"check_run_id", payload.CheckRun.ID, "check_name", payload.CheckRun.Name,
+			"head_sha", payload.CheckRun.HeadSHA)
+		return false, nil
+	}
+	if repo == "" || payload.CheckRun.HeadSHA == "" {
+		return false, fmt.Errorf("durable check_run completion %s missing repo or head SHA", event.DeliveryID)
+	}
+
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		return false, err
+	}
+
+	// Keep the driver's run context: autoPlanBootstrap rebinds ctx to a
+	// timeout-bounded work context, and the post-fold cancellation check below
+	// must distinguish "shutdown or lease loss" (runCtx) from "the work outran
+	// its own timeout after already succeeding" (ctx).
+	runCtx := ctx
+	ctx, cancel, client, err := h.autoPlanBootstrap(ctx, repo, installationID)
+	if err != nil {
+		metrics.RecordWebhookEvent(runCtx, h.metricAppForRepo(repo), "check_run", payload.Action, repo, "auto_plan_bootstrap_failed")
+		return true, fmt.Errorf("bootstrap durable check_run completion %s for %s#%d: %w", event.DeliveryID, repo, pr, err)
+	}
+	defer cancel()
+
+	// The fold core itself verifies the head is still current (returning a
+	// leader re-fold disposition with no error for a superseded head), so no
+	// separate staleness check is needed here.
+	followUp, foldErr := h.updateAggregateCheckOnce(ctx, client, repo, pr, payload.CheckRun.HeadSHA)
+	if foldErr != nil {
+		// Operational failure (head fetch, per-environment upsert). Keep the
+		// delivery retryable so a transient outage cannot silently drop the
+		// re-fold. Participant read failures are conveyed via the retriable
+		// disposition (not this error), so they don't double-retry here.
+		return true, fmt.Errorf("re-fold aggregate for durable check_run completion %s (%s#%d): %w", event.DeliveryID, repo, pr, foldErr)
+	}
+	if ctxErr := runCtx.Err(); ctxErr != nil {
+		// The run was cancelled (shutdown or lease loss) — keep the delivery
+		// retryable so a later claim re-folds instead of completing a partial run.
+		return true, fmt.Errorf("durable check_run completion %s run cancelled during re-fold: %w", event.DeliveryID, ctxErr)
+	}
+
+	h.applyAggregateFoldFollowUp(ctx, client, repo, pr, payload.CheckRun.HeadSHA, followUp)
+	h.logger.Info("durable check_run completion re-folded aggregate",
+		"delivery_id", event.DeliveryID, "repo", repo, "pr", pr,
+		"head_sha", payload.CheckRun.HeadSHA, "check_run_id", payload.CheckRun.ID,
+		"check_name", payload.CheckRun.Name)
+	return false, nil
 }
 
 // processDurableCheckRunRerequest re-runs auto-plan for a claimed check_run

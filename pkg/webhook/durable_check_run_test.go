@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -39,6 +40,110 @@ func durableCheckRunRerequestEvent(t *testing.T) *storage.WebhookEvent {
 		TenantID:    "12345",
 		Payload:     payload,
 	}
+}
+
+// durableCheckRunCompletedEvent returns a claimable check_run completion inbox
+// row for a participant check on a repo the deployment leads, mirroring what the
+// HTTP path enqueues.
+func durableCheckRunCompletedEvent(t *testing.T) *storage.WebhookEvent {
+	t.Helper()
+	payload := []byte(`{
+		"action": "completed",
+		"check_run": {"id": 123, "name": "SchemaBot Tenant B", "status": "completed", "conclusion": "success", "head_sha": "head-sha", "pull_requests": [{"number": 7}]},
+		"repository": {"full_name": "octocat/hello-world"},
+		"installation": {"id": 12345}
+	}`)
+	return &storage.WebhookEvent{
+		Provider:    storage.WebhookProviderGitHub,
+		DeliveryID:  "delivery-check-run-completed-1",
+		Event:       "check_run",
+		Action:      "completed",
+		Repository:  "octocat/hello-world",
+		PullRequest: 7,
+		HeadSHA:     "head-sha",
+		TenantID:    "12345",
+		Payload:     payload,
+	}
+}
+
+// With durable dispatch enabled, a participant check_run completion on a led
+// repo acks fast by persisting an inbox row rather than re-folding the aggregate
+// synchronously on the request path, so a deploy mid-fold cannot drop the
+// leader's aggregate re-fold.
+func TestDurableCheckRunCompletionQueuesAndAcks(t *testing.T) {
+	events := newRecordingWebhookEventStore()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, aggregateLeaderConfig(), nil, logger)
+	clientFactory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
+	h := NewHandler(service, clientFactory, nil, logger, WithDurableWebhookDispatch())
+
+	req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{action: "completed", checkName: "SchemaBot Tenant B", headSHA: "head-sha", pr: 7}, nil)
+	req.Header.Set(headerDeliveryID, "delivery-check-run-completed-1")
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.JSONEq(t, `{"message":"check_run completion queued"}`, rr.Body.String())
+	event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-check-run-completed-1")
+	require.NoError(t, err)
+	require.NotNil(t, event)
+	require.Equal(t, "check_run", event.Event)
+	require.Equal(t, "completed", event.Action)
+	require.Equal(t, "octocat/hello-world", event.Repository)
+	require.Equal(t, 7, event.PullRequest)
+	require.Equal(t, "head-sha", event.HeadSHA)
+	require.Equal(t, "12345", event.TenantID)
+	require.NotEmpty(t, event.Payload)
+
+	select {
+	case <-clientFactory.forInstallationStarted:
+		t.Fatal("durable request path should not create a GitHub client")
+	default:
+	}
+}
+
+// A redelivered participant check_run completion (same delivery GUID) is
+// deduplicated to a single inbox row.
+func TestDurableCheckRunCompletionDeduplicatesDelivery(t *testing.T) {
+	events := newRecordingWebhookEventStore()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, aggregateLeaderConfig(), nil, logger)
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+
+	for range 2 {
+		req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{action: "completed", checkName: "SchemaBot Tenant B", headSHA: "head-sha", pr: 7}, nil)
+		req.Header.Set(headerDeliveryID, "delivery-check-run-completed-1")
+		rr := httptest.NewRecorder()
+
+		h.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+	}
+
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	require.Len(t, events.events, 1)
+}
+
+// A participant completion for a repo this deployment does not lead is rejected
+// before enqueue, so no inbox row is created even with durable dispatch enabled.
+func TestDurableCheckRunCompletionSkipsNonLeaderRepo(t *testing.T) {
+	events := newRecordingWebhookEventStore()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{Repos: map[string]api.RepoConfig{"octocat/hello-world": {}}}, nil, logger)
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+
+	req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{action: "completed", checkName: "SchemaBot Tenant B", headSHA: "head-sha", pr: 7}, nil)
+	req.Header.Set(headerDeliveryID, "delivery-check-run-completed-1")
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	require.Empty(t, events.events, "a completion on a non-leader repo must not be enqueued")
 }
 
 // With durable dispatch enabled, a check_run rerequest for a SchemaBot
@@ -121,16 +226,16 @@ func TestDurableCheckRunRerequestSkipsNonSchemaBotCheck(t *testing.T) {
 	require.Empty(t, events.events, "a non-SchemaBot check rerequest must not be enqueued")
 }
 
-// A claimed check_run delivery whose action is not rerequested (only
-// rerequested is enqueued today) is ignored and completed rather than retried,
-// so a replayed or future-producer row cannot wedge the queue.
+// A claimed check_run delivery whose action is neither rerequested nor completed
+// is ignored and completed rather than retried, so a replayed or future-producer
+// row cannot wedge the queue.
 func TestDurableCheckRunDriverCompletesUnsupportedAction(t *testing.T) {
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
 		Provider:   storage.WebhookProviderGitHub,
-		DeliveryID: "delivery-check-run-completed",
+		DeliveryID: "delivery-check-run-created",
 		Event:      "check_run",
-		Action:     "completed",
-		Payload:    []byte(`{"action":"completed"}`),
+		Action:     "created",
+		Payload:    []byte(`{"action":"created"}`),
 	})
 	h := newDurableDriverHandler(t, store, nil, nil)
 
@@ -330,4 +435,153 @@ func TestDurableCheckRunDriverRetriesBootstrapFailure(t *testing.T) {
 		t.Fatal("expected bootstrap failure to be marked failed")
 	}
 	require.Empty(t, store.completed)
+}
+
+// A claimed check_run completion for a repo this deployment does not lead is
+// completed without folding (or creating a GitHub client): only the aggregate
+// leader re-folds, so a non-leader row is inapplicable rather than retryable.
+func TestDurableCheckRunDriverCompletionSkipsNonLeader(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableCheckRunCompletedEvent(t))
+	factory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
+	h := newDurableDriverHandler(t, store, nil, factory)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case <-store.completed:
+	default:
+		t.Fatal("expected a non-leader check_run completion to be marked completed")
+	}
+	require.Empty(t, store.failed)
+	select {
+	case <-factory.forInstallationStarted:
+		t.Fatal("a non-leader completion must not create a GitHub client")
+	default:
+	}
+}
+
+// A GitHub failure while the leader re-folds is an operational error, not a
+// terminal one, so the delivery stays retryable rather than silently dropping
+// the aggregate re-fold.
+func TestDurableCheckRunDriverCompletionRetriesFoldFailure(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableCheckRunCompletedEvent(t))
+	ghClient, mux := setupGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghClient, testLogger())}
+	h := newDurableDriverHandler(t, store, aggregateLeaderConfig(), factory)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case failure := <-store.failed:
+		require.NotNil(t, failure.retryAfter, "a fold failure must stay retryable")
+		require.Contains(t, failure.errMsg, "re-fold aggregate for durable check_run completion")
+	default:
+		t.Fatal("expected a fold failure to be marked failed")
+	}
+	require.Empty(t, store.completed)
+}
+
+// The producer always stores a resolved positive installation ID in the row's
+// tenant, so a completion whose tenant does not resolve is a corrupted or
+// hand-crafted row: retrying cannot repair it, so the delivery fails
+// terminally instead of burning retry attempts on a deterministic failure.
+func TestDurableCheckRunDriverCompletionFailsUnresolvableTenantTerminally(t *testing.T) {
+	tests := []struct {
+		name     string
+		tenantID string
+		wantErr  string
+	}{
+		{name: "empty tenant", tenantID: "", wantErr: "unparseable tenant ID"},
+		{name: "corrupted tenant", tenantID: "not-a-number", wantErr: "unparseable tenant ID"},
+		{name: "negative tenant", tenantID: "-42", wantErr: "non-positive installation ID"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := durableCheckRunCompletedEvent(t)
+			event.TenantID = tt.tenantID
+			store := newScriptedWebhookEventStore(event)
+			factory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
+			h := newDurableDriverHandler(t, store, aggregateLeaderConfig(), factory)
+
+			h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+			select {
+			case failure := <-store.failed:
+				require.Nil(t, failure.retryAfter, "an unresolvable persisted tenant must not be retried")
+				require.Contains(t, failure.errMsg, tt.wantErr)
+			default:
+				t.Fatal("expected an unresolvable tenant to be marked failed")
+			}
+			require.Empty(t, store.completed)
+			select {
+			case <-factory.forInstallationStarted:
+				t.Fatal("an unresolvable tenant must not create a GitHub client")
+			default:
+			}
+		})
+	}
+}
+
+// A leader's re-fold for a head that is no longer the PR's current head is
+// completed without folding participant state: the fold core hands back a
+// leader re-fold disposition, so a fresh pass against the then-current head is
+// armed instead of retrying the superseded delivery.
+func TestDurableCheckRunDriverCompletionCompletesStaleHeadAndArmsRefold(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableCheckRunCompletedEvent(t))
+	ghClient, mux := setupGitHubServer(t)
+	serveCheckRunPRHead(t, mux, "newer-sha-999")
+	var fileListCalls atomic.Int64
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7/files", func(w http.ResponseWriter, _ *http.Request) {
+		fileListCalls.Add(1)
+		require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{}))
+	})
+	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghClient, testLogger())}
+	h := newDurableDriverHandler(t, store, aggregateLeaderConfig(), factory)
+	// Keep the armed re-fold timer from firing inside the test process;
+	// pending timers at process exit are inert.
+	h.participantRefoldDelayOverride = time.Hour
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case <-store.completed:
+	default:
+		t.Fatal("expected a stale-head completion re-fold to be marked completed")
+	}
+	require.Empty(t, store.failed)
+	require.Equal(t, int64(0), fileListCalls.Load(), "a stale-head fold must stop before participant discovery")
+
+	h.participantRefoldMu.Lock()
+	refoldAttempts := h.participantRefoldAttempts[participantRefoldKey("octocat/hello-world", 7)]
+	h.participantRefoldMu.Unlock()
+	require.Equal(t, 1, refoldAttempts, "a stale-head completion must arm a leader re-fold for the current head")
+}
+
+// A leader's re-fold on a current head runs discovery (proving the leader fold
+// executed) and completes: a PR touching no participant paths has no aggregate
+// to publish, so the delivery is done once the fold runs.
+func TestDurableCheckRunDriverCompletionRefoldsCurrentHead(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableCheckRunCompletedEvent(t))
+	ghClient, mux := setupGitHubServer(t)
+	serveCheckRunPRHead(t, mux, "head-sha")
+	var fileListCalls atomic.Int64
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7/files", func(w http.ResponseWriter, _ *http.Request) {
+		fileListCalls.Add(1)
+		require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{}))
+	})
+	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghClient, testLogger())}
+	h := newDurableDriverHandler(t, store, aggregateLeaderConfig(), factory)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case <-store.completed:
+	default:
+		t.Fatal("expected a current-head completion re-fold to be marked completed")
+	}
+	require.Empty(t, store.failed)
+	require.Equal(t, int64(1), fileListCalls.Load(), "the leader re-fold must run participant discovery")
 }
