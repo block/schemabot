@@ -304,11 +304,14 @@ func (s *Service) rejectControlIfStopPending(ctx context.Context, opName string,
 }
 
 // decodeControlRequest decodes a control request (stop/start/cutover/volume),
-// loads the apply record, and returns a Tern client using the deployment stored
-// on that apply. Control operations are scoped by apply_id + environment; the
-// database is derived from storage so callers cannot target a different
-// database than the one originally planned.
-func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, dest any,
+// loads the apply record, authorizes the caller against the apply's database,
+// and returns a Tern client using the deployment stored on that apply. Control
+// operations are scoped by apply_id + environment; the database is derived
+// from storage so callers cannot target a different database than the one
+// originally planned — which is also why per-database authorization happens
+// here, after the target resolves, and not in the middleware. operation is the
+// control operation name, used for authorization decisions and metrics.
+func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, operation string, dest any,
 	applyID, environment *string) (tern.Client, *storage.Apply, string, bool) {
 
 	decoder := json.NewDecoder(r.Body)
@@ -352,6 +355,9 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, d
 	if apply.Environment != *environment {
 		s.writeError(w, http.StatusBadRequest,
 			fmt.Sprintf("apply %q belongs to environment %q, not %q", applyIdentifier, apply.Environment, *environment))
+		return nil, nil, "", false
+	}
+	if !s.authorizeDirectWrite(w, r, operation, apply.Database, apply.Environment) {
 		return nil, nil, "", false
 	}
 	deployment, err := storedDeploymentForApply(apply)
@@ -444,7 +450,7 @@ type CutoverRequest struct {
 // handleCutover handles POST /api/cutover requests.
 func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 	var req CutoverRequest
-	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, "cutover", &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -659,7 +665,7 @@ const stopResponseStatusAlreadyRequested = apitypes.ControlStatusAlreadyRequeste
 // Records durable stop intent for the apply owner to process.
 func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 	var req StopRequest
-	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, "stop", &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -852,7 +858,7 @@ const cancelResponseStatusAlreadyRequested = apitypes.ControlStatusAlreadyReques
 
 func (s *Service) handleCancel(w http.ResponseWriter, r *http.Request) {
 	var req apitypes.ControlRequest
-	client, apply, _, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, _, ok := s.decodeControlRequest(w, r, "cancel", &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -1208,7 +1214,7 @@ const (
 // handleStart handles POST /api/start requests.
 func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	var req StartRequest
-	client, apply, _, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, _, ok := s.decodeControlRequest(w, r, "start", &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -1648,7 +1654,7 @@ const releaseResponseStatusAlreadyRequested = apitypes.ControlStatusAlreadyReque
 // deployment failure proceed with its remaining deployments.
 func (s *Service) handleRelease(w http.ResponseWriter, r *http.Request) {
 	var req ReleaseRequest
-	_, apply, _, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	_, apply, _, ok := s.decodeControlRequest(w, r, "release", &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -1812,7 +1818,7 @@ type VolumeRequest struct {
 // handleVolume handles POST /api/volume requests.
 func (s *Service) handleVolume(w http.ResponseWriter, r *http.Request) {
 	var req VolumeRequest
-	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, applyID, ok := s.decodeControlRequest(w, r, "volume", &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -1883,7 +1889,7 @@ type RevertRequest struct {
 // handleRevert handles POST /api/revert requests.
 func (s *Service) handleRevert(w http.ResponseWriter, r *http.Request) {
 	var req RevertRequest
-	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, "revert", &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -2011,7 +2017,7 @@ type SkipRevertRequest struct {
 // handleSkipRevert handles POST /api/skip-revert requests.
 func (s *Service) handleSkipRevert(w http.ResponseWriter, r *http.Request) {
 	var req SkipRevertRequest
-	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, "skip_revert", &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -2166,6 +2172,9 @@ func (s *Service) handleRollbackPlan(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		s.writeControlError(w, "rollback plan", apply, err)
+		return
+	}
+	if !s.authorizeDirectWrite(w, r, "rollback_plan", apply.Database, apply.Environment) {
 		return
 	}
 

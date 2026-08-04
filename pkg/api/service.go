@@ -700,61 +700,76 @@ func (s *Service) limitRequestBody(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// apiRoute pairs a mux pattern with its handler.
+type apiRoute struct {
+	pattern string
+	handler http.HandlerFunc
+}
+
+// apiRoutes is the service's complete route table. ConfigureRoutes registers
+// it; the write-tier authorization sweep test enumerates it, so every
+// mutating route added here must carry a handler-level authorizeDirect*
+// check and a matching sweep fixture proving a scoped operator is denied
+// outside their grant.
+func (s *Service) apiRoutes() []apiRoute {
+	return []apiRoute{
+		// Health endpoints. /livez is process liveness (no dependency checks);
+		// /health is readiness (storage-dependent). See the handler comments
+		// for why the two must not be conflated.
+		{"GET /livez", s.handleLivez},
+		{"GET /health", s.handleHealth},
+		{"GET /tern-health/{deployment}/{environment}", s.handleTernHealth},
+
+		// Config API (for CLI to discover environments)
+		{"GET /api/databases", s.handleDatabaseList},
+		{"GET /api/databases/{database}/environments", s.handleDatabaseEnvironments},
+
+		// Orchestration API
+		{"POST /api/pull", s.handlePullSchema},
+		{"POST /api/plan", s.handlePlan},
+		{"POST /api/apply", s.handleApply},
+		{"GET /api/progress/apply/{apply_id}", s.handleProgressByApplyID},
+		{"GET /api/history/{database}", s.handleDatabaseHistory},
+		{"POST /api/cutover", s.handleCutover},
+		{"POST /api/stop", s.handleStop},
+		{"POST /api/cancel", s.handleCancel},
+		{"POST /api/start", s.handleStart},
+		{"POST /api/release", s.handleRelease},
+		{"POST /api/volume", s.handleVolume},
+		{"POST /api/revert", s.handleRevert},
+		{"POST /api/skip-revert", s.handleSkipRevert},
+		{"POST /api/rollback/plan", s.handleRollbackPlan},
+		{"GET /api/status", s.handleStatus},
+		{"GET /api/logs/{database}", s.handleLogs},
+		{"GET /api/logs", s.handleLogsWithoutDatabase},
+		{"POST /api/webhooks/redrive", s.handleWebhookRedrive},
+		{"POST /api/checks/scan", s.handleChecksScan},
+		{"POST /api/checks/synthesize", s.handleChecksSynthesize},
+		{"POST /api/checks/repos", s.handleChecksRepos},
+
+		// Lock API (database-level locking)
+		{"POST /api/locks/acquire", s.handleLockAcquire},
+		{"DELETE /api/locks", s.handleLockRelease},
+		{"GET /api/locks/{database}/{dbtype}", s.handleLockGet},
+		{"GET /api/locks", s.handleLockList},
+
+		// Settings API
+		{"GET /api/settings", s.handleSettingsList},
+		{"GET /api/settings/{key}", s.handleSettingsGet},
+		{"POST /api/settings", s.handleSettingsSet},
+
+		// GitHub webhook endpoint — registered externally via RegisterWebhook
+	}
+}
+
 // ConfigureRoutes registers all HTTP routes — API and health endpoints —
 // on the given mux.
 // Every route is wrapped with a request body size limit so oversized
 // requests are rejected instead of being buffered into memory.
 func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
-	handle := func(pattern string, handler http.HandlerFunc) {
-		mux.HandleFunc(pattern, s.limitRequestBody(handler))
+	for _, route := range s.apiRoutes() {
+		mux.HandleFunc(route.pattern, s.limitRequestBody(route.handler))
 	}
-
-	// Health endpoints. /livez is process liveness (no dependency checks);
-	// /health is readiness (storage-dependent). See the handler comments for
-	// why the two must not be conflated.
-	handle("GET /livez", s.handleLivez)
-	handle("GET /health", s.handleHealth)
-	handle("GET /tern-health/{deployment}/{environment}", s.handleTernHealth)
-
-	// Config API (for CLI to discover environments)
-	handle("GET /api/databases", s.handleDatabaseList)
-	handle("GET /api/databases/{database}/environments", s.handleDatabaseEnvironments)
-
-	// Orchestration API
-	handle("POST /api/pull", s.handlePullSchema)
-	handle("POST /api/plan", s.handlePlan)
-	handle("POST /api/apply", s.handleApply)
-	handle("GET /api/progress/apply/{apply_id}", s.handleProgressByApplyID)
-	handle("GET /api/history/{database}", s.handleDatabaseHistory)
-	handle("POST /api/cutover", s.handleCutover)
-	handle("POST /api/stop", s.handleStop)
-	handle("POST /api/cancel", s.handleCancel)
-	handle("POST /api/start", s.handleStart)
-	handle("POST /api/release", s.handleRelease)
-	handle("POST /api/volume", s.handleVolume)
-	handle("POST /api/revert", s.handleRevert)
-	handle("POST /api/skip-revert", s.handleSkipRevert)
-	handle("POST /api/rollback/plan", s.handleRollbackPlan)
-	handle("GET /api/status", s.handleStatus)
-	handle("GET /api/logs/{database}", s.handleLogs)
-	handle("GET /api/logs", s.handleLogsWithoutDatabase)
-	handle("POST /api/webhooks/redrive", s.handleWebhookRedrive)
-	handle("POST /api/checks/scan", s.handleChecksScan)
-	handle("POST /api/checks/synthesize", s.handleChecksSynthesize)
-	handle("POST /api/checks/repos", s.handleChecksRepos)
-
-	// Lock API (database-level locking)
-	handle("POST /api/locks/acquire", s.handleLockAcquire)
-	handle("DELETE /api/locks", s.handleLockRelease)
-	handle("GET /api/locks/{database}/{dbtype}", s.handleLockGet)
-	handle("GET /api/locks", s.handleLockList)
-
-	// Settings API
-	handle("GET /api/settings", s.handleSettingsList)
-	handle("GET /api/settings/{key}", s.handleSettingsGet)
-	handle("POST /api/settings", s.handleSettingsSet)
-
-	// GitHub webhook endpoint — registered externally via RegisterWebhook
 }
 
 // Config returns the service's server configuration.
