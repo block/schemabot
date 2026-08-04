@@ -404,6 +404,11 @@ func (s *taskStore) CountByApplyID(ctx context.Context, applyID int64) (int64, e
 // operations load the row whose namespace/shard/table matches the operation key,
 // so TargetShards can be rebuilt from storage while reflected per-shard progress
 // rows for unsharded operations stay out of the drive pipeline.
+//
+// Rows are returned in creation order — the plan's statement order — because
+// the sequential drive executes tasks in the order this loader returns them,
+// and plans may order statements deliberately (for example, creating a
+// referenced table before the table that declares the foreign key).
 func (s *taskStore) GetByApplyOperationID(ctx context.Context, applyOperationID int64) ([]*storage.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+prefixedTaskColumns("t")+`
@@ -418,7 +423,7 @@ func (s *taskStore) GetByApplyOperationID(ctx context.Context, applyOperationID 
 					AND ao.operation_key = CONCAT(t.namespace, '/', t.shard, '/', t.table_name)
 				)
 			)
-		ORDER BY t.created_at DESC, t.id DESC
+		ORDER BY t.created_at, t.id
 	`, applyOperationID, storage.ApplyOperationKindWork)
 	if err != nil {
 		return nil, fmt.Errorf("query tasks for apply_operation %d: %w", applyOperationID, err)
