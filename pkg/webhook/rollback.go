@@ -23,7 +23,7 @@ const (
 // It looks up the specified apply, generates a rollback plan from its original schema files,
 // acquires a lock, and posts the plan for confirmation.
 func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel := h.commandContext(commandTimeout)
+	ctx, cancel := h.commandContext(context.Background(), commandTimeout)
 	defer cancel()
 
 	applyID := result.ApplyID
@@ -301,7 +301,7 @@ func (h *Handler) releaseRollbackLockAfterRejectedPlan(ctx context.Context, data
 // It verifies the lock, loads the rollback plan pinned by the preceding rollback
 // command, and executes the apply.
 func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment string, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
+	ctx, cancel, client, err := h.commandBootstrap(context.Background(), repo, installationID)
 	if err != nil {
 		h.logger.Error("rollback-confirm: failed to bootstrap command", "error", err)
 		return

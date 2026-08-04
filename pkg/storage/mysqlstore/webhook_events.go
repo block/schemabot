@@ -81,8 +81,12 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 // operator most needs it to work. Re-open:
 //   - failed and completed rows: a completed row can still have lost its
 //     follow-on work if the process died after the delivery was marked completed
-//     but before the detached plan goroutines durably recorded their plans, and
-//     re-running auto-plan on the same head SHA is idempotent.
+//     but before the detached plan goroutines durably recorded their plans.
+//     Re-running auto-plan on the same head SHA is idempotent, and re-running a
+//     mutating apply or apply-confirm command converges: the command cores
+//     re-evaluate the lock, active-apply, and re-plan gates from current state,
+//     so a redelivered succeeded command answers from that state rather than
+//     double-driving a live apply.
 //   - processing rows whose lease has expired: a driver hard-killed on its final
 //     attempt leaves the row parked in processing with attempts at the cap,
 //     which FindNext never reclaims — so it would otherwise be recoverable only
