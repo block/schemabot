@@ -157,6 +157,29 @@ func TestGetStatusWithOptions(t *testing.T) {
 	assert.Empty(t, gotFailed)
 }
 
+// The apply/rollback preflight asks only for applies still holding a target, so
+// deciding whether one database is busy never depends on settled history.
+func TestCheckActiveSchemaChangeRequestsActiveOnly(t *testing.T) {
+	var gotActive, gotEnvironment string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotActive = r.URL.Query().Get("active")
+		gotEnvironment = r.URL.Query().Get("environment")
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"active_count":1,"limit":1000,"applies":[` +
+			`{"apply_id":"apply-busy","database":"orders","environment":"staging","state":"running"}]}`))
+		require.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	active, err := CheckActiveSchemaChange(server.URL, "orders", "staging")
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	assert.Equal(t, "apply-busy", active.ApplyID)
+	assert.Equal(t, "running", active.State)
+	assert.Equal(t, "true", gotActive)
+	assert.Equal(t, "staging", gotEnvironment)
+}
+
 func TestReadSchemaFiles_RegularDirectories(t *testing.T) {
 	dir := t.TempDir()
 

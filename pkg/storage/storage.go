@@ -393,8 +393,16 @@ type ApplyStore interface {
 	// fail closed on ownership changes.
 	UpdateDerivedState(ctx context.Context, applyID int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (swapped bool, err error)
 
-	// GetRecent returns the most recent applies across all databases, ordered by creation time desc.
-	// Used by `schemabot status` (no args) to show recent activity.
+	// GetRecent returns applies across all databases for `schemabot status` (no
+	// args), in-flight work first.
+	//
+	// An apply is in flight when a driver is still on it: its latest lease
+	// heartbeat — on the apply row or any of its operations — falls inside the
+	// lease staleness window, and its state is not terminal. So a schema change
+	// still copying rows stays on the first page however long ago it started,
+	// while an abandoned or finished one sinks. In-flight applies are ordered
+	// oldest-started first; everything else by when it last changed, which for a
+	// finished apply is when it finished.
 	GetRecent(ctx context.Context, filter RecentAppliesFilter) ([]*Apply, error)
 
 	// CountRecentByState returns how many applies match the filter, grouped by
@@ -523,11 +531,18 @@ type RecentAppliesFilter struct {
 	Environment string
 	Deployment  string
 	States      []string
-	// UpdatedSince, when set, restricts results to applies whose updated_at
-	// falls at or after this instant. Filtering on updated_at rather than
-	// started_at keeps two kinds of applies visible in a window: those that
-	// reached a terminal state within it, and those started earlier but
-	// still active (progress keeps touching updated_at).
+	// ActiveOnly restricts results to applies that have not reached a terminal
+	// state — the ones that still own their target. It is expressed as "not
+	// terminal" rather than as a list of live states so that a state the registry
+	// does not know counts as active: a caller asking whether a target is busy
+	// must not be told it is free because a state was missed.
+	ActiveOnly bool
+	// UpdatedSince, when set, restricts results to applies whose last activity
+	// — the latest lease heartbeat on the apply row or any of its operations —
+	// falls at or after this instant. Windowing on activity rather than start
+	// time keeps two kinds of applies visible in a window: those that reached a
+	// terminal state within it, and those started earlier but still running,
+	// including a fanned-out apply whose heartbeats land only on its operations.
 	UpdatedSince time.Time
 }
 
