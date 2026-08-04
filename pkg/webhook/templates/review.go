@@ -47,12 +47,9 @@ func RenderReviewRequired(data ReviewGateData) string {
 	}
 
 	sb.WriteString("\n### Next steps\n")
-	switch {
-	case hasOperators:
-		sb.WriteString("1. Request a review from the operators above — any authorized reviewer can approve\n")
-	case hasOthers:
-		sb.WriteString("1. Request a review from an authorized reviewer above\n")
-	default:
+	if hasOperators || hasOthers {
+		sb.WriteString("1. Request a review from anyone listed above\n")
+	} else {
 		sb.WriteString("1. Request a review from a database operator or admin\n")
 	}
 	fmt.Fprintf(&sb, "2. Once approved, run `schemabot apply -e %s` again\n", data.Environment)

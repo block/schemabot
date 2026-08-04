@@ -2200,7 +2200,7 @@ Schema changes require approval from an authorized reviewer before applying.
 - @jdoe
 
 ### Next steps
-1. Request a review from the operators above — any authorized reviewer can approve
+1. Request a review from anyone listed above
 2. Once approved, run `schemabot apply -e staging` again
 
 </details>
@@ -2222,7 +2222,7 @@ Schema changes require approval from an authorized reviewer before applying.
 - @jdoe
 
 ### Next steps
-1. Request a review from an authorized reviewer above
+1. Request a review from anyone listed above
 2. Once approved, run `schemabot apply -e staging` again
 
 </details>

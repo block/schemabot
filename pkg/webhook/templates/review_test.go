@@ -28,7 +28,7 @@ func TestRenderReviewRequired(t *testing.T) {
 	assert.Contains(t, result, "approval from an authorized reviewer")
 	assert.Contains(t, result, "**Operators of `payments`**:\n- @org/payments-operators")
 	assert.Contains(t, result, "**Other authorized reviewers**:\n- @bob\n- @org/dba-team")
-	assert.Contains(t, result, "Request a review from the operators above — any authorized reviewer can approve")
+	assert.Contains(t, result, "Request a review from anyone listed above")
 	assert.Contains(t, result, "schemabot apply -e staging")
 }
 
@@ -48,7 +48,7 @@ func TestRenderReviewRequired_NoOperators(t *testing.T) {
 	assert.Contains(t, result, "**Authorized reviewers**:\n- @bob\n- @org/dba-team")
 	assert.NotContains(t, result, "Operators of")
 	assert.NotContains(t, result, "Other authorized reviewers")
-	assert.Contains(t, result, "Request a review from an authorized reviewer above")
+	assert.Contains(t, result, "Request a review from anyone listed above")
 }
 
 // Operators without any broader fallback principals render only the
@@ -67,7 +67,7 @@ func TestRenderReviewRequired_OperatorsOnly(t *testing.T) {
 	assert.Contains(t, result, "**Operators of `payments`**:\n- @org/payments-operators")
 	assert.NotContains(t, result, "Other authorized reviewers")
 	assert.NotContains(t, result, "**Authorized reviewers**:")
-	assert.Contains(t, result, "Request a review from the operators above — any authorized reviewer can approve")
+	assert.Contains(t, result, "Request a review from anyone listed above")
 }
 
 func TestRenderReviewRequired_NoOwners(t *testing.T) {
