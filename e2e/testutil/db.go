@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -89,34 +90,49 @@ func UniqueTableName(prefix string) string {
 	return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano()%100000)
 }
 
+// maxSeedRows bounds what a single insert is asked to generate. A request past it
+// is a mistake in the caller rather than a slow test, so it fails outright instead
+// of waiting on a statement that will not finish — and bounding the request keeps
+// the generator's capacity arithmetic well inside the range of an int.
+const maxSeedRows = 10_000_000
+
 // SeedRows inserts rowCount rows into the given table using cross-joined sequences.
 func SeedRows(t *testing.T, dsn, tableName, columns, valueTemplate string, rowCount int) {
 	t.Helper()
+	require.Positive(t, rowCount, "seed row count for %s", tableName)
+	require.LessOrEqual(t, rowCount, maxSeedRows, "seed row count for %s", tableName)
 	db, err := sql.Open("mysql", dsn)
 	require.NoError(t, err, "open mysql for seeding")
 	defer utils.CloseAndLog(db)
 
-	seqGen := `(SELECT @row := @row + 1 as seq FROM
-		(SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) a`
-	if rowCount >= 100 {
-		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) b`
-	}
-	if rowCount >= 1000 {
-		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) c`
-	}
-	if rowCount >= 10000 {
-		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) d`
-	}
-	if rowCount >= 100000 {
-		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) e`
-	}
-	seqGen += `, (SELECT @row := 0) r) nums`
-
 	query := fmt.Sprintf(`INSERT INTO %s (%s) SELECT %s FROM %s LIMIT %d`,
-		tableName, columns, valueTemplate, seqGen, rowCount)
+		tableName, columns, valueTemplate, sequenceGenerator(rowCount), rowCount)
 
-	_, err = db.ExecContext(t.Context(), query)
+	res, err := db.ExecContext(t.Context(), query)
 	require.NoError(t, err, "seed %d rows into %s", rowCount, tableName)
+
+	// Callers size their table to how long the resulting schema change must run.
+	// A table seeded short finishes its row copy before the assertions that mean
+	// to observe it mid-flight, so the shortfall fails here rather than surfacing
+	// as an unexplained timing failure in the test that asked for the rows.
+	seeded, err := res.RowsAffected()
+	require.NoError(t, err, "seeded row count for %s", tableName)
+	require.EqualValues(t, rowCount, seeded, "seeded row count for %s", tableName)
+}
+
+// sequenceGenerator returns a derived table of sequence values numbering at least
+// rowCount, built by cross-joining one ten-row digit table per decimal digit of
+// rowCount so the generator widens with what the caller asks for. Callers bound
+// rowCount by maxSeedRows, which keeps the capacity below where it could overflow.
+func sequenceGenerator(rowCount int) string {
+	const digits = `(SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9)`
+
+	var joins []string
+	for capacity := 1; capacity < rowCount || len(joins) == 0; capacity *= 10 {
+		joins = append(joins, fmt.Sprintf("%s d%d", digits, len(joins)))
+	}
+	return `(SELECT @row := @row + 1 AS seq FROM ` + strings.Join(joins, ", ") +
+		`, (SELECT @row := 0) init) nums`
 }
 
 // ClearAllTables deletes all rows from all tables in the given database.
