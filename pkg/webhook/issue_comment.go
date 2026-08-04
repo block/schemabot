@@ -879,27 +879,47 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 	parser := NewCommandParser()
 	result := parser.ParseCommand(payload.Comment.Body)
 	result.CommentID = payload.Comment.ID
+	// The two drop paths below can swallow a command the user already saw
+	// acknowledged: a config or command-spec change between enqueue and drive
+	// reclassifies a legitimately enqueued row, and the user is left waiting on
+	// the acknowledgment reaction. Warn plus a distinct completion status keeps
+	// the swallow operator-visible so the delivery can be found and redelivered.
 	if !durableIssueCommentCommandReady(result) {
-		h.logger.Info("durable issue_comment delivery ignored because its comment is not a durably dispatched command",
+		h.logger.Warn("durable issue_comment delivery completed without dispatch because its comment is not a durably dispatched command",
 			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "command", result.Action)
+		metrics.RecordWebhookEvent(ctx, h.metricAppForRepo(repo), "issue_comment", payload.Action, repo, "durable_command_not_ready")
 		return false, nil
 	}
 	if reason := h.durableIssueCommentRoutingBlock(repo, result, parser, payload.Comment.Body); reason != "" {
-		h.logger.Info("durable issue_comment delivery ignored because the request path would not have dispatched it",
+		h.logger.Warn("durable issue_comment delivery completed without dispatch because the request path would not have dispatched it",
 			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "command", result.Action, "reason", reason)
+		metrics.RecordWebhookEvent(ctx, h.metricAppForRepo(repo), "issue_comment", payload.Action, repo, "durable_command_routing_blocked")
 		return false, nil
 	}
 
+	var coreRetry bool
+	var coreErr error
 	switch result.Action {
 	case action.Apply:
-		return h.applyCommandCore(repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
+		coreRetry, coreErr = h.applyCommandCore(ctx, repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
 	case action.ApplyConfirm:
-		return h.applyConfirmCommandCore(repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
+		coreRetry, coreErr = h.applyConfirmCommandCore(ctx, repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
 	default:
 		h.logger.Info("durable issue_comment delivery ignored because its command has no durable driver",
 			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "command", result.Action)
 		return false, nil
 	}
+	if coreErr != nil {
+		return coreRetry, coreErr
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// The run was cancelled (shutdown or lease loss) — the command may have
+		// stopped partway, so keep the delivery retryable instead of completing
+		// it. The cores bound their own work with a private timeout, so ctx here
+		// only carries the driver's run lifetime.
+		return true, fmt.Errorf("durable issue_comment delivery %s run cancelled during %s command: %w", event.DeliveryID, result.Action, ctxErr)
+	}
+	return coreRetry, nil
 }
 
 // durableIssueCommentCommandReady reports whether a re-parsed comment carries

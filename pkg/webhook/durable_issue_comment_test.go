@@ -1,6 +1,9 @@
 package webhook
 
 import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -366,4 +369,104 @@ func TestDurableIssueCommentDriverCompletesUnregisteredRepo(t *testing.T) {
 		t.Fatal("unregistered repo must not create a GitHub client")
 	default:
 	}
+}
+
+// durableIssueCommentCoreConfig returns a server config where the test repo is
+// registered and the databases registry configures "orders" for production
+// only, so an apply targeting another environment reaches the command core and
+// draws a user-facing targeting rejection naming the database and environment.
+func durableIssueCommentCoreConfig() *api.ServerConfig {
+	return &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{"octocat/hello-world": {}},
+		Databases: map[string]api.DatabaseConfig{
+			"orders": {Environments: map[string]api.EnvironmentConfig{"production": {}}},
+		},
+	}
+}
+
+// newDurableIssueCommentCoreHarness builds a durable-driver handler whose stub
+// GitHub server carries the routes the apply command core walks for the
+// driver's PR — pull request, changed files, and a schemabot.yaml resolving to
+// database "orders" — plus a recorder capturing posted PR comments. onComment,
+// when non-nil, runs before each comment post is recorded.
+func newDurableIssueCommentCoreHarness(t *testing.T, store storage.WebhookEventStore, cfg *api.ServerConfig, onComment func()) (*Handler, chan string) {
+	t.Helper()
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"head": map[string]any{"sha": "abc123", "ref": "feature-branch"},
+			"base": map[string]any{"sha": "def456", "ref": "main"},
+			"user": map[string]any{"login": "testuser"},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7/files", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode([]map[string]string{{
+			"filename": "schemabot.yaml",
+			"status":   "modified",
+		}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schemabot.yaml", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
+			"type":     "file",
+			"encoding": "base64",
+			"content":  base64.StdEncoding.EncodeToString([]byte("database: orders\ntype: mysql\n")),
+		}))
+	})
+	recorder := commentRecorder(t, comments)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/7/comments", func(w http.ResponseWriter, r *http.Request) {
+		if onComment != nil {
+			onComment()
+		}
+		recorder(w, r)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	})
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	h := newDurableDriverHandler(t, store, cfg, &fakeClientFactory{client: installClient})
+	return h, comments
+}
+
+// A routed apply command must reach the command core with the payload's
+// environment and database threaded intact: the driver takes the enqueued row
+// through config discovery to the core's user-facing answer — here a targeting
+// rejection naming both the discovered database and the requested environment
+// — and completes the delivery as the command's terminal answer.
+func TestDurableIssueCommentDriverAnswersApplyThroughCore(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableIssueCommentEvent("schemabot apply -e staging"))
+	h, comments := newDurableIssueCommentCoreHarness(t, store, durableIssueCommentCoreConfig(), nil)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case <-store.completed:
+	default:
+		t.Fatal("expected the driven apply command to complete its delivery")
+	}
+	require.Empty(t, store.failed)
+	body := requireComment(t, comments, "environment-not-configured apply answer")
+	require.Contains(t, body, `database "orders" environment "staging" is not configured on this server`)
+}
+
+// Cancelling the driver's context (shutdown or lease loss) must reach the
+// in-flight command work: the run cannot prove it finished dispatching, so the
+// claim is released for another driver to re-drive rather than completed as if
+// the command had been answered.
+func TestDurableIssueCommentDriverCancelledRunReleasesClaim(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableIssueCommentEvent("schemabot apply -e staging"))
+	driveCtx, cancelDrive := context.WithCancel(t.Context())
+	t.Cleanup(cancelDrive)
+	h, _ := newDurableIssueCommentCoreHarness(t, store, durableIssueCommentCoreConfig(), cancelDrive)
+
+	h.driveNextDurableWebhook(driveCtx, 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case released := <-store.released:
+		require.Equal(t, "token-1", released.leaseToken)
+	default:
+		t.Fatal("expected the cancelled run to release its claim for re-drive")
+	}
+	require.Empty(t, store.completed, "a cancelled run must not complete the delivery")
 }

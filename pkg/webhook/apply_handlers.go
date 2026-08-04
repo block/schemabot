@@ -20,7 +20,7 @@ import (
 // discards the durability disposition, which only a durable issue_comment
 // driver consumes.
 func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) {
-	_, _ = h.applyCommandCore(repo, pr, environment, databaseName, installationID, requestedBy, result)
+	_, _ = h.applyCommandCore(context.Background(), repo, pr, environment, databaseName, installationID, requestedBy, result)
 }
 
 // applyCommandCore generates a plan, acquires a lock, and applies automatically
@@ -48,10 +48,14 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 // post best-effort error comments too, so a durable driver re-driving one may
 // post the same comment again.
 //
+// The parent context scopes the command beyond its own timeout: the
+// synchronous wrapper passes context.Background(), while the durable driver
+// passes its run context so lease loss or shutdown cancels in-flight work.
+//
 // The core logs each failure at its site, so the synchronous wrapper can discard
 // the result without losing observability.
-func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) (bool, error) {
-	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
+func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) (bool, error) {
+	ctx, cancel, client, err := h.commandBootstrap(parent, repo, installationID)
 	if err != nil {
 		h.logger.Error("apply: failed to bootstrap command", "repo", repo, "pr", pr, "database", databaseName, "environment", environment, "error", err)
 		return true, fmt.Errorf("apply command bootstrap %s#%d: %w", repo, pr, err)
@@ -406,7 +410,7 @@ func (h *Handler) applyCommandCore(repo string, pr int, environment, databaseNam
 // discards the durability disposition, which only a durable issue_comment
 // driver consumes.
 func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) {
-	_, _ = h.applyConfirmCommandCore(repo, pr, environment, databaseName, installationID, requestedBy, result)
+	_, _ = h.applyConfirmCommandCore(context.Background(), repo, pr, environment, databaseName, installationID, requestedBy, result)
 }
 
 // applyConfirmCommandCore verifies lock ownership, re-plans for drift detection,
@@ -437,10 +441,14 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 // post best-effort error comments too, so a durable driver re-driving one may
 // post the same comment again.
 //
+// The parent context scopes the command beyond its own timeout: the
+// synchronous wrapper passes context.Background(), while the durable driver
+// passes its run context so lease loss or shutdown cancels in-flight work.
+//
 // The core logs each failure at its site, so the synchronous wrapper can discard
 // the result without losing observability.
-func (h *Handler) applyConfirmCommandCore(repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) (bool, error) {
-	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
+func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) (bool, error) {
+	ctx, cancel, client, err := h.commandBootstrap(parent, repo, installationID)
 	if err != nil {
 		h.logger.Error("apply-confirm: failed to bootstrap command", "repo", repo, "pr", pr, "database", databaseName, "environment", environment, "error", err)
 		return true, fmt.Errorf("apply-confirm command bootstrap %s#%d: %w", repo, pr, err)
@@ -633,7 +641,7 @@ func (h *Handler) applyConfirmCommandCore(repo string, pr int, environment, data
 // PRs. This lets a PR author clear a stale local-session lock from the PR
 // workflow that it is blocking.
 func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel := h.commandContext(30 * time.Second)
+	ctx, cancel := h.commandContext(context.Background(), 30*time.Second)
 	defer cancel()
 	if result.Force && result.Database == "" {
 		database, err := h.inferUnlockDatabase(ctx, repo, pr, installationID)
