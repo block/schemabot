@@ -243,10 +243,10 @@ func TestOperator_BasicClaimAndResume(t *testing.T) {
 }
 
 // TestOperator_OperatorClaimsOperationToCompletion exercises the operation-level
-// claim loop (operator_claim_operations enabled). An apply created through the
-// normal flow dual-writes exactly one apply_operations row; the operator claims
-// that row, acquires the parent apply lease, drives the schema change to
-// completion, and marks the operation row completed.
+// claim loop. An apply created through the normal flow dual-writes exactly one
+// apply_operations row; the operator claims that row, acquires the parent apply
+// lease, drives the schema change to completion, and marks the operation row
+// completed.
 func TestOperator_OperatorClaimsOperationToCompletion(t *testing.T) {
 	ctx := t.Context()
 	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")

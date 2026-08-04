@@ -19,11 +19,3 @@ databases:
       production:
         dsn: "env:TERN_TARGET_DSN"
 
-# Data-plane terns queue dispatched applies for their own operator to drive.
-# Claim at the operation level — the same mode the control plane runs — so the
-# e2e suite exercises operation-level claiming on a data plane (dispatch,
-# stop/start resume, volume, crash recovery). The serve Run path would default
-# a gRPC tern to apply-level claiming when this key is unset; apply-level
-# data-plane coverage lives in the e2e/k8s data planes, which rely on that
-# default.
-operator_claim_operations: true

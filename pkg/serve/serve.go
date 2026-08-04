@@ -139,18 +139,6 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	}
 	defer utils.CloseAndLog(srv)
 
-	// A configured GRPC_PORT means this process serves the data plane, which
-	// keeps the conservative apply-level claim default when the mode is unset
-	// (config can still set it explicitly). This is a Run convenience, not a
-	// server mode: an embedder sets ServerConfig.OperatorClaimOperations
-	// directly. Applied before Start (which launches the operator) so the
-	// operator reads the resolved value.
-	if applyDataPlaneClaimDefault(cfg, grpcPort != "") {
-		srv.logger.Info("data-plane gRPC mode: defaulting operator claiming to the apply level", "grpc_port", grpcPort)
-	} else if grpcPort != "" && cfg.ShouldClaimOperations() {
-		srv.logger.Info("data-plane gRPC mode: operator claiming at the operation level (explicit config)", "grpc_port", grpcPort)
-	}
-
 	// Optionally start a gRPC server for the Tern proto (used by
 	// docker-compose.grpc.yml). Embedders attach to their own server instead.
 	if grpcPort != "" {
@@ -868,22 +856,6 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
-}
-
-// applyDataPlaneClaimDefault sets the operator claim mode for a data-plane tern
-// process. LocalClient queues dispatched applies for the storage-claiming
-// operator and dual-writes each apply's operation row, so either claim mode can
-// drive them. Data-plane processes keep the conservative apply-level default
-// when the mode is unset — the mode production data planes run — and an
-// operator opts into operation-level claiming explicitly. Reports whether the
-// default was applied.
-func applyDataPlaneClaimDefault(cfg *api.ServerConfig, isDataPlane bool) bool {
-	if !isDataPlane || cfg.OperatorClaimOperations != nil {
-		return false
-	}
-	applyLevel := false
-	cfg.OperatorClaimOperations = &applyLevel
-	return true
 }
 
 // buildServerAuthorizer constructs the API authorizer exactly as the server

@@ -1396,39 +1396,6 @@ func (s *singleCutoverOpStore) FindNextApplyOperationCutover(context.Context, st
 	return &op, nil
 }
 
-// expiryErrorApplyStore fails the retryable-apply expiry maintenance pass and
-// records whether the claim path (FindNextApply) was still reached afterwards.
-type expiryErrorApplyStore struct {
-	storage.ApplyStore
-	findNextCalled bool
-}
-
-func (s *expiryErrorApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {
-	return nil, errors.New("storage unavailable")
-}
-
-func (s *expiryErrorApplyStore) FindNextApply(context.Context, string) (*storage.Apply, error) {
-	s.findNextCalled = true
-	return nil, nil
-}
-
-// Retryable-apply expiry is best-effort maintenance: a storage failure there
-// must not stop a driver from claiming new pending work in the same tick, or a
-// transient expiry error would starve every queued apply behind it.
-func TestRecoverApplies_ExpiryErrorDoesNotBlockClaim(t *testing.T) {
-	applyStore := &expiryErrorApplyStore{}
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	claimOperations := false
-	cfg := testServerConfig()
-	cfg.OperatorClaimOperations = &claimOperations
-	svc := New(&mockStorageWithApplyStores{applies: applyStore}, cfg, nil, logger)
-
-	svc.recoverApplies(t.Context(), 1)
-
-	assert.True(t, applyStore.findNextCalled,
-		"FindNextApply must run even when ExpireRetryable fails")
-}
-
 // panickingResumeClient simulates an engine whose resume path hits a code or
 // data fault (for example malformed stored metadata) and panics mid-drive.
 type panickingResumeClient struct {
@@ -1477,29 +1444,12 @@ func (s *recordingTaskStore) Update(_ context.Context, task *storage.Task) error
 	return nil
 }
 
-// panicContainmentApplyStore claims a single apply, rotating a lease onto it,
-// and records the terminal write the panic containment path performs. Once the
-// apply is terminal it is no longer claimable, matching the durable claim
-// predicate.
+// panicContainmentApplyStore serves a single apply row and records the
+// terminal write the panic containment path performs.
 type panicContainmentApplyStore struct {
 	storage.ApplyStore
 	apply        *storage.Apply
-	claims       int
 	updateCalled bool
-}
-
-func (s *panicContainmentApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {
-	return nil, nil
-}
-
-func (s *panicContainmentApplyStore) FindNextApply(_ context.Context, owner string) (*storage.Apply, error) {
-	s.claims++
-	if s.apply == nil || state.IsTerminalApplyState(s.apply.State) {
-		return nil, nil
-	}
-	s.apply.LeaseOwner = owner
-	s.apply.LeaseToken = "lease-token"
-	return s.apply, nil
 }
 
 func (s *panicContainmentApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
@@ -1648,77 +1598,6 @@ func TestResumeClaimedApply_DrivePanicUnderOperationLeaseLeavesParentToProjectio
 	require.Len(t, taskStore.updated, 1, "the operation's task must be failed so the operation row can settle")
 	assert.True(t, state.IsState(taskStore.updated[0].State, state.Task.Failed))
 	assert.Contains(t, taskStore.updated[0].ErrorMessage, "corrupt operation metadata")
-}
-
-// One poisoned apply must degrade only itself: the drive tick that claims it
-// contains the panic and marks the apply failed, and the driver keeps claiming
-// fresh work on subsequent ticks instead of crashing the process.
-func TestDriveTick_ContainsDrivePanicAndKeepsClaiming(t *testing.T) {
-	client := &panickingResumeClient{panicValue: "corrupt engine metadata"}
-	apply := &storage.Apply{
-		ID:              42,
-		ApplyIdentifier: "apply-42",
-		Database:        "appdb",
-		Deployment:      "east",
-		Environment:     "staging",
-		State:           state.Apply.Running,
-	}
-	applyStore := &panicContainmentApplyStore{apply: apply}
-	taskStore := &recordingTaskStore{tasks: []*storage.Task{
-		{ID: 9, ApplyID: 42, State: state.Task.Running},
-	}}
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	claimOperations := false
-	cfg := testServerConfig()
-	cfg.OperatorClaimOperations = &claimOperations
-	svc := New(&mockStorageWithApplyStores{
-		plans:   &staticPlanStore{},
-		applies: applyStore,
-		tasks:   taskStore,
-	}, cfg, map[string]tern.Client{
-		"east/staging": client,
-	}, logger)
-
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
-	assert.Equal(t, 1, applyStore.claims)
-	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.Failed),
-		"the poisoned apply must be failed so it is not re-claimed")
-
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
-	assert.Equal(t, 2, applyStore.claims,
-		"the driver must keep claiming after containing the panic, and the failed apply must not be claimable")
-}
-
-// panickingClaimApplyStore simulates a panic in the claim machinery itself
-// (outside the engine drive), counting claim attempts.
-type panickingClaimApplyStore struct {
-	storage.ApplyStore
-	claims int
-}
-
-func (s *panickingClaimApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {
-	return nil, nil
-}
-
-func (s *panickingClaimApplyStore) FindNextApply(context.Context, string) (*storage.Apply, error) {
-	s.claims++
-	panic("claim scan hit a corrupt row")
-}
-
-// A panic in the claim machinery itself (outside the engine drive) must not
-// kill the driver goroutine: the tick boundary contains it and the driver
-// polls again on the next tick.
-func TestDriveTick_ContainsClaimPanic(t *testing.T) {
-	applyStore := &panickingClaimApplyStore{}
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	claimOperations := false
-	cfg := testServerConfig()
-	cfg.OperatorClaimOperations = &claimOperations
-	svc := New(&mockStorageWithApplyStores{applies: applyStore}, cfg, nil, logger)
-
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
-	assert.Equal(t, 2, applyStore.claims, "the driver must keep polling after each contained panic")
 }
 
 // unclaimableParentApplyStore backs the unclaimable-parent reconcile with a
@@ -1910,16 +1789,14 @@ func (s *operationClaimApplyStore) UpdateDerivedState(_ context.Context, _ int64
 	return true, nil
 }
 
-// Retryable-apply expiry is best-effort maintenance on the operation-level
-// claim ladder too: a storage failure there must not stop a driver from
-// claiming operation work in the same tick.
+// Retryable-apply expiry is best-effort maintenance: a storage failure there
+// must not stop a driver from claiming operation work in the same tick, or a
+// transient expiry error would starve every queued apply behind it.
 func TestRecoverApplies_ExpiryErrorDoesNotBlockOperationClaim(t *testing.T) {
 	applies := &operationClaimApplyStore{expireErr: errors.New("storage unavailable")}
 	ops := &claimLadderOperationStore{recoverOperationStore: &recoverOperationStore{}}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	cfg := testServerConfig()
-	cfg.OperatorClaimOperations = new(true)
-	svc := New(&mockStorageWithApplyStores{applies: applies, operations: ops}, cfg, nil, logger)
+	svc := New(&mockStorageWithApplyStores{applies: applies, operations: ops}, testServerConfig(), nil, logger)
 
 	svc.recoverApplies(t.Context(), 1)
 
@@ -1937,9 +1814,7 @@ func TestDriveTick_ContainsOperationClaimPanic(t *testing.T) {
 		claimPanic:            "claim scan hit a corrupt row",
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	cfg := testServerConfig()
-	cfg.OperatorClaimOperations = new(true)
-	svc := New(&mockStorageWithApplyStores{applies: applies, operations: ops}, cfg, nil, logger)
+	svc := New(&mockStorageWithApplyStores{applies: applies, operations: ops}, testServerConfig(), nil, logger)
 
 	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
 	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
@@ -1953,9 +1828,7 @@ func TestDriveTick_ContainsStopReconciliationProbePanic(t *testing.T) {
 	applies := &operationClaimApplyStore{stopProbePanic: "stop probe hit a corrupt row"}
 	ops := &claimLadderOperationStore{recoverOperationStore: &recoverOperationStore{}}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	cfg := testServerConfig()
-	cfg.OperatorClaimOperations = new(true)
-	svc := New(&mockStorageWithApplyStores{applies: applies, operations: ops}, cfg, nil, logger)
+	svc := New(&mockStorageWithApplyStores{applies: applies, operations: ops}, testServerConfig(), nil, logger)
 
 	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
 	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
@@ -1963,10 +1836,10 @@ func TestDriveTick_ContainsStopReconciliationProbePanic(t *testing.T) {
 	assert.Zero(t, ops.claims, "the panic consumed the tick before the operation claim")
 }
 
-// One poisoned apply must degrade only itself under operation-level claiming
-// too: the tick that claims its operation contains the drive panic, the
-// operation row and parent apply are failed so neither is re-claimed, and the
-// driver keeps claiming fresh work on subsequent ticks.
+// One poisoned apply must degrade only itself: the tick that claims its
+// operation contains the drive panic, the operation row and parent apply are
+// failed so neither is re-claimed, and the driver keeps claiming fresh work on
+// subsequent ticks instead of crashing the process.
 func TestDriveTick_ContainsDrivePanicUnderOperationClaimAndKeepsClaiming(t *testing.T) {
 	client := &panickingResumeClient{panicValue: "corrupt engine metadata"}
 	operationID := int64(7)
@@ -1990,15 +1863,13 @@ func TestDriveTick_ContainsDrivePanicUnderOperationClaimAndKeepsClaiming(t *test
 		{ID: 9, ApplyID: 42, ApplyOperationID: &operationID, State: state.Task.Running},
 	}}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	cfg := testServerConfig()
-	cfg.OperatorClaimOperations = new(true)
 	svc := New(&mockStorageWithApplyStores{
 		plans:      &staticPlanStore{},
 		applies:    applies,
 		tasks:      taskStore,
 		controls:   &fakeControlRequestStore{},
 		operations: ops,
-	}, cfg, map[string]tern.Client{
+	}, testServerConfig(), map[string]tern.Client{
 		"east/staging": client,
 	}, logger)
 
