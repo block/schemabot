@@ -382,7 +382,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	// allow-all NoneAuthorizer that lets every request through (attaching an
 	// anonymous user); with "oidc" it validates Bearer JWTs and bypasses
 	// non-API paths (/webhook, health) itself.
-	authz, err := buildAuthorizer(ctx, cfg.Auth, cfg.PRCommandAuthorization.AdminTeams, cfg.OperatorGroupUnion(), logger)
+	authz, err := buildServerAuthorizer(ctx, cfg, logger)
 	if err != nil {
 		return nil, fmt.Errorf("setup auth: %w", err)
 	}
@@ -887,6 +887,15 @@ func applyDataPlaneClaimDefault(cfg *api.ServerConfig, isDataPlane bool) bool {
 	applyLevel := false
 	cfg.OperatorClaimOperations = &applyLevel
 	return true
+}
+
+// buildServerAuthorizer constructs the API authorizer exactly as the server
+// wires it: admin teams from PR command authorization, and the operator-group
+// union that widens forward-auth write admission. Every server build and any
+// test that claims to exercise the real authorizer wiring must go through
+// this function, so the union cannot be dropped from one without the other.
+func buildServerAuthorizer(ctx context.Context, cfg *api.ServerConfig, logger *slog.Logger) (auth.Authorizer, error) {
+	return buildAuthorizer(ctx, cfg.Auth, cfg.PRCommandAuthorization.AdminTeams, cfg.OperatorGroupUnion(), logger)
 }
 
 // buildAuthorizer selects the API authorizer from config. The default
