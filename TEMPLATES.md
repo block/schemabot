@@ -2192,12 +2192,37 @@ Add `development` to `environment_order` (the server-wide list, or this database
 
 Schema changes require approval from an authorized reviewer before applying.
 
+**Operators of `testapp`**:
+- @acme/testapp-operators
+
+**Other authorized reviewers**:
+- @acme/schema-reviewers
+- @jdoe
+
+### Next steps
+1. Request a review from anyone listed above
+2. Once approved, run `schemabot apply -e staging` again
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-review-required-no-operators"></a><strong>Apply Blocked: Review Required (No Operators)</strong></summary>
+
+
+## Review Required
+
+**Database**: `testapp` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+Schema changes require approval from an authorized reviewer before applying.
+
 **Authorized reviewers**:
 - @acme/schema-reviewers
 - @jdoe
 
 ### Next steps
-1. Request a review from an authorized reviewer above
+1. Request a review from anyone listed above
 2. Once approved, run `schemabot apply -e staging` again
 
 </details>

@@ -155,7 +155,8 @@ func TestCheckReviewGate_NoReviewsBlocks(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
-	assert.Equal(t, []string{"bob"}, result.RequiredReviewers)
+	assert.Equal(t, []string{"bob"}, result.OperatorReviewers)
+	assert.Empty(t, result.OtherReviewers)
 }
 
 func TestCheckReviewGate_OperatorUserApproval(t *testing.T) {
@@ -232,7 +233,7 @@ func TestCheckReviewGate_RepoAdminUserApproval(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.True(t, result.Approved)
-	assert.Contains(t, result.RequiredReviewers, "kara")
+	assert.Contains(t, result.OtherReviewers, "kara")
 }
 
 // A repo admin team's member approval satisfies the review gate for any
@@ -262,7 +263,7 @@ func TestCheckReviewGate_RepoAdminTeamApproval(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.True(t, result.Approved)
-	assert.Contains(t, result.RequiredReviewers, "octocat/repo-admins")
+	assert.Contains(t, result.OtherReviewers, "octocat/repo-admins")
 }
 
 // An approval from someone outside the repo admin team does not satisfy the
@@ -319,7 +320,8 @@ func TestCheckReviewGate_RepoAdminOfOtherRepoBlocked(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
-	assert.NotContains(t, result.RequiredReviewers, "kara")
+	assert.NotContains(t, result.OperatorReviewers, "kara")
+	assert.NotContains(t, result.OtherReviewers, "kara")
 }
 
 func TestCheckReviewGate_NotApproved(t *testing.T) {
@@ -340,8 +342,8 @@ func TestCheckReviewGate_NotApproved(t *testing.T) {
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
 	assert.Equal(t, "alice", result.PRAuthor)
-	assert.Contains(t, result.RequiredReviewers, "bob")
-	assert.Contains(t, result.RequiredReviewers, "carol")
+	assert.Contains(t, result.OperatorReviewers, "bob")
+	assert.Contains(t, result.OperatorReviewers, "carol")
 }
 
 func TestCheckReviewGate_SelfApprovalBlocked(t *testing.T) {
@@ -428,6 +430,44 @@ func TestCheckReviewGate_OperatorTeamNotApproved(t *testing.T) {
 	assert.False(t, result.Approved)
 }
 
+// The review-required comment splits reviewers by how close each principal is
+// to the change: the database's own operators get their own leading section —
+// they are the reviewers the author should ping — while the broader fallback
+// principals (global admins, then repo admins) form the "other authorized
+// reviewers" section.
+func TestCheckReviewGate_OperatorsSplitFromOtherReviewers(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		cfg.ReviewPolicy.AdminTeams = []string{"octocat/global-admins"}
+		cfg.ReviewPolicy.AdminUsers = []string{"kara"}
+		cfg.Repos = map[string]api.RepoConfig{
+			"octocat/hello-world": {
+				AdminTeams: []string{"octocat/repo-admins"},
+				AdminUsers: []string{"dave"},
+			},
+		}
+		db := cfg.Databases["orders"]
+		db.OperatorTeams = []string{"octocat/db-admins"}
+		db.OperatorUsers = []string{"bob"}
+		cfg.Databases["orders"] = db
+	}))
+
+	registerPREndpoint(mux, "alice")
+	registerReviewsEndpoint(mux, nil)
+
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
+	require.NoError(t, err)
+
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, result.Approved)
+	assert.Equal(t, []string{"octocat/db-admins", "bob"}, result.OperatorReviewers)
+	assert.Equal(t, []string{
+		"octocat/global-admins", "kara",
+		"octocat/repo-admins", "dave",
+	}, result.OtherReviewers)
+}
+
 func TestCheckReviewGate_CodeownersIgnoredByDefault(t *testing.T) {
 	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
 		db := cfg.Databases["orders"]
@@ -452,7 +492,8 @@ func TestCheckReviewGate_CodeownersIgnoredByDefault(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
-	assert.Equal(t, []string{"bob"}, result.RequiredReviewers)
+	assert.Equal(t, []string{"bob"}, result.OperatorReviewers)
+	assert.Empty(t, result.OtherReviewers)
 }
 
 func TestCheckReviewGate_CodeownersOptIn(t *testing.T) {
@@ -478,13 +519,13 @@ func TestCheckReviewGate_CodeownersOptIn(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.True(t, result.Approved)
-	assert.Contains(t, result.RequiredReviewers, "bob")
+	assert.Contains(t, result.OtherReviewers, "bob")
 
 	result, err = h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/orders")
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
-	assert.Contains(t, result.RequiredReviewers, "carol")
+	assert.Contains(t, result.OtherReviewers, "carol")
 }
 
 func TestCheckReviewGate_NoConfiguredReviewersErrors(t *testing.T) {

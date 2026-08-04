@@ -413,14 +413,30 @@ func PreviewCommentBaseSchemaFreshnessRejected() string {
 	})
 }
 
-// PreviewCommentReviewRequired renders a sample "review required" comment.
+// PreviewCommentReviewRequired renders a sample "review required" comment:
+// the database's operators lead in their own section, with the broader
+// authorized principals as an explicit fallback.
 func PreviewCommentReviewRequired() string {
 	return RenderReviewRequired(ReviewGateData{
-		Database:    "testapp",
-		Environment: "staging",
-		RequestedBy: previewRequestedBy,
-		Reviewers:   []string{"acme/schema-reviewers", "jdoe"},
-		PRAuthor:    previewRequestedBy,
+		Database:          "testapp",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		OperatorReviewers: []string{"acme/testapp-operators"},
+		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:          previewRequestedBy,
+	})
+}
+
+// PreviewCommentReviewRequiredNoOperators renders the "review required"
+// comment for a database with no configured operators: a single flat list of
+// authorized reviewers.
+func PreviewCommentReviewRequiredNoOperators() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:       "testapp",
+		Environment:    "staging",
+		RequestedBy:    previewRequestedBy,
+		OtherReviewers: []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:       previewRequestedBy,
 	})
 }
 
