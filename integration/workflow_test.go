@@ -69,18 +69,6 @@ func startTestServer(t *testing.T, appDBName, appDSN string) testServer {
 
 func startTestServerWithOperatorInterval(t *testing.T, appDBName, appDSN string, operatorInterval time.Duration) testServer {
 	t.Helper()
-	return startTestServerWithOptions(t, appDBName, appDSN, operatorInterval, false)
-}
-
-// startTestServerOperator starts a test server whose operator claims work at
-// the apply_operations level (operator_claim_operations enabled).
-func startTestServerOperator(t *testing.T, appDBName, appDSN string) testServer {
-	t.Helper()
-	return startTestServerWithOptions(t, appDBName, appDSN, 200*time.Millisecond, true)
-}
-
-func startTestServerWithOptions(t *testing.T, appDBName, appDSN string, operatorInterval time.Duration, operatorClaimOperations bool) testServer {
-	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
@@ -97,7 +85,6 @@ func startTestServerWithOptions(t *testing.T, appDBName, appDSN string, operator
 	require.NoError(t, err, "create local client")
 
 	serverConfig := &schemabotapi.ServerConfig{
-		OperatorClaimOperations: &operatorClaimOperations,
 		Databases: map[string]schemabotapi.DatabaseConfig{
 			appDBName: {
 				Type: "mysql",

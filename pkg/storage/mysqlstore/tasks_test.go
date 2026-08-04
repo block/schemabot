@@ -4,6 +4,7 @@ package mysqlstore
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -200,14 +201,15 @@ func TestTaskStore_GetByApplyOperationID(t *testing.T) {
 	createTask("task_a_orders", "orders", opA)
 	createTask("task_b_users", "users", opB)
 
-	// region-a's operation returns only its two tasks, never region-b's.
-	// created_at is second-precision, so both tasks usually share a timestamp;
-	// the id DESC tiebreaker makes the order deterministic (newest id first).
+	// region-a's operation returns only its two tasks, never region-b's, in
+	// creation order — the plan's statement order, which the sequential drive
+	// executes as-is. created_at is second-precision, so both tasks usually
+	// share a timestamp; the id tiebreaker keeps the order deterministic.
 	tasksA, err := store.Tasks().GetByApplyOperationID(ctx, opA)
 	require.NoError(t, err)
 	require.Len(t, tasksA, 2)
-	assert.Equal(t, "task_a_orders", tasksA[0].TaskIdentifier)
-	assert.Equal(t, "task_a_users", tasksA[1].TaskIdentifier)
+	assert.Equal(t, "task_a_users", tasksA[0].TaskIdentifier)
+	assert.Equal(t, "task_a_orders", tasksA[1].TaskIdentifier)
 	for _, task := range tasksA {
 		require.NotNil(t, task.ApplyOperationID)
 		assert.Equal(t, opA, *task.ApplyOperationID)
@@ -365,6 +367,57 @@ func TestTaskStore_GetByApplyOperationIDIncludesMatchingShardedWorkTask(t *testi
 // shard key names the row's namespace/shard/table); unsharded per-table rows
 // always load; reflected per-shard progress rows — shard rows whose operation's
 // key does not match — stay out of the drive pipeline.
+// GetByApplyID returns tasks in creation order — the plan's statement order,
+// which the apply-level sequential drive executes as-is. All rows of one plan
+// are stamped with a shared timestamp and created_at has second precision, so
+// every row ties on the sort key; only the id tiebreaker keeps the order
+// deterministic. The row count is large enough that a tie-broken filesort
+// would otherwise return rows in arbitrary order.
+func TestTaskStore_GetByApplyIDReturnsTasksInCreationOrder(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_tasks_creation_order", 1)
+
+	op, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+
+	const taskCount = 20
+	now := time.Now()
+	for i := range taskCount {
+		table := fmt.Sprintf("table_%02d", i)
+		_, err := store.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier:   fmt.Sprintf("task_order_%02d", i),
+			ApplyID:          apply.ID,
+			ApplyOperationID: &op,
+			PlanID:           apply.PlanID,
+			Database:         apply.Database,
+			DatabaseType:     apply.DatabaseType,
+			Engine:           storage.EngineSpirit,
+			Environment:      apply.Environment,
+			State:            state.Task.Pending,
+			TableName:        table,
+			DDL:              "ALTER TABLE " + table + " ADD COLUMN email VARCHAR(255)",
+			DDLAction:        "ALTER",
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		})
+		require.NoError(t, err)
+	}
+
+	tasks, err := store.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, tasks, taskCount)
+	for i, task := range tasks {
+		assert.Equalf(t, fmt.Sprintf("task_order_%02d", i), task.TaskIdentifier,
+			"task at position %d is out of creation order", i)
+	}
+}
+
 func TestTaskStore_GetByApplyIDIncludesShardScopedDriveTasks(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

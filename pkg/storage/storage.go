@@ -586,8 +586,9 @@ type TaskStore interface {
 	// change; identity and DDL are preserved.
 	UpsertShardProgress(ctx context.Context, task *Task) error
 
-	// GetByApplyID returns all tasks for an apply.
-	// Used for aggregating task states to derive Apply state.
+	// GetByApplyID returns all tasks for an apply, in creation order — the
+	// plan's statement order. Apply-level drives execute tasks sequentially in
+	// the order returned here, and state aggregation reads the same list.
 	GetByApplyID(ctx context.Context, applyID int64) ([]*Task, error)
 
 	// CountByApplyID returns the number of task rows an apply owns, with no
@@ -597,12 +598,13 @@ type TaskStore interface {
 	// filtered loader did not return.
 	CountByApplyID(ctx context.Context, applyID int64) (int64, error)
 
-	// GetByApplyOperationID returns the drive tasks for a single apply_operation.
-	// Unsharded operations return their per-table tasks. Sharded work operations
-	// return the task whose namespace/shard/table matches the operation key so the
-	// drive can rebuild its shard selector. Reflected per-shard progress rows that
-	// do not match a sharded work operation key are excluded — read them via
-	// GetShardProgressByApplyOperationID.
+	// GetByApplyOperationID returns the drive tasks for a single apply_operation,
+	// in creation order — the plan's statement order, which the sequential drive
+	// executes as-is. Unsharded operations return their per-table tasks. Sharded
+	// work operations return the task whose namespace/shard/table matches the
+	// operation key so the drive can rebuild its shard selector. Reflected
+	// per-shard progress rows that do not match a sharded work operation key are
+	// excluded — read them via GetShardProgressByApplyOperationID.
 	GetByApplyOperationID(ctx context.Context, applyOperationID int64) ([]*Task, error)
 
 	// GetShardProgressByApplyOperationID returns the per-shard detail task rows

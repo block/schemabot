@@ -401,10 +401,19 @@ type capturingApplyStore struct {
 	err        error
 }
 
+// capture stores a snapshot of the apply, as real storage would materialize a
+// row. The caller keeps mutating its own struct after the create returns (for
+// example assigning the returned ID), and a concurrently running operator
+// reads the captured row — sharing the caller's pointer would race.
+func (s *capturingApplyStore) capture(apply *storage.Apply) {
+	snapshot := *apply
+	s.apply = &snapshot
+}
+
 func (s *capturingApplyStore) Create(_ context.Context, apply *storage.Apply) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.apply = apply
+	s.capture(apply)
 	if s.err != nil {
 		return 0, s.err
 	}
@@ -445,8 +454,11 @@ func (s *capturingApplyStore) CreateWithTasksAndOperations(ctx context.Context, 
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.apply = apply
-	s.operations = append(s.operations, operations...)
+	s.capture(apply)
+	for _, op := range operations {
+		snapshot := *op
+		s.operations = append(s.operations, &snapshot)
+	}
 	return applyID, nil
 }
 
@@ -467,19 +479,13 @@ func (s *capturingApplyStore) CreateWithGroupedOperations(ctx context.Context, a
 func (s *capturingApplyStore) Update(_ context.Context, apply *storage.Apply) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.apply = apply
+	s.capture(apply)
 	return nil
 }
 
-func (s *capturingApplyStore) FindNextApply(_ context.Context, owner string) (*storage.Apply, error) {
+func (s *capturingApplyStore) ClaimApplyByID(_ context.Context, _ int64, owner string) (*storage.Apply, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.findCh != nil {
-		select {
-		case s.findCh <- struct{}{}:
-		default:
-		}
-	}
 	if s.apply == nil || s.claimed {
 		return nil, nil
 	}
@@ -491,11 +497,83 @@ func (s *capturingApplyStore) FindNextApply(_ context.Context, owner string) (*s
 	return &apply, nil
 }
 
+func (s *capturingApplyStore) FindNextApplyForStopReconciliation(context.Context, string) (*storage.Apply, error) {
+	return nil, nil
+}
+
 func (s *capturingApplyStore) CheckLease(context.Context, storage.ApplyLease) error {
 	return nil
 }
 
 func (s *capturingApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {
+	return nil, nil
+}
+
+// queuedOperationClaimStore serves the operation-level claim ladder over the
+// operation rows a dual-write captured in a capturingApplyStore. The cutover
+// probe always finds nothing, so every operator tick falls through to the
+// operation claim, which signals the apply store's findCh — one observable
+// signal per tick — and leases the first captured row exactly once.
+type queuedOperationClaimStore struct {
+	storage.ApplyOperationStore
+	applies *capturingApplyStore
+	mu      sync.Mutex
+	claimed bool
+}
+
+func (s *queuedOperationClaimStore) capturedOperation() *storage.ApplyOperation {
+	s.applies.mu.Lock()
+	defer s.applies.mu.Unlock()
+	if len(s.applies.operations) == 0 {
+		return nil
+	}
+	op := *s.applies.operations[0]
+	op.ApplyID = 123
+	return &op
+}
+
+func (s *queuedOperationClaimStore) FindNextApplyOperationCutover(context.Context, string) (*storage.ApplyOperation, error) {
+	return nil, nil
+}
+
+func (s *queuedOperationClaimStore) FindNextApplyOperation(_ context.Context, owner string) (*storage.ApplyOperation, error) {
+	s.applies.mu.Lock()
+	findCh := s.applies.findCh
+	s.applies.mu.Unlock()
+	if findCh != nil {
+		select {
+		case findCh <- struct{}{}:
+		default:
+		}
+	}
+
+	op := s.capturedOperation()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if op == nil || s.claimed {
+		return nil, nil
+	}
+	s.claimed = true
+	op.LeaseOwner = owner
+	op.LeaseToken = "op-lease-token"
+	return op, nil
+}
+
+func (s *queuedOperationClaimStore) Get(context.Context, int64) (*storage.ApplyOperation, error) {
+	return s.capturedOperation(), nil
+}
+
+func (s *queuedOperationClaimStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
+	op := s.capturedOperation()
+	if op == nil {
+		return nil, nil
+	}
+	return []*storage.ApplyOperation{op}, nil
+}
+
+func (s *queuedOperationClaimStore) Heartbeat(context.Context, int64) error { return nil }
+
+func (s *queuedOperationClaimStore) ReapStranded(context.Context, int) ([]*storage.ReapedOperation, error) {
 	return nil, nil
 }
 
@@ -540,6 +618,18 @@ func (s *capturingTaskStore) GetByApplyID(_ context.Context, applyID int64) ([]*
 	var tasks []*storage.Task
 	for _, task := range s.tasks {
 		if task.ApplyID == applyID {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks, s.err
+}
+
+func (s *capturingTaskStore) GetByApplyOperationID(_ context.Context, applyOperationID int64) ([]*storage.Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var tasks []*storage.Task
+	for _, task := range s.tasks {
+		if task.ApplyOperationID != nil && *task.ApplyOperationID == applyOperationID {
 			tasks = append(tasks, task)
 		}
 	}
@@ -991,37 +1081,18 @@ func stoppedTestApply(applyID string) *storage.Apply {
 }
 
 func newExecuteApplyTestService(client tern.Client, applies storage.ApplyStore) (*Service, *capturingTaskStore) {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	tasks := &capturingTaskStore{}
-	if capturingApplies, ok := applies.(*capturingApplyStore); ok {
-		capturingApplies.taskStore = tasks
-	}
-	cfg := testServerConfig()
-	cfg.Databases = map[string]DatabaseConfig{
-		"testdb": {
-			Type: storage.DatabaseTypeMySQL,
-			Environments: map[string]EnvironmentConfig{
-				"staging": {Target: "testdb", Deployment: DefaultDeployment},
-			},
-		},
-	}
-	return New(&mockStorageWithApplyStores{
-		plans:     &staticPlanStore{plan: executeApplyTestPlan()},
-		applies:   applies,
-		tasks:     tasks,
-		locks:     &emptyLockStore{},
-		applyLogs: &noopApplyLogStore{},
-		controls:  &memoryControlRequestStore{},
-	}, cfg, map[string]tern.Client{
-		"default/staging": client,
-	}, logger), tasks
+	return newQueueApplyTestService(executeApplyTestPlan(), client, applies)
 }
 
 func newQueueApplyTestService(plan *storage.Plan, client tern.Client, applies storage.ApplyStore) (*Service, *capturingTaskStore) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	tasks := &capturingTaskStore{}
+	var operations storage.ApplyOperationStore
 	if capturingApplies, ok := applies.(*capturingApplyStore); ok {
 		capturingApplies.taskStore = tasks
+		// The operation-claim ladder reads the dual-written operation rows back
+		// through the operation store, so expose them from the same capture.
+		operations = &queuedOperationClaimStore{applies: capturingApplies}
 	}
 	cfg := testServerConfig()
 	cfg.Databases = map[string]DatabaseConfig{
@@ -1033,12 +1104,13 @@ func newQueueApplyTestService(plan *storage.Plan, client tern.Client, applies st
 		},
 	}
 	return New(&mockStorageWithApplyStores{
-		plans:     &staticPlanStore{plan: plan},
-		applies:   applies,
-		tasks:     tasks,
-		locks:     &emptyLockStore{},
-		applyLogs: &noopApplyLogStore{},
-		controls:  &memoryControlRequestStore{},
+		plans:      &staticPlanStore{plan: plan},
+		applies:    applies,
+		tasks:      tasks,
+		locks:      &emptyLockStore{},
+		applyLogs:  &noopApplyLogStore{},
+		controls:   &memoryControlRequestStore{},
+		operations: operations,
 	}, cfg, map[string]tern.Client{
 		"default/staging": client,
 	}, logger), tasks
@@ -1868,10 +1940,6 @@ func TestEnqueueAuthorizedApplyWakesOperatorForQueuedApply(t *testing.T) {
 	mock := &mockTernClient{resumeCh: make(chan *storage.Apply, 1)}
 	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), mock, applies)
 	svc.config.Drivers = 1
-	// This double models the apply-level FindNextApply claim path; the
-	// default operation-level claim path is covered by the operator
-	// integration tests.
-	svc.config.OperatorClaimOperations = new(false)
 	require.NoError(t, svc.SetOperatorPollInterval(time.Hour))
 	svc.StartOperator(t.Context())
 	t.Cleanup(svc.StopOperator)
@@ -2821,10 +2889,6 @@ func TestExecuteApplyWakesOperatorForQueuedLocalApply(t *testing.T) {
 	mock := &mockTernClient{resumeCh: make(chan *storage.Apply, 1)}
 	svc, _ := newExecuteApplyTestService(mock, applies)
 	svc.config.Drivers = 1
-	// This double models the apply-level FindNextApply claim path; the
-	// default operation-level claim path is covered by the operator
-	// integration tests.
-	svc.config.OperatorClaimOperations = new(false)
 	require.NoError(t, svc.SetOperatorPollInterval(time.Hour))
 	svc.StartOperator(t.Context())
 	t.Cleanup(svc.StopOperator)
