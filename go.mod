@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.14
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.41.1
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3
-	github.com/block/spirit v0.15.2-0.20260731132010-e94e99be2c1b
+	github.com/block/spirit v0.16.1-0.20260804150650-0f9ac219835d
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
@@ -274,8 +274,3 @@ replace github.com/pingcap/tidb/pkg/parser => github.com/block/tidb/pkg/parser v
 // type-preserving JSON binlog decoding. Revert to upstream go-mysql once
 // the new flag lands. See https://github.com/morgo/go-mysql/tree/mysql-text-json-rendering.
 replace github.com/go-mysql-org/go-mysql => github.com/morgo/go-mysql v1.16.1-0.20260723231236-3aced1dddcf4
-
-// Pinned to a fork with the in-flight check.StatementRefusal entry point, which
-// this repo uses to classify statements Spirit refuses. Revert to upstream
-// spirit once it lands. See https://github.com/block/spirit/pull/1108.
-replace github.com/block/spirit => github.com/morgo/spirit v0.0.0-20260802121703-50dab2ba1c3d
