@@ -207,8 +207,11 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 			}
 		}
 	}
-	appendRequiredReviewers(reviewPolicy.AdminTeams, reviewPolicy.AdminUsers, repoAdminTeams, repoAdminUsers)
 
+	// RequiredReviewers is the PR-facing list on the review-required comment,
+	// ordered by how close each principal is to the change: the database's own
+	// operators first — they are the reviewers the author should ping — then
+	// the global admin principals, then repo admins, with codeowners last.
 	if config.ReviewPolicyIncludesDatabaseOperators() {
 		dbConfig := config.Database(database)
 		if dbConfig == nil {
@@ -218,6 +221,8 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 		policy.OperatorUsers = dbConfig.OperatorUsers
 		appendRequiredReviewers(dbConfig.OperatorTeams, dbConfig.OperatorUsers)
 	}
+
+	appendRequiredReviewers(reviewPolicy.AdminTeams, reviewPolicy.AdminUsers, repoAdminTeams, repoAdminUsers)
 
 	if reviewPolicy.IncludeCodeowners {
 		owners, err := matchReviewGateCodeowners(ctx, client, repo, baseRef, schemaPath)

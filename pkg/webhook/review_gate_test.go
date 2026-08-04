@@ -428,6 +428,42 @@ func TestCheckReviewGate_OperatorTeamNotApproved(t *testing.T) {
 	assert.False(t, result.Approved)
 }
 
+// The review-required comment lists reviewers by how close each principal is
+// to the change: the database's own operators first — they are the reviewers
+// the author should ping — then the global admin principals, then repo admins.
+func TestCheckReviewGate_OperatorsListedBeforeAdmins(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		cfg.ReviewPolicy.AdminTeams = []string{"octocat/global-admins"}
+		cfg.ReviewPolicy.AdminUsers = []string{"kara"}
+		cfg.Repos = map[string]api.RepoConfig{
+			"octocat/hello-world": {
+				AdminTeams: []string{"octocat/repo-admins"},
+				AdminUsers: []string{"dave"},
+			},
+		}
+		db := cfg.Databases["orders"]
+		db.OperatorTeams = []string{"octocat/db-admins"}
+		db.OperatorUsers = []string{"bob"}
+		cfg.Databases["orders"] = db
+	}))
+
+	registerPREndpoint(mux, "alice")
+	registerReviewsEndpoint(mux, nil)
+
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
+	require.NoError(t, err)
+
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, result.Approved)
+	assert.Equal(t, []string{
+		"octocat/db-admins", "bob",
+		"octocat/global-admins", "kara",
+		"octocat/repo-admins", "dave",
+	}, result.RequiredReviewers)
+}
+
 func TestCheckReviewGate_CodeownersIgnoredByDefault(t *testing.T) {
 	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
 		db := cfg.Databases["orders"]
