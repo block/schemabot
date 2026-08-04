@@ -1720,3 +1720,94 @@ func TestDriveTick_ContainsClaimPanic(t *testing.T) {
 	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
 	assert.Equal(t, 2, applyStore.claims, "the driver must keep polling after each contained panic")
 }
+
+// unclaimableParentApplyStore backs the unclaimable-parent reconcile with a
+// fixed answer from Get: a storage error, a missing row, or a parent apply.
+type unclaimableParentApplyStore struct {
+	storage.ApplyStore
+	apply  *storage.Apply
+	getErr error
+}
+
+func (s *unclaimableParentApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+	return s.apply, nil
+}
+
+// releaseRecordingOperationStore records whether the reconcile released the
+// operation lease. It embeds the interface so any other call panics, keeping
+// the test honest about the code path it covers.
+type releaseRecordingOperationStore struct {
+	storage.ApplyOperationStore
+	released bool
+}
+
+func (s *releaseRecordingOperationStore) ReleaseClaim(context.Context, storage.OperationLease) (bool, error) {
+	s.released = true
+	return true, nil
+}
+
+// When the parent apply cannot be established — the load fails or the row is
+// missing — the driver must retain the operation lease it just claimed and
+// fail closed: releasing on uncertainty would let a peer immediately re-claim
+// into the same failure, thrashing claims, while retaining the lease bounds
+// retries to the lease staleness window. Only a confirmed non-terminal parent
+// releases the lease for an immediate retry.
+func TestReconcileUnclaimableParent_RetainsLeaseWhenParentUnknown(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	op := &storage.ApplyOperation{
+		ID:         42,
+		ApplyID:    7,
+		Deployment: "west",
+		State:      state.ApplyOperation.Running,
+	}
+	opLease := storage.OperationLease{ApplyID: 7, OperationID: 42, Owner: "driver-1", Token: "token-1"}
+
+	t.Run("parent load error", func(t *testing.T) {
+		opStore := &releaseRecordingOperationStore{}
+		svc := New(&recoverTestStorage{
+			applies: &unclaimableParentApplyStore{getErr: errors.New("connection reset")},
+			ops:     opStore,
+		}, testServerConfig(), nil, logger)
+
+		svc.reconcileUnclaimableParent(t.Context(), 1, op, opLease)
+
+		assert.False(t, opStore.released,
+			"a parent load error must retain the operation lease, not release it")
+	})
+
+	t.Run("parent missing", func(t *testing.T) {
+		opStore := &releaseRecordingOperationStore{}
+		svc := New(&recoverTestStorage{
+			applies: &unclaimableParentApplyStore{},
+			ops:     opStore,
+		}, testServerConfig(), nil, logger)
+
+		svc.reconcileUnclaimableParent(t.Context(), 1, op, opLease)
+
+		assert.False(t, opStore.released,
+			"a missing parent apply must retain the operation lease, not release it")
+	})
+
+	t.Run("non-terminal parent releases", func(t *testing.T) {
+		opStore := &releaseRecordingOperationStore{}
+		svc := New(&recoverTestStorage{
+			applies: &unclaimableParentApplyStore{apply: &storage.Apply{
+				ID:              7,
+				ApplyIdentifier: "apply-unclaimable",
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     "staging",
+				State:           state.Apply.Running,
+			}},
+			ops: opStore,
+		}, testServerConfig(), nil, logger)
+
+		svc.reconcileUnclaimableParent(t.Context(), 1, op, opLease)
+
+		assert.True(t, opStore.released,
+			"a confirmed non-terminal parent must release the operation lease for an immediate retry")
+	})
+}

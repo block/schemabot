@@ -1323,6 +1323,39 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	return ad, nil
 }
 
+// ReleaseClaim clears the lease fields and backdates the heartbeat past the
+// staleness window, guarded on the lease token, so the row is re-claimable on
+// the next poll through the stale-active recovery arm of
+// FindNextApplyOperation. State is intentionally untouched: a released row is
+// indistinguishable from a crashed driver's work, and the recovery arm already
+// re-leases active rows without changing their state. Reports false when the
+// lease no longer matches, meaning another writer already rotated or cleared
+// it and the row has moved on.
+func (s *applyOperationStore) ReleaseClaim(ctx context.Context, lease storage.OperationLease) (bool, error) {
+	if !lease.Valid() {
+		return false, fmt.Errorf("release claim for apply_operation %d: %w", lease.OperationID, storage.ErrApplyLeaseLost)
+	}
+	// Backdate one second past the staleness window: updated_at has second
+	// precision, so a backdate of exactly the window can round onto the cutoff
+	// boundary and fail the claim's strict comparison.
+	staleBackdate := storage.ApplyLeaseStaleAfter + time.Second
+	staleHeartbeat := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(staleBackdate.Microseconds())), IntervalMicrosecond)
+	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE apply_operations
+		SET lease_owner = '', lease_token = '', lease_acquired_at = NULL,
+		    updated_at = %s
+		WHERE id = ? AND lease_token = ?
+	`, staleHeartbeat), lease.OperationID, lease.Token)
+	if err != nil {
+		return false, fmt.Errorf("release claim for apply_operation %d: %w", lease.OperationID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read release claim rows affected for apply_operation %d: %w", lease.OperationID, err)
+	}
+	return rows > 0, nil
+}
+
 // Heartbeat refreshes updated_at to maintain the claim's lease. Should be
 // called periodically by a driver holding the lease. Silent no-op when the
 // row no longer exists (mirrors ApplyStore.Heartbeat).

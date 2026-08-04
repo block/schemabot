@@ -722,6 +722,7 @@ func TestRecordOperatorMetrics(t *testing.T) {
 	metrics.RecordOperatorClaimFailure(t.Context(), "expire_retryable_error")
 	metrics.RecordOperatorClaimFailure(t.Context(), "missing_lease_token")
 	metrics.RecordOperatorClaimFailure(t.Context(), "operation_parent_not_claimable")
+	metrics.RecordOperatorClaimFailure(t.Context(), "operation_lease_release_error")
 	metrics.RecordOperatorClaimFailure(t.Context(), "stranded_reaper_error")
 	metrics.RecordOperatorClaimDuration(t.Context(), 50*time.Millisecond, "testdb", "pie", "staging", "running")
 	metrics.RecordOperatorStrandedOperationReaped(t.Context(), "testdb", "pie", "staging", state.Apply.Completed)
@@ -735,6 +736,7 @@ func TestRecordOperatorMetrics(t *testing.T) {
 	var sawMissingLeaseToken bool
 	var sawLeaseLost bool
 	var sawOperationParentNotClaimable bool
+	var sawOperationLeaseReleaseError bool
 	var sawStrandedParentState bool
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
@@ -770,6 +772,8 @@ func TestRecordOperatorMetrics(t *testing.T) {
 					sawLeaseLost = true
 				case "operation_parent_not_claimable":
 					sawOperationParentNotClaimable = true
+				case "operation_lease_release_error":
+					sawOperationLeaseReleaseError = true
 				}
 			}
 		}
@@ -790,6 +794,7 @@ func TestRecordOperatorMetrics(t *testing.T) {
 	assert.True(t, sawMissingLeaseToken, "expected missing_lease_token claim failure reason to be preserved")
 	assert.True(t, sawLeaseLost, "expected lease_lost resume failure reason to be recorded")
 	assert.True(t, sawOperationParentNotClaimable, "expected operation_parent_not_claimable claim failure reason to be preserved, not collapsed to unknown")
+	assert.True(t, sawOperationLeaseReleaseError, "expected operation_lease_release_error claim failure reason to be preserved, not collapsed to unknown")
 }
 
 func TestRecordRemoteDeploymentHealthMetrics(t *testing.T) {

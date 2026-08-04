@@ -634,13 +634,66 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	return false, nil
 }
 
-// handleUnlockCommand handles the "schemabot unlock" PR comment command.
-// By default it finds all locks held by this PR and releases them. With
+// handleUnlockCommand handles the "schemabot unlock" PR comment command. It is
+// the synchronous goSafe entry point: it runs unlockCommandCore and discards
+// the durability disposition, which only a durable issue_comment driver
+// consumes.
+func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
+	_, _ = h.unlockCommandCore(repo, pr, installationID, requestedBy, result)
+}
+
+// unlockRejectionError marks a deterministic unlock rejection: the message is
+// the command's answer, which the same input will always reproduce, so a
+// durable driver must not re-drive it. It renders the wrapped error verbatim
+// so the marker never leaks into a PR comment.
+type unlockRejectionError struct{ err error }
+
+func (e *unlockRejectionError) Error() string { return e.err.Error() }
+func (e *unlockRejectionError) Unwrap() error { return e.err }
+
+func unlockRejection(err error) error { return &unlockRejectionError{err: err} }
+
+func isUnlockRejection(err error) bool {
+	var rejection *unlockRejectionError
+	return errors.As(err, &rejection)
+}
+
+// unlockCommandCore finds all locks held by this PR and releases them. With
 // `--force`, it can also release a CLI-owned lock for the database inferred
 // from this PR's SchemaBot config; `-d <database>` disambiguates multi-database
 // PRs. This lets a PR author clear a stale local-session lock from the PR
-// workflow that it is blocking.
-func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
+// workflow that it is blocking. It returns a durability disposition for a
+// future durable issue_comment driver:
+//
+//   - retry=true, err!=nil — a transient infrastructure failure (a GitHub
+//     read during database inference, a storage lock lookup, the active-apply
+//     verification, or a lock release) that a durable driver should re-drive.
+//     Released locks drop out of the lookup, so a re-drive retries only the
+//     locks that remain.
+//   - retry=false, err=nil — a terminal outcome that is the command's answer
+//     (a completed release, a deterministic inference or lookup rejection, no
+//     locks found, an authorization block on the merits, or an active apply
+//     still protecting the lock).
+//
+// A terminal rejection is a per-delivery decision: it is deterministic for
+// the PR head this delivery read, and a later push can change the answer.
+// The recovery path is a fresh comment after the push — never a re-drive of
+// the superseded delivery.
+//
+// A gate block is terminal only when the gate evaluated its inputs and
+// blocked on the merits. A gate that could not evaluate (for example a
+// GitHub or storage read inside the gate failed) returns an error, which
+// the core classifies retryable: the gate still fails closed for this
+// delivery, but the outcome is not the command's answer.
+//
+// A posted PR comment does not imply a terminal disposition: retryable sites
+// post best-effort error comments too, so a durable driver re-driving one may
+// post the same comment again.
+//
+// Every failure is logged where it is classified — by the core at its own
+// exits, and by the authorization gates for gate outcomes — so the synchronous
+// wrapper can discard the result without losing observability.
+func (h *Handler) unlockCommandCore(repo string, pr int, installationID int64, requestedBy string, result CommandResult) (bool, error) {
 	ctx, cancel := h.commandContext(context.Background(), 30*time.Second)
 	defer cancel()
 	if result.Force && result.Database == "" {
@@ -648,7 +701,10 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 		if err != nil {
 			h.logger.Error("failed to infer database for force unlock", "repo", repo, "pr", pr, "error", err)
 			h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to infer database for force unlock: "+err.Error())
-			return
+			if isUnlockRejection(err) {
+				return false, nil
+			}
+			return true, fmt.Errorf("unlock command infer database %s#%d: %w", repo, pr, err)
 		}
 		result.Database = database
 	}
@@ -657,7 +713,10 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 	if err != nil {
 		h.logger.Error("failed to look up unlock targets", "repo", repo, "pr", pr, "database", result.Database, "force", result.Force, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to look up locks: "+err.Error())
-		return
+		if isUnlockRejection(err) {
+			return false, nil
+		}
+		return true, fmt.Errorf("unlock command lock lookup %s#%d: %w", repo, pr, err)
 	}
 
 	if len(locks) == 0 {
@@ -667,11 +726,11 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 		if h.silentOnUnscopedFanOut(repo, result.Tenant) {
 			h.logger.Info("unscoped fan-out unlock found no locks on this deployment; staying silent so the owning deployment responds",
 				"repo", repo, "pr", pr)
-			return
+			return false, nil
 		}
 		h.logger.Info("unlock: no locks found", "repo", repo, "pr", pr)
 		h.postComment(repo, pr, installationID, templates.RenderNoLocksFound())
-		return
+		return false, nil
 	}
 	h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 
@@ -682,15 +741,18 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 	// database without an environment.
 	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, locks[0].DatabaseName, "", action.Unlock)
 	if blocked {
-		return
+		// The gate has already logged the client-creation failure and posted
+		// the authorization-unavailable comment; it fails closed for this
+		// delivery, but a fresh client may succeed on a later attempt.
+		return true, fmt.Errorf("unlock command actor authorization client %s#%d: GitHub client unavailable", repo, pr)
 	}
 	for _, lock := range locks {
-		// The unlock handler is not a durable core, so an authorization
-		// evaluation failure and a merit denial both stop it here; the gate
-		// has already logged and posted the distinction.
 		blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, lock.DatabaseName, lock.DatabaseType, "", action.Unlock)
-		if authErr != nil || blocked {
-			return
+		if authErr != nil {
+			return true, fmt.Errorf("unlock command actor authorization gate %s#%d database %s: %w", repo, pr, lock.DatabaseName, authErr)
+		}
+		if blocked {
+			return false, nil
 		}
 	}
 
@@ -706,18 +768,22 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
 			h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy,
 				"Failed to verify active applies for database `"+lock.DatabaseName+"`: "+err.Error()+". No locks were released.")
-			return
+			return true, fmt.Errorf("unlock command verify active applies %s#%d database %s: %w", repo, pr, lock.DatabaseName, err)
 		}
 		for _, a := range applies {
 			if a.Database == lock.DatabaseName && !state.IsTerminalApplyState(a.State) {
 				h.postComment(repo, pr, installationID, templates.RenderCannotUnlock(
 					lock.DatabaseName, a.Environment, a.ApplyIdentifier, a.State))
-				return
+				return false, nil
 			}
 		}
 	}
 
-	// Release all locks
+	// Release all locks. A failed release is logged and the loop continues so
+	// one failure does not strand the remaining locks; the collected errors
+	// make the delivery retryable, and a re-drive only sees the locks that are
+	// still held.
+	var releaseErrs []error
 	for _, lock := range locks {
 		var err error
 		if result.Force {
@@ -726,19 +792,26 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 			err = h.service.Storage().Locks().Release(ctx, lock.DatabaseName, lock.DatabaseType, lock.Owner)
 		}
 		if err != nil {
-			h.logger.Error("failed to release lock", "database", lock.DatabaseName, "error", err)
+			h.logger.Error("failed to release lock",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+				"owner", lock.Owner, "force", result.Force, "error", err)
+			releaseErrs = append(releaseErrs, fmt.Errorf("release lock for %s: %w", lock.DatabaseName, err))
 			continue
 		}
 
 		h.postComment(repo, pr, installationID, templates.RenderUnlockSuccess(
 			lock.DatabaseName, "", requestedBy))
 	}
+	if len(releaseErrs) > 0 {
+		return true, fmt.Errorf("unlock command release locks %s#%d: %w", repo, pr, errors.Join(releaseErrs...))
+	}
+	return false, nil
 }
 
 func (h *Handler) locksForUnlock(ctx context.Context, repo string, pr int, result CommandResult) ([]*storage.Lock, error) {
 	if result.Force {
 		if result.Database == "" {
-			return nil, fmt.Errorf("--force requires a database target")
+			return nil, unlockRejection(errors.New("--force requires a database target"))
 		}
 
 		locks, err := h.service.Storage().Locks().List(ctx)
@@ -752,7 +825,7 @@ func (h *Handler) locksForUnlock(ctx context.Context, repo string, pr int, resul
 				continue
 			}
 			if lock.PullRequest != 0 && (lock.Repository != repo || lock.PullRequest != pr) {
-				return nil, fmt.Errorf("lock for %s is held by %s#%d", result.Database, lock.Repository, lock.PullRequest)
+				return nil, unlockRejection(fmt.Errorf("lock for %s is held by %s#%d", result.Database, lock.Repository, lock.PullRequest))
 			}
 			matches = append(matches, lock)
 		}
@@ -788,15 +861,21 @@ func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, 
 		// a database not in this deployment's registry — means there is nothing
 		// for this deployment to unlock: same outcome as no config at all.
 		if isSchemaUnownedByDeploymentError(err) {
-			return "", ghclient.ErrNoConfig
+			return "", unlockRejection(ghclient.ErrNoConfig)
+		}
+		// A repo with no config, or only malformed ones, is a deterministic
+		// discovery outcome the same delivery always reproduces — the
+		// command's answer, not a transient read failure.
+		if errors.Is(err, ghclient.ErrNoConfig) || errors.Is(err, ghclient.ErrInvalidConfig) {
+			return "", unlockRejection(err)
 		}
 		if errors.Is(err, ghclient.ErrMultipleConfigs) {
-			return "", fmt.Errorf("multiple SchemaBot configs match this PR; retry with `schemabot unlock -d <database> --force`: %w", err)
+			return "", unlockRejection(fmt.Errorf("multiple SchemaBot configs match this PR; retry with `schemabot unlock -d <database> --force`: %w", err))
 		}
 		return "", err
 	}
 	if config == nil || config.Database == "" {
-		return "", fmt.Errorf("no database found in SchemaBot config")
+		return "", unlockRejection(errors.New("no database found in SchemaBot config"))
 	}
 	return config.Database, nil
 }
