@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -1034,7 +1035,7 @@ func WriteStatusList(data StatusListData) {
 				maxDeployment, a.Deployment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
-				shortCaller(a.Caller))
+				caller.Short(a.Caller))
 		case data.ShowExternalID:
 			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 				maxID, a.ApplyID,
@@ -1043,7 +1044,7 @@ func WriteStatusList(data StatusListData) {
 				maxEnv, a.Environment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
-				shortCaller(a.Caller))
+				caller.Short(a.Caller))
 		case showDeployment:
 			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 				maxID, a.ApplyID,
@@ -1052,7 +1053,7 @@ func WriteStatusList(data StatusListData) {
 				maxDeployment, a.Deployment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
-				shortCaller(a.Caller))
+				caller.Short(a.Caller))
 		default:
 			fmt.Printf("  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 				maxID, a.ApplyID,
@@ -1060,7 +1061,7 @@ func WriteStatusList(data StatusListData) {
 				maxEnv, a.Environment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
-				shortCaller(a.Caller))
+				caller.Short(a.Caller))
 		}
 	}
 
@@ -1146,11 +1147,11 @@ func statusListShowsDeployment(data StatusListData) bool {
 }
 
 func statusFailureActor(a ActiveApplyData, showExternalID bool) string {
-	caller := shortCaller(a.Caller)
+	actor := caller.Short(a.Caller)
 	if !showExternalID {
-		return caller
+		return actor
 	}
-	return caller + "; external_id=" + statusExternalID(StatusListData{}, a)
+	return actor + "; external_id=" + statusExternalID(StatusListData{}, a)
 }
 
 func formatFailureTimestamp(a ActiveApplyData) string {
@@ -1264,7 +1265,7 @@ func WriteDatabaseHistory(data DatabaseHistoryData) {
 			coloredState,
 			maxStarted, formatStartedAt(a.StartedAt),
 			maxDur, formatApplyDuration(a.StartedAt, a.CompletedAt),
-			shortCaller(a.Caller))
+			caller.Short(a.Caller))
 	}
 
 	fmt.Println()
@@ -1303,19 +1304,6 @@ func stateColorFunc(s string) func(string) string {
 	default:
 		return nil
 	}
-}
-
-// shortCaller strips the trailing location from a caller string for compact
-// display: the machine for CLI callers ("cli:jdoe@macbook.local" -> "cli:jdoe")
-// and the repo#pr for webhook callers ("github:jdoe@org/repo#42" ->
-// "github:jdoe"). The cut is at the last "@" because the user portion may
-// itself contain "@" — authenticated CLI callers carry an email subject
-// ("cli:jdoe@example.com@macbook.local" -> "cli:jdoe@example.com").
-func shortCaller(caller string) string {
-	if at := strings.LastIndex(caller, "@"); at >= 0 {
-		return caller[:at]
-	}
-	return caller
 }
 
 // formatApplyDuration returns a human-readable duration between started and completed.

@@ -1947,7 +1947,7 @@ Wait for the other PR to complete or ask the lock holder to run `schemabot unloc
 
 A CLI session currently holds the lock for this database.
 
-**Locked by**: `cli:jackjackbits@macbook.local`
+**Locked by**: `cli:jackjackbits`
 **Since**: 2026-03-15 14:00:00 UTC
 
 Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock with:

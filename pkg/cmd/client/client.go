@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -421,8 +422,8 @@ type LockInfo struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-// GenerateCLIOwner generates an owner identifier for CLI-based locks.
-// Format: "cli:username@hostname"
+// GenerateCLIOwner generates an owner identifier for CLI-based locks and the
+// caller attribution on CLI-driven requests: "cli:<user>@<host>".
 func GenerateCLIOwner() string {
 	username := "unknown"
 	if u, err := user.Current(); err == nil {
@@ -434,7 +435,7 @@ func GenerateCLIOwner() string {
 		hostname = h
 	}
 
-	return fmt.Sprintf("cli:%s@%s", username, hostname)
+	return caller.FormatCLI(username, hostname)
 }
 
 // AcquireLock attempts to acquire a lock on a database.

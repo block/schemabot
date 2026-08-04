@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -255,14 +256,14 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 	isCLI := data.LockPR == 0
 	if isCLI {
 		sb.WriteString("A CLI session currently holds the lock for this database.\n\n")
-		fmt.Fprintf(&sb, "**Locked by**: `%s`\n", data.LockOwner)
+		fmt.Fprintf(&sb, "**Locked by**: `%s`\n", caller.Short(data.LockOwner))
 	} else {
 		sb.WriteString("Another PR currently holds the lock for this database.\n\n")
 		if data.LockRepo != "" {
 			fmt.Fprintf(&sb, "**Locked by**: [%s#%d](https://github.com/%s/pull/%d)\n",
 				data.LockRepo, data.LockPR, data.LockRepo, data.LockPR)
 		} else {
-			fmt.Fprintf(&sb, "**Locked by**: `%s`\n", data.LockOwner)
+			fmt.Fprintf(&sb, "**Locked by**: `%s`\n", caller.Short(data.LockOwner))
 		}
 	}
 	fmt.Fprintf(&sb, "**Since**: %s\n\n", data.LockCreated.UTC().Format("2006-01-02 15:04:05 UTC"))

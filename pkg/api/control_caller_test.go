@@ -81,22 +81,3 @@ func TestResolveCallerApplyLogRoundTrip(t *testing.T) {
 
 	assert.Equal(t, "cli:bob@example.com", storage.ApplyLogCaller(resolved))
 }
-
-func TestCLICallerHostValidation(t *testing.T) {
-	t.Run("hostname-shaped values are accepted", func(t *testing.T) {
-		host, ok := cliCallerHost("cli:bob@build-agent_7.example.com")
-		assert.True(t, ok)
-		assert.Equal(t, "build-agent_7.example.com", host)
-	})
-
-	t.Run("hostname is the segment after the last at-sign", func(t *testing.T) {
-		host, ok := cliCallerHost("cli:bob@example.com@laptop.example.com")
-		assert.True(t, ok)
-		assert.Equal(t, "laptop.example.com", host)
-	})
-
-	t.Run("hostname over the DNS length limit is rejected", func(t *testing.T) {
-		_, ok := cliCallerHost("cli:bob@" + strings.Repeat("h", 254))
-		assert.False(t, ok)
-	})
-}

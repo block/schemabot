@@ -6,11 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
@@ -235,67 +235,20 @@ func rollbackTaskCompletedAfter(candidate, current *storage.Task) bool {
 // and hostname are preserved: they carry no identity weight, and an operator
 // triaging an apply wants to see how it was driven and from which machine.
 // Only the CLI channel is preserved; any other channel prefix is attributed to
-// the subject alone. A composite that would not fit the stored caller column
-// also degrades to the subject alone — the verified identity is never
+// the subject alone. So is a hostname that fails validation, or a composite
+// that would not fit the stored caller column — the verified identity is never
 // sacrificed for the advisory hostname.
 func resolveCaller(ctx context.Context, requestCaller string) string {
 	subject, ok := auth.AuthenticatedSubject(ctx)
 	if !ok {
 		return requestCaller
 	}
-	if host, ok := cliCallerHost(requestCaller); ok {
-		if composite := "cli:" + subject + "@" + host; len(composite) <= storage.MaxCallerChars {
+	if _, host, ok := caller.SplitCLI(requestCaller); ok && caller.ValidHost(host) {
+		if composite := caller.FormatCLI(subject, host); len(composite) <= storage.MaxCallerChars {
 			return composite
 		}
 	}
 	return subject
-}
-
-// cliCallerHost extracts the hostname from a CLI-shaped caller string
-// ("cli:<user>@<host>", the format the CLI's GenerateCLIOwner produces — keep
-// the two in sync). The hostname is the segment after the last "@": the user
-// portion may itself contain "@" (subjects are often emails), while a hostname
-// never does. It returns false for any other shape — including a hostname that
-// fails validation — so non-CLI and malformed callers are attributed to the
-// authenticated subject alone.
-func cliCallerHost(caller string) (string, bool) {
-	rest, ok := strings.CutPrefix(caller, "cli:")
-	if !ok {
-		return "", false
-	}
-	at := strings.LastIndex(rest, "@")
-	if at < 0 {
-		return "", false
-	}
-	host := rest[at+1:]
-	if !isValidCallerHost(host) {
-		return "", false
-	}
-	return host, true
-}
-
-// maxCallerHostChars caps a client-supplied hostname at the DNS length limit
-// for a fully qualified domain name.
-const maxCallerHostChars = 253
-
-// isValidCallerHost reports whether a client-supplied hostname is safe to
-// store and render. The stored caller is written to storage verbatim and
-// rendered raw in the CLI detail view, so the hostname is restricted to
-// hostname-shaped characters — no whitespace, control characters, or terminal
-// escapes — and bounded in length.
-func isValidCallerHost(host string) bool {
-	if host == "" || len(host) > maxCallerHostChars {
-		return false
-	}
-	for _, r := range host {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-		case r == '.', r == '-', r == '_':
-		default:
-			return false
-		}
-	}
-	return true
 }
 func (s *Service) logControlOperationForApply(ctx context.Context, apply *storage.Apply, caller, eventType, message string) {
 	logStore := s.storage.ApplyLogs()

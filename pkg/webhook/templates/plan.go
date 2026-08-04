@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
@@ -132,7 +133,7 @@ func RenderPlanComment(data PlanCommentData) string {
 	writePlanAttribution(&sb, data)
 
 	if data.IsLocked && data.LockOwner != "" {
-		fmt.Fprintf(&sb, "\n🔒 **Lock acquired by** `%s`", data.LockOwner)
+		fmt.Fprintf(&sb, "\n🔒 **Lock acquired by** `%s`", caller.Short(data.LockOwner))
 		if data.LockAcquired != "" {
 			fmt.Fprintf(&sb, " at %s", data.LockAcquired)
 		}
