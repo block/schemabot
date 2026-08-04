@@ -1112,7 +1112,7 @@ func (s *applyStore) UpdateDerivedState(ctx context.Context, applyID int64, expe
 }
 
 // GetInProgress returns all applies in non-terminal states.
-// Note: For recovery, use FindNextApply which handles locking and heartbeat staleness.
+// Note: For recovery, use ClaimApplyByID which handles locking and heartbeat staleness.
 func (s *applyStore) GetInProgress(ctx context.Context) ([]*storage.Apply, error) {
 	statePredicate, args := nonTerminalApplyStatePredicate("state")
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
@@ -1130,8 +1130,9 @@ func (s *applyStore) GetInProgress(ctx context.Context) ([]*storage.Apply, error
 }
 
 // FindStuckPendingApplies returns pending applies older than olderThan that
-// carry child rows — the child-rows arm of FindNextApply's pending predicate, so
-// every row returned is one a driver should already have claimed. It is a
+// carry child rows — the child-rows arm of the claim predicate (see
+// ClaimApplyByID), so every row returned is one a driver should already have
+// claimed. It is a
 // read-only diagnostic (no lease, no FOR UPDATE): apply creation rejects a
 // second active apply for the same target instead of queuing it, so a pending
 // apply this old is never legitimately waiting its turn. Ordered oldest first
@@ -1381,140 +1382,25 @@ func (s *applyStore) CountRecentByState(ctx context.Context, filter storage.Rece
 	return counts, nil
 }
 
-// FindNextApply atomically claims the next apply that needs attention.
-// A claim selects one stale apply and refreshes its heartbeat in the same
-// transaction. That heartbeat is the operator's lease while it reloads state
-// and resumes the apply.
-// Returns the claimed apply, or nil if nothing needs work.
-//
-// Matches queued pending applies with persisted tasks, pending, stopped, or
-// waiting-for-deploy applies with a pending start control request, stale active
-// applies whose heartbeat expired beyond the lease staleness window, and
-// recently failed_retryable applies that still have retry budget.
-// Apply creation/update enforces one active apply per database/type/environment,
-// so claims only need to lease one row and avoid driver races on that row.
-func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.Apply, error) {
-	if owner == "" {
-		return nil, fmt.Errorf("operator owner is required to claim apply: %w", storage.ErrApplyLeaseLost)
-	}
-	// Read committed keeps concurrent SKIP LOCKED claims from taking next-key
-	// range locks that can serialize drivers across otherwise independent targets.
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	if err != nil {
-		return nil, fmt.Errorf("begin claim apply transaction: %w", err)
-	}
-	defer rollbackTx(ctx, tx, "claim apply")
-
-	activeStates := claimableApplyStates()
-	activeStatePlaceholders := placeholders(len(activeStates))
-	queryArgs := []any{state.Apply.Pending}
-	queryArgs = append(queryArgs, stringArgs(activeStates)...)
-	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
-	queryArgs = append(queryArgs,
-		state.Apply.Pending,
-		storage.ControlOperationStart, storage.ControlRequestPending)
-	queryArgs = append(queryArgs,
-		state.Apply.Stopped,
-		storage.ControlOperationStart, storage.ControlRequestPending)
-	queryArgs = append(queryArgs,
-		state.Apply.WaitingForDeploy,
-		storage.ControlOperationStart, storage.ControlRequestPending)
-
-	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
-	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
-
-	// Apply creation/update enforces at most one active apply per
-	// database/type/environment. The claim query only needs to find stale work;
-	// FOR UPDATE SKIP LOCKED prevents concurrent drivers from claiming the same row.
-	//
-	// The pending clause requires child rows so a half-created apply is never
-	// claimed. Creation dual-writes tasks and the apply_operations row in one
-	// transaction, so either proves the create committed fully; a VSchema-only
-	// apply carries an operation row but no tasks, so tasks alone would strand it.
-	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
-		SELECT %s
-		FROM applies a
-		WHERE (
-				(a.state = ? AND (
-					EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id)
-					OR EXISTS (SELECT 1 FROM apply_operations ao WHERE ao.apply_id = a.id)
-				))
-				OR (a.state IN (%s) AND a.updated_at < %s)
-				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= %s)
-				OR (
-					a.state = ?
-					AND EXISTS (
-						SELECT 1
-						FROM apply_control_requests cr
-						WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
-					)
-				)
-				OR (
-					a.state = ?
-					AND EXISTS (
-						SELECT 1
-						FROM apply_control_requests cr
-						WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
-					)
-				)
-				OR (
-					a.state = ?
-					AND EXISTS (
-						SELECT 1
-						FROM apply_control_requests cr
-						WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
-						AND (
-							a.lease_acquired_at IS NULL
-							OR a.lease_acquired_at < cr.updated_at
-							OR a.updated_at < %s
-						)
-					)
-				)
-			)
-		ORDER BY a.created_at
-		LIMIT 1
-		FOR UPDATE SKIP LOCKED
-	`, applyColumns, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, staleClaimCutoff), queryArgs...)
-
-	apply, err := scanApplyInto(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil // No apply to claim
-	}
-	if err != nil {
-		return nil, fmt.Errorf("query next claimable apply: %w", err)
-	}
-
-	outcome, err := persistApplyClaim(ctx, s.db, s.locker, tx, apply, owner)
-	if err != nil {
-		return nil, err
-	}
-	if outcome.claimedAndComplete() {
-		return apply, nil
-	}
-	if outcome != claimAcquired {
-		return nil, nil
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit claim apply %d (%s): %w", apply.ID, apply.ApplyIdentifier, err)
-	}
-
-	return apply, nil
-}
-
-// ClaimApplyByID atomically claims one specific apply by ID using the same
-// claimability rules as FindNextApply, scoped to a single row. The operation-
-// level claim loop calls this after claiming an apply_operations row to acquire
-// the parent apply lease that lease-guarded writes (ResumeApply, MarkCompleted,
-// Heartbeat) require. Returns nil when the apply does not exist, is locked by a
-// peer (SKIP LOCKED), is not currently claimable, or — for a stopped apply with
-// a pending start request — the claim was refused because another active apply
-// owns the target (the start request is failed in that case; see
-// persistApplyClaim).
+// ClaimApplyByID atomically claims one specific apply by ID: a claim selects
+// the row when it needs a driver — pending with persisted child rows; a stale
+// active state whose heartbeat expired beyond the lease staleness window;
+// recently failed_retryable with retry budget; or pending, stopped, or
+// waiting-for-deploy with a pending start control request — and rotates a
+// fresh lease onto it (owner, token, heartbeat) in the same transaction. The
+// operation-level claim loop calls this after claiming an apply_operations row
+// to acquire the parent apply lease that lease-guarded writes (ResumeApply,
+// MarkCompleted, Heartbeat) require. Returns nil when the apply does not
+// exist, is locked by a peer (SKIP LOCKED), is not currently claimable, or —
+// for a stopped apply with a pending start request — the claim was refused
+// because another active apply owns the target (the start request is failed in
+// that case; see persistApplyClaim).
 func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner string) (*storage.Apply, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply %d: %w", applyID, storage.ErrApplyLeaseLost)
 	}
+	// Read committed keeps concurrent SKIP LOCKED claims from taking next-key
+	// range locks that can serialize drivers across otherwise independent targets.
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("begin claim apply %d transaction: %w", applyID, err)
@@ -1539,6 +1425,13 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
 
+	// FOR UPDATE SKIP LOCKED prevents concurrent drivers from claiming the
+	// same row.
+	//
+	// The pending clause requires child rows so a half-created apply is never
+	// claimed. Creation dual-writes tasks and the apply_operations row in one
+	// transaction, so either proves the create committed fully; a VSchema-only
+	// apply carries an operation row but no tasks, so tasks alone would strand it.
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM applies a
@@ -1914,7 +1807,7 @@ func failPendingStartControlRequestTx(ctx context.Context, tx *sql.Tx, applyID i
 
 // Heartbeat updates the apply's updated_at timestamp to maintain the lease.
 // Should be called every 10 seconds while working on an apply.
-// If not called for > 1 minute, another driver can claim the apply via FindNextApply.
+// If not called for > 1 minute, another driver can claim the apply via ClaimApplyByID.
 // When ctx has an apply lease, a stale token returns ErrApplyLeaseLost so the
 // old operator owner stops before writing state or external side effects.
 // SetRevertSkipped records when skip-revert was dispatched for an apply. It is a
@@ -1924,7 +1817,7 @@ func failPendingStartControlRequestTx(ctx context.Context, tx *sql.Tx, applyID i
 //
 // updated_at is pinned to its current value so this write does not trip the
 // column's ON UPDATE CURRENT_TIMESTAMP. updated_at is the apply's lease
-// heartbeat (the staleness gate in FindNextApply); bumping it here would renew
+// heartbeat (the staleness gate in the claim predicate); bumping it here would renew
 // the heartbeat from a non-lease caller and could delay another driver's
 // recovery claim.
 func (s *applyStore) SetRevertSkipped(ctx context.Context, applyID int64, at time.Time) error {

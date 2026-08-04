@@ -99,7 +99,7 @@ func TestLocalClient_ShardScopedDispatchDrivesItsTasks(t *testing.T) {
 	assert.Equal(t, state.Task.Pending, tasks[0].State)
 
 	// The operator claim drives the queued dispatch to completion.
-	startTestOperator(t, stor, client)
+	startTestOperator(t, stor, client, applyResp.ApplyId)
 	waitForApplyComplete(t, client, ctx, applyResp.ApplyId)
 
 	// The dispatched DDL actually ran on the target database.

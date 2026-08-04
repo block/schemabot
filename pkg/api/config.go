@@ -106,8 +106,8 @@ type ServerConfig struct {
 	EnvironmentOrder []string `yaml:"environment_order"`
 
 	// Drivers is the number of concurrent operator drivers that claim and drive
-	// applies. Each driver independently polls FindNextApply with FOR UPDATE
-	// SKIP LOCKED to prevent races. Defaults to DefaultDrivers.
+	// applies. Each driver independently polls for claimable work with FOR
+	// UPDATE SKIP LOCKED queries to prevent races. Defaults to DefaultDrivers.
 	Drivers int `yaml:"drivers"`
 
 	// MetricsPort is the TCP port of the dedicated HTTP listener serving

@@ -27,8 +27,9 @@ func TestClaimableApplyStates_CoverEveryRegisteredState(t *testing.T) {
 	// because a dedicated path owns their recovery. Each entry names that path;
 	// adding a state here requires such a path to exist.
 	recoveredElsewhere := map[string]string{
-		// FindNextApply's queue arm claims pending applies with no staleness
-		// requirement; persistApplyClaim transitions pending to running.
+		// The claim predicate's pending arm (ClaimApplyByID) claims pending
+		// applies with no staleness requirement; persistApplyClaim transitions
+		// pending to running.
 		state.Apply.Pending: "queue claim path",
 		// Paused needs an explicit human decision: release resumes it, and the
 		// stop-reconciliation claim (FindNextApplyForStopReconciliation)

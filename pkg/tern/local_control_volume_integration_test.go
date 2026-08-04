@@ -202,7 +202,7 @@ func TestLocalClient_VolumeQueuedCrossInstanceAppliedBySequentialDrive(t *testin
 	assert.False(t, conflicting.Accepted, "a conflicting level must not be accepted")
 	assert.Contains(t, conflicting.ErrorMessage, "already queued")
 
-	driveNextQueuedApply(t, stor, drivingClient)
+	driveQueuedApply(t, stor, drivingClient, apply.ApplyIdentifier)
 
 	assert.Equal(t, []int32{9}, drivingEngine.recordedVolumes(),
 		"the driving instance's engine must receive the queued level exactly once")
@@ -248,7 +248,7 @@ func TestLocalClient_VolumeQueuedAppliedByGroupedDrive(t *testing.T) {
 	assert.True(t, volumeResp.Accepted)
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationVolume, storage.ControlRequestPending)
 
-	driveNextQueuedApply(t, stor, client)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
 
 	assert.Equal(t, []int32{2}, eng.recordedVolumes(),
 		"the grouped drive must deliver the queued level to the engine exactly once")
@@ -291,7 +291,7 @@ func TestLocalClient_VolumeEngineFailureFailsRequestWithoutAbortingDrive(t *test
 	require.NoError(t, err)
 	assert.True(t, volumeResp.Accepted)
 
-	driveNextQueuedApply(t, stor, client)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
 
 	req, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationVolume)
 	require.NoError(t, err)
@@ -345,7 +345,7 @@ func TestLocalClient_VolumeRejectsTerminalApplyAndInvalidLevel(t *testing.T) {
 		assert.Contains(t, err.Error(), "volume must be between")
 	}
 
-	driveNextQueuedApply(t, stor, client)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
 	settled, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
 	require.NotNil(t, settled)
@@ -462,7 +462,7 @@ func TestLocalClient_VolumeQueuedAfterSettleIsSweptAndRejected(t *testing.T) {
 	eng.mu.Lock()
 	eng.volumeAttempts = 1
 	eng.mu.Unlock()
-	driveNextQueuedApply(t, stor, client)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
 
 	// The dispatch-time apply snapshot still reads as non-terminal, modelling a
 	// state check that passed just before the driver settled the apply.
@@ -518,7 +518,7 @@ func TestLocalClient_VolumeConvergesLaterTasksToStoredLevel(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, volumeResp.Accepted)
 
-	driveNextQueuedApply(t, stor, client)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
 
 	assert.Equal(t, []int32{9, 9}, eng.recordedVolumes(),
 		"the first task is retuned by the pending request and the second converges to the stored level at start")

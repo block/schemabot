@@ -55,7 +55,7 @@ See [`pkg/state`](../state/) for the full state hierarchy (apply states, task st
 The apply store supports crash recovery through heartbeat-based leasing:
 
 - **Heartbeat**: Drivers call `Heartbeat(applyID)` every 10 seconds to signal they're alive
-- **FindNextApply**: Claims one apply with a stale heartbeat (>1 minute since last update) by selecting it and refreshing its heartbeat in one transaction
+- **ClaimApplyByID**: Claims an apply with a stale heartbeat (>1 minute since last update) by selecting it and refreshing its heartbeat in one transaction
 - If a driver crashes, its apply becomes claimable after the heartbeat times out
 
 ## Webhook Inbox Retention
