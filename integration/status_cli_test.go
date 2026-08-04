@@ -48,11 +48,11 @@ func TestCLI_Status_DefaultLimitShowsTwentyMostRecent(t *testing.T) {
 	assert.Contains(t, stripped, "apply-status-default-21")
 	assert.Contains(t, stripped, "apply-status-default-02")
 	assert.NotContains(t, stripped, "apply-status-default-01")
-	assert.Contains(t, stripped, "Showing the 20 most recent schema changes. Use --limit N to show more.")
+	assert.Contains(t, stripped, "Showing 20 schema changes, in-flight first. Use --limit N to show more.")
 }
 
 // TestCLI_Status_LimitShowsRequestedRecentApplies verifies that --limit changes
-// the recent status window without changing the newest-first ordering.
+// the recent status window without changing the ranking within it.
 func TestCLI_Status_LimitShowsRequestedRecentApplies(t *testing.T) {
 	binPath := buildBinary(t, "schemabot", "./pkg/cmd")
 	endpoint, store := startStatusOnlySchemaBot(t)
@@ -73,7 +73,7 @@ func TestCLI_Status_LimitShowsRequestedRecentApplies(t *testing.T) {
 	assert.Contains(t, stripped, "apply-status-limit-04")
 	assert.Contains(t, stripped, "apply-status-limit-03")
 	assert.NotContains(t, stripped, "apply-status-limit-02")
-	assert.Contains(t, stripped, "Showing the 3 most recent schema changes. Use --limit N to show more.")
+	assert.Contains(t, stripped, "Showing 3 schema changes, in-flight first. Use --limit N to show more.")
 }
 
 // TestCLI_Status_FailedShowsOnlyFailedApplies verifies that --failed switches
@@ -179,7 +179,7 @@ func TestCLI_Status_MaxLimitFooterDoesNotSuggestHigherLimit(t *testing.T) {
 
 	assert.Equal(t, 1000, statusApplyRowCount(out))
 	assert.Contains(t, stripped, "apply-status-cap-1001")
-	assert.Contains(t, stripped, "Showing the 1000 most recent schema changes. This server caps status history at 1000.")
+	assert.Contains(t, stripped, "Showing 1000 schema changes, in-flight first. This server caps status history at 1000.")
 	assert.NotContains(t, stripped, "Use --limit N to show more.")
 }
 
