@@ -401,10 +401,19 @@ type capturingApplyStore struct {
 	err        error
 }
 
+// capture stores a snapshot of the apply, as real storage would materialize a
+// row. The caller keeps mutating its own struct after the create returns (for
+// example assigning the returned ID), and a concurrently running operator
+// reads the captured row — sharing the caller's pointer would race.
+func (s *capturingApplyStore) capture(apply *storage.Apply) {
+	snapshot := *apply
+	s.apply = &snapshot
+}
+
 func (s *capturingApplyStore) Create(_ context.Context, apply *storage.Apply) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.apply = apply
+	s.capture(apply)
 	if s.err != nil {
 		return 0, s.err
 	}
@@ -445,8 +454,11 @@ func (s *capturingApplyStore) CreateWithTasksAndOperations(ctx context.Context, 
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.apply = apply
-	s.operations = append(s.operations, operations...)
+	s.capture(apply)
+	for _, op := range operations {
+		snapshot := *op
+		s.operations = append(s.operations, &snapshot)
+	}
 	return applyID, nil
 }
 
@@ -467,7 +479,7 @@ func (s *capturingApplyStore) CreateWithGroupedOperations(ctx context.Context, a
 func (s *capturingApplyStore) Update(_ context.Context, apply *storage.Apply) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.apply = apply
+	s.capture(apply)
 	return nil
 }
 
