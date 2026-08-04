@@ -1,6 +1,7 @@
 package api
 
 import (
+	"cmp"
 	"encoding/json"
 	"net/http"
 )
@@ -79,7 +80,7 @@ func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logger.Info("setting updated", "key", req.Key, "value", req.Value,
-		"caller", controlOperationCaller(resolveCaller(r.Context(), "")))
+		"caller", cmp.Or(resolveCaller(r.Context(), ""), "unknown"))
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"key":   req.Key,

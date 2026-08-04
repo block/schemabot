@@ -222,13 +222,6 @@ func rollbackTaskCompletedAfter(candidate, current *storage.Task) bool {
 	return candidate.CreatedAt.After(current.CreatedAt)
 }
 
-func controlOperationCaller(caller string) string {
-	if caller == "" {
-		return "unknown"
-	}
-	return caller
-}
-
 // resolveCaller returns the identity an operation is attributed to: the
 // authenticated caller when the request carried a real identity (API auth
 // enabled), otherwise the caller supplied in the request. The authenticated
@@ -274,7 +267,7 @@ func (s *Service) logControlOperationForApply(ctx context.Context, apply *storag
 				"event", eventType)...)
 		return
 	}
-	logMessage := fmt.Sprintf("%s (caller: %s)", message, controlOperationCaller(caller))
+	logMessage := fmt.Sprintf("%s (caller: %s)", message, storage.ApplyLogCaller(caller))
 	if err := logStore.Append(ctx, &storage.ApplyLog{
 		ApplyID:   apply.ID,
 		Level:     storage.LogLevelInfo,
@@ -1410,7 +1403,7 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 		append(apply.LogAttrs(),
 			"requested_by", stopCaller, "start_requested_by", caller, "old_state", oldState, "new_state", apply.State)...)
 	s.logControlOperationForApply(ctx, apply, stopCaller, storage.LogEventStopRequested,
-		fmt.Sprintf("Pending remote stop request completed before start (caller: %s)", stopCaller))
+		"Pending remote stop request completed before start")
 	return nil
 }
 
