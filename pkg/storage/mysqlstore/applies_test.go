@@ -2505,6 +2505,53 @@ func TestApplyStore_ClaimApplyByIDClaimsStaleRevertPhase(t *testing.T) {
 	}
 }
 
+// TestApplyStore_ClaimApplyByIDClaimsStaleWaitingForCutover verifies driver
+// recovery at the cutover gate: an apply parked at waiting_for_cutover with a
+// pending cutover request belongs to its live driver while the heartbeat is
+// fresh, and becomes reclaimable once the heartbeat goes stale — so a driver
+// crash at the highest-risk dwell state never strands the operator's cutover.
+func TestApplyStore_ClaimApplyByIDClaimsStaleWaitingForCutover(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_waiting_for_cutover", 1, state.Apply.WaitingForCutover, "staging")
+	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationCutover,
+		Status:    storage.ControlRequestPending,
+		Metadata:  []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	freshClaim, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+	require.NoError(t, err)
+	assert.Nil(t, freshClaim, "a fresh waiting-for-cutover apply is owned by its active driver")
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a stale waiting-for-cutover apply must be reclaimable so the pending cutover is never stranded")
+	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+	assert.Equal(t, state.Apply.WaitingForCutover, claimed.State)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.WaitingForCutover, persisted.State, "the claim rotates the lease without leaving the cutover gate")
+	assert.Equal(t, "operator-a", persisted.LeaseOwner)
+
+	again, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-b")
+	require.NoError(t, err)
+	assert.Nil(t, again, "the reclaimed apply's fresh lease is not stolen by a peer")
+}
+
 // ClaimApplyByID requires an owner so a lease can never be acquired without an
 // identity that lease-guarded writes can fail closed against.
 func TestApplyStore_ClaimApplyByIDRequiresOwner(t *testing.T) {
@@ -2979,6 +3026,60 @@ func TestApplyStore_ClaimStoppedStartSucceedsWhenTargetClear(t *testing.T) {
 	assert.NotNil(t, stillPending, "a successful claim leaves the start request pending for the resume path to complete")
 
 	assertExactlyOneActiveApply(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+}
+
+// TestApplyStore_ClaimApplyByIDSkipsFailedStoppedStartUntilRerequested verifies
+// that a failed start request never restarts a stopped apply on its own: the
+// stopped arm of the claim predicate requires a pending start control request,
+// so after a start attempt fails the apply stays stopped until an operator
+// deliberately re-requests the start, at which point the claim succeeds again.
+func TestApplyStore_ClaimApplyByIDSkipsFailedStoppedStartUntilRerequested(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stopped_failed_start", 1, state.Apply.Stopped, "staging")
+
+	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+		Metadata:  []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+	require.NoError(t, store.ControlRequests().FailPending(ctx, apply.ID, storage.ControlOperationStart, "remote start failed"))
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "test-owner")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a failed start request must not be retried automatically by operator claims")
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Stopped, persisted.State, "the apply stays stopped until an operator re-requests the start")
+
+	rerequested, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator-retry",
+		Metadata:    []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+	require.Equal(t, storage.ControlRequestPending, rerequested.Status)
+
+	claimedAfterRetry, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "test-owner")
+	require.NoError(t, err)
+	require.NotNil(t, claimedAfterRetry, "a re-requested start makes the stopped apply claimable again")
+	assert.Equal(t, apply.ApplyIdentifier, claimedAfterRetry.ApplyIdentifier)
+
+	persistedAfterRetry, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persistedAfterRetry)
+	assert.Equal(t, state.Apply.Resuming, persistedAfterRetry.State, "the successful claim transitions stopped → resuming")
 }
 
 func TestApplyStore_ClaimApplyByIDDoesNotClaimFreshRunningStopControlRequest(t *testing.T) {
