@@ -748,8 +748,51 @@ auth:
 The authorizer proves the request came from the trusted proxy, then reads the forwarded identity:
 
 - **Trust anchor (required, fail-closed).** With neither `trusted_proxy_cidrs` nor `trusted_proxy_spiffe` set, the server refuses to start. There are three modes: **CIDR only** (trust any request whose source IP is in a trusted network), **SPIFFE only** (trust any request whose XFCC carries a trusted SPIFFE ID), or **both** (require the source CIDR *and* a matching XFCC SPIFFE ID — defense in depth). `X-Forwarded-Client-Cert` (XFCC) is a spoofable HTTP header, so SPIFFE-only is safe only when the proxy sanitizes inbound XFCC and the server is not directly reachable (a service mesh) — the server logs a startup warning in that mode.
-- **Tiers.** Reads are open to any authenticated caller unless `read_groups` is set; writes require membership in `write_groups`. Only the canonical header is read, so a smuggled underscore variant (`X_Forwarded_User`) is ignored.
+- **Tiers.** Reads are open to any authenticated caller unless `read_groups` is set; writes require membership in `write_groups`, or in a database's `operator_groups` (see [Per-database write scoping](#per-database-write-scoping-forward-auth)). Only the canonical header is read, so a smuggled underscore variant (`X_Forwarded_User`) is ignored.
 - **Service callers (read-only).** `trusted_gateway_spiffe` + `read_service_spiffe` open a second lane for services calling as themselves: a caller-forwarding gateway terminates the caller's mTLS, verifies the client certificate, and forwards the caller's SPIFFE ID in `caller_spiffe_header`. The header is honored only when the XFCC-verified peer is a listed gateway, the forwarded caller must appear in `read_service_spiffe`, and service callers never get the write tier (denied with reason `service_caller_write`). The user and groups headers are never read on this lane, and the identity-header proxy always wins — the gateway lane is consulted only when the request did not arrive through the trusted proxy. `trusted_proxy_cidrs`, when set, gate this lane like everything else: a gateway SVID claimed from outside the trusted networks is never honored. **List a gateway only if it strips inbound copies of the caller header before setting it from the verified certificate** — otherwise any caller could forge an identity through it. The lane fails closed: gateways without callers (or callers without a gateway) refuse to start, the lane requires SPIFFE-anchored proxy trust (`trusted_proxy_spiffe`) — under CIDR-only trust an in-CIDR gateway request would be mistaken for the identity-header proxy, leaving the lane unreachable, so that combination refuses to start too — and an empty config disables the lane entirely.
+
+### Per-database write scoping (forward-auth)
+
+`write_groups` grants every database in the deployment. To let a database's owning team run mutating CLI/API operations against *their* database only, set `operator_groups` on the database and `operator_environments` — the instance-wide list of environments where scoped writes are allowed at all — in the forward-auth settings:
+
+```yaml
+auth:
+  type: forward_auth
+  forward_auth:
+    operator_environments: [staging]      # scoped writes allowed here, instance-wide
+databases:
+  payments:
+    type: mysql
+    operator_groups: [payments-team]      # forwarded groups granted scoped write
+    environments:
+      staging:
+        dsn: "env:STAGING_PAYMENTS_DSN"
+      production:
+        dsn: "env:PROD_PAYMENTS_DSN"
+```
+
+Which environments accept scoped writes is a deployment policy, uniform across databases, so it is stated once rather than repeated on every entry. On a server that hosts several environments, that one line is the guard keeping scoped writes out of the environments not named in it.
+
+`operator_groups` is the direct API/CLI counterpart of the database's `operator_teams`/`operator_users` (PR comment commands). The suffix carries the identity domain, consistently across this file — `*_teams`/`*_users` are GitHub identities, `*_groups` are forwarded identity groups:
+
+| Field | Identity domain | Grants | Verified by |
+|---|---|---|---|
+| `operator_teams`, `operator_users` | GitHub teams and users | Mutating PR comment commands for this database; also satisfies its review-gate required-reviewer policy | GitHub team membership, checked at command time |
+| `operator_groups` | Forwarded identity groups (`auth.forward_auth`) | Mutating direct API/CLI operations for this database, in `operator_environments` | Groups header from the trusted forward-auth proxy |
+
+The two value namespaces do not overlap and are verified by different systems, so they are deliberately separate fields: a GitHub team slug has no meaning in the groups header, and a forwarded group name is not a GitHub team. Grant each lane explicitly.
+
+The decision has two halves. The middleware admits any caller in `write_groups` or in any database's `operator_groups` to write-tier endpoints — it runs before the request body is parsed, so it cannot know the target. Each mutating handler then enforces the scope once the target database resolves: `plan` and `apply` from the request/stored plan, control operations (`stop`, `start`, `cutover`, `cancel`, `volume`, `release`, `revert`, `skip-revert`, `rollback plan`) from the stored apply, and lock acquire/release from the named database (locks are operator controls in the same family as stop/cancel and have no environment dimension, so the grant applies database-wide). Operations with no single target database — settings mutation, checks scan/synthesize/repos, webhook redrive — stay admin-only (`write_groups`). Operator members also get the read tier, deployment-wide.
+
+Two consequences of the environment-less lock grant are worth stating outright. First, a scoped operator's lock holds applies off **every** environment of their database, including environments outside `operator_environments` — an operator scoped to staging can still freeze production applies of their own database. That direction is fail-safe (a lock only ever prevents changes), so the grant deliberately allows it. Second, the reverse direction is not: force release (`force: true`) bypasses the lock ownership check, so it could undo another holder's safety brake — for example an admin's incident lock. Force release therefore stays admin-only (`write_groups`); a scoped operator can release only locks their own callers hold.
+
+The grant fails closed everywhere: an unconfigured database or an environment outside `operator_environments` denies scoped callers with a `403` naming the groups that would grant access, and a target that cannot be resolved at decision time — a stored plan or apply lookup failure — surfaces as the operation's own `500`, never as an authorization. Misconfiguration is a startup error, not a silent no-op: any `operator_groups` grant requires a non-empty `operator_environments` (and the reverse), requires `auth.type: forward_auth`, and every granted database must have at least one of its environments in `operator_environments` — a grant that could never authorize anything is rejected at startup.
+
+Group names in `operator_groups` match the same way as `read_groups`/`write_groups`: an exact string, or by final path segment when either side is a bare slug (bridging a proxy that forwards `payments-team` to a configured `org/payments-team`). Because `operator_groups` decides a per-database boundary, org-qualify its entries on deployments whose proxy forwards groups from more than one organization — a bare `admins` would match `org-a/admins` and `org-b/admins` alike.
+
+These are server-instance values owned by the platform operator. Keep them in the server's own configuration — never in repo-editable config, where a database team could grant themselves direct write with a self-merged PR.
+
+Scoped operators bypass PR source policy (`allowed_repos`/`allowed_dirs` are not evaluated for direct API plans), so a scoped grant trades the GitOps audit trail for direct access. Grant it for staging-style environments; before granting a production environment, add a trusted-source or stored-plan gate.
 
 ## Multi-Environment Deployment
 

@@ -1077,6 +1077,88 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsStaleRunning(t *testin
 	assert.WithinDuration(t, time.Now(), persisted.UpdatedAt, 5*time.Second)
 }
 
+// TestApplyOperationStore_ReleaseClaim_ReleasedRowIsImmediatelyReclaimable
+// verifies the release path a driver takes when it claims an operation but
+// cannot acquire the parent apply lease it also needs: releasing the claim
+// clears the lease fields and leaves the row immediately re-claimable through
+// the stale-active recovery arm, without waiting for the retained lease to go
+// stale, and without changing the row's state.
+func TestApplyOperationStore_ReleaseClaim_ReleasedRowIsImmediatelyReclaimable(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_release_claim", 1)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "blocked-driver")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.Equal(t, id, claimed.ID)
+
+	released, err := store.ApplyOperations().ReleaseClaim(ctx, claimed.Lease())
+	require.NoError(t, err)
+	assert.True(t, released, "release guarded on the held token must succeed")
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Empty(t, persisted.LeaseOwner, "release must clear the lease owner")
+	assert.Empty(t, persisted.LeaseToken, "release must clear the lease token")
+	assert.Nil(t, persisted.LeaseAcquiredAt, "release must clear lease_acquired_at")
+	assert.Equal(t, state.ApplyOperation.Running, persisted.State, "release must not change the row's state")
+
+	reclaimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "retry-driver")
+	require.NoError(t, err)
+	require.NotNil(t, reclaimed, "a released row must be re-claimable on the next poll without aging")
+	assert.Equal(t, id, reclaimed.ID)
+	assert.Equal(t, "retry-driver", reclaimed.LeaseOwner)
+	assert.Equal(t, state.ApplyOperation.Running, reclaimed.State, "re-claim recovers the row without changing its state")
+}
+
+// TestApplyOperationStore_ReleaseClaim_MismatchedTokenIsNoOp verifies the
+// token guard: once another driver rotates the lease, the original holder's
+// release must not clear the new owner's lease or perturb its heartbeat.
+func TestApplyOperationStore_ReleaseClaim_MismatchedTokenIsNoOp(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_release_stale_token", 1)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-owner")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	staleLease := claimed.Lease()
+	staleLease.Token = "rotated-away-" + staleLease.Token
+
+	released, err := store.ApplyOperations().ReleaseClaim(ctx, staleLease)
+	require.NoError(t, err)
+	assert.False(t, released, "a mismatched token must not release another owner's lease")
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, "current-owner", persisted.LeaseOwner, "the current owner's lease must be untouched")
+	assert.Equal(t, claimed.LeaseToken, persisted.LeaseToken)
+
+	fresh, err := store.ApplyOperations().FindNextApplyOperation(ctx, "another-driver")
+	require.NoError(t, err)
+	assert.Nil(t, fresh, "the row must stay leased to the current owner after a mismatched release")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_SkipsTerminal verifies that
 // every terminal state listed in state.IsApplyOperationTerminal is excluded
 // from the claim. ApplyOperation shares the full Apply state vocabulary, so

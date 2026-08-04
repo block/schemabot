@@ -45,6 +45,16 @@ type ForwardAuthConfig struct {
 	// can perform write-tier operations (read still works).
 	WriteGroups []string
 
+	// OperatorGroups are the per-database operator groups (the union across
+	// every configured database's operator_groups). Members are admitted to
+	// write-tier endpoints by this middleware, but that admission is only the
+	// first half of the decision: the middleware runs before the request body
+	// is parsed, so it cannot know the target database. Each mutating handler
+	// enforces the per-database and per-environment scope once the target
+	// resolves. Operator members also get the read tier — an operator who can
+	// mutate their database must be able to watch the result.
+	OperatorGroups []string
+
 	// TrustedGatewaySPIFFE lists the SPIFFE IDs of caller-forwarding gateways.
 	// Such a gateway terminates the caller's mTLS, verifies the client
 	// certificate, and forwards the caller's SPIFFE ID in CallerSPIFFEHeader.
@@ -84,8 +94,12 @@ type ForwardAuthConfig struct {
 // alone. Read (visibility) endpoints require only an authenticated caller
 // (optionally narrowed to ReadGroups); write endpoints — which include planning,
 // since a plan stages a change against a database — require membership in a
-// configured write group. The direct-API/CLI write path is for a small
-// privileged set; general users go through the PR-comment workflow instead.
+// configured write group or in a per-database operator group (OperatorGroups).
+// Write groups grant every database; operator membership is only admission —
+// each mutating handler enforces the caller's per-database and per-environment
+// scope once the target resolves, because the middleware runs before the
+// request body carrying the target is parsed. General users go through the
+// PR-comment workflow instead.
 //
 // A second, optional lane serves services calling as themselves through a
 // caller-forwarding gateway (TrustedGatewaySPIFFE): the gateway verifies the
@@ -106,6 +120,7 @@ type ForwardAuthAuthorizer struct {
 	trustedNets       []*net.IPNet
 	readGroups        []string
 	writeGroups       []string
+	operatorGroups    []string
 	gatewaySPIFFE     []string
 	callerHeader      string
 	readServiceSPIFFE []string
@@ -220,6 +235,7 @@ func NewForwardAuthAuthorizer(cfg ForwardAuthConfig, logger *slog.Logger) (*Forw
 		trustedNets:       nets,
 		readGroups:        cfg.ReadGroups,
 		writeGroups:       cfg.WriteGroups,
+		operatorGroups:    cfg.OperatorGroups,
 		gatewaySPIFFE:     gateways,
 		callerHeader:      callerHeader,
 		readServiceSPIFFE: readServices,
@@ -238,7 +254,7 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		tier := tierForRequest(r.Method, r.URL.Path)
+		tier := TierForRequest(r.Method, r.URL.Path)
 
 		trusted, proxyID := a.isTrustedProxy(r)
 		if !trusted {
@@ -281,11 +297,23 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 
 		switch tier {
 		case TierWrite:
-			if !matchesAnyGroup(groups, a.writeGroups) {
+			// Write admission covers deployment write groups and per-database
+			// operator groups. For operators this is only the first half of the
+			// decision: the target database is in the not-yet-parsed request
+			// body, so the mutating handler enforces the per-database and
+			// per-environment scope once the target resolves.
+			if !matchesAnyGroup(groups, a.writeGroups) && !matchesAnyGroup(groups, a.operatorGroups) {
 				a.logger.Warn("forward-auth authorization denied for write operation",
 					"path", r.URL.Path, "subject", user)
 				authDecision(r, tier, "deny", "not_admin")
-				writeAuthError(w, http.StatusForbidden, "this operation requires membership in a write-access group")
+				// Only mention operator groups when the deployment has any;
+				// on a deployment without them the suffix would send a denied
+				// caller hunting for a lane that does not exist.
+				msg := "this operation requires membership in a write-access group"
+				if len(a.operatorGroups) > 0 {
+					msg += " or a database operator group"
+				}
+				writeAuthError(w, http.StatusForbidden, msg)
 				return
 			}
 		default: // TierRead
@@ -370,12 +398,15 @@ func (a *ForwardAuthAuthorizer) authorizeGatewayCaller(w http.ResponseWriter, r 
 
 // canRead reports whether the caller may use read-tier endpoints. With no
 // configured read groups, reads are open to any authenticated caller; otherwise
-// the caller must be in a read group (write-group members can always read).
+// the caller must be in a read group (write-group and database-operator members
+// can always read — anyone who can mutate must be able to watch the result).
 func (a *ForwardAuthAuthorizer) canRead(groups []string) bool {
 	if len(a.readGroups) == 0 {
 		return true
 	}
-	return matchesAnyGroup(groups, a.readGroups) || matchesAnyGroup(groups, a.writeGroups)
+	return matchesAnyGroup(groups, a.readGroups) ||
+		matchesAnyGroup(groups, a.writeGroups) ||
+		matchesAnyGroup(groups, a.operatorGroups)
 }
 
 // extractGroups collects the caller's groups from the groups header, supporting

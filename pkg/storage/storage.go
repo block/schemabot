@@ -810,6 +810,20 @@ type ApplyOperationStore interface {
 	// row, or nil if nothing is ready to cut over.
 	FindNextApplyOperationCutover(ctx context.Context, owner string) (*ApplyOperation, error)
 
+	// ReleaseClaim releases an operation lease the calling driver holds but
+	// cannot use — typically because the parent apply lease it also needs was
+	// transiently unclaimable. It clears the lease fields and backdates the
+	// heartbeat past the staleness window so the row is re-claimable on the
+	// next poll, instead of sitting on the fresh lease until it goes stale.
+	// The row's state is left unchanged: the released row re-enters through
+	// the stale-active recovery arm of FindNextApplyOperation, the same path
+	// that recovers a crashed driver's work.
+	//
+	// The write is guarded on the lease token. Reports false when the lease no
+	// longer matches (another writer rotated or cleared it), in which case the
+	// row has moved on and needs nothing from the caller.
+	ReleaseClaim(ctx context.Context, lease OperationLease) (bool, error)
+
 	// Heartbeat refreshes the child row's updated_at timestamp to extend the
 	// claim's lease while a driver is acting on it. Mirrors ApplyStore.Heartbeat
 	// semantics: silent no-op when the row no longer exists.

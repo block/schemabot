@@ -104,6 +104,9 @@ const checksSynthesizeMaxPRsPerRequest = 10
 const checksDisabledSkipOutcome = "skipped: Check Runs are disabled for this repository (enable_checks: false)"
 
 func (s *Service) handleChecksSynthesize(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeDirectAdminWrite(w, r, "checks_synthesize") {
+		return
+	}
 	var req ChecksSynthesizeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeBodyDecodeError(w, err)
@@ -209,6 +212,9 @@ type webhookRedriveApp struct {
 }
 
 func (s *Service) handleWebhookRedrive(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeDirectAdminWrite(w, r, "webhook_redrive") {
+		return
+	}
 	var req WebhookRedriveRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeBodyDecodeError(w, err)
@@ -225,6 +231,9 @@ func (s *Service) handleWebhookRedrive(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) handleChecksScan(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeDirectAdminWrite(w, r, "checks_scan") {
+		return
+	}
 	var req ChecksScanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeBodyDecodeError(w, err)
@@ -335,6 +344,9 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanReq
 }
 
 func (s *Service) handleChecksRepos(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeDirectAdminWrite(w, r, "checks_repos") {
+		return
+	}
 	response, err := executeChecksRepos(s.config)
 	if err != nil {
 		s.writeWebhookOpsError(w, err)
