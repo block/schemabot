@@ -76,6 +76,45 @@ func (h *Handler) verifyHeadSHACurrency(ctx context.Context, client *ghclient.In
 	return true, nil
 }
 
+// rerequestTargetIsPlannable reports whether a re-run request ("Re-run" /
+// "Re-run all checks") may re-plan its PR: the PR must still be open and
+// headSHA must still be its current head. A closed PR — merged or unmerged —
+// is read-only history: apply commands are rejected on it and PR-close
+// cleanup already removed its stored check state, so a re-plan would recreate
+// deleted rows and post a plan nobody can act on. Closed and stale outcomes
+// are logged and return (false, nil); a GitHub failure fetching the PR is
+// uncertainty, not a decline, so it is returned for the caller to retry or
+// surface.
+func (h *Handler) rerequestTargetIsPlannable(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, operation, deliveryID string) (bool, error) {
+	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  operation,
+			Repository: repo,
+			Status:     "error",
+		})
+		return false, fmt.Errorf("fetch PR to verify re-run request target %s#%d (%s): %w", repo, pr, operation, err)
+	}
+	if prInfo.IsClosed() {
+		h.logger.Info("re-run request ignored because the PR is closed",
+			"repo", repo, "pr", pr, "operation", operation, "head_sha", headSHA,
+			"merged", prInfo.Merged, "delivery_id", deliveryID)
+		return false, nil
+	}
+	if prInfo.HeadSHA != headSHA {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  operation,
+			Repository: repo,
+			Status:     "stale",
+		})
+		h.logger.Info("re-run request ignored because head SHA is no longer current for PR",
+			"repo", repo, "pr", pr, "operation", operation,
+			"stale_head_sha", headSHA, "current_head_sha", prInfo.HeadSHA, "delivery_id", deliveryID)
+		return false, nil
+	}
+	return true, nil
+}
+
 // aggregateFoldFollowUp names the post-fold side effect a caller must apply
 // after updateAggregateCheckOnce returns. The one-shot fold never schedules a
 // timer or mutates the re-fold budget itself, so the owner of retries (the

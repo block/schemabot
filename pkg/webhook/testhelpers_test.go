@@ -197,6 +197,65 @@ func buildCheckRunWebhookRequest(t *testing.T, opts checkRunWebhookPayloadOpts, 
 	return req
 }
 
+type checkSuiteWebhookPayloadOpts struct {
+	action  string
+	headSHA string
+	pr      int
+	noPR    bool
+}
+
+// buildCheckSuiteWebhookRequest constructs a valid check_suite webhook POST request with HMAC signature.
+func buildCheckSuiteWebhookRequest(t *testing.T, opts checkSuiteWebhookPayloadOpts, secret []byte) *http.Request {
+	t.Helper()
+
+	if opts.action == "" {
+		opts.action = "rerequested"
+	}
+	if opts.headSHA == "" {
+		opts.headSHA = "abc123"
+	}
+	if opts.pr == 0 {
+		opts.pr = 1
+	}
+
+	pullRequests := []map[string]any{{
+		"number": opts.pr,
+	}}
+	if opts.noPR {
+		pullRequests = nil
+	}
+
+	payload := map[string]any{
+		"action": opts.action,
+		"check_suite": map[string]any{
+			"id":            456,
+			"head_sha":      opts.headSHA,
+			"pull_requests": pullRequests,
+		},
+		"repository": map[string]any{
+			"full_name": "octocat/hello-world",
+		},
+		"installation": map[string]any{
+			"id": 12345,
+		},
+	}
+
+	body, err := json.Marshal(payload)
+	require.NoError(t, err)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-GitHub-Event", "check_suite")
+
+	if len(secret) > 0 {
+		mac := hmac.New(sha256.New, secret)
+		mac.Write(body)
+		sig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+		req.Header.Set("X-Hub-Signature-256", sig)
+	}
+
+	return req
+}
+
 // webhookPayloadOpts configures how buildWebhookRequest constructs the payload.
 type webhookPayloadOpts struct {
 	comment   string

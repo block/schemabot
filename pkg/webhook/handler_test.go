@@ -361,7 +361,7 @@ func TestCheckRunRerequestIgnoresStaleHeadSHA(t *testing.T) {
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "stale head SHA")
+	assert.Contains(t, rr.Body.String(), "closed PR or stale head")
 }
 
 // newTestHandler creates a Handler wired to a fake GitHub API server.

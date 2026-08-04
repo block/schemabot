@@ -17,21 +17,21 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// durableCheckRunRerequestEvent returns a claimable check_run rerequest inbox
-// row for the default SchemaBot aggregate check, mirroring what the HTTP path
-// enqueues.
-func durableCheckRunRerequestEvent(t *testing.T) *storage.WebhookEvent {
+// durableCheckSuiteRerequestEvent returns a claimable check_suite rerequest
+// inbox row, mirroring what the HTTP path enqueues for the GitHub UI's
+// "Re-run all checks".
+func durableCheckSuiteRerequestEvent(t *testing.T) *storage.WebhookEvent {
 	t.Helper()
 	payload := []byte(`{
 		"action": "rerequested",
-		"check_run": {"id": 123, "name": "SchemaBot", "head_sha": "head-sha", "pull_requests": [{"number": 7}]},
+		"check_suite": {"id": 456, "head_sha": "head-sha", "pull_requests": [{"number": 7}]},
 		"repository": {"full_name": "octocat/hello-world"},
 		"installation": {"id": 12345}
 	}`)
 	return &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
-		DeliveryID:  "delivery-check-run-1",
-		Event:       "check_run",
+		DeliveryID:  "delivery-check-suite-1",
+		Event:       "check_suite",
 		Action:      "rerequested",
 		Repository:  "octocat/hello-world",
 		PullRequest: 7,
@@ -41,29 +41,29 @@ func durableCheckRunRerequestEvent(t *testing.T) *storage.WebhookEvent {
 	}
 }
 
-// With durable dispatch enabled, a check_run rerequest for a SchemaBot
-// aggregate check acks fast by persisting an inbox row rather than running
-// auto-plan synchronously on the request path, so a deploy mid-run cannot drop
-// the re-plan.
-func TestDurableCheckRunRerequestQueuesAndAcks(t *testing.T) {
+// With durable dispatch enabled, a check_suite rerequest ("Re-run all checks",
+// the only re-run affordance on a merged PR) acks fast by persisting an inbox
+// row rather than running auto-plan synchronously on the request path, so a
+// deploy mid-run cannot drop the re-plan.
+func TestDurableCheckSuiteRerequestQueuesAndAcks(t *testing.T) {
 	events := newRecordingWebhookEventStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{}, nil, logger)
 	clientFactory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
 	h := NewHandler(service, clientFactory, nil, logger, WithDurableWebhookDispatch())
 
-	req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{action: "rerequested", headSHA: "head-sha", pr: 7}, nil)
-	req.Header.Set(headerDeliveryID, "delivery-check-run-1")
+	req := buildCheckSuiteWebhookRequest(t, checkSuiteWebhookPayloadOpts{action: "rerequested", headSHA: "head-sha", pr: 7}, nil)
+	req.Header.Set(headerDeliveryID, "delivery-check-suite-1")
 	rr := httptest.NewRecorder()
 
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	require.JSONEq(t, `{"message":"check_run rerequest queued"}`, rr.Body.String())
-	event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-check-run-1")
+	require.JSONEq(t, `{"message":"check_suite rerequest queued"}`, rr.Body.String())
+	event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-check-suite-1")
 	require.NoError(t, err)
 	require.NotNil(t, event)
-	require.Equal(t, "check_run", event.Event)
+	require.Equal(t, "check_suite", event.Event)
 	require.Equal(t, "rerequested", event.Action)
 	require.Equal(t, "octocat/hello-world", event.Repository)
 	require.Equal(t, 7, event.PullRequest)
@@ -78,17 +78,17 @@ func TestDurableCheckRunRerequestQueuesAndAcks(t *testing.T) {
 	}
 }
 
-// A redelivered check_run rerequest (same delivery GUID) is deduplicated to a
+// A redelivered check_suite rerequest (same delivery GUID) is deduplicated to a
 // single inbox row.
-func TestDurableCheckRunRerequestDeduplicatesDelivery(t *testing.T) {
+func TestDurableCheckSuiteRerequestDeduplicatesDelivery(t *testing.T) {
 	events := newRecordingWebhookEventStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{}, nil, logger)
 	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
 
 	for range 2 {
-		req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{action: "rerequested"}, nil)
-		req.Header.Set(headerDeliveryID, "delivery-check-run-1")
+		req := buildCheckSuiteWebhookRequest(t, checkSuiteWebhookPayloadOpts{action: "rerequested"}, nil)
+		req.Header.Set(headerDeliveryID, "delivery-check-suite-1")
 		rr := httptest.NewRecorder()
 
 		h.ServeHTTP(rr, req)
@@ -101,34 +101,58 @@ func TestDurableCheckRunRerequestDeduplicatesDelivery(t *testing.T) {
 	require.Len(t, events.events, 1)
 }
 
-// A rerequest for a check SchemaBot does not own is rejected before enqueue, so
-// no inbox row is created even with durable dispatch enabled.
-func TestDurableCheckRunRerequestSkipsNonSchemaBotCheck(t *testing.T) {
+// A check_suite rerequest without an associated pull request (e.g. a suite on
+// a branch with no open PR) has nothing to re-plan, so it is acknowledged
+// before enqueue and no inbox row is created.
+func TestDurableCheckSuiteRerequestIgnoresWithoutPullRequest(t *testing.T) {
 	events := newRecordingWebhookEventStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{}, nil, logger)
 	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
 
-	req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{action: "rerequested", checkName: "Some Other Check"}, nil)
-	req.Header.Set(headerDeliveryID, "delivery-check-run-1")
+	req := buildCheckSuiteWebhookRequest(t, checkSuiteWebhookPayloadOpts{action: "rerequested", noPR: true}, nil)
+	req.Header.Set(headerDeliveryID, "delivery-check-suite-1")
 	rr := httptest.NewRecorder()
 
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
+	require.JSONEq(t, `{"message":"check_suite rerequest ignored without pull request"}`, rr.Body.String())
 	events.mu.Lock()
 	defer events.mu.Unlock()
-	require.Empty(t, events.events, "a non-SchemaBot check rerequest must not be enqueued")
+	require.Empty(t, events.events, "a PR-less check_suite rerequest must not be enqueued")
 }
 
-// A claimed check_run delivery whose action is not rerequested (only
+// check_suite actions other than rerequested (created, completed) fire on
+// every commit as part of the normal check lifecycle and carry no operator
+// intent, so the request path acknowledges them without enqueueing work.
+func TestCheckSuiteNonRerequestActionIgnored(t *testing.T) {
+	events := newRecordingWebhookEventStore()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{}, nil, logger)
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+
+	req := buildCheckSuiteWebhookRequest(t, checkSuiteWebhookPayloadOpts{action: "completed"}, nil)
+	req.Header.Set(headerDeliveryID, "delivery-check-suite-1")
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.JSONEq(t, `{"message":"check_suite action ignored"}`, rr.Body.String())
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	require.Empty(t, events.events, "a non-rerequested check_suite action must not be enqueued")
+}
+
+// A claimed check_suite delivery whose action is not rerequested (only
 // rerequested is enqueued today) is ignored and completed rather than retried,
 // so a replayed or future-producer row cannot wedge the queue.
-func TestDurableCheckRunDriverCompletesUnsupportedAction(t *testing.T) {
+func TestDurableCheckSuiteDriverCompletesUnsupportedAction(t *testing.T) {
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
 		Provider:   storage.WebhookProviderGitHub,
-		DeliveryID: "delivery-check-run-completed",
-		Event:      "check_run",
+		DeliveryID: "delivery-check-suite-completed",
+		Event:      "check_suite",
 		Action:     "completed",
 		Payload:    []byte(`{"action":"completed"}`),
 	})
@@ -141,18 +165,18 @@ func TestDurableCheckRunDriverCompletesUnsupportedAction(t *testing.T) {
 		require.Equal(t, int64(1), outcome.id)
 		require.Equal(t, "token-1", outcome.leaseToken)
 	default:
-		t.Fatal("expected unsupported check_run action to be marked completed")
+		t.Fatal("expected unsupported check_suite action to be marked completed")
 	}
 	require.Empty(t, store.failed)
 }
 
-// A malformed check_run payload cannot be decoded, so the driver fails it
+// A malformed check_suite payload cannot be decoded, so the driver fails it
 // terminally (no retry) rather than crash-looping the fleet on a poison row.
-func TestDurableCheckRunDriverFailsMalformedTerminally(t *testing.T) {
+func TestDurableCheckSuiteDriverFailsMalformedTerminally(t *testing.T) {
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
 		Provider:   storage.WebhookProviderGitHub,
-		DeliveryID: "delivery-check-run-malformed",
-		Event:      "check_run",
+		DeliveryID: "delivery-check-suite-malformed",
+		Event:      "check_suite",
 		Payload:    []byte(`{not json`),
 	})
 	h := newDurableDriverHandler(t, store, nil, nil)
@@ -162,17 +186,17 @@ func TestDurableCheckRunDriverFailsMalformedTerminally(t *testing.T) {
 	select {
 	case failure := <-store.failed:
 		require.Nil(t, failure.retryAfter, "malformed payload must not be retried")
-		require.Contains(t, failure.errMsg, "decode durable check_run delivery")
+		require.Contains(t, failure.errMsg, "decode durable check_suite delivery")
 	default:
-		t.Fatal("expected malformed check_run event to be marked failed")
+		t.Fatal("expected malformed check_suite event to be marked failed")
 	}
 	require.Empty(t, store.completed)
 }
 
-// A check_run rerequest for a repo outside the allowlist is completed without
+// A check_suite rerequest for a repo outside the allowlist is completed without
 // running auto-plan or creating a GitHub client.
-func TestDurableCheckRunDriverCompletesUnregisteredRepo(t *testing.T) {
-	store := newScriptedWebhookEventStore(durableCheckRunRerequestEvent(t))
+func TestDurableCheckSuiteDriverCompletesUnregisteredRepo(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableCheckSuiteRerequestEvent(t))
 	config := &api.ServerConfig{Repos: map[string]api.RepoConfig{"other/repo": {}}}
 	factory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
 	h := newDurableDriverHandler(t, store, config, factory)
@@ -182,7 +206,7 @@ func TestDurableCheckRunDriverCompletesUnregisteredRepo(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected unregistered-repo check_run event to be marked completed")
+		t.Fatal("expected unregistered-repo check_suite event to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	select {
@@ -192,70 +216,11 @@ func TestDurableCheckRunDriverCompletesUnregisteredRepo(t *testing.T) {
 	}
 }
 
-// A check_run rerequest for a check SchemaBot does not own is completed without
-// running auto-plan — the driver re-validates the same guard the request path
-// applies.
-func TestDurableCheckRunDriverCompletesNonSchemaBotCheck(t *testing.T) {
-	event := durableCheckRunRerequestEvent(t)
-	event.Payload = []byte(`{
-		"action": "rerequested",
-		"check_run": {"id": 123, "name": "Some Other Check", "head_sha": "head-sha", "pull_requests": [{"number": 7}]},
-		"repository": {"full_name": "octocat/hello-world"},
-		"installation": {"id": 12345}
-	}`)
-	store := newScriptedWebhookEventStore(event)
-	factory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
-	h := newDurableDriverHandler(t, store, nil, factory)
-
-	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
-
-	select {
-	case <-store.completed:
-	default:
-		t.Fatal("expected non-SchemaBot check_run rerequest to be marked completed")
-	}
-	require.Empty(t, store.failed)
-	select {
-	case <-factory.forInstallationStarted:
-		t.Fatal("non-SchemaBot check must not create a GitHub client")
-	default:
-	}
-}
-
-// serveCheckRunPRHead registers the PR lookup the driver's pre-dispatch target
-// check performs, reporting currentHeadSHA as the current head of an open PR.
-func serveCheckRunPRHead(t *testing.T, mux *http.ServeMux, currentHeadSHA string) {
-	t.Helper()
-	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"head":  map[string]any{"sha": currentHeadSHA, "ref": "feature-branch"},
-			"base":  map[string]any{"sha": "def456", "ref": "main"},
-			"user":  map[string]any{"login": "testuser"},
-			"state": "open",
-		}))
-	})
-}
-
-// serveMergedCheckRunPR registers the PR lookup reporting a merged (closed) PR
-// whose head is still currentHeadSHA.
-func serveMergedCheckRunPR(t *testing.T, mux *http.ServeMux, currentHeadSHA string) {
-	t.Helper()
-	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"head":   map[string]any{"sha": currentHeadSHA, "ref": "feature-branch"},
-			"base":   map[string]any{"sha": "def456", "ref": "main"},
-			"user":   map[string]any{"login": "testuser"},
-			"state":  "closed",
-			"merged": true,
-		}))
-	})
-}
-
-// A durable rerequest whose head is no longer the PR's current head is completed
-// without running discovery: planning the stale head would list the current
-// PR's files against a stale config snapshot.
-func TestDurableCheckRunDriverCompletesStaleHead(t *testing.T) {
-	store := newScriptedWebhookEventStore(durableCheckRunRerequestEvent(t))
+// A durable check_suite rerequest whose head is no longer the PR's current head
+// is completed without running discovery: planning the stale head would list
+// the current PR's files against a stale config snapshot.
+func TestDurableCheckSuiteDriverCompletesStaleHead(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableCheckSuiteRerequestEvent(t))
 	ghClient, mux := setupGitHubServer(t)
 	serveCheckRunPRHead(t, mux, "newer-sha-999")
 	var fileListCalls atomic.Int64
@@ -271,18 +236,18 @@ func TestDurableCheckRunDriverCompletesStaleHead(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected a stale-head rerequest to be marked completed")
+		t.Fatal("expected a stale-head check_suite rerequest to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	require.Equal(t, int64(0), fileListCalls.Load(), "a stale rerequest must stop before config discovery")
 }
 
-// A durable rerequest for a closed (merged) PR is completed without running
-// discovery: closed PRs are read-only history — apply commands are rejected on
-// them and PR-close cleanup removed their stored check state — so a re-plan
-// would recreate deleted state and post a plan nobody can act on.
-func TestDurableCheckRunDriverCompletesClosedPR(t *testing.T) {
-	store := newScriptedWebhookEventStore(durableCheckRunRerequestEvent(t))
+// A durable check_suite rerequest for a closed (merged) PR is completed without
+// running discovery: closed PRs are read-only history — apply commands are
+// rejected on them and PR-close cleanup removed their stored check state — so
+// a re-plan would recreate deleted state and post a plan nobody can act on.
+func TestDurableCheckSuiteDriverCompletesClosedPR(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableCheckSuiteRerequestEvent(t))
 	ghClient, mux := setupGitHubServer(t)
 	serveMergedCheckRunPR(t, mux, "head-sha")
 	var fileListCalls atomic.Int64
@@ -298,7 +263,7 @@ func TestDurableCheckRunDriverCompletesClosedPR(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected a closed-PR rerequest to be marked completed")
+		t.Fatal("expected a closed-PR check_suite rerequest to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	require.Equal(t, int64(0), fileListCalls.Load(), "a closed-PR rerequest must stop before config discovery")
@@ -307,8 +272,8 @@ func TestDurableCheckRunDriverCompletesClosedPR(t *testing.T) {
 // A GitHub failure verifying the current head is uncertainty, not staleness, so
 // the delivery stays retryable rather than silently completing and dropping the
 // re-plan.
-func TestDurableCheckRunDriverRetriesHeadVerificationFailure(t *testing.T) {
-	store := newScriptedWebhookEventStore(durableCheckRunRerequestEvent(t))
+func TestDurableCheckSuiteDriverRetriesHeadVerificationFailure(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableCheckSuiteRerequestEvent(t))
 	ghClient, mux := setupGitHubServer(t)
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
@@ -321,18 +286,18 @@ func TestDurableCheckRunDriverRetriesHeadVerificationFailure(t *testing.T) {
 	select {
 	case failure := <-store.failed:
 		require.NotNil(t, failure.retryAfter, "head-verification failure must stay retryable")
-		require.Contains(t, failure.errMsg, "verify re-run target for durable check_run rerequest")
+		require.Contains(t, failure.errMsg, "verify re-run target for durable check_suite rerequest")
 	default:
 		t.Fatal("expected head-verification failure to be marked failed")
 	}
 	require.Empty(t, store.completed)
 }
 
-// A durable rerequest whose head is still current proceeds through discovery and
-// completes: a no-schema PR has nothing to plan, so the delivery is done once
-// auto-plan runs.
-func TestDurableCheckRunDriverReplansCurrentHead(t *testing.T) {
-	store := newScriptedWebhookEventStore(durableCheckRunRerequestEvent(t))
+// A durable check_suite rerequest whose head is still current proceeds through
+// discovery and completes: a no-schema PR has nothing to plan, so the delivery
+// is done once auto-plan runs.
+func TestDurableCheckSuiteDriverReplansCurrentHead(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableCheckSuiteRerequestEvent(t))
 	ghClient, mux := setupGitHubServer(t)
 	serveCheckRunPRHead(t, mux, "head-sha")
 	var fileListCalls atomic.Int64
@@ -350,16 +315,16 @@ func TestDurableCheckRunDriverReplansCurrentHead(t *testing.T) {
 	select {
 	case <-store.completed:
 	default:
-		t.Fatal("expected a current-head rerequest to be marked completed")
+		t.Fatal("expected a current-head check_suite rerequest to be marked completed")
 	}
 	require.Empty(t, store.failed)
 	require.Equal(t, int64(1), fileListCalls.Load(), "a current rerequest must run config discovery")
 }
 
-// A bootstrap failure on a valid check_run rerequest stays retryable so a
+// A bootstrap failure on a valid check_suite rerequest stays retryable so a
 // transient installation-token outage does not drop the re-plan.
-func TestDurableCheckRunDriverRetriesBootstrapFailure(t *testing.T) {
-	store := newScriptedWebhookEventStore(durableCheckRunRerequestEvent(t))
+func TestDurableCheckSuiteDriverRetriesBootstrapFailure(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableCheckSuiteRerequestEvent(t))
 	factory := &fakeClientFactory{forInstallationErr: errors.New("installation token unavailable")}
 	h := newDurableDriverHandler(t, store, nil, factory)
 

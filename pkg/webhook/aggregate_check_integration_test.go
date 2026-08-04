@@ -816,7 +816,7 @@ func TestE2ECheckRunRerequestIgnoresStaleHeadSHA(t *testing.T) {
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "stale head SHA")
+	assert.Contains(t, rr.Body.String(), "closed PR or stale head")
 	assert.Equal(t, int64(0), fileListCalls.Load(), "stale check reruns should stop before config discovery")
 
 	select {
