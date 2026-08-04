@@ -929,14 +929,18 @@ func verifyHMAC(signature string, body, secret []byte) bool {
 }
 
 // recoverPanic recovers from panics in async goroutines, logs the stack trace,
-// and posts an error comment on the PR so the user gets feedback instead of silence.
+// and posts an error comment on the PR so the user gets feedback instead of
+// silence. The comment is a fixed line: a panic value can carry anything that
+// was in scope at the panic site (DSN fragments, hostnames, driver internals),
+// and a PR comment is a public surface — the raw value and stack stay
+// server-side in the log.
 // Usage: defer h.recoverPanic(repo, pr, installationID)
 func (h *Handler) recoverPanic(repo string, pr int, installationID int64) {
 	if r := recover(); r != nil {
 		stack := debug.Stack()
 		h.logger.Error("goroutine panic", "repo", repo, "pr", pr, "installation_id", installationID, "error", r, "stack", string(stack))
 		h.postComment(repo, pr, installationID,
-			fmt.Sprintf("**Internal error: goroutine panic. This is a bug — please report it.**\n```\n%v\n```", r))
+			"**Internal error while processing this request. This is a bug — please report it.** Details are in the server logs.")
 	}
 }
 

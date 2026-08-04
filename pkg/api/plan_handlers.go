@@ -375,6 +375,12 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		s.logger.Warn("plan request has empty schema files", "warning", warning, "database", req.Database)
 	}
 
+	// Planning stages a change against a specific database and reads its live
+	// schema, so it takes the same per-database authorization as apply.
+	if !s.authorizeDirectWrite(w, r, "plan", req.Database, req.Environment) {
+		return
+	}
+
 	resp, err := s.ExecutePlan(r.Context(), req)
 	if err != nil {
 		var policyErr *SourcePolicyError
@@ -647,6 +653,10 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Environment == "" {
 		s.writeError(w, http.StatusBadRequest, "environment is required")
+		return
+	}
+
+	if !s.authorizeDirectWriteForStoredPlan(w, r, "apply", req.PlanID, req.Environment) {
 		return
 	}
 
