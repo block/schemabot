@@ -1305,11 +1305,15 @@ func stateColorFunc(s string) func(string) string {
 	}
 }
 
-// shortCaller strips the hostname from a caller string for compact display.
-// "cli:armand@macbook.local" -> "cli:armand"
+// shortCaller strips the trailing location from a caller string for compact
+// display: the machine for CLI callers ("cli:jdoe@macbook.local" -> "cli:jdoe")
+// and the repo#pr for webhook callers ("github:jdoe@org/repo#42" ->
+// "github:jdoe"). The cut is at the last "@" because the user portion may
+// itself contain "@" — authenticated CLI callers carry an email subject
+// ("cli:jdoe@example.com@macbook.local" -> "cli:jdoe@example.com").
 func shortCaller(caller string) string {
-	if before, _, found := strings.Cut(caller, "@"); found {
-		return before
+	if at := strings.LastIndex(caller, "@"); at >= 0 {
+		return caller[:at]
 	}
 	return caller
 }

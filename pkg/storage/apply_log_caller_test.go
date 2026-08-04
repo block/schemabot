@@ -11,6 +11,14 @@ func TestApplyLogCaller(t *testing.T) {
 		assert.Equal(t, "cli:bob", ApplyLogCaller("cli:bob@laptop.example.com"))
 	})
 
+	t.Run("email-shaped user keeps its domain and drops only the hostname", func(t *testing.T) {
+		assert.Equal(t, "cli:bob@example.com", ApplyLogCaller("cli:bob@example.com@laptop.example.com"))
+	})
+
+	t.Run("CLI caller with an empty user reads as unknown", func(t *testing.T) {
+		assert.Equal(t, "cli:unknown", ApplyLogCaller("cli:@laptop.example.com"))
+	})
+
 	t.Run("CLI caller without a hostname passes through", func(t *testing.T) {
 		assert.Equal(t, "cli:bob", ApplyLogCaller("cli:bob"))
 	})
