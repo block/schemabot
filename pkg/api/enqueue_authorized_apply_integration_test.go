@@ -148,13 +148,13 @@ func TestEnqueueAuthorizedApplyQueuesDurableApplyAgainstStorage(t *testing.T) {
 	})
 	require.ErrorIs(t, err, storage.ErrActiveApplyExists)
 
-	// The committed apply and task rows make the queued apply claimable by an
-	// operator driver.
-	claimed, err := stor.Applies().FindNextApply(ctx, "driver-test")
+	// The committed apply, task, and operation rows make the queued apply
+	// claimable by an operator driver.
+	claimed, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "driver-test")
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "queued apply must be operator-claimable")
-	assert.Equal(t, applyID, claimed.ID)
-	assert.Equal(t, state.Apply.Pending, claimed.State)
+	assert.Equal(t, applyID, claimed.ApplyID)
+	assert.Equal(t, operations[0].ID, claimed.ID)
 }
 
 // When API auth is enabled, an authorized write persists an apply attributed to

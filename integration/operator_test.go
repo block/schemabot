@@ -27,9 +27,10 @@ import (
 )
 
 // These tests exercise operator behavior at two levels: the full driver loop
-// in the resume tests, and the atomic claim query through FindNextApply.
-// Operator drivers use FindNextApply before calling ResumeApply, so direct
-// calls keep claim policy tests focused without waiting for ticks.
+// in the resume tests, and the atomic claim query through
+// FindNextApplyOperation. Operator drivers claim an apply_operations row
+// before driving it, so direct calls keep claim policy tests focused without
+// waiting for ticks.
 
 type operatorClaimFixture struct {
 	appDBName string
@@ -52,7 +53,7 @@ func newBlockingResumeClient(client tern.Client, release <-chan struct{}) *block
 	}
 }
 
-func (c *blockingResumeClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
+func (c *blockingResumeClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
 	select {
 	case c.started <- struct{}{}:
 	default:
@@ -64,7 +65,7 @@ func (c *blockingResumeClient) ResumeApply(ctx context.Context, apply *storage.A
 	case <-c.release:
 	}
 
-	return c.Client.ResumeApply(ctx, apply)
+	return c.Client.ResumeApplyOperation(ctx, apply, applyOperationID)
 }
 
 func (c *blockingResumeClient) waitForResume(t *testing.T, timeout time.Duration) {
@@ -147,8 +148,9 @@ func TestOperator_BasicClaimAndResume(t *testing.T) {
 	plan2, err := ts.Storage.Plans().Get(ctx, planID2)
 	require.NoError(t, err)
 
-	// Seed storage with a stale running apply and running tasks, matching the
-	// state left behind when a driver stops heartbeating before completing.
+	// Seed storage with a stale running apply, its operation row, and running
+	// tasks, matching the state left behind when a driver stops heartbeating
+	// before completing.
 	now := time.Now()
 	staleApply := &storage.Apply{
 		ApplyIdentifier: fmt.Sprintf("apply-stale-%d", now.UnixNano()%100000),
@@ -167,29 +169,40 @@ func TestOperator_BasicClaimAndResume(t *testing.T) {
 	staleID, err := ts.Storage.Applies().Create(ctx, staleApply)
 	require.NoError(t, err)
 
+	staleOpID, err := ts.Storage.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    staleID,
+		Deployment: appDBName,
+		Target:     appDBName,
+	})
+	require.NoError(t, err)
+	require.NoError(t, ts.Storage.ApplyOperations().MarkStarted(ctx, staleOpID))
+
 	schemabotDB, err := sql.Open("mysql", schemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 	defer utils.CloseAndLog(schemabotDB)
 	_, err = schemabotDB.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", staleID)
 	require.NoError(t, err)
+	_, err = schemabotDB.ExecContext(ctx, "UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", staleOpID)
+	require.NoError(t, err)
 
 	for _, tc := range plan2.FlatDDLChanges() {
 		_, err := ts.Storage.Tasks().Create(ctx, &storage.Task{
-			TaskIdentifier: fmt.Sprintf("task-stale-%d", time.Now().UnixNano()%100000),
-			ApplyID:        staleID,
-			PlanID:         plan2.ID,
-			Database:       appDBName,
-			DatabaseType:   "mysql",
-			Engine:         "spirit",
-			State:          state.Task.Running,
-			TableName:      tc.Table,
-			DDL:            tc.DDL,
-			DDLAction:      tc.Operation,
-			Options:        []byte("{}"),
-			Environment:    "staging",
-			CreatedAt:      now,
-			UpdatedAt:      now,
+			TaskIdentifier:   fmt.Sprintf("task-stale-%d", time.Now().UnixNano()%100000),
+			ApplyID:          staleID,
+			ApplyOperationID: &staleOpID,
+			PlanID:           plan2.ID,
+			Database:         appDBName,
+			DatabaseType:     "mysql",
+			Engine:           "spirit",
+			State:            state.Task.Running,
+			TableName:        tc.Table,
+			DDL:              tc.DDL,
+			DDLAction:        tc.Operation,
+			Options:          []byte("{}"),
+			Environment:      "staging",
+			CreatedAt:        now,
+			UpdatedAt:        now,
 		})
 		require.NoError(t, err)
 	}
@@ -240,7 +253,7 @@ func TestOperator_OperatorClaimsOperationToCompletion(t *testing.T) {
 	require.NoError(t, err)
 
 	appDBName, appDSN := createTestDB(t, "operator_claim_")
-	ts := startTestServerOperator(t, appDBName, appDSN)
+	ts := startTestServer(t, appDBName, appDSN)
 
 	planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
 		"database": appDBName, "environment": "staging", "type": "mysql",
@@ -302,7 +315,7 @@ func TestOperator_OperatorClaimsOperationToCompletion(t *testing.T) {
 func TestOperator_OperatorSkipsOperationWhenParentTerminal(t *testing.T) {
 	ctx := t.Context()
 	appDBName, appDSN := createTestDB(t, "operator_skip_terminal_")
-	ts := startTestServerOperator(t, appDBName, appDSN)
+	ts := startTestServer(t, appDBName, appDSN)
 
 	// A pending operation under an already-completed parent, created before any
 	// live work so it sits ahead of it in claim order.
@@ -374,7 +387,7 @@ func TestOperator_OperatorSkipsOperationWhenParentTerminal(t *testing.T) {
 func TestOperator_ReconcilesClaimedOperationWhoseParentSettled(t *testing.T) {
 	ctx := t.Context()
 	appDBName, appDSN := createTestDB(t, "operator_settled_parent_")
-	ts := startTestServerOperator(t, appDBName, appDSN)
+	ts := startTestServer(t, appDBName, appDSN)
 
 	now := time.Now()
 	parentID, err := ts.Storage.Applies().Create(ctx, &storage.Apply{
@@ -441,7 +454,7 @@ func TestOperator_StartResumesStoppedApplyWhoseDeploymentsNeverStarted(t *testin
 	require.NoError(t, err)
 
 	appDBName, appDSN := createTestDB(t, "start_resumes_never_started_")
-	ts := startTestServerOperator(t, appDBName, appDSN)
+	ts := startTestServer(t, appDBName, appDSN)
 
 	// Apply the schema normally so a plan exists, then drop the table so a
 	// replan yields DDL the resumed operation actually has to run.
@@ -573,7 +586,7 @@ func TestOperator_StartResumesStoppedApplyWhoseDeploymentsNeverStarted(t *testin
 func TestOperator_StopReconciliationDrivesTaskStop(t *testing.T) {
 	ctx := t.Context()
 	appDBName, appDSN := createTestDB(t, "stop_reconcile_drive_")
-	ts := startTestServerOperator(t, appDBName, appDSN)
+	ts := startTestServer(t, appDBName, appDSN)
 
 	now := time.Now()
 	applyID, err := ts.Storage.Applies().Create(ctx, &storage.Apply{
@@ -683,7 +696,7 @@ func TestOperator_OperationDeploymentDrivesByOperationDeployment(t *testing.T) {
 	require.NoError(t, err)
 
 	appDBName, appDSN := createTestDB(t, "op_deploy_mismatch_")
-	ts := startTestServerOperator(t, appDBName, appDSN)
+	ts := startTestServer(t, appDBName, appDSN)
 
 	// Apply the schema normally so the target reaches the desired state, then
 	// drop the table so a replan yields DDL a resumed operation could run.
@@ -817,7 +830,7 @@ func TestOperator_OperationMissingDeploymentFailsClosed(t *testing.T) {
 	require.NoError(t, err)
 
 	appDBName, appDSN := createTestDB(t, "op_missing_deploy_")
-	ts := startTestServerOperator(t, appDBName, appDSN)
+	ts := startTestServer(t, appDBName, appDSN)
 
 	planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
 		"database": appDBName, "environment": "staging", "type": "mysql",
@@ -950,7 +963,7 @@ func TestOperator_OperationMissingDeploymentFailsClosed(t *testing.T) {
 func TestOperator_OperationWithoutTasksFailsClosed(t *testing.T) {
 	ctx := t.Context()
 	appDBName, appDSN := createTestDB(t, "op_no_tasks_")
-	ts := startTestServerOperator(t, appDBName, appDSN)
+	ts := startTestServer(t, appDBName, appDSN)
 	ts.Service.StopOperator()
 
 	// Seed a resumable apply and a child operation whose deployment matches the
@@ -1055,22 +1068,41 @@ func TestOperator_ClaimOrdering(t *testing.T) {
 		UpdatedAt:       now,
 	})
 	require.NoError(t, err)
-	_, err = schemabotDB.ExecContext(ctx, "UPDATE applies SET created_at = NOW() - INTERVAL 2 MINUTE, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", olderID)
+
+	olderOpID := seedStartedOperation(t, stor, olderID, db1Name)
+	newerOpID := seedStartedOperation(t, stor, newerID, db2Name)
+	_, err = schemabotDB.ExecContext(ctx, "UPDATE apply_operations SET created_at = NOW() - INTERVAL 2 MINUTE, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", olderOpID)
 	require.NoError(t, err)
-	_, err = schemabotDB.ExecContext(ctx, "UPDATE applies SET created_at = NOW() - INTERVAL 1 MINUTE, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", newerID)
+	_, err = schemabotDB.ExecContext(ctx, "UPDATE apply_operations SET created_at = NOW() - INTERVAL 1 MINUTE, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", newerOpID)
 	require.NoError(t, err)
 
-	// The operator claim path should pick the oldest stale apply first.
-	claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
+	// The operator claim path should pick the oldest stale operation first.
+	claimed, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
-	assert.Equal(t, "apply-order-older", claimed.ApplyIdentifier)
+	assert.Equal(t, olderID, claimed.ApplyID)
 
 	// After the first target is claimed, the operator can claim the next stale target.
-	claimed2, err := stor.Applies().FindNextApply(ctx, "test-owner")
+	claimed2, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed2)
-	assert.Equal(t, "apply-order-newer", claimed2.ApplyIdentifier)
+	assert.Equal(t, newerID, claimed2.ApplyID)
+}
+
+// seedStartedOperation inserts a running apply_operations row for the apply so
+// claim-policy tests can exercise FindNextApplyOperation against work that
+// looks like a drive already started it.
+func seedStartedOperation(t *testing.T, stor *mysqlstore.Storage, applyID int64, deployment string) int64 {
+	t.Helper()
+
+	opID, err := stor.ApplyOperations().Insert(t.Context(), &storage.ApplyOperation{
+		ApplyID:    applyID,
+		Deployment: deployment,
+		Target:     deployment,
+	})
+	require.NoError(t, err)
+	require.NoError(t, stor.ApplyOperations().MarkStarted(t.Context(), opID))
+	return opID
 }
 
 func TestOperator_ClaimableStates(t *testing.T) {
@@ -1125,37 +1157,30 @@ func TestOperator_ClaimableStates(t *testing.T) {
 				UpdatedAt:       now,
 			})
 			require.NoError(t, err)
-			if tc.applyState == state.Apply.Pending {
-				// Pending applies become operator work only after task creation
-				// finishes; a bare pending apply is still in request setup.
-				_, err := stor.Tasks().Create(ctx, &storage.Task{
-					TaskIdentifier: fmt.Sprintf("task-%s", applyIdentifier),
-					ApplyID:        applyID,
-					Database:       appDBName,
-					DatabaseType:   tc.databaseType,
-					Engine:         tc.engine,
-					State:          state.Task.Pending,
-					TableName:      "claimable_pending",
-					DDL:            "ALTER TABLE claimable_pending ADD COLUMN note VARCHAR(255)",
-					DDLAction:      "alter",
-					Options:        []byte("{}"),
-					Environment:    "staging",
-					CreatedAt:      now,
-					UpdatedAt:      now,
-				})
-				require.NoError(t, err)
+
+			// The operation row carries the same state as its parent apply, so
+			// the case exercises the claim query's per-state contract at the
+			// row the operator actually claims.
+			opID, err := stor.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID:    applyID,
+				Deployment: appDBName,
+				Target:     appDBName,
+			})
+			require.NoError(t, err)
+			if tc.applyState != state.Apply.Pending {
+				require.NoError(t, stor.ApplyOperations().UpdateState(ctx, opID, tc.applyState))
 			}
 			_, err = schemabotDB.ExecContext(ctx,
-				"UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE apply_identifier = ?",
-				applyIdentifier)
+				"UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?",
+				opID)
 			require.NoError(t, err)
 
-			// The operator should claim only queued or stale applies in states it can resume safely.
-			claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
+			// The operator should claim only queued or stale operations in states it can resume safely.
+			claimed, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "test-owner")
 			require.NoError(t, err)
 			if tc.wantClaim {
 				require.NotNil(t, claimed)
-				assert.Equal(t, applyIdentifier, claimed.ApplyIdentifier)
+				assert.Equal(t, opID, claimed.ID)
 			} else {
 				assert.Nil(t, claimed)
 			}
@@ -1182,27 +1207,28 @@ func TestOperator_ClaimRefreshesHeartbeat(t *testing.T) {
 		Environment:     "staging",
 	})
 	require.NoError(t, err)
-	_, err = schemabotDB.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", applyID)
+	opID := seedStartedOperation(t, stor, applyID, appDBName)
+	_, err = schemabotDB.ExecContext(ctx, "UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", opID)
 	require.NoError(t, err)
 
-	beforeClaim, err := stor.Applies().Get(ctx, applyID)
+	beforeClaim, err := stor.ApplyOperations().Get(ctx, opID)
 	require.NoError(t, err)
 	require.NotNil(t, beforeClaim)
 
-	// Claiming is also the operator's lease renewal; it keeps another driver from immediately reclaiming the same apply.
-	claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
+	// Claiming is also the operator's lease renewal; it keeps another driver from immediately reclaiming the same operation.
+	claimed, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
-	assert.Equal(t, "apply-claim-refreshes-heartbeat", claimed.ApplyIdentifier)
+	assert.Equal(t, opID, claimed.ID)
 
-	afterClaim, err := stor.Applies().Get(ctx, applyID)
+	afterClaim, err := stor.ApplyOperations().Get(ctx, opID)
 	require.NoError(t, err)
 	require.NotNil(t, afterClaim)
-	assert.True(t, afterClaim.UpdatedAt.After(beforeClaim.UpdatedAt), "claim should refresh the apply heartbeat")
+	assert.True(t, afterClaim.UpdatedAt.After(beforeClaim.UpdatedAt), "claim should refresh the operation heartbeat")
 
-	reclaimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
+	reclaimed, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "test-owner")
 	require.NoError(t, err)
-	assert.Nil(t, reclaimed, "freshly claimed apply should not be claimable again")
+	assert.Nil(t, reclaimed, "freshly claimed operation should not be claimable again")
 }
 
 func TestOperator_ExpiresRetryableBudget(t *testing.T) {
@@ -1315,10 +1341,6 @@ func TestOperator_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 
 	svc := schemabotapi.New(stor, &schemabotapi.ServerConfig{
 		Drivers: 2,
-		// This scenario seeds stale applies with tasks (no apply_operations
-		// rows), so it exercises apply-level claiming. The operation-level
-		// claim path has its own dedicated coverage.
-		OperatorClaimOperations: new(false),
 		Databases: map[string]schemabotapi.DatabaseConfig{
 			db1Name: {
 				Type: "mysql",
@@ -1418,22 +1440,25 @@ func seedStaleOperatorApply(
 	})
 	require.NoError(t, err)
 
+	opID := seedStartedOperation(t, stor, applyID, dbName)
+
 	for _, tc := range plan.FlatDDLChanges() {
 		_, err := stor.Tasks().Create(t.Context(), &storage.Task{
-			TaskIdentifier: fmt.Sprintf("task-multi-driver-%s-%s", dbName, tc.Table),
-			ApplyID:        applyID,
-			PlanID:         plan.ID,
-			Database:       dbName,
-			DatabaseType:   storage.DatabaseTypeMySQL,
-			Engine:         "spirit",
-			State:          state.Task.Running,
-			TableName:      tc.Table,
-			DDL:            tc.DDL,
-			DDLAction:      tc.Operation,
-			Options:        []byte("{}"),
-			Environment:    "staging",
-			CreatedAt:      now,
-			UpdatedAt:      now,
+			TaskIdentifier:   fmt.Sprintf("task-multi-driver-%s-%s", dbName, tc.Table),
+			ApplyID:          applyID,
+			ApplyOperationID: &opID,
+			PlanID:           plan.ID,
+			Database:         dbName,
+			DatabaseType:     storage.DatabaseTypeMySQL,
+			Engine:           "spirit",
+			State:            state.Task.Running,
+			TableName:        tc.Table,
+			DDL:              tc.DDL,
+			DDLAction:        tc.Operation,
+			Options:          []byte("{}"),
+			Environment:      "staging",
+			CreatedAt:        now,
+			UpdatedAt:        now,
 		})
 		require.NoError(t, err)
 	}
@@ -1443,6 +1468,13 @@ func seedStaleOperatorApply(
 		"UPDATE applies SET created_at = ?, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?",
 		createdAt,
 		applyID,
+	)
+	require.NoError(t, err)
+	_, err = db.ExecContext(
+		t.Context(),
+		"UPDATE apply_operations SET created_at = ?, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?",
+		createdAt,
+		opID,
 	)
 	require.NoError(t, err)
 
@@ -1490,7 +1522,7 @@ func TestOperator_DatabaseExclusionScopedByEnvironment(t *testing.T) {
 	schemabotDB := fixture.storageDB
 
 	now := time.Now()
-	_, err := stor.Applies().Create(ctx, &storage.Apply{
+	stagingID, err := stor.Applies().Create(ctx, &storage.Apply{
 		ApplyIdentifier: "apply-env-active-staging",
 		Database:        appDBName,
 		DatabaseType:    "mysql",
@@ -1503,6 +1535,7 @@ func TestOperator_DatabaseExclusionScopedByEnvironment(t *testing.T) {
 		UpdatedAt:       now,
 	})
 	require.NoError(t, err)
+	seedStartedOperation(t, stor, stagingID, appDBName)
 
 	productionID, err := stor.Applies().Create(ctx, &storage.Apply{
 		ApplyIdentifier: "apply-env-stale-production",
@@ -1517,14 +1550,16 @@ func TestOperator_DatabaseExclusionScopedByEnvironment(t *testing.T) {
 		UpdatedAt:       now.Add(-time.Minute),
 	})
 	require.NoError(t, err)
-	_, err = schemabotDB.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", productionID)
+	productionOpID := seedStartedOperation(t, stor, productionID, appDBName)
+	_, err = schemabotDB.ExecContext(ctx, "UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", productionOpID)
 	require.NoError(t, err)
 
-	// The operator should allow a stale apply when the active apply is for another environment.
-	claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
+	// The operator should allow a stale operation when the active apply on the
+	// same database belongs to another environment.
+	claimed, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
-	assert.Equal(t, "apply-env-stale-production", claimed.ApplyIdentifier)
+	assert.Equal(t, productionID, claimed.ApplyID)
 }
 
 // A pending operation row left under an apply that has already settled will
@@ -1573,12 +1608,12 @@ func TestOperator_ReaperSettlesStrandedOperationsUnderSettledApplies(t *testing.
 	require.NoError(t, err)
 	require.NotNil(t, before)
 
-	// Rows strand precisely while drivers claim at the apply level and leave the
-	// operation rows undriven, so the reaper must run in that shape too.
-	claimAtApplyLevel := false
+	// The claim ladder must not touch the row itself: a pending operation under
+	// a terminal parent is gated off FindNextApplyOperation, so only the reaper
+	// can settle it. Running the full operator alongside the reaper proves the
+	// two do not fight over the stranded row.
 	svc := schemabotapi.New(stor, &schemabotapi.ServerConfig{
-		Drivers:                 1,
-		OperatorClaimOperations: &claimAtApplyLevel,
+		Drivers: 1,
 	}, nil, logger)
 	require.NoError(t, svc.SetOperatorPollInterval(50*time.Millisecond))
 	require.NoError(t, svc.SetStrandedReaperInterval(50*time.Millisecond))

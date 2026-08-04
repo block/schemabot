@@ -53,8 +53,7 @@ func registerRemoteTern(stor storage.Storage, logger *slog.Logger, deployment st
 	remoteTernOperatorMu.Lock()
 	defer remoteTernOperatorMu.Unlock()
 	if remoteTernOperatorSvc == nil {
-		cfg := &schemabotapi.ServerConfig{OperatorClaimOperations: new(true)}
-		svc := schemabotapi.New(stor, cfg, nil, logger)
+		svc := schemabotapi.New(stor, &schemabotapi.ServerConfig{}, nil, logger)
 		if err := svc.SetOperatorPollInterval(100 * time.Millisecond); err != nil {
 			return fmt.Errorf("set remote tern operator poll interval: %w", err)
 		}
