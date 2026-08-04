@@ -1067,17 +1067,15 @@ func WriteStatusList(data StatusListData) {
 	writeStatusListFooter(data)
 }
 
-// writeStatusListTruncation says what a truncated page holds. The list is ranked
-// rather than purely chronological — in-flight work sorts above settled work — so
-// the notice says so: on a full page of running changes, one that finished
-// moments ago sits below the cut, and calling the page the most recent changes
-// would misdescribe what was left off.
+// writeStatusListTruncation says how much of the history a truncated page holds,
+// and how to see more of it — or that the server will not serve more, when the
+// page is already at the cap.
 func writeStatusListTruncation(data StatusListData, item string) {
 	if data.MaxLimit > 0 && data.Limit >= data.MaxLimit {
-		fmt.Printf("%sShowing %d %s, in-flight first. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
+		fmt.Printf("%sShowing the %d most recent %s. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
 		return
 	}
-	fmt.Printf("%sShowing %d %s, in-flight first. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
+	fmt.Printf("%sShowing the %d most recent %s. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
 }
 
 func writeStatusListFooter(data StatusListData) {
