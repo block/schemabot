@@ -667,6 +667,11 @@ func isUnlockRejection(err error) bool {
 //     locks found, an authorization block on the merits, or an active apply
 //     still protecting the lock).
 //
+// A terminal rejection is a per-delivery decision: it is deterministic for
+// the PR head this delivery read, and a later push can change the answer.
+// The recovery path is a fresh comment after the push — never a re-drive of
+// the superseded delivery.
+//
 // A gate block is terminal only when the gate evaluated its inputs and
 // blocked on the merits. A gate that could not evaluate (for example a
 // GitHub or storage read inside the gate failed) returns an error, which

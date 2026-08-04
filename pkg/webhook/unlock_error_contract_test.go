@@ -2,6 +2,8 @@ package webhook
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -326,4 +328,125 @@ func TestUnlockCommandCoreTerminalDispositions(t *testing.T) {
 		body := requireComment(t, comments, "release success comment")
 		assert.Contains(t, body, "Lock Released")
 	})
+}
+
+// serveUnlockInferencePR registers the PR read and changed-files routes
+// force-unlock database inference walks, listing the given paths as modified
+// files.
+func serveUnlockInferencePR(t *testing.T, mux *http.ServeMux, files ...string) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_, err := fmt.Fprint(w, `{"head":{"ref":"feature-branch","sha":"newsha222"},"base":{"ref":"main","sha":"def456"},"user":{"login":"testuser"}}`)
+		require.NoError(t, err)
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		entries := make([]map[string]string, 0, len(files))
+		for _, f := range files {
+			entries = append(entries, map[string]string{"filename": f, "status": "modified"})
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(entries))
+	})
+}
+
+// serveConfigFile registers the contents route for one schemabot.yaml so
+// config discovery resolves the given path to the given file content.
+func serveConfigFile(t *testing.T, mux *http.ServeMux, path, content string) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/"+path, func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
+			"type":     "file",
+			"encoding": "base64",
+			"content":  base64.StdEncoding.EncodeToString([]byte(content)),
+		}))
+	})
+}
+
+// Every deterministic force-unlock inference rejection — a repo whose only
+// config is malformed, a PR ambiguously spanning several managed configs, or
+// schema another deployment owns — reproduces on any re-drive of the same
+// delivery, so each classification must ride the rejection marker and report
+// (retry=false, err=nil) with the rejection posted as the command's answer.
+func TestUnlockCommandCoreInferenceRejectionsAreTerminal(t *testing.T) {
+	cases := []struct {
+		name        string
+		config      *api.ServerConfig
+		serve       func(t *testing.T, mux *http.ServeMux)
+		wantComment string
+	}{
+		{
+			// A repo whose only schemabot.yaml cannot be parsed is a
+			// deterministic discovery outcome: re-driving cannot repair the
+			// file.
+			name:   "invalid config rejection is terminal",
+			config: &api.ServerConfig{},
+			serve: func(t *testing.T, mux *http.ServeMux) {
+				serveUnlockInferencePR(t, mux)
+				mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, _ *http.Request) {
+					_, err := fmt.Fprint(w, `{"sha":"newsha222","tree":[{"path":"schemabot.yaml","type":"blob"}],"truncated":false}`)
+					require.NoError(t, err)
+				})
+				serveConfigFile(t, mux, "schemabot.yaml", "type: mysql\n")
+			},
+			wantComment: "invalid schemabot.yaml config found",
+		},
+		{
+			// A PR spanning several configs this deployment manages is
+			// ambiguous for a single-database command; the same delivery
+			// always resolves the same config set, so the "scope with -d"
+			// answer is terminal.
+			name: "multiple managed configs rejection is terminal",
+			config: &api.ServerConfig{
+				Databases: map[string]api.DatabaseConfig{
+					"orders":   {Type: storage.DatabaseTypeMySQL},
+					"payments": {Type: storage.DatabaseTypeMySQL},
+				},
+			},
+			serve: func(t *testing.T, mux *http.ServeMux) {
+				serveUnlockInferencePR(t, mux, "db/orders/schemabot.yaml", "db/payments/schemabot.yaml")
+				serveConfigFile(t, mux, "db/orders/schemabot.yaml", "database: orders\ntype: mysql\n")
+				serveConfigFile(t, mux, "db/payments/schemabot.yaml", "database: payments\ntype: mysql\n")
+			},
+			wantComment: "multiple SchemaBot configs match this PR",
+		},
+		{
+			// A config outside this deployment's allowed_dirs is another
+			// deployment's schema: this deployment deterministically has
+			// nothing to unlock, the same outcome as no config at all.
+			name: "unowned schema rejection is terminal",
+			config: &api.ServerConfig{
+				Databases: map[string]api.DatabaseConfig{
+					"orders": {
+						Type:         storage.DatabaseTypeMySQL,
+						AllowedRepos: []string{"octocat/hello-world"},
+						AllowedDirs:  []string{"db/orders/schema"},
+					},
+				},
+			},
+			serve: func(t *testing.T, mux *http.ServeMux) {
+				serveUnlockInferencePR(t, mux, "db/other/schemabot.yaml")
+				serveConfigFile(t, mux, "db/other/schemabot.yaml", "database: orders\ntype: mysql\n")
+			},
+			wantComment: "no schemabot.yaml config found",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := recordComments(t, mux)
+			tc.serve(t, mux)
+			lockStore := &unlockTestLockStore{}
+			st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
+			h := actorAuthStorageTestHandler(tc.config, st, ghclient.NewInstallationClient(client, testLogger()))
+
+			retry, err := h.unlockCommandCore("octocat/hello-world", 1, 12345, "testuser",
+				CommandResult{Action: action.Unlock, Force: true})
+
+			require.NoError(t, err)
+			assert.False(t, retry, "a deterministic inference rejection is the command's answer; re-driving reproduces it")
+			body := requireComment(t, comments, "inference rejection comment")
+			assert.Contains(t, body, "Failed to infer database for force unlock")
+			assert.Contains(t, body, tc.wantComment)
+		})
+	}
 }
