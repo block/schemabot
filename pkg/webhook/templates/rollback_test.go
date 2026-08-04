@@ -253,11 +253,13 @@ func TestRenderRollbackBlockedByLock(t *testing.T) {
 		assert.Contains(t, rendered, "`schemabot unlock --tenant acme`")
 	})
 
-	t.Run("non-PR lock renders bare owner", func(t *testing.T) {
+	t.Run("non-PR lock renders the owner without its hostname", func(t *testing.T) {
 		rendered := RenderRollbackBlockedByLock("testapp", "staging", "cli:alice@laptop", "", 0, "")
 
 		assert.Contains(t, rendered, "## Rollback Blocked")
-		assert.Contains(t, rendered, "`cli:alice@laptop`")
+		assert.Contains(t, rendered, "`cli:alice`")
+		assert.NotContains(t, rendered, "laptop",
+			"the lock owner's machine is internal detail and stays out of PR markdown")
 		assert.Contains(t, rendered, "ask the lock owner to release it")
 		assert.NotContains(t, rendered, "github.com",
 			"bare-owner variant should not include any github.com link")

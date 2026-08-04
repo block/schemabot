@@ -10,6 +10,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
@@ -221,13 +222,6 @@ func rollbackTaskCompletedAfter(candidate, current *storage.Task) bool {
 	return candidate.CreatedAt.After(current.CreatedAt)
 }
 
-func controlOperationCaller(caller string) string {
-	if caller == "" {
-		return "unknown"
-	}
-	return caller
-}
-
 // resolveCaller returns the identity an operation is attributed to: the
 // authenticated caller when the request carried a real identity (API auth
 // enabled), otherwise the caller supplied in the request. The authenticated
@@ -235,11 +229,26 @@ func controlOperationCaller(caller string) string {
 // than a client-supplied string; with auth disabled (or on paths with no
 // authenticated user, like control-plane dispatch) the request caller is used
 // unchanged.
+//
+// When the request caller declares a CLI origin ("cli:<user>@<host>"), the
+// verified subject replaces the client-claimed username but the channel prefix
+// and hostname are preserved: they carry no identity weight, and an operator
+// triaging an apply wants to see how it was driven and from which machine.
+// Only the CLI channel is preserved; any other channel prefix is attributed to
+// the subject alone. So is a hostname that fails validation, or a composite
+// that would not fit the stored caller column — the verified identity is never
+// sacrificed for the advisory hostname.
 func resolveCaller(ctx context.Context, requestCaller string) string {
-	if subject, ok := auth.AuthenticatedSubject(ctx); ok {
-		return subject
+	subject, ok := auth.AuthenticatedSubject(ctx)
+	if !ok {
+		return requestCaller
 	}
-	return requestCaller
+	if _, host, ok := caller.SplitCLI(requestCaller); ok && caller.ValidHost(host) {
+		if composite := caller.FormatCLI(subject, host); len(composite) <= storage.MaxCallerChars {
+			return composite
+		}
+	}
+	return subject
 }
 func (s *Service) logControlOperationForApply(ctx context.Context, apply *storage.Apply, caller, eventType, message string) {
 	logStore := s.storage.ApplyLogs()
@@ -249,7 +258,7 @@ func (s *Service) logControlOperationForApply(ctx context.Context, apply *storag
 				"event", eventType)...)
 		return
 	}
-	logMessage := fmt.Sprintf("%s (caller: %s)", message, controlOperationCaller(caller))
+	logMessage := fmt.Sprintf("%s (caller: %s)", message, storage.ApplyLogCaller(caller))
 	if err := logStore.Append(ctx, &storage.ApplyLog{
 		ApplyID:   apply.ID,
 		Level:     storage.LogLevelInfo,
@@ -1391,7 +1400,7 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 		append(apply.LogAttrs(),
 			"requested_by", stopCaller, "start_requested_by", caller, "old_state", oldState, "new_state", apply.State)...)
 	s.logControlOperationForApply(ctx, apply, stopCaller, storage.LogEventStopRequested,
-		fmt.Sprintf("Pending remote stop request completed before start (caller: %s)", stopCaller))
+		"Pending remote stop request completed before start")
 	return nil
 }
 

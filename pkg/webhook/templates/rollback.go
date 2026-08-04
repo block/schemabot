@@ -3,6 +3,8 @@ package templates
 import (
 	"fmt"
 	"strings"
+
+	"github.com/block/schemabot/pkg/caller"
 )
 
 // RenderRollbackPlanComment renders the rollback plan comment markdown.
@@ -166,7 +168,7 @@ func RenderRollbackBlockedByLock(database, environment, lockOwner, lockRepo stri
 		"**Database**: `%s` | **Environment**: `%s`\n\n"+
 		"A lock is currently held by `%s`.\n\n"+
 		"Wait for that operation to complete, or ask the lock owner to release it.",
-		database, environment, lockOwner))
+		database, environment, caller.Short(lockOwner)))
 }
 
 // RenderRollbackNothingToDo renders the message posted when a rollback plan
@@ -184,7 +186,7 @@ func RenderRollbackLockNotOwned(database, environment, lockOwner string) string 
 	return fmt.Sprintf("## Lock Not Owned\n\n"+
 		"**Database**: `%s` | **Environment**: `%s`\n\n"+
 		"The lock is held by `%s`, not this PR. Cannot confirm rollback.",
-		database, environment, lockOwner)
+		database, environment, caller.Short(lockOwner))
 }
 
 // RenderRollbackAlreadyRolledBack renders the message posted when rollback-confirm
@@ -212,7 +214,7 @@ func RenderRollbackAlreadyRolledBackLockHeld(database, environment, lockOwner, t
 		"```\n%s\n```\n"+
 		"If the lock persists, force-release it:\n"+
 		"```\n%s\n```",
-		database, environment, lockOwner,
+		database, environment, caller.Short(lockOwner),
 		appendTenantFlag("schemabot unlock", tenant),
 		appendTenantFlag(fmt.Sprintf("schemabot unlock -d %s --force", database), tenant))
 }

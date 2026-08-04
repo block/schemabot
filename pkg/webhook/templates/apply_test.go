@@ -32,6 +32,9 @@ func TestRenderApplyBlockedByCLILockUsesValidUnlockCommand(t *testing.T) {
 
 	assert.Contains(t, rendered, "schemabot unlock -d example-db --force")
 	assert.NotContains(t, rendered, "schemabot unlock -d example-db -e staging --force")
+	assert.Contains(t, rendered, "**Locked by**: `cli:testuser`")
+	assert.NotContains(t, rendered, "example.local",
+		"the lock owner's machine is internal detail and stays out of PR markdown")
 }
 
 func TestRenderApplyCommentsIncludeEnvironmentInTitle(t *testing.T) {

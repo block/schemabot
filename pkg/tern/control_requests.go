@@ -198,8 +198,5 @@ func controlRequestCaller(req *storage.ApplyControlRequest) string {
 }
 
 func callerApplyLogSuffix(caller string) string {
-	if caller == "" {
-		caller = "unknown"
-	}
-	return fmt.Sprintf(" (caller: %s)", caller)
+	return fmt.Sprintf(" (caller: %s)", storage.ApplyLogCaller(caller))
 }
