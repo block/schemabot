@@ -585,26 +585,9 @@ func (h *Handler) processDurableCheckRunCompleted(ctx context.Context, event *st
 		return false, fmt.Errorf("durable check_run completion %s missing repo or head SHA", event.DeliveryID)
 	}
 
-	installationID, parseErr := strconv.ParseInt(event.TenantID, 10, 64)
-	if parseErr != nil && event.TenantID != "" {
-		// A non-empty, non-numeric TenantID is a corrupted/enqueue-side bug,
-		// distinct from a legitimately empty tenant (a legacy row that stored no
-		// tenant, which parses as an error too); surface only the corrupted case
-		// rather than silently folding it into the payload fallback below.
-		h.logger.Warn("durable check_run completion has an unparseable tenant ID; falling back to the payload installation",
-			"delivery_id", event.DeliveryID, "tenant_id", event.TenantID,
-			"repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA, "error", parseErr)
-	}
-	if parseErr != nil || installationID == 0 {
-		// Fallback for rows without a stored tenant. The only producer today
-		// (enqueueDurableCheckRun) always stores a resolved non-zero
-		// installation ID; check_run payloads carry an installation ID only for
-		// org/user App installs, so a repo-level delivery relying on this
-		// fallback would fail below.
-		installationID = h.effectiveInstallationID(ctx, payload.Installation.ID)
-	}
-	if installationID == 0 {
-		return false, fmt.Errorf("durable check_run completion %s missing installation ID", event.DeliveryID)
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		return false, err
 	}
 
 	// Keep the driver's run context: autoPlanBootstrap rebinds ctx to a

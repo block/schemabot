@@ -1,7 +1,6 @@
 package webhook
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +9,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -484,49 +484,80 @@ func TestDurableCheckRunDriverCompletionRetriesFoldFailure(t *testing.T) {
 	require.Empty(t, store.completed)
 }
 
-// A stored tenant that is missing and one that is corrupted are different
-// conditions: a legacy row with no tenant falls back to the payload installation
-// silently, while a non-numeric tenant is an enqueue-side bug an operator should
-// see. Only the corrupted case warns, so legacy rows do not generate misleading
-// "unparseable tenant ID" noise on every re-fold.
-func TestDurableCheckRunDriverCompletionWarnsOnlyForCorruptedTenant(t *testing.T) {
-	refold := func(t *testing.T, tenantID string) string {
-		t.Helper()
-		event := durableCheckRunCompletedEvent(t)
-		event.TenantID = tenantID
-		store := newScriptedWebhookEventStore(event)
-
-		var logBuf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&logBuf, nil))
-		ghClient, mux := setupGitHubServer(t)
-		serveCheckRunPRHead(t, mux, "head-sha")
-		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7/files", func(w http.ResponseWriter, _ *http.Request) {
-			require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{}))
-		})
-		service := api.New(&durableWebhookTestStorage{webhookEvents: store}, aggregateLeaderConfig(), nil, logger)
-		factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghClient, testLogger())}
-		h := NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch())
-
-		h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
-
-		select {
-		case <-store.completed:
-		default:
-			t.Fatal("expected the completion re-fold to be marked completed via the payload installation")
-		}
-		require.Empty(t, store.failed)
-		return logBuf.String()
+// The producer always stores a resolved positive installation ID in the row's
+// tenant, so a completion whose tenant does not resolve is a corrupted or
+// hand-crafted row: retrying cannot repair it, so the delivery fails
+// terminally instead of burning retry attempts on a deterministic failure.
+func TestDurableCheckRunDriverCompletionFailsUnresolvableTenantTerminally(t *testing.T) {
+	tests := []struct {
+		name     string
+		tenantID string
+		wantErr  string
+	}{
+		{name: "empty tenant", tenantID: "", wantErr: "unparseable tenant ID"},
+		{name: "corrupted tenant", tenantID: "not-a-number", wantErr: "unparseable tenant ID"},
+		{name: "negative tenant", tenantID: "-42", wantErr: "non-positive installation ID"},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := durableCheckRunCompletedEvent(t)
+			event.TenantID = tt.tenantID
+			store := newScriptedWebhookEventStore(event)
+			factory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
+			h := newDurableDriverHandler(t, store, aggregateLeaderConfig(), factory)
 
-	t.Run("missing tenant", func(t *testing.T) {
-		require.NotContains(t, refold(t, ""), "unparseable tenant ID",
-			"a legacy row with no stored tenant is missing, not corrupted")
-	})
+			h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
-	t.Run("corrupted tenant", func(t *testing.T) {
-		require.Contains(t, refold(t, "not-a-number"), "unparseable tenant ID",
-			"a non-numeric stored tenant is an enqueue-side bug an operator must see")
+			select {
+			case failure := <-store.failed:
+				require.Nil(t, failure.retryAfter, "an unresolvable persisted tenant must not be retried")
+				require.Contains(t, failure.errMsg, tt.wantErr)
+			default:
+				t.Fatal("expected an unresolvable tenant to be marked failed")
+			}
+			require.Empty(t, store.completed)
+			select {
+			case <-factory.forInstallationStarted:
+				t.Fatal("an unresolvable tenant must not create a GitHub client")
+			default:
+			}
+		})
+	}
+}
+
+// A leader's re-fold for a head that is no longer the PR's current head is
+// completed without folding participant state: the fold core hands back a
+// leader re-fold disposition, so a fresh pass against the then-current head is
+// armed instead of retrying the superseded delivery.
+func TestDurableCheckRunDriverCompletionCompletesStaleHeadAndArmsRefold(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableCheckRunCompletedEvent(t))
+	ghClient, mux := setupGitHubServer(t)
+	serveCheckRunPRHead(t, mux, "newer-sha-999")
+	var fileListCalls atomic.Int64
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7/files", func(w http.ResponseWriter, _ *http.Request) {
+		fileListCalls.Add(1)
+		require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{}))
 	})
+	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghClient, testLogger())}
+	h := newDurableDriverHandler(t, store, aggregateLeaderConfig(), factory)
+	// Keep the armed re-fold timer from firing inside the test process;
+	// pending timers at process exit are inert.
+	h.participantRefoldDelayOverride = time.Hour
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case <-store.completed:
+	default:
+		t.Fatal("expected a stale-head completion re-fold to be marked completed")
+	}
+	require.Empty(t, store.failed)
+	require.Equal(t, int64(0), fileListCalls.Load(), "a stale-head fold must stop before participant discovery")
+
+	h.participantRefoldMu.Lock()
+	refoldAttempts := h.participantRefoldAttempts[participantRefoldKey("octocat/hello-world", 7)]
+	h.participantRefoldMu.Unlock()
+	require.Equal(t, 1, refoldAttempts, "a stale-head completion must arm a leader re-fold for the current head")
 }
 
 // A leader's re-fold on a current head runs discovery (proving the leader fold
