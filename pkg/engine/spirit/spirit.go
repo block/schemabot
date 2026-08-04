@@ -21,6 +21,7 @@ import (
 	"time"
 
 	spiritmigration "github.com/block/spirit/pkg/migration"
+	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
@@ -401,6 +402,15 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		}, nil
 	}
 
+	// The engine's refusal checks compare a redeclared column against its
+	// current type, so each ALTER is classified alongside the table's current
+	// definition. The diff only emits an ALTER for a table present in
+	// currentSchema, so every ALTER below has an entry here.
+	currentByTable := make(map[string]string, len(currentSchema))
+	for _, ts := range currentSchema {
+		currentByTable[ts.Name] = ts.Schema
+	}
+
 	// Convert PlannedChanges to engine types
 	var lintViolations []engine.LintViolation
 	changes := make([]engine.TableChange, 0, len(plan.Changes))
@@ -430,10 +440,14 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		// behave — routed to direct execution when the policy permits, or
 		// guaranteed to fail when it doesn't. Only ALTERs can be refused, and
 		// gating here keeps the verdict — an informational field — from ever
-		// failing the plan on a statement type the verdict's own parser
+		// failing the plan on a statement type the engine's own parser
 		// doesn't accept.
 		if stmtType == ddl.StatementAlterTable {
-			reason, refused, err := ddl.EngineRefusalReason(pc.Statement)
+			currentCreateTable, ok := currentByTable[pc.TableName]
+			if !ok {
+				return nil, fmt.Errorf("plan produced an ALTER for table %q, which has no current definition in database %q", pc.TableName, database)
+			}
+			reason, refused, err := check.StatementRefusal(ctx, pc.Statement, currentCreateTable, e.logger)
 			if err != nil {
 				return nil, fmt.Errorf("execution verdict for table %q: %w", pc.TableName, err)
 			}

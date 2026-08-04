@@ -15,11 +15,12 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-sql-driver/mysql"
 
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
@@ -308,8 +309,18 @@ type alterRouting struct {
 // Spirit accepts run through Spirit, refused statements run directly only
 // when the policy permits, and anything else fails the apply before any
 // statement executes.
+//
+// Some of the engine's refusals depend on the table's current column types, so
+// each statement is classified against the target's live definition of its
+// table, read here rather than taken from the plan's snapshot: re-reading it is
+// how a column type changed since the plan is caught. A definition that cannot
+// be read fails the apply, because classifying without it would silently narrow
+// the refusals Spirit reports and route a statement Spirit refuses onto Spirit
+// anyway.
 func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB, database string, alters []string, policy directPolicy) (alterRouting, error) {
 	var routing alterRouting
+	logger := e.changeLogger()
+	schema := &targetSchema{target: target}
 	for _, stmt := range alters {
 		parsed, err := statement.New(stmt)
 		if err != nil {
@@ -320,8 +331,22 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 		}
 		table := parsed[0].Table
 
-		reason, refused, err := ddl.EngineRefusalReason(stmt)
+		currentCreateTable, err := schema.createTable(ctx, table)
 		if err != nil {
+			// The raw error carries target infrastructure detail (host, account,
+			// driver internals) and this one surfaces in a PR comment, so the
+			// apply fails with a fixed line and the cause stays in the logs.
+			logger.Error("routing failed: cannot read the target's current table definition",
+				"database", database, "table", table, "error", err)
+			return alterRouting{}, fmt.Errorf("cannot read the current definition of table %q on the target; see server logs", table)
+		}
+		reason, refused, err := check.StatementRefusal(ctx, stmt, currentCreateTable, logger)
+		if err != nil {
+			// The engine could not judge the statement — typically the current
+			// definition no longer describes a column the statement redeclares.
+			// That is not a refusal, so it must not be routed as one.
+			logger.Error("routing failed: the engine cannot classify the statement against the current table definition",
+				"database", database, "table", table, "error", err)
 			return alterRouting{}, fmt.Errorf("route ALTER statement for table %q: %w", table, err)
 		}
 		if !refused {
@@ -465,9 +490,11 @@ func targetDSN(host, username, password, database string) string {
 	return cfg.FormatDSN()
 }
 
-// lazyTargetDB opens a connection to the target database on first use so
-// callers that never need one (no refused statements, policy disabled with no
-// direct work) never pay for a connection.
+// lazyTargetDB opens a connection to the target database on first use, so an
+// apply that never reaches the target — one with no ALTER to route, or no
+// statement at all — never pays for a connection. An apply carrying an ALTER
+// always does: routing reads the table's current definition to classify it,
+// whether or not the statement turns out to be refused.
 type lazyTargetDB struct {
 	dsn string
 	db  *sql.DB
@@ -494,4 +521,33 @@ func (l *lazyTargetDB) close() {
 		utils.CloseAndLog(l.db)
 		l.db = nil
 	}
+}
+
+// targetSchema reads the target's current CREATE TABLE for the tables an apply
+// touches, caching each one so routing several ALTERs against the same table
+// costs a single round trip. It is not safe for concurrent use; routing
+// classifies statements one at a time.
+type targetSchema struct {
+	target *lazyTargetDB
+	cache  map[string]string
+}
+
+func (s *targetSchema) createTable(ctx context.Context, tableName string) (string, error) {
+	if createTable, ok := s.cache[tableName]; ok {
+		return createTable, nil
+	}
+	db, err := s.target.get(ctx)
+	if err != nil {
+		return "", err
+	}
+	var name, createTable string
+	query := "SHOW CREATE TABLE " + sqlescape.EscapeIdentifier(tableName)
+	if err := db.QueryRowContext(ctx, query).Scan(&name, &createTable); err != nil {
+		return "", fmt.Errorf("%s: %w", query, err)
+	}
+	if s.cache == nil {
+		s.cache = make(map[string]string)
+	}
+	s.cache[tableName] = createTable
+	return createTable, nil
 }

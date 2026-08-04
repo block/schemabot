@@ -581,10 +581,14 @@ func TestEngine_ExecuteAlterPhase_BusyTableFailsFast(t *testing.T) {
 	assert.Equal(t, []string{"id"}, pkColumns(t, database, "direct_busy"), "the target is untouched")
 }
 
-// A refused statement whose table size cannot be estimated is blocked: an
-// unestimated table must never rebuild natively, so routing fails with the
-// unavailable-estimate reason instead of running the statement.
-func TestEngine_RouteAlterStatements_UnknownSizeBlocked(t *testing.T) {
+// Routing classifies each statement against its table's current definition,
+// because some of the engine's refusals depend on the existing column types. A
+// table whose definition cannot be read fails the apply before any statement
+// runs: classifying without it would narrow the refusals the engine reports and
+// hand a refused statement to the engine anyway. The failure names the table but
+// not the database's answer — that error reaches a PR comment, so the driver and
+// target detail it carries stays in the logs.
+func TestEngine_RouteAlterStatements_UnreadableTableBlocked(t *testing.T) {
 	dsn, _ := setupTestMySQL(t)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -600,6 +604,32 @@ func TestEngine_RouteAlterStatements_UnknownSizeBlocked(t *testing.T) {
 		[]string{"ALTER TABLE `direct_missing` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)"},
 		directPolicy{Enabled: true, MaxTableRows: 100000})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "direct_missing")
-	assert.Contains(t, err.Error(), "row count is unavailable")
+	assert.Contains(t, err.Error(), "cannot read the current definition of table \"direct_missing\"")
+	assert.Contains(t, err.Error(), "see server logs")
+	assert.NotContains(t, err.Error(), "SHOW CREATE TABLE", "the raw query and driver error belong in the logs")
+	assert.NotContains(t, err.Error(), "Error 1146", "the raw query and driver error belong in the logs")
+}
+
+// A refused statement whose table size cannot be estimated is blocked: an
+// unestimated table must never rebuild natively, so the size gate resolves to
+// the blocked mode with the unavailable-estimate reason instead of permitting
+// the statement to run directly.
+func TestEngine_ResolveRefusedMode_UnknownSizeBlocked(t *testing.T) {
+	dsn, _ := setupTestMySQL(t)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	eng := New(Config{Logger: logger})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	target := &lazyTargetDB{dsn: targetDSN(host, username, password, database)}
+	defer target.close()
+
+	decision := eng.resolveRefusedMode(t.Context(), target, directPolicy{Enabled: true, MaxTableRows: 100000},
+		database, "direct_missing", "dropping primary key is not supported")
+	assert.Equal(t, engine.ExecutionModeBlocked, decision.mode)
+	assert.Equal(t, "blocked_size_unknown", decision.outcome)
+	assert.Contains(t, decision.modeReason, "dropping primary key is not supported")
+	assert.Contains(t, decision.modeReason, "row count is unavailable")
 }
