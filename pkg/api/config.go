@@ -826,6 +826,22 @@ type DatabaseConfig struct {
 	// OperatorUsers are GitHub users who may run mutating PR comment commands
 	// for this database when PR command authorization is enabled.
 	OperatorUsers []string `yaml:"operator_users,omitempty"`
+
+	// OperatorGroups are forwarded identity groups (see auth.forward_auth)
+	// whose members may run mutating direct API/CLI operations against this
+	// database only, in the instance-wide environments listed in
+	// auth.forward_auth.operator_environments. This is the CLI/API-door
+	// counterpart of OperatorTeams: GitHub teams and forwarded groups are
+	// different identity domains with different verification, so they are
+	// deliberately separate fields. Setting this is the per-database opt-in
+	// for scoped write; a database without it stays admin-only
+	// (auth.forward_auth.write_groups). Requires auth type "forward_auth" and
+	// a non-empty auth.forward_auth.operator_environments.
+	//
+	// These are server-instance values owned by the platform operator — they
+	// must never move into repo-editable configuration, where a database team
+	// could grant themselves direct write with a self-merged PR.
+	OperatorGroups []string `yaml:"operator_groups,omitempty"`
 }
 
 // PRCommandAuthorizationConfig configures actor authorization for mutating
@@ -1365,6 +1381,10 @@ func (c *ServerConfig) Validate() error {
 		}
 	}
 
+	if err := c.validateOperatorScoping(); err != nil {
+		return err
+	}
+
 	for repo, repoConfig := range c.Repos {
 		if err := validateAggregateConfig(repo, repoConfig.Aggregate); err != nil {
 			return err
@@ -1476,6 +1496,17 @@ type ForwardAuthSettings struct {
 	// ReadServiceSPIFFE lists caller SPIFFE IDs granted read-tier access
 	// through a trusted gateway. Service callers never get the write tier.
 	ReadServiceSPIFFE []string `yaml:"read_service_spiffe,omitempty"`
+
+	// OperatorEnvironments lists the environments in which per-database
+	// operator grants (databases.*.operator_groups) may mutate. The policy is
+	// instance-wide: which environments accept scoped direct writes is a
+	// deployment decision, not a per-database one. It must be set exactly when
+	// at least one database configures operator_groups — a half-configured
+	// grant is rejected at startup so a grant that silently does nothing
+	// cannot ship. On instances that serve multiple environments this list is
+	// the code-enforced guard keeping scoped writes out of the environments
+	// not named here.
+	OperatorEnvironments []string `yaml:"operator_environments,omitempty"`
 }
 
 // Validate checks the auth configuration. Unknown types are rejected so a

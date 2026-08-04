@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.14
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.41.1
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3
-	github.com/block/spirit v0.15.2-0.20260731132010-e94e99be2c1b
+	github.com/block/spirit v0.15.2-0.20260731194359-9d6bdd67a9e1
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
@@ -18,7 +18,7 @@ require (
 	github.com/docker/docker v28.5.1+incompatible
 	github.com/docker/go-connections v0.6.0
 	github.com/go-jose/go-jose/v4 v4.1.4
-	github.com/go-mysql-org/go-mysql v1.15.1-0.20260526024741-088eb1fbf0ea
+	github.com/go-mysql-org/go-mysql v1.16.1-0.20260731133054-6f853f178dc3
 	github.com/go-mysql/hotswap-dsn-driver v1.0.1
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/gofri/go-github-ratelimit/v2 v2.0.2
@@ -269,8 +269,3 @@ replace vitess.io/vitess => github.com/block/vitess v0.0.0-20260703150944-881ec2
 
 // needed for SPATIAL index support in Spirit v0.13.0
 replace github.com/pingcap/tidb/pkg/parser => github.com/block/tidb/pkg/parser v0.0.0-20260506200501-e528fd979fc8
-
-// Pinned to a fork with the in-flight RenderJSONAsMySQLText flag for
-// type-preserving JSON binlog decoding. Revert to upstream go-mysql once
-// the new flag lands. See https://github.com/morgo/go-mysql/tree/mysql-text-json-rendering.
-replace github.com/go-mysql-org/go-mysql => github.com/morgo/go-mysql v1.16.1-0.20260723231236-3aced1dddcf4

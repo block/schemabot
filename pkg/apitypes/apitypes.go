@@ -74,6 +74,7 @@ const (
 	ErrCodeStateSyncFailed      = "state_sync_failed"      // Operation succeeded but local state sync failed
 	ErrCodeActiveApplyExists    = "active_apply_exists"    // Another active apply already exists for the target
 	ErrCodeSourcePolicyDenied   = "source_policy_denied"   // Source repo/path is not authorized for the database
+	ErrCodeLockNotOwned         = "lock_not_owned"         // Lock release denied because the caller is not the owner
 )
 
 var retryableErrorCodes = map[string]bool{
