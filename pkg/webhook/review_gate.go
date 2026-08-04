@@ -14,9 +14,14 @@ import (
 
 // ReviewGateResult contains the outcome of a review gate check.
 type ReviewGateResult struct {
-	Approved          bool
-	RequiredReviewers []string
-	PRAuthor          string
+	Approved bool
+	// OperatorReviewers are the database's own operator principals; the
+	// review-required comment leads with them in their own section.
+	OperatorReviewers []string
+	// OtherReviewers are the broader principals whose approval also satisfies
+	// the gate — global admins, then repo admins, then codeowners.
+	OtherReviewers []string
+	PRAuthor       string
 }
 
 // enforceReviewGate runs the review gate check and posts the appropriate comment if blocked.
@@ -41,11 +46,12 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 	}
 	if gateResult != nil && !gateResult.Approved {
 		h.postComment(repo, pr, installationID, templates.RenderReviewRequired(templates.ReviewGateData{
-			Database:    schemaResult.Database,
-			Environment: environment,
-			RequestedBy: requestedBy,
-			Reviewers:   gateResult.RequiredReviewers,
-			PRAuthor:    gateResult.PRAuthor,
+			Database:          schemaResult.Database,
+			Environment:       environment,
+			RequestedBy:       requestedBy,
+			OperatorReviewers: gateResult.OperatorReviewers,
+			OtherReviewers:    gateResult.OtherReviewers,
+			PRAuthor:          gateResult.PRAuthor,
 		}))
 		return true, nil
 	}
@@ -88,7 +94,7 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 	if err != nil {
 		return nil, err
 	}
-	if len(policy.RequiredReviewers) == 0 {
+	if len(policy.OperatorReviewers) == 0 && len(policy.OtherReviewers) == 0 {
 		return nil, fmt.Errorf("review policy has no configured reviewers for database %q", database)
 	}
 
@@ -113,10 +119,12 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 			h.logger.Info("review gate: approved",
 				"repo", repo, "pr", pr, "database", database,
 				"approved_by", reviewer, "matched_principal", principal,
-				"required_reviewers", policy.RequiredReviewers)
+				"operator_reviewers", policy.OperatorReviewers,
+				"other_reviewers", policy.OtherReviewers)
 			return &ReviewGateResult{
 				Approved:          true,
-				RequiredReviewers: policy.RequiredReviewers,
+				OperatorReviewers: policy.OperatorReviewers,
+				OtherReviewers:    policy.OtherReviewers,
 				PRAuthor:          prInfo.User,
 			}, nil
 		}
@@ -124,10 +132,13 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 
 	h.logger.Info("review gate: blocked",
 		"repo", repo, "pr", pr, "database", database,
-		"valid_approvers", validApprovers, "required_reviewers", policy.RequiredReviewers)
+		"valid_approvers", validApprovers,
+		"operator_reviewers", policy.OperatorReviewers,
+		"other_reviewers", policy.OtherReviewers)
 	return &ReviewGateResult{
 		Approved:          false,
-		RequiredReviewers: policy.RequiredReviewers,
+		OperatorReviewers: policy.OperatorReviewers,
+		OtherReviewers:    policy.OtherReviewers,
 		PRAuthor:          prInfo.User,
 	}, nil
 }
@@ -140,7 +151,14 @@ type reviewGatePolicy struct {
 	OperatorTeams      []string
 	OperatorUsers      []string
 	CodeownerReviewers map[string]struct{}
-	RequiredReviewers  []string
+	// OperatorReviewers and OtherReviewers are the PR-facing reviewer lists on
+	// the review-required comment. The database's own operators get their own
+	// leading section — they are the reviewers the author should ping — while
+	// the broader fallbacks follow in order of scope: global admin principals,
+	// then repo admins, then codeowners. A principal configured in more than
+	// one tier is listed once, in its most specific tier.
+	OperatorReviewers []string
+	OtherReviewers    []string
 }
 
 func (p reviewGatePolicy) Matches(ctx context.Context, client *ghclient.InstallationClient, reviewer string) (bool, string, error) {
@@ -200,18 +218,26 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 		RepoAdminUsers:     repoAdminUsers,
 		CodeownerReviewers: make(map[string]struct{}),
 	}
-	appendRequiredReviewers := func(values ...[]string) {
+	appendOperatorReviewers := func(values ...[]string) {
 		for _, group := range values {
 			for _, value := range group {
-				policy.RequiredReviewers = appendUniqueString(policy.RequiredReviewers, value)
+				policy.OperatorReviewers = appendUniqueString(policy.OperatorReviewers, value)
+			}
+		}
+	}
+	// A principal already listed as an operator is not repeated in the
+	// fallback section.
+	appendOtherReviewers := func(values ...[]string) {
+		for _, group := range values {
+			for _, value := range group {
+				if containsFold(policy.OperatorReviewers, value) {
+					continue
+				}
+				policy.OtherReviewers = appendUniqueString(policy.OtherReviewers, value)
 			}
 		}
 	}
 
-	// RequiredReviewers is the PR-facing list on the review-required comment,
-	// ordered by how close each principal is to the change: the database's own
-	// operators first — they are the reviewers the author should ping — then
-	// the global admin principals, then repo admins, with codeowners last.
 	if config.ReviewPolicyIncludesDatabaseOperators() {
 		dbConfig := config.Database(database)
 		if dbConfig == nil {
@@ -219,10 +245,10 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 		}
 		policy.OperatorTeams = dbConfig.OperatorTeams
 		policy.OperatorUsers = dbConfig.OperatorUsers
-		appendRequiredReviewers(dbConfig.OperatorTeams, dbConfig.OperatorUsers)
+		appendOperatorReviewers(dbConfig.OperatorTeams, dbConfig.OperatorUsers)
 	}
 
-	appendRequiredReviewers(reviewPolicy.AdminTeams, reviewPolicy.AdminUsers, repoAdminTeams, repoAdminUsers)
+	appendOtherReviewers(reviewPolicy.AdminTeams, reviewPolicy.AdminUsers, repoAdminTeams, repoAdminUsers)
 
 	if reviewPolicy.IncludeCodeowners {
 		owners, err := matchReviewGateCodeowners(ctx, client, repo, baseRef, schemaPath)
@@ -243,7 +269,7 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 				policy.CodeownerReviewers[strings.ToLower(owner.Value)] = struct{}{}
 			}
 		}
-		appendRequiredReviewers(ghclient.OwnerNames(owners))
+		appendOtherReviewers(ghclient.OwnerNames(owners))
 	}
 
 	return policy, nil
@@ -280,10 +306,17 @@ func (h *Handler) isReviewGateEnabled(repo string) bool {
 }
 
 func appendUniqueString(values []string, value string) []string {
-	for _, existing := range values {
-		if strings.EqualFold(existing, value) {
-			return values
-		}
+	if containsFold(values, value) {
+		return values
 	}
 	return append(values, value)
+}
+
+func containsFold(values []string, value string) bool {
+	for _, existing := range values {
+		if strings.EqualFold(existing, value) {
+			return true
+		}
+	}
+	return false
 }
