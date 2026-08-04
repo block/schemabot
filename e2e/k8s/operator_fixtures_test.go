@@ -60,8 +60,9 @@ func markApplyHeartbeatStale(t *testing.T, dsn, applyID, storageName string) {
 	// FindNextApplyOperation's stale-heartbeat clause, which keys off
 	// apply_operations.updated_at (not applies.updated_at). Age the apply's
 	// operation rows too so the operator can re-lease without waiting out the
-	// production staleness window. Operation rows are optional here (e.g. the
-	// data-plane apply has none), so we don't assert a row count.
+	// production staleness window. Under apply-level claiming the operation
+	// rows never leave pending, so aging them is a harmless no-op there — we
+	// don't assert a row count.
 	_, err = db.ExecContext(t.Context(),
 		`UPDATE apply_operations ao
 			JOIN applies a ON ao.apply_id = a.id

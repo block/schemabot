@@ -1811,3 +1811,206 @@ func TestReconcileUnclaimableParent_RetainsLeaseWhenParentUnknown(t *testing.T) 
 			"a confirmed non-terminal parent must release the operation lease for an immediate retry")
 	})
 }
+
+// claimLadderOperationStore drives the operation-level claim ladder over a
+// single operation row: the cutover probe finds nothing, and the operation
+// claim leases the row while it is claimable — or panics when configured, to
+// model a fault in the claim machinery itself.
+type claimLadderOperationStore struct {
+	*recoverOperationStore
+	claims     int
+	claimPanic string
+}
+
+func (s *claimLadderOperationStore) FindNextApplyOperationCutover(context.Context, string) (*storage.ApplyOperation, error) {
+	return nil, nil
+}
+
+func (s *claimLadderOperationStore) FindNextApplyOperation(_ context.Context, owner string) (*storage.ApplyOperation, error) {
+	s.claims++
+	if s.claimPanic != "" {
+		panic(s.claimPanic)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.op == nil || state.IsTerminalApplyState(s.op.State) {
+		return nil, nil
+	}
+	s.op.LeaseOwner = owner
+	s.op.LeaseToken = "op-lease-token"
+	op := *s.op
+	return &op, nil
+}
+
+// operationClaimApplyStore serves the apply-side calls the operation-level
+// claim ladder makes around an operation claim: the retryable-expiry pass, the
+// stop-reconciliation probe, the parent claim, and the post-drive
+// reload/derivation.
+type operationClaimApplyStore struct {
+	storage.ApplyStore
+	mu             sync.Mutex
+	apply          *storage.Apply
+	expireErr      error
+	stopProbePanic string
+	stopProbes     int
+	updateCalled   bool
+}
+
+func (s *operationClaimApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {
+	return nil, s.expireErr
+}
+
+func (s *operationClaimApplyStore) FindNextApplyForStopReconciliation(context.Context, string) (*storage.Apply, error) {
+	s.mu.Lock()
+	s.stopProbes++
+	s.mu.Unlock()
+	if s.stopProbePanic != "" {
+		panic(s.stopProbePanic)
+	}
+	return nil, nil
+}
+
+func (s *operationClaimApplyStore) ClaimApplyByID(_ context.Context, _ int64, owner string) (*storage.Apply, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.apply == nil || state.IsTerminalApplyState(s.apply.State) {
+		return nil, nil
+	}
+	s.apply.LeaseOwner = owner
+	s.apply.LeaseToken = "lease-token"
+	return s.apply, nil
+}
+
+func (s *operationClaimApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.apply == nil {
+		return nil, nil
+	}
+	fresh := *s.apply
+	return &fresh, nil
+}
+
+func (s *operationClaimApplyStore) Update(_ context.Context, apply *storage.Apply) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updateCalled = true
+	s.apply = apply
+	return nil
+}
+
+func (s *operationClaimApplyStore) UpdateDerivedState(_ context.Context, _ int64, expectedState, newState, errorMessage string, _, _ *time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.apply == nil || !state.IsState(s.apply.State, expectedState) {
+		return false, nil
+	}
+	s.apply.State = newState
+	s.apply.ErrorMessage = errorMessage
+	return true, nil
+}
+
+// Retryable-apply expiry is best-effort maintenance on the operation-level
+// claim ladder too: a storage failure there must not stop a driver from
+// claiming operation work in the same tick.
+func TestRecoverApplies_ExpiryErrorDoesNotBlockOperationClaim(t *testing.T) {
+	applies := &operationClaimApplyStore{expireErr: errors.New("storage unavailable")}
+	ops := &claimLadderOperationStore{recoverOperationStore: &recoverOperationStore{}}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	cfg := testServerConfig()
+	cfg.OperatorClaimOperations = new(true)
+	svc := New(&mockStorageWithApplyStores{applies: applies, operations: ops}, cfg, nil, logger)
+
+	svc.recoverApplies(t.Context(), 1)
+
+	assert.Equal(t, 1, ops.claims,
+		"FindNextApplyOperation must run even when ExpireRetryable fails")
+}
+
+// A panic in the operation claim machinery itself (outside the engine drive)
+// must not kill the driver goroutine: the tick boundary contains it and the
+// driver polls again on the next tick.
+func TestDriveTick_ContainsOperationClaimPanic(t *testing.T) {
+	applies := &operationClaimApplyStore{}
+	ops := &claimLadderOperationStore{
+		recoverOperationStore: &recoverOperationStore{},
+		claimPanic:            "claim scan hit a corrupt row",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	cfg := testServerConfig()
+	cfg.OperatorClaimOperations = new(true)
+	svc := New(&mockStorageWithApplyStores{applies: applies, operations: ops}, cfg, nil, logger)
+
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	assert.Equal(t, 2, ops.claims, "the driver must keep polling after each contained panic")
+}
+
+// A panic in the pre-claim stop-reconciliation probe is contained the same
+// way: the driver survives and probes again on the next tick instead of
+// crashing the process.
+func TestDriveTick_ContainsStopReconciliationProbePanic(t *testing.T) {
+	applies := &operationClaimApplyStore{stopProbePanic: "stop probe hit a corrupt row"}
+	ops := &claimLadderOperationStore{recoverOperationStore: &recoverOperationStore{}}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	cfg := testServerConfig()
+	cfg.OperatorClaimOperations = new(true)
+	svc := New(&mockStorageWithApplyStores{applies: applies, operations: ops}, cfg, nil, logger)
+
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	assert.Equal(t, 2, applies.stopProbes, "the driver must keep probing after each contained panic")
+	assert.Zero(t, ops.claims, "the panic consumed the tick before the operation claim")
+}
+
+// One poisoned apply must degrade only itself under operation-level claiming
+// too: the tick that claims its operation contains the drive panic, the
+// operation row and parent apply are failed so neither is re-claimed, and the
+// driver keeps claiming fresh work on subsequent ticks.
+func TestDriveTick_ContainsDrivePanicUnderOperationClaimAndKeepsClaiming(t *testing.T) {
+	client := &panickingResumeClient{panicValue: "corrupt engine metadata"}
+	operationID := int64(7)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "appdb",
+		Deployment:      "east",
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	op := &storage.ApplyOperation{
+		ID:         operationID,
+		ApplyID:    42,
+		Deployment: "east",
+		State:      state.ApplyOperation.Running,
+	}
+	applies := &operationClaimApplyStore{apply: apply}
+	ops := &claimLadderOperationStore{recoverOperationStore: &recoverOperationStore{op: op}}
+	taskStore := &recordingTaskStore{tasks: []*storage.Task{
+		{ID: 9, ApplyID: 42, ApplyOperationID: &operationID, State: state.Task.Running},
+	}}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	cfg := testServerConfig()
+	cfg.OperatorClaimOperations = new(true)
+	svc := New(&mockStorageWithApplyStores{
+		plans:      &staticPlanStore{},
+		applies:    applies,
+		tasks:      taskStore,
+		controls:   &fakeControlRequestStore{},
+		operations: ops,
+	}, cfg, map[string]tern.Client{
+		"east/staging": client,
+	}, logger)
+
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	assert.Equal(t, 1, ops.claims)
+	assert.True(t, state.IsState(op.State, state.ApplyOperation.Failed),
+		"the poisoned operation row must be failed so it is not re-claimed")
+	assert.Contains(t, op.ErrorMessage, "corrupt engine metadata")
+	assert.True(t, state.IsState(applies.apply.State, state.Apply.Failed),
+		"the parent apply must be failed under the dual-lease containment")
+
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	assert.Equal(t, 2, ops.claims,
+		"the driver must keep claiming after containing the panic, and the failed operation must not be claimable")
+}

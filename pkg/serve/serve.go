@@ -139,16 +139,16 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	}
 	defer utils.CloseAndLog(srv)
 
-	// A configured GRPC_PORT means this process serves the data plane, whose
-	// LocalClient drives claim at the apply level — so default operator claiming
-	// to the apply level (unless config set it explicitly). This is a Run
-	// convenience, not a server mode: an embedder sets
-	// ServerConfig.OperatorClaimOperations directly. Applied before Start
-	// (which launches the operator) so the operator reads the resolved value.
+	// A configured GRPC_PORT means this process serves the data plane, which
+	// keeps the conservative apply-level claim default when the mode is unset
+	// (config can still set it explicitly). This is a Run convenience, not a
+	// server mode: an embedder sets ServerConfig.OperatorClaimOperations
+	// directly. Applied before Start (which launches the operator) so the
+	// operator reads the resolved value.
 	if applyDataPlaneClaimDefault(cfg, grpcPort != "") {
 		srv.logger.Info("data-plane gRPC mode: defaulting operator claiming to the apply level", "grpc_port", grpcPort)
 	} else if grpcPort != "" && cfg.ShouldClaimOperations() {
-		srv.logger.Warn("data-plane gRPC mode has operation-level operator claiming enabled; data-plane drives hold apply-level leases, so stop/start resume will not recover", "grpc_port", grpcPort)
+		srv.logger.Info("data-plane gRPC mode: operator claiming at the operation level (explicit config)", "grpc_port", grpcPort)
 	}
 
 	// Optionally start a gRPC server for the Tern proto (used by
@@ -871,13 +871,12 @@ func getEnv(key, defaultValue string) string {
 }
 
 // applyDataPlaneClaimDefault sets the operator claim mode for a data-plane tern
-// process. A process serving the Tern proto over gRPC drives applies inline via
-// LocalClient and does not own the apply_operations lifecycle, so its operator
-// must recover work at the apply level via FindNextApply; operation-level
-// claiming reads a vestigial operation row that never tracks the apply and so
-// cannot resume it. When the mode is unset, default it to apply-level claiming
-// for this process; an operator can still opt in explicitly. Operation-level
-// claiming is a control-plane concept. Reports whether the default was applied.
+// process. LocalClient queues dispatched applies for the storage-claiming
+// operator and dual-writes each apply's operation row, so either claim mode can
+// drive them. Data-plane processes keep the conservative apply-level default
+// when the mode is unset — the mode production data planes run — and an
+// operator opts into operation-level claiming explicitly. Reports whether the
+// default was applied.
 func applyDataPlaneClaimDefault(cfg *api.ServerConfig, isDataPlane bool) bool {
 	if !isDataPlane || cfg.OperatorClaimOperations != nil {
 		return false
