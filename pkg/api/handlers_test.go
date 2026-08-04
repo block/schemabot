@@ -221,9 +221,12 @@ func (s *staticApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
 func (s *staticApplyStore) SetRevertSkipped(context.Context, int64, time.Time) error {
 	return nil
 }
-func (s *staticApplyStore) GetByDatabase(_ context.Context, database, dbType, environment string) ([]*storage.Apply, error) {
+func (s *staticApplyStore) GetByDatabase(_ context.Context, database, dbType, environment string, limit int) ([]*storage.Apply, error) {
 	if s.err != nil {
 		return nil, s.err
+	}
+	if limit <= 0 {
+		return nil, fmt.Errorf("limit must be positive, got %d", limit)
 	}
 	if len(s.applies) > 0 {
 		var applies []*storage.Apply
@@ -242,6 +245,9 @@ func (s *staticApplyStore) GetByDatabase(_ context.Context, database, dbType, en
 				}
 			}
 			applies = append(applies, apply)
+			if len(applies) == limit {
+				break
+			}
 		}
 		return applies, nil
 	}
@@ -3675,6 +3681,100 @@ func TestParseStatusLimit(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestParseLogsLimit(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		limitStr string
+		want     int
+	}{
+		{name: "default", limitStr: "", want: defaultLogsLimit},
+		{name: "custom", limitStr: "200", want: 200},
+		{name: "clamped", limitStr: "999999999", want: maxLogsLimit},
+		{name: "zero falls back to default", limitStr: "0", want: defaultLogsLimit},
+		{name: "negative falls back to default", limitStr: "-5", want: defaultLogsLimit},
+		{name: "not a number falls back to default", limitStr: "lots", want: defaultLogsLimit},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, parseLogsLimit(tt.limitStr))
+		})
+	}
+}
+
+// listCapturingApplyLogStore records the filters passed to List so tests can
+// assert how many log rows a handler asked storage for.
+type listCapturingApplyLogStore struct {
+	storage.ApplyLogStore
+	listFilters []storage.ApplyLogFilter
+}
+
+func (s *listCapturingApplyLogStore) List(_ context.Context, filter storage.ApplyLogFilter) ([]*storage.ApplyLog, error) {
+	s.listFilters = append(s.listFilters, filter)
+	return nil, nil
+}
+
+// TestLogsLimitClamp verifies that the logs endpoint never asks storage for
+// more than maxLogsLimit rows: a request far above the ceiling is served with
+// the clamped limit instead of loading an unbounded number of log entries.
+func TestLogsLimitClamp(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	applyLogs := &listCapturingApplyLogStore{}
+	svc := New(&mockStorageWithApplyStores{
+		applies: &staticApplyStore{apply: &storage.Apply{
+			ID:              7,
+			ApplyIdentifier: "apply_logs_limit",
+			Database:        "testdb",
+			Environment:     "staging",
+			State:           state.Apply.Running,
+		}},
+		applyLogs: applyLogs,
+	}, testServerConfig(), nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply_logs_limit&limit=999999999", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, applyLogs.listFilters, 1)
+	assert.Equal(t, maxLogsLimit, applyLogs.listFilters[0].Limit)
+	assert.Equal(t, int64(7), applyLogs.listFilters[0].ApplyID)
+}
+
+// TestDatabaseHistoryCapped verifies that the database-history endpoint reads
+// at most maxHistoryLimit applies from storage, so a database with a long
+// apply history returns the most recent entries instead of everything.
+func TestDatabaseHistoryCapped(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	applies := make([]*storage.Apply, 0, maxHistoryLimit+1)
+	for i := range maxHistoryLimit + 1 {
+		applies = append(applies, &storage.Apply{
+			ID:              int64(i + 1),
+			ApplyIdentifier: fmt.Sprintf("apply_%d", i),
+			Database:        "testdb",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Environment:     "staging",
+			State:           state.Apply.Completed,
+		})
+	}
+	svc := New(&mockStorageWithApplyStores{
+		applies: &staticApplyStore{applies: applies},
+	}, testServerConfig(), nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/history/testdb?environment=staging", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp apitypes.DatabaseHistoryResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Applies, maxHistoryLimit)
+	assert.Equal(t, "apply_0", resp.Applies[0].ApplyID)
+	assert.Equal(t, fmt.Sprintf("apply_%d", maxHistoryLimit-1), resp.Applies[maxHistoryLimit-1].ApplyID)
 }
 
 func TestParseStatusLast(t *testing.T) {

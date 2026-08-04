@@ -23,6 +23,12 @@ import (
 const (
 	defaultStatusLimit = 20
 	maxStatusLimit     = 1000
+
+	// maxHistoryLimit bounds how many applies a database-history response can
+	// load into memory. The CLI renders the full response, so the cap is
+	// generous, but a database with years of apply history must not be pulled
+	// into one unbounded read.
+	maxHistoryLimit = 1000
 )
 
 // changeTypeToString converts a proto ChangeType enum to a lowercase string.
@@ -540,7 +546,8 @@ func (s *Service) overlayStoredDisplayMetadata(ctx context.Context, resp *apityp
 }
 
 // handleDatabaseHistory handles GET /api/history/{database} requests.
-// Returns all applies for a database, sorted by created_at desc.
+// Returns the most recent applies for a database, sorted by created_at desc,
+// capped at maxHistoryLimit entries.
 func (s *Service) handleDatabaseHistory(w http.ResponseWriter, r *http.Request) {
 	database := r.PathValue("database")
 	if database == "" {
@@ -550,7 +557,7 @@ func (s *Service) handleDatabaseHistory(w http.ResponseWriter, r *http.Request) 
 
 	environment := r.URL.Query().Get("environment")
 
-	applies, err := s.storage.Applies().GetByDatabase(r.Context(), database, "", environment)
+	applies, err := s.storage.Applies().GetByDatabase(r.Context(), database, "", environment, maxHistoryLimit)
 	if err != nil {
 		s.logger.Error("failed to get applies", "database", database, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "failed to get applies: "+err.Error())

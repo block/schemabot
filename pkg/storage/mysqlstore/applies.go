@@ -2097,9 +2097,14 @@ func retryableExpirationReason(apply *storage.Apply) storage.RetryableExpiration
 	return storage.RetryableExpirationRecoveryWindow
 }
 
-// GetByDatabase returns applies for a specific database and optionally filtered by dbType and environment.
-// If dbType or environment are empty strings, they are not used as filters.
-func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, environment string) ([]*storage.Apply, error) {
+// GetByDatabase returns the most recent applies for a specific database,
+// optionally filtered by dbType and environment (empty strings match all
+// values). limit bounds the result set and must be positive.
+func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, environment string, limit int) ([]*storage.Apply, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("query applies for database %s: limit must be positive, got %d", database, limit)
+	}
+
 	query := `
 		SELECT ` + applyColumns + `
 		FROM applies
@@ -2114,7 +2119,8 @@ func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, enviro
 		query += " AND environment = ?"
 		args = append(args, environment)
 	}
-	query += " ORDER BY created_at DESC"
+	query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+	args = append(args, limit)
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {

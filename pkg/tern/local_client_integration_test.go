@@ -3778,7 +3778,7 @@ func TestLocalClient_Apply_AtomicRejectsMultiNamespace(t *testing.T) {
 
 	// The apply should fail with multi-namespace error
 	require.Eventually(t, func() bool {
-		applies, err := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
+		applies, err := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "", 1)
 		if err != nil || len(applies) == 0 {
 			return false
 		}
@@ -3860,7 +3860,7 @@ func TestLocalClient_Apply_SequentialNamespaceMatchesTask(t *testing.T) {
 
 	// Wait for completion
 	require.Eventually(t, func() bool {
-		applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
+		applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "", 1)
 		if len(applies) == 0 {
 			return false
 		}
@@ -3868,7 +3868,7 @@ func TestLocalClient_Apply_SequentialNamespaceMatchesTask(t *testing.T) {
 	}, 30*time.Second, 500*time.Millisecond, "apply should complete")
 
 	// Verify task has correct namespace and progress was persisted
-	applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
+	applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "", 1)
 	require.NotEmpty(t, applies)
 	tasks, err := stor.Tasks().GetByApplyID(ctx, applies[0].ID)
 	require.NoError(t, err)
@@ -3938,14 +3938,14 @@ func TestLocalClient_Apply_FailedAtomicHasErrorMessage(t *testing.T) {
 	// Spirit failures are retryable by default. The first failure should pause
 	// in failed_retryable instead of becoming permanently failed.
 	require.Eventually(t, func() bool {
-		applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
+		applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "", 1)
 		if len(applies) == 0 {
 			return false
 		}
 		return applies[0].State == state.Apply.FailedRetryable
 	}, 30*time.Second, 500*time.Millisecond, "apply should pause for operator retry")
 
-	applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
+	applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "", 1)
 	require.NotEmpty(t, applies)
 	assert.NotEmpty(t, applies[0].ErrorMessage, "apply.ErrorMessage should contain the failure reason")
 	t.Logf("apply error: %s", applies[0].ErrorMessage)

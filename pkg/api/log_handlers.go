@@ -16,6 +16,30 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+const (
+	// defaultLogsLimit is the number of log entries returned when the caller
+	// does not specify a limit.
+	defaultLogsLimit = 50
+	// maxLogsLimit bounds how many log entries a single request can load into
+	// memory. Requests above the ceiling are clamped, not rejected, matching
+	// the status endpoint's limit behavior.
+	maxLogsLimit = 1000
+)
+
+// parseLogsLimit returns the log-entry limit for a request. Missing, malformed,
+// or non-positive values fall back to the default; values above the ceiling are
+// clamped to it.
+func parseLogsLimit(limitStr string) int {
+	if limitStr == "" {
+		return defaultLogsLimit
+	}
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 {
+		return defaultLogsLimit
+	}
+	return min(limit, maxLogsLimit)
+}
+
 // handleLogs returns apply logs for a database or apply.
 // GET /api/logs/{database}?environment=staging&limit=50
 // GET /api/logs/{database}?apply_id=apply_abc123&limit=50
@@ -51,13 +75,7 @@ func (s *Service) handleLogsWithoutDatabase(w http.ResponseWriter, r *http.Reque
 
 // handleLogsCommon is the shared implementation for log handlers.
 func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, database, environment, applyID, deployment, limitStr string) {
-
-	limit := 50
-	if limitStr != "" {
-		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
-			limit = l
-		}
-	}
+	limit := parseLogsLimit(limitStr)
 	if deployment != "" && applyID == "" {
 		s.writeError(w, http.StatusBadRequest, "deployment requires an explicit apply_id")
 		return
@@ -85,7 +103,8 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 			return
 		}
 
-		applies, err := s.storage.Applies().GetByDatabase(r.Context(), database, "", environment)
+		// Only the most recent apply is needed to serve its logs.
+		applies, err := s.storage.Applies().GetByDatabase(r.Context(), database, "", environment, 1)
 		if err != nil {
 			s.logger.Error("failed to get applies", "database", database, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "failed to get applies")
