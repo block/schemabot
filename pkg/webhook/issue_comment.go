@@ -831,10 +831,12 @@ func (h *Handler) enqueueDurableIssueComment(ctx context.Context, body []byte, d
 // the acknowledgment reaction before enqueueing, so the driver's job is the
 // command itself: it re-parses the stored comment — parsing is deterministic
 // on the payload — and routes to the command core, whose (retry, err)
-// disposition drives the lease. Enqueue-time guards are re-validated
-// fail-closed (rows can arrive via replay or a hand-crafted insert), so a
-// delivery that no longer decodes to a durably dispatched command completes as
-// a no-op rather than running work the request path would not have enqueued.
+// disposition drives the lease. Every enqueue-time gate is re-validated
+// fail-closed (rows can arrive via replay or a hand-crafted insert, and
+// configuration can change between enqueue and drive), so a delivery the
+// request path would not have enqueued — a non-command comment, an
+// unsupported flag, or a tenant or environment this deployment does not
+// route — completes as a no-op rather than running unrouted work.
 func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
 	var payload webhookPayload
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
@@ -874,11 +876,17 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 	if payload.Comment.User != nil {
 		requestedBy = payload.Comment.User.Login
 	}
-	result := NewCommandParser().ParseCommand(payload.Comment.Body)
+	parser := NewCommandParser()
+	result := parser.ParseCommand(payload.Comment.Body)
 	result.CommentID = payload.Comment.ID
 	if !durableIssueCommentCommandReady(result) {
 		h.logger.Info("durable issue_comment delivery ignored because its comment is not a durably dispatched command",
 			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "command", result.Action)
+		return false, nil
+	}
+	if reason := h.durableIssueCommentRoutingBlock(repo, result, parser, payload.Comment.Body); reason != "" {
+		h.logger.Info("durable issue_comment delivery ignored because the request path would not have dispatched it",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "command", result.Action, "reason", reason)
 		return false, nil
 	}
 
@@ -904,4 +912,37 @@ func durableIssueCommentCommandReady(result CommandResult) bool {
 		return false
 	}
 	return result.Action == action.Apply || result.Action == action.ApplyConfirm
+}
+
+// durableIssueCommentRoutingBlock re-runs the request-path routing and usage
+// gates that precede the durable enqueue, returning a non-empty reason when
+// any of them would have kept the delivery out of the inbox. The request path
+// answers usage errors synchronously and routes tenant- or environment-owned
+// commands to the deployment that owns them, so a claimed row tripping one of
+// these gates is a replayed or hand-crafted delivery — or one enqueued before
+// a configuration change moved the ownership — and must complete as a no-op
+// rather than run work this deployment does not route.
+func (h *Handler) durableIssueCommentRoutingBlock(repo string, result CommandResult, parser *CommandParser, commentBody string) string {
+	if h.service != nil {
+		cfg := h.service.Config()
+		if result.Tenant != "" && !cfg.ShouldRespondToTenant(result.Tenant) {
+			return "tenant handled by another deployment"
+		}
+		if result.Tenant == "" && cfg.Tenant != "" && commandRequiresTenantTarget(result) {
+			fansOut := h.fansOutUnscopedCommand(repo) && unscopedCommandFansOut(result)
+			if !fansOut {
+				return "tenant target required"
+			}
+		}
+		if result.Environment != "" && !cfg.IsEnvironmentAllowed(result.Environment) {
+			return "environment handled by another instance"
+		}
+	}
+	if result.Action != action.Apply && parser.HasAutoConfirmFlag(commentBody) {
+		return "auto-confirm flag unsupported for command"
+	}
+	if !commandSupportsDatabaseFlag(result.Action) && parser.HasDatabaseFlag(commentBody) {
+		return "database flag unsupported for command"
+	}
+	return ""
 }

@@ -235,6 +235,10 @@ func TestDurableIssueCommentDriverCompletesNonDispatchableRows(t *testing.T) {
 			name:    "apply missing environment flag",
 			payload: durableIssueCommentPayload("schemabot apply"),
 		},
+		{
+			name:    "apply-confirm with unsupported auto-confirm flag",
+			payload: durableIssueCommentPayload("schemabot apply-confirm -e production -y"),
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -259,6 +263,85 @@ func TestDurableIssueCommentDriverCompletesNonDispatchableRows(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A delivery whose command this deployment does not route — a tenant target
+// addressed to a sibling deployment, an unscoped command on a tenanted
+// deployment, or an environment owned by another instance — completes as a
+// no-op without creating a client. The request path routes these away before
+// enqueueing, so a claimed row tripping one of the gates is a replayed or
+// hand-crafted delivery, or one enqueued before a configuration change moved
+// the ownership.
+func TestDurableIssueCommentDriverCompletesUnroutedCommands(t *testing.T) {
+	tests := []struct {
+		name    string
+		comment string
+		config  *api.ServerConfig
+	}{
+		{
+			name:    "tenant addressed to another deployment",
+			comment: "schemabot apply -e production -t other",
+			config:  &api.ServerConfig{Tenant: "mine"},
+		},
+		{
+			name:    "unscoped command on a tenanted deployment",
+			comment: "schemabot apply -e production",
+			config:  &api.ServerConfig{Tenant: "mine"},
+		},
+		{
+			name:    "environment owned by another instance",
+			comment: "schemabot apply -e production",
+			config:  &api.ServerConfig{AllowedEnvironments: []string{"staging"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newScriptedWebhookEventStore(durableIssueCommentEvent(tt.comment))
+			factory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
+			h := newDurableDriverHandler(t, store, tt.config, factory)
+
+			h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+			select {
+			case <-store.completed:
+			default:
+				t.Fatal("expected unrouted issue_comment delivery to be marked completed")
+			}
+			require.Empty(t, store.failed)
+			select {
+			case <-factory.forInstallationStarted:
+				t.Fatal("an unrouted delivery must not create a GitHub client")
+			default:
+			}
+		})
+	}
+}
+
+// An aggregate participant serves unscoped apply commands by fanning out onto
+// the work it owns, so the driver's tenant-target gate must let the command
+// through to the command core rather than completing it as a no-op.
+func TestDurableIssueCommentDriverDispatchesParticipantFanOut(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableIssueCommentEvent("schemabot apply -e production"))
+	config := &api.ServerConfig{
+		Tenant: "mine",
+		Repos: map[string]api.RepoConfig{
+			"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}},
+		},
+	}
+	factory := &fakeClientFactory{
+		forInstallationStarted: make(chan struct{}),
+		forInstallationErr:     fmt.Errorf("installation token unavailable"),
+	}
+	h := newDurableDriverHandler(t, store, config, factory)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case <-factory.forInstallationStarted:
+	default:
+		t.Fatal("expected participant fan-out apply to reach the command core")
+	}
+	require.Empty(t, store.completed, "fan-out apply must dispatch, not complete as a no-op")
 }
 
 // A delivery for a repo this deployment does not manage completes as a no-op
