@@ -406,9 +406,10 @@ func (s *taskStore) CountByApplyID(ctx context.Context, applyID int64) (int64, e
 // rows for unsharded operations stay out of the drive pipeline.
 //
 // Rows are returned in creation order — the plan's statement order — because
-// the sequential drive executes tasks in the order this loader returns them,
-// and plans may order statements deliberately (for example, creating a
-// referenced table before the table that declares the foreign key).
+// the sequential drive executes tasks in the order this loader returns them.
+// The planner emits statements in a deliberate order (CREATE, then ALTER,
+// then DROP), and stop-on-failure semantics assume top-to-bottom execution:
+// everything before a failing statement ran, everything after it did not.
 func (s *taskStore) GetByApplyOperationID(ctx context.Context, applyOperationID int64) ([]*storage.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+prefixedTaskColumns("t")+`
