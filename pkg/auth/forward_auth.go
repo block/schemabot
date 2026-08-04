@@ -254,7 +254,7 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		tier := tierForRequest(r.Method, r.URL.Path)
+		tier := TierForRequest(r.Method, r.URL.Path)
 
 		trusted, proxyID := a.isTrustedProxy(r)
 		if !trusted {
@@ -306,7 +306,14 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 				a.logger.Warn("forward-auth authorization denied for write operation",
 					"path", r.URL.Path, "subject", user)
 				authDecision(r, tier, "deny", "not_admin")
-				writeAuthError(w, http.StatusForbidden, "this operation requires membership in a write-access group or a database operator group")
+				// Only mention operator groups when the deployment has any;
+				// on a deployment without them the suffix would send a denied
+				// caller hunting for a lane that does not exist.
+				msg := "this operation requires membership in a write-access group"
+				if len(a.operatorGroups) > 0 {
+					msg += " or a database operator group"
+				}
+				writeAuthError(w, http.StatusForbidden, msg)
 				return
 			}
 		default: // TierRead

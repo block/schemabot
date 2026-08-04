@@ -181,7 +181,30 @@ func (c *ServerConfig) validateOperatorScoping() error {
 			return fmt.Errorf("auth.forward_auth.operator_environments entry %q is not a configured environment on any database", env)
 		}
 	}
+	for _, name := range grantedDatabases {
+		if !c.databaseHasAnyEnvironment(name, environments) {
+			return fmt.Errorf("databases.%s.operator_groups grant can never authorize an operation: none of the database's environments appear in auth.forward_auth.operator_environments (%s)",
+				name, strings.Join(environments, ", "))
+		}
+	}
 	return nil
+}
+
+// databaseHasAnyEnvironment reports whether the database defines at least one
+// of the given environments. A scoped grant on a database whose environments
+// are all outside the operator-environment policy can never authorize an
+// operation, so it is a configuration error, not a silent no-op.
+func (c *ServerConfig) databaseHasAnyEnvironment(database string, environments []string) bool {
+	dbConfig, ok := c.Databases[database]
+	if !ok {
+		return false
+	}
+	for _, env := range environments {
+		if _, ok := dbConfig.Environments[env]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // environmentConfiguredOnAnyDatabase reports whether any configured database
@@ -311,6 +334,16 @@ func (s *Service) authorizeDirectAdminWrite(w http.ResponseWriter, r *http.Reque
 	return s.finishDirectWriteDecision(w, r, operation, "", "", result)
 }
 
+// authorizeDirectForceLockRelease enforces admin-only access for force lock
+// release. Force bypasses the lock ownership check — an administrative
+// override, not an operator control on the caller's own database — so a
+// database operator grant does not cover it. The database still rides along
+// for the decision metric and denial log.
+func (s *Service) authorizeDirectForceLockRelease(w http.ResponseWriter, r *http.Request, database string) bool {
+	result := s.config.AuthorizeDirectAdminWrite(auth.UserFromContext(r.Context()))
+	return s.finishDirectWriteDecision(w, r, "lock_force_release", database, "", result)
+}
+
 func (s *Service) finishDirectWriteDecision(w http.ResponseWriter, r *http.Request, operation, database, environment string, result DirectWriteAuthorizationResult) bool {
 	metrics.RecordDirectWriteAuthorization(r.Context(), operation,
 		s.config.metricDatabaseAttribute(database), s.config.metricEnvironmentAttribute(environment),
@@ -357,7 +390,7 @@ func (s *Service) directWriteDenialMessage(operation, database, environment stri
 			strings.Join(trimmedNonEmpty(s.config.Auth.ForwardAuth.OperatorEnvironments), ", "),
 			strings.Join(writeGroups, ", "))
 	case DirectWriteReasonNotAdmin:
-		return fmt.Sprintf("%s has no single target database, so it requires membership in a deployment write group (%s)",
+		return fmt.Sprintf("%s requires membership in a deployment write group (%s); database operator grants do not cover it",
 			operation, strings.Join(writeGroups, ", "))
 	case DirectWriteReasonMissingIdentity:
 		return fmt.Sprintf("%s requires an authenticated caller identity", operation)

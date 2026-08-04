@@ -16,8 +16,10 @@ const (
 	TierRead Tier = iota
 	// TierWrite covers everything that stages or makes a change: plan, apply,
 	// cutover, control operations, locks, and settings. It requires membership
-	// in a configured admin group — the CLI/direct-API write path is for a small
-	// privileged set; general users go through the PR-comment workflow instead.
+	// in a deployment write group, or in some database's operator groups — for
+	// operators the mutating handler then enforces the per-database and
+	// per-environment scope once the target resolves. General users go through
+	// the PR-comment workflow instead.
 	// Planning is included deliberately — running a plan stages a change against
 	// a specific database and reads its live schema, so it belongs to the change
 	// workflow, not open read access. Viewing existing plan results and reading a
@@ -43,11 +45,13 @@ var readPaths = map[string]bool{
 	"/api/pull": true,
 }
 
-// tierForRequest classifies an API request into the access tier it requires.
+// TierForRequest classifies an API request into the access tier it requires.
 // GET/HEAD requests and the explicit read-only endpoints are read; everything
 // else is write, so a newly added mutating-looking endpoint fails closed
-// (requires authorization) until it is classified here.
-func tierForRequest(method, path string) Tier {
+// (requires authorization) until it is classified here. Exported so the
+// route authorization sweep test enforces per-database scoping against the
+// same rule the middleware admits with.
+func TierForRequest(method, path string) Tier {
 	if readPaths[path] {
 		return TierRead
 	}

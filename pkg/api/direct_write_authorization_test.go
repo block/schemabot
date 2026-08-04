@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -101,6 +102,19 @@ func TestServerConfig_ValidateOperatorScoping(t *testing.T) {
 		err := cfg.Validate()
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), `"sandbox" is not a configured environment on any database`)
+	})
+
+	t.Run("granted database must define an operator environment", func(t *testing.T) {
+		cfg := scopedWriteConfig()
+		db := cfg.Databases["payments"]
+		db.Environments = map[string]EnvironmentConfig{
+			"production": {DSN: "root@tcp(localhost)/payments_prod"},
+		}
+		cfg.Databases["payments"] = db
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "databases.payments.operator_groups grant can never authorize an operation")
+		assert.Contains(t, err.Error(), "staging")
 	})
 
 	t.Run("duplicate operator groups are rejected", func(t *testing.T) {
@@ -302,6 +316,16 @@ func TestHandlersEnforceScopedWriteDenials(t *testing.T) {
 		assert.Contains(t, rec.Body.String(), "payments", "the denial names the database resolved from the plan")
 	})
 
+	t.Run("apply denies when the plan lookup fails: an unresolvable target never authorizes", func(t *testing.T) {
+		st := &mockStorageWithPlanLookup{plans: &mockPlanLookupStore{err: assert.AnError}}
+		svc := New(st, scopedWriteConfig(), nil, logger)
+		rec := scopedDenialRequest(t, svc.handleApply, operator, http.MethodPost, "/api/apply",
+			`{"plan_id":"plan-1","environment":"staging"}`)
+
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
+		assert.Contains(t, rec.Body.String(), "get plan plan-1")
+	})
+
 	t.Run("apply rejects a plan that does not exist at decision time", func(t *testing.T) {
 		st := &mockStorageWithPlanLookup{plans: &mockPlanLookupStore{}}
 		svc := New(st, scopedWriteConfig(), nil, logger)
@@ -335,6 +359,15 @@ func TestHandlersEnforceScopedWriteDenials(t *testing.T) {
 		assert.Equal(t, http.StatusForbidden, rec.Code)
 	})
 
+	t.Run("lock release denies a database outside the grant", func(t *testing.T) {
+		svc := New(&mockStorage{}, scopedWriteConfig(), nil, logger)
+		rec := scopedDenialRequest(t, svc.handleLockRelease, operator, http.MethodDelete, "/api/locks",
+			`{"database":"orders","database_type":"mysql","owner":"bob"}`)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Contains(t, rec.Body.String(), "schema-admins")
+	})
+
 	t.Run("settings mutation stays admin-only for scoped operators", func(t *testing.T) {
 		svc := New(&mockStorage{}, scopedWriteConfig(), nil, logger)
 		rec := scopedDenialRequest(t, svc.handleSettingsSet, operator, http.MethodPost, "/api/settings",
@@ -342,5 +375,65 @@ func TestHandlersEnforceScopedWriteDenials(t *testing.T) {
 
 		assert.Equal(t, http.StatusForbidden, rec.Code)
 		assert.Contains(t, rec.Body.String(), "schema-admins")
+	})
+}
+
+// recordingLockStore records lock mutations so a test can assert whether a
+// handler reached the storage layer at all.
+type recordingLockStore struct {
+	storage.LockStore
+	forceReleased bool
+	released      bool
+}
+
+func (s *recordingLockStore) ForceRelease(context.Context, string, string) error {
+	s.forceReleased = true
+	return nil
+}
+
+func (s *recordingLockStore) Release(context.Context, string, string, string) error {
+	s.released = true
+	return nil
+}
+
+// Force lock release bypasses the ownership check, so it is an administrative
+// override: a database operator's grant covers releasing their own team's
+// locks, but never force-releasing someone else's — for example an admin's
+// incident lock holding applies off the database. Only deployment write-group
+// members may force.
+func TestForceLockReleaseIsAdminOnly(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	body := `{"database":"payments","database_type":"mysql","force":true}`
+
+	t.Run("a scoped operator cannot force even on their granted database", func(t *testing.T) {
+		locks := &recordingLockStore{}
+		svc := New(&mockStorageWithApplyStores{locks: locks}, scopedWriteConfig(), nil, logger)
+		operator := &auth.User{Subject: "bob", Groups: []string{"payments-team"}}
+		rec := scopedDenialRequest(t, svc.handleLockRelease, operator, http.MethodDelete, "/api/locks", body)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Contains(t, rec.Body.String(), "schema-admins", "the denial names the write groups that may force")
+		assert.False(t, locks.forceReleased, "the handler must not reach storage on a denied force release")
+	})
+
+	t.Run("a deployment write-group member may force", func(t *testing.T) {
+		locks := &recordingLockStore{}
+		svc := New(&mockStorageWithApplyStores{locks: locks}, scopedWriteConfig(), nil, logger)
+		admin := &auth.User{Subject: "alice", Groups: []string{"schema-admins"}}
+		rec := scopedDenialRequest(t, svc.handleLockRelease, admin, http.MethodDelete, "/api/locks", body)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.True(t, locks.forceReleased)
+	})
+
+	t.Run("a scoped operator's normal release on their granted database proceeds", func(t *testing.T) {
+		locks := &recordingLockStore{}
+		svc := New(&mockStorageWithApplyStores{locks: locks}, scopedWriteConfig(), nil, logger)
+		operator := &auth.User{Subject: "bob", Groups: []string{"payments-team"}}
+		rec := scopedDenialRequest(t, svc.handleLockRelease, operator, http.MethodDelete, "/api/locks",
+			`{"database":"payments","database_type":"mysql","owner":"bob"}`)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.True(t, locks.released, "the ownership-checked release path serves the operator grant")
 	})
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -134,7 +135,15 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.authorizeDirectDatabaseWrite(w, r, "lock_release", req.Database) {
+	// Force release bypasses the lock ownership check, so it is an
+	// administrative override rather than an operator control on the caller's
+	// own database: a database operator grant does not cover it. Normal
+	// release keeps the ownership check, so the operator grant applies.
+	if req.Force {
+		if !s.authorizeDirectForceLockRelease(w, r, req.Database) {
+			return
+		}
+	} else if !s.authorizeDirectDatabaseWrite(w, r, "lock_release", req.Database) {
 		return
 	}
 
@@ -174,7 +183,7 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 	}
 	if errors.Is(err, storage.ErrLockNotOwned) {
 		metrics.RecordLockOperation(ctx, "release", req.Database, "not_owned")
-		s.writeError(w, http.StatusForbidden, "lock is not owned by you")
+		s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeLockNotOwned, "lock is not owned by you")
 		return
 	}
 	if err != nil {
