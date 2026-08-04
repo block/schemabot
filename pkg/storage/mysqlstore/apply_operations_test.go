@@ -1516,6 +1516,58 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsStoppedWithCompletedSta
 	assert.Nil(t, claimed, "stopped operation must not be reclaimed once its start request is no longer pending")
 }
 
+// A failed start request must never be retried automatically: the stopped
+// operation stays parked until an operator re-issues the start, which resets
+// the failed request to pending and restores claimability.
+func TestApplyOperationStore_FindNextApplyOperation_SkipsStoppedWithFailedStartUntilRerequested(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_stopped_failed_start", 1, state.Apply.Stopped, "staging")
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Stopped,
+	})
+	require.NoError(t, err)
+
+	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+	require.NoError(t, store.ControlRequests().FailPending(ctx, apply.ID, storage.ControlOperationStart, "remote start failed"))
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a failed start request must not be retried automatically by operator claims")
+
+	reset, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator-retry",
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+	assert.Equal(t, storage.ControlRequestPending, reset.Status)
+	assert.Equal(t, "operator-retry", reset.RequestedBy)
+
+	reclaimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, reclaimed, "re-issuing the start restores claimability")
+	assert.Equal(t, id, reclaimed.ID)
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.ApplyOperation.Resuming, persisted.State)
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableWithinBudget
 // verifies recovery parity with ApplyStore.FindNextApply: a failed_retryable
 // operation is reclaimable while its parent apply still has recovery budget
