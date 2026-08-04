@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -235,11 +236,35 @@ func controlOperationCaller(caller string) string {
 // than a client-supplied string; with auth disabled (or on paths with no
 // authenticated user, like control-plane dispatch) the request caller is used
 // unchanged.
+//
+// When the request caller declares a CLI origin ("cli:<user>@<host>"), the
+// verified subject replaces the client-claimed username but the channel prefix
+// and hostname are preserved: they carry no identity weight, and an operator
+// triaging an apply wants to see how it was driven and from which machine.
 func resolveCaller(ctx context.Context, requestCaller string) string {
-	if subject, ok := auth.AuthenticatedSubject(ctx); ok {
-		return subject
+	subject, ok := auth.AuthenticatedSubject(ctx)
+	if !ok {
+		return requestCaller
 	}
-	return requestCaller
+	if host, ok := cliCallerHost(requestCaller); ok {
+		return "cli:" + subject + "@" + host
+	}
+	return subject
+}
+
+// cliCallerHost extracts the hostname from a CLI-shaped caller string
+// ("cli:<user>@<host>", the format the CLI's GenerateCLIOwner produces — keep
+// the two in sync). It returns false for any other shape so non-CLI callers
+// are attributed to the authenticated subject alone.
+func cliCallerHost(caller string) (string, bool) {
+	rest, ok := strings.CutPrefix(caller, "cli:")
+	if !ok {
+		return "", false
+	}
+	if _, host, found := strings.Cut(rest, "@"); found && host != "" {
+		return host, true
+	}
+	return "", false
 }
 func (s *Service) logControlOperationForApply(ctx context.Context, apply *storage.Apply, caller, eventType, message string) {
 	logStore := s.storage.ApplyLogs()
