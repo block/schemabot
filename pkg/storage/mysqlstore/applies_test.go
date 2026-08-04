@@ -2015,6 +2015,98 @@ func TestApplyStore_ClaimApplyByIDReturnsNilForTerminalAndMissing(t *testing.T) 
 	assert.Nil(t, missing, "a non-existent apply id yields no claim")
 }
 
+// Claiming a failed_retryable apply within budget performs the retryable
+// recovery bookkeeping: the claim charges one recovery attempt, clears the
+// stored error, and leases the row as running so the redispatched drive starts
+// from a clean failure record. The caller sees the pre-claim state with the
+// charged attempt, and a repeat claim is refused while the lease is fresh.
+func TestApplyStore_ClaimApplyByIDClaimsRetryable(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_retryable", 603, state.Apply.FailedRetryable, "staging")
+	apply.ErrorMessage = "transient engine failure"
+	require.NoError(t, store.Applies().Update(ctx, apply))
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+	assert.Equal(t, state.Apply.FailedRetryable, claimed.State, "caller sees the pre-claim state")
+	assert.Equal(t, 1, claimed.Attempt, "the claim charges one recovery attempt")
+	assert.Empty(t, claimed.ErrorMessage)
+	assert.Equal(t, "operator-a", claimed.LeaseOwner)
+	assert.NotEmpty(t, claimed.LeaseToken)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Running, persisted.State)
+	assert.Equal(t, 1, persisted.Attempt)
+	assert.Empty(t, persisted.ErrorMessage)
+
+	again, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-b")
+	require.NoError(t, err)
+	assert.Nil(t, again, "a freshly claimed apply is owned by its current driver")
+}
+
+// ClaimApplyByID must refuse a failed_retryable apply whose recovery budget is
+// exhausted or whose failure is outside the redispatch freshness window. The
+// stale-active operation claim arm can hand such a parent to the operation
+// loop; the refused parent claim is what routes it to unclaimable-parent
+// reconciliation for settling instead of another drive.
+func TestApplyStore_ClaimApplyByIDRefusesUnrecoverableRetryable(t *testing.T) {
+	t.Run("failure outside the freshness window", func(t *testing.T) {
+		clearTables(t)
+		ctx := t.Context()
+		store := New(testDB)
+
+		lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+		apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_old_retryable", 604, state.Apply.FailedRetryable, "staging")
+		_, err := testDB.ExecContext(ctx, `
+			UPDATE applies
+			SET updated_at = NOW() - INTERVAL 2 DAY
+			WHERE id = ?
+		`, apply.ID)
+		require.NoError(t, err)
+
+		claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+		require.NoError(t, err)
+		assert.Nil(t, claimed, "stale retryable failures are never auto-redispatched")
+
+		persisted, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.FailedRetryable, persisted.State)
+		assert.Equal(t, 0, persisted.Attempt)
+	})
+
+	t.Run("recovery budget exhausted", func(t *testing.T) {
+		clearTables(t)
+		ctx := t.Context()
+		store := New(testDB)
+
+		lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+		apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_spent_retryable", 605, state.Apply.FailedRetryable, "staging")
+		_, err := testDB.ExecContext(ctx, `
+			UPDATE applies SET attempt = ? WHERE id = ?
+		`, maxRecoveryAttempts, apply.ID)
+		require.NoError(t, err)
+
+		claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+		require.NoError(t, err)
+		assert.Nil(t, claimed, "a retryable apply with no recovery budget left must not be redispatched")
+
+		persisted, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.FailedRetryable, persisted.State)
+		assert.Equal(t, maxRecoveryAttempts, persisted.Attempt)
+	})
+}
+
 // A PlanetScale apply transitions through engine setup-phase states
 // (preparing_branch through validating_deploy_request) before per-table work
 // begins. If the driver driving setup crashes, the apply is left in one of
