@@ -531,6 +531,12 @@ type RecentAppliesFilter struct {
 	Environment string
 	Deployment  string
 	States      []string
+	// ActiveOnly restricts results to applies that have not reached a terminal
+	// state — the ones that still own their target. It is expressed as "not
+	// terminal" rather than as a list of live states so that a state the registry
+	// does not know counts as active: a caller asking whether a target is busy
+	// must not be told it is free because a state was missed.
+	ActiveOnly bool
 	// UpdatedSince, when set, restricts results to applies whose last activity
 	// — the latest lease heartbeat on the apply row or any of its operations —
 	// falls at or after this instant. Windowing on activity rather than start

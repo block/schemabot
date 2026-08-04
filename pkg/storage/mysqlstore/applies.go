@@ -1189,8 +1189,15 @@ func recentAppliesWhere(filter storage.RecentAppliesFilter) ([]string, []any) {
 		where = append(where, fmt.Sprintf("state IN (%s)", placeholders(len(filter.States))))
 		args = append(args, stringArgs(filter.States)...)
 	}
+	if filter.ActiveOnly {
+		terminal := terminalApplyStates()
+		where = append(where, fmt.Sprintf("state NOT IN (%s)", placeholders(len(terminal))))
+		args = append(args, stringArgs(terminal)...)
+	}
 	if !filter.UpdatedSince.IsZero() {
-		where = append(where, recentAppliesLastActivity+" >= ?")
+		activity, activityArgs := recentAppliesLastActivity(filter)
+		where = append(where, activity+" >= ?")
+		args = append(args, activityArgs...)
 		args = append(args, filter.UpdatedSince)
 	}
 	return where, args
@@ -1216,14 +1223,27 @@ func recentAppliesWhere(filter storage.RecentAppliesFilter) ([]string, []any) {
 //
 // GREATEST keeps whichever row moved last, so an apply whose own state changed
 // after its operations went quiet still sorts by its own timestamp.
-const recentAppliesLastActivity = `GREATEST(
-	applies.updated_at,
-	COALESCE((
-		SELECT MAX(ao.updated_at)
-		FROM apply_operations ao
-		WHERE ao.apply_id = applies.id
-	), applies.updated_at)
-)`
+//
+// Under a deployment filter the operation half is scoped to that deployment, so
+// the view answers for the deployment an operator asked about: a rollout whose
+// operation elsewhere is still heartbeating reads as quiet here, matching the
+// per-deployment state the same row renders.
+func recentAppliesLastActivity(filter storage.RecentAppliesFilter) (string, []any) {
+	var scope string
+	var args []any
+	if filter.Deployment != "" {
+		scope = " AND ao.deployment = ?"
+		args = append(args, filter.Deployment)
+	}
+	return `GREATEST(
+		applies.updated_at,
+		COALESCE((
+			SELECT MAX(ao.updated_at)
+			FROM apply_operations ao
+			WHERE ao.apply_id = applies.id` + scope + `
+		), applies.updated_at)
+	)`, args
+}
 
 // recentAppliesActivityAlias names the last-activity value once it has been
 // projected by recentAppliesSelect, so the sort keys reference a column instead
@@ -1236,19 +1256,23 @@ const recentAppliesListAlias = "recent"
 // recentAppliesSelect projects the filtered applies along with their last
 // activity, for the outer query to sort.
 //
-// The list computes last activity in this inner select rather than inside its
-// ORDER BY because the value appears in three of the four sort keys: evaluated
-// in place, the subquery runs once per key per candidate row, and the query
-// spends most of its time re-deriving a value it already has. Projecting it once
-// makes the sort keys plain column references.
+// The list projects last activity here rather than deriving it inside its ORDER
+// BY because most of the sort keys need it: evaluated in place, its subquery over
+// the operation rows runs again for every key on every candidate row, and the
+// query spends most of its time re-deriving a value it already has. Projected
+// once, the sort keys are plain column references.
+//
+// Args are appended in the order their placeholders appear in the statement —
+// the projected expression precedes the predicates that follow FROM.
 func recentAppliesSelect(filter storage.RecentAppliesFilter) (string, []any) {
-	query := "SELECT " + applyColumns + ", " + recentAppliesLastActivity + " AS " + recentAppliesActivityAlias +
+	activity, args := recentAppliesLastActivity(filter)
+	query := "SELECT " + applyColumns + ", " + activity + " AS " + recentAppliesActivityAlias +
 		" FROM applies"
-	where, args := recentAppliesWhere(filter)
+	where, whereArgs := recentAppliesWhere(filter)
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
-	return query, args
+	return query, append(args, whereArgs...)
 }
 
 // recentAppliesOrderBy sorts the status list into a live group and a quiet
@@ -1294,8 +1318,15 @@ func (s *applyStore) recentAppliesOrderBy() (string, []any) {
 			%s DESC
 	`, isLive, isLive, col("started_at"), col("created_at"), col(recentAppliesActivityAlias), col("id"))
 
-	// The live predicate appears twice, so its states bind twice.
-	args := append(stringArgs(terminal), stringArgs(terminal)...)
+	// The predicate is spelled out per key it appears in, so its states bind once
+	// per occurrence. A column alias is not visible to sibling expressions in the
+	// select list that produced it, so hoisting the predicate into that select
+	// would mean repeating the activity subquery rather than referencing it —
+	// paying per row to save a handful of constant binds. Each occurrence is a
+	// state comparison against an already-projected column, so the repetition
+	// costs nothing per row.
+	args := stringArgs(terminal)
+	args = append(args, stringArgs(terminal)...)
 	return orderBy, args
 }
 

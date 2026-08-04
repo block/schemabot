@@ -780,6 +780,11 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	activeOnly, err := parseStatusActiveOnly(r)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	filter := storage.RecentAppliesFilter{
 		Limit:       limit + 1,
@@ -791,6 +796,9 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if stateFilter != "" {
 		filter.States = []string{stateFilter}
+	}
+	if activeOnly {
+		filter.ActiveOnly = true
 	}
 	if last > 0 {
 		filter.UpdatedSince = time.Now().Add(-last)
@@ -969,8 +977,9 @@ func parseStatusLimit(r *http.Request) (int, error) {
 	return limit, nil
 }
 
-// parseStatusLast parses the optional `last` query parameter bounding the
-// status list to applies updated within the window. Zero means unbounded.
+// parseStatusLast parses the optional `last` query parameter bounding the status
+// list to applies whose latest activity — on the apply row or any of its
+// operations — falls within the window. Zero means unbounded.
 func parseStatusLast(r *http.Request) (time.Duration, error) {
 	raw := r.URL.Query().Get("last")
 	if raw == "" {
@@ -981,6 +990,21 @@ func parseStatusLast(r *http.Request) (time.Duration, error) {
 		return 0, fmt.Errorf("last must be a positive duration such as 30m or 24h")
 	}
 	return last, nil
+}
+
+// parseStatusActiveOnly parses the optional `active` query parameter restricting
+// the status list to applies that have not reached a terminal state. Callers use
+// it to ask whether a target is busy without paging through settled history.
+func parseStatusActiveOnly(r *http.Request) (bool, error) {
+	raw := r.URL.Query().Get("active")
+	if raw == "" {
+		return false, nil
+	}
+	active, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("active must be a boolean")
+	}
+	return active, nil
 }
 
 func parseStatusFailuresOnly(r *http.Request) (bool, error) {

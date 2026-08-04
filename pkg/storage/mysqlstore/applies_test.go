@@ -1564,9 +1564,9 @@ func insertOperationWithUpdatedAt(t *testing.T, applyID int64, deployment, opSta
 }
 
 // TestApplyStore_GetRecentUpdatedSince verifies the status window bound: only
-// applies whose updated_at falls at or after the bound are returned, so an
-// apply that last changed before the window drops out while fresh activity
-// stays visible.
+// applies whose last activity falls at or after the bound are returned, so an
+// apply that went quiet before the window drops out while fresh activity stays
+// visible.
 func TestApplyStore_GetRecentUpdatedSince(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -1660,6 +1660,112 @@ func TestApplyStore_GetRecentWindowKeepsOperationActivity(t *testing.T) {
 	counts, err := store.Applies().CountRecentByState(ctx, filter)
 	require.NoError(t, err)
 	assert.Equal(t, 1, counts[state.Apply.Running])
+}
+
+// A deployment-scoped view answers for the deployment the operator asked about.
+// A rollout still heartbeating in some other deployment reads as quiet here,
+// matching the per-deployment state rendered on the same row.
+func TestApplyStore_GetRecentScopesActivityToDeployment(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+	now := time.Now()
+
+	// Two fanned-out applies. In one deployment the first is still working and
+	// the second went quiet hours ago; in the other it is the other way round.
+	first := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "scoped_a", "mysql", "staging"),
+		"apply_scoped_first", 290, state.Apply.Running, "staging")
+	second := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "scoped_b", "mysql", "staging"),
+		"apply_scoped_second", 291, state.Apply.Running, "staging")
+
+	insertOperationWithUpdatedAt(t, first.ID, "deploy-east", state.ApplyOperation.Running, now)
+	insertOperationWithUpdatedAt(t, first.ID, "deploy-west", state.ApplyOperation.Completed, now.Add(-3*time.Hour))
+	insertOperationWithUpdatedAt(t, second.ID, "deploy-east", state.ApplyOperation.Completed, now.Add(-3*time.Hour))
+	insertOperationWithUpdatedAt(t, second.ID, "deploy-west", state.ApplyOperation.Running, now)
+	setApplyUpdatedAt(t, first.ID, now.Add(-3*time.Hour))
+	setApplyUpdatedAt(t, second.ID, now.Add(-3*time.Hour))
+
+	east, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit: 10, Environment: "staging", Deployment: "deploy-east",
+	})
+	require.NoError(t, err)
+	require.Len(t, east, 2)
+	assert.Equal(t, "apply_scoped_first", east[0].ApplyIdentifier)
+
+	west, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit: 10, Environment: "staging", Deployment: "deploy-west",
+	})
+	require.NoError(t, err)
+	require.Len(t, west, 2)
+	assert.Equal(t, "apply_scoped_second", west[0].ApplyIdentifier)
+}
+
+// A deployment-scoped time window is scoped the same way as the ordering, so an
+// apply quiet in the requested deployment falls outside the window even while
+// another deployment keeps heartbeating.
+func TestApplyStore_GetRecentDeploymentWindowScopesActivity(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+	now := time.Now()
+
+	lock := createTestLock(t, store, "scoped_window", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_scoped_window", 292, state.Apply.Running, "staging")
+	insertOperationWithUpdatedAt(t, apply.ID, "deploy-east", state.ApplyOperation.Completed, now.Add(-3*time.Hour))
+	insertOperationWithUpdatedAt(t, apply.ID, "deploy-west", state.ApplyOperation.Running, now)
+	setApplyUpdatedAt(t, apply.ID, now.Add(-3*time.Hour))
+
+	quiet, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit: 10, Environment: "staging", Deployment: "deploy-east",
+		UpdatedSince: now.Add(-time.Hour),
+	})
+	require.NoError(t, err)
+	assert.Empty(t, quiet)
+
+	working, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit: 10, Environment: "staging", Deployment: "deploy-west",
+		UpdatedSince: now.Add(-time.Hour),
+	})
+	require.NoError(t, err)
+	require.Len(t, working, 1)
+	assert.Equal(t, "apply_scoped_window", working[0].ApplyIdentifier)
+}
+
+// An active-only query answers "is this target busy" without reading settled
+// history. It is expressed as "not terminal", so an apply in a state the registry
+// does not know still counts as active — a caller must never be told a target is
+// free because a state was missed.
+func TestApplyStore_GetRecentActiveOnly(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_a", "mysql", "staging"),
+		"apply_active_running", 300, state.Apply.Running, "staging")
+	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_b", "mysql", "staging"),
+		"apply_active_retryable", 301, state.Apply.FailedRetryable, "staging")
+	unknownState := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_c", "mysql", "staging"),
+		"apply_active_unknown", 302, state.Apply.Completed, "staging")
+	_, err := testDB.ExecContext(ctx,
+		"UPDATE `applies` SET state = ?, updated_at = updated_at WHERE id = ?", "some_future_state", unknownState.ID)
+	require.NoError(t, err)
+
+	// Settled work that must not appear.
+	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_d", "mysql", "staging"),
+		"apply_active_completed", 303, state.Apply.Completed, "staging")
+	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_e", "mysql", "staging"),
+		"apply_active_stopped", 304, state.Apply.Stopped, "staging")
+
+	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit: 10, Environment: "staging", ActiveOnly: true,
+	})
+	require.NoError(t, err)
+
+	got := make([]string, 0, len(applies))
+	for _, a := range applies {
+		got = append(got, a.ApplyIdentifier)
+	}
+	assert.ElementsMatch(t, []string{"apply_active_running", "apply_active_retryable", "apply_active_unknown"}, got)
 }
 
 // A status summary must tally every apply matching the filters — unbounded by
