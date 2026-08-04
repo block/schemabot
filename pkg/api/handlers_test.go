@@ -498,10 +498,10 @@ func (s *capturingApplyStore) ExpireRetryable(context.Context) ([]*storage.Retry
 }
 
 // queuedOperationClaimStore serves the operation-level claim ladder over the
-// operation rows a dual-write captured in a capturingApplyStore: the cutover
-// probe finds nothing, and the operation claim leases the first captured row
-// exactly once. Each claim poll signals the apply store's findCh so tests can
-// observe the operator ticking.
+// operation rows a dual-write captured in a capturingApplyStore. The cutover
+// probe always finds nothing, so every operator tick falls through to the
+// operation claim, which signals the apply store's findCh — one observable
+// signal per tick — and leases the first captured row exactly once.
 type queuedOperationClaimStore struct {
 	storage.ApplyOperationStore
 	applies *capturingApplyStore
