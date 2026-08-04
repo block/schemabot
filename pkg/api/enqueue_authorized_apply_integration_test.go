@@ -155,6 +155,7 @@ func TestEnqueueAuthorizedApplyQueuesDurableApplyAgainstStorage(t *testing.T) {
 	require.NotNil(t, claimed, "queued apply must be operator-claimable")
 	assert.Equal(t, applyID, claimed.ApplyID)
 	assert.Equal(t, operations[0].ID, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.Pending, claimed.State, "caller sees the pre-claim state")
 }
 
 // When API auth is enabled, an authorized write persists an apply attributed to

@@ -357,6 +357,12 @@ func (s *taskStore) insertShardTaskGuardedByApply(ctx context.Context, task *sto
 // an operation whose key does not match) are excluded so they never re-enter the
 // per-table drive/gating/progress pipeline on reload. Read those via
 // GetShardProgressByApplyOperationID.
+//
+// Rows are returned in creation order — the plan's statement order — with the
+// id tiebreaker since created_at has second precision. Apply-level drives
+// (ResumeApply) execute tasks sequentially in the order this loader returns
+// them, so the ordering carries the same stop-on-failure contract as
+// GetByApplyOperationID.
 func (s *taskStore) GetByApplyID(ctx context.Context, applyID int64) ([]*storage.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+prefixedTaskColumns("t")+`
@@ -373,7 +379,7 @@ func (s *taskStore) GetByApplyID(ctx context.Context, applyID int64) ([]*storage
 					AND ao.operation_key = CONCAT(t.namespace, '/', t.shard, '/', t.table_name)
 				)
 			)
-		ORDER BY t.created_at DESC
+		ORDER BY t.created_at, t.id
 	`, applyID, storage.ApplyOperationKindWork)
 	if err != nil {
 		return nil, fmt.Errorf("query tasks for apply %d: %w", applyID, err)
@@ -407,8 +413,8 @@ func (s *taskStore) CountByApplyID(ctx context.Context, applyID int64) (int64, e
 //
 // Rows are returned in creation order — the plan's statement order — because
 // the sequential drive executes tasks in the order this loader returns them.
-// The planner emits statements in a deliberate order (CREATE, then ALTER,
-// then DROP), and stop-on-failure semantics assume top-to-bottom execution:
+// The planner orders destructive statements last (DROPs after CREATEs and
+// ALTERs), and stop-on-failure semantics assume top-to-bottom execution:
 // everything before a failing statement ran, everything after it did not.
 func (s *taskStore) GetByApplyOperationID(ctx context.Context, applyOperationID int64) ([]*storage.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
