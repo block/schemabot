@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -226,7 +227,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment("## MySQL Schema Change Plan\n\nplan summary\n\n---\n\n💡 **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e staging\n```")
+		body := h.renderPRComment("## MySQL Schema Change Plan\n\nplan summary\n\n---\n\n▶️ **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e staging\n```")
 
 		assert.NotContains(t, body, "Support:")
 	})
@@ -1191,22 +1192,33 @@ func TestWebhookRepoAllowlistPullRequestRejectsUnregistered(t *testing.T) {
 // goSafe recovers it, logs the stack, and posts an error comment on the PR
 // so the user gets feedback instead of silence. This is the recovery wrapper
 // every async command dispatch (apply, plan, rollback, reactions) runs under.
+// The comment is a fixed user-safe line — the panic value can carry internal
+// detail (DSN fragments, hostnames, driver internals) and the PR is a public
+// surface, so the raw value and stack stay server-side in the log.
 func TestGoSafeRecoversPanicAndPostsErrorComment(t *testing.T) {
 	client, mux := setupGitHubServer(t)
 	comments := make(chan string, 1)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 	h := &Handler{
 		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
-		logger:    testLogger(),
+		logger:    logger,
 	}
 
 	h.goSafe("octocat/hello-world", 1, 12345, func() {
-		panic("boom")
+		panic("boom: mysql://user:secret@internal-host/db")
 	})
 
 	body := requireComment(t, comments, "panic recovery comment")
-	assert.Contains(t, body, "Internal error: goroutine panic")
-	assert.Contains(t, body, "boom")
+	assert.Contains(t, body, "Internal error while processing this request")
+	assert.NotContains(t, body, "boom", "the raw panic value must never reach the public PR comment")
+
+	logged := logBuf.String()
+	assert.Contains(t, logged, "goroutine panic")
+	assert.Contains(t, logged, "boom: mysql://user:secret@internal-host/db",
+		"the raw panic value must stay triageable in the server log")
+	assert.Contains(t, logged, "recoverPanic", "the stack trace must be logged")
 }

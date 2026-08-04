@@ -224,7 +224,7 @@ func runControlCommand[R any](
 // handleStopCommand handles the "schemabot stop <apply-id> -e <env>" PR
 // comment command by recording durable stop intent for the operator owner.
 func (h *Handler) handleStopCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel := h.commandContext(commandTimeout)
+	ctx, cancel := h.commandContext(context.Background(), commandTimeout)
 	defer cancel()
 
 	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Stop,
@@ -257,7 +257,7 @@ func (h *Handler) handleStopCommand(repo string, pr int, installationID int64, r
 // handleCancelCommand handles the "schemabot cancel <apply-id> -e <env>" PR
 // comment command by recording durable cancel intent for the operator owner.
 func (h *Handler) handleCancelCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel := h.commandContext(commandTimeout)
+	ctx, cancel := h.commandContext(context.Background(), commandTimeout)
 	defer cancel()
 
 	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Cancel,
@@ -290,7 +290,7 @@ func (h *Handler) handleCancelCommand(repo string, pr int, installationID int64,
 // handleStartCommand handles the "schemabot start <apply-id> -e <env>" PR
 // comment command by recording durable start intent for the operator owner.
 func (h *Handler) handleStartCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel := h.commandContext(commandTimeout)
+	ctx, cancel := h.commandContext(context.Background(), commandTimeout)
 	defer cancel()
 
 	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Start,
@@ -324,7 +324,7 @@ func (h *Handler) handleStartCommand(repo string, pr int, installationID int64, 
 // comment command by recording a durable release latch so the operator lets a
 // rollout paused after an on_failure=pause failure proceed.
 func (h *Handler) handleReleaseCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel := h.commandContext(commandTimeout)
+	ctx, cancel := h.commandContext(context.Background(), commandTimeout)
 	defer cancel()
 
 	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Release,
@@ -353,7 +353,7 @@ func (h *Handler) handleReleaseCommand(repo string, pr int, installationID int64
 // handleCutoverCommand handles the "schemabot cutover <apply-id> -e <env>" PR
 // comment command by recording durable cutover intent for the operator owner.
 func (h *Handler) handleCutoverCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel := h.commandContext(commandTimeout)
+	ctx, cancel := h.commandContext(context.Background(), commandTimeout)
 	defer cancel()
 
 	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Cutover,
@@ -393,7 +393,7 @@ func volumeCommandLevelValid(result CommandResult) bool {
 // PR comment command by queueing a durable volume adjustment that the driver
 // applies at its next progress check.
 func (h *Handler) handleVolumeCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel := h.commandContext(commandTimeout)
+	ctx, cancel := h.commandContext(context.Background(), commandTimeout)
 	defer cancel()
 
 	// A missing apply ID takes precedence over level validation so the
@@ -449,7 +449,7 @@ func (h *Handler) handleVolumeCommand(repo string, pr int, installationID int64,
 }
 
 func (h *Handler) handleSkipRevertCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel := h.commandContext(commandTimeout)
+	ctx, cancel := h.commandContext(context.Background(), commandTimeout)
 	defer cancel()
 
 	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.SkipRevert,
@@ -474,7 +474,7 @@ func (h *Handler) handleSkipRevertCommand(repo string, pr int, installationID in
 }
 
 func (h *Handler) handleRevertCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel := h.commandContext(commandTimeout)
+	ctx, cancel := h.commandContext(context.Background(), commandTimeout)
 	defer cancel()
 
 	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Revert,

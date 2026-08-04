@@ -259,6 +259,11 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 	query := url.Values{}
 	query.Set("environment", environment)
 	query.Set("limit", "1000")
+	// Ask only for applies still holding a target. This runs on every apply and
+	// rollback preflight, and the answer never depends on settled history, so
+	// scanning it would make every schema change pay for the environment's whole
+	// past to learn whether one database is busy.
+	query.Set("active", "true")
 	if err := doGetInto(endpoint, "/api/status?"+query.Encode(), &result); err != nil {
 		return nil, err
 	}
@@ -267,6 +272,8 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 		if apply.Database != database || apply.Environment != environment {
 			continue
 		}
+		// The server already excluded terminal states; re-checking here keeps the
+		// answer correct if this ever reads a response that was not filtered.
 		if state.IsTerminalApplyState(apply.State) {
 			continue
 		}
@@ -509,7 +516,10 @@ func ReleaseLock(endpoint, database, dbType, owner string) error {
 	if err != nil {
 		var apiErr *APIError
 		if errors.As(err, &apiErr) {
-			if apiErr.Status == http.StatusForbidden {
+			// A 403 can also be an authorization denial naming the groups
+			// that would grant access, so only the ownership error code maps
+			// to ErrLockNotOwned; other denials surface the server's message.
+			if apiErr.Status == http.StatusForbidden && apiErr.ErrorCode == apitypes.ErrCodeLockNotOwned {
 				return ErrLockNotOwned
 			}
 			if apiErr.Status == http.StatusNotFound {
@@ -575,9 +585,13 @@ type StatusOptions struct {
 	// State restricts the list to one apply state; empty means all states.
 	State  string
 	Failed bool
-	// Last bounds the list to applies updated within this window; zero means
-	// unbounded.
+	// Last bounds the list to applies whose latest activity — on the apply or any
+	// of its operations — falls within this window; zero means unbounded.
 	Last time.Duration
+	// Active restricts the list to applies that have not reached a terminal
+	// state, so a caller asking whether a target is busy does not page through
+	// settled history.
+	Active bool
 }
 
 // GetStatus fetches recent schema changes.
@@ -603,6 +617,9 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 		}
 		if opts[0].Last > 0 {
 			values.Set("last", opts[0].Last.String())
+		}
+		if opts[0].Active {
+			values.Set("active", "true")
 		}
 		if encoded := values.Encode(); encoded != "" {
 			requestPath += "?" + encoded

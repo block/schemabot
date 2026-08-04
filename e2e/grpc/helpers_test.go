@@ -478,39 +478,10 @@ func grpcCreateTestTable(t *testing.T, env, tableName, ddl string) {
 	})
 }
 
-// grpcSeedRows inserts test data using efficient SQL cross-joins.
+// grpcSeedRows inserts test data into the Tern MySQL for the given environment.
 func grpcSeedRows(t *testing.T, env, tableName, columns, valueTemplate string, rowCount int) {
 	t.Helper()
-	dsn := grpcTernMySQLDSN(t, env)
-	db, err := sql.Open("mysql", dsn)
-	require.NoErrorf(t, err, "open tern mysql (%s)", env)
-	defer utils.CloseAndLog(db)
-
-	seqGen := `(SELECT @row := @row + 1 as seq FROM
-		(SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) a`
-
-	if rowCount >= 100 {
-		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) b`
-	}
-	if rowCount >= 1000 {
-		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) c`
-	}
-	if rowCount >= 10000 {
-		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) d`
-	}
-	if rowCount >= 100000 {
-		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) e`
-	}
-	if rowCount > 100000 {
-		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) f`
-	}
-	seqGen += `, (SELECT @row := 0) r) nums`
-
-	query := fmt.Sprintf(`INSERT INTO %s (%s) SELECT %s FROM %s LIMIT %d`,
-		tableName, columns, valueTemplate, seqGen, rowCount)
-
-	_, err = db.ExecContext(t.Context(), query)
-	require.NoErrorf(t, err, "seed %s on %s", tableName, env)
+	testutil.SeedRows(t, grpcTernMySQLDSN(t, env), tableName, columns, valueTemplate, rowCount)
 }
 
 // grpcColumnExists checks if a column exists in a table on the Tern MySQL.

@@ -487,13 +487,90 @@ func RecordPRCommandActorAuthorization(ctx context.Context, command, database, e
 	)
 }
 
+var knownDirectWriteAuthOperations = map[string]bool{
+	"plan":               true,
+	"apply":              true,
+	"rollback_plan":      true,
+	"stop":               true,
+	"start":              true,
+	"cutover":            true,
+	"cancel":             true,
+	"volume":             true,
+	"release":            true,
+	"revert":             true,
+	"skip_revert":        true,
+	"lock_acquire":       true,
+	"lock_release":       true,
+	"lock_force_release": true,
+	"checks_scan":        true,
+	"checks_synthesize":  true,
+	"checks_repos":       true,
+	"webhook_redrive":    true,
+	"settings_set":       true,
+}
+
+var knownDirectWriteAuthStatuses = map[string]bool{
+	"allowed": true,
+	"denied":  true,
+	"skipped": true,
+}
+
+var knownDirectWriteAuthReasons = map[string]bool{
+	"scoped_lane_disabled":    true,
+	"admin_allow":             true,
+	"scoped_allow":            true,
+	"missing_identity":        true,
+	"not_admin":               true,
+	"not_database_operator":   true,
+	"environment_not_allowed": true,
+	"missing_database_config": true,
+	"unknown":                 true,
+}
+
+// RecordDirectWriteAuthorization increments the counter for per-database
+// direct-write (CLI/API) authorization decisions made at the handler layer,
+// after the forward-auth middleware has admitted the caller to the write tier.
+// A spike in denied decisions means scoped operators are attempting operations
+// outside their grant — check the reason attribute to see whether the target
+// database, the environment, or the group membership is what mismatched.
+// Operation, status, and reason are allowlisted here; database and
+// environment can arrive from request bodies, so callers bound them to
+// configured names before recording. Every attribute stays low-cardinality
+// even when a request names a database or environment that does not exist.
+func RecordDirectWriteAuthorization(ctx context.Context, operation, database, environment, status, reason string) {
+	if !knownDirectWriteAuthOperations[operation] {
+		operation = "unknown"
+	}
+	if !knownDirectWriteAuthStatuses[status] {
+		status = "unknown"
+	}
+	if !knownDirectWriteAuthReasons[reason] {
+		reason = "unknown"
+	}
+	// Admin-gated operations have no single target database, and some denials
+	// happen before the target resolves; record the same sentinel the
+	// environment attribute uses so empty never appears as a blank label.
+	if database == "" {
+		database = "unknown"
+	}
+
+	addCounter(ctx, "schemabot.direct_write_authorization.total",
+		"Total per-database direct write authorization decisions", "{decision}",
+		attribute.String("operation", operation),
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("status", status),
+		attribute.String("reason", reason),
+	)
+}
+
 // RecordAuthDecision increments the counter for API auth decisions on the
 // direct request path (the OIDC and forward-auth authorizers). Labels are
 // inherently low-cardinality: tier is read/write, decision is allow/deny,
 // reason is a fixed set.
 func RecordAuthDecision(ctx context.Context, tier, decision, reason string) {
 	addCounter(ctx, "schemabot.auth_decisions.total",
-		"Total API auth decisions on the OIDC request path", "{decision}",
+		"Total API auth decisions on the direct request path", "{decision}",
 		attribute.String("tier", tier),
 		attribute.String("decision", decision),
 		attribute.String("reason", reason),
@@ -802,8 +879,36 @@ func RecordOperatorResumeFailure(ctx context.Context, database, deployment, envi
 	)
 }
 
+// RecordOperatorStrandedOperationReaped counts apply operations the reaper
+// settled from an already-settled parent apply — rows describing work that will
+// never run, left behind non-terminal.
+//
+// A one-time burst is the historical backlog draining and needs no action. A
+// rate that keeps climbing means something is actively stranding operations, so
+// the investigation belongs on the producer — a path that terminalizes a parent
+// apply without settling its children — not on the reaper.
+//
+// deployment is the reaped operation's own deployment, the routing key that says
+// which target the settled row belonged to; stranded rows arise in exactly the
+// multi-deployment applies where it differs from the parent's.
+//
+// This counter is emitted under the operator name only. The deprecated
+// schemabot.scheduler.* alias exists to carry pre-existing series through one
+// release, and a metric introduced after that rename has no legacy series to
+// migrate.
+func RecordOperatorStrandedOperationReaped(ctx context.Context, database, deployment, environment, parentState string) {
+	addCounter(ctx, "schemabot.operator.stranded_operations_reaped_total",
+		"Total number of stranded apply operations the reaper settled from their parent apply's outcome", "{operation}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("parent_state", parentState),
+	)
+}
+
 var knownOperatorClaimFailureReasons = map[string]bool{
 	"expire_retryable_error":                  true,
+	"stranded_reaper_error":                   true,
 	"missing_lease_token":                     true,
 	"storage_error":                           true,
 	"operation_storage_error":                 true,
@@ -814,6 +919,7 @@ var knownOperatorClaimFailureReasons = map[string]bool{
 	"operation_parent_missing":                true,
 	"operation_parent_claim_error":            true,
 	"operation_parent_not_claimable":          true,
+	"operation_lease_release_error":           true,
 	"missing_operation_deployment":            true,
 	"stop_reconciliation_claim_error":         true,
 	"stop_reconciliation_missing_lease_token": true,
@@ -828,6 +934,33 @@ func RecordOperatorClaimFailure(ctx context.Context, reason string) {
 		"Total number of operator claim attempts that failed", "{attempt}",
 		EnvironmentAttribute(""),
 		attribute.String("reason", reason),
+	)
+}
+
+// RecordOperatorStuckPendingApplies records how many pending applies are older
+// than the stuck threshold while still carrying the child rows that make them
+// claimable — work a driver should already have picked up. Apply creation
+// rejects a concurrent apply for the same target rather than queuing it, so a
+// nonzero value is not normal backpressure: it means the operator driver pool is
+// not claiming (all drivers saturated on long-running applies, an
+// operator-less/crash-looping deployment, or a wedged claim path). The expected
+// operator action is to check driver liveness and claim-failure metrics/logs.
+func RecordOperatorStuckPendingApplies(ctx context.Context, count int64) {
+	recordGauge(ctx, "schemabot.operator.stuck_pending_applies", count,
+		"Number of pending applies past the stuck threshold that a driver should have claimed", "{apply}",
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordOperatorStuckPendingScanFailure counts failed stuck-pending scans. The
+// stuck-pending gauge is a last-value instrument, so a failed scan leaves it
+// frozen at its last-good value — indistinguishable from a healthy operator.
+// This counter is the liveness signal for the gauge: a nonzero rate means the
+// stuck-pending value is stale and must not be trusted.
+func RecordOperatorStuckPendingScanFailure(ctx context.Context) {
+	addCounter(ctx, "schemabot.operator.stuck_pending_scan_failures",
+		"Total number of failed operator stuck-pending apply scans", "{failure}",
+		EnvironmentAttribute(""),
 	)
 }
 

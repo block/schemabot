@@ -203,6 +203,61 @@ func TestResumeClaimedApply_DriveLogsCarryApplyIdentity(t *testing.T) {
 		"mutable state must not be frozen into the bound drive logger")
 }
 
+// expiringApplyStore returns a fixed set of retryable-apply expirations so the
+// expiry maintenance pass can be exercised without a database.
+type expiringApplyStore struct {
+	storage.ApplyStore
+	expirations []*storage.RetryableApplyExpiration
+}
+
+func (s *expiringApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {
+	return s.expirations, nil
+}
+
+// A retryable-apply expiry is a control-plane lifecycle transition an operator
+// triages from logs alone, so the expiry line must carry the apply's full
+// triage attributes — including external_id, the join key to the data plane's
+// logs — plus the expiry-specific attempt and reason.
+func TestExpireRetryableApplies_LogsCarryFullApplyAttrs(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "appdb",
+		DatabaseType:    "mysql",
+		Deployment:      "east",
+		Environment:     "staging",
+		Repository:      "org/repo",
+		PullRequest:     123,
+		State:           state.Apply.Failed,
+		Attempt:         3,
+		ExternalID:      "remote-apply-7",
+	}
+	svc := New(&mockStorageWithApplyStores{
+		applies: &expiringApplyStore{expirations: []*storage.RetryableApplyExpiration{
+			{Apply: apply, Reason: storage.RetryableExpirationAttemptBudget},
+		}},
+	}, testServerConfig(), nil, logger)
+
+	svc.expireRetryableApplies(t.Context(), 1)
+
+	lines := decodeLogLines(t, logBuf.Bytes())
+	line := requireLogLine(t, lines, "operator: retryable apply expired")
+	assert.Equal(t, "apply-42", line["apply_id"])
+	assert.Equal(t, "appdb", line["database"])
+	assert.Equal(t, "mysql", line["database_type"])
+	assert.Equal(t, "staging", line["environment"])
+	assert.Equal(t, "org/repo", line["repo"])
+	assert.Equal(t, float64(123), line["pr"])
+	assert.Equal(t, "east", line["deployment"])
+	assert.Equal(t, state.Apply.Failed, line["state"])
+	assert.Equal(t, "remote-apply-7", line["external_id"])
+	assert.Equal(t, float64(3), line["attempt"])
+	assert.Equal(t, string(storage.RetryableExpirationAttemptBudget), line["reason"])
+	assert.Equal(t, float64(1), line["driver"])
+}
+
 // decodeLogLines parses newline-delimited slog JSON output into one map per line.
 func decodeLogLines(t *testing.T, output []byte) []map[string]any {
 	t.Helper()
@@ -1664,4 +1719,95 @@ func TestDriveTick_ContainsClaimPanic(t *testing.T) {
 	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
 	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
 	assert.Equal(t, 2, applyStore.claims, "the driver must keep polling after each contained panic")
+}
+
+// unclaimableParentApplyStore backs the unclaimable-parent reconcile with a
+// fixed answer from Get: a storage error, a missing row, or a parent apply.
+type unclaimableParentApplyStore struct {
+	storage.ApplyStore
+	apply  *storage.Apply
+	getErr error
+}
+
+func (s *unclaimableParentApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+	return s.apply, nil
+}
+
+// releaseRecordingOperationStore records whether the reconcile released the
+// operation lease. It embeds the interface so any other call panics, keeping
+// the test honest about the code path it covers.
+type releaseRecordingOperationStore struct {
+	storage.ApplyOperationStore
+	released bool
+}
+
+func (s *releaseRecordingOperationStore) ReleaseClaim(context.Context, storage.OperationLease) (bool, error) {
+	s.released = true
+	return true, nil
+}
+
+// When the parent apply cannot be established — the load fails or the row is
+// missing — the driver must retain the operation lease it just claimed and
+// fail closed: releasing on uncertainty would let a peer immediately re-claim
+// into the same failure, thrashing claims, while retaining the lease bounds
+// retries to the lease staleness window. Only a confirmed non-terminal parent
+// releases the lease for an immediate retry.
+func TestReconcileUnclaimableParent_RetainsLeaseWhenParentUnknown(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	op := &storage.ApplyOperation{
+		ID:         42,
+		ApplyID:    7,
+		Deployment: "west",
+		State:      state.ApplyOperation.Running,
+	}
+	opLease := storage.OperationLease{ApplyID: 7, OperationID: 42, Owner: "driver-1", Token: "token-1"}
+
+	t.Run("parent load error", func(t *testing.T) {
+		opStore := &releaseRecordingOperationStore{}
+		svc := New(&recoverTestStorage{
+			applies: &unclaimableParentApplyStore{getErr: errors.New("connection reset")},
+			ops:     opStore,
+		}, testServerConfig(), nil, logger)
+
+		svc.reconcileUnclaimableParent(t.Context(), 1, op, opLease)
+
+		assert.False(t, opStore.released,
+			"a parent load error must retain the operation lease, not release it")
+	})
+
+	t.Run("parent missing", func(t *testing.T) {
+		opStore := &releaseRecordingOperationStore{}
+		svc := New(&recoverTestStorage{
+			applies: &unclaimableParentApplyStore{},
+			ops:     opStore,
+		}, testServerConfig(), nil, logger)
+
+		svc.reconcileUnclaimableParent(t.Context(), 1, op, opLease)
+
+		assert.False(t, opStore.released,
+			"a missing parent apply must retain the operation lease, not release it")
+	})
+
+	t.Run("non-terminal parent releases", func(t *testing.T) {
+		opStore := &releaseRecordingOperationStore{}
+		svc := New(&recoverTestStorage{
+			applies: &unclaimableParentApplyStore{apply: &storage.Apply{
+				ID:              7,
+				ApplyIdentifier: "apply-unclaimable",
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     "staging",
+				State:           state.Apply.Running,
+			}},
+			ops: opStore,
+		}, testServerConfig(), nil, logger)
+
+		svc.reconcileUnclaimableParent(t.Context(), 1, op, opLease)
+
+		assert.True(t, opStore.released,
+			"a confirmed non-terminal parent must release the operation lease for an immediate retry")
+	})
 }

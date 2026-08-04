@@ -30,7 +30,7 @@ func TestApplyCommandCoreBootstrapFailureIsRetryable(t *testing.T) {
 		logger: testLogger(),
 	}
 
-	retry, err := h.applyCommandCore("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+	retry, err := h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
 
 	require.Error(t, err)
 	assert.True(t, retry, "a command bootstrap failure is a transient infra failure a durable driver should re-drive")
@@ -46,7 +46,7 @@ func TestApplyCommandCoreTerminalDispositions(t *testing.T) {
 		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
-		retry, err := h.applyCommandCore("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+		retry, err := h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
 
 		require.NoError(t, err)
 		assert.False(t, retry, "a non-owning fan-out skip is the command's terminal answer, not a retryable failure")
@@ -60,7 +60,7 @@ func TestApplyCommandCoreTerminalDispositions(t *testing.T) {
 		h, mux, comments := newFanOutSkipHandler(t, nonAggregateConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
-		retry, err := h.applyCommandCore("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+		retry, err := h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
 
 		require.NoError(t, err)
 		assert.False(t, retry, "a config-shape rejection is the command's answer, not a transient failure")
@@ -79,7 +79,7 @@ func TestApplyCommandCoreTerminalDispositions(t *testing.T) {
 		h, mux, comments := newFanOutSkipHandler(t, cfg)
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
-		retry, err := h.applyCommandCore("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+		retry, err := h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
 
 		require.NoError(t, err)
 		assert.False(t, retry, "an unconfigured-environment rejection is the command's answer, not a transient failure")
@@ -111,7 +111,7 @@ func TestApplyCommandCoreTransientConfigReadFailureIsRetryable(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 
-	retry, err := h.applyCommandCore("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+	retry, err := h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
 
 	require.Error(t, err)
 	assert.True(t, retry, "a transient GitHub config read failure must stay retryable for a durable driver")
@@ -128,7 +128,7 @@ func TestApplyCommandCoreChecksGateEvaluationFailureIsRetryable(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 
-	retry, err := h.applyCommandCore("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+	retry, err := h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
 
 	require.Error(t, err)
 	assert.True(t, retry, "an unevaluated checks gate must be retried")
@@ -142,7 +142,7 @@ func TestApplyCommandCoreChecksGateMeritBlockIsTerminal(t *testing.T) {
 		Typename: "CheckRun", Name: "CI / tests", Status: "completed", Conclusion: "failure", AppSlug: "github-actions",
 	}})
 
-	retry, err := h.applyCommandCore("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+	retry, err := h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
 
 	require.NoError(t, err)
 	assert.False(t, retry, "a verified checks gate block is terminal")
@@ -159,7 +159,7 @@ func TestApplyConfirmCommandCoreBaseFreshnessFailureIsRetryableAndKeepsPendingLo
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 
-	retry, err := h.applyConfirmCommandCore("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+	retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
 
 	require.Error(t, err)
 	assert.True(t, retry, "base-freshness uncertainty must be retried")
@@ -192,7 +192,7 @@ func TestApplyConfirmCommandCoreStaleBaseIsTerminalAndReleasesPendingLock(t *tes
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"tree": []map[string]string{{"path": "orders", "type": "tree", "sha": "orders-new"}}}))
 	})
 
-	retry, err := h.applyConfirmCommandCore("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+	retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
 
 	require.NoError(t, err)
 	assert.False(t, retry, "a verified stale base is terminal")

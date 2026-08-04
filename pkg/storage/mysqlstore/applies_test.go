@@ -5,6 +5,7 @@ package mysqlstore
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -1390,10 +1391,182 @@ func TestApplyStore_GetRecentLimitAndEnvironment(t *testing.T) {
 	assert.Equal(t, "apply_recent_staging_failed", applies[0].ApplyIdentifier)
 }
 
+// The status list puts in-flight work first: a copy that has been running for
+// days stays on the first page while applies created after it — and finished
+// since — sort below it.
+func TestApplyStore_GetRecentPutsInFlightWorkFirst(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+	now := time.Now()
+
+	lock := createTestLock(t, store, "activitydb", "mysql", "staging")
+	longRunning := createTestApplyWithStateAndEnv(t, store, lock, "apply_long_running", 230, state.Apply.Running, "staging")
+	finishedRecently := createTestApplyWithStateAndEnv(t, store, lock, "apply_finished_recently", 231, state.Apply.Completed, "staging")
+	finishedEarlier := createTestApplyWithStateAndEnv(t, store, lock, "apply_finished_earlier", 232, state.Apply.Completed, "staging")
+
+	// The long-running apply was requested first and is still heartbeating; the
+	// two that follow were created after it and have since gone quiet.
+	setApplyStartedAt(t, longRunning.ID, now.Add(-48*time.Hour))
+	setApplyUpdatedAt(t, longRunning.ID, now)
+	setApplyUpdatedAt(t, finishedRecently.ID, now.Add(-time.Hour))
+	setApplyUpdatedAt(t, finishedEarlier.ID, now.Add(-2*time.Hour))
+
+	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit:       3,
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	require.Len(t, applies, 3)
+	assert.Equal(t, "apply_long_running", applies[0].ApplyIdentifier)
+	assert.Equal(t, "apply_finished_recently", applies[1].ApplyIdentifier)
+	assert.Equal(t, "apply_finished_earlier", applies[2].ApplyIdentifier)
+}
+
+// Every driver heartbeats on the same interval, so concurrent applies all carry
+// a timestamp from within one interval. Ordering them by that timestamp would
+// reshuffle the top of the list between calls, so in-flight applies are ordered
+// by when they started, oldest first — the longest-held table reads first and a
+// newly started apply joins the bottom of the group.
+func TestApplyStore_GetRecentOrdersInFlightByStart(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+	now := time.Now()
+
+	// One database admits one in-flight apply, so concurrent rollouts are always
+	// against different databases.
+	oldest := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "concurrent_a", "mysql", "staging"),
+		"apply_running_oldest", 250, state.Apply.Running, "staging")
+	middle := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "concurrent_b", "mysql", "staging"),
+		"apply_running_middle", 251, state.Apply.Running, "staging")
+	newest := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "concurrent_c", "mysql", "staging"),
+		"apply_running_newest", 252, state.Apply.Running, "staging")
+
+	setApplyStartedAt(t, oldest.ID, now.Add(-48*time.Hour))
+	setApplyStartedAt(t, middle.ID, now.Add(-2*time.Hour))
+	setApplyStartedAt(t, newest.ID, now.Add(-5*time.Minute))
+
+	// Heartbeats land in a different order than the applies started, spread
+	// across one heartbeat interval the way concurrent drivers produce.
+	setApplyUpdatedAt(t, middle.ID, now)
+	setApplyUpdatedAt(t, newest.ID, now.Add(-3*time.Second))
+	setApplyUpdatedAt(t, oldest.ID, now.Add(-6*time.Second))
+
+	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit:       3,
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	require.Len(t, applies, 3)
+	assert.Equal(t, "apply_running_oldest", applies[0].ApplyIdentifier)
+	assert.Equal(t, "apply_running_middle", applies[1].ApplyIdentifier)
+	assert.Equal(t, "apply_running_newest", applies[2].ApplyIdentifier)
+}
+
+// An apply left in a non-terminal state with nothing driving it stops
+// heartbeating, so it is not in flight and does not hold the top of the list
+// ahead of work that is actually moving.
+func TestApplyStore_GetRecentSinksAbandonedApplies(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+	now := time.Now()
+
+	abandonedLock := createTestLock(t, store, "abandoned_a", "mysql", "staging")
+	liveLock := createTestLock(t, store, "abandoned_b", "mysql", "staging")
+	abandoned := createTestApplyWithStateAndEnv(t, store, abandonedLock, "apply_abandoned", 260, state.Apply.FailedRetryable, "staging")
+	running := createTestApplyWithStateAndEnv(t, store, liveLock, "apply_still_running", 261, state.Apply.Running, "staging")
+	finished := createTestApplyWithStateAndEnv(t, store, abandonedLock, "apply_finished", 262, state.Apply.Completed, "staging")
+
+	setApplyStartedAt(t, abandoned.ID, now.Add(-72*time.Hour))
+	setApplyStartedAt(t, running.ID, now.Add(-time.Hour))
+	setApplyUpdatedAt(t, abandoned.ID, now.Add(-72*time.Hour))
+	setApplyUpdatedAt(t, running.ID, now)
+	setApplyUpdatedAt(t, finished.ID, now.Add(-time.Minute*30))
+
+	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit:       3,
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	require.Len(t, applies, 3)
+	assert.Equal(t, "apply_still_running", applies[0].ApplyIdentifier)
+	assert.Equal(t, "apply_finished", applies[1].ApplyIdentifier, "the abandoned apply does not outrank work that settled since")
+	assert.Equal(t, "apply_abandoned", applies[2].ApplyIdentifier)
+}
+
+// A fanned-out apply is driven per operation, and an operation-scoped drive is
+// refused a parent heartbeat, so the parent row stays frozen while the rollout
+// advances. Its operations' heartbeats keep it in flight.
+func TestApplyStore_GetRecentTreatsOperationActivityAsInFlight(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+	now := time.Now()
+
+	lock := createTestLock(t, store, "opactivitydb", "mysql", "staging")
+	fannedOut := createTestApplyWithStateAndEnv(t, store, lock, "apply_fanned_out", 240, state.Apply.Running, "staging")
+	finished := createTestApplyWithStateAndEnv(t, store, lock, "apply_finished", 241, state.Apply.Completed, "staging")
+
+	// Only the operation is heartbeating: the parent apply row last changed
+	// before the finished apply did.
+	setApplyStartedAt(t, fannedOut.ID, now.Add(-24*time.Hour))
+	setApplyUpdatedAt(t, fannedOut.ID, now.Add(-3*time.Hour))
+	setApplyUpdatedAt(t, finished.ID, now.Add(-time.Hour))
+	insertOperationWithUpdatedAt(t, fannedOut.ID, "deploy-a", state.ApplyOperation.Running, now)
+
+	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit:       2,
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	require.Len(t, applies, 2)
+	assert.Equal(t, "apply_fanned_out", applies[0].ApplyIdentifier)
+	assert.Equal(t, "apply_finished", applies[1].ApplyIdentifier)
+
+	// An operation quieter than its parent must not drag the apply down: the
+	// parent's own state change is the later activity.
+	setApplyUpdatedAt(t, finished.ID, now.Add(-4*time.Hour))
+	insertOperationWithUpdatedAt(t, finished.ID, "deploy-b", state.ApplyOperation.Completed, now.Add(-5*time.Hour))
+
+	applies, err = store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit:       2,
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	require.Len(t, applies, 2)
+	assert.Equal(t, "apply_fanned_out", applies[0].ApplyIdentifier)
+	assert.Equal(t, "apply_finished", applies[1].ApplyIdentifier)
+}
+
+func setApplyStartedAt(t *testing.T, applyID int64, at time.Time) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(),
+		"UPDATE `applies` SET started_at = ?, updated_at = updated_at WHERE id = ?", at, applyID)
+	require.NoError(t, err)
+}
+
+func setApplyUpdatedAt(t *testing.T, applyID int64, at time.Time) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(),
+		"UPDATE `applies` SET updated_at = ? WHERE id = ?", at, applyID)
+	require.NoError(t, err)
+}
+
+func insertOperationWithUpdatedAt(t *testing.T, applyID int64, deployment, opState string, at time.Time) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(), `
+		INSERT INTO apply_operations (apply_id, deployment, target, state, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		applyID, deployment, deployment+"-target", opState, at, at)
+	require.NoError(t, err)
+}
+
 // TestApplyStore_GetRecentUpdatedSince verifies the status window bound: only
-// applies whose updated_at falls at or after the bound are returned, so an
-// apply that last changed before the window drops out while fresh activity
-// stays visible.
+// applies whose last activity falls at or after the bound are returned, so an
+// apply that went quiet before the window drops out while fresh activity stays
+// visible.
 func TestApplyStore_GetRecentUpdatedSince(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -1424,6 +1597,175 @@ func TestApplyStore_GetRecentUpdatedSince(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, applies, 2)
+}
+
+// Work that just finished reads newest-first, not as if it were still running.
+// A terminal apply's last heartbeat stays fresh for as long as the staleness
+// window, so recency of activity alone would group it with the live work and
+// sort it by start time — showing an operator the oldest of the applies that
+// just settled, under a heading that says in flight.
+func TestApplyStore_GetRecentOrdersSettledWorkByFinish(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+	now := time.Now()
+
+	lock := createTestLock(t, store, "settled", "mysql", "staging")
+	earlier := createTestApplyWithStateAndEnv(t, store, lock, "apply_settled_earlier", 280, state.Apply.Completed, "staging")
+	later := createTestApplyWithStateAndEnv(t, store, lock, "apply_settled_later", 281, state.Apply.Completed, "staging")
+
+	// Both finished within the staleness window, the longer-running one first.
+	setApplyStartedAt(t, earlier.ID, now.Add(-3*time.Hour))
+	setApplyStartedAt(t, later.ID, now.Add(-2*time.Hour))
+	setApplyUpdatedAt(t, earlier.ID, now.Add(-30*time.Second))
+	setApplyUpdatedAt(t, later.ID, now.Add(-10*time.Second))
+
+	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit:       10,
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	require.Len(t, applies, 2)
+	assert.Equal(t, "apply_settled_later", applies[0].ApplyIdentifier)
+	assert.Equal(t, "apply_settled_earlier", applies[1].ApplyIdentifier)
+}
+
+// A time window keeps a fanned-out apply visible while it is still working. An
+// operation-scoped drive is refused a parent heartbeat by design, so the parent
+// row can be hours stale while the operations tick every few seconds; windowing
+// on the parent row alone would hide a running rollout from both the list and
+// the summary counts that an operator reads together.
+func TestApplyStore_GetRecentWindowKeepsOperationActivity(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+	now := time.Now()
+
+	lock := createTestLock(t, store, "window_fanout", "mysql", "staging")
+	fannedOut := createTestApplyWithStateAndEnv(t, store, lock, "apply_window_fanout", 270, state.Apply.Running, "staging")
+	insertOperationWithUpdatedAt(t, fannedOut.ID, "deploy-a", state.ApplyOperation.Running, now)
+	setApplyUpdatedAt(t, fannedOut.ID, now.Add(-2*time.Hour))
+
+	filter := storage.RecentAppliesFilter{
+		Limit:        10,
+		Environment:  "staging",
+		UpdatedSince: now.Add(-time.Hour),
+	}
+
+	applies, err := store.Applies().GetRecent(ctx, filter)
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, "apply_window_fanout", applies[0].ApplyIdentifier)
+
+	counts, err := store.Applies().CountRecentByState(ctx, filter)
+	require.NoError(t, err)
+	assert.Equal(t, 1, counts[state.Apply.Running])
+}
+
+// A deployment-scoped view answers for the deployment the operator asked about.
+// A rollout still heartbeating in some other deployment reads as quiet here,
+// matching the per-deployment state rendered on the same row.
+func TestApplyStore_GetRecentScopesActivityToDeployment(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+	now := time.Now()
+
+	// Two fanned-out applies. In one deployment the first is still working and
+	// the second went quiet hours ago; in the other it is the other way round.
+	first := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "scoped_a", "mysql", "staging"),
+		"apply_scoped_first", 290, state.Apply.Running, "staging")
+	second := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "scoped_b", "mysql", "staging"),
+		"apply_scoped_second", 291, state.Apply.Running, "staging")
+
+	insertOperationWithUpdatedAt(t, first.ID, "deploy-east", state.ApplyOperation.Running, now)
+	insertOperationWithUpdatedAt(t, first.ID, "deploy-west", state.ApplyOperation.Completed, now.Add(-3*time.Hour))
+	insertOperationWithUpdatedAt(t, second.ID, "deploy-east", state.ApplyOperation.Completed, now.Add(-3*time.Hour))
+	insertOperationWithUpdatedAt(t, second.ID, "deploy-west", state.ApplyOperation.Running, now)
+	setApplyUpdatedAt(t, first.ID, now.Add(-3*time.Hour))
+	setApplyUpdatedAt(t, second.ID, now.Add(-3*time.Hour))
+
+	east, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit: 10, Environment: "staging", Deployment: "deploy-east",
+	})
+	require.NoError(t, err)
+	require.Len(t, east, 2)
+	assert.Equal(t, "apply_scoped_first", east[0].ApplyIdentifier)
+
+	west, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit: 10, Environment: "staging", Deployment: "deploy-west",
+	})
+	require.NoError(t, err)
+	require.Len(t, west, 2)
+	assert.Equal(t, "apply_scoped_second", west[0].ApplyIdentifier)
+}
+
+// A deployment-scoped time window is scoped the same way as the ordering, so an
+// apply quiet in the requested deployment falls outside the window even while
+// another deployment keeps heartbeating.
+func TestApplyStore_GetRecentDeploymentWindowScopesActivity(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+	now := time.Now()
+
+	lock := createTestLock(t, store, "scoped_window", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_scoped_window", 292, state.Apply.Running, "staging")
+	insertOperationWithUpdatedAt(t, apply.ID, "deploy-east", state.ApplyOperation.Completed, now.Add(-3*time.Hour))
+	insertOperationWithUpdatedAt(t, apply.ID, "deploy-west", state.ApplyOperation.Running, now)
+	setApplyUpdatedAt(t, apply.ID, now.Add(-3*time.Hour))
+
+	quiet, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit: 10, Environment: "staging", Deployment: "deploy-east",
+		UpdatedSince: now.Add(-time.Hour),
+	})
+	require.NoError(t, err)
+	assert.Empty(t, quiet)
+
+	working, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit: 10, Environment: "staging", Deployment: "deploy-west",
+		UpdatedSince: now.Add(-time.Hour),
+	})
+	require.NoError(t, err)
+	require.Len(t, working, 1)
+	assert.Equal(t, "apply_scoped_window", working[0].ApplyIdentifier)
+}
+
+// An active-only query answers "is this target busy" without reading settled
+// history. It is expressed as "not terminal", so an apply in a state the registry
+// does not know still counts as active — a caller must never be told a target is
+// free because a state was missed.
+func TestApplyStore_GetRecentActiveOnly(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_a", "mysql", "staging"),
+		"apply_active_running", 300, state.Apply.Running, "staging")
+	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_b", "mysql", "staging"),
+		"apply_active_retryable", 301, state.Apply.FailedRetryable, "staging")
+	unknownState := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_c", "mysql", "staging"),
+		"apply_active_unknown", 302, state.Apply.Completed, "staging")
+	_, err := testDB.ExecContext(ctx,
+		"UPDATE `applies` SET state = ?, updated_at = updated_at WHERE id = ?", "some_future_state", unknownState.ID)
+	require.NoError(t, err)
+
+	// Settled work that must not appear.
+	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_d", "mysql", "staging"),
+		"apply_active_completed", 303, state.Apply.Completed, "staging")
+	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_e", "mysql", "staging"),
+		"apply_active_stopped", 304, state.Apply.Stopped, "staging")
+
+	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit: 10, Environment: "staging", ActiveOnly: true,
+	})
+	require.NoError(t, err)
+
+	got := make([]string, 0, len(applies))
+	for _, a := range applies {
+		got = append(got, a.ApplyIdentifier)
+	}
+	assert.ElementsMatch(t, []string{"apply_active_running", "apply_active_retryable", "apply_active_unknown"}, got)
 }
 
 // A status summary must tally every apply matching the filters — unbounded by
@@ -2377,6 +2719,119 @@ func TestApplyStore_FindNextApplyRequiresTasksForPendingApply(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, persisted)
 	assert.Equal(t, state.Apply.Running, persisted.State)
+}
+
+// FindStuckPendingApplies is the operator's stuck-pending observability probe.
+// It surfaces pending applies a driver should already have claimed — pending
+// with child rows, the same claimability predicate FindNextApply uses — that
+// have aged past the threshold, so an operator can tell a wedged or saturated
+// driver pool from a healthy one. It must never surface a young pending apply
+// (still within normal claim latency), a pending apply with no child rows (not
+// yet claimable), or a terminal apply.
+func TestApplyStore_FindStuckPendingApplies(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	// Each pending apply needs a distinct target: apply creation rejects a
+	// second active apply for the same database/type/environment, and pending is
+	// an active state.
+	seedPending := func(t *testing.T, applyID string, planID int64, withTask bool) *storage.Apply {
+		t.Helper()
+		lock := createTestLock(t, store, "db_"+applyID, storage.DatabaseTypeMySQL, "staging")
+		apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Pending, "staging")
+		if withTask {
+			now := time.Now()
+			_, err := store.Tasks().Create(ctx, &storage.Task{
+				TaskIdentifier: "task_" + applyID,
+				ApplyID:        apply.ID,
+				PlanID:         apply.PlanID,
+				Database:       apply.Database,
+				DatabaseType:   apply.DatabaseType,
+				Engine:         storage.EngineSpirit,
+				Environment:    apply.Environment,
+				State:          state.Task.Pending,
+				TableName:      "users",
+				DDL:            "CREATE TABLE users (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+				DDLAction:      "CREATE",
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			})
+			require.NoError(t, err)
+		}
+		return apply
+	}
+	// A VSchema-only apply carries an apply_operations row but no tasks; that
+	// operation row alone makes it claimable, so the stuck scan must surface it.
+	seedPendingVSchemaOnly := func(t *testing.T, applyID string, planID int64) *storage.Apply {
+		t.Helper()
+		lock := createTestLock(t, store, "db_"+applyID, storage.DatabaseTypeVitess, "staging")
+		apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Pending, "staging")
+		now := time.Now()
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID:    apply.ID,
+			Deployment: apply.Database,
+			State:      state.ApplyOperation.Pending,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		})
+		require.NoError(t, err)
+		return apply
+	}
+	backdate := func(t *testing.T, id int64, age time.Duration) {
+		t.Helper()
+		_, err := testDB.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE applies SET created_at = NOW() - INTERVAL %d SECOND WHERE id = ?`, int(age.Seconds())),
+			id)
+		require.NoError(t, err)
+	}
+
+	// Old claimable pending applies → stuck, oldest first. The tasks arm and the
+	// apply_operations arm are both claimable, so both must be surfaced.
+	oldest := seedPending(t, "apply_oldest_claimable", 9001, true)
+	backdate(t, oldest.ID, 40*time.Minute)
+	vschemaOnly := seedPendingVSchemaOnly(t, "apply_vschema_only", 9006)
+	backdate(t, vschemaOnly.ID, 30*time.Minute)
+	older := seedPending(t, "apply_old_claimable", 9002, true)
+	backdate(t, older.ID, 20*time.Minute)
+
+	// Young claimable pending apply (created now) → below threshold, not stuck.
+	seedPending(t, "apply_young_claimable", 9003, true)
+
+	// Old pending apply with no child rows → not yet claimable, excluded.
+	noChildren := seedPending(t, "apply_old_no_children", 9004, false)
+	backdate(t, noChildren.ID, 40*time.Minute)
+
+	// Old terminal apply → not pending, excluded.
+	completedLock := createTestLock(t, store, "db_completed", storage.DatabaseTypeMySQL, "staging")
+	completed := createTestApplyWithStateAndEnv(t, store, completedLock, "apply_old_completed", 9005, state.Apply.Completed, "staging")
+	backdate(t, completed.ID, 40*time.Minute)
+
+	threshold := 10 * time.Minute
+
+	t.Run("returns aged claimable pending applies oldest first", func(t *testing.T) {
+		stuck, err := store.Applies().FindStuckPendingApplies(ctx, threshold, 0)
+		require.NoError(t, err)
+		require.Len(t, stuck, 3)
+		assert.Equal(t, oldest.ApplyIdentifier, stuck[0].ApplyIdentifier)
+		assert.Equal(t, vschemaOnly.ApplyIdentifier, stuck[1].ApplyIdentifier,
+			"a task-less pending apply with an apply_operations row must be surfaced")
+		assert.Equal(t, older.ApplyIdentifier, stuck[2].ApplyIdentifier)
+		assert.Equal(t, state.Apply.Pending, stuck[0].State)
+	})
+
+	t.Run("limit caps the result to the oldest rows", func(t *testing.T) {
+		stuck, err := store.Applies().FindStuckPendingApplies(ctx, threshold, 1)
+		require.NoError(t, err)
+		require.Len(t, stuck, 1)
+		assert.Equal(t, oldest.ApplyIdentifier, stuck[0].ApplyIdentifier)
+	})
+
+	t.Run("a threshold above every age surfaces nothing", func(t *testing.T) {
+		stuck, err := store.Applies().FindStuckPendingApplies(ctx, time.Hour, 0)
+		require.NoError(t, err)
+		assert.Empty(t, stuck)
+	})
 }
 
 // A VSchema-only apply carries an apply_operations row but no tasks — the

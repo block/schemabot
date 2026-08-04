@@ -121,6 +121,8 @@ type staticApplyOperationStore struct {
 	err             error
 	resumeStateByOp map[int64]*storage.EngineResumeState
 	resumeStateErr  error
+	reaped          []*storage.ReapedOperation
+	reapErr         error
 }
 
 func (s *staticApplyOperationStore) ListByApply(_ context.Context, applyID int64) ([]*storage.ApplyOperation, error) {
@@ -161,6 +163,14 @@ func (s *staticApplyOperationStore) GetEngineResumeState(_ context.Context, oper
 		return rs, nil
 	}
 	return nil, storage.ErrEngineResumeStateNotFound
+}
+
+// ReapStranded is called by the stranded-operation reaper, which starts with the
+// operator, so every double reachable from the operator lifecycle answers it. It
+// can return settlements and an error together, the way a pass that fails partway
+// reports the rows it already committed.
+func (s *staticApplyOperationStore) ReapStranded(context.Context, int) ([]*storage.ReapedOperation, error) {
+	return s.reaped, s.reapErr
 }
 
 type staticPlanStore struct {
@@ -3723,6 +3733,41 @@ func TestHandleStatusLastWindowBoundsFilter(t *testing.T) {
 	mux.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	require.Len(t, applies.filters, 1, "an invalid window must not reach storage")
+}
+
+// TestHandleStatusActiveFilter verifies that the `active` query parameter reaches
+// storage as the not-terminal restriction, so a caller asking whether a target is
+// busy is answered from in-flight work instead of paging settled history, and
+// that a non-boolean value is rejected rather than silently ignored.
+func TestHandleStatusActiveFilter(t *testing.T) {
+	applies := &recentApplyStore{}
+	stor := &mockStorageWithApplyStores{applies: applies}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(stor, testServerConfig(), nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?active=true", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, applies.filters, 1)
+	assert.True(t, applies.filters[0].ActiveOnly)
+	assert.Empty(t, applies.filters[0].States, "active is expressed as not-terminal, not as a list of live states")
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, applies.filters, 2)
+	assert.False(t, applies.filters[1].ActiveOnly)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?active=sometimes", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	require.Len(t, applies.filters, 2, "an invalid active value must not reach storage")
 }
 
 // TestHandleStatusStateFilter verifies that the `state` query parameter

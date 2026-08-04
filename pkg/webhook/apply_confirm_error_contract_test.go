@@ -29,7 +29,7 @@ func TestApplyConfirmCommandCoreBootstrapFailureIsRetryable(t *testing.T) {
 		logger: testLogger(),
 	}
 
-	retry, err := h.applyConfirmCommandCore("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+	retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
 
 	require.Error(t, err)
 	assert.True(t, retry, "a command bootstrap failure is a transient infra failure a durable driver should re-drive")
@@ -45,7 +45,7 @@ func TestApplyConfirmCommandCoreTerminalDispositions(t *testing.T) {
 		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
-		retry, err := h.applyConfirmCommandCore("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+		retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
 
 		require.NoError(t, err)
 		assert.False(t, retry, "a non-owning fan-out skip is the command's terminal answer, not a retryable failure")
@@ -59,7 +59,7 @@ func TestApplyConfirmCommandCoreTerminalDispositions(t *testing.T) {
 		h, mux, comments := newFanOutSkipHandler(t, nonAggregateConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
-		retry, err := h.applyConfirmCommandCore("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+		retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
 
 		require.NoError(t, err)
 		assert.False(t, retry, "a config-shape rejection is the command's answer, not a transient failure")
@@ -78,7 +78,7 @@ func TestApplyConfirmCommandCoreTerminalDispositions(t *testing.T) {
 		h, mux, comments := newFanOutSkipHandler(t, cfg)
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
-		retry, err := h.applyConfirmCommandCore("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+		retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
 
 		require.NoError(t, err)
 		assert.False(t, retry, "an unconfigured-environment rejection is the command's answer, not a transient failure")
@@ -110,7 +110,7 @@ func TestApplyConfirmCommandCoreTransientConfigReadFailureIsRetryable(t *testing
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 
-	retry, err := h.applyConfirmCommandCore("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+	retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
 
 	require.Error(t, err)
 	assert.True(t, retry, "a transient GitHub config read failure must stay retryable for a durable driver")

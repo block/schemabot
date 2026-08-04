@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,7 +50,7 @@ func TestServerMetricsHandlerSeparateFromAPIHandler(t *testing.T) {
 
 	webhook, err := buildWebhookRuntime(cfg, svc, logger)
 	require.NoError(t, err)
-	authz, err := buildAuthorizer(t.Context(), cfg.Auth, nil, logger)
+	authz, err := buildServerAuthorizer(t.Context(), cfg, logger)
 	require.NoError(t, err)
 	telemetry, err := api.SetupTelemetry(logger)
 	require.NoError(t, err)
@@ -101,7 +102,7 @@ func TestForwardAuthEnforcedThroughServerHandler(t *testing.T) {
 	svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
 	webhook, err := buildWebhookRuntime(cfg, svc, logger)
 	require.NoError(t, err)
-	authz, err := buildAuthorizer(t.Context(), cfg.Auth, nil, logger)
+	authz, err := buildServerAuthorizer(t.Context(), cfg, logger)
 	require.NoError(t, err)
 	telemetry, err := api.SetupTelemetry(logger)
 	require.NoError(t, err)
@@ -178,7 +179,7 @@ func TestForwardAuthServiceCallerLaneThroughServerHandler(t *testing.T) {
 	svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
 	webhook, err := buildWebhookRuntime(cfg, svc, logger)
 	require.NoError(t, err)
-	authz, err := buildAuthorizer(t.Context(), cfg.Auth, nil, logger)
+	authz, err := buildServerAuthorizer(t.Context(), cfg, logger)
 	require.NoError(t, err)
 	telemetry, err := api.SetupTelemetry(logger)
 	require.NoError(t, err)
@@ -224,5 +225,96 @@ func TestForwardAuthServiceCallerLaneThroughServerHandler(t *testing.T) {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
+}
+
+// Per-database operator scoping only works if the server wires the
+// operator-group union from database config into the forward-auth middleware.
+// This drives the real server handler with a caller who is in an operator
+// group but no write group: the middleware must admit them to the write tier
+// (the union wiring), the handler must allow their granted database and deny
+// another — so a build that drops the union, or a handler that skips the
+// scope check, fails behaviorally.
+func TestForwardAuthOperatorScopingThroughServerHandler(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	cfg := &api.ServerConfig{
+		Auth: api.AuthConfig{
+			Type: "forward_auth",
+			ForwardAuth: api.ForwardAuthSettings{
+				// httptest's default RemoteAddr (192.0.2.1) falls in this range,
+				// so it is the trusted proxy; other sources are untrusted.
+				TrustedProxyCIDRs:    []string{"192.0.2.0/24"},
+				GroupsHeader:         "X-Forwarded-Capabilities",
+				WriteGroups:          []string{"owners"},
+				OperatorEnvironments: []string{"staging"},
+			},
+		},
+		Databases: map[string]api.DatabaseConfig{
+			"payments": {
+				Type: "mysql",
+				Environments: map[string]api.EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/payments"},
+				},
+				OperatorGroups: []string{"payments-team"},
+			},
+			"orders": {
+				Type: "mysql",
+				Environments: map[string]api.EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/orders"},
+				},
+			},
+		},
+	}
+	svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
+	webhook, err := buildWebhookRuntime(cfg, svc, logger)
+	require.NoError(t, err)
+	authz, err := buildServerAuthorizer(t.Context(), cfg, logger)
+	require.NoError(t, err)
+	telemetry, err := api.SetupTelemetry(logger)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		_ = telemetry.Shutdown(shutdownCtx)
+	})
+
+	srv := &Server{cfg: cfg, svc: svc, logger: logger, webhook: webhook, telemetry: telemetry, authz: authz}
+	handler := srv.Handler()
+
+	operatorRequest := func(t *testing.T, method, path, body string) *http.Request {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), method, path, strings.NewReader(body))
+		req.RemoteAddr = "192.0.2.1:1234"
+		req.Header.Set("X-Forwarded-User", "bob")
+		req.Header.Set("X-Forwarded-Capabilities", "users,payments-team")
+		return req
+	}
+
+	planBody := func(database string) string {
+		return `{"database":"` + database + `","environment":"staging","type":"mysql","schema_files":{"default":{"files":{"t.sql":"CREATE TABLE t (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY)"}}}}`
+	}
+
+	t.Run("operator is admitted to the write tier and allowed on their granted database", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, operatorRequest(t, http.MethodPost, "/api/plan", planBody("payments")))
+		// Both authorization layers pass — middleware admission via the
+		// operator-group union, handler scope via the payments grant — so the
+		// request reaches plan execution, which fails downstream in this
+		// harness (no engine wired). Any 401/403 means an auth layer denied.
+		assert.NotEqual(t, http.StatusUnauthorized, rec.Code, "middleware must authenticate the operator: %s", rec.Body.String())
+		assert.NotEqual(t, http.StatusForbidden, rec.Code, "both authorization layers must allow the granted database: %s", rec.Body.String())
+	})
+
+	t.Run("the same operator is denied another database at the handler", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, operatorRequest(t, http.MethodPost, "/api/plan", planBody("orders")))
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Contains(t, rec.Body.String(), "owners", "the denial names the write groups that could act instead")
+	})
+
+	t.Run("operator gets the read tier deployment-wide", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, operatorRequest(t, http.MethodGet, "/api/databases", ""))
+		assert.Equal(t, http.StatusOK, rec.Code)
 	})
 }

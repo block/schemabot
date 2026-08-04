@@ -2,8 +2,6 @@ package ddl
 
 import (
 	"strings"
-
-	"github.com/block/spirit/pkg/statement"
 )
 
 // SplitStatements splits SQL content into individual DDL statements.
@@ -13,15 +11,16 @@ func SplitStatements(content string) ([]string, error) {
 	return defaultParser.Split(content)
 }
 
-// ClassifyStatement classifies a single DDL statement using Spirit's parser.
-// Returns the typed StatementType and table name. Handles the Classify
-// boilerplate (nil check, empty results) so callers don't have to.
+// ClassifyStatement classifies a single DDL statement using the package's
+// default StatementParser. Returns the typed StatementType and table name.
+// Handles the Classify boilerplate (nil check, empty results) so callers
+// don't have to.
 //
 // The input must be exactly one statement: a compound string could hide a
 // destructive statement behind the classification of the first one, so
 // multi-statement input is rejected. Callers with multi-statement content
 // must split it with SplitStatements first.
-func ClassifyStatement(stmt string) (statement.StatementType, string, error) {
+func ClassifyStatement(stmt string) (StatementType, string, error) {
 	return defaultParser.Classify(stmt)
 }
 
@@ -50,38 +49,4 @@ func ClassifyStatementOp(stmt string) (string, string, error) {
 		return "", "", err
 	}
 	return StatementTypeToOp(t), table, nil
-}
-
-// StatementTypeToOp converts a Spirit StatementType to the lowercase operation
-// string used in storage and API layers ("create", "alter", "drop", "rename").
-func StatementTypeToOp(t statement.StatementType) string {
-	switch t {
-	case statement.StatementCreateTable:
-		return "create"
-	case statement.StatementAlterTable:
-		return "alter"
-	case statement.StatementDropTable:
-		return "drop"
-	case statement.StatementRenameTable:
-		return "rename"
-	default:
-		return "unknown"
-	}
-}
-
-// OpToStatementType converts a storage operation string back to a Spirit
-// StatementType. Used when reading from storage/proto boundaries.
-func OpToStatementType(op string) statement.StatementType {
-	switch strings.ToLower(op) {
-	case "create":
-		return statement.StatementCreateTable
-	case "alter":
-		return statement.StatementAlterTable
-	case "drop":
-		return statement.StatementDropTable
-	case "rename":
-		return statement.StatementRenameTable
-	default:
-		return statement.StatementUnknown
-	}
 }

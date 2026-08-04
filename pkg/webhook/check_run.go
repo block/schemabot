@@ -39,7 +39,7 @@ func (h *Handler) handleCheckRun(ctx context.Context, metricApp string, w http.R
 	case "rerequested":
 		h.handleCheckRunRerequest(ctx, metricApp, w, payload, body, deliveryID)
 	case "completed":
-		h.handleParticipantCheckCompleted(ctx, w, payload)
+		h.handleParticipantCheckCompleted(ctx, metricApp, w, payload, body, deliveryID)
 	default:
 		h.logger.Debug("check_run action ignored",
 			"action", payload.Action,
@@ -56,7 +56,7 @@ func (h *Handler) handleCheckRun(ctx context.Context, metricApp string, w http.R
 // every participant's state via the trusted FindCheckRunByName path, so reacting
 // to any completed check on a led repo is safe. The leader's own aggregate check
 // is skipped so its own writes do not trigger a self-loop.
-func (h *Handler) handleParticipantCheckCompleted(ctx context.Context, w http.ResponseWriter, payload checkRunPayload) {
+func (h *Handler) handleParticipantCheckCompleted(ctx context.Context, metricApp string, w http.ResponseWriter, payload checkRunPayload, body []byte, deliveryID string) {
 	repo := payload.Repository.FullName
 
 	if h.service == nil || !h.service.Config().IsAggregateLeaderForRepo(repo) {
@@ -98,6 +98,39 @@ func (h *Handler) handleParticipantCheckCompleted(ctx context.Context, w http.Re
 
 	if payload.CheckRun.HeadSHA == "" {
 		h.writeError(w, http.StatusBadRequest, "missing check_run head SHA")
+		return
+	}
+
+	if h.durableWebhookDispatch {
+		// Enqueue the re-fold as a durable row and ack fast: a deploy mid-fold
+		// would otherwise drop the leader's aggregate re-fold, leaving the
+		// aggregate stale until an unrelated event re-folds it. Enqueue failure
+		// is a deliberate 500 (metric below + a red delivery in GitHub's webhook
+		// UI); GitHub does not auto-retry, so the delivery stays lost until an
+		// operator redelivers or another participant completion re-triggers it.
+		inserted, err := h.enqueueDurableCheckRun(ctx, payload, body, deliveryID, pr, installationID)
+		if err != nil {
+			h.logger.Error("failed to enqueue durable check_run completion",
+				"repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA,
+				"installation_id", installationID, "check_run_id", payload.CheckRun.ID,
+				"check_name", payload.CheckRun.Name, "delivery_id", deliveryID, "error", err)
+			metrics.RecordWebhookEvent(ctx, metricApp, "check_run", payload.Action, repo, "durable_enqueue_failed")
+			h.writeError(w, http.StatusInternalServerError, "failed to enqueue webhook delivery")
+			return
+		}
+		if !inserted {
+			h.logger.Info("durable check_run completion already queued",
+				"repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA,
+				"installation_id", installationID, "check_run_id", payload.CheckRun.ID,
+				"check_name", payload.CheckRun.Name, "delivery_id", deliveryID)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run completion already queued"})
+			return
+		}
+		h.logger.Info("durable check_run completion queued",
+			"repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA,
+			"installation_id", installationID, "check_run_id", payload.CheckRun.ID,
+			"check_name", payload.CheckRun.Name, "delivery_id", deliveryID)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run completion queued"})
 		return
 	}
 

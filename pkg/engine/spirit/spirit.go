@@ -78,6 +78,13 @@ type Engine struct {
 
 // runningSchemaChange tracks the state of an in-progress schema change.
 type runningSchemaChange struct {
+	// logger is the schema-change-scoped logger carrying the caller's triage
+	// identity (apply id, repo, PR, environment); spiritLogger is the
+	// filtered Spirit logger derived from it. Both fall back to the engine's
+	// loggers when the caller did not provide one.
+	logger       *slog.Logger
+	spiritLogger *slog.Logger
+
 	database                string            // MySQL database name parsed from DSN
 	tableNamespace          map[string]string // table name → namespace (from ApplyRequest.Changes)
 	tables                  []string
@@ -202,6 +209,62 @@ func New(cfg Config) *Engine {
 
 func (e *Engine) Name() string {
 	return "spirit"
+}
+
+// resolveChangeLoggers resolves the loggers for one schema change from the
+// caller's optional request logger. When the caller provides a logger — bound
+// with its triage identity (apply id, repo, PR, environment) — every engine
+// line and every routed Spirit runner line for the change inherits that
+// identity; otherwise the engine's configured loggers are used. The Spirit
+// logger is rebuilt on the request logger's handler so it keeps the runtime
+// debug-log filter and apply-log routing.
+func (e *Engine) resolveChangeLoggers(reqLogger *slog.Logger) (logger, spiritLogger *slog.Logger) {
+	if reqLogger == nil {
+		return e.logger, e.spiritLogger
+	}
+	return reqLogger, slog.New(&spiritLogFilter{
+		handler:  reqLogger.Handler(),
+		debugRef: &e.debugLogs,
+		onLogRef: &e.onLog,
+	})
+}
+
+// changeLogger returns the logger for the tracked schema change: the
+// change-scoped logger bound by Apply when the caller provided one, or the
+// engine's configured logger otherwise. Execution paths use it so every line
+// about the running change carries the caller's triage identity.
+func (e *Engine) changeLogger() *slog.Logger {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.runningSchemaChange != nil && e.runningSchemaChange.logger != nil {
+		return e.runningSchemaChange.logger
+	}
+	return e.logger
+}
+
+// schemaChangeLogger returns the logger bound to the given schema change,
+// falling back to the engine's configured logger when the change is nil or
+// carries no caller-bound logger. Control paths that hold a specific change
+// use it instead of changeLogger so their lines carry that change's triage
+// identity even when the engine has since started tracking a different one.
+// The change's logger is set once at creation, so no lock is needed.
+func (e *Engine) schemaChangeLogger(rm *runningSchemaChange) *slog.Logger {
+	if rm != nil && rm.logger != nil {
+		return rm.logger
+	}
+	return e.logger
+}
+
+// changeSpiritLogger returns the filtered Spirit logger for the tracked
+// schema change, falling back to the engine-level Spirit logger. Runner log
+// lines routed through it inherit the change's triage identity.
+func (e *Engine) changeSpiritLogger() *slog.Logger {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.runningSchemaChange != nil && e.runningSchemaChange.spiritLogger != nil {
+		return e.runningSchemaChange.spiritLogger
+	}
+	return e.spiritLogger
 }
 
 // SetLogCallback sets a callback that receives Spirit log messages.
@@ -379,7 +442,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		// gating here keeps the verdict — an informational field — from ever
 		// failing the plan on a statement type the engine's own parser
 		// doesn't accept.
-		if stmtType == statement.StatementAlterTable {
+		if stmtType == ddl.StatementAlterTable {
 			currentCreateTable, ok := currentByTable[pc.TableName]
 			if !ok {
 				return nil, fmt.Errorf("plan produced an ALTER for table %q, which has no current definition in database %q", pc.TableName, database)
@@ -470,7 +533,9 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// Check for defer_cutover option
 	deferCutover := req.Options["defer_cutover"] == "true"
 
-	e.logger.Info("applying plan",
+	logger, spiritLogger := e.resolveChangeLoggers(req.Logger)
+
+	logger.Info("applying plan",
 		"database", req.Database,
 		"ddl_count", len(req.FlatDDL()),
 		"defer_cutover", deferCutover,
@@ -511,7 +576,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	cpuHint := e.cpuHint
 	e.mu.Unlock()
 	if cpuHint == 0 {
-		cpuHint = e.queryCPUHint(ctx, req.Credentials.DSN)
+		cpuHint = e.queryCPUHint(ctx, req.Credentials.DSN, logger)
 		e.mu.Lock()
 		e.cpuHint = cpuHint
 		e.mu.Unlock()
@@ -531,6 +596,8 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	rm := &runningSchemaChange{
+		logger:          logger,
+		spiritLogger:    spiritLogger,
 		database:        database,
 		tableNamespace:  tableNamespace,
 		tables:          nil, // Tables will be populated by executeSchemaChange
