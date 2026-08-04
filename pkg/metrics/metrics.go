@@ -488,24 +488,25 @@ func RecordPRCommandActorAuthorization(ctx context.Context, command, database, e
 }
 
 var knownDirectWriteAuthOperations = map[string]bool{
-	"plan":              true,
-	"apply":             true,
-	"rollback_plan":     true,
-	"stop":              true,
-	"start":             true,
-	"cutover":           true,
-	"cancel":            true,
-	"volume":            true,
-	"release":           true,
-	"revert":            true,
-	"skip_revert":       true,
-	"lock_acquire":      true,
-	"lock_release":      true,
-	"checks_scan":       true,
-	"checks_synthesize": true,
-	"checks_repos":      true,
-	"webhook_redrive":   true,
-	"settings_set":      true,
+	"plan":               true,
+	"apply":              true,
+	"rollback_plan":      true,
+	"stop":               true,
+	"start":              true,
+	"cutover":            true,
+	"cancel":             true,
+	"volume":             true,
+	"release":            true,
+	"revert":             true,
+	"skip_revert":        true,
+	"lock_acquire":       true,
+	"lock_release":       true,
+	"lock_force_release": true,
+	"checks_scan":        true,
+	"checks_synthesize":  true,
+	"checks_repos":       true,
+	"webhook_redrive":    true,
+	"settings_set":       true,
 }
 
 var knownDirectWriteAuthStatuses = map[string]bool{
@@ -546,6 +547,12 @@ func RecordDirectWriteAuthorization(ctx context.Context, operation, database, en
 	if !knownDirectWriteAuthReasons[reason] {
 		reason = "unknown"
 	}
+	// Admin-gated operations have no single target database, and some denials
+	// happen before the target resolves; record the same sentinel the
+	// environment attribute uses so empty never appears as a blank label.
+	if database == "" {
+		database = "unknown"
+	}
 
 	addCounter(ctx, "schemabot.direct_write_authorization.total",
 		"Total per-database direct write authorization decisions", "{decision}",
@@ -563,7 +570,7 @@ func RecordDirectWriteAuthorization(ctx context.Context, operation, database, en
 // reason is a fixed set.
 func RecordAuthDecision(ctx context.Context, tier, decision, reason string) {
 	addCounter(ctx, "schemabot.auth_decisions.total",
-		"Total API auth decisions on the OIDC request path", "{decision}",
+		"Total API auth decisions on the direct request path", "{decision}",
 		attribute.String("tier", tier),
 		attribute.String("decision", decision),
 		attribute.String("reason", reason),

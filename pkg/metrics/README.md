@@ -33,6 +33,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.github.rate_limit.used` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
 | `schemabot.lock_operations_total` | Counter | operation, database, environment, status | Lock acquire/release operations |
+| `schemabot.direct_write_authorization.total` | Counter | operation, database, environment, status, reason | Per-database direct-write (CLI/API) authorization decisions at the handler layer |
 | `schemabot.operator.resumed_total` | Counter | database, environment, previous_state | Applies resumed by the operator |
 | `schemabot.operator.resume_failures_total` | Counter | database, environment, reason | Operator resume attempts that failed |
 | `schemabot.operator.claim_failures_total` | Counter | environment, reason | Operator claim attempts that failed |
@@ -238,6 +239,41 @@ Operation values:
 |---|---|
 | `acquire` | Try to acquire the database lock for a plan/apply workflow. |
 | `release` | Try to release the database lock, either by owner or administrative override. |
+
+### Direct Write Authorization
+
+`schemabot.direct_write_authorization.total` tracks per-database direct-write
+(CLI/API) authorization decisions made at the handler layer, after the
+forward-auth middleware has admitted the caller to the write tier. A spike in
+`status=denied` means scoped operators are attempting operations outside their
+grant — the `reason` attribute says whether the target database, the
+environment, or the group membership mismatched.
+
+Status values: `allowed`, `denied`, and `skipped` (the decision could not reach
+an authorization outcome — for example the stored plan lookup failed — and the
+request was rejected by the operation's own error path instead).
+
+Reason values:
+
+| Reason | Meaning |
+|---|---|
+| `scoped_lane_disabled` | No database has `operator_groups`; the decision is the plain admin gate. |
+| `admin_allow` | Allowed via deployment `write_groups` membership. |
+| `scoped_allow` | Allowed via the target database's `operator_groups` grant. |
+| `missing_identity` | No authenticated user in the request context. |
+| `not_admin` | Caller is not in `write_groups` (and, for admin-only operations, has no other path). |
+| `not_database_operator` | Caller's groups do not match the target database's `operator_groups`. |
+| `environment_not_allowed` | Target environment is outside `operator_environments`. |
+| `missing_database_config` | The target database is not configured. |
+
+Operation names mirror the mutating endpoints (`plan`, `apply`, control
+operations, `lock_acquire`/`lock_release`/`lock_force_release`, and the
+admin-only `checks_*`, `webhook_redrive`, `settings_set`). Unrecognized
+operation, status, or reason values are recorded as `unknown` to keep
+cardinality bounded. `database` and `environment` use the `unknown` sentinel
+when the operation has no such dimension (admin-only operations have no single
+target database; lock operations have no environment) or when the request
+failed before the target resolved.
 
 ## HTTP Server Metrics
 
