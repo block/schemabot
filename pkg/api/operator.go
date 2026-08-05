@@ -556,6 +556,11 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 		return
 	}
 
+	// The merge gate request depends only on the apply settling to terminal
+	// success; record it before control-request cleanup so a cleanup error
+	// cannot suppress it.
+	s.recordMergeGateIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID)
+
 	// If the derived state above settled the apply terminally and a stop or
 	// cancel is still pending, complete it now so the request does not linger
 	// after the rollout has resolved.
@@ -733,6 +738,11 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 	// error must not suppress it.
 	s.publishTerminalSummaryIfWon(operationLeaseCtx, driverID, finalApply, result)
 
+	// Like the terminal summary, the merge gate request depends only on the
+	// apply settling to terminal success; record it before control-request
+	// cleanup so a cleanup error cannot suppress it.
+	s.recordMergeGateIfApplyResolved(operationLeaseCtx, driverID, finalApply.ID)
+
 	if err := s.completePendingControlRequestsIfApplyResolved(operationLeaseCtx, driverID, finalApply.ID); err != nil {
 		s.logger.Error("operator: failed to complete pending control requests for resolved apply",
 			append(finalApply.LogAttrs(),
@@ -904,6 +914,12 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 	// summary; publish it if this projection won the terminal swap.
 	s.publishTerminalSummaryIfWon(applyLeaseCtx, driverID, finalApply, result)
 
+	// Like the terminal summary, the merge gate request depends only on the
+	// apply settling to terminal success (the data-plane apply can complete
+	// while a stop was requested); record it before control-request cleanup so
+	// a cleanup error cannot suppress it.
+	s.recordMergeGateIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID)
+
 	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID); err != nil {
 		s.logger.Error("operator: failed to complete pending control requests after stop reconciliation",
 			append(finalApply.LogAttrs(),
@@ -1001,6 +1017,85 @@ func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, dr
 		"database", apply.Database, "environment", apply.Environment,
 		"state", apply.State, "operation", op)
 	return nil
+}
+
+// hasMergeGateConsumer reports whether a merge gate consumer — the
+// webhook handler's merge gate processor — exists on this server. The handler
+// registers OnMergeGateRecorded at construction, so a nil callback means
+// no GitHub runtime is configured: no PR check state to refresh and no
+// processor to drain requests.
+func (s *Service) hasMergeGateConsumer() bool {
+	return s.OnMergeGateRecorded != nil
+}
+
+// recordMergeGateIfApplyResolved records a durable merge gate request
+// once the apply has settled to terminal success. A completed apply —
+// including a completed rollback — changes the live schema of its
+// (environment, database type, database) target, which stales the stored plan
+// check state of every other open PR planning against that target. The check
+// merge gate processor consumes the durable request to re-plan those PRs. The
+// apply is reloaded because the derived-state write operates on a copy and
+// does not mutate the caller's row. Recording is idempotent (one request per
+// apply) and never fails the drive tail: errors are logged and counted, and
+// the backstop sweep over recently completed applies re-records anything
+// missed here. No-op on a server with no merge gate consumer (no GitHub
+// runtime configured) and for every settled state other than terminal
+// success — only terminal success mutates the target schema.
+func (s *Service) recordMergeGateIfApplyResolved(ctx context.Context, driverID int, applyID int64) {
+	if !s.hasMergeGateConsumer() {
+		// Without a GitHub webhook runtime this server has no PR check state
+		// to refresh and no processor to drain requests, so a recorded row
+		// would sit pending forever.
+		s.logger.Debug("operator: no merge gate consumer registered (GitHub is not configured on this server); skipping merge gate recording",
+			"driver", driverID)
+		return
+	}
+	apply, err := s.storage.Applies().Get(ctx, applyID)
+	if err != nil {
+		s.logger.Error("operator: failed to reload apply before recording merge gate request; the backstop sweep will record it",
+			"driver", driverID, "error", fmt.Errorf("reload apply %d: %w", applyID, err))
+		return
+	}
+	if apply == nil {
+		s.logger.Error("operator: apply not found while recording merge gate request; sibling checks will not be re-planned",
+			"driver", driverID, "error", fmt.Errorf("reload apply %d: %w", applyID, storage.ErrApplyNotFound))
+		return
+	}
+	if !state.IsState(apply.State, state.Apply.Completed) {
+		// Only terminal success mutates the target schema; every other outcome
+		// (still running, stopped, cancelled, failed, reverted) leaves sibling
+		// plan checks accurate.
+		s.logger.Debug("operator: apply did not settle to terminal success; no merge gate recorded",
+			append(apply.LogAttrs(), "driver", driverID)...)
+		return
+	}
+
+	recorded, err := s.storage.MergeGateRequests().Record(ctx, &storage.MergeGateRequest{
+		ApplyID:         apply.ID,
+		ApplyIdentifier: apply.ApplyIdentifier,
+		Environment:     apply.Environment,
+		DatabaseType:    apply.DatabaseType,
+		DatabaseName:    apply.Database,
+		Repository:      apply.Repository,
+		ChangeKey:       storage.ChangeKeyForPullRequest(apply.PullRequest),
+		RequestedBy:     apply.Caller,
+	})
+	if err != nil {
+		s.logger.Error("operator: failed to record merge gate request for completed apply; sibling PR checks stay stale until the backstop sweep records it",
+			append(apply.LogAttrs(), "driver", driverID, "error", err)...)
+		metrics.RecordMergeGateRecordFailure(ctx, apply.Database, apply.Environment)
+		return
+	}
+	if !recorded {
+		s.logger.Debug("operator: merge gate request already recorded for completed apply",
+			append(apply.LogAttrs(), "driver", driverID)...)
+		return
+	}
+	s.logger.Info("operator: recorded merge gate request for completed apply; sibling PR checks against the target will be re-planned",
+		append(apply.LogAttrs(), "driver", driverID)...)
+	metrics.RecordMergeGateRecorded(ctx, apply.Database, apply.Environment, metrics.MergeGateSourceDriveTail)
+	// Non-nil by the consumer gate above; wake the processor to drain now.
+	s.OnMergeGateRecorded()
 }
 
 // reconcileUnclaimableParent handles a claimed operation whose parent apply

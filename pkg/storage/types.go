@@ -1419,6 +1419,16 @@ type MergeGateRequest struct {
 	UpdatedAt      time.Time
 }
 
+// ChangeKeyForPullRequest renders a GitHub pull request number as a merge
+// gate change key. Zero (no originating PR) renders as the empty key, which
+// the fan-out treats as "exclude nothing".
+func ChangeKeyForPullRequest(pr int) string {
+	if pr <= 0 {
+		return ""
+	}
+	return strconv.Itoa(pr)
+}
+
 // WebhookEvent is a durable inbox row for one SCM/webhook delivery.
 type WebhookEvent struct {
 	ID             int64
