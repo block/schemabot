@@ -485,16 +485,17 @@ func TestDurableCheckRunDriverCompletionRetriesFoldFailure(t *testing.T) {
 }
 
 // The producer always stores a resolved positive installation ID in the row's
-// tenant, so a completion whose tenant does not resolve is a corrupted or
-// hand-crafted row: retrying cannot repair it, so the delivery fails
-// terminally instead of burning retry attempts on a deterministic failure.
+// tenant, so a completion whose tenant is missing or does not resolve is a
+// corrupted or hand-crafted row: retrying cannot repair it, so the delivery
+// fails terminally instead of burning retry attempts on a deterministic
+// failure, with the error naming which of the two defects the row has.
 func TestDurableCheckRunDriverCompletionFailsUnresolvableTenantTerminally(t *testing.T) {
 	tests := []struct {
 		name     string
 		tenantID string
 		wantErr  string
 	}{
-		{name: "empty tenant", tenantID: "", wantErr: "unparseable tenant ID"},
+		{name: "empty tenant", tenantID: "", wantErr: "missing its stored tenant"},
 		{name: "corrupted tenant", tenantID: "not-a-number", wantErr: "unparseable tenant ID"},
 		{name: "negative tenant", tenantID: "-42", wantErr: "non-positive installation ID"},
 	}

@@ -794,11 +794,18 @@ func (h *Handler) enqueueDurableWebhookEvent(ctx context.Context, event *storage
 
 // durableInstallationID resolves the installation ID for a claimed delivery
 // from the tenant persisted at enqueue. Every producer stores a resolved
-// positive installation ID in TenantID, so an unparseable or non-positive
-// tenant is a corrupted or hand-crafted row: retrying cannot repair it, and
-// driver work runs outside an HTTP request, so there is no out-of-band
-// resolution to recover with. Callers treat the returned error as terminal.
+// positive installation ID in TenantID, so a missing, unparseable, or
+// non-positive tenant is a corrupted or hand-crafted row: retrying cannot
+// repair it, and driver work runs outside an HTTP request, so there is no
+// out-of-band resolution to recover with. Callers treat the returned error as
+// terminal. A missing tenant is reported distinctly from an unparseable one so
+// triage can tell an enqueue that stored nothing apart from one that stored
+// garbage.
 func durableInstallationID(event *storage.WebhookEvent) (int64, error) {
+	if event.TenantID == "" {
+		return 0, fmt.Errorf("durable %s delivery %s for %s is missing its stored tenant",
+			event.Event, event.DeliveryID, durableDeliveryLocation(event))
+	}
 	installationID, err := strconv.ParseInt(event.TenantID, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("durable %s delivery %s for %s has an unparseable tenant ID %q: %w",
