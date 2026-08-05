@@ -1101,8 +1101,9 @@ func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, dri
 // deployment's tasks via ResumeApplyOperation with both the operation lease (for
 // the operation's tasks) and the parent apply lease (for the applies.state the
 // engine still writes) attached to ctx, so sibling deployments are unaffected;
-// when it is 0 (the legacy whole-apply path) it drives every task of the apply
-// via ResumeApply with only the apply lease attached. Returns true when the work
+// when it is 0 (the whole-apply drive the stop-reconciliation claim uses) it
+// drives every task of the apply via ResumeApply with only the apply lease
+// attached. Returns true when the work
 // resumed without error. Failures are logged and recorded as metrics internally;
 // the bool lets the operation-level claim loop decide whether to mark its
 // operation terminal, and the returned error lets it distinguish the fail-closed
@@ -1138,8 +1139,9 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 	// operationDeployment is observability attribution only — RoutingClient
 	// reloads the operation row and routes by its own deployment. The
 	// operation-claim path passes the claimed op's deployment so logs/metrics
-	// name the deployment actually being driven; the legacy whole-apply path
-	// passes "" and falls back to the apply's stored deployment. For single-op
+	// name the deployment actually being driven; the whole-apply
+	// stop-reconciliation drive passes "" and falls back to the apply's stored
+	// deployment. For single-op
 	// applies the two are equal, so the attribution is unchanged.
 	deployment := operationDeployment
 	if deployment == "" {
@@ -1187,7 +1189,8 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 	// leased so sibling deployments are unaffected; ResumeApplyOperation fails
 	// closed when no tasks scope to the operation. The cutover variant drives a
 	// barrier-parked operation through its swap instead of its copy phase. The
-	// legacy whole-apply path (applyOperationID == 0) drives every task.
+	// whole-apply stop-reconciliation drive (applyOperationID == 0) drives
+	// every task.
 	// The drive runs behind a panic boundary: engine and resume code process
 	// stored metadata, so one poisoned row must degrade only this apply, not
 	// the process. A contained panic surfaces as a *panicsafe.Error and is

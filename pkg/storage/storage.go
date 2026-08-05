@@ -411,12 +411,12 @@ type ApplyStore interface {
 	CountRecentByState(ctx context.Context, filter RecentAppliesFilter) (map[string]int, error)
 
 	// GetInProgress returns all applies in non-terminal states.
-	// Note: For recovery, use FindNextApply which handles locking.
+	// Note: For recovery, use ClaimApplyByID which handles locking.
 	GetInProgress(ctx context.Context) ([]*Apply, error)
 
-	// FindStuckPendingApplies returns pending applies that FindNextApply should
+	// FindStuckPendingApplies returns pending applies that a driver should
 	// already have claimed — pending with child rows (the child-rows arm of
-	// FindNextApply's pending predicate) — but whose created_at is older than
+	// ClaimApplyByID's pending predicate) — but whose created_at is older than
 	// olderThan, ordered oldest first and capped at limit. It is a read-only
 	// diagnostic: apply creation rejects a second active apply for the same
 	// target rather than queuing it, so a pending apply this old is not waiting
@@ -425,16 +425,9 @@ type ApplyStore interface {
 	// nothing is stuck. A non-positive limit means no cap.
 	FindStuckPendingApplies(ctx context.Context, olderThan time.Duration, limit int) ([]*Apply, error)
 
-	// FindNextApply atomically claims the next apply that needs attention.
-	// A claim selects one apply that needs work and refreshes its heartbeat in
-	// the same transaction. The owner is stored with a freshly generated lease
-	// token so operator-owned writes can fail closed after ownership changes.
-	// Returns the claimed apply, or nil if nothing needs work.
-	FindNextApply(ctx context.Context, owner string) (*Apply, error)
-
-	// ClaimApplyByID atomically claims one specific apply by ID, scoped to the
-	// same claimability rules as FindNextApply (pending with tasks, stale active
-	// state, retryable within budget, or a pending start control request). On a
+	// ClaimApplyByID atomically claims one specific apply by ID when it needs a
+	// driver (pending with child rows, stale active state, retryable within
+	// budget, or a pending start control request). On a
 	// successful claim it rotates the lease (owner, token, acquired_at) and
 	// refreshes the heartbeat so operator-owned writes can fail closed after
 	// ownership changes. Returns the claimed apply, or nil if the apply does not
@@ -449,7 +442,7 @@ type ApplyStore interface {
 	// failed_retryable and stopped are excluded because they have their own resume
 	// paths — that has a pending stop control request, at least one
 	// pending operation, and no active operation (none being driven and none
-	// awaiting stale recovery), rotating the lease onto it like FindNextApply. It
+	// awaiting stale recovery), rotating the lease onto it like ClaimApplyByID. It
 	// is the trigger for stop reconciliation when no operation is claimable to
 	// carry it: under on_failure "continue" a failed earlier sibling can leave the
 	// apply with only terminal and pending operations, and the claim gate keeps

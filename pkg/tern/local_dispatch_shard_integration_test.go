@@ -20,8 +20,8 @@ import (
 // A shard-scoped dispatch — the control plane's per-shard fan-out sending one
 // (namespace, shard, table)'s changes to a data plane — tags its drive tasks
 // with the target shard and stamps the matching shard operation key on its
-// operation row. The operator's whole-apply claim must load those tasks and
-// drive them through the engine: the apply reaches completed only after the
+// operation row. The operator's drive of the claimed apply must load those
+// tasks and run them through the engine: the apply reaches completed only after the
 // dispatched DDL actually ran on the target, never by completing a task-less
 // no-op that leaves the work pending.
 func TestLocalClient_ShardScopedDispatchDrivesItsTasks(t *testing.T) {
@@ -99,7 +99,7 @@ func TestLocalClient_ShardScopedDispatchDrivesItsTasks(t *testing.T) {
 	assert.Equal(t, state.Task.Pending, tasks[0].State)
 
 	// The operator claim drives the queued dispatch to completion.
-	startTestOperator(t, stor, client)
+	startTestOperator(t, stor, client, applyResp.ApplyId)
 	waitForApplyComplete(t, client, ctx, applyResp.ApplyId)
 
 	// The dispatched DDL actually ran on the target database.

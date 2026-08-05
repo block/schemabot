@@ -1210,7 +1210,7 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsTerminal(t *testing.T) 
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_ClaimsStoppedWithPendingStart
-// verifies stop/start parity with ApplyStore.FindNextApply: a stopped operation
+// verifies stop/start parity with ApplyStore.ClaimApplyByID: a stopped operation
 // whose parent apply has a pending start request is reclaimable so the operator
 // can resume it. Without this, a stopped operation would strand the apply's
 // start request under the operation-claim path. The re-claim keeps the row's
@@ -1569,7 +1569,7 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsStoppedWithFailedStartU
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableWithinBudget
-// verifies recovery parity with ApplyStore.FindNextApply: a failed_retryable
+// verifies recovery parity with ApplyStore.ClaimApplyByID: a failed_retryable
 // operation is reclaimable while its parent apply still has recovery budget
 // (attempt < max) and the failure is recent. The re-claim keeps the row's
 // failed_retryable state (the resume drive transitions it) and refreshes the
@@ -1862,7 +1862,7 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableBudgetEx
 
 // TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableStale
 // verifies the freshness window is enforced: an old failed_retryable failure is
-// not reclaimed, matching ApplyStore.FindNextApply's recovery-freshness gate.
+// not reclaimed, matching ApplyStore.ClaimApplyByID's recovery-freshness gate.
 func TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableStale(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -1919,7 +1919,7 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableParentAc
 // verifies crash recovery: if the driver driving a retry dies, the parent apply
 // is left active (running) with a stale heartbeat while the child row still says
 // failed_retryable. Another driver must be able to reclaim that child to recover
-// the in-flight retry, mirroring ApplyStore.FindNextApply's stale-active clause.
+// the in-flight retry, mirroring ApplyStore.ClaimApplyByID's stale-active clause.
 func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableParentActiveStale(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -2022,7 +2022,7 @@ func TestApplyOperationStore_FindNextApplyOperation_RecoversStaleSetupPhase(t *t
 // TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaims verifies
 // the SKIP LOCKED contract on a contended row: N drivers race to claim a
 // single pending child row, and exactly one wins. Mirrors the apply-level
-// TestApplyStore_FindNextApplyConcurrentPendingClaims.
+// TestApplyStore_ClaimApplyByIDConcurrentPendingClaims.
 func TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaims(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

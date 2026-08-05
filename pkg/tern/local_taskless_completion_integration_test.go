@@ -100,7 +100,7 @@ func TestLocalClient_ResumeRefusesTasklessCompletionWhenApplyOwnsTaskRows(t *tes
 	require.NoError(t, err)
 	require.Empty(t, loaded, "the hidden task row must not load through the whole-apply loader for this scenario to hold")
 
-	claimed, err := stor.Applies().FindNextApply(ctx, "test-operator-"+t.Name())
+	claimed, err := stor.Applies().ClaimApplyByID(ctx, apply.ID, "test-operator-"+t.Name())
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	require.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
@@ -144,7 +144,7 @@ func TestLocalClient_TasklessApplyCompletesWithDurableLog(t *testing.T) {
 
 	apply := dispatchQueuedApply(t, stor, client, nil)
 
-	claimed, err := stor.Applies().FindNextApply(ctx, "test-operator-"+t.Name())
+	claimed, err := stor.Applies().ClaimApplyByID(ctx, apply.ID, "test-operator-"+t.Name())
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	require.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
