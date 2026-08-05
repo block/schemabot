@@ -1370,23 +1370,39 @@ const (
 	MergeGateFailed     = "failed"
 )
 
+// Merge gate request kinds. A preflight request runs before an apply's
+// engine work starts: it holds every sibling change's stored check on the
+// target action-required so a merge cannot land on a verdict the apply is
+// about to invalidate, and the operator gate blocks the apply's start until
+// it completes. A settle request runs after the apply settles terminally: it
+// re-plans each sibling against the (possibly changed) live schema, which
+// both refreshes the verdicts and releases the preflight holds.
+const (
+	MergeGateKindPreflight = "preflight"
+	MergeGateKindSettle    = "settle"
+)
+
 // MergeGateRequest is a durable request to re-evaluate stored check state
 // for every open change targeting one (environment, database_type,
-// database_name) after an apply successfully changed that target's live
-// schema. Plans and merge-gate statuses on sibling changes were computed
-// against the previous live schema, so each request fans out to those changes
-// and re-plans them; the request row is the durable record that the fan-out
-// must happen, surviving pod restarts and lease handovers.
+// database_name) around an apply against that target. Plans and merge-gate
+// statuses on sibling changes were computed against the pre-apply live
+// schema, so each request fans out to those changes — a preflight holds
+// their checks while the apply runs, a settle re-plans them once it
+// finishes. The request row is the durable record that the fan-out must
+// happen, surviving pod restarts and lease handovers.
 //
-// One row exists per originating apply (unique on apply_id), so recording is
-// idempotent and a sweep over recently completed applies can backfill any
-// request lost between the apply's terminal write and its recording.
+// One row exists per originating apply and kind (unique on apply_id + kind),
+// so recording is idempotent and the backstop sweeps can backfill any request
+// lost between the apply's state write and its recording.
 type MergeGateRequest struct {
 	ID int64
 	// ApplyID is the internal row id of the originating apply, used only for
 	// the uniqueness guard and sweep join. Logs and operator-facing text use
 	// ApplyIdentifier.
 	ApplyID int64
+	// Kind selects the fan-out the processor runs for this request:
+	// CheckRefreshKindPreflight or CheckRefreshKindSettle.
+	Kind string
 	// ApplyIdentifier is the originating apply's user-facing string identifier,
 	// carried for attribution in refreshed check summaries and logs.
 	ApplyIdentifier string

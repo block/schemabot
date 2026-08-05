@@ -1,6 +1,7 @@
 CREATE TABLE `merge_gate_requests` (
   `id` bigint unsigned NOT NULL AUTO_INCREMENT,
   `apply_id` bigint unsigned NOT NULL,
+  `kind` varchar(20) NOT NULL,
   `apply_identifier` varchar(255) NOT NULL,
   `environment` varchar(50) NOT NULL,
   `database_type` varchar(50) NOT NULL,
@@ -20,7 +21,7 @@ CREATE TABLE `merge_gate_requests` (
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  UNIQUE KEY `idx_merge_gate_apply` (`apply_id`),
+  UNIQUE KEY `idx_merge_gate_apply` (`apply_id`,`kind`),
   KEY `idx_merge_gate_claimable` (`state`,`retry_after`,`lease_expires_at`,`created_at`),
   KEY `idx_merge_gate_target` (`environment`,`database_type`,`database_name`,`state`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

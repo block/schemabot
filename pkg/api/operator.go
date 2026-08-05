@@ -1072,6 +1072,7 @@ func (s *Service) recordMergeGateIfApplyResolved(ctx context.Context, driverID i
 
 	recorded, err := s.storage.MergeGateRequests().Record(ctx, &storage.MergeGateRequest{
 		ApplyID:         apply.ID,
+		Kind:            storage.CheckRefreshKindSettle,
 		ApplyIdentifier: apply.ApplyIdentifier,
 		Environment:     apply.Environment,
 		DatabaseType:    apply.DatabaseType,
