@@ -55,17 +55,17 @@ func TestSettings(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.Empty(t, settings)
 
-		// Create some settings
-		keys := []string{"aaa", "bbb", "ccc"}
-		for _, key := range keys {
+		// Create settings out of key order so the sorted-output assertion
+		// below cannot pass by insertion order alone.
+		for _, key := range []string{"bbb", "ccc", "aaa"} {
 			require.NoError(t, store.Settings().Set(ctx, key, "value-"+key))
 		}
 
-		// List should return all settings, sorted by key
+		// List must return all settings ordered by key ascending.
 		settings, err = store.Settings().List(ctx)
 		require.NoError(t, err)
 		require.Len(t, settings, 3)
-		for i, key := range keys {
+		for i, key := range []string{"aaa", "bbb", "ccc"} {
 			require.Equal(t, key, settings[i].Key)
 		}
 	})

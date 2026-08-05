@@ -6,7 +6,9 @@
 //
 // An implementation package wires itself in by implementing Harness against
 // its own test fixture (container, schema bootstrap, table clearing) and
-// calling the exported Test functions from its integration tests.
+// calling Run from its integration tests. Per-family Test functions are also
+// exported so a family can be exercised in isolation while it is being
+// brought up on a new implementation.
 package storagetest
 
 import (
@@ -21,10 +23,15 @@ import (
 // Harness supplies dialect-specific fixtures to the parity suite. Each
 // storage implementation provides one, backed by its own integration-test
 // infrastructure.
+//
+// The suite runs subtests sequentially (no t.Parallel), so a harness may
+// assume only one Storage from NewStorage is live at a time.
 type Harness interface {
 	// NewStorage returns a Storage backed by an empty, fully bootstrapped
-	// schema. The suite calls it at the start of every subtest, so
-	// implementations must clear all rows written by earlier subtests.
+	// schema. The suite calls it at the start of every subtest; state
+	// written by earlier subtests must not be visible through the returned
+	// Storage. Per-subtest truncation, fresh schemas, and transaction
+	// rollback are all valid strategies.
 	NewStorage(t *testing.T) storage.Storage
 	// NewUnreachableStorage returns a Storage whose backing database
 	// connection is unusable (for example, already closed), so the suite can
@@ -32,6 +39,19 @@ type Harness interface {
 	// instead of swallowing them.
 	NewUnreachableStorage(t *testing.T) storage.Storage
 }
+
+// Run executes every parity family against the harness. Implementations call
+// Run from a single integration test so a storage backend cannot silently
+// opt out of part of the contract — each new family is added here as it
+// lands.
+func Run(t *testing.T, h Harness) {
+	t.Run("Settings", func(t *testing.T) { TestSettings(t, h) })
+	t.Run("ApplyLogs", func(t *testing.T) { TestApplyLogs(t, h) })
+}
+
+// Fixture helpers. These build the canonical Lock/Apply rows used by the
+// parity families, and implementation packages delegate their own test
+// fixtures here so both suites always validate the same row shape.
 
 // CreateLock acquires a lock for the given target and returns the stored row.
 func CreateLock(t *testing.T, store storage.Storage, dbName, dbType string) *storage.Lock {

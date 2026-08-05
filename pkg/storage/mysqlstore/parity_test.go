@@ -29,10 +29,6 @@ func (mysqlHarness) NewUnreachableStorage(t *testing.T) storage.Storage {
 	return New(db)
 }
 
-func TestStorageParity_Settings(t *testing.T) {
-	storagetest.TestSettings(t, mysqlHarness{})
-}
-
-func TestStorageParity_ApplyLogs(t *testing.T) {
-	storagetest.TestApplyLogs(t, mysqlHarness{})
+func TestStorageParity(t *testing.T) {
+	storagetest.Run(t, mysqlHarness{})
 }

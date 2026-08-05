@@ -78,13 +78,14 @@ func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error
 	return nil
 }
 
-// GetByApply returns all logs for an apply, ordered by created_at.
+// GetByApply returns all logs for an apply, ordered by created_at ascending.
+// Ties on created_at are broken by id so entries keep their insertion order.
 func (s *applyLogStore) GetByApply(ctx context.Context, applyID int64) ([]*storage.ApplyLog, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+applyLogColumns+`
 		FROM apply_logs
 		WHERE apply_id = ?
-		ORDER BY created_at ASC
+		ORDER BY created_at ASC, id ASC
 	`, applyID)
 	if err != nil {
 		return nil, err
