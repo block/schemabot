@@ -18,6 +18,7 @@ import (
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/storage/storagetest"
 )
 
 func TestApplyStore_Create(t *testing.T) {
@@ -4017,30 +4018,19 @@ func TestApplyStore_AllFields(t *testing.T) {
 
 // Helper functions
 
+// The fixture helpers delegate to storagetest so this package's tests and the
+// cross-dialect parity suite always build identical Lock/Apply row shapes.
+
 func createTestLock(t *testing.T, store *Storage, dbName, dbType, env string) *storage.Lock {
 	t.Helper()
-	return createTestLockWithPR(t, store, dbName, dbType, env, "org/repo", 123)
+	_ = env // unused, but kept for API compatibility with tests
+	return storagetest.CreateLock(t, store, dbName, dbType)
 }
 
 func createTestLockWithPR(t *testing.T, store *Storage, dbName, dbType, env, repo string, pr int) *storage.Lock {
 	t.Helper()
-	ctx := t.Context()
-
 	_ = env // unused, but kept for API compatibility with tests
-
-	lock := &storage.Lock{
-		DatabaseName: dbName,
-		DatabaseType: dbType,
-		Repository:   repo,
-		PullRequest:  pr,
-		Owner:        "testuser",
-	}
-
-	require.NoError(t, store.Locks().Acquire(ctx, lock))
-
-	lock, err := store.Locks().Get(ctx, dbName, dbType)
-	require.NoError(t, err)
-	return lock
+	return storagetest.CreateLockWithPR(t, store, dbName, dbType, repo, pr)
 }
 
 // getStartControlRequest reads the 'start' control request for an apply
@@ -4092,41 +4082,17 @@ func assertExactlyOneActiveApply(t *testing.T, store *Storage, database, dbType,
 
 func createTestApply(t *testing.T, store *Storage, lock *storage.Lock, applyID string, planID int64) *storage.Apply {
 	t.Helper()
-	return createTestApplyWithEnv(t, store, lock, applyID, planID, "staging")
-}
-
-func createTestApplyWithEnv(t *testing.T, store *Storage, lock *storage.Lock, applyID string, planID int64, env string) *storage.Apply {
-	t.Helper()
-	return createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Pending, env)
+	return storagetest.CreateApply(t, store, lock, applyID, planID)
 }
 
 func createTestApplyWithStateAndEnv(t *testing.T, store *Storage, lock *storage.Lock, applyID string, planID int64, applyState, env string) *storage.Apply {
 	t.Helper()
-	return createTestApplyWithStateEnvDeployment(t, store, lock, applyID, planID, applyState, env, "")
+	return storagetest.CreateApplyWithStateAndEnv(t, store, lock, applyID, planID, applyState, env)
 }
 
 func createTestApplyWithStateEnvDeployment(t *testing.T, store *Storage, lock *storage.Lock, applyID string, planID int64, applyState, env, deployment string) *storage.Apply {
 	t.Helper()
-	ctx := t.Context()
-
-	apply := &storage.Apply{
-		ApplyIdentifier: applyID,
-		LockID:          lock.ID,
-		PlanID:          planID,
-		Database:        lock.DatabaseName,
-		DatabaseType:    lock.DatabaseType,
-		Repository:      lock.Repository,
-		PullRequest:     lock.PullRequest,
-		Environment:     env,
-		Deployment:      deployment,
-		Engine:          storage.EngineForType(lock.DatabaseType),
-		State:           applyState,
-	}
-
-	id, err := store.Applies().Create(ctx, apply)
-	require.NoError(t, err)
-	apply.ID = id
-	return apply
+	return storagetest.CreateApplyWithStateEnvDeployment(t, store, lock, applyID, planID, applyState, env, deployment)
 }
 
 // DB error tests

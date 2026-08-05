@@ -1,6 +1,6 @@
 # storage
 
-Package `storage` defines the persistence interfaces for SchemaBot. All state — locks, plans, applies, tasks, logs, control requests, settings — flows through these interfaces. The MySQL implementation lives in [`storage/mysqlstore`](./mysqlstore/).
+Package `storage` defines the persistence interfaces for SchemaBot. All state — locks, plans, applies, tasks, logs, control requests, settings — flows through these interfaces. The MySQL implementation lives in [`storage/mysqlstore`](./mysqlstore/). The cross-dialect behavioral parity suite that every implementation must pass lives in [`storage/storagetest`](./storagetest/).
 
 ## Interface Hierarchy
 

@@ -209,10 +209,11 @@ type SettingsStore interface {
 	// Set saves a setting. Creates if not exists, updates if exists.
 	Set(ctx context.Context, key string, value string) error
 
-	// List returns all settings.
+	// List returns all settings, ordered by key ascending.
 	List(ctx context.Context) ([]*Setting, error)
 
-	// Delete removes a setting by key.
+	// Delete removes a setting by key. It returns ErrSettingNotFound when no
+	// setting with that key exists.
 	Delete(ctx context.Context, key string) error
 }
 
@@ -891,21 +892,30 @@ type ReapedOperation struct {
 // ApplyLogStore manages apply log entries for debugging and audit.
 // Logs capture state transitions, errors, and events during schema changes.
 // Logs are kept forever for audit purposes.
+//
+// Ordering contract: every read returns entries ordered by created_at
+// ascending, with ties on created_at broken by ascending id so entries keep
+// their insertion order. Callers rendering log tails (PR comments, the logs
+// API) depend on same-timestamp bursts reading in the order they were
+// appended, so implementations must provide the tie-break regardless of the
+// backing store's timestamp precision.
 type ApplyLogStore interface {
 	// Append adds a new log entry.
 	Append(ctx context.Context, log *ApplyLog) error
 
-	// GetByApply returns all logs for an apply, ordered by created_at.
+	// GetByApply returns all logs for an apply, ordered by created_at
+	// ascending with ties broken by ascending id.
 	GetByApply(ctx context.Context, applyID int64) ([]*ApplyLog, error)
 
 	// GetRecentByApply returns the newest limit logs for an apply, ordered by
-	// created_at ascending so the result reads chronologically. The query is
-	// bounded — long-running applies can accumulate far more log rows than a
-	// caller rendering a tail needs.
+	// created_at ascending (ties broken by ascending id) so the result reads
+	// chronologically. The query is bounded — long-running applies can
+	// accumulate far more log rows than a caller rendering a tail needs.
 	GetRecentByApply(ctx context.Context, applyID int64, limit int) ([]*ApplyLog, error)
 
 	// List returns the newest Limit logs matching the filter criteria,
-	// ordered by created_at ascending so the result reads chronologically.
+	// ordered by created_at ascending (ties broken by ascending id) so the
+	// result reads chronologically.
 	List(ctx context.Context, filter ApplyLogFilter) ([]*ApplyLog, error)
 }
 
