@@ -410,38 +410,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	// Deploy (starts the schema change). PlanetScale may still be validating
-	// the deploy request even after reporting "ready", so retry on transient
-	// validation errors.
-	drNumber := dr.Number
-	var deployErr error
-	for attempt := range maxRetries {
-		if attempt > 0 {
-			delay := retryDelay(attempt, deployErr)
-			e.logger.Warn("retrying deploy request", "deploy_request", drNumber, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", deployErr)
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(delay):
-			}
-		}
-		dr, deployErr = client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
-			Organization: org,
-			Database:     req.Database,
-			Number:       drNumber,
-			InstantDDL:   useInstant,
-		})
-		if deployErr == nil {
-			break
-		}
-		if strings.Contains(deployErr.Error(), "approved") {
-			return nil, fmt.Errorf("deploy request #%d could not be deployed: PlanetScale deploy request approvals are not supported — disable 'Require administrator approval for deploy requests' in the PlanetScale database settings", drNumber)
-		}
-		if !isRetryablePSError(deployErr) {
-			return nil, fmt.Errorf("deploy deploy request #%d: %w", drNumber, deployErr)
-		}
-	}
-	if deployErr != nil {
-		return nil, fmt.Errorf("deploy deploy request #%d (after %d attempts): %w", drNumber, maxRetries, deployErr)
+	// the deploy request even after it leaves the pending state, and transient
+	// API errors may occur; deployDeployRequest absorbs both.
+	dr, err = e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, useInstant)
+	if err != nil {
+		return nil, err
 	}
 
 	emitEvent(engine.ApplyEvent{
@@ -856,9 +829,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// context can be identified once Vitess creates migrations for this deploy.
 	existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
 
-	dr, err = client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
-		Organization: org, Database: req.Database, Number: dr.Number, InstantDDL: useInstant,
-	})
+	dr, err = e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, useInstant)
 	if err != nil {
 		return nil, fmt.Errorf("deploy on resume: %w", err)
 	}
@@ -938,11 +909,9 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 		// Vitess context can be identified after Vitess creates migrations.
 		existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
 
-		deployed, deployErr := client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
-			Organization: org, Database: req.Database, Number: dr.Number, InstantDDL: meta.IsInstant,
-		})
+		deployed, deployErr := e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, meta.IsInstant)
 		if deployErr != nil {
-			return nil, fmt.Errorf("deploy recovered deploy request #%d on resume: %w", dr.Number, deployErr)
+			return nil, fmt.Errorf("recovered deploy request on resume: %w", deployErr)
 		}
 		dr = deployed
 
