@@ -1024,11 +1024,13 @@ func TestOperator_OperationWithoutTasksFailsClosed(t *testing.T) {
 	require.NotNil(t, op.CompletedAt, "a failed operation stamps completed_at")
 
 	// The parent apply state is derived from its child operations, so a single
-	// failed operation drives the parent to failed.
-	parent, err := ts.Storage.Applies().Get(ctx, applyDBID)
-	require.NoError(t, err)
-	require.NotNil(t, parent)
-	assert.Equal(t, state.Apply.Failed, parent.State,
+	// failed operation drives the parent to failed. The re-derivation is a
+	// separate write after the operation is terminalized, so poll for it.
+	require.Eventually(t, func() bool {
+		parent, err := ts.Storage.Applies().Get(ctx, applyDBID)
+		require.NoError(t, err)
+		return parent != nil && state.IsState(parent.State, state.Apply.Failed)
+	}, 10*time.Second, 200*time.Millisecond,
 		"parent apply is derived from its operations and must reflect the failed child")
 }
 

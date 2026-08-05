@@ -24,6 +24,7 @@ type Storage struct {
 	checks          *checkStore
 	settings        *settingsStore
 	webhookEvents   *webhookEventStore
+	checkRefreshes  *checkRefreshRequestStore
 }
 
 // New creates a new MySQL storage instance.
@@ -42,6 +43,7 @@ func New(db *sql.DB) *Storage {
 		checks:          &checkStore{db: db, dialect: MySQLDialect{}},
 		settings:        &settingsStore{db: db, dialect: MySQLDialect{}},
 		webhookEvents:   &webhookEventStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}},
+		checkRefreshes:  &checkRefreshRequestStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}},
 	}
 }
 
@@ -103,6 +105,11 @@ func (s *Storage) Settings() storage.SettingsStore {
 // WebhookEvents returns the durable webhook event inbox store.
 func (s *Storage) WebhookEvents() storage.WebhookEventStore {
 	return s.webhookEvents
+}
+
+// CheckRefreshRequests returns the durable check refresh request store.
+func (s *Storage) CheckRefreshRequests() storage.CheckRefreshRequestStore {
+	return s.checkRefreshes
 }
 
 // Ping verifies the database connection is alive.

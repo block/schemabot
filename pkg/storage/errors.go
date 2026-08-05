@@ -68,4 +68,10 @@ var (
 
 	// ErrWebhookEventLeaseLost is returned when a driver no longer owns a durable webhook event.
 	ErrWebhookEventLeaseLost = errors.New("webhook event lease lost")
+
+	// ErrCheckRefreshNotFound is returned when a durable check refresh request does not exist.
+	ErrCheckRefreshNotFound = errors.New("check refresh request not found")
+
+	// ErrCheckRefreshLeaseLost is returned when a driver no longer owns a durable check refresh request.
+	ErrCheckRefreshLeaseLost = errors.New("check refresh request lease lost")
 )

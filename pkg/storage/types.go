@@ -1358,6 +1358,63 @@ type WebhookInboxStats struct {
 	StuckProcessing int64
 }
 
+// MaxCheckRefreshAttempts is the claim budget for check refresh requests: how
+// many times a request may be claimed before a failure is recorded as
+// terminal. Attempts increment on claim, so a request that keeps failing (for
+// example against a misconfigured repository) cannot retry forever.
+const MaxCheckRefreshAttempts = 5
+
+// Check refresh request states.
+const (
+	CheckRefreshPending    = "pending"
+	CheckRefreshProcessing = "processing"
+	CheckRefreshCompleted  = "completed"
+	CheckRefreshFailed     = "failed"
+)
+
+// CheckRefreshRequest is a durable request to re-evaluate stored check state
+// for every open PR targeting one (environment, database_type, database_name)
+// after an apply successfully changed that target's live schema. Plans and
+// Check Runs on sibling PRs were computed against the previous live schema, so
+// each request fans out to those PRs and re-plans them; the request row is the
+// durable record that the fan-out must happen, surviving pod restarts and
+// lease handovers.
+//
+// One row exists per originating apply (unique on apply_id), so recording is
+// idempotent and a sweep over recently completed applies can backfill any
+// request lost between the apply's terminal write and its recording.
+type CheckRefreshRequest struct {
+	ID int64
+	// ApplyID is the internal row id of the originating apply, used only for
+	// the uniqueness guard and sweep join. Logs and operator-facing text use
+	// ApplyIdentifier.
+	ApplyID int64
+	// ApplyIdentifier is the originating apply's user-facing string identifier,
+	// carried for attribution in refreshed check summaries and logs.
+	ApplyIdentifier string
+	Environment     string
+	DatabaseType    string
+	DatabaseName    string
+	// Repository and PullRequest identify the PR that originated the apply,
+	// when there is one. The fan-out excludes that PR — its own apply lifecycle
+	// already updates its stored check state. Both are zero for CLI/gRPC
+	// applies, which have no originating PR and therefore exclude nothing.
+	Repository  string
+	PullRequest int
+	// RequestedBy is the originating apply's caller, carried for attribution.
+	RequestedBy    string
+	State          string
+	Attempts       int
+	LeaseOwner     string
+	LeaseToken     string
+	LeaseExpiresAt *time.Time
+	RetryAfter     *time.Time
+	LastError      string
+	CompletedAt    *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
 // WebhookEvent is a durable inbox row for one SCM/webhook delivery.
 type WebhookEvent struct {
 	ID             int64
