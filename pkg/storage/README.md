@@ -1,6 +1,6 @@
 # storage
 
-Package `storage` defines the persistence interfaces for SchemaBot. All state — locks, plans, applies, tasks, logs, control requests, settings — flows through these interfaces. The MySQL implementation lives in [`storage/mysqlstore`](./mysqlstore/).
+Package `storage` defines the persistence interfaces for SchemaBot. All state — locks, plans, applies, tasks, logs, control requests, settings — flows through these interfaces. The MySQL implementation lives in [`storage/mysqlstore`](./mysqlstore/). The cross-dialect behavioral parity suite that every implementation must pass lives in [`storage/storagetest`](./storagetest/).
 
 ## Interface Hierarchy
 
@@ -55,8 +55,9 @@ See [`pkg/state`](../state/) for the full state hierarchy (apply states, task st
 The apply store supports crash recovery through heartbeat-based leasing:
 
 - **Heartbeat**: Drivers call `Heartbeat(applyID)` every 10 seconds to signal they're alive
-- **FindNextApply**: Claims one apply with a stale heartbeat (>1 minute since last update) by selecting it and refreshing its heartbeat in one transaction
-- If a driver crashes, its apply becomes claimable after the heartbeat times out
+- **Discovery**: the operation ladder (`FindNextApplyOperation`) scans for claimable work, including operation rows whose heartbeat went stale (>1 minute since last update)
+- **ClaimApplyByID**: after leasing an operation row, the driver leases its parent apply by ID — the claim predicate covers pending applies with child rows, stale active states, retryable applies within budget, and pending start control requests, and rotates the lease and heartbeat in one transaction
+- If a driver crashes, its work becomes claimable after the heartbeat times out
 
 ## Webhook Inbox Retention
 

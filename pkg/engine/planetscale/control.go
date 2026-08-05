@@ -176,14 +176,9 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 		"deploy_request", meta.DeployRequestID,
 		"instant_ddl", meta.IsInstant,
 	)
-	dr, deployErr := client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
-		Organization: credOrg(req.Credentials),
-		Database:     req.Database,
-		Number:       meta.DeployRequestID,
-		InstantDDL:   meta.IsInstant,
-	})
+	dr, deployErr := e.deployDeployRequest(ctx, client, credOrg(req.Credentials), req.Database, meta.DeployRequestID, meta.IsInstant)
 	if deployErr != nil {
-		return nil, fmt.Errorf("deploy deploy request #%d: %w", meta.DeployRequestID, deployErr)
+		return nil, deployErr
 	}
 	return &engine.ControlResult{
 		Accepted:    true,

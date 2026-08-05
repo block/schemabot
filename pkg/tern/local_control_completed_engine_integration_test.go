@@ -61,7 +61,7 @@ func TestLocalClient_CancelAfterEngineChangeCompletedSettlesCompleted(t *testing
 	require.True(t, cancelResp.Accepted)
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestPending)
 
-	driveNextQueuedApply(t, stor, client)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
 
 	settled, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
@@ -81,7 +81,7 @@ func TestLocalClient_CancelAfterEngineChangeCompletedSettlesCompleted(t *testing
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestCompleted)
 	assert.Contains(t, eng.recorded(), "Cancel", "the drive must consult the engine before settling")
 
-	reclaimed, err := stor.Applies().FindNextApply(ctx, "test-reclaim-"+t.Name())
+	reclaimed, err := stor.Applies().ClaimApplyByID(ctx, apply.ID, "test-reclaim-"+t.Name())
 	require.NoError(t, err)
 	assert.Nil(t, reclaimed, "a completed apply must not be claimable again")
 }

@@ -64,6 +64,34 @@ func newOperatorTestService(opStore storage.ApplyOperationStore) *Service {
 	return New(&mockStorageWithApplyOperations{applyOps: opStore}, testServerConfig(), nil, logger)
 }
 
+// failingStopReconciliationApplyStore errors on the stop-reconciliation claim.
+// It embeds the interface so only that method needs an implementation; any
+// other call panics, which keeps the test honest about the code path it covers.
+type failingStopReconciliationApplyStore struct {
+	storage.ApplyStore
+	err error
+}
+
+func (s *failingStopReconciliationApplyStore) FindNextApplyForStopReconciliation(context.Context, string) (*storage.Apply, error) {
+	return nil, s.err
+}
+
+// TestRecoverApplyPendingStop_ClaimErrorDoesNotConsumeTick verifies the driver
+// ladder keeps moving when the stop-reconciliation claim itself fails: a failed
+// claim did no work and holds no lease, so the tick must fall through to the
+// operation claim instead of a persistent storage error on this first rung
+// starving every claim the driver runs after it.
+func TestRecoverApplyPendingStop_ClaimErrorDoesNotConsumeTick(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		applies: &failingStopReconciliationApplyStore{err: errors.New("storage unavailable")},
+	}, testServerConfig(), nil, logger)
+
+	consumed := svc.recoverApplyPendingStop(t.Context(), 1, driverLeaseOwner(1))
+
+	assert.False(t, consumed, "a failed stop-reconciliation claim must not consume the driver tick")
+}
+
 type noopProgressObserver struct{}
 
 func (noopProgressObserver) OnProgress(*storage.Apply, []*storage.Task) {}
@@ -1746,6 +1774,10 @@ func (s *operationClaimApplyStore) FindNextApplyForStopReconciliation(context.Co
 	if s.stopProbePanic != "" {
 		panic(s.stopProbePanic)
 	}
+	return nil, nil
+}
+
+func (s *operationClaimApplyStore) FindNextApplyForOperationProjection(context.Context, string) (*storage.Apply, error) {
 	return nil, nil
 }
 

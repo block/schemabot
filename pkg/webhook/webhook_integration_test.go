@@ -171,6 +171,10 @@ type e2eServiceOpts struct {
 	// engine policies (e.g. direct execution) for the test's plans and
 	// applies.
 	engineMetadata map[string]string
+	// skipOperator leaves the operator claim loop stopped so a test can
+	// observe the initial durable state of queued work (e.g. a pending
+	// apply_operations row) without racing an operator claim.
+	skipOperator bool
 }
 
 // setupE2EServiceOpts creates a real api.Service with a LocalClient for the
@@ -244,7 +248,10 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 	require.NoError(t, svc.SetOperatorPollInterval(100*time.Millisecond))
 	// Webhook E2E helpers use the real service lifecycle. Local applies are
 	// durably queued by ExecuteApply, then dispatched by operator drivers.
-	svc.StartOperator(ctx)
+	// Tests that assert on pre-claim durable state opt out via skipOperator.
+	if !opts.skipOperator {
+		svc.StartOperator(ctx)
+	}
 	t.Cleanup(func() { _ = svc.Close() })
 
 	return svc

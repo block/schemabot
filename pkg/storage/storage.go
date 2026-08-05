@@ -209,10 +209,11 @@ type SettingsStore interface {
 	// Set saves a setting. Creates if not exists, updates if exists.
 	Set(ctx context.Context, key string, value string) error
 
-	// List returns all settings.
+	// List returns all settings, ordered by key ascending.
 	List(ctx context.Context) ([]*Setting, error)
 
-	// Delete removes a setting by key.
+	// Delete removes a setting by key. It returns ErrSettingNotFound when no
+	// setting with that key exists.
 	Delete(ctx context.Context, key string) error
 }
 
@@ -411,12 +412,12 @@ type ApplyStore interface {
 	CountRecentByState(ctx context.Context, filter RecentAppliesFilter) (map[string]int, error)
 
 	// GetInProgress returns all applies in non-terminal states.
-	// Note: For recovery, use FindNextApply which handles locking.
+	// Note: For recovery, use ClaimApplyByID which handles locking.
 	GetInProgress(ctx context.Context) ([]*Apply, error)
 
-	// FindStuckPendingApplies returns pending applies that FindNextApply should
+	// FindStuckPendingApplies returns pending applies that a driver should
 	// already have claimed — pending with child rows (the child-rows arm of
-	// FindNextApply's pending predicate) — but whose created_at is older than
+	// ClaimApplyByID's pending predicate) — but whose created_at is older than
 	// olderThan, ordered oldest first and capped at limit. It is a read-only
 	// diagnostic: apply creation rejects a second active apply for the same
 	// target rather than queuing it, so a pending apply this old is not waiting
@@ -425,16 +426,9 @@ type ApplyStore interface {
 	// nothing is stuck. A non-positive limit means no cap.
 	FindStuckPendingApplies(ctx context.Context, olderThan time.Duration, limit int) ([]*Apply, error)
 
-	// FindNextApply atomically claims the next apply that needs attention.
-	// A claim selects one apply that needs work and refreshes its heartbeat in
-	// the same transaction. The owner is stored with a freshly generated lease
-	// token so operator-owned writes can fail closed after ownership changes.
-	// Returns the claimed apply, or nil if nothing needs work.
-	FindNextApply(ctx context.Context, owner string) (*Apply, error)
-
-	// ClaimApplyByID atomically claims one specific apply by ID, scoped to the
-	// same claimability rules as FindNextApply (pending with tasks, stale active
-	// state, retryable within budget, or a pending start control request). On a
+	// ClaimApplyByID atomically claims one specific apply by ID when it needs a
+	// driver (pending with child rows, stale active state, retryable within
+	// budget, or a pending start control request). On a
 	// successful claim it rotates the lease (owner, token, acquired_at) and
 	// refreshes the heartbeat so operator-owned writes can fail closed after
 	// ownership changes. Returns the claimed apply, or nil if the apply does not
@@ -449,7 +443,7 @@ type ApplyStore interface {
 	// failed_retryable and stopped are excluded because they have their own resume
 	// paths — that has a pending stop control request, at least one
 	// pending operation, and no active operation (none being driven and none
-	// awaiting stale recovery), rotating the lease onto it like FindNextApply. It
+	// awaiting stale recovery), rotating the lease onto it like ClaimApplyByID. It
 	// is the trigger for stop reconciliation when no operation is claimable to
 	// carry it: under on_failure "continue" a failed earlier sibling can leave the
 	// apply with only terminal and pending operations, and the claim gate keeps
@@ -459,6 +453,22 @@ type ApplyStore interface {
 	// the stop themselves. Returns nil when no such apply exists or it is locked
 	// by a peer.
 	FindNextApplyForStopReconciliation(ctx context.Context, owner string) (*Apply, error)
+
+	// FindNextApplyForOperationProjection atomically claims one apply whose
+	// operation rows have all settled while the apply itself is still
+	// non-terminal and its heartbeat has gone stale, rotating the lease onto it
+	// like ClaimApplyByID. It is the repair path for a parent left behind its own
+	// children: an operation drive writes its terminal operation row and then
+	// projects the parent, so a crash between those two writes leaves nothing to
+	// finish the projection — every operation is terminal, so no operation-level
+	// claim arm matches, and the one-active-apply guard keeps that target blocked
+	// until the parent settles. Requiring a stale heartbeat is what keeps this off
+	// live rollouts: a driver mid-projection still holds a fresh lease. Applies
+	// with no operation rows are excluded (there is nothing to project from), as
+	// are pending, stopped, and failed_retryable parents, which have their own
+	// resume paths. Returns nil when no such apply exists or it is locked by a
+	// peer.
+	FindNextApplyForOperationProjection(ctx context.Context, owner string) (*Apply, error)
 
 	// Heartbeat updates the apply's updated_at timestamp to maintain the lease.
 	// Should be called every 10 seconds while working on an apply.
@@ -882,21 +892,30 @@ type ReapedOperation struct {
 // ApplyLogStore manages apply log entries for debugging and audit.
 // Logs capture state transitions, errors, and events during schema changes.
 // Logs are kept forever for audit purposes.
+//
+// Ordering contract: every read returns entries ordered by created_at
+// ascending, with ties on created_at broken by ascending id so entries keep
+// their insertion order. Callers rendering log tails (PR comments, the logs
+// API) depend on same-timestamp bursts reading in the order they were
+// appended, so implementations must provide the tie-break regardless of the
+// backing store's timestamp precision.
 type ApplyLogStore interface {
 	// Append adds a new log entry.
 	Append(ctx context.Context, log *ApplyLog) error
 
-	// GetByApply returns all logs for an apply, ordered by created_at.
+	// GetByApply returns all logs for an apply, ordered by created_at
+	// ascending with ties broken by ascending id.
 	GetByApply(ctx context.Context, applyID int64) ([]*ApplyLog, error)
 
 	// GetRecentByApply returns the newest limit logs for an apply, ordered by
-	// created_at ascending so the result reads chronologically. The query is
-	// bounded — long-running applies can accumulate far more log rows than a
-	// caller rendering a tail needs.
+	// created_at ascending (ties broken by ascending id) so the result reads
+	// chronologically. The query is bounded — long-running applies can
+	// accumulate far more log rows than a caller rendering a tail needs.
 	GetRecentByApply(ctx context.Context, applyID int64, limit int) ([]*ApplyLog, error)
 
 	// List returns the newest Limit logs matching the filter criteria,
-	// ordered by created_at ascending so the result reads chronologically.
+	// ordered by created_at ascending (ties broken by ascending id) so the
+	// result reads chronologically.
 	List(ctx context.Context, filter ApplyLogFilter) ([]*ApplyLog, error)
 }
 

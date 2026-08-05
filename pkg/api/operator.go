@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"slices"
 	"time"
 
@@ -260,6 +259,15 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int) {
 	// progress ahead of starting more copy phases. Dormant until the
 	// multi-deployment fan-out lands (nothing parks at the barrier today).
 	if s.recoverApplyOperationCutover(ctx, driverID, owner) {
+		return
+	}
+	// Settle a parent left behind its own children before claiming new
+	// operation work: until it settles, the one-active-apply guard blocks
+	// every new apply for that target, so the repair unblocks a database
+	// rather than merely tidying a row. It matches nothing while any
+	// operation is still non-terminal or any driver is still heartbeating,
+	// so on a healthy plane this is a cheap no-op.
+	if s.recoverApplyOperationProjection(ctx, driverID, owner) {
 		return
 	}
 	s.recoverApplyOperation(ctx, driverID, owner)
@@ -796,17 +804,20 @@ func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int
 // and completes the stop once the apply is terminal.
 //
 // Returns true when this tick is consumed by stop reconciliation — an apply was
-// claimed (whether the reconciliation that followed succeeded or hit an error)
-// or the claim itself errored or returned an invalid lease — so the caller does
-// not also run the normal operation claim this tick. Returns false only when no
-// apply needed reconciliation.
+// claimed, whether the reconciliation that followed succeeded, hit an error, or
+// the claim returned an invalid lease — so the caller does not also run the
+// normal operation claim this tick. Returns false when no apply needed
+// reconciliation, and when the claim itself errored: a failed claim did no work
+// and holds no lease, so the tick falls through to the operation claim instead
+// of letting a persistent storage error on this path starve every other claim
+// the driver ladder runs after it.
 func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, owner string) bool {
 	apply, err := s.storage.Applies().FindNextApplyForStopReconciliation(ctx, owner)
 	if err != nil {
 		s.logger.Error("operator: failed to claim apply for stop reconciliation",
 			"driver", driverID, "lease_owner", owner, "error", err)
 		metrics.RecordOperatorClaimFailure(ctx, "stop_reconciliation_claim_error")
-		return true
+		return false
 	}
 	if apply == nil {
 		s.logger.Debug("operator: no apply needs stop reconciliation", "driver", driverID)
@@ -887,6 +898,88 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID); err != nil {
 		s.logger.Error("operator: failed to complete pending control requests after stop reconciliation",
 			append(finalApply.LogAttrs(),
+				"driver", driverID, "error", err)...)
+		return true
+	}
+	return true
+}
+
+// recoverApplyOperationProjection settles an apply whose operation rows have all
+// reached a terminal state while the apply itself is still non-terminal: a
+// parent left behind its own children because a drive stopped between writing
+// its terminal operation row and projecting that outcome onto the parent.
+//
+//	apply_operations              applies
+//	┌──────────────────┐          ┌──────────────────────────┐
+//	│ id=8  completed  │          │ id=7  running  ← stranded│
+//	│ id=9  completed  │  ──✗──▶  └──────────────────────────┘
+//	└──────────────────┘            the projection never ran
+//	  every child settled           the target stays blocked
+//
+// Nothing else recovers it. No operation-level claim arm matches a fully
+// terminal operation set, the parent's own state never moves again, and the
+// one-active-apply guard keeps refusing new applies for that target until it
+// does. Re-deriving the parent from its operations is the entire repair — no
+// engine work is driven, because the operations already carry their outcomes.
+//
+// Returns true when this driver spent its tick here, including on failure, so a
+// repair that could not complete is retried rather than falling through to
+// claim new work behind a target that is still blocked.
+func (s *Service) recoverApplyOperationProjection(ctx context.Context, driverID int, owner string) bool {
+	apply, err := s.storage.Applies().FindNextApplyForOperationProjection(ctx, owner)
+	if err != nil {
+		s.logger.Error("operator: failed to claim apply for operation projection",
+			"driver", driverID, "lease_owner", owner, "error", err)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_projection_claim_error")
+		return true
+	}
+	if apply == nil {
+		s.logger.Debug("operator: no apply needs operation projection", "driver", driverID)
+		return false
+	}
+
+	lease := apply.Lease()
+	if !lease.Valid() {
+		s.logger.Error("operator: claimed apply for operation projection without a valid lease token; the apply stays non-terminal and its target stays blocked until a later tick reclaims it",
+			append(apply.LogAttrs(),
+				"driver", driverID, "lease_owner", owner)...)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_projection_missing_lease_token")
+		return true
+	}
+	applyLeaseCtx := storage.WithApplyLease(ctx, lease)
+
+	s.logger.Info("operator: claimed an apply whose operations have all settled while it stayed non-terminal; deriving its state from them",
+		append(apply.LogAttrs(),
+			"driver", driverID, "lease_owner", owner)...)
+
+	result, err := s.updateApplyStateFromOperations(applyLeaseCtx, driverID, apply, allowLeaseScopedFailedReopen)
+	if err != nil {
+		s.logger.Error("operator: failed to derive apply state from its settled operations; the apply stays non-terminal and its target stays blocked until a later tick reclaims it",
+			append(apply.LogAttrs(),
+				"driver", driverID, "error", err)...)
+		return true
+	}
+	if !result.Swapped {
+		// The claim refreshed the heartbeat, so this apply is not reconsidered
+		// until the staleness window elapses again. Warn rather than debug: a
+		// terminal operation set that does not derive a terminal parent means the
+		// projection and the claim predicate disagree, and the target stays
+		// blocked in the meantime.
+		s.logger.Warn("operator: settled operations did not move the apply out of its non-terminal state; its target stays blocked until the state changes or an operator reconciles it",
+			append(apply.LogAttrs(),
+				"driver", driverID, "derived_state", result.DerivedState,
+				"operation_count", result.OperationCount)...)
+		return true
+	}
+	metrics.RecordOperatorOperationProjectionRepair(ctx, apply.Database, apply.Deployment, apply.Environment, result.DerivedState)
+
+	// No operation drive is left to publish on this apply's behalf, so this
+	// projection owes the single terminal summary if it won the terminal swap.
+	s.publishTerminalSummaryIfWon(applyLeaseCtx, driverID, apply, result)
+
+	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, apply.ID); err != nil {
+		s.logger.Error("operator: failed to complete pending control requests after deriving apply state from its settled operations",
+			append(apply.LogAttrs(),
 				"driver", driverID, "error", err)...)
 		return true
 	}
@@ -1101,8 +1194,9 @@ func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, dri
 // deployment's tasks via ResumeApplyOperation with both the operation lease (for
 // the operation's tasks) and the parent apply lease (for the applies.state the
 // engine still writes) attached to ctx, so sibling deployments are unaffected;
-// when it is 0 (the legacy whole-apply path) it drives every task of the apply
-// via ResumeApply with only the apply lease attached. Returns true when the work
+// when it is 0 (the whole-apply drive the stop-reconciliation claim uses) it
+// drives every task of the apply via ResumeApply with only the apply lease
+// attached. Returns true when the work
 // resumed without error. Failures are logged and recorded as metrics internally;
 // the bool lets the operation-level claim loop decide whether to mark its
 // operation terminal, and the returned error lets it distinguish the fail-closed
@@ -1138,8 +1232,9 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 	// operationDeployment is observability attribution only — RoutingClient
 	// reloads the operation row and routes by its own deployment. The
 	// operation-claim path passes the claimed op's deployment so logs/metrics
-	// name the deployment actually being driven; the legacy whole-apply path
-	// passes "" and falls back to the apply's stored deployment. For single-op
+	// name the deployment actually being driven; the whole-apply
+	// stop-reconciliation drive passes "" and falls back to the apply's stored
+	// deployment. For single-op
 	// applies the two are equal, so the attribution is unchanged.
 	deployment := operationDeployment
 	if deployment == "" {
@@ -1187,7 +1282,8 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 	// leased so sibling deployments are unaffected; ResumeApplyOperation fails
 	// closed when no tasks scope to the operation. The cutover variant drives a
 	// barrier-parked operation through its swap instead of its copy phase. The
-	// legacy whole-apply path (applyOperationID == 0) drives every task.
+	// whole-apply stop-reconciliation drive (applyOperationID == 0) drives
+	// every task.
 	// The drive runs behind a panic boundary: engine and resume code process
 	// stored metadata, so one poisoned row must degrade only this apply, not
 	// the process. A contained panic surfaces as a *panicsafe.Error and is
@@ -2006,9 +2102,5 @@ func (s *Service) publishTerminalSummaryIfWon(ctx context.Context, driverID int,
 }
 
 func driverLeaseOwner(driverID int) string {
-	hostname, err := os.Hostname()
-	if err != nil || hostname == "" {
-		hostname = "unknown-host"
-	}
-	return fmt.Sprintf("%s/%d/driver-%d", hostname, os.Getpid(), driverID)
+	return fmt.Sprintf("%s/driver-%d", storage.LeaseOwnerProcess(), driverID)
 }

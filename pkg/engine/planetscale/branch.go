@@ -535,6 +535,73 @@ func (e *Engine) getDeployRequest(ctx context.Context, client psclient.PSClient,
 	})
 }
 
+// deployDeployRequest starts a deploy request's schema change, absorbing the
+// rejections that clear on their own. PlanetScale keeps rejecting the deploy
+// while the deploy request's pre-deploy safety validation is still running —
+// a not-ready condition, not a failure — so that rejection polls on its own
+// bounded budget (deployValidationWait) instead of counting toward the
+// transient-error retry bound, which validation routinely outlives. Transient
+// API errors retry with backoff up to maxRetries. Any other rejection fails
+// immediately.
+func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClient, org, database string, number uint64, instantDDL bool) (*ps.DeployRequest, error) {
+	var validationDeadline time.Time
+	validationWaitLogged := false
+	transientAttempts := 0
+	for {
+		dr, err := client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
+			Organization: org,
+			Database:     database,
+			Number:       number,
+			InstantDDL:   instantDDL,
+		})
+		if err == nil {
+			return dr, nil
+		}
+		if strings.Contains(err.Error(), "approved") {
+			return nil, fmt.Errorf("deploy request #%d could not be deployed: PlanetScale deploy request approvals are not supported — disable 'Require administrator approval for deploy requests' in the PlanetScale database settings", number)
+		}
+		switch {
+		case isDeployStillValidatingError(err):
+			// The budget starts at the first validating rejection, not at the
+			// first deploy attempt, so transient retries never eat into it.
+			if validationDeadline.IsZero() {
+				validationDeadline = time.Now().Add(deployValidationWait)
+			}
+			if time.Now().After(validationDeadline) {
+				return nil, fmt.Errorf("deploy deploy request #%d: PlanetScale was still validating the deploy request after waiting %s: %w", number, deployValidationWait, err)
+			}
+			if !validationWaitLogged {
+				e.logger.Info("deploy rejected because the deploy request is still validating; deploy will be retried until validation completes",
+					"database", database, "deploy_request", number, "poll_interval", deployValidationPollInterval, "wait_bound", deployValidationWait)
+				validationWaitLogged = true
+			} else {
+				e.logger.Debug("deploy request still validating; retrying deploy",
+					"database", database, "deploy_request", number)
+			}
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("context cancelled waiting for deploy request #%d to finish validating: %w", number, ctx.Err())
+			case <-time.After(deployValidationPollInterval):
+			}
+		case isRetryablePSError(err):
+			transientAttempts++
+			if transientAttempts >= maxRetries {
+				return nil, fmt.Errorf("deploy deploy request #%d (after %d attempts): %w", number, maxRetries, err)
+			}
+			delay := retryDelay(transientAttempts, err)
+			e.logger.Warn("retrying deploy request",
+				"database", database, "deploy_request", number, "attempt", transientAttempts+1, "delay", delay.Round(time.Millisecond), "error", err)
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("context cancelled retrying deploy request #%d: %w", number, ctx.Err())
+			case <-time.After(delay):
+			}
+		default:
+			return nil, fmt.Errorf("deploy deploy request #%d: %w", number, err)
+		}
+	}
+}
+
 // waitForDeployRequestPending polls a deploy request until PlanetScale finishes
 // computing its schema diff and transitions it out of the pending state. The
 // deploy request number is held in a local so a transient poll error never

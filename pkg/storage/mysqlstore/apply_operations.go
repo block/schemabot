@@ -668,7 +668,7 @@ func releasedFailureExemptionArgs() []any {
 // is never re-gated. A single-operation apply has no earlier-deployment
 // sibling, so the gate is a no-op for it regardless of policy.
 //
-// Mirrors ApplyStore.FindNextApply: SELECT ... FOR UPDATE SKIP LOCKED to
+// Mirrors ApplyStore.ClaimApplyByID: SELECT ... FOR UPDATE SKIP LOCKED to
 // avoid driver races, READ COMMITTED isolation to prevent next-key range
 // locks from serializing claims across otherwise independent rows.
 //
@@ -777,7 +777,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// deploy is deferred. The operation row is never persisted to
 	// waiting_for_deploy, so an operation-state predicate would never match.
 	// Gating on the parent's waiting_for_deploy state mirrors
-	// ApplyStore.FindNextApply's deferred-deploy clause.
+	// ApplyStore.ClaimApplyByID's deferred-deploy clause.
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	queryArgs = append(queryArgs, state.Apply.WaitingForDeploy)
 	queryArgs = append(queryArgs,
@@ -786,7 +786,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 
-	// The stopped-row and failed_retryable clauses mirror ApplyStore.FindNextApply:
+	// The stopped-row and failed_retryable clauses mirror ApplyStore.ClaimApplyByID:
 	// neither carries a deployment-order gate, because both rows already ran —
 	// resuming them is recovering work they started, not starting a new deployment.
 	//
@@ -797,14 +797,14 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	//     pending start request is reclaimable so the operator can trigger the
 	//     deferred deploy. The operation row stays running while the apply parks
 	//     at waiting_for_deploy (only the deploy is deferred), so this gate keys
-	//     on the parent apply state, mirroring ApplyStore.FindNextApply.
+	//     on the parent apply state, mirroring ApplyStore.ClaimApplyByID.
 	//
 	//   - A failed_retryable operation is reclaimable only while its PARENT apply
 	//     is itself claimable for that operation's recovery. The operator claim
 	//     path drives the parent apply, so the operation row is a shadow of the
 	//     parent: gating on the parent's claimability (not just its retry budget)
 	//     is what keeps a healthy retry from being re-claimed every poll. The two
-	//     sub-conditions mirror the parent clauses in ApplyStore.FindNextApply:
+	//     sub-conditions mirror the parent clauses in ApplyStore.ClaimApplyByID:
 	//       * parent still failed_retryable, within recovery budget (attempt < max)
 	//         and recent — a fresh bounded retry; and
 	//       * parent already claimed into an active state but its lease has gone
@@ -816,7 +816,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	//     churning on a row another driver is actively driving.
 	//
 	// There is intentionally no "pending + pending start request" clause to
-	// match ApplyStore.FindNextApply's pending-start clause. That apply-level
+	// match ApplyStore.ClaimApplyByID's pending-start clause. That apply-level
 	// clause only matters because apply-level pending claimability is
 	// task-gated (state = pending AND EXISTS tasks); a start request lets a
 	// no-task pending apply be claimed. Operation-level pending claimability is

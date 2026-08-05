@@ -8,6 +8,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -70,14 +71,23 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 			continue
 		}
 
+		// Both resolvers below decide based on the task's parent apply — its
+		// state and its lease ownership. Any uncertainty (a storage failure or a
+		// missing apply row) means the task cannot be proven resolvable, so it
+		// keeps blocking (fail closed).
+		apply, ok := c.applyForConflictCheck(ctx, t)
+		if !ok {
+			return t.TaskIdentifier
+		}
+
 		// A pending task of a terminal apply can never start; cancel it so it
 		// stops blocking the database as phantom active work.
-		if c.tryResolveOrphanedPendingTask(ctx, t) {
+		if c.tryResolveOrphanedPendingTask(ctx, t, apply) {
 			continue
 		}
 
 		// Storage says non-terminal — verify with engine before blocking.
-		if c.tryResolveStaleTask(ctx, t, plan.Database) {
+		if c.tryResolveStaleTask(ctx, t, apply, plan.Database) {
 			continue // Task was stale; engine confirmed it's done.
 		}
 
@@ -87,29 +97,37 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 	return ""
 }
 
+// applyForConflictCheck loads the parent apply the conflict-check resolvers
+// decide on. Returns ok=false when the apply cannot be loaded or the row is
+// missing — the caller must keep the task blocking, because without the apply
+// neither the task's orphan status nor its lease ownership can be proven.
+func (c *LocalClient) applyForConflictCheck(ctx context.Context, t *storage.Task) (*storage.Apply, bool) {
+	apply, err := c.storage.Applies().Get(ctx, t.ApplyID)
+	if err != nil {
+		c.logger.Warn("conflict check: failed to load the task's apply; the task keeps blocking the database",
+			append(t.LogAttrs(), "error", err)...)
+		return nil, false
+	}
+	if apply == nil {
+		c.logger.Warn("conflict check: task's apply row is missing; the task keeps blocking the database",
+			t.LogAttrs()...)
+		return nil, false
+	}
+	return apply, true
+}
+
 // tryResolveOrphanedPendingTask cancels a pending task whose parent apply has
 // already reached a terminal state. Such a task can never start: a terminal
 // apply is not claimable, so no drive will ever pick the task up, and pending
 // means no engine work or checkpoint exists to preserve. Left alone the task
 // would block every later apply targeting its database as phantom active work.
-// Any uncertainty — a non-pending state, a storage failure, or a missing apply
-// row — leaves the task untouched so it keeps blocking (fail closed).
+// A non-pending state leaves the task untouched so it stays with the
+// engine-backed checks.
 // Returns true if the task was cancelled and no longer blocks.
-func (c *LocalClient) tryResolveOrphanedPendingTask(ctx context.Context, t *storage.Task) bool {
+func (c *LocalClient) tryResolveOrphanedPendingTask(ctx context.Context, t *storage.Task, apply *storage.Apply) bool {
 	if !state.IsState(t.State, state.Task.Pending) {
 		// Only a pending task is provably unstarted; every other state may own
 		// engine work or a checkpoint and stays with the engine-backed checks.
-		return false
-	}
-	apply, err := c.storage.Applies().Get(ctx, t.ApplyID)
-	if err != nil {
-		c.logger.Warn("conflict check: failed to load the pending task's apply; the task keeps blocking the database",
-			append(t.LogAttrs(), "error", err)...)
-		return false
-	}
-	if apply == nil {
-		c.logger.Warn("conflict check: pending task's apply row is missing; the task keeps blocking the database",
-			t.LogAttrs()...)
 		return false
 	}
 	if !state.IsTerminalApplyState(apply.State) {
@@ -147,11 +165,25 @@ func (c *LocalClient) tryResolveOrphanedPendingTask(ctx context.Context, t *stor
 // If the engine reports a terminal state, or reports no active work for a task that
 // storage believes is in-flight, the task is updated in storage and no longer blocks.
 // Resting tasks (Stopped, FailedRetryable) are left untouched.
+//
+// The engine probe is in-memory and database-scoped: it reports this process's
+// last run on the database, not the task's actual cross-process state. The
+// task's parent apply lease decides whether that memory is authoritative — a
+// fresh lease means a live driver owns the work and the task keeps blocking,
+// and a terminal report is only trusted when the last lease belongs to this
+// process (the completing process's own report).
 // Returns true if the task was resolved (no longer blocking).
-func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, database string) bool {
+func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, apply *storage.Apply, database string) bool {
 	eng := c.getEngine()
 	if eng == nil {
 		c.logger.Error("tryResolveStaleTask: engine is nil", t.LogAttrs()...)
+		return false
+	}
+
+	if apply.HasFreshLease(time.Now()) {
+		c.logger.Info("conflict check: task's apply is actively driven; the task keeps blocking until its lease owner settles it",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner)...)
+		metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "fresh_lease")
 		return false
 	}
 
@@ -177,6 +209,18 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 	// "No active schema change" just means Spirit has no runningSchemaChange,
 	// which could mean completed, never started, or crashed.
 	if result.State.IsTerminal() {
+		// A terminal report for work last leased to another process is this
+		// process's memory of an older run on the same database, not the
+		// completing driver's own report — stamping it would mark someone
+		// else's task done with state that says nothing about it. Leave the
+		// task blocking until driver stale-claim recovery settles it.
+		if apply.LeaseOwner != "" && !storage.LeaseOwnedByThisProcess(apply.LeaseOwner) {
+			c.logger.Warn("conflict check: engine reports terminal state, but the apply's last lease belongs to another process; the task keeps blocking until driver recovery settles it",
+				append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner,
+					"engine_state", result.State, "engine_message", result.Message)...)
+			metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "foreign_terminal_report")
+			return false
+		}
 		c.logger.Info("conflict check: engine reports terminal state",
 			"task_id", t.TaskIdentifier, "engine_state", result.State,
 			"engine_message", result.Message, "storage_state", t.State)
