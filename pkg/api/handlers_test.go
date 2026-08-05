@@ -501,6 +501,10 @@ func (s *capturingApplyStore) FindNextApplyForStopReconciliation(context.Context
 	return nil, nil
 }
 
+func (s *capturingApplyStore) FindNextApplyForOperationProjection(context.Context, string) (*storage.Apply, error) {
+	return nil, nil
+}
+
 func (s *capturingApplyStore) CheckLease(context.Context, storage.ApplyLease) error {
 	return nil
 }
