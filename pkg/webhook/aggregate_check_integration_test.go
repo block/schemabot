@@ -95,7 +95,9 @@ func TestE2EAggregateCheck(t *testing.T) {
 // TestE2EAggregateCheckStaleCleanup verifies that when a new commit removes all schema
 // changes from a PR, the stale per-database checks and aggregate check are re-created
 // on the new HEAD SHA with "success" conclusion. This reproduces the scenario where a
-// user pushes a commit that reverts their schema change.
+// user pushes a commit that reverts their schema change. The superseded plan's change
+// summary is cleared with the cleanup, so the aggregate table renders the databases as
+// having no pending schema change instead of repeating the old plan's counts.
 func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 	dbName := "webhook_aggregate_stale"
 	svc := setupE2EServiceMultiEnv(t, dbName)
@@ -104,16 +106,17 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 	// Seed per-database checks and aggregate as if a plan already ran on the first commit.
 	for _, env := range []string{"staging", "production"} {
 		check := &storage.Check{
-			Repository:   "octocat/hello-world",
-			PullRequest:  1,
-			HeadSHA:      "oldsha111",
-			Environment:  env,
-			DatabaseType: "mysql",
-			DatabaseName: dbName,
-			CheckRunID:   100,
-			HasChanges:   true,
-			Status:       checkStatusCompleted,
-			Conclusion:   checkConclusionActionRequired,
+			Repository:    "octocat/hello-world",
+			PullRequest:   1,
+			HeadSHA:       "oldsha111",
+			Environment:   env,
+			DatabaseType:  "mysql",
+			DatabaseName:  dbName,
+			CheckRunID:    100,
+			HasChanges:    true,
+			Status:        checkStatusCompleted,
+			Conclusion:    checkConclusionActionRequired,
+			ChangeSummary: "1 alter",
 		}
 		require.NoError(t, svc.Storage().Checks().Upsert(ctx, check))
 	}
@@ -217,6 +220,14 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 		assert.Equal(t, aggregateCheckName, cr.Name)
 		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
 		assert.False(t, prematurePassingAggregate.Load(), "passing aggregate was published before stale per-database records were cleaned")
+
+		// The cleaned rows render as databases with no pending schema change:
+		// an em dash in the Change column, not the superseded plan's counts.
+		require.NotNil(t, cr.Output)
+		assert.Equal(t, "Schema up to date", cr.Output.Title)
+		assert.Contains(t, cr.Output.Summary, fmt.Sprintf("| `%s` | staging | mysql | — | Up to date |", dbName))
+		assert.Contains(t, cr.Output.Summary, fmt.Sprintf("| `%s` | production | mysql | — | Up to date |", dbName))
+		assert.NotContains(t, cr.Output.Summary, "1 alter", "the aggregate must not repeat the superseded plan's change summary on a head with no schema changes")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for aggregate check run")
 	}
@@ -230,6 +241,7 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 				assert.Equal(t, checkConclusionSuccess, check.Conclusion)
 				assert.False(t, check.HasChanges)
 				assert.Empty(t, check.BlockingReason)
+				assert.Empty(t, check.ChangeSummary)
 				break
 			}
 			select {

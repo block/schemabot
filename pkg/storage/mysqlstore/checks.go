@@ -219,9 +219,12 @@ func successfulNoOpPlanResult(check *storage.Check) bool {
 // claimed the row after stale cleanup read it keeps blocking: a row that is
 // in_progress or owns an apply ID is left untouched, because a passing check must
 // never be derived from cleanup alone while an apply may have reached the live
-// database. Returns true when the row is in the plan-only successful state after
-// this call (whether this call wrote it or it already was), and false only when a
-// started apply still owns it.
+// database. The change summary is overwritten with the caller's value;
+// an empty summary clears the stored one (persisted as NULL), because the
+// stored summary describes the superseded plan and must not survive onto a
+// head that no longer touches the database. Returns true when the row is in the
+// plan-only successful state after this call (whether this call wrote it or it
+// already was), and false only when a started apply still owns it.
 //
 // This deliberately clears a review-time deployment drift block too: once a later
 // commit removes the database from the PR and no apply has started, the reviewed
@@ -243,11 +246,11 @@ func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage
 		    conclusion = ?,
 		    blocking_reason = ?,
 		    error_message = ?,
-		    change_summary = COALESCE(NULLIF(?, ''), change_summary)
+		    change_summary = ?
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
 		  AND status != ? AND apply_id IS NULL
-	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, check.ChangeSummary,
+	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, nullString(check.ChangeSummary),
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 		checkStatusInProgress)
 	if err != nil {

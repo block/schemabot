@@ -189,6 +189,18 @@ func TestRenderDatabaseSection_EnvironmentColumn(t *testing.T) {
 	})
 }
 
+// A row with no recorded change summary — a database the current head does not
+// change, whether it was never touched or a later commit removed its schema
+// change — renders an em dash in the Change column, so both cases present
+// identically as "no pending schema change".
+func TestRenderDatabaseSection_NoPendingChangeRendersEmDash(t *testing.T) {
+	checks := []*storage.Check{
+		{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: false},
+	}
+	section := renderDatabaseSection(checks, maxCheckRunTextLength)
+	assert.Contains(t, section, "| `orders` | mysql | — | Up to date |")
+}
+
 // When the leader gates on participant deployments, their folded outcomes render
 // in a separate "Tenant deployments" section, keyed by tenant, distinct from the
 // leader's own per-database rows.
