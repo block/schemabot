@@ -18,6 +18,16 @@ import "embed"
 //go:embed mysql/*.sql
 var MySQLFS embed.FS
 
+// PostgresFS contains the embedded SQL schema files for SchemaBot's own
+// storage tables on PostgreSQL. Each file holds one CREATE TABLE statement
+// followed by its CREATE INDEX statements, separated by semicolons. The files
+// mirror the MySQL schema table-for-table and column-for-column; updated_at
+// stamping is the application's responsibility on PostgreSQL (there is no
+// ON UPDATE CURRENT_TIMESTAMP equivalent and no trigger is installed).
+//
+//go:embed postgres/*.sql
+var PostgresFS embed.FS
+
 // SchemaFiles maps namespace names to their file contents.
 // The namespace key is engine-specific:
 //   - MySQL: schema name
