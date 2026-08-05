@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -58,12 +59,18 @@ func (o reviewDriftOutcome) planDriftState() storage.PlanDriftState {
 	}
 }
 
+// errPlanCheckHeadStale reports that a plan check record was not stored
+// because the PR head advanced past the planned head. The newer head's own
+// plan is authoritative, so callers racing a synchronize (for example the
+// merge gate fan-out) treat this as a benign skip rather than a failure.
+var errPlanCheckHeadStale = errors.New("plan head is no longer the PR's current head")
+
 // storePlanCheckRecord stores per-database check state after a plan is generated.
 // The state is used internally by the aggregate check to compute its overall status.
 // No per-database GitHub Check Run is created — only the aggregate is visible on the PR.
 // Returns the commit SHA used for the plan. Failures are non-fatal.
 func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, drift reviewDriftOutcome) (string, error) {
-	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, drift)
+	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, drift, "")
 	return headSHA, err
 }
 
@@ -71,7 +78,7 @@ func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.Ins
 // plan and then reconciles same-head apply-owned stored check state when the manual
 // plan proves the target already matches the PR schema.
 func (h *Handler) storeManualPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, drift reviewDriftOutcome) (string, bool, error) {
-	headSHA, check, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, drift)
+	headSHA, check, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, drift, "")
 	if err != nil {
 		return headSHA, false, err
 	}
@@ -134,7 +141,13 @@ func planCheckConclusion(hasChanges, hasPlanErrors, driftBlocked bool) string {
 	}
 }
 
-func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, drift reviewDriftOutcome) (string, *storage.Check, error) {
+// upsertPlanCheckRecord verifies the planned head is still the PR's current
+// head (returning errPlanCheckHeadStale when it is not) and upserts the
+// per-database stored check state for the plan. refreshNote, when non-empty,
+// is a pre-sanitized attribution line the merge gate fan-out appends to the
+// stored change summary so the Change column says why an unchanged PR was
+// re-planned; ordinary plan writes pass "".
+func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, drift reviewDriftOutcome, refreshNote string) (string, *storage.Check, error) {
 	headSHA := schema.HeadSHA
 	if headSHA == "" {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -170,8 +183,8 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 			Environment:  environment,
 			Status:       "stale",
 		})
-		return headSHA, nil, fmt.Errorf("skip stale plan check record for repo %s pr %d environment %s database_type %s database %s: plan head SHA %s no longer matches current head SHA for PR %s",
-			repo, pr, environment, schema.Type, schema.Database, headSHA, prInfo.HeadSHA)
+		return headSHA, nil, fmt.Errorf("skip stale plan check record for repo %s pr %d environment %s database_type %s database %s: plan head SHA %s no longer matches current head SHA %s: %w",
+			repo, pr, environment, schema.Type, schema.Database, headSHA, prInfo.HeadSHA, errPlanCheckHeadStale)
 	}
 
 	hasChanges := planResp.HasChanges()
@@ -184,8 +197,14 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	// the block rides on BlockingReason + Conclusion so a stored drift block is
 	// legible and durable across write paths.
 	changeSummary := summarizePlanChanges(schema, planResp, environment)
+	if refreshNote != "" {
+		changeSummary = appendRefreshNote(changeSummary, refreshNote)
+	}
 	blockingReason := ""
 	if driftBlocked {
+		// The drift summary owns the Change column when drift blocks: it names
+		// the deployment divergence the operator must resolve, which supersedes
+		// refresh attribution.
 		changeSummary = drift.summary
 		blockingReason = reviewTimeDeploymentDriftBlock.blockingReason
 	}

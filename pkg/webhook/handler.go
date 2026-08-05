@@ -173,6 +173,20 @@ type Handler struct {
 	webhookReconcileGrace    time.Duration
 	webhookReconcileMaxPages int
 
+	// Merge gate processor lifecycle (see merge_gate.go). The intervals
+	// have package defaults set at construction; tests override them directly.
+	mergeGatePollInterval  time.Duration
+	mergeGateLeaseDuration time.Duration
+	mergeGateSweepLookback time.Duration
+	mergeGateMu            sync.Mutex
+	mergeGateStop          chan struct{}
+	mergeGateCancel        context.CancelFunc
+	mergeGateWg            sync.WaitGroup
+	// mergeGateKick wakes the driver to run a pass now instead of waiting
+	// for the next poll tick; buffered so one pending kick coalesces any
+	// number of concurrent recordings.
+	mergeGateKick chan struct{}
+
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
 	priorEnvCheckRetryInterval time.Duration
@@ -258,6 +272,10 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 		webhookReconcileLookback:    defaultWebhookReconcileLookback,
 		webhookReconcileGrace:       defaultWebhookReconcileGrace,
 		webhookReconcileMaxPages:    defaultWebhookReconcileMaxPages,
+		mergeGatePollInterval:       defaultMergeGatePollInterval,
+		mergeGateLeaseDuration:      defaultMergeGateLeaseDuration,
+		mergeGateSweepLookback:      defaultMergeGateSweepLookback,
+		mergeGateKick:               make(chan struct{}, 1),
 		priorEnvCheckMaxAttempts:    defaultPriorEnvCheckMaxAttempts,
 		priorEnvCheckRetryInterval:  defaultPriorEnvCheckRetryInterval,
 	}
@@ -344,6 +362,12 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 			obs.OnTerminal(apply, tasks)
 			return nil
 		}
+
+		// Wake the merge gate processor as soon as a drive tail records a
+		// request, so sibling PR checks re-plan without waiting for the next
+		// poll tick. The durable request row stays the source of truth: a
+		// kick lost to a pod boundary only costs poll latency.
+		service.OnMergeGateRecorded = h.KickMergeGate
 	}
 
 	return h

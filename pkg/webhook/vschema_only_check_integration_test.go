@@ -94,7 +94,7 @@ func TestUpsertPlanCheckRecord_VSchemaOnlyPlanRequiresApply(t *testing.T) {
 			}},
 		}
 
-		gotSHA, check, err := h.upsertPlanCheckRecord(ctx, installClient, repo, pr, schema, planResp, env, reviewDriftOutcome{})
+		gotSHA, check, err := h.upsertPlanCheckRecord(ctx, installClient, repo, pr, schema, planResp, env, reviewDriftOutcome{}, "")
 		require.NoError(t, err)
 		assert.Equal(t, headSHA, gotSHA)
 		require.NotNil(t, check)
@@ -114,7 +114,7 @@ func TestUpsertPlanCheckRecord_VSchemaOnlyPlanRequiresApply(t *testing.T) {
 			Changes: []*apitypes.SchemaChangeResponse{{Namespace: "boardgames_sharded"}},
 		}
 
-		_, check, err := h.upsertPlanCheckRecord(ctx, installClient, repo, pr, schema, planResp, env, reviewDriftOutcome{})
+		_, check, err := h.upsertPlanCheckRecord(ctx, installClient, repo, pr, schema, planResp, env, reviewDriftOutcome{}, "")
 		require.NoError(t, err)
 		require.NotNil(t, check)
 		assert.False(t, check.HasChanges)

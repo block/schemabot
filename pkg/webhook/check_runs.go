@@ -108,6 +108,17 @@ var reviewTimeDeploymentDriftBlock = checkBlockReason{
 	message:        "One or more deployments differ from the reviewed plan, or could not be confirmed to match it; reconcile the deployment drift or replan once the deployments match before this check can pass.",
 }
 
+// schemaChangedReplanFailedBlock is used when the live schema of a check's
+// target changed after its plan was computed (another apply reached terminal
+// success there) and the merge gate fan-out could not re-plan the PR. The
+// stored check fails closed: a plan computed against a schema that no longer
+// exists must not keep passing. The raw re-plan error stays in the server
+// logs; only this fixed message is rendered on the PR.
+var schemaChangedReplanFailedBlock = checkBlockReason{
+	blockingReason: "schema_changed_replan_failed",
+	message:        "The live schema for this database changed after this plan was computed, and SchemaBot could not re-plan the PR against it. Re-run `schemabot plan` (or push a new commit) before this check can pass; see server logs for the re-plan failure.",
+}
+
 // noAllowedConfiguredEnvironmentsBlock is used when schema files changed but
 // the server-configured environments for the database do not overlap this
 // service's allowed_environments. SchemaBot cannot safely plan the schema

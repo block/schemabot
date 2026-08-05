@@ -90,6 +90,8 @@ type webhookRuntime struct {
 	stopDurableWebhookDispatch      func()
 	drainInProcessWebhookWork       func(context.Context)
 	reconcileMissingSummaryComments func(context.Context)
+	startMergeGateProcessor         func(context.Context)
+	stopMergeGateProcessor          func()
 }
 
 func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, logger *slog.Logger) {
@@ -535,10 +537,11 @@ func (s *Server) MetricsHandler() http.Handler {
 }
 
 // Start launches the server's background work: the operator driver pool
-// (dispatches queued applies and recovers stale ones), the remote-deployment
-// health monitor, the webhook inbox monitor (emits durable-inbox depth/backlog
-// metrics), and the pending-drops cleaner — all of which run until ctx is
-// canceled or Close is called. It also kicks off a one-shot missing-summary
+// (dispatches queued applies and recovers stale ones), the merge gate
+// processor (re-plans sibling PR checks after a target's schema changes), the
+// remote-deployment health monitor, the webhook inbox monitor (emits
+// durable-inbox depth/backlog metrics), and the pending-drops cleaner — all of
+// which run until ctx is canceled or Close is called. It also kicks off a one-shot missing-summary
 // reconciliation that, once started, runs to completion independently of ctx (it
 // repairs interrupted terminal comments and must not be cut short by a request
 // context); it runs before the operator so recovered applies attach observers
@@ -548,6 +551,9 @@ func (s *Server) Start(ctx context.Context) {
 	if s.webhook.startDurableWebhookDispatch != nil {
 		s.webhook.startDurableWebhookDispatch(ctx)
 	}
+	if s.webhook.startMergeGateProcessor != nil {
+		s.webhook.startMergeGateProcessor(ctx)
+	}
 	s.svc.StartOperator(ctx)
 	s.svc.StartRemoteDeploymentHealthMonitor(ctx)
 	s.svc.StartWebhookInboxMonitor(ctx)
@@ -555,7 +561,8 @@ func (s *Server) Start(ctx context.Context) {
 }
 
 // Close releases the resources the Server owns and returns all cleanup errors
-// encountered, joined together. It stops the pending-drops cleaner, stops the
+// encountered, joined together. It stops the pending-drops cleaner and the
+// merge gate processor, stops the
 // operator (before closing the gRPC client it built, see below), shuts down
 // telemetry, closes that gRPC fallback client, and closes the service. svc.Close
 // stops the health monitor and closes the service's clients and storage (the
@@ -564,6 +571,9 @@ func (s *Server) Start(ctx context.Context) {
 // after Start.
 func (s *Server) Close() error {
 	s.svc.StopPendingDropsCleaner()
+	if s.webhook.stopMergeGateProcessor != nil {
+		s.webhook.stopMergeGateProcessor()
+	}
 	if s.webhook.stopDurableWebhookDispatch != nil {
 		s.webhook.stopDurableWebhookDispatch()
 	}
@@ -775,6 +785,8 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		drainInProcessWebhookWork:       handler.DrainInProcessWebhookWork,
 		handler:                         handler,
 		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,
+		startMergeGateProcessor:         handler.StartMergeGateProcessor,
+		stopMergeGateProcessor:          handler.StopMergeGateProcessor,
 	}, nil
 }
 
@@ -853,6 +865,8 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 		drainInProcessWebhookWork:       handler.DrainInProcessWebhookWork,
 		handler:                         handler,
 		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,
+		startMergeGateProcessor:         handler.StartMergeGateProcessor,
+		stopMergeGateProcessor:          handler.StopMergeGateProcessor,
 	}, nil
 }
 

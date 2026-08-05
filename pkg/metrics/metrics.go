@@ -1547,3 +1547,58 @@ func RecordMergeGateRecordFailure(ctx context.Context, database, environment str
 		EnvironmentAttribute(environment),
 	)
 }
+
+// RecordMergeGatePROutcome counts per-PR outcomes of merge gate fan-out.
+// Outcomes:
+//   - "refreshed": the PR's stored check state was re-planned against the
+//     mutated target schema.
+//   - "blocked_replan_failed": the re-plan failed, so the stored check was
+//     flipped to blocking (fail closed) — check the server logs for the
+//     re-plan error and re-plan the PR once the cause is fixed.
+//   - "skipped_in_flight": the PR's check row is owned by an in-flight apply,
+//     which stays authoritative; the row was left untouched.
+//   - "skipped_pr_closed": the PR is closed, so its stored checks no longer
+//     gate anything.
+//   - "skipped_not_managed": the PR no longer manages schema for the target
+//     (config removed or database dropped from the PR's schema files).
+//   - "skipped_superseded": a racing write (a synchronize that re-planned a
+//     newer head, or an apply that claimed the row) landed first and is
+//     authoritative; the refresh yielded to it.
+func RecordMergeGatePROutcome(ctx context.Context, repository, database, environment, outcome string) {
+	addCounter(ctx, "schemabot.merge_gate.pr_refreshes_total",
+		"Total per-PR outcomes of merge gate fan-out after a target schema changed", "{refresh}",
+		attribute.String("repository", repository),
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
+// RecordMergeGateEventOutcome counts terminal outcomes of driving one
+// durable merge gate request. Outcomes:
+//   - "completed": the fan-out refreshed (or safely skipped) every sibling PR.
+//   - "failed_retrying": the fan-out failed and the request will be retried.
+//   - "failed_terminal": the fan-out failed on its final attempt — sibling PR
+//     stored checks for the target may remain stale until their PRs re-plan.
+//     Check the server logs for the failing PR and re-plan it.
+//   - "lease_lost": the drive lost its lease mid-fan-out; another driver
+//     re-drives the request (re-planning the same PRs again is safe).
+func RecordMergeGateEventOutcome(ctx context.Context, database, environment, outcome string) {
+	addCounter(ctx, "schemabot.merge_gate.events_total",
+		"Total terminal outcomes of driving durable merge gate requests", "{event}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
+// RecordMergeGateTerminatedStuck counts merge gate requests terminated
+// by the stuck-processing sweep: rows wedged past the attempt cap with an
+// expired lease (a driver hard-killed on its final attempt). Each terminated
+// request means sibling PR stored checks for its target may remain stale —
+// find the request's target in the server logs and re-plan the affected PRs.
+func RecordMergeGateTerminatedStuck(ctx context.Context, terminated int64) {
+	addCounterN(ctx, terminated, "schemabot.merge_gate.terminated_stuck_total",
+		"Total merge gate requests terminated by the stuck-processing sweep", "{request}",
+	)
+}
