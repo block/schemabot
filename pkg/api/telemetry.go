@@ -60,10 +60,11 @@ func SetupTelemetry(logger *slog.Logger) (*Telemetry, error) {
 	var tp *sdktrace.TracerProvider
 
 	// OTLP exporters: enabled when OTEL_EXPORTER_OTLP_ENDPOINT is set.
-	// The OTel SDK reads endpoint, headers, and protocol from standard env vars:
+	// Endpoint and headers are read from standard env vars by the SDK; the
+	// transport protocol is resolved by setupOTLP:
 	//   OTEL_EXPORTER_OTLP_ENDPOINT   (e.g., https://otlp-gateway-us.grafana.net/otlp)
 	//   OTEL_EXPORTER_OTLP_HEADERS    (e.g., Authorization=Basic ...)
-	//   OTEL_EXPORTER_OTLP_PROTOCOL   (default: http/protobuf)
+	//   OTEL_EXPORTER_OTLP_PROTOCOL   (grpc or http/protobuf; default: http/protobuf)
 	if otlpEndpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); otlpEndpoint != "" {
 		otlpMeterReader, otlpTraceExporter, err := setupOTLP(ctx)
 		if err != nil {
@@ -86,6 +87,8 @@ func SetupTelemetry(logger *slog.Logger) (*Telemetry, error) {
 		logger.Info("telemetry initialized",
 			"metrics_endpoint", "/metrics",
 			"otlp_endpoint", redacted,
+			"otlp_metrics_protocol", otlpProtocol("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"),
+			"otlp_traces_protocol", otlpProtocol("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"),
 		)
 	} else {
 		logger.Info("telemetry initialized", "metrics_endpoint", "/metrics")
