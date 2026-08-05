@@ -556,10 +556,10 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 		return
 	}
 
-	// The merge gate request depends only on the apply settling to terminal
+	// The check refresh request depends only on the apply settling to terminal
 	// success; record it before control-request cleanup so a cleanup error
 	// cannot suppress it.
-	s.recordMergeGateIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID)
+	s.recordCheckRefreshIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID)
 
 	// If the derived state above settled the apply terminally and a stop or
 	// cancel is still pending, complete it now so the request does not linger
@@ -738,10 +738,10 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 	// error must not suppress it.
 	s.publishTerminalSummaryIfWon(operationLeaseCtx, driverID, finalApply, result)
 
-	// Like the terminal summary, the merge gate request depends only on the
+	// Like the terminal summary, the check refresh request depends only on the
 	// apply settling to terminal success; record it before control-request
 	// cleanup so a cleanup error cannot suppress it.
-	s.recordMergeGateIfApplyResolved(operationLeaseCtx, driverID, finalApply.ID)
+	s.recordCheckRefreshIfApplyResolved(operationLeaseCtx, driverID, finalApply.ID)
 
 	if err := s.completePendingControlRequestsIfApplyResolved(operationLeaseCtx, driverID, finalApply.ID); err != nil {
 		s.logger.Error("operator: failed to complete pending control requests for resolved apply",
@@ -914,11 +914,11 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 	// summary; publish it if this projection won the terminal swap.
 	s.publishTerminalSummaryIfWon(applyLeaseCtx, driverID, finalApply, result)
 
-	// Like the terminal summary, the merge gate request depends only on the
+	// Like the terminal summary, the check refresh request depends only on the
 	// apply settling to terminal success (the data-plane apply can complete
 	// while a stop was requested); record it before control-request cleanup so
 	// a cleanup error cannot suppress it.
-	s.recordMergeGateIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID)
+	s.recordCheckRefreshIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID)
 
 	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID); err != nil {
 		s.logger.Error("operator: failed to complete pending control requests after stop reconciliation",
@@ -1019,84 +1019,242 @@ func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, dr
 	return nil
 }
 
-// hasMergeGateConsumer reports whether a merge gate consumer — the
-// webhook handler's merge gate processor — exists on this server. The handler
-// registers OnMergeGateRecorded at construction, so a nil callback means
+// hasCheckRefreshConsumer reports whether a check refresh consumer — the
+// webhook handler's refresh processor — exists on this server. The handler
+// registers OnCheckRefreshRecorded at construction, so a nil callback means
 // no GitHub runtime is configured: no PR check state to refresh and no
 // processor to drain requests.
-func (s *Service) hasMergeGateConsumer() bool {
-	return s.OnMergeGateRecorded != nil
+func (s *Service) hasCheckRefreshConsumer() bool {
+	return s.OnCheckRefreshRecorded != nil
 }
 
-// recordMergeGateIfApplyResolved records a durable merge gate request
-// once the apply has settled to terminal success. A completed apply —
+// recordCheckRefreshIfApplyResolved records a durable settle check refresh
+// request once the apply has settled terminally. A completed apply —
 // including a completed rollback — changes the live schema of its
 // (environment, database type, database) target, which stales the stored plan
-// check state of every other open PR planning against that target. The check
-// merge gate processor consumes the durable request to re-plan those PRs. The
-// apply is reloaded because the derived-state write operates on a copy and
-// does not mutate the caller's row. Recording is idempotent (one request per
-// apply) and never fails the drive tail: errors are logged and counted, and
-// the backstop sweep over recently completed applies re-records anything
-// missed here. No-op on a server with no merge gate consumer (no GitHub
-// runtime configured) and for every settled state other than terminal
-// success — only terminal success mutates the target schema.
-func (s *Service) recordMergeGateIfApplyResolved(ctx context.Context, driverID int, applyID int64) {
-	if !s.hasMergeGateConsumer() {
+// check state of every other open PR planning against that target; the check
+// refresh processor consumes the settle to re-plan those PRs. A terminal
+// outcome that did not change the schema (failed, stopped, cancelled) needs a
+// settle only when a preflight request held sibling checks before the apply
+// started — the settle's re-plan is what releases those holds. The apply is
+// reloaded because the derived-state write operates on a copy and does not
+// mutate the caller's row. Recording is idempotent (one request per apply and
+// kind) and never fails the drive tail: errors are logged and counted, and
+// the backstop sweeps re-record anything missed here. No-op on a server with
+// no check refresh consumer (no GitHub runtime configured).
+func (s *Service) recordCheckRefreshIfApplyResolved(ctx context.Context, driverID int, applyID int64) {
+	if !s.hasCheckRefreshConsumer() {
 		// Without a GitHub webhook runtime this server has no PR check state
 		// to refresh and no processor to drain requests, so a recorded row
 		// would sit pending forever.
-		s.logger.Debug("operator: no merge gate consumer registered (GitHub is not configured on this server); skipping merge gate recording",
+		s.logger.Debug("operator: no check refresh consumer registered (GitHub is not configured on this server); skipping check refresh recording",
 			"driver", driverID)
 		return
 	}
 	apply, err := s.storage.Applies().Get(ctx, applyID)
 	if err != nil {
-		s.logger.Error("operator: failed to reload apply before recording merge gate request; the backstop sweep will record it",
+		s.logger.Error("operator: failed to reload apply before recording settle check refresh request; the backstop sweep will record it",
 			"driver", driverID, "error", fmt.Errorf("reload apply %d: %w", applyID, err))
 		return
 	}
 	if apply == nil {
-		s.logger.Error("operator: apply not found while recording merge gate request; sibling checks will not be re-planned",
+		s.logger.Error("operator: apply not found while recording settle check refresh request; no refresh will be recorded",
 			"driver", driverID, "error", fmt.Errorf("reload apply %d: %w", applyID, storage.ErrApplyNotFound))
 		return
 	}
-	if !state.IsState(apply.State, state.Apply.Completed) {
-		// Only terminal success mutates the target schema; every other outcome
-		// (still running, stopped, cancelled, failed, reverted) leaves sibling
-		// plan checks accurate.
-		s.logger.Debug("operator: apply did not settle to terminal success; no merge gate recorded",
+	if !state.IsTerminalApplyState(apply.State) {
+		s.logger.Debug("operator: apply is not terminal; no settle check refresh recorded",
 			append(apply.LogAttrs(), "driver", driverID)...)
 		return
 	}
+	if !state.IsState(apply.State, state.Apply.Completed) {
+		// Only terminal success mutates the target schema, so a non-success
+		// outcome needs a settle only to release a preflight hold.
+		preflight, err := s.storage.CheckRefreshRequests().GetByApplyAndKind(ctx, apply.ID, storage.CheckRefreshKindPreflight)
+		if err != nil {
+			s.logger.Error("operator: failed to look up preflight check refresh request for settled apply; the release sweep will record the settle if sibling checks are held",
+				append(apply.LogAttrs(), "driver", driverID, "error", err)...)
+			metrics.RecordCheckRefreshRecordFailure(ctx, apply.Database, apply.Environment)
+			return
+		}
+		if preflight == nil {
+			s.logger.Debug("operator: apply settled without terminal success and no preflight held sibling checks; no settle check refresh needed",
+				append(apply.LogAttrs(), "driver", driverID)...)
+			return
+		}
+	}
 
-	recorded, err := s.storage.MergeGateRequests().Record(ctx, &storage.MergeGateRequest{
+	recorded, err := s.storage.CheckRefreshRequests().Record(ctx, &storage.CheckRefreshRequest{
 		ApplyID:         apply.ID,
-		Kind:            storage.MergeGateKindSettle,
+		Kind:            storage.CheckRefreshKindSettle,
 		ApplyIdentifier: apply.ApplyIdentifier,
 		Environment:     apply.Environment,
 		DatabaseType:    apply.DatabaseType,
 		DatabaseName:    apply.Database,
 		Repository:      apply.Repository,
-		ChangeKey:       storage.ChangeKeyForPullRequest(apply.PullRequest),
+		PullRequest:     apply.PullRequest,
 		RequestedBy:     apply.Caller,
 	})
 	if err != nil {
-		s.logger.Error("operator: failed to record merge gate request for completed apply; sibling PR checks stay stale until the backstop sweep records it",
+		s.logger.Error("operator: failed to record settle check refresh request for settled apply; sibling PR checks stay stale or held until the backstop sweep records it",
 			append(apply.LogAttrs(), "driver", driverID, "error", err)...)
-		metrics.RecordMergeGateRecordFailure(ctx, apply.Database, apply.Environment)
+		metrics.RecordCheckRefreshRecordFailure(ctx, apply.Database, apply.Environment)
 		return
 	}
 	if !recorded {
-		s.logger.Debug("operator: merge gate request already recorded for completed apply",
+		s.logger.Debug("operator: settle check refresh request already recorded for settled apply",
 			append(apply.LogAttrs(), "driver", driverID)...)
 		return
 	}
-	s.logger.Info("operator: recorded merge gate request for completed apply; sibling PR checks against the target will be re-planned",
+	s.logger.Info("operator: recorded settle check refresh request; sibling PR checks against the target will be re-planned",
 		append(apply.LogAttrs(), "driver", driverID)...)
-	metrics.RecordMergeGateRecorded(ctx, apply.Database, apply.Environment, metrics.MergeGateSourceDriveTail)
+	metrics.RecordCheckRefreshRecorded(ctx, apply.Database, apply.Environment, metrics.CheckRefreshSourceDriveTail)
 	// Non-nil by the consumer gate above; wake the processor to drain now.
-	s.OnMergeGateRecorded()
+	s.OnCheckRefreshRecorded()
+}
+
+const (
+	// checkPreflightGateTimeout bounds how long one drive attempt waits for
+	// the preflight fan-out to hold sibling PR checks before the apply's
+	// engine work may start. It exceeds the check refresh processor's poll
+	// interval so a wake-up kick lost across pods still completes within one
+	// wait. On expiry the drive attempt is abandoned and the apply stays
+	// claimable — fail closed: engine work never starts before the holds are
+	// confirmed.
+	checkPreflightGateTimeout = 90 * time.Second
+
+	// checkPreflightGatePollInterval is the cadence at which the gate re-reads
+	// the preflight request while waiting for the fan-out to complete.
+	checkPreflightGatePollInterval = time.Second
+)
+
+// gateApplyStartOnCheckPreflight blocks an apply's engine work until the
+// preflight check refresh fan-out has durably held every sibling PR check on
+// the apply's target action-required (posting a PR comment that explains the
+// hold). Merges must not land on check verdicts this apply is about to
+// invalidate, so the holds are a hard precondition of the drive: a nil return
+// means the holds are confirmed (or the gate does not apply — no GitHub
+// consumer, or a task-less apply that cannot change the schema). An error
+// means the holds could not be confirmed; the caller abandons the drive
+// attempt and the apply stays claimable, so the start is retried on a later
+// poll and the apply never runs un-preflighted.
+//
+// The gate is idempotent across drive attempts, lease handovers, and resumes:
+// the preflight request is unique per apply, and a completed request passes
+// immediately, so mid-apply resumes and cutover drives pay one storage read.
+func (s *Service) gateApplyStartOnCheckPreflight(ctx context.Context, driverID int, apply *storage.Apply, deployment string) error {
+	if !s.hasCheckRefreshConsumer() {
+		// Without a GitHub webhook runtime there is no PR check state to hold
+		// and no processor to drain the request; the apply starts ungated.
+		s.logger.Debug("operator: no check refresh consumer registered (GitHub is not configured on this server); apply starts without a check preflight",
+			"driver", driverID)
+		return nil
+	}
+
+	store := s.storage.CheckRefreshRequests()
+	req, err := store.GetByApplyAndKind(ctx, apply.ID, storage.CheckRefreshKindPreflight)
+	if err != nil {
+		metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "error")
+		return fmt.Errorf("load preflight check refresh request: %w", err)
+	}
+	if req != nil && req.State == storage.CheckRefreshCompleted {
+		// The common resume/cutover fast path: holds were confirmed on an
+		// earlier drive attempt.
+		s.logger.Debug("operator: check preflight already completed; apply may start",
+			append(apply.LogAttrs(), "driver", driverID, "operation_deployment", deployment)...)
+		return nil
+	}
+	if req == nil {
+		// Only an apply that executes DDL invalidates sibling check verdicts.
+		// An apply that owns no task rows cannot change the schema (its drive
+		// fails closed on the no-tasks claim gate), so it holds nothing.
+		taskCount, err := s.storage.Tasks().CountByApplyID(ctx, apply.ID)
+		if err != nil {
+			metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "error")
+			return fmt.Errorf("count apply tasks before check preflight: %w", err)
+		}
+		if taskCount == 0 {
+			s.logger.Debug("operator: apply owns no schema change tasks; no check preflight needed",
+				append(apply.LogAttrs(), "driver", driverID, "operation_deployment", deployment)...)
+			return nil
+		}
+		recorded, err := store.Record(ctx, &storage.CheckRefreshRequest{
+			ApplyID:         apply.ID,
+			Kind:            storage.CheckRefreshKindPreflight,
+			ApplyIdentifier: apply.ApplyIdentifier,
+			Environment:     apply.Environment,
+			DatabaseType:    apply.DatabaseType,
+			DatabaseName:    apply.Database,
+			Repository:      apply.Repository,
+			PullRequest:     apply.PullRequest,
+			RequestedBy:     apply.Caller,
+		})
+		if err != nil {
+			metrics.RecordCheckRefreshRecordFailure(ctx, apply.Database, apply.Environment)
+			metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "error")
+			return fmt.Errorf("record preflight check refresh request: %w", err)
+		}
+		if recorded {
+			s.logger.Info("operator: recorded preflight check refresh request; apply start waits for sibling PR checks on the target to be held",
+				append(apply.LogAttrs(), "driver", driverID, "operation_deployment", deployment)...)
+			metrics.RecordCheckRefreshRecorded(ctx, apply.Database, apply.Environment, metrics.CheckRefreshSourcePreflightGate)
+		}
+		// Non-nil by the consumer gate above; wake the processor to drain now.
+		s.OnCheckRefreshRecorded()
+	}
+
+	return s.waitForCheckPreflight(ctx, driverID, apply, deployment)
+}
+
+// waitForCheckPreflight polls the apply's preflight request until the fan-out
+// completes, the gate deadline expires, or the drive context ends. A
+// terminally failed request is re-armed to pending with a fresh attempt
+// budget so a long outage (for example GitHub unavailable past the retry cap)
+// blocks the apply only until the cause clears, not until manual
+// intervention.
+func (s *Service) waitForCheckPreflight(ctx context.Context, driverID int, apply *storage.Apply, deployment string) error {
+	store := s.storage.CheckRefreshRequests()
+	deadline := time.Now().Add(checkPreflightGateTimeout)
+	for {
+		req, err := store.GetByApplyAndKind(ctx, apply.ID, storage.CheckRefreshKindPreflight)
+		if err != nil {
+			metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "error")
+			return fmt.Errorf("poll preflight check refresh request: %w", err)
+		}
+		if req == nil {
+			metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "error")
+			return fmt.Errorf("preflight check refresh request for apply %s disappeared while the gate waited on it", apply.ApplyIdentifier)
+		}
+		if req.State == storage.CheckRefreshCompleted {
+			s.logger.Info("operator: check preflight completed; sibling PR checks on the target are held and the apply may start",
+				append(apply.LogAttrs(), "driver", driverID, "operation_deployment", deployment)...)
+			metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "passed")
+			return nil
+		}
+		if req.State == storage.CheckRefreshFailed && req.RetryAfter == nil {
+			reopened, err := store.ReopenForRetry(ctx, req.ID)
+			if err != nil {
+				metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "error")
+				return fmt.Errorf("re-arm terminally failed preflight check refresh request: %w", err)
+			}
+			if reopened {
+				s.logger.Warn("operator: preflight check refresh request had terminally failed; re-armed it for retry and the gate keeps waiting",
+					append(apply.LogAttrs(), "driver", driverID, "operation_deployment", deployment, "last_error", req.LastError)...)
+				s.OnCheckRefreshRecorded()
+			}
+		}
+		if time.Now().After(deadline) {
+			metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "timeout")
+			return fmt.Errorf("preflight holds for apply %s not confirmed within %s (request state %s, attempts %d): apply start stays blocked until the check refresh processor confirms them",
+				apply.ApplyIdentifier, checkPreflightGateTimeout, req.State, req.Attempts)
+		}
+		select {
+		case <-ctx.Done():
+			metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "error")
+			return fmt.Errorf("drive context ended while waiting for preflight holds: %w", ctx.Err())
+		case <-time.After(checkPreflightGatePollInterval):
+		}
+	}
 }
 
 // reconcileUnclaimableParent handles a claimed operation whose parent apply
@@ -1265,6 +1423,23 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 	// without this entry, an operator reading apply_logs sees a gap between
 	// the last failure and the resumed work.
 	s.logApplyResumeClaim(ctx, driverID, apply)
+
+	// Engine work must not start until sibling PR checks on the target are
+	// held: their verdicts were computed against the schema this apply is
+	// about to change, and a merge must not land on them mid-apply. The gate
+	// waits for the durable preflight fan-out and fails closed — an
+	// unconfirmed hold abandons this drive attempt and leaves the apply
+	// claimable for a later poll.
+	if err := s.gateApplyStartOnCheckPreflight(ctx, driverID, apply, deployment); err != nil {
+		s.logger.Error("operator: check preflight gate did not confirm sibling PR check holds; the apply will not start on this attempt and stays claimable",
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"apply_operation_id", applyOperationID,
+				"operation_deployment", deployment,
+				"error", err)...)
+		metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "check_preflight_gate")
+		return false, err
+	}
 
 	previousState := apply.State
 
