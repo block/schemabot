@@ -1,10 +1,12 @@
 package schema
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/block/spirit/pkg/statement"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -53,7 +55,11 @@ func TestPostgresFilesMirrorMySQLFiles(t *testing.T) {
 }
 
 // TestPostgresFilesContainNoMySQLSyntax lints every postgres schema file for
-// MySQL-only constructs that PostgreSQL rejects or silently misinterprets.
+// MySQL constructs that must not appear in the postgres DDL. Most are syntax
+// PostgreSQL rejects outright; charset and collate are policy bans — the
+// storage DDL uses the database's default collation, and any collation
+// decision (e.g. case-insensitive matching) belongs to the store layer where
+// its query semantics can be tested, not hidden in the bootstrap DDL.
 func TestPostgresFilesContainNoMySQLSyntax(t *testing.T) {
 	forbidden := []string{
 		"`",
@@ -88,28 +94,105 @@ func TestPostgresTableNamesMatchFilenames(t *testing.T) {
 	}
 }
 
+// postgresIndex is one CREATE INDEX statement parsed from a postgres schema file.
+type postgresIndex struct {
+	file    string
+	name    string
+	table   string
+	unique  bool
+	columns []string
+}
+
+var postgresCreateIndexRe = regexp.MustCompile(`(?m)^CREATE (UNIQUE )?INDEX (\S+) ON (\S+) \(([^)]+)\);`)
+
+// readPostgresIndexes parses every CREATE INDEX statement in the postgres
+// schema directory. The parse count per file is cross-checked against literal
+// CREATE INDEX occurrences, so an index written in a format the regex does
+// not recognize fails loudly instead of silently escaping the schema lints.
+func readPostgresIndexes(t *testing.T) []postgresIndex {
+	t.Helper()
+
+	var indexes []postgresIndex
+	for name, content := range readSchemaDir(t, "postgres") {
+		matches := postgresCreateIndexRe.FindAllStringSubmatch(content, -1)
+		literal := strings.Count(content, "CREATE INDEX ") + strings.Count(content, "CREATE UNIQUE INDEX ")
+		require.Len(t, matches, literal, "%s: every CREATE INDEX must be a single-line statement of the form CREATE [UNIQUE] INDEX name ON table (cols);", name)
+		for _, match := range matches {
+			columns := strings.Split(match[4], ",")
+			for i, col := range columns {
+				columns[i] = strings.TrimSpace(col)
+			}
+			indexes = append(indexes, postgresIndex{
+				file:    name,
+				name:    match[2],
+				table:   match[3],
+				unique:  match[1] != "",
+				columns: columns,
+			})
+		}
+	}
+	require.NotEmpty(t, indexes)
+	return indexes
+}
+
 // TestPostgresIndexNames verifies index naming across the postgres schema.
 // Unlike MySQL, PostgreSQL index names share one schema-wide namespace, so
 // every index name must be globally unique, carry its table's name as a
 // prefix, and fit within the identifier length limit.
 func TestPostgresIndexNames(t *testing.T) {
-	createIndexRe := regexp.MustCompile(`(?m)^CREATE (?:UNIQUE )?INDEX (\S+) ON (\S+) `)
-
 	seen := make(map[string]string)
-	for name, content := range readSchemaDir(t, "postgres") {
-		table := strings.TrimSuffix(name, ".sql")
-		for _, match := range createIndexRe.FindAllStringSubmatch(content, -1) {
-			indexName, indexTable := match[1], match[2]
-			assert.Equal(t, table, indexTable, "%s: index %s must target its own file's table", name, indexName)
-			assert.True(t, strings.HasPrefix(indexName, "idx_"+table+"_"),
-				"%s: index %s must be prefixed idx_%s_", name, indexName, table)
-			assert.LessOrEqual(t, len(indexName), postgresMaxIdentifierLength,
-				"%s: index %s exceeds the PostgreSQL identifier length limit", name, indexName)
-			if prev, dup := seen[indexName]; dup {
-				t.Errorf("index name %s in %s collides with %s (PostgreSQL index names are schema-wide)", indexName, name, prev)
+	for _, idx := range readPostgresIndexes(t) {
+		table := strings.TrimSuffix(idx.file, ".sql")
+		assert.Equal(t, table, idx.table, "%s: index %s must target its own file's table", idx.file, idx.name)
+		assert.True(t, strings.HasPrefix(idx.name, "idx_"+table+"_"),
+			"%s: index %s must be prefixed idx_%s_", idx.file, idx.name, table)
+		assert.LessOrEqual(t, len(idx.name), postgresMaxIdentifierLength,
+			"%s: index %s exceeds the PostgreSQL identifier length limit", idx.file, idx.name)
+		if prev, dup := seen[idx.name]; dup {
+			t.Errorf("index name %s in %s collides with %s (PostgreSQL index names are schema-wide)", idx.name, idx.file, prev)
+		}
+		seen[idx.name] = idx.file
+	}
+}
+
+// indexShape is the dialect-neutral identity of an index: the table it
+// covers, its ordered column list, and whether it is unique. Names are
+// excluded — they legitimately differ across dialects (postgres names are
+// table-prefixed and occasionally renamed for clarity) and are linted by
+// TestPostgresIndexNames instead.
+func indexShape(table string, unique bool, columns []string) string {
+	kind := "INDEX"
+	if unique {
+		kind = "UNIQUE"
+	}
+	return fmt.Sprintf("%s %s (%s)", kind, table, strings.Join(columns, ", "))
+}
+
+// TestPostgresIndexesMirrorMySQLIndexes verifies every MySQL index has a
+// postgres counterpart on the same table with the same ordered column list
+// and the same uniqueness, and that postgres defines no extra indexes. The
+// PostgreSQL store's ON CONFLICT upserts and duplicate-rejection guarantees
+// depend on the unique indexes existing with exactly the MySQL semantics, so
+// a dropped or de-uniquified index must fail here rather than surface as a
+// runtime error or silent duplicate acceptance.
+func TestPostgresIndexesMirrorMySQLIndexes(t *testing.T) {
+	pgShapes := make([]string, 0)
+	for _, idx := range readPostgresIndexes(t) {
+		pgShapes = append(pgShapes, indexShape(idx.table, idx.unique, idx.columns))
+	}
+
+	mysqlShapes := make([]string, 0, len(pgShapes))
+	for name, content := range readSchemaDir(t, "mysql") {
+		parsed, err := statement.ParseCreateTable(content)
+		require.NoError(t, err, "parse mysql schema file %s", name)
+		for _, idx := range parsed.Indexes {
+			if idx.Type == "PRIMARY KEY" {
+				continue
 			}
-			seen[indexName] = name
+			mysqlShapes = append(mysqlShapes, indexShape(parsed.TableName, idx.Type == "UNIQUE", idx.Columns))
 		}
 	}
-	assert.NotEmpty(t, seen)
+
+	assert.ElementsMatch(t, mysqlShapes, pgShapes,
+		"index sets differ between dialects: every mysql index needs a postgres counterpart with the same table, ordered columns, and uniqueness, and vice versa")
 }

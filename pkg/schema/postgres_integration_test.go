@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/block/spirit/pkg/statement"
+	"github.com/block/spirit/pkg/utils"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -19,11 +20,11 @@ import (
 
 // TestPostgresSchemaFilesExecuteAndMirrorMySQL executes every embedded
 // postgres schema file against a real PostgreSQL server, then verifies each
-// table mirrors its MySQL counterpart column-for-column: same column names and
-// same nullability. The MySQL side is parsed from the embedded files; the
-// PostgreSQL side is read back from information_schema after the DDL runs, so
-// the comparison covers what the server actually created, not what the file
-// claims.
+// table mirrors its MySQL counterpart column-for-column: same column names,
+// same nullability, the declared type mapping, and identical varchar widths.
+// The MySQL side is parsed from the embedded files; the PostgreSQL side is
+// read back from information_schema after the DDL runs, so the comparison
+// covers what the server actually created, not what the file claims.
 func TestPostgresSchemaFilesExecuteAndMirrorMySQL(t *testing.T) {
 	ctx := t.Context()
 
@@ -46,7 +47,7 @@ func TestPostgresSchemaFilesExecuteAndMirrorMySQL(t *testing.T) {
 
 	db, err := sql.Open("pgx", dsn)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(db) })
 	require.NoError(t, db.PingContext(ctx))
 
 	for name, content := range readSchemaDir(t, "postgres") {
@@ -70,10 +71,24 @@ func TestPostgresSchemaFilesExecuteAndMirrorMySQL(t *testing.T) {
 		mysqlNames := make([]string, 0, len(parsed.Columns))
 		for _, col := range parsed.Columns {
 			mysqlNames = append(mysqlNames, col.Name)
-			nullable, ok := pgColumns[col.Name]
-			if assert.True(t, ok, "table %s: column %s missing from postgres schema", parsed.TableName, col.Name) {
-				assert.Equal(t, col.Nullable, nullable,
-					"table %s: column %s nullability differs (mysql nullable=%v)", parsed.TableName, col.Name, col.Nullable)
+			pgCol, ok := pgColumns[col.Name]
+			if !assert.True(t, ok, "table %s: column %s missing from postgres schema", parsed.TableName, col.Name) {
+				continue
+			}
+			assert.Equal(t, col.Nullable, pgCol.nullable,
+				"table %s: column %s nullability differs (mysql nullable=%v)", parsed.TableName, col.Name, col.Nullable)
+
+			wantType, ok := expectedPostgresColumnType(col)
+			require.True(t, ok, "table %s: column %s has mysql type %q with no declared postgres mapping", parsed.TableName, col.Name, col.Type)
+			assert.Equal(t, wantType, pgCol.dataType,
+				"table %s: column %s type differs (mysql type=%q)", parsed.TableName, col.Name, col.Type)
+
+			if col.Type == "varchar" {
+				require.NotNil(t, col.Length, "table %s: mysql varchar column %s has no length", parsed.TableName, col.Name)
+				if assert.True(t, pgCol.charMaxLen.Valid, "table %s: postgres column %s has no character maximum length", parsed.TableName, col.Name) {
+					assert.Equal(t, int64(*col.Length), pgCol.charMaxLen.Int64,
+						"table %s: column %s varchar width differs", parsed.TableName, col.Name)
+				}
 			}
 		}
 		pgNames := make([]string, 0, len(pgColumns))
@@ -84,25 +99,70 @@ func TestPostgresSchemaFilesExecuteAndMirrorMySQL(t *testing.T) {
 	}
 }
 
-// postgresColumns returns column name → nullable for a table in the public
+// postgresColumn is one column definition read back from information_schema
+// after the DDL ran, so assertions cover what the server actually created.
+type postgresColumn struct {
+	nullable   bool
+	dataType   string
+	charMaxLen sql.NullInt64
+}
+
+// postgresColumns returns column name → definition for a table in the public
 // schema of the connected PostgreSQL database.
-func postgresColumns(t *testing.T, db *sql.DB, tableName string) map[string]bool {
+func postgresColumns(t *testing.T, db *sql.DB, tableName string) map[string]postgresColumn {
 	t.Helper()
 
 	rows, err := db.QueryContext(t.Context(),
-		`SELECT column_name, is_nullable FROM information_schema.columns
+		`SELECT column_name, is_nullable, data_type, character_maximum_length
+		 FROM information_schema.columns
 		 WHERE table_schema = 'public' AND table_name = $1`,
 		tableName,
 	)
 	require.NoError(t, err)
-	defer func() { _ = rows.Close() }()
+	defer utils.CloseAndLog(rows)
 
-	columns := make(map[string]bool)
+	columns := make(map[string]postgresColumn)
 	for rows.Next() {
 		var colName, isNullable string
-		require.NoError(t, rows.Scan(&colName, &isNullable))
-		columns[colName] = isNullable == "YES"
+		var col postgresColumn
+		require.NoError(t, rows.Scan(&colName, &isNullable, &col.dataType, &col.charMaxLen))
+		col.nullable = isNullable == "YES"
+		columns[colName] = col
 	}
 	require.NoError(t, rows.Err())
 	return columns
+}
+
+// expectedPostgresColumnType returns the information_schema data_type the
+// postgres translation of a TiDB-parsed mysql column must produce. This is
+// the single declaration of the cross-dialect type mapping: identity bigint
+// PKs, bigint for unsigned ints (PostgreSQL has no unsigned types and integer
+// would halve the range), boolean for tinyint(1), jsonb for json, and
+// zone-less timestamp for zone-less datetime.
+func expectedPostgresColumnType(col statement.Column) (string, bool) {
+	unsigned := col.Unsigned != nil && *col.Unsigned
+	switch col.Type {
+	case "tinyint":
+		if col.Length == nil || *col.Length != 1 {
+			return "", false
+		}
+		return "boolean", true
+	case "int":
+		if unsigned {
+			return "bigint", true
+		}
+		return "integer", true
+	case "bigint":
+		return "bigint", true
+	case "varchar":
+		return "character varying", true
+	case "text":
+		return "text", true
+	case "datetime":
+		return "timestamp without time zone", true
+	case "json":
+		return "jsonb", true
+	default:
+		return "", false
+	}
 }

@@ -161,6 +161,7 @@ jobs:
           scripts/ci/prepull-images.sh \
             mysql:8.0 \
             mysql:8.4 \
+            postgres:16 \
             localstack/localstack:3.0 \
             testcontainers/ryuk:0.13.0
       - name: "Test"

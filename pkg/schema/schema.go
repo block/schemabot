@@ -1,13 +1,6 @@
 // Package schema provides embedded SQL schema files and shared schema types
-// for SchemaBot storage.
-//
-// Tables:
-//   - locks: Deployment locks
-//   - checks: Schema check tracking
-//   - settings: Runtime settings
-//   - plans: Schema change plans
-//   - tasks: Schema change tasks
-//   - apply_operations: Per-(apply, deployment) child rows for multi-deployment applies
+// for SchemaBot storage. Each storage table has one file per dialect
+// directory; see mysql/ and postgres/.
 package schema
 
 import "embed"
