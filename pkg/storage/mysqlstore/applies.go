@@ -1603,6 +1603,91 @@ func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, own
 	return apply, nil
 }
 
+// FindNextApplyForOperationProjection claims one apply whose operation rows have
+// all settled while the apply itself is still non-terminal and its heartbeat has
+// gone stale, so the operator can re-derive the parent from its operations. See
+// the interface doc for why a parent can be left behind its own children.
+func (s *applyStore) FindNextApplyForOperationProjection(ctx context.Context, owner string) (*storage.Apply, error) {
+	if owner == "" {
+		return nil, fmt.Errorf("operator owner is required to claim apply for operation projection: %w", storage.ErrApplyLeaseLost)
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin claim apply for operation projection transaction: %w", err)
+	}
+	defer rollbackTx(ctx, tx, "claim apply for operation projection")
+
+	// Parent eligibility is the recovery-claimable set: the same states
+	// ClaimApplyByID re-leases when a heartbeat goes stale, which is exactly the
+	// population a crashed operation drive can leave behind. pending is excluded
+	// because an apply whose operations all settled was necessarily driven, and
+	// the resumable stopped and failed_retryable states have their own resume
+	// paths.
+	parentStates := claimableApplyStates()
+	parentStatePlaceholders := placeholders(len(parentStates))
+
+	// Any operation not in a terminal state can still move the parent on its own,
+	// so the parent is not stranded and this path leaves it alone. That includes
+	// pending operations: a pending row under a non-terminal parent is queued
+	// work for the operation claim, not residue.
+	settledOpStates := terminalApplyStates()
+	settledOpStatePlaceholders := placeholders(len(settledOpStates))
+
+	// The staleness gate is what keeps this off live rollouts. A driver that is
+	// mid-projection still holds a fresh lease, so only a parent whose owner has
+	// stopped heartbeating for the full window is claimable here.
+	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+
+	queryArgs := stringArgs(parentStates)
+	queryArgs = append(queryArgs, stringArgs(settledOpStates)...)
+
+	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM applies a
+		WHERE a.state IN (%s)
+			AND a.updated_at < %s
+			AND EXISTS (
+				SELECT 1
+				FROM apply_operations ao
+				WHERE ao.apply_id = a.id
+			)
+			AND NOT EXISTS (
+				SELECT 1
+				FROM apply_operations unsettled
+				WHERE unsettled.apply_id = a.id
+					AND unsettled.state NOT IN (%s)
+			)
+		ORDER BY a.created_at
+		LIMIT 1
+		FOR UPDATE SKIP LOCKED
+	`, applyColumns, parentStatePlaceholders, staleClaimCutoff, settledOpStatePlaceholders), queryArgs...)
+
+	apply, err := scanApplyInto(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil // nothing to reconcile
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query next apply for operation projection: %w", err)
+	}
+
+	// persistApplyClaim rotates the lease and refreshes the heartbeat. Refreshing
+	// it is what bounds re-claim churn: a parent the projection cannot settle is
+	// not reconsidered until the staleness window elapses again.
+	outcome, err := persistApplyClaim(ctx, s.db, s.locker, tx, apply, owner)
+	if err != nil {
+		return nil, err
+	}
+	if outcome != claimAcquired {
+		return nil, nil
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit claim apply %d (%s) for operation projection: %w", apply.ID, apply.ApplyIdentifier, err)
+	}
+
+	return apply, nil
+}
+
 // claimOutcome describes how persistApplyClaim resolved a claim attempt and
 // who owns committing the transaction.
 type claimOutcome int

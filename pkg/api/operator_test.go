@@ -1749,6 +1749,10 @@ func (s *operationClaimApplyStore) FindNextApplyForStopReconciliation(context.Co
 	return nil, nil
 }
 
+func (s *operationClaimApplyStore) FindNextApplyForOperationProjection(context.Context, string) (*storage.Apply, error) {
+	return nil, nil
+}
+
 func (s *operationClaimApplyStore) ClaimApplyByID(_ context.Context, _ int64, owner string) (*storage.Apply, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

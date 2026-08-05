@@ -576,6 +576,78 @@ func TestOperator_StartResumesStoppedApplyWhoseDeploymentsNeverStarted(t *testin
 		"the serviced start request is completed")
 }
 
+// TestOperator_ProjectsApplyLeftBehindItsSettledOperations covers a parent apply
+// left behind its own children: a drive wrote its terminal operation row and
+// then stopped before projecting that outcome onto the parent, so every
+// operation is terminal while the apply itself is still running. No operation
+// claim arm matches a fully settled operation set, and until the parent settles
+// the one-active-apply guard refuses every new apply for that target. Once the
+// crashed drive's lease goes stale the operator must derive the parent from its
+// operations and release the target, leaving the operation rows untouched.
+func TestOperator_ProjectsApplyLeftBehindItsSettledOperations(t *testing.T) {
+	ctx := t.Context()
+	appDBName, appDSN := createTestDB(t, "operator_projection_")
+	ts := startTestServer(t, appDBName, appDSN)
+
+	now := time.Now()
+	applyID, err := ts.Storage.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply-settled-ops-orphan",
+		Database:        appDBName,
+		DatabaseType:    "mysql",
+		Deployment:      appDBName,
+		Engine:          "spirit",
+		State:           state.Apply.Running,
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	require.NoError(t, err)
+
+	opID, err := ts.Storage.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    applyID,
+		Deployment: appDBName,
+		Target:     appDBName,
+		State:      state.ApplyOperation.Completed,
+	})
+	require.NoError(t, err)
+
+	// Age the apply's heartbeat past the lease staleness window so the crashed
+	// drive is no longer presumed live. Written directly because every storage
+	// write path refreshes updated_at, which is the heartbeat itself.
+	storageDB, err := sql.Open("mysql", schemabotDSN)
+	require.NoError(t, err, "open schemabot db")
+	require.NoError(t, storageDB.PingContext(ctx))
+	t.Cleanup(func() {
+		utils.CloseAndLog(storageDB)
+	})
+	_, err = storageDB.ExecContext(ctx,
+		`UPDATE applies SET updated_at = NOW() - INTERVAL ? SECOND WHERE id = ?`,
+		int64((2 * storage.ApplyLeaseStaleAfter).Seconds()), applyID)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		apply, err := ts.Storage.Applies().Get(ctx, applyID)
+		if err != nil || apply == nil {
+			return false
+		}
+		return state.IsState(apply.State, state.Apply.Completed)
+	}, 30*time.Second, 200*time.Millisecond,
+		"operator should derive the parent apply from its already-settled operations")
+
+	apply, err := ts.Storage.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	assert.Equal(t, state.Apply.Completed, apply.State, "the parent settles to the state its operations derive")
+	require.NotNil(t, apply.CompletedAt, "a parent settled to a terminal state stamps completed_at")
+
+	op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+	require.NoError(t, err)
+	require.NotNil(t, op)
+	assert.Equal(t, state.ApplyOperation.Completed, op.State,
+		"the repair derives the parent from the operations and never rewrites them")
+}
+
 // TestOperator_StopReconciliationDrivesTaskStop covers the operation-claim stop
 // path for an apply whose operation row is still pending when a stop is
 // requested — the window before the operator claims and drives the operation.

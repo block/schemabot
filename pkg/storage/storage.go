@@ -453,6 +453,22 @@ type ApplyStore interface {
 	// by a peer.
 	FindNextApplyForStopReconciliation(ctx context.Context, owner string) (*Apply, error)
 
+	// FindNextApplyForOperationProjection atomically claims one apply whose
+	// operation rows have all settled while the apply itself is still
+	// non-terminal and its heartbeat has gone stale, rotating the lease onto it
+	// like ClaimApplyByID. It is the repair path for a parent left behind its own
+	// children: an operation drive writes its terminal operation row and then
+	// projects the parent, so a crash between those two writes leaves nothing to
+	// finish the projection — every operation is terminal, so no operation-level
+	// claim arm matches, and the one-active-apply guard keeps that target blocked
+	// until the parent settles. Requiring a stale heartbeat is what keeps this off
+	// live rollouts: a driver mid-projection still holds a fresh lease. Applies
+	// with no operation rows are excluded (there is nothing to project from), as
+	// are pending, stopped, and failed_retryable parents, which have their own
+	// resume paths. Returns nil when no such apply exists or it is locked by a
+	// peer.
+	FindNextApplyForOperationProjection(ctx context.Context, owner string) (*Apply, error)
+
 	// Heartbeat updates the apply's updated_at timestamp to maintain the lease.
 	// Should be called every 10 seconds while working on an apply.
 	// If not called for > 1 minute, another driver can claim the apply.

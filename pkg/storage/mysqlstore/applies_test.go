@@ -4439,6 +4439,138 @@ func TestApplyStore_FindNextApplyForStopReconciliation_SkipsApplyWithoutPendingS
 	assert.Nil(t, claimed, "an apply without a pending stop is not a reconciliation candidate")
 }
 
+// stageOperationProjectionOrphan builds an apply whose operations are all in the
+// given states while the apply itself stays in parentState, then ages the apply's
+// heartbeat by staleBy so the projection claim's staleness gate can be exercised
+// in either direction.
+func stageOperationProjectionOrphan(t *testing.T, store *Storage, identifier, parentState string, staleBy time.Duration, opStates ...string) *storage.Apply {
+	t.Helper()
+	ctx := t.Context()
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, identifier, 1, parentState, "staging")
+	for i, opState := range opStates {
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID:    apply.ID,
+			Deployment: fmt.Sprintf("region-%d", i),
+			State:      opState,
+		})
+		require.NoError(t, err)
+	}
+	_, err := testDB.ExecContext(ctx,
+		`UPDATE applies SET updated_at = NOW() - INTERVAL ? SECOND WHERE id = ?`,
+		int64(staleBy.Seconds()), apply.ID)
+	require.NoError(t, err)
+	return apply
+}
+
+// TestApplyStore_FindNextApplyForOperationProjection_ClaimsSettledOperationOrphan
+// verifies the repair trigger for a parent left behind its own children: every
+// operation has reached a terminal state, the apply itself is still running, and
+// its heartbeat has gone stale, so no drive is coming back to project the
+// outcome. The apply is claimable here so the operator can derive its state from
+// the operations and release the target.
+func TestApplyStore_FindNextApplyForOperationProjection_ClaimsSettledOperationOrphan(t *testing.T) {
+	clearTables(t)
+	store := New(testDB)
+
+	apply := stageOperationProjectionOrphan(t, store, "apply_op_projection", state.Apply.Running,
+		2*storage.ApplyLeaseStaleAfter, state.ApplyOperation.Completed, state.ApplyOperation.Completed)
+
+	claimed, err := store.Applies().FindNextApplyForOperationProjection(t.Context(), "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "an apply whose operations have all settled must be claimable for projection")
+	assert.Equal(t, apply.ID, claimed.ID)
+	assert.Equal(t, "test-operator", claimed.LeaseOwner, "the claim rotates the lease owner")
+	assert.Equal(t, state.Apply.Running, claimed.State, "the claim refreshes the lease without changing apply state")
+}
+
+// TestApplyStore_FindNextApplyForOperationProjection_SkipsLiveAndUnsettledApplies
+// verifies the two gates that keep this repair off applies that are not
+// stranded. A fresh heartbeat means a driver is still on the apply and may be
+// mid-projection. Any non-terminal operation — pending queued work included —
+// means an operation claim arm can still move the parent on its own.
+func TestApplyStore_FindNextApplyForOperationProjection_SkipsLiveAndUnsettledApplies(t *testing.T) {
+	cases := []struct {
+		name     string
+		staleBy  time.Duration
+		opStates []string
+		reason   string
+	}{
+		{
+			name:     "fresh heartbeat",
+			staleBy:  0,
+			opStates: []string{state.ApplyOperation.Completed, state.ApplyOperation.Completed},
+			reason:   "a driver still heartbeating the apply may be mid-projection",
+		},
+		{
+			name:     "pending operation left",
+			staleBy:  2 * storage.ApplyLeaseStaleAfter,
+			opStates: []string{state.ApplyOperation.Completed, state.ApplyOperation.Pending},
+			reason:   "a pending operation is queued work for the operation claim, not residue",
+		},
+		{
+			name:     "running operation left",
+			staleBy:  2 * storage.ApplyLeaseStaleAfter,
+			opStates: []string{state.ApplyOperation.Completed, state.ApplyOperation.Running},
+			reason:   "a running operation is recovered by the operation claim, which projects the parent itself",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			store := New(testDB)
+
+			stageOperationProjectionOrphan(t, store, "apply_op_projection_skip", state.Apply.Running, tc.staleBy, tc.opStates...)
+
+			claimed, err := store.Applies().FindNextApplyForOperationProjection(t.Context(), "test-operator")
+			require.NoError(t, err)
+			assert.Nil(t, claimed, tc.reason)
+		})
+	}
+}
+
+// TestApplyStore_FindNextApplyForOperationProjection_SkipsTerminalAndChildlessApplies
+// verifies the repair is scoped to parents that are genuinely behind their
+// children. A terminal apply has already recorded its verdict, and an apply with
+// no operation rows has nothing to derive a state from.
+func TestApplyStore_FindNextApplyForOperationProjection_SkipsTerminalAndChildlessApplies(t *testing.T) {
+	t.Run("terminal apply", func(t *testing.T) {
+		clearTables(t)
+		store := New(testDB)
+
+		stageOperationProjectionOrphan(t, store, "apply_op_projection_terminal", state.Apply.Completed,
+			2*storage.ApplyLeaseStaleAfter, state.ApplyOperation.Completed)
+
+		claimed, err := store.Applies().FindNextApplyForOperationProjection(t.Context(), "test-operator")
+		require.NoError(t, err)
+		assert.Nil(t, claimed, "a terminal apply has already recorded its verdict")
+	})
+
+	t.Run("apply with no operations", func(t *testing.T) {
+		clearTables(t)
+		store := New(testDB)
+
+		stageOperationProjectionOrphan(t, store, "apply_op_projection_childless", state.Apply.Running,
+			2*storage.ApplyLeaseStaleAfter)
+
+		claimed, err := store.Applies().FindNextApplyForOperationProjection(t.Context(), "test-operator")
+		require.NoError(t, err)
+		assert.Nil(t, claimed, "an apply with no operation rows has nothing to project from")
+	})
+}
+
+// TestApplyStore_FindNextApplyForOperationProjection_RequiresOwner verifies the
+// claim fails closed without an owner: an unowned claim would rotate a lease
+// nobody holds, leaving the apply writable by any driver.
+func TestApplyStore_FindNextApplyForOperationProjection_RequiresOwner(t *testing.T) {
+	clearTables(t)
+	store := New(testDB)
+
+	_, err := store.Applies().FindNextApplyForOperationProjection(t.Context(), "")
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+}
+
 // SetRevertSkipped records skip-revert on the apply and the timestamp round-trips
 // through Get, so progress can show that revert was skipped without an
 // engine-specific side table. It is a targeted write that leaves other fields

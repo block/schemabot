@@ -907,26 +907,28 @@ func RecordOperatorStrandedOperationReaped(ctx context.Context, database, deploy
 }
 
 var knownOperatorClaimFailureReasons = map[string]bool{
-	"expire_retryable_error":                  true,
-	"stranded_reaper_error":                   true,
-	"missing_lease_token":                     true,
-	"operation_storage_error":                 true,
-	"missing_operation_lease_token":           true,
-	"operation_set_list_error":                true,
-	"operation_set_missing":                   true,
-	"operation_task_inspect_error":            true,
-	"operation_cutover_storage_error":         true,
-	"missing_operation_cutover_lease_token":   true,
-	"operation_cutover_set_list_error":        true,
-	"operation_cutover_set_invalid":           true,
-	"operation_parent_load_error":             true,
-	"operation_parent_missing":                true,
-	"operation_parent_claim_error":            true,
-	"operation_parent_not_claimable":          true,
-	"operation_lease_release_error":           true,
-	"missing_operation_deployment":            true,
-	"stop_reconciliation_claim_error":         true,
-	"stop_reconciliation_missing_lease_token": true,
+	"expire_retryable_error":                   true,
+	"stranded_reaper_error":                    true,
+	"missing_lease_token":                      true,
+	"operation_storage_error":                  true,
+	"missing_operation_lease_token":            true,
+	"operation_set_list_error":                 true,
+	"operation_set_missing":                    true,
+	"operation_task_inspect_error":             true,
+	"operation_cutover_storage_error":          true,
+	"missing_operation_cutover_lease_token":    true,
+	"operation_cutover_set_list_error":         true,
+	"operation_cutover_set_invalid":            true,
+	"operation_parent_load_error":              true,
+	"operation_parent_missing":                 true,
+	"operation_parent_claim_error":             true,
+	"operation_parent_not_claimable":           true,
+	"operation_lease_release_error":            true,
+	"missing_operation_deployment":             true,
+	"stop_reconciliation_claim_error":          true,
+	"stop_reconciliation_missing_lease_token":  true,
+	"operation_projection_claim_error":         true,
+	"operation_projection_missing_lease_token": true,
 }
 
 // RecordOperatorClaimFailure increments the operator claim failure counter.
@@ -965,6 +967,26 @@ func RecordOperatorStuckPendingScanFailure(ctx context.Context) {
 	addCounter(ctx, "schemabot.operator.stuck_pending_scan_failures",
 		"Total number of failed operator stuck-pending apply scans", "{failure}",
 		EnvironmentAttribute(""),
+	)
+}
+
+// RecordOperatorOperationProjectionRepair counts applies the operator settled by
+// re-deriving the parent from operation rows that had all already settled — a
+// parent left behind its own children because a drive stopped between writing
+// its terminal operation row and projecting the parent. Every increment is one
+// target that was blocked for the lease staleness window by the one-active-apply
+// guard, so a sustained rate means drives are dying mid-projection and the
+// expected operator action is to look for driver crashes, evictions, or
+// deploy-time terminations rather than at this repair path. derived_state names
+// the verdict the repair landed on, so a spike that is all failed reads
+// differently from one that is all completed.
+func RecordOperatorOperationProjectionRepair(ctx context.Context, database, deployment, environment, derivedState string) {
+	addOperatorCounter(ctx, "operation_projection_repairs_total",
+		"Total number of applies settled by re-deriving the parent from already-settled operation rows", "{apply}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("derived_state", derivedState),
 	)
 }
 
