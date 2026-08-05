@@ -1019,6 +1019,15 @@ func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, dr
 	return nil
 }
 
+// hasCheckRefreshConsumer reports whether a check refresh consumer — the
+// webhook handler's refresh processor — exists on this server. The handler
+// registers OnCheckRefreshRecorded at construction, so a nil callback means
+// no GitHub runtime is configured: no PR check state to refresh and no
+// processor to drain requests.
+func (s *Service) hasCheckRefreshConsumer() bool {
+	return s.OnCheckRefreshRecorded != nil
+}
+
 // recordCheckRefreshIfApplyResolved records a durable check refresh request
 // once the apply has settled to terminal success. A completed apply —
 // including a completed rollback — changes the live schema of its
@@ -1029,9 +1038,18 @@ func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, dr
 // does not mutate the caller's row. Recording is idempotent (one request per
 // apply) and never fails the drive tail: errors are logged and counted, and
 // the backstop sweep over recently completed applies re-records anything
-// missed here. No-op for every other settled state — only terminal success
-// mutates the target schema.
+// missed here. No-op on a server with no check refresh consumer (no GitHub
+// runtime configured) and for every settled state other than terminal
+// success — only terminal success mutates the target schema.
 func (s *Service) recordCheckRefreshIfApplyResolved(ctx context.Context, driverID int, applyID int64) {
+	if !s.hasCheckRefreshConsumer() {
+		// Without a GitHub webhook runtime this server has no PR check state
+		// to refresh and no processor to drain requests, so a recorded row
+		// would sit pending forever.
+		s.logger.Debug("operator: no check refresh consumer registered (GitHub is not configured on this server); skipping check refresh recording",
+			"driver", driverID)
+		return
+	}
 	apply, err := s.storage.Applies().Get(ctx, applyID)
 	if err != nil {
 		s.logger.Error("operator: failed to reload apply before recording check refresh request; the backstop sweep will record it",
@@ -1076,9 +1094,8 @@ func (s *Service) recordCheckRefreshIfApplyResolved(ctx context.Context, driverI
 	s.logger.Info("operator: recorded check refresh request for completed apply; sibling PR checks against the target will be re-planned",
 		append(apply.LogAttrs(), "driver", driverID)...)
 	metrics.RecordCheckRefreshRecorded(ctx, apply.Database, apply.Environment, metrics.CheckRefreshSourceDriveTail)
-	if s.OnCheckRefreshRecorded != nil {
-		s.OnCheckRefreshRecorded()
-	}
+	// Non-nil by the consumer gate above; wake the processor to drain now.
+	s.OnCheckRefreshRecorded()
 }
 
 // reconcileUnclaimableParent handles a claimed operation whose parent apply

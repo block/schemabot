@@ -180,11 +180,15 @@ type Service struct {
 
 	// OnCheckRefreshRecorded is called after a drive tail durably records a
 	// check refresh request. Set by the webhook handler to wake its refresh
-	// processor immediately instead of waiting for the next poll tick. The
-	// durable request row stays the source of truth: a missed call (no
-	// processor on this pod, callback unset) only costs poll latency, never
-	// the refresh. Implementations must be non-blocking and safe for
-	// concurrent drivers.
+	// processor immediately instead of waiting for the next poll tick; the
+	// durable request row stays the source of truth, so a lost wake-up only
+	// costs poll latency, never the refresh.
+	//
+	// Registration doubles as the drive tails' consumer signal: when nil, no
+	// GitHub webhook runtime exists on this server — there is no PR check
+	// state to refresh and no processor to drain requests — so drive tails
+	// skip recording entirely. Implementations must be non-blocking and safe
+	// for concurrent drivers.
 	OnCheckRefreshRecorded func()
 
 	pendingObserverMu sync.Mutex
