@@ -1626,6 +1626,20 @@ func RecordCheckPreflightGateOutcome(ctx context.Context, database, environment,
 	)
 }
 
+// RecordMergeGatePlanTimeHold counts plan-time check writes stored born held:
+// the plan's verdict would have passed, but a preflighted apply is changing
+// the target, so storing a passing check would reopen the merge gate
+// mid-apply. The apply's settle fan-out re-plans held checks when it settles.
+// A sustained rate with no matching settle re-plans means holds are piling up
+// on the target — check the merge gate processor's logs.
+func RecordMergeGatePlanTimeHold(ctx context.Context, database, environment string) {
+	addCounter(ctx, "schemabot.merge_gate.plan_time_holds_total",
+		"Total plan-time check writes stored held because a preflighted apply was in flight on the target", "{hold}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+	)
+}
+
 // RecordMergeGateTerminatedStuck counts merge gate requests terminated
 // by the stuck-processing sweep: rows wedged past the attempt cap with an
 // expired lease (a driver hard-killed on its final attempt). Each terminated
