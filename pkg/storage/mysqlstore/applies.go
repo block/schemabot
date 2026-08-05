@@ -1132,8 +1132,8 @@ func (s *applyStore) GetInProgress(ctx context.Context) ([]*storage.Apply, error
 // FindStuckPendingApplies returns pending applies older than olderThan that
 // carry child rows — the child-rows arm of the claim predicate (see
 // ClaimApplyByID), so every row returned is one a driver should already have
-// claimed. It is a
-// read-only diagnostic (no lease, no FOR UPDATE): apply creation rejects a
+// claimed. It is a read-only diagnostic (no lease, no FOR UPDATE): apply
+// creation rejects a
 // second active apply for the same target instead of queuing it, so a pending
 // apply this old is never legitimately waiting its turn. Ordered oldest first
 // (with an id tiebreak so same-second rows are stable) and capped at limit; a

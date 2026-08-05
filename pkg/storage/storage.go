@@ -426,8 +426,8 @@ type ApplyStore interface {
 	FindStuckPendingApplies(ctx context.Context, olderThan time.Duration, limit int) ([]*Apply, error)
 
 	// ClaimApplyByID atomically claims one specific apply by ID when it needs a
-	// driver (pending with child rows, stale active
-	// state, retryable within budget, or a pending start control request). On a
+	// driver (pending with child rows, stale active state, retryable within
+	// budget, or a pending start control request). On a
 	// successful claim it rotates the lease (owner, token, acquired_at) and
 	// refreshes the heartbeat so operator-owned writes can fail closed after
 	// ownership changes. Returns the claimed apply, or nil if the apply does not

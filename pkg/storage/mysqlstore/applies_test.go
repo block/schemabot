@@ -2418,35 +2418,47 @@ func TestApplyStore_ClaimApplyByIDRefusesUnrecoverableRetryable(t *testing.T) {
 // ClaimApplyByID is how the operation-level claim loop acquires the parent apply
 // lease after leasing a stale operation row. When a PlanetScale driver crashes
 // mid-setup the operation row stays running (stale) while the parent apply sits
-// in a setup-phase state, so ClaimApplyByID must reclaim that stale parent for
-// recovery while still refusing one whose heartbeat is fresh.
+// in one of the setup-phase states, so ClaimApplyByID must reclaim a stale
+// parent in every one of them — a state missing from the claim list would
+// strand a crash in that exact phase — while still refusing one whose
+// heartbeat is fresh.
 func TestApplyStore_ClaimApplyByIDClaimsStaleSetupPhase(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := New(testDB)
+	for i, setupState := range []string{
+		state.Apply.PreparingBranch,
+		state.Apply.ApplyingBranchChanges,
+		state.Apply.ValidatingBranch,
+		state.Apply.CreatingDeployRequest,
+		state.Apply.ValidatingDeployRequest,
+	} {
+		t.Run(setupState, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := New(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
-	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_setup", 701, state.Apply.ApplyingBranchChanges, "staging")
-	require.Equal(t, storage.EnginePlanetScale, apply.Engine, "setup-phase states only occur for the PlanetScale engine")
+			lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
+			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_setup_"+setupState, int64(701+i), setupState, "staging")
+			require.Equal(t, storage.EnginePlanetScale, apply.Engine, "setup-phase states only occur for the PlanetScale engine")
 
-	fresh, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
-	require.NoError(t, err)
-	assert.Nil(t, fresh, "a fresh setup-phase apply is owned by its active driver")
+			fresh, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+			require.NoError(t, err)
+			assert.Nil(t, fresh, "a fresh setup-phase apply is owned by its active driver")
 
-	_, err = testDB.ExecContext(ctx, `
-		UPDATE applies
-		SET updated_at = NOW() - INTERVAL 2 MINUTE
-		WHERE id = ?
-	`, apply.ID)
-	require.NoError(t, err)
+			_, err = testDB.ExecContext(ctx, `
+				UPDATE applies
+				SET updated_at = NOW() - INTERVAL 2 MINUTE
+				WHERE id = ?
+			`, apply.ID)
+			require.NoError(t, err)
 
-	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
-	require.NoError(t, err)
-	require.NotNil(t, claimed, "a stale setup-phase parent apply must be reclaimable")
-	assert.Equal(t, state.Apply.ApplyingBranchChanges, claimed.State)
-	assert.Equal(t, storage.EnginePlanetScale, claimed.Engine, "the reclaimed parent apply keeps its PlanetScale engine")
-	assert.Equal(t, "operator-a", claimed.LeaseOwner)
-	assert.NotEmpty(t, claimed.LeaseToken)
+			claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+			require.NoError(t, err)
+			require.NotNil(t, claimed, "a stale setup-phase parent apply must be reclaimable")
+			assert.Equal(t, setupState, claimed.State)
+			assert.Equal(t, storage.EnginePlanetScale, claimed.Engine, "the reclaimed parent apply keeps its PlanetScale engine")
+			assert.Equal(t, "operator-a", claimed.LeaseOwner)
+			assert.NotEmpty(t, claimed.LeaseToken)
+		})
+	}
 }
 
 // An apply dwells in a revert-phase state (reverting, skipping_revert) while
@@ -2506,10 +2518,11 @@ func TestApplyStore_ClaimApplyByIDClaimsStaleRevertPhase(t *testing.T) {
 }
 
 // TestApplyStore_ClaimApplyByIDClaimsStaleWaitingForCutover verifies driver
-// recovery at the cutover gate: an apply parked at waiting_for_cutover with a
-// pending cutover request belongs to its live driver while the heartbeat is
-// fresh, and becomes reclaimable once the heartbeat goes stale — so a driver
-// crash at the highest-risk dwell state never strands the operator's cutover.
+// recovery at the cutover gate: waiting_for_cutover is a claimable dwell
+// state, so an apply parked there belongs to its live driver while the
+// heartbeat is fresh and becomes reclaimable through the stale-active arm once
+// the heartbeat goes stale — a driver crash at the highest-risk dwell state
+// never strands the operator's cutover.
 func TestApplyStore_ClaimApplyByIDClaimsStaleWaitingForCutover(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -2517,14 +2530,6 @@ func TestApplyStore_ClaimApplyByIDClaimsStaleWaitingForCutover(t *testing.T) {
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_waiting_for_cutover", 1, state.Apply.WaitingForCutover, "staging")
-	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
-		ApplyID:   apply.ID,
-		Operation: storage.ControlOperationCutover,
-		Status:    storage.ControlRequestPending,
-		Metadata:  []byte(`{}`),
-	})
-	require.NoError(t, err)
-	require.False(t, alreadyPending)
 
 	freshClaim, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
 	require.NoError(t, err)
@@ -3080,6 +3085,10 @@ func TestApplyStore_ClaimApplyByIDSkipsFailedStoppedStartUntilRerequested(t *tes
 	require.NoError(t, err)
 	require.NotNil(t, persistedAfterRetry)
 	assert.Equal(t, state.Apply.Resuming, persistedAfterRetry.State, "the successful claim transitions stopped → resuming")
+
+	again, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-b")
+	require.NoError(t, err)
+	assert.Nil(t, again, "the just-resumed apply belongs to its claimer; a repeat claim must not steal the fresh lease")
 }
 
 func TestApplyStore_ClaimApplyByIDDoesNotClaimFreshRunningStopControlRequest(t *testing.T) {
