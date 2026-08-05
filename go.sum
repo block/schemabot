@@ -113,8 +113,8 @@ github.com/beorn7/perks v0.0.0-20180321164747-3a771d992973/go.mod h1:Dwedo/Wpr24
 github.com/beorn7/perks v1.0.0/go.mod h1:KWe93zE9D1o94FZ5RNwFwVgaQK1VOXiVxmqh+CedLV8=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
-github.com/block/spirit v0.16.1-0.20260804150650-0f9ac219835d h1:IJ5Z8J8vUZC7Nztn8NM7JcVuNW4UxzWVMSvMpD565PE=
-github.com/block/spirit v0.16.1-0.20260804150650-0f9ac219835d/go.mod h1:aR9KJ8sca3Lo5IpwH6ZGRqK2zdl4Ukhuh7jNdBCRdDk=
+github.com/block/spirit v0.16.1-0.20260805154536-ea50a2eb683e h1:MXkHRB6YUHwYu9cNV7FXi8Ep9fYYgPaaAqEvsbUdClo=
+github.com/block/spirit v0.16.1-0.20260805154536-ea50a2eb683e/go.mod h1:aR9KJ8sca3Lo5IpwH6ZGRqK2zdl4Ukhuh7jNdBCRdDk=
 github.com/block/tidb/pkg/parser v0.0.0-20260506200501-e528fd979fc8 h1:+OfdTacrEyjlqcRUpBFX9uJ6ROBq6cUjwY4DClhnsdU=
 github.com/block/tidb/pkg/parser v0.0.0-20260506200501-e528fd979fc8/go.mod h1:zDLDsfNBU5+L6T4J9/OgWAHc/WZvMUjbpgHqQ/t3yKo=
 github.com/block/vitess v0.0.0-20260703150944-881ec2298245 h1:R7e7uAxl6WIZpeY957JDsrZtuihck6vm7QgRooI295U=
