@@ -90,7 +90,7 @@ func TestRecordMergeGateGatedOnConsumer(t *testing.T) {
 		require.Len(t, gateStore.recorded, 1)
 		recorded := gateStore.recorded[0]
 		assert.Equal(t, "apply-gate-test", recorded.ApplyIdentifier)
-		assert.Equal(t, storage.CheckRefreshKindSettle, recorded.Kind)
+		assert.Equal(t, storage.MergeGateKindSettle, recorded.Kind)
 		assert.Equal(t, "gate_db", recorded.DatabaseName)
 		assert.Equal(t, "mysql", recorded.DatabaseType)
 		assert.Equal(t, "staging", recorded.Environment)

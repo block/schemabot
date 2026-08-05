@@ -1401,7 +1401,7 @@ type MergeGateRequest struct {
 	// ApplyIdentifier.
 	ApplyID int64
 	// Kind selects the fan-out the processor runs for this request:
-	// CheckRefreshKindPreflight or CheckRefreshKindSettle.
+	// MergeGateKindPreflight or MergeGateKindSettle.
 	Kind string
 	// ApplyIdentifier is the originating apply's user-facing string identifier,
 	// carried for attribution in refreshed check summaries and logs.

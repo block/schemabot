@@ -177,7 +177,7 @@ func (h *Handler) sweepMergeGateRequests(ctx context.Context) {
 	for _, apply := range applies {
 		recorded, err := store.Record(ctx, &storage.MergeGateRequest{
 			ApplyID:         apply.ID,
-			Kind:            storage.CheckRefreshKindSettle,
+			Kind:            storage.MergeGateKindSettle,
 			ApplyIdentifier: apply.ApplyIdentifier,
 			Environment:     apply.Environment,
 			DatabaseType:    apply.DatabaseType,

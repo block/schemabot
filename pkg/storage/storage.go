@@ -62,8 +62,8 @@ type Storage interface {
 	// WebhookEvents returns the durable webhook event inbox store.
 	WebhookEvents() WebhookEventStore
 
-	// CheckRefreshRequests returns the durable check refresh request store.
-	CheckRefreshRequests() CheckRefreshRequestStore
+	// MergeGateRequests returns the durable merge gate request store.
+	MergeGateRequests() MergeGateRequestStore
 
 	// Ping verifies the database connection is alive.
 	Ping(ctx context.Context) error
@@ -177,13 +177,13 @@ type CheckStore interface {
 	GetByDatabase(ctx context.Context, repo, environment, dbType, database string) ([]*Check, error)
 
 	// GetByTarget returns all stored check state for a target across all
-	// repositories and PRs. The check refresh fan-out uses it: a CLI/gRPC apply
+	// repositories and PRs. The merge gate fan-out uses it: a CLI/gRPC apply
 	// carries no repository, so the fan-out must find every PR whose plan was
 	// computed against the target's previous live schema regardless of repo.
 	GetByTarget(ctx context.Context, environment, dbType, database string) ([]*Check, error)
 
 	// MarkBlockedForFailedRefresh flips stored check state to a blocking
-	// conclusion after a check refresh re-plan failed, so a plan computed
+	// conclusion after a merge gate re-plan failed, so a plan computed
 	// against a schema that has since changed cannot keep passing. The update
 	// is conditional on the head SHA the refresher read: a racing synchronize
 	// that already re-planned a newer commit wins and is preserved. It also
@@ -318,24 +318,24 @@ type WebhookEventStore interface {
 	TerminateStuckProcessing(ctx context.Context, reason string) (int64, error)
 }
 
-// CheckRefreshRequestStore manages durable check refresh requests. A request
+// MergeGateRequestStore manages durable merge gate requests. A request
 // records that an apply is changing (preflight) or has changed (settle) a
 // target's live schema, so stored check state on every other open PR against
 // that target must be held or re-planned. The row is behavioral state, not
-// just audit: the check refresh processor consumes pending rows to recover
+// just audit: the merge gate processor consumes pending rows to recover
 // the fan-out after process restarts, and the operator's preflight gate waits
 // on the preflight row before starting an apply's engine work.
-type CheckRefreshRequestStore interface {
-	// Record records a pending refresh request. Kind is required. Returns
+type MergeGateRequestStore interface {
+	// Record records a pending merge gate request. Kind is required. Returns
 	// recorded=false when a request for the same apply and kind already exists
 	// (any state), so recording is idempotent across drive tails, the operator
 	// preflight gate, and the backfill sweeps.
-	Record(ctx context.Context, req *CheckRefreshRequest) (recorded bool, err error)
+	Record(ctx context.Context, req *MergeGateRequest) (recorded bool, err error)
 
 	// GetByApplyAndKind returns the request of one kind for an originating
 	// apply, or nil if not found. The operator preflight gate polls it while
 	// waiting for the preflight fan-out to complete.
-	GetByApplyAndKind(ctx context.Context, applyID int64, kind string) (*CheckRefreshRequest, error)
+	GetByApplyAndKind(ctx context.Context, applyID int64, kind string) (*MergeGateRequest, error)
 
 	// ReopenForRetry re-arms a terminally failed request back to pending with a
 	// fresh attempt budget. The operator preflight gate uses it so an apply
@@ -349,9 +349,9 @@ type CheckRefreshRequestStore interface {
 	// request. The claim rotates lease_owner/lease_token, increments attempts,
 	// and sets a lease expiry in the same transaction. Retryable and
 	// lease-expired rows are only reclaimed while attempts <
-	// MaxCheckRefreshAttempts, so a poison request cannot be reclaimed forever.
+	// MaxMergeGateAttempts, so a poison request cannot be reclaimed forever.
 	// Returns nil when no request is claimable.
-	ClaimNext(ctx context.Context, owner string, leaseDuration time.Duration) (*CheckRefreshRequest, error)
+	ClaimNext(ctx context.Context, owner string, leaseDuration time.Duration) (*MergeGateRequest, error)
 
 	// PendingForTarget returns the pending requests of one kind for the same
 	// (environment, database_type, database_name) target, excluding the given
@@ -360,16 +360,16 @@ type CheckRefreshRequestStore interface {
 	// together with the claimed request. Kind-scoped because a preflight
 	// fan-out (hold checks) does not do a settle's work (re-plan them), or
 	// vice versa.
-	PendingForTarget(ctx context.Context, environment, databaseType, databaseName, kind string, excludeID int64) ([]*CheckRefreshRequest, error)
+	PendingForTarget(ctx context.Context, environment, databaseType, databaseName, kind string, excludeID int64) ([]*MergeGateRequest, error)
 
 	// Heartbeat extends the lease on a claimed request so a fan-out that spans
 	// many PRs can outlive the initial lease without being reclaimed
-	// mid-flight. Returns ErrCheckRefreshLeaseLost when the lease token is
+	// mid-flight. Returns ErrMergeGateLeaseLost when the lease token is
 	// stale.
 	Heartbeat(ctx context.Context, id int64, leaseToken string, leaseDuration time.Duration) error
 
 	// MarkCompleted marks a claimed request terminal-successful. Returns
-	// ErrCheckRefreshLeaseLost when the lease token is stale.
+	// ErrMergeGateLeaseLost when the lease token is stale.
 	MarkCompleted(ctx context.Context, id int64, leaseToken string) error
 
 	// CompletePendingCoalesced marks a still-pending sibling request completed
@@ -380,7 +380,7 @@ type CheckRefreshRequestStore interface {
 
 	// MarkFailed marks a claimed request failed. A non-nil retryAfter keeps it
 	// retryable after that time; nil makes the failure terminal. Returns
-	// ErrCheckRefreshLeaseLost when the lease token is stale.
+	// ErrMergeGateLeaseLost when the lease token is stale.
 	MarkFailed(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error
 
 	// FindCompletedAppliesMissingRequest returns applies that reached the
@@ -410,7 +410,7 @@ type CheckRefreshRequestStore interface {
 
 	// TerminateStuckProcessing marks as terminally failed every processing row
 	// whose lease has expired and whose attempts have reached
-	// MaxCheckRefreshAttempts — a driver hard-killed on its final attempt.
+	// MaxMergeGateAttempts — a driver hard-killed on its final attempt.
 	// Returns the number of rows terminated.
 	TerminateStuckProcessing(ctx context.Context, reason string) (int64, error)
 }
