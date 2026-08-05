@@ -43,6 +43,7 @@ func TestSettings(t *testing.T, h Harness) {
 		// Verify update
 		setting, err := store.Settings().Get(ctx, "test_key")
 		require.NoError(t, err)
+		require.NotNil(t, setting)
 		require.Equal(t, "updated_value", setting.Value)
 	})
 
@@ -98,6 +99,7 @@ func TestSettings(t *testing.T, h Harness) {
 
 		setting, err := store.Settings().Get(ctx, "rate_limits")
 		require.NoError(t, err)
+		require.NotNil(t, setting)
 		require.Equal(t, jsonValue, setting.Value)
 	})
 

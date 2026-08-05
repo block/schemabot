@@ -212,7 +212,8 @@ type SettingsStore interface {
 	// List returns all settings, ordered by key ascending.
 	List(ctx context.Context) ([]*Setting, error)
 
-	// Delete removes a setting by key.
+	// Delete removes a setting by key. It returns ErrSettingNotFound when no
+	// setting with that key exists.
 	Delete(ctx context.Context, key string) error
 }
 
