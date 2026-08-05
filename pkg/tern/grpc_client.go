@@ -592,7 +592,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
 		message := "remote apply id is not available"
-		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, message); err != nil {
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, message, remoteID); err != nil {
 			return err
 		}
 		return fmt.Errorf("process pending gRPC cutover for apply %s: %s", apply.ApplyIdentifier, message)
@@ -612,7 +612,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 	})
 	if err != nil {
 		errorMessage := fmt.Sprintf("remote cutover failed: %v", err)
-		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); failErr != nil {
+		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage, remoteID); failErr != nil {
 			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %w; fail pending cutover request: %w", apply.ApplyIdentifier, remoteID, err, failErr)
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,
@@ -621,7 +621,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 	}
 	if resp == nil {
 		errorMessage := "not accepted"
-		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage, remoteID); err != nil {
 			return err
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,
@@ -633,7 +633,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		if resp.ErrorMessage != "" {
 			errorMessage = resp.ErrorMessage
 		}
-		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage, remoteID); err != nil {
 			return err
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,
@@ -686,11 +686,13 @@ func (c *GRPCClient) processPendingSkipRevertControlRequest(ctx context.Context,
 		return fmt.Errorf("process pending skip-revert for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if !resp.Accepted {
+		c.applyLogger(apply).WarnContext(ctx, "skip-revert was not accepted by the data plane",
+			append(apply.MutableLogAttrs(), "remote_apply_id", remoteID, "error_message", resp.ErrorMessage)...)
 		message := "skip-revert was not accepted by the data plane"
 		if resp.ErrorMessage != "" {
 			message = fmt.Sprintf("skip-revert was not accepted: %s", resp.ErrorMessage)
 		}
-		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationSkipRevert, message)
+		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationSkipRevert, message, remoteID)
 	}
 	if apply.Engine == storage.EnginePlanetScale {
 		if err := c.storage.Applies().SetRevertSkipped(ctx, apply.ID, time.Now()); err != nil {
@@ -731,11 +733,13 @@ func (c *GRPCClient) processPendingRevertControlRequest(ctx context.Context, app
 		return fmt.Errorf("process pending revert for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if !resp.Accepted {
+		c.applyLogger(apply).WarnContext(ctx, "revert was not accepted by the data plane",
+			append(apply.MutableLogAttrs(), "remote_apply_id", remoteID, "error_message", resp.ErrorMessage)...)
 		message := "revert was not accepted by the data plane"
 		if resp.ErrorMessage != "" {
 			message = fmt.Sprintf("revert was not accepted: %s", resp.ErrorMessage)
 		}
-		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert, message)
+		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert, message, remoteID)
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventRevertTriggered,
 		fmt.Sprintf("Revert triggered by user%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
@@ -2064,7 +2068,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 					return fmt.Errorf("persist stopped gRPC apply %s after start failure: %w", apply.ApplyIdentifier, reconcileErr)
 				}
 				if startRequested {
-					if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message); failErr != nil {
+					if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message, remoteID); failErr != nil {
 						return failErr
 					}
 				}
@@ -2231,7 +2235,7 @@ func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, appl
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
 		message := fmt.Sprintf("gRPC apply %s is waiting for deploy without a remote apply id; start dispatch state is ambiguous", apply.ApplyIdentifier)
-		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message); err != nil {
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message, remoteID); err != nil {
 			return err
 		}
 		return errors.New(message)
@@ -2246,7 +2250,7 @@ func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, appl
 			append(apply.MutableLogAttrs(),
 				"remote_apply_id", remoteID,
 				"error", err)...)
-		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message); failErr != nil {
+		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message, remoteID); failErr != nil {
 			return failErr
 		}
 		return fmt.Errorf("start gRPC deferred deploy %s: %w", apply.ApplyIdentifier, err)
@@ -3539,7 +3543,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 					if err := c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now, scope); err != nil {
 						return fmt.Errorf("persist stopped gRPC apply %s after start grace period: %w", apply.ApplyIdentifier, err)
 					}
-					if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message); err != nil {
+					if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message, remoteID); err != nil {
 						return err
 					}
 					return fmt.Errorf("start accepted for gRPC apply %s but %s", apply.ApplyIdentifier, message)
