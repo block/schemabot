@@ -686,6 +686,8 @@ func (c *GRPCClient) processPendingSkipRevertControlRequest(ctx context.Context,
 		return fmt.Errorf("process pending skip-revert for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if !resp.Accepted {
+		c.applyLogger(apply).WarnContext(ctx, "skip-revert was not accepted by the data plane",
+			append(apply.MutableLogAttrs(), "remote_apply_id", remoteID, "error_message", resp.ErrorMessage)...)
 		message := "skip-revert was not accepted by the data plane"
 		if resp.ErrorMessage != "" {
 			message = fmt.Sprintf("skip-revert was not accepted: %s", resp.ErrorMessage)
@@ -731,6 +733,8 @@ func (c *GRPCClient) processPendingRevertControlRequest(ctx context.Context, app
 		return fmt.Errorf("process pending revert for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if !resp.Accepted {
+		c.applyLogger(apply).WarnContext(ctx, "revert was not accepted by the data plane",
+			append(apply.MutableLogAttrs(), "remote_apply_id", remoteID, "error_message", resp.ErrorMessage)...)
 		message := "revert was not accepted by the data plane"
 		if resp.ErrorMessage != "" {
 			message = fmt.Sprintf("revert was not accepted: %s", resp.ErrorMessage)

@@ -15,7 +15,8 @@ import "strings"
 // multi-operation apply deliberately carries none on its parent.
 //
 // The remote identifier stays triageable: it is on the apply or operation row,
-// and every path that rewrites a message logs the raw one first.
+// and every path that relays or stores live rejection text logs the raw
+// message before rewriting it.
 //
 // Replacing an identifier everywhere it appears in free-form text is safe
 // because apply identifiers are fixed-length tokens from a single generator, so
