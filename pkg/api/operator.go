@@ -1019,11 +1019,10 @@ func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, dr
 	return nil
 }
 
-// hasCheckRefreshConsumer reports whether a check refresh consumer — the
-// webhook handler's refresh processor — exists on this server. The handler
-// registers OnCheckRefreshRecorded at construction, so a nil callback means
-// no GitHub runtime is configured: no PR check state to refresh and no
-// processor to drain requests.
+// hasCheckRefreshConsumer reports whether a check refresh consumer — a
+// running refresh processor, registered by the code-host integration — exists
+// on this server. A nil callback means no code-host integration is running a
+// processor: no stored check state to refresh and nothing to drain requests.
 func (s *Service) hasCheckRefreshConsumer() bool {
 	return s.OnCheckRefreshRecorded != nil
 }
@@ -1032,7 +1031,7 @@ func (s *Service) hasCheckRefreshConsumer() bool {
 // request once the apply has settled terminally. A completed apply —
 // including a completed rollback — changes the live schema of its
 // (environment, database type, database) target, which stales the stored plan
-// check state of every other open PR planning against that target; the check
+// check state of every other open change planning against that target; the check
 // refresh processor consumes the settle to re-plan those PRs. A terminal
 // outcome that did not change the schema (failed, stopped, cancelled) needs a
 // settle only when a preflight request held sibling checks before the apply
@@ -1041,13 +1040,13 @@ func (s *Service) hasCheckRefreshConsumer() bool {
 // mutate the caller's row. Recording is idempotent (one request per apply and
 // kind) and never fails the drive tail: errors are logged and counted, and
 // the backstop sweeps re-record anything missed here. No-op on a server with
-// no check refresh consumer (no GitHub runtime configured).
+// no check refresh consumer (no code-host integration running a processor).
 func (s *Service) recordCheckRefreshIfApplyResolved(ctx context.Context, driverID int, applyID int64) {
 	if !s.hasCheckRefreshConsumer() {
-		// Without a GitHub webhook runtime this server has no PR check state
-		// to refresh and no processor to drain requests, so a recorded row
-		// would sit pending forever.
-		s.logger.Debug("operator: no check refresh consumer registered (GitHub is not configured on this server); skipping check refresh recording",
+		// Without a code-host integration this server has no stored check
+		// state to refresh and no processor to drain requests, so a recorded
+		// row would sit pending forever.
+		s.logger.Debug("operator: no check refresh consumer registered (no code-host integration on this server); skipping check refresh recording",
 			"driver", driverID)
 		return
 	}
@@ -1096,7 +1095,7 @@ func (s *Service) recordCheckRefreshIfApplyResolved(ctx context.Context, driverI
 		RequestedBy:     apply.Caller,
 	})
 	if err != nil {
-		s.logger.Error("operator: failed to record settle check refresh request for settled apply; sibling PR checks stay stale or held until the backstop sweep records it",
+		s.logger.Error("operator: failed to record settle check refresh request for settled apply; sibling change checks stay stale or held until the backstop sweep records it",
 			append(apply.LogAttrs(), "driver", driverID, "error", err)...)
 		metrics.RecordCheckRefreshRecordFailure(ctx, apply.Database, apply.Environment)
 		return
@@ -1106,7 +1105,7 @@ func (s *Service) recordCheckRefreshIfApplyResolved(ctx context.Context, driverI
 			append(apply.LogAttrs(), "driver", driverID)...)
 		return
 	}
-	s.logger.Info("operator: recorded settle check refresh request; sibling PR checks against the target will be re-planned",
+	s.logger.Info("operator: recorded settle check refresh request; sibling change checks against the target will be re-planned",
 		append(apply.LogAttrs(), "driver", driverID)...)
 	metrics.RecordCheckRefreshRecorded(ctx, apply.Database, apply.Environment, metrics.CheckRefreshSourceDriveTail)
 	// Non-nil by the consumer gate above; wake the processor to drain now.
@@ -1115,7 +1114,7 @@ func (s *Service) recordCheckRefreshIfApplyResolved(ctx context.Context, driverI
 
 const (
 	// checkPreflightGateTimeout bounds how long one drive attempt waits for
-	// the preflight fan-out to hold sibling PR checks before the apply's
+	// the preflight fan-out to hold sibling change checks before the apply's
 	// engine work may start. It exceeds the check refresh processor's poll
 	// interval so a wake-up kick lost across pods still completes within one
 	// wait. On expiry the drive attempt is abandoned and the apply stays
@@ -1129,12 +1128,13 @@ const (
 )
 
 // gateApplyStartOnCheckPreflight blocks an apply's engine work until the
-// preflight check refresh fan-out has durably held every sibling PR check on
-// the apply's target action-required (posting a PR comment that explains the
-// hold). Merges must not land on check verdicts this apply is about to
-// invalidate, so the holds are a hard precondition of the drive: a nil return
-// means the holds are confirmed (or the gate does not apply — no GitHub
-// consumer, or a task-less apply that cannot change the schema). An error
+// preflight check refresh fan-out has durably held every sibling change's
+// stored check on the apply's target action-required (with a comment on the
+// change explaining the hold). Merges must not land on check verdicts this
+// apply is about to invalidate, so the holds are a hard precondition of the
+// drive: a nil return means the holds are confirmed (or the gate does not
+// apply — no check refresh consumer, or a task-less apply that cannot change
+// the schema). An error
 // means the holds could not be confirmed; the caller abandons the drive
 // attempt and the apply stays claimable, so the start is retried on a later
 // poll and the apply never runs un-preflighted.
@@ -1144,9 +1144,9 @@ const (
 // immediately, so mid-apply resumes and cutover drives pay one storage read.
 func (s *Service) gateApplyStartOnCheckPreflight(ctx context.Context, driverID int, apply *storage.Apply, deployment string) error {
 	if !s.hasCheckRefreshConsumer() {
-		// Without a GitHub webhook runtime there is no PR check state to hold
-		// and no processor to drain the request; the apply starts ungated.
-		s.logger.Debug("operator: no check refresh consumer registered (GitHub is not configured on this server); apply starts without a check preflight",
+		// Without a code-host integration there is no stored check state to
+		// hold and no processor to drain the request; the apply starts ungated.
+		s.logger.Debug("operator: no check refresh consumer registered (no code-host integration on this server); apply starts without a check preflight",
 			"driver", driverID)
 		return nil
 	}
@@ -1195,7 +1195,7 @@ func (s *Service) gateApplyStartOnCheckPreflight(ctx context.Context, driverID i
 			return fmt.Errorf("record preflight check refresh request: %w", err)
 		}
 		if recorded {
-			s.logger.Info("operator: recorded preflight check refresh request; apply start waits for sibling PR checks on the target to be held",
+			s.logger.Info("operator: recorded preflight check refresh request; apply start waits for sibling change checks on the target to be held",
 				append(apply.LogAttrs(), "driver", driverID, "operation_deployment", deployment)...)
 			metrics.RecordCheckRefreshRecorded(ctx, apply.Database, apply.Environment, metrics.CheckRefreshSourcePreflightGate)
 		}
@@ -1209,8 +1209,8 @@ func (s *Service) gateApplyStartOnCheckPreflight(ctx context.Context, driverID i
 // waitForCheckPreflight polls the apply's preflight request until the fan-out
 // completes, the gate deadline expires, or the drive context ends. A
 // terminally failed request is re-armed to pending with a fresh attempt
-// budget so a long outage (for example GitHub unavailable past the retry cap)
-// blocks the apply only until the cause clears, not until manual
+// budget so a long outage (for example the code host unavailable past the
+// retry cap) blocks the apply only until the cause clears, not until manual
 // intervention.
 func (s *Service) waitForCheckPreflight(ctx context.Context, driverID int, apply *storage.Apply, deployment string) error {
 	store := s.storage.CheckRefreshRequests()
@@ -1226,7 +1226,7 @@ func (s *Service) waitForCheckPreflight(ctx context.Context, driverID int, apply
 			return fmt.Errorf("preflight check refresh request for apply %s disappeared while the gate waited on it", apply.ApplyIdentifier)
 		}
 		if req.State == storage.CheckRefreshCompleted {
-			s.logger.Info("operator: check preflight completed; sibling PR checks on the target are held and the apply may start",
+			s.logger.Info("operator: check preflight completed; sibling change checks on the target are held and the apply may start",
 				append(apply.LogAttrs(), "driver", driverID, "operation_deployment", deployment)...)
 			metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "passed")
 			return nil
@@ -1424,14 +1424,14 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 	// the last failure and the resumed work.
 	s.logApplyResumeClaim(ctx, driverID, apply)
 
-	// Engine work must not start until sibling PR checks on the target are
+	// Engine work must not start until sibling change checks on the target are
 	// held: their verdicts were computed against the schema this apply is
 	// about to change, and a merge must not land on them mid-apply. The gate
 	// waits for the durable preflight fan-out and fails closed — an
 	// unconfirmed hold abandons this drive attempt and leaves the apply
 	// claimable for a later poll.
 	if err := s.gateApplyStartOnCheckPreflight(ctx, driverID, apply, deployment); err != nil {
-		s.logger.Error("operator: check preflight gate did not confirm sibling PR check holds; the apply will not start on this attempt and stays claimable",
+		s.logger.Error("operator: check preflight gate did not confirm sibling change check holds; the apply will not start on this attempt and stays claimable",
 			append(apply.LogAttrs(),
 				"driver", driverID,
 				"apply_operation_id", applyOperationID,

@@ -1312,10 +1312,9 @@ type EngineResumeState struct {
 	Metadata         string
 }
 
-// Durable code-host providers, shared by every table that attributes a row
-// to the code host it came from (webhook events, merge gate requests).
+// Durable webhook event providers.
 const (
-	ProviderGitHub = "github"
+	WebhookProviderGitHub = "github"
 )
 
 // Durable webhook event states.
@@ -1356,21 +1355,21 @@ type WebhookInboxStats struct {
 	StuckProcessing int64
 }
 
-// MaxMergeGateAttempts is the claim budget for merge gate requests: how
+// MaxCheckRefreshAttempts is the claim budget for check refresh requests: how
 // many times a request may be claimed before a failure is recorded as
 // terminal. Attempts increment on claim, so a request that keeps failing (for
 // example against a misconfigured repository) cannot retry forever.
-const MaxMergeGateAttempts = 5
+const MaxCheckRefreshAttempts = 5
 
-// Merge gate request states.
+// Check refresh request states.
 const (
-	MergeGatePending    = "pending"
-	MergeGateProcessing = "processing"
-	MergeGateCompleted  = "completed"
-	MergeGateFailed     = "failed"
+	CheckRefreshPending    = "pending"
+	CheckRefreshProcessing = "processing"
+	CheckRefreshCompleted  = "completed"
+	CheckRefreshFailed     = "failed"
 )
 
-// Merge gate request kinds. A preflight request runs before an apply's
+// Check refresh request kinds. A preflight request runs before an apply's
 // engine work starts: it holds every sibling change's stored check on the
 // target action-required so a merge cannot land on a verdict the apply is
 // about to invalidate, and the operator gate blocks the apply's start until
@@ -1378,30 +1377,30 @@ const (
 // re-plans each sibling against the (possibly changed) live schema, which
 // both refreshes the verdicts and releases the preflight holds.
 const (
-	MergeGateKindPreflight = "preflight"
-	MergeGateKindSettle    = "settle"
+	CheckRefreshKindPreflight = "preflight"
+	CheckRefreshKindSettle    = "settle"
 )
 
-// MergeGateRequest is a durable request to re-evaluate stored check state
+// CheckRefreshRequest is a durable request to re-evaluate stored check state
 // for every open change targeting one (environment, database_type,
 // database_name) around an apply against that target. Plans and merge-gate
 // statuses on sibling changes were computed against the pre-apply live
-// schema, so each request fans out to those changes — a preflight holds
-// their checks while the apply runs, a settle re-plans them once it
-// finishes. The request row is the durable record that the fan-out must
-// happen, surviving pod restarts and lease handovers.
+// schema, so each request fans out to those siblings — a preflight holds
+// their checks while the apply runs, a settle re-plans them once it finishes.
+// The request row is the durable record that the fan-out must happen,
+// surviving pod restarts and lease handovers.
 //
 // One row exists per originating apply and kind (unique on apply_id + kind),
 // so recording is idempotent and the backstop sweeps can backfill any request
 // lost between the apply's state write and its recording.
-type MergeGateRequest struct {
+type CheckRefreshRequest struct {
 	ID int64
 	// ApplyID is the internal row id of the originating apply, used only for
 	// the uniqueness guard and sweep join. Logs and operator-facing text use
 	// ApplyIdentifier.
 	ApplyID int64
 	// Kind selects the fan-out the processor runs for this request:
-	// MergeGateKindPreflight or MergeGateKindSettle.
+	// CheckRefreshKindPreflight or CheckRefreshKindSettle.
 	Kind string
 	// ApplyIdentifier is the originating apply's user-facing string identifier,
 	// carried for attribution in refreshed check summaries and logs.
@@ -1409,18 +1408,12 @@ type MergeGateRequest struct {
 	Environment     string
 	DatabaseType    string
 	DatabaseName    string
-	// Provider names the code host the originating change lives on (for
-	// example "github"). Empty means the storage default, "github".
-	Provider string
-	// Repository and ChangeKey identify the change that originated the apply,
-	// when there is one. ChangeKey is the provider-scoped handle for the
-	// change within Repository — a PR number rendered as a string on GitHub;
-	// other providers use their own change identity. The fan-out excludes
-	// that change — its own apply lifecycle already updates its stored check
-	// state. Both are empty for CLI/gRPC applies, which have no originating
-	// change and therefore exclude nothing.
-	Repository string
-	ChangeKey  string
+	// Repository and PullRequest identify the PR that originated the apply,
+	// when there is one. The fan-out excludes that PR — its own apply lifecycle
+	// already updates its stored check state. Both are zero for CLI/gRPC
+	// applies, which have no originating PR and therefore exclude nothing.
+	Repository  string
+	PullRequest int
 	// RequestedBy is the originating apply's caller, carried for attribution.
 	RequestedBy    string
 	State          string
@@ -1440,16 +1433,6 @@ type MergeGateRequest struct {
 	CompletedAt     *time.Time
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
-}
-
-// ChangeKeyForPullRequest renders a GitHub pull request number as a merge
-// gate change key. Zero (no originating PR) renders as the empty key, which
-// the fan-out treats as "exclude nothing".
-func ChangeKeyForPullRequest(pr int) string {
-	if pr <= 0 {
-		return ""
-	}
-	return strconv.Itoa(pr)
 }
 
 // WebhookEvent is a durable inbox row for one SCM/webhook delivery.

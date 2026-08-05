@@ -1600,14 +1600,14 @@ func RecordCheckRefreshEventOutcome(ctx context.Context, database, environment, 
 }
 
 // RecordCheckPreflightGateOutcome counts outcomes of the operator gate that
-// blocks an apply's engine work until sibling PR checks on its target are
-// held action-required. Outcomes:
+// blocks an apply's engine work until sibling changes' stored checks on its
+// target are held action-required. Outcomes:
 //   - "passed": the preflight fan-out confirmed the holds; the apply started.
 //   - "timeout": the holds were not confirmed within the gate deadline; the
 //     drive attempt was abandoned and the apply stays claimable. A sustained
 //     rate means the check refresh processor is failing to drain preflight
-//     requests — check its logs; applies on GitHub-configured servers will
-//     not start until it recovers.
+//     requests — check its logs; applies on servers with a check refresh
+//     consumer will not start until it recovers.
 //   - "error": the gate could not read or record the preflight request
 //     (storage failure); the drive attempt was abandoned, fail closed.
 func RecordCheckPreflightGateOutcome(ctx context.Context, database, environment, outcome string) {
