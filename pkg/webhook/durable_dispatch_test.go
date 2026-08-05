@@ -348,7 +348,7 @@ func TestDurableInstallationID(t *testing.T) {
 	}{
 		{name: "valid tenant", event: "pull_request", pullRequest: 7, tenantID: "12345", wantID: 12345},
 		{name: "unparseable tenant", event: "pull_request", pullRequest: 7, tenantID: "not-an-installation-id", wantErr: "unparseable tenant ID"},
-		{name: "empty tenant", event: "pull_request", pullRequest: 7, tenantID: "", wantErr: "unparseable tenant ID"},
+		{name: "missing tenant", event: "pull_request", pullRequest: 7, tenantID: "", wantErr: "missing its stored tenant"},
 		{name: "zero tenant", event: "pull_request", pullRequest: 7, tenantID: "0", wantErr: "non-positive installation ID"},
 		{name: "negative tenant", event: "pull_request", pullRequest: 7, tenantID: "-42", wantErr: "non-positive installation ID"},
 		{name: "zero tenant on PR-less event", event: "push", tenantID: "0", wantErr: "non-positive installation ID"},
