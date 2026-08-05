@@ -781,6 +781,28 @@ func RecordEngineTerminalTruthReconcile(ctx context.Context, database, deploymen
 	)
 }
 
+// RecordConflictCheckOwnershipBlock counts conflict-check decisions that kept
+// a non-terminal task blocking its database because the task's parent apply
+// lease says this process's engine memory is not authoritative for it.
+// Reasons:
+//   - "fresh_lease": a live driver holds the apply's lease, so the local
+//     engine probe was skipped and the live drive stays authoritative. A
+//     sustained rate means new applies are repeatedly dispatched against a
+//     target that already has actively driven work — check who is submitting
+//     the duplicates.
+//   - "foreign_terminal_report": the lease is stale and this process's engine
+//     memory reports terminal, but the lease was last held by another process,
+//     so the report was refused. Driver stale-claim recovery settles the task;
+//     investigate if the same task repeats here without converging.
+func RecordConflictCheckOwnershipBlock(ctx context.Context, database, databaseType, reason string) {
+	addCounter(ctx, "schemabot.conflict_check.ownership_blocks_total",
+		"Total conflict-check decisions that kept a task blocking because the apply lease denies local engine authority", "{block}",
+		attribute.String("database", database),
+		attribute.String("database_type", databaseType),
+		attribute.String("reason", reason),
+	)
+}
+
 // RecordPlanetScaleUnclassifiedCancelRejection counts PlanetScale cancel
 // rejections whose live deployment state has no explicit classification. Every
 // known deployment state is classified explicitly; a hit here means PlanetScale
