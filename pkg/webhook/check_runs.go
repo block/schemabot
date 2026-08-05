@@ -110,7 +110,7 @@ var reviewTimeDeploymentDriftBlock = checkBlockReason{
 
 // schemaChangedReplanFailedBlock is used when the live schema of a check's
 // target changed after its plan was computed (another apply reached terminal
-// success there) and the check refresh fan-out could not re-plan the PR. The
+// success there) and the merge gate fan-out could not re-plan the PR. The
 // stored check fails closed: a plan computed against a schema that no longer
 // exists must not keep passing. The raw re-plan error stays in the server
 // logs; only this fixed message is rendered on the PR.

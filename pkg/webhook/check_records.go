@@ -62,7 +62,7 @@ func (o reviewDriftOutcome) planDriftState() storage.PlanDriftState {
 // errPlanCheckHeadStale reports that a plan check record was not stored
 // because the PR head advanced past the planned head. The newer head's own
 // plan is authoritative, so callers racing a synchronize (for example the
-// check refresh fan-out) treat this as a benign skip rather than a failure.
+// merge gate fan-out) treat this as a benign skip rather than a failure.
 var errPlanCheckHeadStale = errors.New("plan head is no longer the PR's current head")
 
 // storePlanCheckRecord stores per-database check state after a plan is generated.
@@ -144,7 +144,7 @@ func planCheckConclusion(hasChanges, hasPlanErrors, driftBlocked bool) string {
 // upsertPlanCheckRecord verifies the planned head is still the PR's current
 // head (returning errPlanCheckHeadStale when it is not) and upserts the
 // per-database stored check state for the plan. refreshNote, when non-empty,
-// is a pre-sanitized attribution line the check refresh fan-out appends to the
+// is a pre-sanitized attribution line the merge gate fan-out appends to the
 // stored change summary so the Change column says why an unchanged PR was
 // re-planned; ordinary plan writes pass "".
 func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, drift reviewDriftOutcome, refreshNote string) (string, *storage.Check, error) {
