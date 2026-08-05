@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/block/spirit/pkg/utils"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -38,6 +39,14 @@ func TestServerCloseSucceedsWhenTelemetryFlushFails(t *testing.T) {
 	// without a reachable database.
 	db, err := sql.Open("mysql", "schemabot@tcp(127.0.0.1:1)/schemabot")
 	require.NoError(t, err)
+	// srv.Close (via svc.Close) owns the handle; this cleanup only prevents a
+	// leak when the test fails before Close runs.
+	serverClosed := false
+	t.Cleanup(func() {
+		if !serverClosed {
+			utils.CloseAndLog(db)
+		}
+	})
 	svc := api.New(mysqlstore.New(db), &api.ServerConfig{}, nil, logger)
 
 	srv := &Server{cfg: &api.ServerConfig{}, svc: svc, logger: logger, telemetry: telemetry}
@@ -46,6 +55,7 @@ func TestServerCloseSucceedsWhenTelemetryFlushFails(t *testing.T) {
 	metrics.RecordPlan(t.Context(), "org/repo", "testdb", "pie", "staging", "success")
 
 	require.NoError(t, srv.Close(), "a failed telemetry flush must not fail Close")
+	serverClosed = true
 	assert.Contains(t, logs.String(), "telemetry shutdown failed",
 		"the dropped flush must be visible to operators as a warning")
 }
