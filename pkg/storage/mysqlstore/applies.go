@@ -1550,6 +1550,16 @@ func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, own
 	queryArgs = append(queryArgs, state.ApplyOperation.Pending)
 	queryArgs = append(queryArgs, stringArgs(activeOpStates)...)
 
+	// The claim itself rotates the lease (persistApplyClaim stamps
+	// lease_acquired_at), so a lease newer than the stop request's last write
+	// means this request was already claimed for reconciliation — re-matching
+	// it every poll would consume the driver's tick before the operation claim
+	// runs and starve the rest of the ladder whenever the reconciliation that
+	// follows keeps failing. The apply becomes claimable again when the stop
+	// request is re-issued or re-opened (cr.updated_at moves past the lease) or
+	// when the prior claim's heartbeat goes stale (a crashed or wedged driver).
+	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM applies a
@@ -1558,6 +1568,11 @@ func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, own
 				SELECT 1
 				FROM apply_control_requests cr
 				WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
+					AND (
+						a.lease_acquired_at IS NULL
+						OR a.lease_acquired_at < cr.updated_at
+						OR a.updated_at < %s
+					)
 			)
 			AND EXISTS (
 				SELECT 1
@@ -1573,7 +1588,7 @@ func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, own
 		ORDER BY a.created_at
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyColumns, parentStatePlaceholders, activeOpStatePlaceholders), queryArgs...)
+	`, applyColumns, parentStatePlaceholders, staleClaimCutoff, activeOpStatePlaceholders), queryArgs...)
 
 	apply, err := scanApplyInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

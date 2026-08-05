@@ -805,17 +805,20 @@ func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int
 // and completes the stop once the apply is terminal.
 //
 // Returns true when this tick is consumed by stop reconciliation — an apply was
-// claimed (whether the reconciliation that followed succeeded or hit an error)
-// or the claim itself errored or returned an invalid lease — so the caller does
-// not also run the normal operation claim this tick. Returns false only when no
-// apply needed reconciliation.
+// claimed, whether the reconciliation that followed succeeded, hit an error, or
+// the claim returned an invalid lease — so the caller does not also run the
+// normal operation claim this tick. Returns false when no apply needed
+// reconciliation, and when the claim itself errored: a failed claim did no work
+// and holds no lease, so the tick falls through to the operation claim instead
+// of letting a persistent storage error on this path starve every other claim
+// the driver ladder runs after it.
 func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, owner string) bool {
 	apply, err := s.storage.Applies().FindNextApplyForStopReconciliation(ctx, owner)
 	if err != nil {
 		s.logger.Error("operator: failed to claim apply for stop reconciliation",
 			"driver", driverID, "lease_owner", owner, "error", err)
 		metrics.RecordOperatorClaimFailure(ctx, "stop_reconciliation_claim_error")
-		return true
+		return false
 	}
 	if apply == nil {
 		s.logger.Debug("operator: no apply needs stop reconciliation", "driver", driverID)
